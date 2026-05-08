@@ -1,0 +1,303 @@
+#!/usr/bin/env python
+"""Evaluate stage-1 table-to-table and path-aware recall."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from stage1_io import iter_jsonl, update_stage1_manifest, write_json
+from train_student import Student, TYPES, load_embeddings
+
+
+def load_student(student_dir: Path, device: torch.device) -> Student:
+    ckpt = torch.load(student_dir / "student.pt", map_location=device)
+    model = Student(int(ckpt["in_dim"]), int(ckpt["student_dim"])).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    return model
+
+
+def score_pair(model: Student, vectors: dict[str, np.ndarray], a: str, ta: str, b: str, tb: str, device: torch.device) -> float:
+    with torch.no_grad():
+        za = torch.tensor(vectors[a], dtype=torch.float32, device=device).unsqueeze(0)
+        zb = torch.tensor(vectors[b], dtype=torch.float32, device=device).unsqueeze(0)
+        return float(torch.sigmoid(model.score(za, ta, zb, tb))[0].cpu())
+
+
+def relation_query_from_projected(model: Student, projected_vec: np.ndarray, source_type: str, target_type: str, device: torch.device) -> np.ndarray:
+    with torch.no_grad():
+        ua = torch.tensor(projected_vec, dtype=torch.float32, device=device).unsqueeze(0)
+        query = ua @ model.rel[f"{source_type}__{target_type}"]
+        query = torch.nn.functional.normalize(query, p=2, dim=-1)
+        return query.cpu().numpy().astype("float32")
+
+
+def dcg(rels: list[int]) -> float:
+    return sum((2**rel - 1) / math.log2(idx + 2) for idx, rel in enumerate(rels))
+
+
+def metrics_for(qrels: list[dict[str, Any]], rankings: dict[str, list[str]], topks: list[int]) -> dict[str, float]:
+    rel_by_q: dict[str, dict[str, int]] = defaultdict(dict)
+    for qrel in qrels:
+        rel_by_q[qrel["query_id"]][qrel["target_id"]] = int(qrel["rel"])
+    out: dict[str, float] = {}
+    n = len(rel_by_q)
+    for k in topks:
+        recall = 0.0
+        ndcg = 0.0
+        for q, rels in rel_by_q.items():
+            ranked = rankings.get(q, [])[:k]
+            hits = sum(1 for t in ranked if t in rels)
+            recall += hits / max(1, len(rels))
+            ranked_rels = [rels.get(t, 0) for t in ranked]
+            ideal = sorted(rels.values(), reverse=True)[:k]
+            ndcg += dcg(ranked_rels) / max(1e-12, dcg(ideal))
+        out[f"Recall@{k}"] = recall / max(1, n)
+        out[f"nDCG@{k}"] = ndcg / max(1, n)
+    mrr = 0.0
+    for q, rels in rel_by_q.items():
+        rank = 0
+        for idx, target in enumerate(rankings.get(q, []), 1):
+            if target in rels:
+                rank = idx
+                break
+        mrr += 1.0 / rank if rank else 0.0
+    out["MRR"] = mrr / max(1, n)
+    out["queries"] = n
+    return out
+
+
+def table_rankings(stage1_dir: Path, model: Student, vectors: dict[str, np.ndarray], device: torch.device) -> dict[str, list[str]]:
+    fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
+    queries = [f for f in fragments.values() if f.get("role") in {"left_visible", "left_hidden"} and f["fragment_id"] in vectors]
+    targets = [f for f in fragments.values() if f.get("role") == "right_target" and f["fragment_id"] in vectors]
+    rankings: dict[str, list[str]] = {}
+    for q in queries:
+        scored = []
+        for t in targets:
+            scored.append((score_pair(model, vectors, q["fragment_id"], "table_fragment", t["fragment_id"], "table_fragment", device), t["fragment_id"]))
+        scored.sort(reverse=True)
+        rankings[q["fragment_id"]] = [tid for _, tid in scored]
+    return rankings
+
+
+def load_hnsw(hnsw_dir: Path, object_type: str, dim: int):
+    try:
+        import hnswlib
+    except ImportError:
+        return None, []
+    bin_path = hnsw_dir / f"{object_type}.bin"
+    ids_path = hnsw_dir / f"{object_type}_ids.json"
+    if not bin_path.exists() or not ids_path.exists():
+        return None, []
+    index = hnswlib.Index(space="cosine", dim=dim)
+    ids = json.loads(ids_path.read_text(encoding="utf-8"))
+    index.load_index(str(bin_path), max_elements=len(ids))
+    index.set_ef(100)
+    return index, ids
+
+
+def load_projected(student_dir: Path) -> dict[str, tuple[str, np.ndarray]]:
+    projected = {}
+    emb_dir = student_dir / "index_embeddings"
+    for object_type in TYPES:
+        npy = emb_dir / f"{object_type}.npy"
+        ids_path = emb_dir / f"{object_type}_ids.json"
+        if npy.exists() and ids_path.exists():
+            arr = np.load(npy).astype("float32")
+            ids = json.loads(ids_path.read_text(encoding="utf-8"))
+            projected.update({oid: (object_type, arr[i]) for i, oid in enumerate(ids)})
+    return projected
+
+
+def compose_path_score(prev_score: float, edge_score: float, composition: str) -> float:
+    if composition == "product":
+        return prev_score * edge_score
+    return min(prev_score, edge_score)
+
+
+def relation_aware_neighbors(
+    model: Student,
+    projected: dict[str, tuple[str, np.ndarray]],
+    indexes: dict[str, Any],
+    ids_by_type: dict[str, list[str]],
+    node_id: str,
+    source_type: str,
+    target_type: str,
+    k: int,
+    device: torch.device,
+) -> list[str]:
+    if target_type not in indexes or not ids_by_type.get(target_type) or node_id not in projected:
+        return []
+    query = relation_query_from_projected(model, projected[node_id][1], source_type, target_type, device)
+    labels, _ = indexes[target_type].knn_query(query, k=min(k, len(ids_by_type[target_type])))
+    return [ids_by_type[target_type][int(label)] for label in labels[0]]
+
+
+def beam_search_tables(
+    args: argparse.Namespace,
+    model: Student,
+    vectors: dict[str, np.ndarray],
+    projected: dict[str, tuple[str, np.ndarray]],
+    indexes: dict[str, Any],
+    ids_by_type: dict[str, list[str]],
+    query_id: str,
+    device: torch.device,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    if query_id not in projected:
+        return [], {}
+    start_type = projected[query_id][0]
+    frontier = [
+        {
+            "node_id": query_id,
+            "node_type": start_type,
+            "score": 1.0,
+            "path": [(query_id, start_type)],
+        }
+    ]
+    best_tables: dict[str, dict[str, Any]] = {}
+    neighbor_k = max(1, int(args.beam_neighbors))
+    for _ in range(max(1, int(args.max_hops))):
+        candidates = []
+        for state in frontier:
+            for target_type in TYPES:
+                neighbors = relation_aware_neighbors(
+                    model,
+                    projected,
+                    indexes,
+                    ids_by_type,
+                    state["node_id"],
+                    state["node_type"],
+                    target_type,
+                    neighbor_k,
+                    device,
+                )
+                for next_id in neighbors:
+                    if next_id == query_id or any(node_id == next_id for node_id, _ in state["path"]):
+                        continue
+                    if state["node_id"] not in vectors or next_id not in vectors:
+                        continue
+                    edge_score = score_pair(model, vectors, state["node_id"], state["node_type"], next_id, target_type, device)
+                    path_score = compose_path_score(float(state["score"]), edge_score, args.path_composition)
+                    path = [*state["path"], (next_id, target_type)]
+                    next_state = {"node_id": next_id, "node_type": target_type, "score": path_score, "path": path}
+                    candidates.append(next_state)
+                    if target_type == "table_fragment":
+                        previous = best_tables.get(next_id)
+                        if previous is None or path_score > previous["score"]:
+                            best_tables[next_id] = {"score": path_score, "path": path}
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        frontier = candidates[: max(1, int(args.beam_width))]
+        if not frontier:
+            break
+    ranked = [tid for tid, _ in sorted(best_tables.items(), key=lambda item: item[1]["score"], reverse=True)]
+    return ranked, best_tables
+
+
+def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Student, vectors: dict[str, np.ndarray], device: torch.device, topks: list[int]) -> dict[str, Any]:
+    student_dir = Path(args.student_dir)
+    emb_dir = student_dir / "index_embeddings"
+    table_arr = np.load(emb_dir / "table_fragment.npy")
+    dim = int(table_arr.shape[1])
+    indexes: dict[str, Any] = {}
+    ids_by_type: dict[str, list[str]] = {}
+    for object_type in TYPES:
+        index, ids = load_hnsw(Path(args.hnsw_dir), object_type, dim)
+        if index is not None:
+            indexes[object_type] = index
+            ids_by_type[object_type] = ids
+    if "table_fragment" not in indexes:
+        return {"available": False}
+    projected = load_projected(student_dir)
+    human = {rec["path_id"]: rec.get("human_label") for rec in iter_jsonl(stage1_dir / "human_labeled_paths.jsonl")} if (stage1_dir / "human_labeled_paths.jsonl").exists() else {}
+    paths_by_query_asset_target = {}
+    pool_iter = iter_jsonl(stage1_dir / "hitl_pool.jsonl") if (stage1_dir / "hitl_pool.jsonl").exists() else []
+    for path in pool_iter:
+        paths_by_query_asset_target[(path["query_fragment_id"], path["asset_id"], path["target_fragment_id"])] = path
+    qrels = [rec for rec in iter_jsonl(Path(args.qrels))]
+    hidden_q = sorted({q["query_id"] for q in qrels if q.get("query_role") == "left_hidden"})
+    correct = defaultdict(set)
+    for q in qrels:
+        if q.get("query_role") == "left_hidden":
+            correct[q["query_id"]].add(q["target_id"])
+    recalls = {f"Bridge-aware Table Recall@{k}": 0.0 for k in topks}
+    direct_indirect = 0
+    related_only = 0
+    evidence_seen = 0
+    total_retrieved_tables = 0
+    for qid in hidden_q:
+        if qid not in projected:
+            continue
+        ranked, best_paths = beam_search_tables(args, model, vectors, projected, indexes, ids_by_type, qid, device)
+        total_retrieved_tables += len(ranked)
+        for tid, payload in best_paths.items():
+            path_nodes = payload["path"]
+            if len(path_nodes) == 3 and path_nodes[1][1] in {"text_asset", "image_asset"}:
+                aid = path_nodes[1][0]
+                path = paths_by_query_asset_target.get((qid, aid, tid))
+                if path and path.get("path_id") in human:
+                    evidence_seen += 1
+                    if human[path["path_id"]] in {1, 2}:
+                        direct_indirect += 1
+                    elif human[path["path_id"]] == 0:
+                        related_only += 1
+        for k in topks:
+            recalls[f"Bridge-aware Table Recall@{k}"] += float(any(t in correct[qid] for t in ranked[:k]))
+    denom = max(1, len(hidden_q))
+    return {
+        "available": True,
+        **{k: v / denom for k, v in recalls.items()},
+        "Bridge Evidence Precision": direct_indirect / max(1, evidence_seen),
+        "Related-only False Positive Rate": related_only / max(1, evidence_seen),
+        "labeled_evidence_seen": evidence_seen,
+        "retrieved_table_endpoints": total_retrieved_tables,
+        "max_hops": int(args.max_hops),
+        "beam_width": int(args.beam_width),
+        "beam_neighbors": int(args.beam_neighbors),
+    }
+
+
+def run(args: argparse.Namespace) -> None:
+    topks = [int(k) for k in args.topk]
+    stage1_dir = Path(args.stage1_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vectors, _, _, _ = load_embeddings(Path(args.embedding_dir if hasattr(args, "embedding_dir") else stage1_dir / "embeddings"))
+    model = load_student(Path(args.student_dir), device)
+    qrels = list(iter_jsonl(Path(args.qrels)))
+    rankings = table_rankings(stage1_dir, model, vectors, device)
+    results: dict[str, Any] = {}
+    for split in ("dev", "test"):
+        for role in ("left_visible", "left_hidden"):
+            subset = [q for q in qrels if q.get("split") == split and q.get("query_role") == role]
+            results[f"{split}_{role}"] = metrics_for(subset, rankings, topks)
+    results["path_aware"] = path_aware_metrics(args, stage1_dir, model, vectors, device, topks)
+    write_json(stage1_dir / "eval_results.json", results)
+    update_stage1_manifest(stage1_dir, "eval", {"results": results, "args": vars(args)})
+    print(json.dumps(results, ensure_ascii=False, indent=2))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage1_dir", default="output_stage1_logic")
+    parser.add_argument("--student_dir", default="output_stage1_logic/student")
+    parser.add_argument("--hnsw_dir", default="output_stage1_logic/hnsw_indices")
+    parser.add_argument("--qrels", default="output_stage1_logic/qrels.jsonl")
+    parser.add_argument("--topk", nargs="+", default=["10", "50", "100"])
+    parser.add_argument("--max_hops", type=int, default=3)
+    parser.add_argument("--beam_width", type=int, default=64)
+    parser.add_argument("--beam_neighbors", type=int, default=50)
+    parser.add_argument("--path_composition", choices=["min", "product"], default="min")
+    parser.add_argument("--seed", type=int, default=13)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run(parse_args())

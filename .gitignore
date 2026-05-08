@@ -1,0 +1,51 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and editor state
+.env
+.env.*
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
+tmp/
+
+# Generated Stage-1 / dataset outputs
+output/
+output_*/
+output_stage1_logic/
+output_medium/
+
+# Local input datasets and downloaded assets
+dataset/
+hf_models/
+
+# Large model / index / tensor artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.bin
+*.index
+*.aria2
+
+# Human annotation working files
+human_labels_filled_round_*.jsonl
+*.filled.jsonl
+
+# Local agent instructions
+AGENTS.md

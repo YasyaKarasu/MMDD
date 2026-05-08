@@ -1,0 +1,182 @@
+#!/usr/bin/env python
+"""Build pair and path samples for the pairwise teacher."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+from typing import Any
+
+from stage1_io import iter_jsonl, setup_logging, stable_hash, update_stage1_manifest, write_jsonl
+
+
+def bool_arg(value: str) -> bool:
+    return str(value).lower() in {"1", "true", "yes", "y"}
+
+
+def load_paths(stage1_dir: Path) -> list[dict[str, Any]]:
+    path = stage1_dir / "hitl_pool.jsonl"
+    paths = {rec["path_id"]: rec for rec in iter_jsonl(path)} if path.exists() else {}
+    human = stage1_dir / "human_labeled_paths.jsonl"
+    if human.exists():
+        for rec in iter_jsonl(human):
+            paths[rec["path_id"]] = rec
+    return list(paths.values())
+
+
+def path_label(path: dict[str, Any]) -> tuple[float, float, str] | None:
+    if path.get("human_label") is not None:
+        label = int(path["human_label"])
+        if label == 2:
+            return 1.0, 1.0, "human"
+        if label == 1:
+            return 0.6, 0.8, "human"
+        return 0.0, 1.0, "human"
+    weak = path.get("weak_label")
+    if weak == "weak_direct":
+        return 0.8, 0.4, "weak"
+    if weak == "weak_indirect":
+        return 0.5, 0.3, "weak"
+    if weak == "weak_negative":
+        return 0.0, 0.4, "weak"
+    return None
+
+
+def run(args: argparse.Namespace) -> None:
+    setup_logging()
+    rng = random.Random(args.seed)
+    stage1_dir = Path(args.stage1_dir)
+    fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
+    targets_by_split: dict[str, list[dict[str, Any]]] = {}
+    for frag in fragments.values():
+        if frag.get("role") == "right_target":
+            targets_by_split.setdefault(frag.get("split", "unknown"), []).append(frag)
+    samples: list[dict[str, Any]] = []
+    logic_pairs = list(iter_jsonl(stage1_dir / "logic_pairs.jsonl"))
+    for pair in logic_pairs:
+        q = fragments.get(pair["query_fragment_id"])
+        t = fragments.get(pair["target_fragment_id"])
+        if not q or not t:
+            continue
+        weight = float(pair.get("weight", 1.0))
+        label_source = "self_supervised" if q.get("role") == "left_visible" else "weak"
+        if q.get("role") == "left_hidden":
+            weight = min(weight, 0.4)
+        samples.append(
+            {
+                "sample_id": f"train_{stable_hash(pair['pair_id'])}",
+                "sample_kind": "pair",
+                "object_id_a": q["fragment_id"],
+                "object_type_a": "table_fragment",
+                "object_id_b": t["fragment_id"],
+                "object_type_b": "table_fragment",
+                "label": float(pair["label"]),
+                "weight": weight,
+                "split": pair.get("split"),
+                "chain_id": pair.get("chain_id"),
+                "label_source": label_source,
+                "reason": pair.get("reason"),
+            }
+        )
+        negatives = [
+            cand
+            for cand in targets_by_split.get(pair.get("split", "unknown"), [])
+            if cand.get("source_table_id") != pair.get("source_table_id") and cand.get("chain_id") != pair.get("chain_id")
+        ]
+        rng.shuffle(negatives)
+        for neg in negatives[:1]:
+            samples.append(
+                {
+                    "sample_id": f"train_neg_{stable_hash(q['fragment_id'], neg['fragment_id'])}",
+                    "sample_kind": "pair",
+                    "object_id_a": q["fragment_id"],
+                    "object_type_a": "table_fragment",
+                    "object_id_b": neg["fragment_id"],
+                    "object_type_b": "table_fragment",
+                    "label": 0.0,
+                    "weight": 1.0,
+                    "split": pair.get("split"),
+                    "chain_id": pair.get("chain_id"),
+                    "label_source": "negative",
+                    "reason": "same_split_different_source_chain_target",
+                }
+            )
+
+    for path in load_paths(stage1_dir):
+        mapped = path_label(path)
+        if mapped is None:
+            continue
+        label, weight, source = mapped
+        samples.append(
+            {
+                "sample_id": f"train_path_{stable_hash(path['path_id'], source)}",
+                "sample_kind": "path",
+                "query_fragment_id": path["query_fragment_id"],
+                "query_object_type": "table_fragment",
+                "asset_id": path["asset_id"],
+                "asset_object_type": f"{path['asset_type']}_asset",
+                "target_fragment_id": path["target_fragment_id"],
+                "target_object_type": "table_fragment",
+                "label": label,
+                "weight": weight,
+                "split": path.get("split"),
+                "chain_id": path.get("chain_id"),
+                "path_id": path["path_id"],
+                "label_source": source,
+                "reason": path.get("reason"),
+            }
+        )
+
+    if bool_arg(str(args.include_pseudo_labels)) and (stage1_dir / "teacher_scores.jsonl").exists():
+        for score in iter_jsonl(stage1_dir / "teacher_scores.jsonl"):
+            path_score = score.get("path_score")
+            if score.get("path_id") is None or path_score is None:
+                continue
+            path_score = float(path_score)
+            if path_score > args.pseudo_pos_threshold:
+                label = 1.0
+            elif path_score < args.pseudo_neg_threshold:
+                label = 0.0
+            else:
+                continue
+            samples.append(
+                {
+                    "sample_id": f"train_pseudo_{stable_hash(score['path_id'], path_score)}",
+                    "sample_kind": "path",
+                    "query_fragment_id": score["query_fragment_id"],
+                    "query_object_type": "table_fragment",
+                    "asset_id": score["asset_id"],
+                    "asset_object_type": score["asset_object_type"],
+                    "target_fragment_id": score["target_fragment_id"],
+                    "target_object_type": "table_fragment",
+                    "label": label,
+                    "weight": 0.2,
+                    "split": score.get("split"),
+                    "chain_id": score.get("chain_id"),
+                    "path_id": score["path_id"],
+                    "label_source": "pseudo",
+                    "reason": "high_confidence_teacher_path_score",
+                }
+            )
+
+    out = Path(args.output)
+    count = write_jsonl(out, samples)
+    update_stage1_manifest(stage1_dir, "teacher_training_data", {"output": str(out), "records": count, "args": vars(args)})
+    print(json.dumps({"records": count, "output": str(out)}, ensure_ascii=False, indent=2))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage1_dir", default="output_stage1_logic")
+    parser.add_argument("--output", default="output_stage1_logic/train_pairs.jsonl")
+    parser.add_argument("--include_pseudo_labels", default="false")
+    parser.add_argument("--pseudo_pos_threshold", type=float, default=0.9)
+    parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=13)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run(parse_args())
