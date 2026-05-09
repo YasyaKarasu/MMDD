@@ -368,6 +368,14 @@ conda run -n MMDD python scripts/stage1_run_all.py \
   --port 7860
 ```
 
+如果想在浏览器里查看已经构造出来的连接组，可以运行：
+
+```bash
+conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output_stage1_logic --port 7861
+```
+
+这个 viewer 会按 `chain_id` 分页展示，每页包含 visible query、hidden query、target fragment、logic pairs、qrels 和 evidence paths。
+
 下面这些底层命令仍然可以用于调试或单独运行某一步：
 
 ```bash

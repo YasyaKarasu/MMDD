@@ -216,6 +216,14 @@ conda run -n MMDD python scripts/stage1_run_all.py \
   --port 7860
 ```
 
+To inspect constructed connection groups in a browser, run:
+
+```bash
+conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output_stage1_logic --port 7861
+```
+
+The viewer paginates by `chain_id` and shows the visible query, hidden query, target fragment, logic pairs, qrels, and evidence paths for each group.
+
 Lower-level commands are still available for debugging or running individual steps:
 
 ```bash

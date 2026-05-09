@@ -11,8 +11,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from build_stage1_logic_connectivity import build_target_rows
+from build_stage1_logic_connectivity import build_target_rows, choose_query_context_cols
 from hitl_annotation_app import create_app
+from stage1_connection_viewer import create_app as create_connection_viewer_app
+from stage1_connection_viewer import load_groups
 from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
 from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder
@@ -93,6 +95,22 @@ def test_abc_fragment_provenance_core():
     assert q_source_rows == [0, 1, 2, 3, 4, 5]
     assert t_source_rows == [0, 1, 2, 3, 4, 5]
     assert q_rows[0]["cells"][0]["source_column_index"] == 0
+
+
+def test_query_fragments_keep_irrelevant_context_without_target_leakage():
+    table = synthetic_table()
+    context_cols = choose_query_context_cols(table, {0, 1, 2}, max_cols=2)
+    assert context_cols == [3]
+
+    visible_cols = [0, 1] + context_cols
+    hidden_cols = [0] + context_cols
+    qv_rows, _ = project_rows(table, visible_cols, dedupe_col=0, min_required_cols=2)
+    qh_rows, _ = project_rows(table, hidden_cols, dedupe_col=0, min_required_cols=1)
+
+    assert [cell["source_column_index"] for cell in qv_rows[0]["cells"]] == [0, 1, 3]
+    assert [cell["source_column_index"] for cell in qh_rows[0]["cells"]] == [0, 3]
+    assert 2 not in [cell["source_column_index"] for cell in qv_rows[0]["cells"]]
+    assert 1 not in [cell["source_column_index"] for cell in qh_rows[0]["cells"]]
 
 
 def test_table_serialization_excludes_hidden_fields_and_values():
@@ -227,6 +245,37 @@ def test_hitl_annotation_app_saves_and_merges(tmp_path):
     by_id = {item["path_id"]: item for item in merged}
     assert by_id["p_new"]["human_label"] == 2
     assert by_id["p_new"]["annotator_notes"] == "verified"
+
+
+def test_connection_viewer_groups_stage1_artifacts(tmp_path):
+    fragment_base = {
+        "object_type": "table_fragment",
+        "split": "train",
+        "chain_id": "c1",
+        "source_table_id": "s1",
+        "page_title": "Page",
+        "columns": [{"column_name": "A"}],
+        "rows": [{"cells": [{"text": "alpha"}]}],
+    }
+    write_jsonl(
+        tmp_path / "logic_fragments.jsonl",
+        [
+            {**fragment_base, "fragment_id": "qv", "role": "left_visible", "statement": "A -> B"},
+            {**fragment_base, "fragment_id": "qh", "role": "left_hidden", "statement": "A -> hidden(B)"},
+            {**fragment_base, "fragment_id": "t", "role": "right_target", "statement": "B -> C"},
+        ],
+    )
+    write_jsonl(tmp_path / "logic_pairs.jsonl", [{"pair_id": "p", "chain_id": "c1", "label": 1, "weight": 1.0, "reason": "visible_chain"}])
+    write_jsonl(tmp_path / "qrels.jsonl", [{"chain_id": "c1", "query_id": "qv", "target_id": "t", "query_role": "left_visible", "target_role": "right_target", "rel": 3}])
+    write_jsonl(tmp_path / "hitl_pool.jsonl", [{"path_id": "path", "chain_id": "c1", "asset_type": "text", "claim_text": "alpha -> beta", "entity_text": "alpha", "bridge_col_name": "B", "bridge_value": "beta"}])
+    groups = load_groups(tmp_path, max_rows=5, max_evidence_paths=10)
+    assert len(groups) == 1
+    assert groups[0]["visible"]["fragment_id"] == "qv"
+    assert groups[0]["evidence_paths"][0]["path_id"] == "path"
+    client = create_connection_viewer_app(tmp_path, max_rows=5, max_evidence_paths=10).test_client()
+    resp = client.get("/?q=alpha")
+    assert resp.status_code == 200
+    assert b"Stage-1 Connection Viewer" in resp.data
 
 
 def test_train_pairs_do_not_auto_positive_unlabeled_assets(tmp_path):

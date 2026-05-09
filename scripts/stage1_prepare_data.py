@@ -25,6 +25,7 @@ def run(args: argparse.Namespace) -> None:
             max_chains_per_table=args.max_chains_per_table,
             max_bridges_per_anchor=args.max_bridges_per_anchor,
             max_target_attrs=args.max_target_attrs,
+            max_query_context_attrs=args.max_query_context_attrs,
             seed=args.seed,
             min_ab_purity=args.min_ab_purity,
             min_bc_purity=args.min_bc_purity,
@@ -64,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_chains_per_table", type=int, default=10)
     parser.add_argument("--max_bridges_per_anchor", type=int, default=5)
     parser.add_argument("--max_target_attrs", type=int, default=2)
+    parser.add_argument("--max_query_context_attrs", type=int, default=2)
     parser.add_argument("--min_ab_purity", type=float, default=0.95)
     parser.add_argument("--min_bc_purity", type=float, default=0.85)
     parser.add_argument("--min_support", type=int, default=6)

@@ -42,16 +42,21 @@ def valid_target_profile(table: dict[str, Any], idx: int, profile: dict[str, Any
     return float(profile.get("non_empty_ratio", 0.0)) >= 0.6 and distinct >= 2
 
 
-def choose_context_col(table: dict[str, Any], exclude: set[int]) -> list[int]:
+def choose_query_context_cols(table: dict[str, Any], exclude: set[int], max_cols: int) -> list[int]:
+    if max_cols <= 0:
+        return []
     profiles = column_profiles(table)
     candidates = []
     for idx, profile in profiles.items():
         if idx in exclude or is_useless_column_name(get_column_name(table, idx)):
             continue
-        if float(profile.get("non_empty_ratio", 0.0)) >= 0.6 and float(profile.get("numeric_ratio", 0.0)) <= 0.5:
-            candidates.append((float(profile.get("non_empty_ratio", 0.0)), -float(profile.get("unique_ratio", 1.0)), idx))
+        non_empty_ratio = float(profile.get("non_empty_ratio", 0.0))
+        if non_empty_ratio >= 0.6:
+            numeric_ratio = float(profile.get("numeric_ratio", 0.0))
+            unique_ratio = float(profile.get("unique_ratio", 1.0))
+            candidates.append((numeric_ratio <= 0.5, non_empty_ratio, -unique_ratio, -idx, idx))
     candidates.sort(reverse=True)
-    return [candidates[0][2]] if candidates else []
+    return [candidate[-1] for candidate in candidates[:max_cols]]
 
 
 def build_target_rows(source_table: dict[str, Any], b_col: int, c_cols: list[int]) -> tuple[list[dict[str, Any]], list[int]]:
@@ -221,9 +226,14 @@ def run(args: argparse.Namespace) -> None:
                 valid_cs.sort(reverse=True)
                 c_cols = [c for _, c in valid_cs[: args.max_target_attrs]]
 
-                qv_rows, qv_source_rows = project_rows(table, [a_col, b_col], dedupe_col=a_col)
-                context_cols = choose_context_col(table, {a_col, b_col, *c_cols})
-                qh_cols = [a_col] + context_cols
+                query_context_cols = choose_query_context_cols(
+                    table,
+                    {a_col, b_col, *c_cols},
+                    args.max_query_context_attrs,
+                )
+                qv_cols = [a_col, b_col] + query_context_cols
+                qv_rows, qv_source_rows = project_rows(table, qv_cols, dedupe_col=a_col, min_required_cols=2)
+                qh_cols = [a_col] + query_context_cols
                 qh_rows, qh_source_rows = project_rows(table, qh_cols, dedupe_col=a_col, min_required_cols=1)
                 t_cols = [b_col] + c_cols
                 t_rows, t_source_rows = build_target_rows(table, b_col, c_cols)
@@ -239,11 +249,14 @@ def run(args: argparse.Namespace) -> None:
                     split,
                     chain_id,
                     "left_visible",
-                    [a_col, b_col],
+                    qv_cols,
                     qv_rows,
                     qv_source_rows,
                     f"{a_name} -> {b_name}",
-                    {"visible_bridge": True},
+                    {
+                        "visible_bridge": True,
+                        "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
+                    },
                 )
                 q_hidden = make_fragment(
                     table,
@@ -258,6 +271,7 @@ def run(args: argparse.Namespace) -> None:
                         "visible_bridge": False,
                         "hidden_bridge_col": b_col,
                         "hidden_bridge_col_name": b_name,
+                        "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
                     },
                 )
                 target = make_fragment(
@@ -358,6 +372,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_chains_per_table", type=int, default=10)
     parser.add_argument("--max_bridges_per_anchor", type=int, default=5)
     parser.add_argument("--max_target_attrs", type=int, default=2)
+    parser.add_argument("--max_query_context_attrs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--min_ab_purity", type=float, default=0.95)
     parser.add_argument("--min_bc_purity", type=float, default=0.85)
