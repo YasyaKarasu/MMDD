@@ -36,6 +36,7 @@ def resolve_encoder_path(path: str | None = None) -> Path:
 
 
 def _load_official_embedder(model_dir: Path):
+    _check_official_runtime_dependencies()
     script_path = model_dir / "scripts" / "qwen3_vl_embedding.py"
     if not script_path.exists():
         raise FileNotFoundError(f"Missing official Qwen embedder script: {script_path}")
@@ -46,6 +47,36 @@ def _load_official_embedder(model_dir: Path):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.Qwen3VLEmbedder
+
+
+def _check_official_runtime_dependencies() -> None:
+    try:
+        from importlib import metadata as importlib_metadata
+
+        transformers_version = importlib_metadata.version("transformers")
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise ImportError(
+            "Qwen3-VL-Embedding requires transformers>=4.57.0,<5. "
+            "Install project dependencies in the active Python environment."
+        ) from exc
+
+    try:
+        transformers_major = int(transformers_version.split(".", 1)[0])
+    except ValueError:
+        transformers_major = 0
+    if transformers_major >= 5:
+        raise ImportError(
+            "Qwen3-VL-Embedding-2B is not compatible with transformers "
+            f"{transformers_version}; use transformers>=4.57.0,<5. "
+            "For example: python -m pip install "
+            "'transformers>=4.57.0,<5' 'qwen-vl-utils>=0.0.14'"
+        )
+
+    if importlib.util.find_spec("qwen_vl_utils") is None:
+        raise ImportError(
+            "Qwen3-VL-Embedding requires qwen-vl-utils>=0.0.14. "
+            "For example: python -m pip install 'qwen-vl-utils>=0.0.14'"
+        )
 
 
 class Qwen3VLEmbeddingEncoder:
