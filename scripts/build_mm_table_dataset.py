@@ -63,6 +63,8 @@ YEAR_RE = re.compile(r"^(?:1[5-9]\d{2}|20\d{2}|21\d{2})(?:[-/]\d{1,2}(?:[-/]\d{1
 ORDINAL_RE = re.compile(r"^\d+(?:st|nd|rd|th)?$", re.IGNORECASE)
 SCORE_RE = re.compile(r"^\(?\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*\)?$")
 WHITESPACE_RE = re.compile(r"\s+")
+PARAGRAPH_BREAK_RE = re.compile(r"(?:\r?\n){2,}")
+SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
 
 
 def normalize_title(title: str) -> str:
@@ -87,6 +89,119 @@ def clean_text(value: Any) -> str:
         return WHITESPACE_RE.sub(" ", text)
     except Exception:
         return ""
+
+
+def _split_long_text_unit(text: str, max_chars: int) -> list[str]:
+    pieces: list[str] = []
+    rest = clean_text(text)
+    while len(rest) > max_chars:
+        split_at = rest.rfind(" ", 0, max_chars + 1)
+        if split_at < max(1, max_chars // 2):
+            split_at = max_chars
+        piece = clean_text(rest[:split_at])
+        if piece:
+            pieces.append(piece)
+        rest = clean_text(rest[split_at:])
+    if rest:
+        pieces.append(rest)
+    return pieces
+
+
+def split_text_asset_content(
+    content: Any,
+    max_chars: int = 800,
+    min_chars: int = 120,
+    max_chunks: int = 0,
+) -> list[str]:
+    """Split a Wikipedia extract into stable text-asset sized fragments."""
+    raw = "" if content is None else html.unescape(str(content)).replace("\xa0", " ").strip()
+    if not raw:
+        return []
+
+    max_chars = max(1, int(max_chars))
+    min_chars = max(1, min(int(min_chars), max_chars))
+    paragraphs = [clean_text(part) for part in PARAGRAPH_BREAK_RE.split(raw)]
+    paragraphs = [part for part in paragraphs if part]
+    if not paragraphs:
+        paragraphs = [clean_text(raw)]
+
+    units: list[str] = []
+    for paragraph in paragraphs:
+        if len(paragraph) <= max_chars:
+            units.append(paragraph)
+            continue
+        for sentence in SENTENCE_BREAK_RE.split(paragraph):
+            sentence = clean_text(sentence)
+            if not sentence:
+                continue
+            units.extend(_split_long_text_unit(sentence, max_chars))
+
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        candidate = f"{current} {unit}".strip() if current else unit
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = unit
+    if current:
+        chunks.append(current)
+
+    merged: list[str] = []
+    for chunk in chunks:
+        if merged and len(chunk) < min_chars and len(merged[-1]) + 1 + len(chunk) <= max_chars:
+            merged[-1] = f"{merged[-1]} {chunk}"
+        else:
+            merged.append(chunk)
+
+    if max_chunks and max_chunks > 0:
+        return merged[:max_chunks]
+    return merged
+
+
+def add_relevance_term(terms: dict[str, float], value: Any, weight: float) -> None:
+    term = clean_text(value)
+    if len(term) < 2:
+        return
+    terms[term.casefold()] = max(terms.get(term.casefold(), 0.0), weight)
+
+
+def entity_text_relevance_terms(entity: dict[str, Any]) -> dict[str, float]:
+    terms: dict[str, float] = {}
+    add_relevance_term(terms, entity.get("wiki_title"), 5.0)
+    for text in entity.get("display_texts") or []:
+        add_relevance_term(terms, text, 4.0)
+    for term in entity.get("context_terms") or []:
+        add_relevance_term(terms, term, 2.0)
+    for appearance in entity.get("appears_in") or []:
+        if isinstance(appearance, dict):
+            add_relevance_term(terms, appearance.get("column_name"), 1.0)
+    return terms
+
+
+def score_text_chunk(chunk: str, terms: dict[str, float]) -> float:
+    content = clean_text(chunk).casefold()
+    score = 0.0
+    for term, weight in terms.items():
+        if term and term in content:
+            score += weight * content.count(term)
+    return score
+
+
+def select_relevant_text_chunks(
+    chunks: list[str],
+    entity: dict[str, Any],
+    max_chunks: int,
+) -> list[tuple[int, str, float]]:
+    scored = [
+        (idx, chunk, score_text_chunk(chunk, entity_text_relevance_terms(entity)))
+        for idx, chunk in enumerate(chunks)
+    ]
+    if max_chunks and max_chunks > 0:
+        scored = sorted(scored, key=lambda item: (-item[2], item[0]))[:max_chunks]
+    return sorted(scored, key=lambda item: item[0])
 
 
 def parse_wiki_cell(cell: str) -> dict[str, Any]:
@@ -739,6 +854,7 @@ def add_entity_cell(
     query_view_id: str | None,
     row_id: int,
     cell: dict[str, Any],
+    row: dict[str, Any] | None = None,
 ) -> None:
     wiki_title = cell.get("wiki_title")
     if not wiki_title:
@@ -750,6 +866,7 @@ def add_entity_cell(
             "entity_id": entity_id,
             "wiki_title": normalized,
             "display_texts": set(),
+            "context_terms": Counter(),
             "appears_in": [],
         }
     record = entity_records[entity_id]
@@ -764,6 +881,16 @@ def add_entity_cell(
             "column_name": cell.get("column_name"),
         }
     )
+    if row:
+        for context_cell in row.get("cells", []):
+            if context_cell is cell:
+                continue
+            context_text = clean_text(context_cell.get("text"))
+            context_name = clean_text(context_cell.get("column_name"))
+            if context_text and not is_numeric_text(context_text):
+                record["context_terms"][context_text] += 1
+            if context_name:
+                record["context_terms"][context_name] += 1
 
 
 def update_entities_from_table(
@@ -780,6 +907,7 @@ def update_entities_from_table(
                 None,
                 row["row_id"],
                 cell,
+                row,
             )
 
 
@@ -797,6 +925,7 @@ def update_entities_from_query_view(
                 query_view["query_view_id"],
                 row["row_id"],
                 cell,
+                row,
             )
 
 
@@ -808,6 +937,9 @@ def finalize_entities(entity_records: dict[str, dict[str, Any]]) -> list[dict[st
                 "entity_id": record["entity_id"],
                 "wiki_title": record["wiki_title"],
                 "display_texts": sorted(record["display_texts"]),
+                "context_terms": [
+                    term for term, _count in record.get("context_terms", Counter()).most_common(80)
+                ],
                 "appears_in": record["appears_in"],
             }
         )
@@ -1061,6 +1193,9 @@ def build_bridge_assets(
     entities: list[dict[str, Any]],
     max_entities: int | None,
     max_images_per_entity: int,
+    text_asset_chunk_chars: int,
+    min_text_asset_chunk_chars: int,
+    max_text_asset_chunks_per_entity: int,
     wikipedia_client: WikipediaClient | None,
     asset_writer: ShardedJsonlWriter,
     flush_every_records: int,
@@ -1079,18 +1214,34 @@ def build_bridge_assets(
         if not page or page.get("missing"):
             continue
 
-        extract = clean_text(page.get("extract"))
-        if extract:
-            asset_id = f"asset_text_{stable_hash(entity['entity_id'], 'extract')}"
+        text_chunks = split_text_asset_content(
+            page.get("extract"),
+            max_chars=text_asset_chunk_chars,
+            min_chars=min_text_asset_chunk_chars,
+            max_chunks=0,
+        )
+        selected_text_chunks = select_relevant_text_chunks(
+            text_chunks,
+            entity,
+            max_text_asset_chunks_per_entity,
+        )
+        source_asset_id = f"asset_text_{stable_hash(entity['entity_id'], 'extract')}"
+        for chunk_index, chunk, chunk_score in selected_text_chunks:
+            asset_id = f"{source_asset_id}_{chunk_index:03d}"
             write_jsonl_record(
                 asset_writer,
                 {
                     "asset_id": asset_id,
+                    "source_asset_id": source_asset_id,
                     "entity_id": entity["entity_id"],
                     "entity_wiki_title": entity["wiki_title"],
                     "asset_type": "text",
-                    "content": extract,
-                    "source": "wikipedia_extract",
+                    "content": chunk,
+                    "text_chunk_index": chunk_index,
+                    "text_chunk_count": len(text_chunks),
+                    "selected_text_chunk_count": len(selected_text_chunks),
+                    "text_chunk_relevance_score": round(chunk_score, 6),
+                    "source": "wikipedia_extract_chunk",
                     "url": page.get("canonicalurl")
                     or f"https://en.wikipedia.org/wiki/{quote(entity['wiki_title'].replace(' ', '_'))}",
                 },
@@ -1526,6 +1677,9 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             entities,
             args.max_entities,
             args.max_images_per_entity,
+            args.text_asset_chunk_chars,
+            args.min_text_asset_chunk_chars,
+            args.max_text_asset_chunks_per_entity,
             wikipedia_client,
             bridge_assets_writer,
             flush_every,
@@ -1570,6 +1724,9 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "avg_columns_per_query_view": round(query_view_cols_sum / max(1, query_view_count), 6),
         "flush_every_records": flush_every,
         "records_per_shard": records_per_shard,
+        "text_asset_chunk_chars": args.text_asset_chunk_chars,
+        "min_text_asset_chunk_chars": args.min_text_asset_chunk_chars,
+        "max_text_asset_chunks_per_entity": args.max_text_asset_chunks_per_entity,
         "skipped_reasons": dict(skip_reasons),
         "notes": [
             "query_views are query workload tables, not labels",
@@ -1624,6 +1781,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum number of entities for Wikipedia asset fetching. Entity extraction is not limited.",
     )
     parser.add_argument("--max_images_per_entity", type=int, default=3)
+    parser.add_argument(
+        "--text_asset_chunk_chars",
+        type=int,
+        default=800,
+        help="Maximum characters per Wikipedia extract text asset chunk.",
+    )
+    parser.add_argument(
+        "--min_text_asset_chunk_chars",
+        type=int,
+        default=120,
+        help="Prefer merging trailing Wikipedia text chunks shorter than this when possible.",
+    )
+    parser.add_argument(
+        "--max_text_asset_chunks_per_entity",
+        type=int,
+        default=3,
+        help="Maximum relevant Wikipedia text chunks per entity. Use 0 for no limit.",
+    )
     parser.add_argument("--wiki_link_threshold", type=float, default=0.3)
     parser.add_argument("--min_rows", type=int, default=2)
     parser.add_argument("--min_cols", type=int, default=2)

@@ -12,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from build_stage1_logic_connectivity import build_target_rows, choose_query_context_cols
+from build_mm_table_dataset import ShardedJsonlWriter, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
 from stage1_connection_viewer import create_app as create_connection_viewer_app
+from stage1_connection_viewer import load_assets
 from stage1_connection_viewer import load_groups
 from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
@@ -147,6 +149,110 @@ def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
     assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
 
 
+def test_wikipedia_extract_text_assets_are_chunked(tmp_path):
+    content = (
+        "Alpha was founded in 1990 and became known for bridge evidence. "
+        "It later expanded into several regions with detailed public records.\n\n"
+        "The second paragraph contains target facts and additional context. "
+        "It should be stored as a separate text asset chunk for retrieval."
+    )
+    chunks = split_text_asset_content(content, max_chars=120, min_chars=40)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 120 for chunk in chunks)
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def get_page(self, wiki_title):
+            return {
+                "extract": content,
+                "canonicalurl": f"https://example.test/wiki/{wiki_title}",
+                "images": [],
+            }
+
+    entities = [{"entity_id": "ent_alpha", "wiki_title": "Alpha"}]
+    writer = ShardedJsonlWriter(tmp_path / "bridge_assets", max_records_per_shard=10)
+    with writer:
+        entity_to_assets, api_failures, text_count, image_count = build_bridge_assets(
+            entities,
+            max_entities=None,
+            max_images_per_entity=0,
+            text_asset_chunk_chars=120,
+            min_text_asset_chunk_chars=40,
+            max_text_asset_chunks_per_entity=0,
+            wikipedia_client=FakeWikipediaClient(),
+            asset_writer=writer,
+            flush_every_records=10,
+        )
+
+    records = [
+        json.loads(line)
+        for path in writer.paths()
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert api_failures == 0
+    assert image_count == 0
+    assert text_count == len(chunks)
+    assert entity_to_assets["ent_alpha"] == [record["asset_id"] for record in records]
+    assert {record["source"] for record in records} == {"wikipedia_extract_chunk"}
+    assert all(record["asset_type"] == "text" for record in records)
+    assert [record["text_chunk_index"] for record in records] == list(range(len(records)))
+    assert {record["text_chunk_count"] for record in records} == {len(records)}
+
+
+def test_text_asset_chunk_limit_keeps_relevant_chunk(tmp_path):
+    content = (
+        "Alpha has a long public biography with unrelated background details.\n\n"
+        "Alpha represented Arkansas and this paragraph contains the bridge evidence.\n\n"
+        "Alpha also appeared in other unrelated references."
+    )
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def get_page(self, wiki_title):
+            return {
+                "extract": content,
+                "canonicalurl": f"https://example.test/wiki/{wiki_title}",
+                "images": [],
+            }
+
+    entities = [
+        {
+            "entity_id": "ent_alpha",
+            "wiki_title": "Alpha",
+            "display_texts": ["Alpha"],
+            "context_terms": ["Arkansas", "State"],
+        }
+    ]
+    writer = ShardedJsonlWriter(tmp_path / "bridge_assets", max_records_per_shard=10)
+    with writer:
+        entity_to_assets, _api_failures, text_count, image_count = build_bridge_assets(
+            entities,
+            max_entities=None,
+            max_images_per_entity=0,
+            text_asset_chunk_chars=120,
+            min_text_asset_chunk_chars=20,
+            max_text_asset_chunks_per_entity=1,
+            wikipedia_client=FakeWikipediaClient(),
+            asset_writer=writer,
+            flush_every_records=10,
+        )
+
+    records = [
+        json.loads(line)
+        for path in writer.paths()
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert image_count == 0
+    assert text_count == 1
+    assert len(entity_to_assets["ent_alpha"]) == 1
+    assert records[0]["content"] == "Alpha represented Arkansas and this paragraph contains the bridge evidence."
+    assert records[0]["text_chunk_index"] == 1
+    assert records[0]["selected_text_chunk_count"] == 1
+    assert records[0]["text_chunk_relevance_score"] > 0
+
+
 def test_hitl_label_merge():
     with tempfile.TemporaryDirectory() as tmp:
         stage = Path(tmp)
@@ -276,6 +382,85 @@ def test_connection_viewer_groups_stage1_artifacts(tmp_path):
     resp = client.get("/?q=alpha")
     assert resp.status_code == 200
     assert b"Stage-1 Connection Viewer" in resp.data
+
+
+def test_connection_viewer_shows_only_referenced_text_chunk(tmp_path):
+    input_dir = tmp_path / "input"
+    bridge_dir = input_dir / "bridge_assets"
+    bridge_dir.mkdir(parents=True)
+    write_jsonl(
+        bridge_dir / "part-00000.jsonl",
+        [
+            {
+                "asset_id": "asset_text_alpha_000",
+                "source_asset_id": "asset_text_alpha",
+                "asset_type": "text",
+                "entity_wiki_title": "Alpha",
+                "content": "First chunk not used as the bridge.",
+                "source": "wikipedia_extract_chunk",
+                "text_chunk_index": 0,
+                "text_chunk_count": 2,
+            },
+            {
+                "asset_id": "asset_text_alpha_001",
+                "source_asset_id": "asset_text_alpha",
+                "asset_type": "text",
+                "entity_wiki_title": "Alpha",
+                "content": "Second chunk is the bridge evidence.",
+                "source": "wikipedia_extract_chunk",
+                "text_chunk_index": 1,
+                "text_chunk_count": 2,
+            },
+        ],
+    )
+    (input_dir / "dataset_manifest.json").write_text(
+        json.dumps({"artifacts": {"bridge_assets": {"shards": [{"path": "bridge_assets/part-00000.jsonl", "records": 2}]}}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps({"evidence_paths": {"input_dir": str(input_dir)}}), encoding="utf-8")
+    fragment_base = {
+        "object_type": "table_fragment",
+        "split": "train",
+        "chain_id": "c1",
+        "source_table_id": "s1",
+        "page_title": "Page",
+        "columns": [{"column_name": "A"}],
+        "rows": [{"cells": [{"text": "alpha"}]}],
+    }
+    write_jsonl(
+        tmp_path / "logic_fragments.jsonl",
+        [
+            {**fragment_base, "fragment_id": "qv", "role": "left_visible"},
+            {**fragment_base, "fragment_id": "qh", "role": "left_hidden"},
+            {**fragment_base, "fragment_id": "t", "role": "right_target"},
+        ],
+    )
+    write_jsonl(
+        tmp_path / "evidence_paths.jsonl",
+        [
+            {
+                "path_id": "path",
+                "chain_id": "c1",
+                "query_fragment_id": "qh",
+                "target_fragment_id": "t",
+                "asset_id": "asset_text_alpha_001",
+                "asset_type": "text",
+                "claim_text": "alpha -> beta",
+            }
+        ],
+    )
+    assets, loaded_input_dir = load_assets(tmp_path)
+    groups = load_groups(
+        tmp_path,
+        max_rows=5,
+        max_evidence_paths=10,
+        assets=assets,
+        input_dir=loaded_input_dir,
+    )
+    path = groups[0]["evidence_paths"][0]
+    assert path["asset_content_snippet"] == "Second chunk is the bridge evidence."
+    assert path["asset_chunk_label"] == "chunk 2/2"
+    assert "First chunk" not in path["asset_content_snippet"]
 
 
 def test_train_pairs_do_not_auto_positive_unlabeled_assets(tmp_path):

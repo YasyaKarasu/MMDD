@@ -276,7 +276,7 @@ PAGE_TEMPLATE = """
             <div class="asset-box">
               <div class="item-head">
                 <strong>{{ path.asset_title or path.asset_id }}</strong>
-                <span class="badge">{{ path.asset_source or "asset" }}</span>
+                <span class="badge">{{ path.asset_source or "asset" }}{% if path.asset_chunk_label %} · {{ path.asset_chunk_label }}{% endif %}</span>
               </div>
               {% if path.asset_url %}
               <div><a href="{{ path.asset_url }}" target="_blank" rel="noreferrer">{{ path.asset_url }}</a></div>
@@ -448,16 +448,35 @@ def image_metadata_snippet(asset: dict[str, Any], max_chars: int = 900) -> str:
 def enrich_evidence_path(path: dict[str, Any], asset: dict[str, Any] | None, input_dir: Path, max_text_chars: int = 1400) -> dict[str, Any]:
     out = dict(path)
     asset = asset or {}
+    if asset.get("asset_type") and not out.get("asset_type"):
+        out["asset_type"] = clean_text(asset.get("asset_type"))
     out["asset_title"] = clean_text(asset.get("entity_wiki_title")) or clean_text(path.get("entity_text"))
     out["asset_source"] = clean_text(asset.get("source"))
     out["asset_url"] = clean_text(asset.get("url") or asset.get("description_url") or asset.get("image_url"))
     out["asset_file_name"] = clean_text(asset.get("file_name"))
     out["asset_content_snippet"] = clean_text(asset.get("content"))[:max_text_chars]
+    out["asset_chunk_label"] = text_chunk_label(asset)
     local_file = resolve_asset_file(input_dir, asset)
     out["asset_local_path"] = str(local_file) if local_file else clean_text(asset.get("local_path") or asset.get("relative_path"))
     out["asset_image_available"] = bool(local_file and out.get("asset_type") == "image")
     out["asset_metadata_snippet"] = image_metadata_snippet(asset)
     return out
+
+
+def text_chunk_label(asset: dict[str, Any]) -> str:
+    if asset.get("asset_type") != "text" or asset.get("text_chunk_index") is None:
+        return ""
+    try:
+        chunk_index = int(asset.get("text_chunk_index")) + 1
+    except (TypeError, ValueError):
+        return ""
+    try:
+        chunk_count = int(asset.get("text_chunk_count") or 0)
+    except (TypeError, ValueError):
+        chunk_count = 0
+    if chunk_count > 0:
+        return f"chunk {chunk_index}/{chunk_count}"
+    return f"chunk {chunk_index}"
 
 
 def load_groups(
