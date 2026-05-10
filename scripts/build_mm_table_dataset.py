@@ -17,7 +17,9 @@ import mimetypes
 import math
 import random
 import re
+import shutil
 import sys
+import subprocess
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -1083,13 +1085,32 @@ class WikipediaClient:
         if not url:
             return None
 
-        extension = infer_image_extension(imageinfo)
+        source_is_svg = is_svg_image(imageinfo)
+        extension = ".png" if source_is_svg else infer_image_extension(imageinfo)
         self.image_output_dir.mkdir(parents=True, exist_ok=True)
         image_path = self.image_output_dir / f"{asset_id}{extension}"
+        tmp_path = image_path.with_suffix(image_path.suffix + ".tmp")
         if image_path.exists():
             return file_download_record(image_path, self.output_dir, downloaded=False)
+        if source_is_svg:
+            legacy_svg_path = self.image_output_dir / f"{asset_id}.svg"
+            if legacy_svg_path.exists():
+                converted, reason = rasterize_svg_to_png(legacy_svg_path, tmp_path, imageinfo)
+                if converted:
+                    tmp_path.replace(image_path)
+                    record = file_download_record(image_path, self.output_dir, downloaded=False)
+                    record["converted_from"] = "image/svg+xml"
+                    record["source_bytes"] = legacy_svg_path.stat().st_size
+                    record["source_sha256"] = sha256_file(legacy_svg_path)
+                    return record
+                logging.warning("Existing SVG conversion failed for %s: %s", legacy_svg_path, reason)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
 
-        tmp_path = image_path.with_suffix(image_path.suffix + ".tmp")
+        download_tmp_path = image_path.with_suffix(".svg.tmp") if source_is_svg else tmp_path
         digest = hashlib.sha256()
         total_bytes = 0
         self._wait()
@@ -1101,17 +1122,30 @@ class WikipediaClient:
                 if content_type and not content_type.lower().startswith("image/"):
                     logging.warning("Skipping non-image response for %s: %s", url, content_type)
                     return None
-                with tmp_path.open("wb") as handle:
+                with download_tmp_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 128):
                         if not chunk:
                             continue
                         handle.write(chunk)
                         digest.update(chunk)
                         total_bytes += len(chunk)
+            if source_is_svg:
+                converted, reason = rasterize_svg_to_png(download_tmp_path, tmp_path, imageinfo)
+                if not converted:
+                    raise RuntimeError(f"SVG rasterization failed: {reason}")
+                try:
+                    download_tmp_path.unlink()
+                except OSError:
+                    pass
             tmp_path.replace(image_path)
             record = file_download_record(image_path, self.output_dir, downloaded=True)
-            record["sha256"] = digest.hexdigest()
-            record["bytes"] = total_bytes
+            if source_is_svg:
+                record["converted_from"] = "image/svg+xml"
+                record["source_bytes"] = total_bytes
+                record["source_sha256"] = digest.hexdigest()
+            else:
+                record["sha256"] = digest.hexdigest()
+                record["bytes"] = total_bytes
             return record
         except Exception as exc:
             self.api_failures += 1
@@ -1119,9 +1153,154 @@ class WikipediaClient:
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
+                if download_tmp_path.exists():
+                    download_tmp_path.unlink()
             except OSError:
                 pass
             return None
+
+
+def is_svg_image(imageinfo: dict[str, Any]) -> bool:
+    mime = str(imageinfo.get("mime") or "").lower()
+    if mime == "image/svg+xml":
+        return True
+    extension = infer_image_extension(imageinfo)
+    return extension == ".svg"
+
+
+def svg_raster_size(imageinfo: dict[str, Any]) -> tuple[int | None, int | None]:
+    width = int(imageinfo.get("width") or 0)
+    height = int(imageinfo.get("height") or 0)
+    return (width or None, height or None)
+
+
+INTERNAL_ENTITY_RE = re.compile(
+    r"""<!ENTITY\s+([A-Za-z_][\w.-]*)\s+(?:"([^"]{0,2048})"|'([^']{0,2048})')\s*>""",
+    re.IGNORECASE,
+)
+
+
+def split_svg_doctype(text: str) -> tuple[str | None, str]:
+    match = re.search(r"<!DOCTYPE\b", text, re.IGNORECASE)
+    if not match:
+        return None, text
+    start = match.start()
+    first_gt = text.find(">", start)
+    if first_gt == -1:
+        return None, text
+    subset_start = text.find("[", start, first_gt)
+    if subset_start == -1:
+        end = first_gt + 1
+    else:
+        subset_end = text.find("]>", subset_start)
+        if subset_end == -1:
+            return None, text
+        end = subset_end + 2
+    return text[start:end], text[:start] + text[end:]
+
+
+def svg_bytes_without_internal_entities(svg_path: Path) -> bytes:
+    text = svg_path.read_text(encoding="utf-8", errors="replace")
+    doctype, text = split_svg_doctype(text)
+    entities: dict[str, str] = {}
+    if doctype:
+        for name, double_quoted, single_quoted in INTERNAL_ENTITY_RE.findall(doctype):
+            value = double_quoted or single_quoted
+            if "&" in value or "%" in value or "<" in value:
+                continue
+            entities[name] = value
+    for name, value in entities.items():
+        text = text.replace(f"&{name};", value)
+    return text.encode("utf-8")
+
+
+def cairosvg_kwargs(svg_path: Path, png_path: Path, imageinfo: dict[str, Any]) -> dict[str, Any]:
+    width, height = svg_raster_size(imageinfo)
+    kwargs: dict[str, Any] = {"url": str(svg_path), "write_to": str(png_path)}
+    if width:
+        kwargs["output_width"] = width
+    if height:
+        kwargs["output_height"] = height
+    return kwargs
+
+
+def rasterize_with_cairosvg(cairosvg: Any, svg_path: Path, png_path: Path, imageinfo: dict[str, Any]) -> tuple[bool, str]:
+    kwargs = cairosvg_kwargs(svg_path, png_path, imageinfo)
+    try:
+        cairosvg.svg2png(**kwargs)
+    except Exception as exc:
+        if exc.__class__.__name__ != "EntitiesForbidden":
+            raise
+        kwargs.pop("url", None)
+        kwargs["bytestring"] = svg_bytes_without_internal_entities(svg_path)
+        cairosvg.svg2png(**kwargs)
+        return True, "cairosvg_sanitized_entities"
+    return True, "cairosvg"
+
+
+def rasterize_svg_to_png(svg_path: Path, png_path: Path, imageinfo: dict[str, Any]) -> tuple[bool, str]:
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    if png_path.exists():
+        png_path.unlink()
+
+    width, height = svg_raster_size(imageinfo)
+    failures: list[str] = []
+    try:
+        import cairosvg
+
+        ok, reason = rasterize_with_cairosvg(cairosvg, svg_path, png_path, imageinfo)
+        if png_path.exists() and png_path.stat().st_size > 0:
+            return ok, reason
+        failures.append("cairosvg: produced no output")
+    except ImportError as exc:
+        failures.append(f"cairosvg import failed: {exc}")
+    except Exception as exc:
+        failures.append(f"cairosvg: {exc}")
+
+    commands: list[tuple[str, list[str]]] = []
+    if rsvg := shutil.which("rsvg-convert"):
+        command = [rsvg, "-f", "png", "-o", str(png_path)]
+        if width:
+            command.extend(["-w", str(width)])
+        if height:
+            command.extend(["-h", str(height)])
+        command.append(str(svg_path))
+        commands.append(("rsvg-convert", command))
+    if inkscape := shutil.which("inkscape"):
+        command = [inkscape, str(svg_path), "--export-type=png", f"--export-filename={png_path}"]
+        if width:
+            command.append(f"--export-width={width}")
+        if height:
+            command.append(f"--export-height={height}")
+        commands.append(("inkscape", command))
+    if magick := shutil.which("magick"):
+        command = [magick, str(svg_path)]
+        if width or height:
+            command.extend(["-resize", f"{width or ''}x{height or ''}"])
+        command.append(str(png_path))
+        commands.append(("magick", command))
+    if convert := shutil.which("convert"):
+        command = [convert, str(svg_path)]
+        if width or height:
+            command.extend(["-resize", f"{width or ''}x{height or ''}"])
+        command.append(str(png_path))
+        commands.append(("convert", command))
+
+    for name, command in commands:
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=90)
+        except Exception as exc:
+            failures.append(f"{name}: {exc}")
+            continue
+        if png_path.exists() and png_path.stat().st_size > 0:
+            return True, name
+        failures.append(f"{name}: produced no output")
+
+    if not commands:
+        if failures:
+            return False, "; ".join(failures)
+        return False, "no SVG rasterizer available; install cairosvg, librsvg, inkscape, or imagemagick"
+    return False, "; ".join(failures)
 
 
 def infer_image_extension(imageinfo: dict[str, Any]) -> str:

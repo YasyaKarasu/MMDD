@@ -11,15 +11,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import build_mm_table_dataset as mm_table_dataset
+import build_stage1_embeddings as stage1_embeddings
 from build_stage1_logic_connectivity import build_target_rows, choose_query_context_cols
-from build_mm_table_dataset import ShardedJsonlWriter, build_bridge_assets, split_text_asset_content
+from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
 from stage1_connection_viewer import create_app as create_connection_viewer_app
 from stage1_connection_viewer import load_assets
 from stage1_connection_viewer import load_groups
 from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
-from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder
+from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_exception, resize_batch_images_for_limit
 from stage1_io import fd_purity, project_rows, write_jsonl
 from stage1_serialization import serialize_table_for_embedding
 from train_student import Student, build_ranking_groups, train_loss
@@ -149,6 +151,46 @@ def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
     assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
 
 
+def test_large_embedding_image_is_resized_under_pixel_limit(tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+    source = tmp_path / "large.png"
+    Image.new("RGB", (100, 80), color=(30, 90, 120)).save(source)
+
+    resized, record = stage1_embeddings.ensure_image_within_pixel_limit(
+        source,
+        tmp_path / "cache",
+        max_pixels=1000,
+    )
+
+    assert resized != source
+    assert record is not None
+    assert record["source_pixels"] == 8000
+    with Image.open(resized) as image:
+        assert image.width * image.height <= 1000
+    assert source.exists()
+
+
+def test_qwen_image_limit_error_is_parsed():
+    exc = ValueError(
+        "Image size (260546715 pixels) exceeds limit of 89500000 pixels, "
+        "could be decompression bomb DOS attack."
+    )
+    assert image_limit_from_exception(exc) == 89500000
+
+
+def test_qwen_retry_resize_uses_dynamic_limit(tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+    source = tmp_path / "large.jpg"
+    Image.new("RGB", (100, 80), color=(30, 90, 120)).save(source)
+    batch = [{"image": str(source), "text": "prompt"}]
+
+    resized_batch = resize_batch_images_for_limit(batch, tmp_path / "cache", 1000)
+
+    assert resized_batch[0]["image"] != str(source)
+    with Image.open(resized_batch[0]["image"]) as image:
+        assert image.width * image.height <= 1000
+
+
 def test_wikipedia_extract_text_assets_are_chunked(tmp_path):
     content = (
         "Alpha was founded in 1990 and became known for bridge evidence. "
@@ -251,6 +293,96 @@ def test_text_asset_chunk_limit_keeps_relevant_chunk(tmp_path):
     assert records[0]["text_chunk_index"] == 1
     assert records[0]["selected_text_chunk_count"] == 1
     assert records[0]["text_chunk_relevance_score"] > 0
+
+
+def test_wikipedia_svg_download_converts_to_png_without_thumbnail(tmp_path, monkeypatch):
+    svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800"></svg>'
+
+    class FakeResponse:
+        headers = {"Content-Type": "image/svg+xml"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield svg_bytes
+
+    class FakeSession:
+        def __init__(self):
+            self.urls = []
+            self.headers = {}
+
+        def get(self, url, stream=True, timeout=60):
+            self.urls.append(url)
+            return FakeResponse()
+
+    def fake_rasterize(svg_path, png_path, imageinfo):
+        assert svg_path.read_bytes() == svg_bytes
+        assert imageinfo["width"] == 1200
+        png_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        return True, "fake"
+
+    monkeypatch.setattr(mm_table_dataset, "rasterize_svg_to_png", fake_rasterize)
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="test",
+    )
+    client.session = FakeSession()
+    record = client.download_image(
+        {
+            "url": "https://example.test/original.svg",
+            "mime": "image/svg+xml",
+            "width": 1200,
+            "height": 800,
+        },
+        "asset_svg",
+    )
+
+    assert record is not None
+    assert record["file_name"] == "asset_svg.png"
+    assert Path(record["local_path"]).read_bytes().startswith(b"\x89PNG")
+    assert record["converted_from"] == "image/svg+xml"
+    assert record["source_bytes"] == len(svg_bytes)
+    assert not (tmp_path / "images" / "asset_svg.svg.tmp").exists()
+    assert client.session.urls == ["https://example.test/original.svg"]
+
+
+def test_svg_rasterization_handles_wikimedia_namespace_entities(tmp_path):
+    pytest.importorskip("cairosvg")
+    svg_path = tmp_path / "entity.svg"
+    png_path = tmp_path / "entity.png"
+    svg_path.write_text(
+        """<!DOCTYPE svg [
+<!ENTITY ns_svg "http://www.w3.org/2000/svg">
+<!ENTITY ns_xlink "http://www.w3.org/1999/xlink">
+]>
+<svg xmlns="&ns_svg;" xmlns:xlink="&ns_xlink;" width="120" height="80">
+  <rect width="120" height="80" fill="red"/>
+</svg>
+""",
+        encoding="utf-8",
+    )
+
+    ok, reason = mm_table_dataset.rasterize_svg_to_png(
+        svg_path,
+        png_path,
+        {"mime": "image/svg+xml", "width": 120, "height": 80},
+    )
+
+    assert ok
+    assert reason == "cairosvg_sanitized_entities"
+    assert png_path.exists()
+    assert png_path.stat().st_size > 0
 
 
 def test_hitl_label_merge():

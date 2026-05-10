@@ -7,3 +7,5 @@ qwen-vl-utils>=0.0.14
 tqdm
 requests
 Flask>=3.1.0
+cairosvg>=2.7.0
+Pillow

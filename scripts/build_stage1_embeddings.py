@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from image_preprocessing import DEFAULT_MAX_IMAGE_PIXELS, ensure_image_within_pixel_limit
 from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder
 from stage1_io import iter_jsonl, iter_manifest_records, setup_logging, update_stage1_manifest, write_json
 from stage1_serialization import (
@@ -56,6 +58,7 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
     image_paths: list[str] = []
     image_prompts: list[str] = []
     skipped_images: list[dict[str, str]] = []
+    resized_images: list[dict[str, Any]] = []
     need_text = not existing(emb_dir, "text_asset", args.force_recompute)
     need_image = not existing(emb_dir, "image_asset", args.force_recompute)
     if not need_text and not need_image:
@@ -75,6 +78,19 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
             if path is None or not path.exists():
                 skipped_images.append({"asset_id": asset.get("asset_id", ""), "reason": "missing_file"})
                 continue
+            try:
+                path, resize_record = ensure_image_within_pixel_limit(
+                    path,
+                    emb_dir / "resized_images",
+                    max_pixels=getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
+                )
+            except Exception as exc:
+                skipped_images.append({"asset_id": asset.get("asset_id", ""), "reason": f"image_resize_failed:{exc}"})
+                logging.warning("Skipping image asset %s after resize failure: %s", asset.get("asset_id", ""), exc)
+                continue
+            if resize_record:
+                resize_record["asset_id"] = asset.get("asset_id", "")
+                resized_images.append(resize_record)
             image_ids.append(asset["asset_id"])
             image_paths.append(str(path))
             image_prompts.append(serialize_image_asset_prompt(asset))
@@ -87,6 +103,7 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
         embeddings = encoder.encode_images(image_paths, prompts=image_prompts, instruction=IMAGE_INSTRUCTION)
         save_embeddings(emb_dir, "image_asset", image_ids, embeddings)
         write_json(emb_dir / "skipped_images.json", skipped_images)
+        write_json(emb_dir / "resized_images.json", resized_images)
         stats.append(
             {
                 "object_type": "image_asset",
@@ -94,6 +111,8 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
                 "dimension": int(embeddings.shape[1]),
                 "cached": False,
                 "skipped_images": len(skipped_images),
+                "resized_images": len(resized_images),
+                "max_image_pixels": getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
             }
         )
     return stats
@@ -108,6 +127,7 @@ def run(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         device=args.device,
         dtype=args.dtype,
+        image_resize_cache_dir=str(emb_dir / "resized_images"),
     )
     stats = [encode_table_fragments(args, encoder, emb_dir)]
     stats.extend(encode_assets(args, encoder, emb_dir))
@@ -116,6 +136,7 @@ def run(args: argparse.Namespace) -> None:
         "device": args.device,
         "dtype": args.dtype,
         "batch_size": args.batch_size,
+        "max_image_pixels": getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
         "objects": stats,
     }
     write_json(emb_dir / "embedding_stats.json", payload)
@@ -133,6 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--max_table_rows", type=int, default=5)
     parser.add_argument("--max_text_chars", type=int, default=2048)
+    parser.add_argument("--max_image_pixels", type=int, default=DEFAULT_MAX_IMAGE_PIXELS)
     parser.add_argument("--force_recompute", action="store_true")
     return parser.parse_args()
 

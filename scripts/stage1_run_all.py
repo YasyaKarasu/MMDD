@@ -41,6 +41,7 @@ def run(args: argparse.Namespace) -> None:
                 dtype=args.dtype,
                 max_table_rows=args.max_table_rows,
                 max_text_chars=args.max_text_chars,
+                max_image_pixels=args.max_image_pixels,
                 force_recompute_embeddings=args.force_recompute_embeddings,
             )
         )
@@ -132,6 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--max_table_rows", type=int, default=5)
     parser.add_argument("--max_text_chars", type=int, default=2048)
+    parser.add_argument("--max_image_pixels", type=int, default=178_956_970)
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--hitl_rounds", type=int, default=1)
     parser.add_argument("--start_round", type=int, default=None)

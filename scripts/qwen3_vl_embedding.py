@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from image_preprocessing import ensure_image_within_pixel_limit
 from stage1_io import l2_normalize_array
+
+LOG = logging.getLogger("stage1")
+IMAGE_LIMIT_RE = re.compile(r"Image size \((\d+) pixels\) exceeds limit of (\d+) pixels")
 
 
 def resolve_encoder_path(path: str | None = None) -> Path:
@@ -79,6 +85,34 @@ def _check_official_runtime_dependencies() -> None:
         )
 
 
+def image_limit_from_exception(exc: Exception) -> int | None:
+    match = IMAGE_LIMIT_RE.search(str(exc))
+    if not match:
+        return None
+    return int(match.group(2))
+
+
+def resize_batch_images_for_limit(
+    batch: list[dict[str, Any]],
+    cache_dir: Path,
+    limit: int,
+) -> list[dict[str, Any]]:
+    resized_batch: list[dict[str, Any]] = []
+    for item in batch:
+        image = item.get("image")
+        if not image:
+            resized_batch.append(item)
+            continue
+        resized_path, _record = ensure_image_within_pixel_limit(Path(str(image)), cache_dir, max_pixels=limit)
+        if str(resized_path) == str(image):
+            resized_batch.append(item)
+        else:
+            resized_item = dict(item)
+            resized_item["image"] = str(resized_path)
+            resized_batch.append(resized_item)
+    return resized_batch
+
+
 class Qwen3VLEmbeddingEncoder:
     """Frozen local Qwen3-VL-Embedding encoder.
 
@@ -94,11 +128,13 @@ class Qwen3VLEmbeddingEncoder:
         dtype: str = "bf16",
         batch_size: int = 8,
         mock: bool = False,
+        image_resize_cache_dir: str | None = None,
     ) -> None:
         self.batch_size = max(1, int(batch_size))
         self.mock = mock
         self.device = device
         self.dtype = dtype
+        self.image_resize_cache_dir = Path(image_resize_cache_dir or ".qwen_resized_images")
         if mock:
             self.model_dir = Path("<mock>")
             self.model = None
@@ -134,6 +170,18 @@ class Qwen3VLEmbeddingEncoder:
             vectors.append(rng.normal(size=32).astype("float32"))
         return l2_normalize_array(np.vstack(vectors))
 
+    def _encode_batch(self, batch: list[dict[str, Any]]) -> np.ndarray:
+        try:
+            emb = self.model.process(batch, normalize=True)
+        except Exception as exc:
+            limit = image_limit_from_exception(exc)
+            if limit is None or not any(item.get("image") for item in batch):
+                raise
+            resized_batch = resize_batch_images_for_limit(batch, self.image_resize_cache_dir, limit)
+            LOG.warning("Retrying Qwen image embedding batch after resizing images to <= %s pixels", limit)
+            emb = self.model.process(resized_batch, normalize=True)
+        return emb.detach().float().cpu().numpy()
+
     def encode_items(self, items: list[dict[str, Any]]) -> np.ndarray:
         if not items:
             return np.zeros((0, 0), dtype="float32")
@@ -142,8 +190,7 @@ class Qwen3VLEmbeddingEncoder:
         outputs = []
         for start in range(0, len(items), self.batch_size):
             batch = items[start : start + self.batch_size]
-            emb = self.model.process(batch, normalize=True)
-            outputs.append(emb.detach().float().cpu().numpy())
+            outputs.append(self._encode_batch(batch))
         return l2_normalize_array(np.vstack(outputs))
 
     def encode_texts(self, texts: list[str], instruction: str | None = None) -> np.ndarray:
