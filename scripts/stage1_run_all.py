@@ -70,6 +70,8 @@ def run(args: argparse.Namespace) -> None:
                 gui=args.gui,
                 wait_for_labels=args.wait_for_labels,
                 final_teacher_retrain=args.final_teacher_retrain,
+                force_retrain=getattr(args, "force_retrain", False),
+                reset_human_labels=getattr(args, "reset_human_labels", False),
                 host=args.host,
                 lan=getattr(args, "lan", False),
                 port=args.port,
@@ -157,6 +159,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_teacher_retrain", dest="final_teacher_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_teacher_retrain", dest="final_teacher_retrain", action="store_false")
+    parser.add_argument("--force_retrain", action="store_true", help="Clear generated teacher/student/HITL training outputs before training.")
+    parser.add_argument("--reset_human_labels", action="store_true", help="With --force_retrain, also delete merged human labels.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)

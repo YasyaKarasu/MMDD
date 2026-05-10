@@ -193,6 +193,7 @@ conda run -n MMDD python scripts/stage1_train_models.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --force_retrain \
   --lan \
   --port 7860
 
@@ -214,6 +215,7 @@ conda run -n MMDD python scripts/stage1_run_all.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --force_retrain \
   --lan \
   --port 7860
 ```
@@ -227,6 +229,8 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 The viewer paginates by `chain_id` and shows the visible query, hidden query, target fragment, logic pairs, qrels, and evidence paths for each group.
 
 By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, or `stage1_connection_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
+
+Use `--force_retrain` when you want to ignore partially generated training outputs and start the training/HITL loop cleanly. It removes teacher/student models, teacher scores, train pairs, open HITL selections, templates, and annotation status files while preserving prepared data, embeddings, and merged human labels. Add `--reset_human_labels` only when you also want to discard previously merged human labels.
 
 Lower-level commands are still available for debugging or running individual steps:
 
@@ -259,6 +263,7 @@ conda run -n MMDD python scripts/run_hitl_training_rounds.py \
   --embedding_dir output_stage1_logic/embeddings \
   --rounds 3 \
   --batch_size 50 \
+  --force_retrain \
   --lan \
   --port 7860
 ```

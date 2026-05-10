@@ -11,6 +11,7 @@ from run_hitl_training_rounds import run as run_hitl_rounds
 from run_hitl_training_rounds import run_teacher_cycle
 from stage1_gui import resolve_gui_host
 from stage1_io import update_stage1_manifest
+from stage1_training_cache import clear_training_outputs
 from train_student import run as train_student
 
 
@@ -37,6 +38,8 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
                 gui=args.gui,
                 wait_for_labels=args.wait_for_labels,
                 final_retrain=args.final_teacher_retrain,
+                force_retrain=False,
+                reset_human_labels=False,
                 host=args.host,
                 lan=getattr(args, "lan", False),
                 port=args.port,
@@ -70,6 +73,9 @@ def run(args: argparse.Namespace) -> None:
     if args.student_dir is None:
         args.student_dir = str(Path(args.stage1_dir) / "student")
     args.host = resolve_gui_host(getattr(args, "host", None), getattr(args, "lan", False))
+    if getattr(args, "force_retrain", False):
+        removed = clear_training_outputs(Path(args.stage1_dir), Path(args.student_dir), getattr(args, "reset_human_labels", False))
+        print(f"Force retrain cleanup removed {len(removed)} training artifact(s).")
     train_teacher_and_hitl(args)
     if args.hitl_rounds > 0 and args.gui and not args.wait_for_labels:
         print("Skipping student distillation because --no_wait_for_labels was used.")
@@ -124,6 +130,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_teacher_retrain", dest="final_teacher_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_teacher_retrain", dest="final_teacher_retrain", action="store_false")
+    parser.add_argument("--force_retrain", action="store_true", help="Clear generated teacher/student/HITL training outputs before training.")
+    parser.add_argument("--reset_human_labels", action="store_true", help="With --force_retrain, also delete merged human labels.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)

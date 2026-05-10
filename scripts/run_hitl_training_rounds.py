@@ -15,6 +15,7 @@ from build_teacher_training_data import run as build_teacher_training_data
 from select_hitl_batch import run as select_hitl_batch
 from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import iter_jsonl, load_json, update_stage1_manifest
+from stage1_training_cache import clear_training_outputs
 from train_teacher import run as train_teacher
 
 
@@ -138,6 +139,9 @@ def wait_for_merge(args: argparse.Namespace, round_id: int, proc: subprocess.Pop
 def run(args: argparse.Namespace) -> None:
     stage1_dir = Path(args.stage1_dir)
     args.host = resolve_gui_host(getattr(args, "host", None), getattr(args, "lan", False))
+    if getattr(args, "force_retrain", False):
+        removed = clear_training_outputs(stage1_dir, reset_human_labels=getattr(args, "reset_human_labels", False))
+        print(f"Force retrain cleanup removed {len(removed)} training artifact(s).")
     start = args.start_round if args.start_round is not None else next_round_id(stage1_dir)
     completed = []
     for offset in range(args.rounds):
@@ -198,6 +202,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_retrain", dest="final_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_retrain", dest="final_retrain", action="store_false")
+    parser.add_argument("--force_retrain", action="store_true", help="Clear generated teacher/student/HITL training outputs before training.")
+    parser.add_argument("--reset_human_labels", action="store_true", help="With --force_retrain, also delete merged human labels.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--lan", action="store_true", help="Expose the annotation GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)

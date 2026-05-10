@@ -25,6 +25,7 @@ from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_excepti
 from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import fd_purity, project_rows, write_jsonl
 from stage1_serialization import serialize_table_for_embedding
+from stage1_training_cache import clear_training_outputs
 from train_student import Student, build_ranking_groups, train_loss
 from eval_stage1_recall import relation_query_from_projected
 
@@ -465,6 +466,68 @@ def test_gui_host_resolution_and_lan_url(monkeypatch):
     assert "Local browser: http://127.0.0.1:7860" in message
     assert "LAN devices:   http://192.168.1.20:7860" in message
 
+
+def test_force_retrain_cleanup_preserves_prepared_data_and_human_labels(tmp_path):
+    prepared = [
+        "logic_fragments.jsonl",
+        "logic_pairs.jsonl",
+        "qrels.jsonl",
+        "hitl_pool.jsonl",
+        "weak_labeled_paths.jsonl",
+    ]
+    training_files = [
+        "teacher_scores.jsonl",
+        "train_pairs_round_0.jsonl",
+        "student_train_pairs.jsonl",
+        "hitl_selected_round_0.jsonl",
+        "human_labels_template_round_0.jsonl",
+        "hitl_round_0_annotation_status.json",
+    ]
+    for name in prepared + training_files + ["human_labeled_paths.jsonl"]:
+        (tmp_path / name).write_text("{}\n", encoding="utf-8")
+    (tmp_path / "teacher_round_0").mkdir()
+    (tmp_path / "teacher_round_0" / "teacher.pt").write_text("model", encoding="utf-8")
+    (tmp_path / "student").mkdir()
+    (tmp_path / "student" / "student.pt").write_text("model", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "logic_connectivity": {},
+                "teacher": {},
+                "student": {},
+                "teacher_training_data": {},
+                "hitl_round_0": {},
+                "human_labels": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    removed = clear_training_outputs(tmp_path, tmp_path / "student")
+
+    assert removed
+    for name in prepared + ["human_labeled_paths.jsonl"]:
+        assert (tmp_path / name).exists()
+    for name in training_files:
+        assert not (tmp_path / name).exists()
+    assert not (tmp_path / "teacher_round_0").exists()
+    assert not (tmp_path / "student").exists()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert "logic_connectivity" in manifest
+    assert "human_labels" in manifest
+    assert "teacher" not in manifest
+    assert "student" not in manifest
+    assert "hitl_round_0" not in manifest
+
+
+def test_force_retrain_cleanup_can_reset_human_labels(tmp_path):
+    (tmp_path / "human_labeled_paths.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(json.dumps({"human_labels": {}, "teacher": {}}), encoding="utf-8")
+
+    clear_training_outputs(tmp_path, reset_human_labels=True)
+
+    assert not (tmp_path / "human_labeled_paths.jsonl").exists()
+    assert "human_labels" not in json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
 
 
 def test_hitl_annotation_app_saves_and_merges(tmp_path):
