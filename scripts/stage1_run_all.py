@@ -7,6 +7,7 @@ import argparse
 
 from stage1_index_eval import run as run_index_eval
 from stage1_prepare_data import run as run_prepare_data
+from stage1_gui import resolve_gui_host
 from stage1_train_models import run as run_train_models
 
 
@@ -19,6 +20,7 @@ def run(args: argparse.Namespace) -> None:
         args.hnsw_dir = f"{args.stage1_dir}/hnsw_indices"
     if args.qrels is None:
         args.qrels = f"{args.stage1_dir}/qrels.jsonl"
+    args.host = resolve_gui_host(getattr(args, "host", None), getattr(args, "lan", False))
     if not args.train_only:
         run_prepare_data(
             argparse.Namespace(
@@ -69,6 +71,7 @@ def run(args: argparse.Namespace) -> None:
                 wait_for_labels=args.wait_for_labels,
                 final_teacher_retrain=args.final_teacher_retrain,
                 host=args.host,
+                lan=getattr(args, "lan", False),
                 port=args.port,
                 poll_seconds=args.poll_seconds,
                 wait_timeout_seconds=args.wait_timeout_seconds,
@@ -154,7 +157,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_teacher_retrain", dest="final_teacher_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_teacher_retrain", dest="final_teacher_retrain", action="store_false")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--poll_seconds", type=float, default=2.0)
     parser.add_argument("--wait_timeout_seconds", type=float, default=0.0)

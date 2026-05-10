@@ -13,6 +13,7 @@ from typing import Any
 
 from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
 
+from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import clean_text, iter_jsonl, iter_manifest_records, load_json
 
 PAGE_TEMPLATE = """
@@ -614,7 +615,8 @@ def create_app(stage1_dir: Path, max_rows: int, max_evidence_paths: int) -> Flas
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage1_dir", default="output_stage1_logic")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--lan", action="store_true", help="Expose the viewer GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7861)
     parser.add_argument("--max_rows", type=int, default=8)
     parser.add_argument("--max_evidence_paths", type=int, default=30)
@@ -624,7 +626,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.host = resolve_gui_host(args.host, args.lan)
     app = create_app(Path(args.stage1_dir), args.max_rows, args.max_evidence_paths)
+    print(format_gui_urls("Connection viewer", args.host, args.port))
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

@@ -193,6 +193,7 @@ conda run -n MMDD python scripts/stage1_train_models.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --lan \
   --port 7860
 
 # 3) Build ANN indexes and evaluate relation-aware multi-hop recall.
@@ -213,6 +214,7 @@ conda run -n MMDD python scripts/stage1_run_all.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --lan \
   --port 7860
 ```
 
@@ -223,6 +225,8 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 ```
 
 The viewer paginates by `chain_id` and shows the visible query, hidden query, target fragment, logic pairs, qrels, and evidence paths for each group.
+
+By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, or `stage1_connection_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
 
 Lower-level commands are still available for debugging or running individual steps:
 
@@ -255,6 +259,7 @@ conda run -n MMDD python scripts/run_hitl_training_rounds.py \
   --embedding_dir output_stage1_logic/embeddings \
   --rounds 3 \
   --batch_size 50 \
+  --lan \
   --port 7860
 ```
 
@@ -263,7 +268,7 @@ Each round trains the teacher on the latest merged human labels, scores all cand
 To annotate an existing round without running training:
 
 ```bash
-conda run -n MMDD python scripts/hitl_annotation_app.py --stage1_dir output_stage1_logic --round_id 0 --port 7860
+conda run -n MMDD python scripts/hitl_annotation_app.py --stage1_dir output_stage1_logic --round_id 0 --lan --port 7860
 ```
 
 The default encoder is the local Qwen3-VL-Embedding-2B model. If `./Qwen3-VL-Embedding-2B` is not present, the wrapper also checks `./hf_models/Qwen3-VL-Embedding-2B`; pass `--encoder_path` for any other local path.

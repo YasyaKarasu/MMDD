@@ -9,6 +9,7 @@ from pathlib import Path
 
 from run_hitl_training_rounds import run as run_hitl_rounds
 from run_hitl_training_rounds import run_teacher_cycle
+from stage1_gui import resolve_gui_host
 from stage1_io import update_stage1_manifest
 from train_student import run as train_student
 
@@ -37,6 +38,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
                 wait_for_labels=args.wait_for_labels,
                 final_retrain=args.final_teacher_retrain,
                 host=args.host,
+                lan=getattr(args, "lan", False),
                 port=args.port,
                 poll_seconds=args.poll_seconds,
                 wait_timeout_seconds=args.wait_timeout_seconds,
@@ -67,6 +69,7 @@ def run(args: argparse.Namespace) -> None:
         args.embedding_dir = str(Path(args.stage1_dir) / "embeddings")
     if args.student_dir is None:
         args.student_dir = str(Path(args.stage1_dir) / "student")
+    args.host = resolve_gui_host(getattr(args, "host", None), getattr(args, "lan", False))
     train_teacher_and_hitl(args)
     if args.hitl_rounds > 0 and args.gui and not args.wait_for_labels:
         print("Skipping student distillation because --no_wait_for_labels was used.")
@@ -121,7 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_teacher_retrain", dest="final_teacher_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_teacher_retrain", dest="final_teacher_retrain", action="store_false")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--poll_seconds", type=float, default=2.0)
     parser.add_argument("--wait_timeout_seconds", type=float, default=0.0)

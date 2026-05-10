@@ -22,6 +22,7 @@ from stage1_connection_viewer import load_groups
 from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
 from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_exception, resize_batch_images_for_limit
+from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import fd_purity, project_rows, write_jsonl
 from stage1_serialization import serialize_table_for_embedding
 from train_student import Student, build_ranking_groups, train_loss
@@ -453,6 +454,17 @@ def test_hitl_selection_excludes_labeled_and_previous(tmp_path):
     )
     selected = [json.loads(line) for line in (tmp_path / "hitl_selected_round_1.jsonl").read_text().splitlines()]
     assert [item["path_id"] for item in selected] == ["p_new"]
+
+
+def test_gui_host_resolution_and_lan_url(monkeypatch):
+    assert resolve_gui_host(None, lan=False) == "127.0.0.1"
+    assert resolve_gui_host(None, lan=True) == "0.0.0.0"
+    assert resolve_gui_host("192.168.1.10", lan=True) == "192.168.1.10"
+    monkeypatch.setattr("stage1_gui.guess_lan_ipv4", lambda: "192.168.1.20")
+    message = format_gui_urls("Annotation GUI", "0.0.0.0", 7860)
+    assert "Local browser: http://127.0.0.1:7860" in message
+    assert "LAN devices:   http://192.168.1.20:7860" in message
+
 
 
 def test_hitl_annotation_app_saves_and_merges(tmp_path):

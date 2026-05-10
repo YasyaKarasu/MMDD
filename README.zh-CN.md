@@ -345,6 +345,7 @@ conda run -n MMDD python scripts/stage1_train_models.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --lan \
   --port 7860
 
 # 3) 构建 ANN 索引，并评估 relation-aware multi-hop recall。
@@ -365,6 +366,7 @@ conda run -n MMDD python scripts/stage1_run_all.py \
   --hitl_rounds 3 \
   --hitl_batch_size 50 \
   --distill_loss pairwise \
+  --lan \
   --port 7860
 ```
 
@@ -375,6 +377,8 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 ```
 
 这个 viewer 会按 `chain_id` 分页展示，每页包含 visible query、hidden query、target fragment、logic pairs、qrels 和 evidence paths。
+
+默认情况下，Flask GUI 绑定 `127.0.0.1`，只能在本机访问。给 `stage1_train_models.py`、`stage1_run_all.py`、`run_hitl_training_rounds.py`、`hitl_annotation_app.py` 或 `stage1_connection_viewer.py` 加上 `--lan` 后会绑定到 `0.0.0.0`，启动日志会同时打印本机 URL 和内网设备可访问的 URL。如果内网 URL 仍然打不开，检查主机防火墙是否放行对应端口，并确认设备在同一个网络里。
 
 下面这些底层命令仍然可以用于调试或单独运行某一步：
 
@@ -407,6 +411,7 @@ conda run -n MMDD python scripts/run_hitl_training_rounds.py \
   --embedding_dir output_stage1_logic/embeddings \
   --rounds 3 \
   --batch_size 50 \
+  --lan \
   --port 7860
 ```
 
@@ -415,13 +420,13 @@ conda run -n MMDD python scripts/run_hitl_training_rounds.py \
 如果只想标注已有 round，而不启动训练闭环：
 
 ```bash
-conda run -n MMDD python scripts/hitl_annotation_app.py --stage1_dir output_stage1_logic --round_id 0 --port 7860
+conda run -n MMDD python scripts/hitl_annotation_app.py --stage1_dir output_stage1_logic --round_id 0 --lan --port 7860
 ```
 
 然后在浏览器打开：
 
 ```text
-http://127.0.0.1:7860
+http://<启动日志里显示的内网 IP>:7860
 ```
 
 默认 encoder 是本地 `Qwen3-VL-Embedding-2B`。如果 `./Qwen3-VL-Embedding-2B` 不存在，wrapper 也会检查 `./hf_models/Qwen3-VL-Embedding-2B`；其他本地路径可以通过 `--encoder_path` 指定。

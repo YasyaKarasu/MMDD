@@ -13,6 +13,7 @@ from pathlib import Path
 
 from build_teacher_training_data import run as build_teacher_training_data
 from select_hitl_batch import run as select_hitl_batch
+from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import iter_jsonl, load_json, update_stage1_manifest
 from train_teacher import run as train_teacher
 
@@ -110,7 +111,7 @@ def launch_gui(args: argparse.Namespace, round_id: int) -> subprocess.Popen[str]
         str(args.port),
     ]
     proc = subprocess.Popen(cmd, text=True)
-    print(f"Annotation GUI for round {round_id}: http://{args.host}:{args.port}")
+    print(format_gui_urls(f"Annotation GUI for round {round_id}", args.host, args.port))
     return proc
 
 
@@ -136,6 +137,7 @@ def wait_for_merge(args: argparse.Namespace, round_id: int, proc: subprocess.Pop
 
 def run(args: argparse.Namespace) -> None:
     stage1_dir = Path(args.stage1_dir)
+    args.host = resolve_gui_host(getattr(args, "host", None), getattr(args, "lan", False))
     start = args.start_round if args.start_round is not None else next_round_id(stage1_dir)
     completed = []
     for offset in range(args.rounds):
@@ -196,7 +198,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_wait_for_labels", dest="wait_for_labels", action="store_false")
     parser.add_argument("--final_retrain", dest="final_retrain", action="store_true", default=True)
     parser.add_argument("--no_final_retrain", dest="final_retrain", action="store_false")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--lan", action="store_true", help="Expose the annotation GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--poll_seconds", type=float, default=2.0)
     parser.add_argument("--wait_timeout_seconds", type=float, default=0.0)

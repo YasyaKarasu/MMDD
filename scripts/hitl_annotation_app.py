@@ -11,6 +11,7 @@ from typing import Any
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from merge_human_labels import run as merge_human_labels
+from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import iter_jsonl, update_stage1_manifest, write_json, write_jsonl
 
 ALLOWED_LABELS = {
@@ -439,7 +440,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage1_dir", default="output_stage1_logic")
     parser.add_argument("--round_id", type=int, required=True)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--lan", action="store_true", help="Expose the annotation GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
@@ -447,7 +449,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.host = resolve_gui_host(args.host, args.lan)
     app = create_app(Path(args.stage1_dir), args.round_id)
+    print(format_gui_urls("Annotation GUI", args.host, args.port))
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 
