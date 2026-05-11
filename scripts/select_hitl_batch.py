@@ -10,11 +10,19 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from stage1_io import clean_text, iter_jsonl, setup_logging, update_stage1_manifest, write_jsonl
 
 
 ROUND_RE = re.compile(r"hitl_selected_round_(\d+)\.jsonl$")
+
+
+def wikipedia_page_url(title: str | None) -> str:
+    title = clean_text(title)
+    if not title:
+        return ""
+    return f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
 
 
 def load_teacher_scores(path: Path | None) -> dict[str, float]:
@@ -35,12 +43,100 @@ def weak_default_score(path: dict[str, Any]) -> float:
     return 0.35
 
 
-def preview_fragment(fragment: dict[str, Any]) -> dict[str, Any]:
-    cols = [col.get("column_name") for col in fragment.get("columns", [])]
+def row_match_score(row: dict[str, Any], values: list[str]) -> int:
+    candidates = [clean_text(value).casefold() for value in values if clean_text(value)]
+    if not candidates:
+        return 0
+    score = 0
+    for cell in row.get("cells", []):
+        text = clean_text(cell.get("text")).casefold()
+        if not text:
+            continue
+        for value in candidates:
+            if text == value:
+                score += 2
+            elif len(value) >= 3 and value in text:
+                score += 1
+    return score
+
+
+def row_id_matches(row: dict[str, Any], focus_row_id: int | None) -> bool:
+    if focus_row_id is None:
+        return False
+    for key in ("source_row_id", "row_id"):
+        try:
+            if int(row.get(key)) == int(focus_row_id):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def choose_focus_row(rows: list[dict[str, Any]], values: list[str], focus_row_id: int | None = None) -> dict[str, Any] | None:
+    for row in rows:
+        if row_id_matches(row, focus_row_id):
+            return row
+    scored = [(row_match_score(row, values), -idx, row) for idx, row in enumerate(rows)]
+    scored = [item for item in scored if item[0] > 0]
+    if not scored:
+        return None
+    scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
+    return scored[0][2]
+
+
+def preview_table_like(
+    table: dict[str, Any],
+    focus_values: list[str] | None = None,
+    max_rows: int | None = 5,
+    focus_row_id: int | None = None,
+) -> dict[str, Any]:
+    cols = [col.get("column_name") for col in table.get("columns", [])]
+    table_rows = list(table.get("rows", []))
+    focus_row = choose_focus_row(table_rows, focus_values or [], focus_row_id)
+    if max_rows is None:
+        selected_rows = table_rows
+    else:
+        selected_rows = list(table_rows[:max_rows])
+        if focus_row is not None and focus_row not in selected_rows:
+            if len(selected_rows) >= max_rows:
+                selected_rows = selected_rows[: max(0, max_rows - 1)]
+            selected_rows.append(focus_row)
     rows = []
-    for row in fragment.get("rows", [])[:5]:
-        rows.append({cols[i]: cell.get("text") for i, cell in enumerate(row.get("cells", [])) if i < len(cols)})
-    return {"fragment_id": fragment.get("fragment_id"), "columns": cols, "rows": rows}
+    focus_id = id(focus_row) if focus_row is not None else None
+    for row in selected_rows:
+        preview_row = {}
+        links = {}
+        for i, cell in enumerate(row.get("cells", [])):
+            if i >= len(cols):
+                continue
+            preview_row[cols[i]] = cell.get("text")
+            url = wikipedia_page_url(cell.get("wiki_title"))
+            if url:
+                links[cols[i]] = url
+        if links:
+            preview_row["_links"] = links
+        if id(row) == focus_id:
+            preview_row["_focus"] = True
+        rows.append(preview_row)
+    return {
+        "fragment_id": table.get("fragment_id"),
+        "source_table_id": table.get("source_table_id"),
+        "page_title": table.get("page_title"),
+        "page_url": wikipedia_page_url(table.get("page_title")),
+        "caption": table.get("caption"),
+        "section_title": table.get("section_title"),
+        "columns": cols,
+        "rows": rows,
+    }
+
+
+def preview_fragment(
+    fragment: dict[str, Any],
+    focus_values: list[str] | None = None,
+    max_rows: int = 5,
+    focus_row_id: int | None = None,
+) -> dict[str, Any]:
+    return preview_table_like(fragment, focus_values, max_rows, focus_row_id)
 
 
 def load_excluded_path_ids(stage1_dir: Path, round_id: int, allow_reselect_previous: bool, allow_reselect_labeled: bool) -> set[str]:
@@ -71,6 +167,27 @@ def load_assets_for_selected(stage1_dir: Path, selected: list[dict[str, Any]]) -
             if len(assets) == len(needed):
                 break
     return assets
+
+
+def load_source_tables_for_selected(stage1_dir: Path, selected: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    manifest = json.loads((stage1_dir / "manifest.json").read_text(encoding="utf-8"))
+    input_dir = Path(manifest.get("evidence_paths", {}).get("input_dir", "output_medium"))
+    from stage1_io import iter_manifest_records
+
+    needed = {item.get("source_table_id") for item in selected if item.get("source_table_id")}
+    tables = {}
+    if not needed:
+        return tables
+    try:
+        source_iter = iter_manifest_records(input_dir, "source_tables", log_every=1000)
+        for table in source_iter:
+            if table.get("source_table_id") in needed:
+                tables[table["source_table_id"]] = table
+                if len(tables) == len(needed):
+                    break
+    except (KeyError, FileNotFoundError):
+        return tables
+    return tables
 
 
 def run(args: argparse.Namespace) -> None:
@@ -118,11 +235,14 @@ def run(args: argparse.Namespace) -> None:
         keys = next_keys
 
     assets = load_assets_for_selected(stage1_dir, selected)
+    source_tables = load_source_tables_for_selected(stage1_dir, selected)
     templates = []
     for item in selected:
         asset = assets.get(item["asset_id"], {})
         query = fragments.get(item["query_fragment_id"], {})
         target = fragments.get(item["target_fragment_id"], {})
+        source_table = source_tables.get(item.get("source_table_id"), {})
+        focus_values = [item.get("entity_text", ""), item.get("bridge_value", "")]
         snippet = ""
         image_path = ""
         if item.get("asset_type") == "text":
@@ -133,8 +253,9 @@ def run(args: argparse.Namespace) -> None:
         templates.append(
             {
                 "path_id": item["path_id"],
-                "query_fragment_preview": preview_fragment(query),
-                "target_fragment_preview": preview_fragment(target),
+                "query_fragment_preview": preview_fragment(query, focus_values, focus_row_id=item.get("source_row_id")),
+                "target_fragment_preview": preview_fragment(target, [item.get("bridge_value", ""), item.get("entity_text", "")]),
+                "source_table_preview": preview_table_like(source_table, focus_values, max_rows=None, focus_row_id=item.get("source_row_id")) if source_table else None,
                 "claim_text": item.get("claim_text"),
                 "asset_type": item.get("asset_type"),
                 "evidence_text_snippet": snippet,

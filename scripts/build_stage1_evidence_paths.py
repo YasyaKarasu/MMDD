@@ -124,6 +124,7 @@ def run(args: argparse.Namespace) -> None:
                         "split": frag.get("split"),
                         "chain_id": frag["chain_id"],
                         "source_table_id": frag["source_table_id"],
+                        "source_row_id": key[1],
                         "query_fragment_id": frag["fragment_id"],
                         "target_fragment_id": target["fragment_id"],
                         "asset_id": asset_id,

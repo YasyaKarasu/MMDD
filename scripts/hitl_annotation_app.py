@@ -154,10 +154,39 @@ PAGE_TEMPLATE = """
     .table-box {
       min-width: 0;
     }
+    .full-table {
+      margin-top: 12px;
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    .full-table .table-box {
+      min-width: 720px;
+      width: max(100%, 720px);
+    }
+    .full-table table {
+      table-layout: auto;
+    }
+    .full-table th,
+    .full-table td {
+      min-width: 120px;
+      max-width: 220px;
+      white-space: normal;
+    }
+    .full-table th:first-child,
+    .full-table td:first-child {
+      min-width: 150px;
+      max-width: 260px;
+    }
     .table-title {
       color: var(--muted);
       font-size: 12px;
       margin-bottom: 4px;
+    }
+    .table-title a {
+      color: var(--accent);
+      text-decoration: none;
     }
     table {
       width: 100%;
@@ -172,6 +201,11 @@ PAGE_TEMPLATE = """
       overflow-wrap: anywhere;
     }
     th { background: #eef2f7; text-align: left; }
+    tr.focus-row td {
+      background: #fff7d6;
+      border-color: #e0b94d;
+      font-weight: 600;
+    }
     .controls {
       display: grid;
       grid-template-columns: 210px 1fr auto;
@@ -230,6 +264,11 @@ PAGE_TEMPLATE = """
           {{ preview_table("Query", item.query_fragment_preview) | safe }}
           {{ preview_table("Target", item.target_fragment_preview) | safe }}
         </div>
+        {% if item.source_table_preview %}
+        <div class="full-table">
+          {{ preview_table("Full Source Table", item.source_table_preview) | safe }}
+        </div>
+        {% endif %}
         <div class="controls">
           <select name="label">
             <option value="">Unlabeled</option>
@@ -346,11 +385,22 @@ def preview_table(title: str, preview: dict[str, Any] | None) -> str:
     head = "".join(f"<th>{escape_html(col)}</th>" for col in cols)
     body_rows = []
     for row in rows:
-        cells = "".join(f"<td>{escape_html(row.get(col, ''))}</td>" for col in cols)
-        body_rows.append(f"<tr>{cells}</tr>")
+        links = row.get("_links") or {}
+        cells = ""
+        for col in cols:
+            value = escape_html(row.get(col, ""))
+            url = links.get(col)
+            if url:
+                value = f'<a href="{escape_html(url)}" target="_blank" rel="noreferrer">{value}</a>'
+            cells += f"<td>{value}</td>"
+        row_class = ' class="focus-row"' if row.get("_focus") else ""
+        body_rows.append(f"<tr{row_class}>{cells}</tr>")
+    page_title = escape_html(preview.get("page_title", ""))
+    page_url = escape_html(preview.get("page_url", ""))
+    page_link = f' · <a href="{page_url}" target="_blank" rel="noreferrer">{page_title}</a>' if page_url else ""
     return (
         '<div class="table-box">'
-        f'<div class="table-title">{escape_html(title)}: {escape_html(preview.get("fragment_id", ""))}</div>'
+        f'<div class="table-title">{escape_html(title)}: {escape_html(preview.get("fragment_id", "") or preview.get("source_table_id", ""))}{page_link}</div>'
         f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
         "</div>"
     )

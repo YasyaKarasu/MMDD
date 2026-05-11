@@ -457,6 +457,117 @@ def test_hitl_selection_excludes_labeled_and_previous(tmp_path):
     assert [item["path_id"] for item in selected] == ["p_new"]
 
 
+def test_hitl_template_preview_includes_bridge_entity_row(tmp_path):
+    input_dir = tmp_path / "input"
+    bridge_dir = input_dir / "bridge_assets"
+    source_dir = input_dir / "source_tables"
+    bridge_dir.mkdir(parents=True)
+    source_dir.mkdir(parents=True)
+    write_jsonl(bridge_dir / "part-00000.jsonl", [{"asset_id": "asset_focus", "asset_type": "text", "content": "Focus evidence"}])
+    source_rows = [
+        {
+            "row_id": idx,
+            "cells": [
+                {"column_index": 0, "column_name": "Entity", "text": f"Entity {idx}", "wiki_title": f"Entity {idx}", "has_wiki_link": True},
+                {"column_index": 1, "column_name": "Bridge", "text": "Focus Bridge" if idx == 0 else f"Bridge {idx}", "wiki_title": None, "has_wiki_link": False},
+            ],
+        }
+        for idx in range(6)
+    ] + [
+        {
+            "row_id": 6,
+            "cells": [
+                {"column_index": 0, "column_name": "Entity", "text": "Focus Entity", "wiki_title": "Focus Entity", "has_wiki_link": True},
+                {"column_index": 1, "column_name": "Bridge", "text": "Focus Bridge", "wiki_title": None, "has_wiki_link": False},
+            ],
+        }
+    ]
+    write_jsonl(
+        source_dir / "part-00000.jsonl",
+        [
+            {
+                "source_table_id": "source_focus",
+                "page_title": "Focus Page",
+                "caption": "Focus caption",
+                "columns": [{"column_index": 0, "column_name": "Entity"}, {"column_index": 1, "column_name": "Bridge"}],
+                "rows": source_rows,
+            }
+        ],
+    )
+    (input_dir / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "artifacts": {
+                    "bridge_assets": {"shards": [{"path": "bridge_assets/part-00000.jsonl", "records": 1}]},
+                    "source_tables": {"shards": [{"path": "source_tables/part-00000.jsonl", "records": 1}]},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps({"evidence_paths": {"input_dir": str(input_dir)}}), encoding="utf-8")
+    query_rows = [{"cells": [{"text": f"Entity {idx}", "wiki_title": f"Entity {idx}"}]} for idx in range(6)] + [{"cells": [{"text": "Focus Entity", "wiki_title": "Focus Entity"}]}]
+    target_rows = [{"cells": [{"text": f"Bridge {idx}"}]} for idx in range(6)] + [{"cells": [{"text": "Focus Bridge"}]}]
+    write_jsonl(
+        tmp_path / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "query", "source_table_id": "source_focus", "columns": [{"column_name": "Entity"}], "rows": query_rows, "page_title": "Focus Page"},
+            {"fragment_id": "target", "source_table_id": "source_focus", "columns": [{"column_name": "Bridge"}], "rows": target_rows, "page_title": "Focus Page"},
+        ],
+    )
+    write_jsonl(
+        tmp_path / "hitl_pool.jsonl",
+        [
+            {
+                "path_id": "path_focus",
+                "source_table_id": "source_focus",
+                "query_fragment_id": "query",
+                "target_fragment_id": "target",
+                "asset_id": "asset_focus",
+                "asset_type": "text",
+                "split": "train",
+                "source_row_id": 6,
+                "entity_text": "Focus Entity",
+                "bridge_col_name": "Bridge",
+                "bridge_value": "Focus Bridge",
+                "claim_text": "Focus Entity -> Focus Bridge",
+                "weak_score": 0.5,
+                "human_label": None,
+            }
+        ],
+    )
+
+    select_hitl_batch(
+        argparse.Namespace(
+            stage1_dir=str(tmp_path),
+            teacher_scores=None,
+            round_id=0,
+            batch_size=1,
+            candidate_top_n=1,
+            seed=13,
+            allow_reselect_previous=False,
+            allow_reselect_labeled=False,
+        )
+    )
+
+    template = [json.loads(line) for line in (tmp_path / "human_labels_template_round_0.jsonl").read_text().splitlines()]
+    item = template[0]
+    assert len(item["query_fragment_preview"]["rows"]) == 5
+    assert len(item["target_fragment_preview"]["rows"]) == 5
+    assert any(row.get("Entity") == "Focus Entity" and row.get("_focus") for row in item["query_fragment_preview"]["rows"])
+    assert any(row.get("Bridge") == "Focus Bridge" and row.get("_focus") for row in item["target_fragment_preview"]["rows"])
+    assert item["source_table_preview"]["page_url"] == "https://en.wikipedia.org/wiki/Focus_Page"
+    assert len(item["source_table_preview"]["rows"]) == 7
+    assert sum(1 for row in item["source_table_preview"]["rows"] if row.get("_focus")) == 1
+    assert sum(1 for row in item["query_fragment_preview"]["rows"] if row.get("_focus")) == 1
+    assert sum(1 for row in item["target_fragment_preview"]["rows"] if row.get("_focus")) == 1
+    source_focus = item["source_table_preview"]["rows"][-1]
+    assert source_focus["Entity"] == "Focus Entity"
+    assert source_focus["_links"]["Entity"] == "https://en.wikipedia.org/wiki/Focus_Entity"
+    query_focus = next(row for row in item["query_fragment_preview"]["rows"] if row.get("Entity") == "Focus Entity")
+    assert query_focus["_links"]["Entity"] == "https://en.wikipedia.org/wiki/Focus_Entity"
+
+
 def test_gui_host_resolution_and_lan_url(monkeypatch):
     assert resolve_gui_host(None, lan=False) == "127.0.0.1"
     assert resolve_gui_host(None, lan=True) == "0.0.0.0"
