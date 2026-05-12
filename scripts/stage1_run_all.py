@@ -86,6 +86,7 @@ def run(args: argparse.Namespace) -> None:
                 ranking_temperature=args.ranking_temperature,
                 max_pairs_per_group=args.max_pairs_per_group,
                 pairwise_min_delta=args.pairwise_min_delta,
+                progress=getattr(args, "progress", True),
             )
         )
     if not args.prepare_only and not args.train_only:
@@ -107,6 +108,7 @@ def run(args: argparse.Namespace) -> None:
                 beam_width=args.beam_width,
                 beam_neighbors=args.beam_neighbors,
                 path_composition=args.path_composition,
+                progress=getattr(args, "progress", True),
             )
         )
 
@@ -185,6 +187,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_hops", type=int, default=3)
     parser.add_argument("--beam_width", type=int, default=64)
     parser.add_argument("--beam_neighbors", type=int, default=50)
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 

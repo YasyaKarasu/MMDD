@@ -17,8 +17,17 @@ from torch.utils.data import DataLoader
 
 from stage1_io import iter_jsonl, update_stage1_manifest, write_json, write_jsonl
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - exercised only in minimal envs.
+    tqdm = None  # type: ignore[assignment]
+
 TYPES = ["table_fragment", "text_asset", "image_asset"]
 TYPE_TO_ID = {name: idx for idx, name in enumerate(TYPES)}
+
+
+def progress_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "progress", True))
 
 
 def load_embeddings(embedding_dir: Path) -> tuple[dict[str, np.ndarray], dict[str, str], int, dict[str, list[str]]]:
@@ -269,13 +278,24 @@ def run(args: argparse.Namespace) -> None:
     for epoch in range(args.epochs):
         total = 0.0
         steps = 0
-        for batch in loader:
+        batches = loader
+        if tqdm is not None and progress_enabled(args):
+            batches = tqdm(
+                loader,
+                desc=f"Student distill epoch {epoch + 1}/{args.epochs}",
+                total=len(loader),
+                unit="batch",
+            )
+        for batch in batches:
             opt.zero_grad()
             loss = train_loss(model, batch, vectors, device, args)
             loss.backward()
             opt.step()
-            total += float(loss.detach().cpu())
+            loss_value = float(loss.detach().cpu())
+            total += loss_value
             steps += 1
+            if tqdm is not None and progress_enabled(args):
+                batches.set_postfix(loss=f"{total / max(1, steps):.4f}")  # type: ignore[attr-defined]
         history.append({"epoch": epoch + 1, "loss": total / max(1, steps)})
         print(history[-1])
     out_dir = Path(args.output_dir)
@@ -302,6 +322,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_pairs_per_group", type=int, default=2048)
     parser.add_argument("--pairwise_min_delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 

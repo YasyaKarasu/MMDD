@@ -16,6 +16,15 @@ import torch
 from stage1_io import iter_jsonl, update_stage1_manifest, write_json
 from train_student import Student, TYPES, load_embeddings
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - exercised only in minimal envs.
+    tqdm = None  # type: ignore[assignment]
+
+
+def progress_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "progress", True))
+
 
 def load_student(student_dir: Path, device: torch.device) -> Student:
     ckpt = torch.load(student_dir / "student.pt", map_location=device)
@@ -75,17 +84,49 @@ def metrics_for(qrels: list[dict[str, Any]], rankings: dict[str, list[str]], top
     return out
 
 
-def table_rankings(stage1_dir: Path, model: Student, vectors: dict[str, np.ndarray], device: torch.device) -> dict[str, list[str]]:
+def table_rankings(
+    args: argparse.Namespace,
+    stage1_dir: Path,
+    model: Student,
+    vectors: dict[str, np.ndarray],
+    device: torch.device,
+) -> dict[str, list[str]]:
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     queries = [f for f in fragments.values() if f.get("role") in {"left_visible", "left_hidden"} and f["fragment_id"] in vectors]
     targets = [f for f in fragments.values() if f.get("role") == "right_target" and f["fragment_id"] in vectors]
     rankings: dict[str, list[str]] = {}
-    for q in queries:
-        scored = []
-        for t in targets:
-            scored.append((score_pair(model, vectors, q["fragment_id"], "table_fragment", t["fragment_id"], "table_fragment", device), t["fragment_id"]))
-        scored.sort(reverse=True)
-        rankings[q["fragment_id"]] = [tid for _, tid in scored]
+    total_pairs = len(queries) * len(targets)
+    progress = None
+    if tqdm is not None and progress_enabled(args):
+        progress = tqdm(total=total_pairs, desc="Scoring table recall", unit="pair")
+    try:
+        for q_idx, q in enumerate(queries, 1):
+            should_log = q_idx == 1 or q_idx == len(queries) or q_idx % max(1, len(queries) // 20) == 0
+            if progress is None and progress_enabled(args) and should_log:
+                print(f"Scoring table recall: {q_idx}/{len(queries)} queries", flush=True)
+            scored = []
+            for t in targets:
+                scored.append(
+                    (
+                        score_pair(
+                            model,
+                            vectors,
+                            q["fragment_id"],
+                            "table_fragment",
+                            t["fragment_id"],
+                            "table_fragment",
+                            device,
+                        ),
+                        t["fragment_id"],
+                    )
+                )
+                if progress is not None:
+                    progress.update(1)
+            scored.sort(reverse=True)
+            rankings[q["fragment_id"]] = [tid for _, tid in scored]
+    finally:
+        if progress is not None:
+            progress.close()
     return rankings
 
 
@@ -233,7 +274,13 @@ def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Studen
     related_only = 0
     evidence_seen = 0
     total_retrieved_tables = 0
-    for qid in hidden_q:
+    query_iter = hidden_q
+    if tqdm is not None and progress_enabled(args):
+        query_iter = tqdm(hidden_q, desc="Path-aware recall", unit="query")  # type: ignore[assignment]
+    for q_idx, qid in enumerate(query_iter, 1):
+        should_log = q_idx == 1 or q_idx == len(hidden_q) or q_idx % max(1, len(hidden_q) // 20) == 0
+        if tqdm is None and progress_enabled(args) and should_log:
+            print(f"Path-aware recall: {q_idx}/{len(hidden_q)} hidden queries", flush=True)
         if qid not in projected:
             continue
         ranked, best_paths = beam_search_tables(args, model, vectors, projected, indexes, ids_by_type, qid, device)
@@ -272,7 +319,7 @@ def run(args: argparse.Namespace) -> None:
     vectors, _, _, _ = load_embeddings(Path(args.embedding_dir if hasattr(args, "embedding_dir") else stage1_dir / "embeddings"))
     model = load_student(Path(args.student_dir), device)
     qrels = list(iter_jsonl(Path(args.qrels)))
-    rankings = table_rankings(stage1_dir, model, vectors, device)
+    rankings = table_rankings(args, stage1_dir, model, vectors, device)
     results: dict[str, Any] = {}
     for split in ("dev", "test"):
         for role in ("left_visible", "left_hidden"):
@@ -296,6 +343,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beam_neighbors", type=int, default=50)
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 

@@ -99,6 +99,7 @@ def run(args: argparse.Namespace) -> None:
             max_pairs_per_group=args.max_pairs_per_group,
             pairwise_min_delta=args.pairwise_min_delta,
             seed=args.seed,
+            progress=getattr(args, "progress", True),
         )
     )
     update_stage1_manifest(Path(args.stage1_dir), "stage1_train_models", {"args": vars(args)})
@@ -146,6 +147,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ranking_temperature", type=float, default=1.0)
     parser.add_argument("--max_pairs_per_group", type=int, default=2048)
     parser.add_argument("--pairwise_min_delta", type=float, default=1e-4)
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 
