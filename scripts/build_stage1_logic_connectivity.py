@@ -138,6 +138,116 @@ def make_fragment(
     }
 
 
+def query_bridge_columns(fragment: dict[str, Any]) -> set[int]:
+    role = fragment.get("role")
+    if role == "left_hidden" and fragment.get("hidden_bridge_col") is not None:
+        try:
+            return {int(fragment["hidden_bridge_col"])}
+        except (TypeError, ValueError):
+            return set()
+    if role == "left_visible":
+        bridge_col = fragment.get("visible_bridge_col")
+        if bridge_col is not None:
+            try:
+                return {int(bridge_col)}
+            except (TypeError, ValueError):
+                return set()
+        source_cols = fragment.get("source_column_indices") or []
+        if len(source_cols) >= 2 and fragment.get("visible_bridge"):
+            try:
+                return {int(source_cols[1])}
+            except (TypeError, ValueError):
+                return set()
+    return set()
+
+
+def source_column_set(fragment: dict[str, Any]) -> set[int]:
+    cols: set[int] = set()
+    for col in fragment.get("source_column_indices", []) or []:
+        try:
+            cols.add(int(col))
+        except (TypeError, ValueError):
+            continue
+    return cols
+
+
+def add_same_source_bridge_positive_pairs(
+    fragments: list[dict[str, Any]],
+    pairs: list[dict[str, Any]],
+    qrels: list[dict[str, Any]],
+) -> int:
+    existing_pairs = {
+        (pair.get("query_fragment_id"), pair.get("target_fragment_id"))
+        for pair in pairs
+    }
+    existing_qrels = {
+        (qrel.get("query_id"), qrel.get("target_id"))
+        for qrel in qrels
+    }
+    targets_by_group: dict[tuple[Any, Any], list[tuple[dict[str, Any], set[int]]]] = {}
+    for frag in fragments:
+        if frag.get("role") == "right_target":
+            key = (frag.get("source_table_id"), frag.get("split"))
+            targets_by_group.setdefault(key, []).append((frag, source_column_set(frag)))
+    queries = [frag for frag in fragments if frag.get("role") in {"left_visible", "left_hidden"}]
+    added = 0
+
+    for query in queries:
+        bridge_cols = query_bridge_columns(query)
+        if not bridge_cols:
+            continue
+        query_id = query["fragment_id"]
+        source_table_id = query.get("source_table_id")
+        split = query.get("split")
+        for target, target_cols in targets_by_group.get((source_table_id, split), []):
+            matched_cols = sorted(bridge_cols & target_cols)
+            if not matched_cols:
+                continue
+            target_id = target["fragment_id"]
+            if (query_id, target_id) in existing_pairs:
+                continue
+
+            bridge_col = matched_cols[0]
+            bridge_name = (
+                query.get("hidden_bridge_col_name")
+                or query.get("visible_bridge_col_name")
+                or get_column_name(query, bridge_col)
+            )
+            is_hidden = query.get("role") == "left_hidden"
+            pairs.append(
+                {
+                    "pair_id": f"pair_{stable_hash(query_id, target_id, 'same_source_bridge')}",
+                    "source_table_id": source_table_id,
+                    "split": split,
+                    "chain_id": query.get("chain_id"),
+                    "target_chain_id": target.get("chain_id"),
+                    "query_fragment_id": query_id,
+                    "target_fragment_id": target_id,
+                    "label": 1,
+                    "weight": 0.4 if is_hidden else 1.0,
+                    "reason": f"same_source_bridge_column:{bridge_name}",
+                }
+            )
+            existing_pairs.add((query_id, target_id))
+            if (query_id, target_id) not in existing_qrels:
+                qrels.append(
+                    {
+                        "query_id": query_id,
+                        "target_id": target_id,
+                        "rel": 2 if is_hidden else 3,
+                        "split": split,
+                        "chain_id": query.get("chain_id"),
+                        "target_chain_id": target.get("chain_id"),
+                        "query_role": query.get("role"),
+                        "target_role": "right_target",
+                        "reason": f"same_source_bridge_column:{bridge_name}",
+                    }
+                )
+                existing_qrels.add((query_id, target_id))
+            added += 1
+    return added
+
+
 def build_readme(stage1_dir: Path) -> None:
     text = """# Stage-1 Logic Connectivity Outputs
 
@@ -255,6 +365,8 @@ def run(args: argparse.Namespace) -> None:
                     f"{a_name} -> {b_name}",
                     {
                         "visible_bridge": True,
+                        "visible_bridge_col": b_col,
+                        "visible_bridge_col_name": b_name,
                         "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
                     },
                 )
@@ -351,6 +463,7 @@ def run(args: argparse.Namespace) -> None:
         if table_idx % 500 == 0:
             print(f"processed_tables={table_idx} chains={chain_count}")
 
+    bridge_positive_pairs = add_same_source_bridge_positive_pairs(fragments, pairs, qrels)
     rng.shuffle(debug_examples)
     counts = {
         "logic_fragments": write_jsonl(output_dir / "logic_fragments.jsonl", fragments),
@@ -358,6 +471,7 @@ def run(args: argparse.Namespace) -> None:
         "qrels": write_jsonl(output_dir / "qrels.jsonl", qrels),
         "debug_examples": write_jsonl(output_dir / "debug_chain_examples.jsonl", debug_examples),
         "chains": chain_count,
+        "same_source_bridge_positive_pairs": bridge_positive_pairs,
     }
     build_readme(output_dir)
     update_stage1_manifest(output_dir, "logic_connectivity", {"input_dir": args.input_dir, "counts": counts, "args": vars(args)})

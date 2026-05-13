@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_mm_table_dataset as mm_table_dataset
 import build_stage1_embeddings as stage1_embeddings
-from build_stage1_logic_connectivity import build_target_rows, choose_query_context_cols
+from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_target_rows, choose_query_context_cols
 from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
 from stage1_connection_viewer import create_app as create_connection_viewer_app
@@ -118,6 +118,55 @@ def test_query_fragments_keep_irrelevant_context_without_target_leakage():
     assert [cell["source_column_index"] for cell in qh_rows[0]["cells"]] == [0, 3]
     assert 2 not in [cell["source_column_index"] for cell in qv_rows[0]["cells"]]
     assert 1 not in [cell["source_column_index"] for cell in qh_rows[0]["cells"]]
+
+
+def test_same_source_targets_with_query_bridge_column_are_positive():
+    def frag(fragment_id, role, source_cols, chain_id="c1", source_table_id="s1", **extra):
+        return {
+            "fragment_id": fragment_id,
+            "role": role,
+            "split": "train",
+            "chain_id": chain_id,
+            "source_table_id": source_table_id,
+            "source_column_indices": source_cols,
+            **extra,
+        }
+
+    fragments = [
+        frag("q_visible", "left_visible", [0, 1], visible_bridge=True, visible_bridge_col=1, visible_bridge_col_name="Country"),
+        frag("q_hidden", "left_hidden", [0], hidden_bridge_col=1, hidden_bridge_col_name="Country"),
+        frag("target_original", "right_target", [1, 2]),
+        frag("target_other_chain", "right_target", [3, 1], chain_id="c2"),
+        frag("target_no_bridge", "right_target", [2, 3], chain_id="c3"),
+        frag("target_other_source", "right_target", [1, 4], chain_id="c4", source_table_id="s2"),
+    ]
+    pairs = [
+        {
+            "query_fragment_id": "q_hidden",
+            "target_fragment_id": "target_original",
+            "label": 1,
+        }
+    ]
+    qrels = [
+        {
+            "query_id": "q_hidden",
+            "target_id": "target_original",
+            "rel": 2,
+        }
+    ]
+
+    added = add_same_source_bridge_positive_pairs(fragments, pairs, qrels)
+
+    positive_pairs = {(pair["query_fragment_id"], pair["target_fragment_id"]) for pair in pairs}
+    positive_qrels = {(qrel["query_id"], qrel["target_id"]) for qrel in qrels}
+    assert added == 3
+    assert ("q_visible", "target_original") in positive_pairs
+    assert ("q_visible", "target_other_chain") in positive_pairs
+    assert ("q_hidden", "target_other_chain") in positive_pairs
+    assert ("q_hidden", "target_original") in positive_pairs
+    assert ("q_hidden", "target_no_bridge") not in positive_pairs
+    assert ("q_hidden", "target_other_source") not in positive_pairs
+    assert ("q_hidden", "target_other_chain") in positive_qrels
 
 
 def test_table_serialization_excludes_hidden_fields_and_values():
