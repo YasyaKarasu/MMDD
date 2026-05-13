@@ -128,6 +128,7 @@ def run(args: argparse.Namespace) -> None:
         device=args.device,
         dtype=args.dtype,
         image_resize_cache_dir=str(emb_dir / "resized_images"),
+        progress=bool(getattr(args, "progress", True)),
     )
     stats = [encode_table_fragments(args, encoder, emb_dir)]
     if not getattr(args, "table_only", False):
@@ -159,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_image_pixels", type=int, default=DEFAULT_MAX_IMAGE_PIXELS)
     parser.add_argument("--force_recompute", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Only encode table fragments; skip text/image asset embeddings.")
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 

@@ -15,6 +15,11 @@ import numpy as np
 from image_preprocessing import ensure_image_within_pixel_limit
 from stage1_io import l2_normalize_array
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is an optional runtime nicety.
+    tqdm = None  # type: ignore[assignment]
+
 LOG = logging.getLogger("stage1")
 IMAGE_LIMIT_RE = re.compile(r"Image size \((\d+) pixels\) exceeds limit of (\d+) pixels")
 
@@ -129,12 +134,14 @@ class Qwen3VLEmbeddingEncoder:
         batch_size: int = 8,
         mock: bool = False,
         image_resize_cache_dir: str | None = None,
+        progress: bool = True,
     ) -> None:
         self.batch_size = max(1, int(batch_size))
         self.mock = mock
         self.device = device
         self.dtype = dtype
         self.image_resize_cache_dir = Path(image_resize_cache_dir or ".qwen_resized_images")
+        self.progress = bool(progress)
         if mock:
             self.model_dir = Path("<mock>")
             self.model = None
@@ -182,25 +189,41 @@ class Qwen3VLEmbeddingEncoder:
             emb = self.model.process(resized_batch, normalize=True)
         return emb.detach().float().cpu().numpy()
 
-    def encode_items(self, items: list[dict[str, Any]]) -> np.ndarray:
+    def encode_items(self, items: list[dict[str, Any]], progress_desc: str = "Encoding embeddings") -> np.ndarray:
         if not items:
             return np.zeros((0, 0), dtype="float32")
         if self.mock:
             return self._mock_encode(items)
         outputs = []
-        for start in range(0, len(items), self.batch_size):
-            batch = items[start : start + self.batch_size]
-            outputs.append(self._encode_batch(batch))
+        progress_bar = None
+        if tqdm is not None and self.progress:
+            progress_bar = tqdm(total=len(items), desc=progress_desc, unit="item")
+        try:
+            for start in range(0, len(items), self.batch_size):
+                batch = items[start : start + self.batch_size]
+                outputs.append(self._encode_batch(batch))
+                if progress_bar is not None:
+                    progress_bar.update(len(batch))
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         return l2_normalize_array(np.vstack(outputs))
 
     def encode_texts(self, texts: list[str], instruction: str | None = None) -> np.ndarray:
-        return self.encode_items([{"text": text, "instruction": instruction} for text in texts])
+        return self.encode_items(
+            [{"text": text, "instruction": instruction} for text in texts],
+            progress_desc="Encoding text embeddings",
+        )
 
     def encode_images(self, images: list[str], prompts: list[str] | None = None, instruction: str | None = None) -> np.ndarray:
         prompts = prompts or [""] * len(images)
         return self.encode_items(
-            [{"image": image, "text": prompt, "instruction": instruction} for image, prompt in zip(images, prompts)]
+            [{"image": image, "text": prompt, "instruction": instruction} for image, prompt in zip(images, prompts)],
+            progress_desc="Encoding image embeddings",
         )
 
     def encode_tables(self, serialized_tables: list[str], instruction: str | None = None) -> np.ndarray:
-        return self.encode_texts(serialized_tables, instruction=instruction)
+        return self.encode_items(
+            [{"text": table, "instruction": instruction} for table in serialized_tables],
+            progress_desc="Encoding table embeddings",
+        )

@@ -46,6 +46,7 @@ def run(args: argparse.Namespace) -> None:
                 max_image_pixels=args.max_image_pixels,
                 force_recompute_embeddings=args.force_recompute_embeddings,
                 table_only=args.table_only,
+                progress=getattr(args, "progress", True),
             )
         )
     if not args.prepare_only:

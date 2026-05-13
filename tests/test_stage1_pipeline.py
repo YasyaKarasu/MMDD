@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_mm_table_dataset as mm_table_dataset
 import build_stage1_embeddings as stage1_embeddings
+import qwen3_vl_embedding
 from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_target_rows, choose_query_context_cols
 from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
@@ -201,6 +202,32 @@ def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
     arr = encoder.encode_texts(["hello", "world"])
     assert arr.shape == (2, 32)
     assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
+
+
+def test_qwen_encoder_progress_bar_updates_by_item(monkeypatch):
+    events: list[tuple[str, object]] = []
+
+    class FakeTqdm:
+        def __init__(self, *, total: int, desc: str, unit: str) -> None:
+            events.append(("init", (total, desc, unit)))
+
+        def update(self, amount: int) -> None:
+            events.append(("update", amount))
+
+        def close(self) -> None:
+            events.append(("close", None))
+
+    encoder = Qwen3VLEmbeddingEncoder(mock=True, batch_size=2, progress=True)
+    encoder.mock = False
+    encoder._encode_batch = lambda batch: np.ones((len(batch), 2), dtype="float32")  # type: ignore[method-assign]
+    monkeypatch.setattr(qwen3_vl_embedding, "tqdm", FakeTqdm)
+
+    arr = encoder.encode_texts(["one", "two", "three"])
+
+    assert arr.shape == (3, 2)
+    assert events[0] == ("init", (3, "Encoding text embeddings", "item"))
+    assert [event for event in events if event[0] == "update"] == [("update", 2), ("update", 1)]
+    assert events[-1] == ("close", None)
 
 
 def test_large_embedding_image_is_resized_under_pixel_limit(tmp_path):

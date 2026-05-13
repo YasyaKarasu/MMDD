@@ -55,6 +55,7 @@ def run(args: argparse.Namespace) -> None:
                 max_image_pixels=args.max_image_pixels,
                 force_recompute=args.force_recompute_embeddings,
                 table_only=getattr(args, "table_only", False),
+                progress=bool(getattr(args, "progress", True)),
             )
         )
     update_stage1_manifest(stage1_dir, "stage1_prepare_data", {"args": vars(args)})
@@ -85,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_image_pixels", type=int, default=178_956_970)
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Build only table-fragment artifacts and embeddings; skip multimodal evidence artifacts.")
+    parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 
