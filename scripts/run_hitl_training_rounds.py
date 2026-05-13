@@ -65,6 +65,7 @@ def run_teacher_cycle(args: argparse.Namespace, round_id: int, final: bool = Fal
             pseudo_pos_threshold=args.pseudo_pos_threshold,
             pseudo_neg_threshold=args.pseudo_neg_threshold,
             seed=args.seed,
+            table_only=getattr(args, "table_only", False),
         )
     )
     train_teacher(
@@ -78,6 +79,7 @@ def run_teacher_cycle(args: argparse.Namespace, round_id: int, final: bool = Fal
             lr=args.teacher_lr,
             path_composition=args.path_composition,
             seed=args.seed,
+            table_only=getattr(args, "table_only", False),
         )
     )
 

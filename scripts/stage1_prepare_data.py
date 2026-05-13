@@ -33,10 +33,13 @@ def run(args: argparse.Namespace) -> None:
             max_bridge_unique_ratio=args.max_bridge_unique_ratio,
         )
     )
-    print("=== Stage-1 prepare: evidence paths ===")
-    build_evidence_paths(argparse.Namespace(input_dir=args.input_dir, stage1_dir=args.stage1_dir, seed=args.seed))
-    print("=== Stage-1 prepare: weak labels / HITL pool ===")
-    generate_weak_labels(argparse.Namespace(stage1_dir=args.stage1_dir))
+    if getattr(args, "table_only", False):
+        print("=== Stage-1 prepare: table-only mode skips evidence paths and weak labels ===")
+    else:
+        print("=== Stage-1 prepare: evidence paths ===")
+        build_evidence_paths(argparse.Namespace(input_dir=args.input_dir, stage1_dir=args.stage1_dir, seed=args.seed))
+        print("=== Stage-1 prepare: weak labels / HITL pool ===")
+        generate_weak_labels(argparse.Namespace(stage1_dir=args.stage1_dir))
     if not args.skip_embeddings:
         print("=== Stage-1 prepare: frozen embeddings ===")
         build_embeddings(
@@ -51,6 +54,7 @@ def run(args: argparse.Namespace) -> None:
                 max_text_chars=args.max_text_chars,
                 max_image_pixels=args.max_image_pixels,
                 force_recompute=args.force_recompute_embeddings,
+                table_only=getattr(args, "table_only", False),
             )
         )
     update_stage1_manifest(stage1_dir, "stage1_prepare_data", {"args": vars(args)})
@@ -80,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_text_chars", type=int, default=2048)
     parser.add_argument("--max_image_pixels", type=int, default=178_956_970)
     parser.add_argument("--force_recompute_embeddings", action="store_true")
+    parser.add_argument("--table_only", action="store_true", help="Build only table-fragment artifacts and embeddings; skip multimodal evidence artifacts.")
     return parser.parse_args()
 
 

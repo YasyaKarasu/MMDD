@@ -26,8 +26,9 @@ from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import fd_purity, project_rows, write_jsonl
 from stage1_serialization import serialize_table_for_embedding
 from stage1_training_cache import clear_training_outputs
-from train_student import Student, build_ranking_groups, train_loss
-from eval_stage1_recall import relation_query_from_projected
+from train_teacher import TeacherMLP, score_paths
+from train_student import Student, build_distill_records, build_ranking_groups, train_loss
+from eval_stage1_recall import infer_table_only, relation_query_from_projected, table_rankings
 
 
 def cell(idx, name, text):
@@ -817,6 +818,90 @@ def test_train_pairs_do_not_auto_positive_unlabeled_assets(tmp_path):
     assert not any(r.get("path_id") == "path_unlabeled" for r in records)
 
 
+def test_table_only_train_pairs_exclude_path_labels(tmp_path):
+    stage = tmp_path
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment", "split": "train", "chain_id": "c1", "source_table_id": "s1"},
+            {"fragment_id": "t", "role": "right_target", "object_type": "table_fragment", "split": "train", "chain_id": "c1", "source_table_id": "s1"},
+            {"fragment_id": "tneg", "role": "right_target", "object_type": "table_fragment", "split": "train", "chain_id": "c2", "source_table_id": "s2"},
+        ],
+    )
+    write_jsonl(
+        stage / "logic_pairs.jsonl",
+        [{"pair_id": "p", "source_table_id": "s1", "split": "train", "chain_id": "c1", "query_fragment_id": "qv", "target_fragment_id": "t", "label": 1, "weight": 1.0}],
+    )
+    write_jsonl(
+        stage / "hitl_pool.jsonl",
+        [{"path_id": "path_weak", "query_fragment_id": "qv", "asset_id": "a1", "asset_type": "text", "target_fragment_id": "t", "split": "train", "chain_id": "c1", "weak_label": "weak_direct"}],
+    )
+    write_jsonl(
+        stage / "human_labeled_paths.jsonl",
+        [{"path_id": "path_human", "query_fragment_id": "qv", "asset_id": "a2", "asset_type": "image", "target_fragment_id": "t", "split": "train", "chain_id": "c1", "human_label": 2}],
+    )
+    write_jsonl(
+        stage / "teacher_scores.jsonl",
+        [{"sample_kind": "path_score", "path_id": "path_pseudo", "query_fragment_id": "qv", "asset_id": "a3", "asset_object_type": "text_asset", "target_fragment_id": "t", "path_score": 0.99, "split": "train", "chain_id": "c1"}],
+    )
+    from build_teacher_training_data import run as build_train
+
+    out = stage / "train_pairs.jsonl"
+    build_train(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            output=str(out),
+            include_pseudo_labels="true",
+            pseudo_pos_threshold=0.9,
+            pseudo_neg_threshold=0.1,
+            seed=13,
+            table_only=True,
+        )
+    )
+    records = [json.loads(line) for line in out.read_text().splitlines()]
+    assert records
+    assert {r["sample_kind"] for r in records} == {"pair"}
+    assert not any("asset_id" in r for r in records)
+
+
+def test_table_only_student_distill_records_exclude_paths(tmp_path):
+    stage = tmp_path
+    scores = stage / "teacher_scores.jsonl"
+    write_jsonl(
+        scores,
+        [
+            {"sample_kind": "pair_score", "query_id": "q", "target_id": "t", "score": 0.8},
+            {"sample_kind": "path_score", "query_fragment_id": "q", "asset_id": "a", "asset_object_type": "text_asset", "target_fragment_id": "t", "score_Q_asset": 0.7, "score_asset_T": 0.6, "path_score": 0.6},
+        ],
+    )
+    write_jsonl(
+        stage / "human_labeled_paths.jsonl",
+        [{"query_fragment_id": "q", "asset_id": "a2", "asset_type": "image", "target_fragment_id": "t", "human_label": 2}],
+    )
+    records = build_distill_records(stage, scores, table_only=True)
+    assert records == [
+        {"kind": "pair", "a": "q", "ta": "table_fragment", "b": "t", "tb": "table_fragment", "target": 0.8, "group_id": "pair:q:table_fragment"}
+    ]
+
+
+def test_table_only_teacher_scores_training_pair_negatives(tmp_path):
+    write_jsonl(tmp_path / "qrels.jsonl", [{"query_id": "q", "target_id": "heldout"}])
+    model = TeacherMLP(2)
+    vectors = {
+        "q": np.array([1.0, 0.0], dtype="float32"),
+        "t_pos": np.array([1.0, 0.0], dtype="float32"),
+        "t_neg": np.array([0.0, 1.0], dtype="float32"),
+    }
+    pair_records = [
+        {"sample_kind": "pair", "object_id_a": "q", "object_type_a": "table_fragment", "object_id_b": "t_pos", "object_type_b": "table_fragment", "label": 1.0, "split": "train"},
+        {"sample_kind": "pair", "object_id_a": "q", "object_type_a": "table_fragment", "object_id_b": "t_neg", "object_type_b": "table_fragment", "label": 0.0, "split": "train"},
+    ]
+    scores = score_paths(tmp_path, model, vectors, torch.device("cpu"), "min", table_only=True, pair_records=pair_records)
+    assert {score["target_id"] for score in scores} == {"t_pos", "t_neg"}
+    assert all(score["sample_kind"] == "pair_score" for score in scores)
+    assert "heldout" not in {score["target_id"] for score in scores}
+
+
 def test_student_ranking_groups_and_pairwise_loss():
     vectors = {
         "q": np.array([1.0, 0.0], dtype="float32"),
@@ -849,6 +934,93 @@ def test_relation_query_uses_relation_matrix():
         torch.device("cpu"),
     )[0]
     assert np.allclose(query, np.array([0.0, 1.0], dtype="float32"), atol=1e-6)
+
+
+def test_table_only_eval_uses_hnsw_table_index(tmp_path):
+    hnswlib = pytest.importorskip("hnswlib")
+    stage = tmp_path
+    student_dir = stage / "student"
+    index_emb_dir = student_dir / "index_embeddings"
+    hnsw_dir = stage / "hnsw_indices"
+    index_emb_dir.mkdir(parents=True)
+    hnsw_dir.mkdir()
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "q", "role": "left_hidden", "object_type": "table_fragment"},
+            {"fragment_id": "t_good", "role": "right_target", "object_type": "table_fragment"},
+            {"fragment_id": "t_bad", "role": "right_target", "object_type": "table_fragment"},
+        ],
+    )
+    projected_ids = ["q", "t_good", "t_bad"]
+    projected_arr = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype="float32")
+    np.save(index_emb_dir / "table_fragment.npy", projected_arr)
+    (index_emb_dir / "table_fragment_ids.json").write_text(json.dumps(projected_ids), encoding="utf-8")
+    index_ids = ["t_good", "t_bad"]
+    index_arr = projected_arr[[1, 2]]
+    index = hnswlib.Index(space="cosine", dim=2)
+    index.init_index(max_elements=2, ef_construction=20, M=8)
+    index.add_items(index_arr, np.arange(2))
+    index.save_index(str(hnsw_dir / "table_fragment.bin"))
+    (hnsw_dir / "table_fragment_ids.json").write_text(json.dumps(index_ids), encoding="utf-8")
+    model = Student(2, 2)
+    with torch.no_grad():
+        for proj in model.proj.values():
+            proj.weight.copy_(torch.eye(2))
+        model.rel["table_fragment__table_fragment"].copy_(torch.eye(2))
+    rankings = table_rankings(
+        argparse.Namespace(student_dir=str(student_dir), hnsw_dir=str(hnsw_dir), table_only=True, table_hnsw_k=0, progress=False),
+        stage,
+        model,
+        {oid: projected_arr[idx] for idx, oid in enumerate(projected_ids)},
+        torch.device("cpu"),
+        [1],
+    )
+    assert rankings["q"][0] == "t_good"
+    assert "q" not in rankings["q"]
+
+
+def test_eval_infers_table_only_from_hnsw_stats(tmp_path):
+    hnsw_dir = tmp_path / "hnsw_indices"
+    hnsw_dir.mkdir()
+    (hnsw_dir / "hnsw_stats.json").write_text(json.dumps({"table_only": True}), encoding="utf-8")
+    args = argparse.Namespace(table_only=False, hnsw_dir=str(hnsw_dir))
+    assert infer_table_only(args, tmp_path)
+
+
+def test_hnsw_table_index_contains_only_right_targets(tmp_path):
+    pytest.importorskip("hnswlib")
+    from build_hnsw_indices import run as build_hnsw
+
+    stage = tmp_path
+    student_dir = stage / "student"
+    emb_dir = student_dir / "index_embeddings"
+    emb_dir.mkdir(parents=True)
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment"},
+            {"fragment_id": "qh", "role": "left_hidden", "object_type": "table_fragment"},
+            {"fragment_id": "t", "role": "right_target", "object_type": "table_fragment"},
+        ],
+    )
+    np.save(emb_dir / "table_fragment.npy", np.eye(3, dtype="float32"))
+    (emb_dir / "table_fragment_ids.json").write_text(json.dumps(["qv", "qh", "t"]), encoding="utf-8")
+    build_hnsw(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            student_dir=str(student_dir),
+            space="cosine",
+            m=8,
+            ef_construction=20,
+            ef_search=20,
+            table_only=True,
+        )
+    )
+    indexed_ids = json.loads((stage / "hnsw_indices" / "table_fragment_ids.json").read_text(encoding="utf-8"))
+    stats = json.loads((stage / "hnsw_indices" / "hnsw_stats.json").read_text(encoding="utf-8"))
+    assert indexed_ids == ["t"]
+    assert stats["objects"][0]["indexed_role"] == "right_target"
 
 
 def test_hnsw_index_build_query():

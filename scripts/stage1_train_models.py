@@ -16,6 +16,26 @@ from train_student import run as train_student
 
 
 def train_teacher_and_hitl(args: argparse.Namespace) -> None:
+    if getattr(args, "table_only", False):
+        print("=== Stage-1 train: table-only teacher without HITL rounds ===")
+        run_teacher_cycle(
+            argparse.Namespace(
+                stage1_dir=args.stage1_dir,
+                embedding_dir=args.embedding_dir,
+                include_pseudo_labels="false",
+                pseudo_pos_threshold=args.pseudo_pos_threshold,
+                pseudo_neg_threshold=args.pseudo_neg_threshold,
+                seed=args.seed,
+                teacher_epochs=args.teacher_epochs,
+                teacher_batch_size=args.teacher_batch_size,
+                teacher_lr=args.teacher_lr,
+                path_composition=args.path_composition,
+                table_only=True,
+            ),
+            round_id=0,
+            final=True,
+        )
+        return
     if args.hitl_rounds > 0:
         run_hitl_rounds(
             argparse.Namespace(
@@ -45,6 +65,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
                 port=args.port,
                 poll_seconds=args.poll_seconds,
                 wait_timeout_seconds=args.wait_timeout_seconds,
+                table_only=False,
             )
         )
         return
@@ -61,6 +82,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
             teacher_batch_size=args.teacher_batch_size,
             teacher_lr=args.teacher_lr,
             path_composition=args.path_composition,
+            table_only=False,
         ),
         round_id=0,
         final=True,
@@ -100,6 +122,7 @@ def run(args: argparse.Namespace) -> None:
             pairwise_min_delta=args.pairwise_min_delta,
             seed=args.seed,
             progress=getattr(args, "progress", True),
+            table_only=getattr(args, "table_only", False),
         )
     )
     update_stage1_manifest(Path(args.stage1_dir), "stage1_train_models", {"args": vars(args)})
@@ -133,6 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_final_teacher_retrain", dest="final_teacher_retrain", action="store_false")
     parser.add_argument("--force_retrain", action="store_true", help="Clear generated teacher/student/HITL training outputs before training.")
     parser.add_argument("--reset_human_labels", action="store_true", help="With --force_retrain, also delete merged human labels.")
+    parser.add_argument("--table_only", action="store_true", help="Train only table-table connectivity; skip HITL/path samples and multimodal distillation.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)

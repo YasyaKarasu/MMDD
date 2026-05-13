@@ -75,7 +75,7 @@ class Student(nn.Module):
         return torch.nn.functional.normalize(query, p=2, dim=-1)
 
 
-def build_distill_records(stage1_dir: Path, teacher_scores: Path) -> list[dict[str, Any]]:
+def build_distill_records(stage1_dir: Path, teacher_scores: Path, table_only: bool = False) -> list[dict[str, Any]]:
     records = []
     for score in iter_jsonl(teacher_scores):
         if score.get("sample_kind") == "pair_score":
@@ -90,7 +90,7 @@ def build_distill_records(stage1_dir: Path, teacher_scores: Path) -> list[dict[s
                     "group_id": f"pair:{score['query_id']}:table_fragment",
                 }
             )
-        elif score.get("sample_kind") == "path_score":
+        elif not table_only and score.get("sample_kind") == "path_score":
             records.append(
                 {
                     "kind": "pair",
@@ -115,7 +115,7 @@ def build_distill_records(stage1_dir: Path, teacher_scores: Path) -> list[dict[s
             )
             records.append({"kind": "path", **score, "target": float(score["path_score"]), "group_id": f"path:{score['query_fragment_id']}:table_fragment"})
     human = stage1_dir / "human_labeled_paths.jsonl"
-    if human.exists():
+    if not table_only and human.exists():
         for rec in iter_jsonl(human):
             if rec.get("human_label") == 2:
                 target = 1.0
@@ -266,10 +266,19 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     stage1_dir = Path(args.stage1_dir)
     vectors, _, in_dim, ids_by_type = load_embeddings(Path(args.embedding_dir))
-    records = build_distill_records(stage1_dir, Path(args.teacher_scores))
+    if getattr(args, "table_only", False):
+        ids_by_type = {"table_fragment": ids_by_type.get("table_fragment", [])}
+        table_ids = set(ids_by_type["table_fragment"])
+        vectors = {oid: vec for oid, vec in vectors.items() if oid in table_ids}
+    records = build_distill_records(stage1_dir, Path(args.teacher_scores), table_only=getattr(args, "table_only", False))
     write_jsonl(stage1_dir / "student_train_pairs.jsonl", records)
     groups = build_ranking_groups(records, vectors)
     write_jsonl(stage1_dir / "student_train_groups.jsonl", [{"group_id": group["group_id"], "records": len(group["items"])} for group in groups])
+    if not groups:
+        raise RuntimeError(
+            "No student ranking groups were built. Check that teacher_scores contains at least two scored targets with different scores for a query; "
+            "in table-only mode, rerun teacher training after the --table_only fix so positive and negative table pairs are scored."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = Student(in_dim, args.student_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -323,6 +332,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairwise_min_delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--no_progress", dest="progress", action="store_false")
+    parser.add_argument("--table_only", action="store_true", help="Distill only table-table pair scores; skip path and human multimodal labels.")
     parser.set_defaults(progress=True)
     return parser.parse_args()
 

@@ -26,6 +26,19 @@ def progress_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "progress", True))
 
 
+def infer_table_only(args: argparse.Namespace, stage1_dir: Path) -> bool:
+    if getattr(args, "table_only", False):
+        return True
+    hnsw_dir = Path(getattr(args, "hnsw_dir", stage1_dir / "hnsw_indices"))
+    stats_path = hnsw_dir / "hnsw_stats.json"
+    if stats_path.exists():
+        try:
+            return bool(json.loads(stats_path.read_text(encoding="utf-8")).get("table_only"))
+        except (json.JSONDecodeError, OSError):
+            return False
+    return False
+
+
 def load_student(student_dir: Path, device: torch.device) -> Student:
     ckpt = torch.load(student_dir / "student.pt", map_location=device)
     model = Student(int(ckpt["in_dim"]), int(ckpt["student_dim"])).to(device)
@@ -90,10 +103,13 @@ def table_rankings(
     model: Student,
     vectors: dict[str, np.ndarray],
     device: torch.device,
+    topks: list[int],
 ) -> dict[str, list[str]]:
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     queries = [f for f in fragments.values() if f.get("role") in {"left_visible", "left_hidden"} and f["fragment_id"] in vectors]
     targets = [f for f in fragments.values() if f.get("role") == "right_target" and f["fragment_id"] in vectors]
+    if getattr(args, "table_only", False):
+        return hnsw_table_rankings(args, model, queries, targets, device, topks)
     rankings: dict[str, list[str]] = {}
     total_pairs = len(queries) * len(targets)
     progress = None
@@ -127,6 +143,49 @@ def table_rankings(
     finally:
         if progress is not None:
             progress.close()
+    return rankings
+
+
+def hnsw_table_rankings(
+    args: argparse.Namespace,
+    model: Student,
+    queries: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    device: torch.device,
+    topks: list[int],
+) -> dict[str, list[str]]:
+    projected = load_projected(Path(args.student_dir))
+    table_projected = {oid: vec for oid, (object_type, vec) in projected.items() if object_type == "table_fragment"}
+    if not table_projected:
+        raise SystemExit("table-only HNSW evaluation requires student/index_embeddings/table_fragment.npy")
+    dim = len(next(iter(table_projected.values())))
+    index, table_ids = load_hnsw(Path(args.hnsw_dir), "table_fragment", dim)
+    if index is None:
+        raise SystemExit("table-only HNSW evaluation requires hnsw_indices/table_fragment.bin")
+    target_ids = {target["fragment_id"] for target in targets}
+    unexpected_ids = [table_id for table_id in table_ids if table_id not in target_ids]
+    if unexpected_ids:
+        raise SystemExit(
+            "table-only HNSW evaluation expects hnsw_indices/table_fragment_ids.json to contain only right_target fragments. "
+            "Rebuild the index with scripts/stage1_index_eval.py --table_only."
+        )
+    requested_k = int(getattr(args, "table_hnsw_k", 0) or 0)
+    hnsw_k = min(requested_k if requested_k > 0 else len(table_ids), len(table_ids))
+    rankings: dict[str, list[str]] = {}
+    query_iter = queries
+    if tqdm is not None and progress_enabled(args):
+        query_iter = tqdm(queries, desc="HNSW table recall", unit="query")  # type: ignore[assignment]
+    for q_idx, q in enumerate(query_iter, 1):
+        qid = q["fragment_id"]
+        should_log = q_idx == 1 or q_idx == len(queries) or q_idx % max(1, len(queries) // 20) == 0
+        if tqdm is None and progress_enabled(args) and should_log:
+            print(f"HNSW table recall: {q_idx}/{len(queries)} queries", flush=True)
+        if qid not in table_projected:
+            rankings[qid] = []
+            continue
+        query = relation_query_from_projected(model, table_projected[qid], "table_fragment", "table_fragment", device)
+        labels, _ = index.knn_query(query, k=hnsw_k)
+        rankings[qid] = [table_ids[int(label)] for label in labels[0]]
     return rankings
 
 
@@ -315,17 +374,19 @@ def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Studen
 def run(args: argparse.Namespace) -> None:
     topks = [int(k) for k in args.topk]
     stage1_dir = Path(args.stage1_dir)
+    args.table_only = infer_table_only(args, stage1_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vectors, _, _, _ = load_embeddings(Path(args.embedding_dir if hasattr(args, "embedding_dir") else stage1_dir / "embeddings"))
     model = load_student(Path(args.student_dir), device)
     qrels = list(iter_jsonl(Path(args.qrels)))
-    rankings = table_rankings(args, stage1_dir, model, vectors, device)
+    rankings = table_rankings(args, stage1_dir, model, vectors, device, topks)
     results: dict[str, Any] = {}
     for split in ("dev", "test"):
         for role in ("left_visible", "left_hidden"):
             subset = [q for q in qrels if q.get("split") == split and q.get("query_role") == role]
             results[f"{split}_{role}"] = metrics_for(subset, rankings, topks)
-    results["path_aware"] = path_aware_metrics(args, stage1_dir, model, vectors, device, topks)
+    if not getattr(args, "table_only", False):
+        results["path_aware"] = path_aware_metrics(args, stage1_dir, model, vectors, device, topks)
     write_json(stage1_dir / "eval_results.json", results)
     update_stage1_manifest(stage1_dir, "eval", {"results": results, "args": vars(args)})
     print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -343,6 +404,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beam_neighbors", type=int, default=50)
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--table_only", action="store_true", help="Only compute direct table-to-table recall; skip path-aware metrics.")
+    parser.add_argument(
+        "--table_hnsw_k",
+        type=int,
+        default=0,
+        help="right_target table neighbors to retrieve for table-only HNSW eval; 0 means all indexed target tables.",
+    )
     parser.add_argument("--no_progress", dest="progress", action="store_false")
     parser.set_defaults(progress=True)
     return parser.parse_args()

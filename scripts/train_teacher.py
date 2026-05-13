@@ -126,33 +126,73 @@ def train_batch(model: TeacherMLP, batch: list[dict[str, Any]], vectors: dict[st
     return torch.stack(losses).mean()
 
 
-def score_paths(stage1_dir: Path, model: TeacherMLP, vectors: dict[str, np.ndarray], device: torch.device, composition: str) -> list[dict[str, Any]]:
-    path_file = stage1_dir / "hitl_pool.jsonl"
-    if not path_file.exists():
-        path_file = stage1_dir / "evidence_paths.jsonl"
+def score_paths(
+    stage1_dir: Path,
+    model: TeacherMLP,
+    vectors: dict[str, np.ndarray],
+    device: torch.device,
+    composition: str,
+    table_only: bool = False,
+    pair_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     scores = []
-    for path in iter_jsonl(path_file):
-        mt = f"{path['asset_type']}_asset"
-        q_asset = pair_score(model, vectors, path["query_fragment_id"], "table_fragment", path["asset_id"], mt, device)
-        asset_t = pair_score(model, vectors, path["asset_id"], mt, path["target_fragment_id"], "table_fragment", device)
-        if q_asset is None or asset_t is None:
-            continue
-        path_score = min(q_asset, asset_t) if composition == "min" else q_asset * asset_t
-        scores.append(
-            {
-                "sample_kind": "path_score",
-                "path_id": path["path_id"],
-                "split": path.get("split"),
-                "chain_id": path.get("chain_id"),
-                "query_fragment_id": path["query_fragment_id"],
-                "asset_id": path["asset_id"],
-                "asset_object_type": mt,
-                "target_fragment_id": path["target_fragment_id"],
-                "score_Q_asset": q_asset,
-                "score_asset_T": asset_t,
-                "path_score": path_score,
-            }
-        )
+    if table_only:
+        for rec in pair_records or []:
+            if rec.get("sample_kind") != "pair":
+                continue
+            score = pair_score(
+                model,
+                vectors,
+                rec["object_id_a"],
+                rec["object_type_a"],
+                rec["object_id_b"],
+                rec["object_type_b"],
+                device,
+            )
+            if score is None:
+                continue
+            scores.append(
+                {
+                    "sample_kind": "pair_score",
+                    "query_id": rec["object_id_a"],
+                    "target_id": rec["object_id_b"],
+                    "score": score,
+                    "split": rec.get("split"),
+                    "chain_id": rec.get("chain_id"),
+                    "label": rec.get("label"),
+                    "weight": rec.get("weight"),
+                    "label_source": rec.get("label_source"),
+                    "reason": rec.get("reason"),
+                }
+            )
+        return scores
+
+    if not table_only:
+        path_file = stage1_dir / "hitl_pool.jsonl"
+        if not path_file.exists():
+            path_file = stage1_dir / "evidence_paths.jsonl"
+        for path in iter_jsonl(path_file):
+            mt = f"{path['asset_type']}_asset"
+            q_asset = pair_score(model, vectors, path["query_fragment_id"], "table_fragment", path["asset_id"], mt, device)
+            asset_t = pair_score(model, vectors, path["asset_id"], mt, path["target_fragment_id"], "table_fragment", device)
+            if q_asset is None or asset_t is None:
+                continue
+            path_score = min(q_asset, asset_t) if composition == "min" else q_asset * asset_t
+            scores.append(
+                {
+                    "sample_kind": "path_score",
+                    "path_id": path["path_id"],
+                    "split": path.get("split"),
+                    "chain_id": path.get("chain_id"),
+                    "query_fragment_id": path["query_fragment_id"],
+                    "asset_id": path["asset_id"],
+                    "asset_object_type": mt,
+                    "target_fragment_id": path["target_fragment_id"],
+                    "score_Q_asset": q_asset,
+                    "score_asset_T": asset_t,
+                    "path_score": path_score,
+                }
+            )
     for qrel in iter_jsonl(stage1_dir / "qrels.jsonl"):
         score = pair_score(model, vectors, qrel["query_id"], "table_fragment", qrel["target_id"], "table_fragment", device)
         if score is not None:
@@ -170,6 +210,8 @@ def run(args: argparse.Namespace) -> None:
     records = [rec for rec in iter_jsonl(Path(args.train_pairs)) if rec.get("split") == "train"]
     if not records:
         records = list(iter_jsonl(Path(args.train_pairs)))
+    if getattr(args, "table_only", False):
+        records = [rec for rec in records if rec.get("sample_kind") == "pair"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TeacherMLP(dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -193,7 +235,15 @@ def run(args: argparse.Namespace) -> None:
     torch.save({"state_dict": model.state_dict(), "dim": dim, "types": TYPES, "args": vars(args)}, out_dir / "teacher.pt")
     write_json(out_dir / "train_history.json", history)
     model.eval()
-    scores = score_paths(stage1_dir, model, vectors, device, args.path_composition)
+    scores = score_paths(
+        stage1_dir,
+        model,
+        vectors,
+        device,
+        args.path_composition,
+        table_only=getattr(args, "table_only", False),
+        pair_records=records,
+    )
     count = write_jsonl(stage1_dir / "teacher_scores.jsonl", scores)
     update_stage1_manifest(stage1_dir, "teacher", {"output_dir": str(out_dir), "scores": count, "history": history, "args": vars(args)})
     print(json.dumps({"scores": count, "output_dir": str(out_dir)}, ensure_ascii=False, indent=2))
@@ -210,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--table_only", action="store_true", help="Train and score only table-table pair samples; skip evidence path scoring.")
     return parser.parse_args()
 
 

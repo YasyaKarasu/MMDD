@@ -130,13 +130,15 @@ def run(args: argparse.Namespace) -> None:
         image_resize_cache_dir=str(emb_dir / "resized_images"),
     )
     stats = [encode_table_fragments(args, encoder, emb_dir)]
-    stats.extend(encode_assets(args, encoder, emb_dir))
+    if not getattr(args, "table_only", False):
+        stats.extend(encode_assets(args, encoder, emb_dir))
     payload = {
         "encoder_path": str(encoder.model_dir),
         "device": args.device,
         "dtype": args.dtype,
         "batch_size": args.batch_size,
         "max_image_pixels": getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
+        "table_only": bool(getattr(args, "table_only", False)),
         "objects": stats,
     }
     write_json(emb_dir / "embedding_stats.json", payload)
@@ -156,6 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_text_chars", type=int, default=2048)
     parser.add_argument("--max_image_pixels", type=int, default=DEFAULT_MAX_IMAGE_PIXELS)
     parser.add_argument("--force_recompute", action="store_true")
+    parser.add_argument("--table_only", action="store_true", help="Only encode table fragments; skip text/image asset embeddings.")
     return parser.parse_args()
 
 

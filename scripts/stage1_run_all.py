@@ -45,6 +45,7 @@ def run(args: argparse.Namespace) -> None:
                 max_text_chars=args.max_text_chars,
                 max_image_pixels=args.max_image_pixels,
                 force_recompute_embeddings=args.force_recompute_embeddings,
+                table_only=args.table_only,
             )
         )
     if not args.prepare_only:
@@ -87,6 +88,7 @@ def run(args: argparse.Namespace) -> None:
                 max_pairs_per_group=args.max_pairs_per_group,
                 pairwise_min_delta=args.pairwise_min_delta,
                 progress=getattr(args, "progress", True),
+                table_only=args.table_only,
             )
         )
     if not args.prepare_only and not args.train_only:
@@ -109,6 +111,8 @@ def run(args: argparse.Namespace) -> None:
                 beam_neighbors=args.beam_neighbors,
                 path_composition=args.path_composition,
                 progress=getattr(args, "progress", True),
+                table_only=args.table_only,
+                table_hnsw_k=args.table_hnsw_k,
             )
         )
 
@@ -124,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--train_only", action="store_true")
+    parser.add_argument("--table_only", action="store_true", help="Run Stage-1 using only table-table connectivity; skip multimodal evidence, HITL, path distillation, and path-aware eval.")
     parser.add_argument("--min_rows_per_fragment", type=int, default=5)
     parser.add_argument("--max_chains_per_table", type=int, default=10)
     parser.add_argument("--max_bridges_per_anchor", type=int, default=5)
@@ -187,6 +192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_hops", type=int, default=3)
     parser.add_argument("--beam_width", type=int, default=64)
     parser.add_argument("--beam_neighbors", type=int, default=50)
+    parser.add_argument(
+        "--table_hnsw_k",
+        type=int,
+        default=0,
+        help="right_target table neighbors to retrieve for table-only HNSW eval; 0 means all indexed target tables.",
+    )
     parser.add_argument("--no_progress", dest="progress", action="store_false")
     parser.set_defaults(progress=True)
     return parser.parse_args()

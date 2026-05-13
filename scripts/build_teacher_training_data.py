@@ -104,32 +104,33 @@ def run(args: argparse.Namespace) -> None:
                 }
             )
 
-    for path in load_paths(stage1_dir):
-        mapped = path_label(path)
-        if mapped is None:
-            continue
-        label, weight, source = mapped
-        samples.append(
-            {
-                "sample_id": f"train_path_{stable_hash(path['path_id'], source)}",
-                "sample_kind": "path",
-                "query_fragment_id": path["query_fragment_id"],
-                "query_object_type": "table_fragment",
-                "asset_id": path["asset_id"],
-                "asset_object_type": f"{path['asset_type']}_asset",
-                "target_fragment_id": path["target_fragment_id"],
-                "target_object_type": "table_fragment",
-                "label": label,
-                "weight": weight,
-                "split": path.get("split"),
-                "chain_id": path.get("chain_id"),
-                "path_id": path["path_id"],
-                "label_source": source,
-                "reason": path.get("reason"),
-            }
-        )
+    if not getattr(args, "table_only", False):
+        for path in load_paths(stage1_dir):
+            mapped = path_label(path)
+            if mapped is None:
+                continue
+            label, weight, source = mapped
+            samples.append(
+                {
+                    "sample_id": f"train_path_{stable_hash(path['path_id'], source)}",
+                    "sample_kind": "path",
+                    "query_fragment_id": path["query_fragment_id"],
+                    "query_object_type": "table_fragment",
+                    "asset_id": path["asset_id"],
+                    "asset_object_type": f"{path['asset_type']}_asset",
+                    "target_fragment_id": path["target_fragment_id"],
+                    "target_object_type": "table_fragment",
+                    "label": label,
+                    "weight": weight,
+                    "split": path.get("split"),
+                    "chain_id": path.get("chain_id"),
+                    "path_id": path["path_id"],
+                    "label_source": source,
+                    "reason": path.get("reason"),
+                }
+            )
 
-    if bool_arg(str(args.include_pseudo_labels)) and (stage1_dir / "teacher_scores.jsonl").exists():
+    if not getattr(args, "table_only", False) and bool_arg(str(args.include_pseudo_labels)) and (stage1_dir / "teacher_scores.jsonl").exists():
         for score in iter_jsonl(stage1_dir / "teacher_scores.jsonl"):
             path_score = score.get("path_score")
             if score.get("path_id") is None or path_score is None:
@@ -175,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo_pos_threshold", type=float, default=0.9)
     parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--table_only", action="store_true", help="Only emit table-table pair samples; skip path, HITL, and pseudo-label samples.")
     return parser.parse_args()
 
 
