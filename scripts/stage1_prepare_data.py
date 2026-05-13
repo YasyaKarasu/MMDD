@@ -31,6 +31,7 @@ def run(args: argparse.Namespace) -> None:
             min_bc_purity=args.min_bc_purity,
             min_support=args.min_support,
             max_bridge_unique_ratio=args.max_bridge_unique_ratio,
+            table_only=getattr(args, "table_only", False),
         )
     )
     if getattr(args, "table_only", False):

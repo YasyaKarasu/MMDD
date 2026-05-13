@@ -114,6 +114,8 @@ def run(args: argparse.Namespace) -> None:
                 progress=getattr(args, "progress", True),
                 table_only=args.table_only,
                 table_hnsw_k=args.table_hnsw_k,
+                recall_records=args.recall_records,
+                write_recall_records=getattr(args, "write_recall_records", True),
             )
         )
 
@@ -199,8 +201,10 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="right_target table neighbors to retrieve for table-only HNSW eval; 0 means all indexed target tables.",
     )
+    parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
+    parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument("--no_progress", dest="progress", action="store_false")
-    parser.set_defaults(progress=True)
+    parser.set_defaults(progress=True, write_recall_records=True)
     return parser.parse_args()
 
 

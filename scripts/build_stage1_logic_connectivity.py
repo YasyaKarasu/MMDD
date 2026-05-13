@@ -283,6 +283,7 @@ def run(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
+    table_only = bool(getattr(args, "table_only", False))
     output_dir.mkdir(parents=True, exist_ok=True)
     split_map = load_split_map(input_dir)
 
@@ -343,11 +344,20 @@ def run(args: argparse.Namespace) -> None:
                 )
                 qv_cols = [a_col, b_col] + query_context_cols
                 qv_rows, qv_source_rows = project_rows(table, qv_cols, dedupe_col=a_col, min_required_cols=2)
-                qh_cols = [a_col] + query_context_cols
-                qh_rows, qh_source_rows = project_rows(table, qh_cols, dedupe_col=a_col, min_required_cols=1)
                 t_cols = [b_col] + c_cols
                 t_rows, t_source_rows = build_target_rows(table, b_col, c_cols)
-                if min(len(qv_rows), len(qh_rows), len(t_rows)) < args.min_rows_per_fragment:
+                if table_only:
+                    if min(len(qv_rows), len(t_rows)) < args.min_rows_per_fragment:
+                        continue
+                    qh_rows: list[dict[str, Any]] = []
+                    qh_source_rows: list[int] = []
+                    qh_cols: list[int] = []
+                else:
+                    qh_cols = [a_col] + query_context_cols
+                    qh_rows, qh_source_rows = project_rows(table, qh_cols, dedupe_col=a_col, min_required_cols=1)
+                    if min(len(qv_rows), len(qh_rows), len(t_rows)) < args.min_rows_per_fragment:
+                        continue
+                if min(len(qv_rows), len(t_rows)) < args.min_rows_per_fragment:
                     continue
 
                 chain_id = f"chain_{stable_hash(source_table_id, a_col, b_col, ','.join(map(str, c_cols)))}"
@@ -370,22 +380,24 @@ def run(args: argparse.Namespace) -> None:
                         "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
                     },
                 )
-                q_hidden = make_fragment(
-                    table,
-                    split,
-                    chain_id,
-                    "left_hidden",
-                    qh_cols,
-                    qh_rows,
-                    qh_source_rows,
-                    f"{a_name} -> hidden({b_name})",
-                    {
-                        "visible_bridge": False,
-                        "hidden_bridge_col": b_col,
-                        "hidden_bridge_col_name": b_name,
-                        "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
-                    },
-                )
+                q_hidden = None
+                if not table_only:
+                    q_hidden = make_fragment(
+                        table,
+                        split,
+                        chain_id,
+                        "left_hidden",
+                        qh_cols,
+                        qh_rows,
+                        qh_source_rows,
+                        f"{a_name} -> hidden({b_name})",
+                        {
+                            "visible_bridge": False,
+                            "hidden_bridge_col": b_col,
+                            "hidden_bridge_col_name": b_name,
+                            "query_context_col_names": [get_column_name(table, col) for col in query_context_cols],
+                        },
+                    )
                 target = make_fragment(
                     table,
                     split,
@@ -397,20 +409,22 @@ def run(args: argparse.Namespace) -> None:
                     f"{b_name} -> {', '.join(c_names)}",
                     {"target_bridge_col_name": b_name},
                 )
-                fragments.extend([q_visible, q_hidden, target])
-                pairs.extend(
-                    [
-                        {
-                            "pair_id": f"pair_{stable_hash(q_visible['fragment_id'], target['fragment_id'])}",
-                            "source_table_id": source_table_id,
-                            "split": split,
-                            "chain_id": chain_id,
-                            "query_fragment_id": q_visible["fragment_id"],
-                            "target_fragment_id": target["fragment_id"],
-                            "label": 1,
-                            "weight": 1.0,
-                            "reason": f"visible_chain:{a_name}->{b_name}+{b_name}->{','.join(c_names)}",
-                        },
+                fragments.extend([q_visible, target] if table_only else [q_visible, q_hidden, target])
+                pairs.append(
+                    {
+                        "pair_id": f"pair_{stable_hash(q_visible['fragment_id'], target['fragment_id'])}",
+                        "source_table_id": source_table_id,
+                        "split": split,
+                        "chain_id": chain_id,
+                        "query_fragment_id": q_visible["fragment_id"],
+                        "target_fragment_id": target["fragment_id"],
+                        "label": 1,
+                        "weight": 1.0,
+                        "reason": f"visible_chain:{a_name}->{b_name}+{b_name}->{','.join(c_names)}",
+                    }
+                )
+                if q_hidden is not None:
+                    pairs.append(
                         {
                             "pair_id": f"pair_{stable_hash(q_hidden['fragment_id'], target['fragment_id'])}",
                             "source_table_id": source_table_id,
@@ -421,20 +435,21 @@ def run(args: argparse.Namespace) -> None:
                             "label": 1,
                             "weight": 0.4,
                             "reason": f"latent_chain:{a_name}->hidden({b_name})+{b_name}->{','.join(c_names)}",
-                        },
-                    ]
+                        }
+                    )
+                qrels.append(
+                    {
+                        "query_id": q_visible["fragment_id"],
+                        "target_id": target["fragment_id"],
+                        "rel": 3,
+                        "split": split,
+                        "chain_id": chain_id,
+                        "query_role": "left_visible",
+                        "target_role": "right_target",
+                    }
                 )
-                qrels.extend(
-                    [
-                        {
-                            "query_id": q_visible["fragment_id"],
-                            "target_id": target["fragment_id"],
-                            "rel": 3,
-                            "split": split,
-                            "chain_id": chain_id,
-                            "query_role": "left_visible",
-                            "target_role": "right_target",
-                        },
+                if q_hidden is not None:
+                    qrels.append(
                         {
                             "query_id": q_hidden["fragment_id"],
                             "target_id": target["fragment_id"],
@@ -443,9 +458,8 @@ def run(args: argparse.Namespace) -> None:
                             "chain_id": chain_id,
                             "query_role": "left_hidden",
                             "target_role": "right_target",
-                        },
-                    ]
-                )
+                        }
+                    )
                 if len(debug_examples) < 25:
                     debug_examples.append(
                         {
@@ -492,6 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_bc_purity", type=float, default=0.85)
     parser.add_argument("--min_support", type=int, default=6)
     parser.add_argument("--max_bridge_unique_ratio", type=float, default=0.85)
+    parser.add_argument("--table_only", action="store_true", help="Build only visible table-table connectivity; do not create hidden bridge queries.")
     return parser.parse_args()
 
 

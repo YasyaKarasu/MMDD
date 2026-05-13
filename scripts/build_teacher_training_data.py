@@ -60,6 +60,8 @@ def run(args: argparse.Namespace) -> None:
         t = fragments.get(pair["target_fragment_id"])
         if not q or not t:
             continue
+        if getattr(args, "table_only", False) and q.get("role") != "left_visible":
+            continue
         weight = float(pair.get("weight", 1.0))
         label_source = "self_supervised" if q.get("role") == "left_visible" else "weak"
         if q.get("role") == "left_hidden":

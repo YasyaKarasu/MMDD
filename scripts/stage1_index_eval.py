@@ -49,6 +49,8 @@ def run(args: argparse.Namespace) -> None:
                 seed=args.seed,
                 table_only=getattr(args, "table_only", False),
                 table_hnsw_k=args.table_hnsw_k,
+                recall_records=args.recall_records,
+                write_recall_records=getattr(args, "write_recall_records", True),
             )
         )
     update_stage1_manifest(Path(args.stage1_dir), "stage1_index_eval", {"args": vars(args)})
@@ -74,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beam_neighbors", type=int, default=50)
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--table_only", action="store_true", help="Build/evaluate only direct table-to-table retrieval; skip path-aware metrics.")
+    parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
+    parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument(
         "--table_hnsw_k",
         type=int,
@@ -81,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         help="right_target table neighbors to retrieve for table-only HNSW eval; 0 means all indexed target tables.",
     )
     parser.add_argument("--no_progress", dest="progress", action="store_false")
-    parser.set_defaults(progress=True)
+    parser.set_defaults(progress=True, write_recall_records=True)
     return parser.parse_args()
 
 

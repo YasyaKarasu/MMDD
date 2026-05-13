@@ -15,11 +15,13 @@ import build_mm_table_dataset as mm_table_dataset
 import build_stage1_embeddings as stage1_embeddings
 import qwen3_vl_embedding
 from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_target_rows, choose_query_context_cols
+from build_stage1_logic_connectivity import run as build_logic_connectivity
 from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
 from stage1_connection_viewer import create_app as create_connection_viewer_app
 from stage1_connection_viewer import load_assets
 from stage1_connection_viewer import load_groups
+from stage1_recall_viewer import assemble_query_cards, load_recorded_recall_cards, render_targets
 from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
 from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_exception, resize_batch_images_for_limit
@@ -29,7 +31,7 @@ from stage1_serialization import serialize_table_for_embedding
 from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
 from train_student import Student, build_distill_records, build_ranking_groups, train_loss
-from eval_stage1_recall import infer_table_only, relation_query_from_projected, table_rankings
+from eval_stage1_recall import bridge_recall_record, direct_eval_qrels, direct_recall_records, infer_table_only, relation_query_from_projected, table_rankings
 
 
 def cell(idx, name, text):
@@ -119,6 +121,74 @@ def test_query_fragments_keep_irrelevant_context_without_target_leakage():
     assert [cell["source_column_index"] for cell in qh_rows[0]["cells"]] == [0, 3]
     assert 2 not in [cell["source_column_index"] for cell in qv_rows[0]["cells"]]
     assert 1 not in [cell["source_column_index"] for cell in qh_rows[0]["cells"]]
+
+
+def test_table_only_logic_connectivity_does_not_create_hidden_queries(tmp_path):
+    input_dir = tmp_path / "input"
+    stage = tmp_path / "stage"
+    rows = []
+    for row_id, (entity, bridge, attr) in enumerate(
+        [
+            ("a1", "b1", "c1"),
+            ("a2", "b1", "c1"),
+            ("a3", "b1", "c1"),
+            ("a4", "b2", "c2"),
+            ("a5", "b2", "c2"),
+            ("a6", "b2", "c2"),
+        ]
+    ):
+        rows.append(
+            {
+                "row_id": row_id,
+                "cells": [
+                    cell(0, "Entity", entity),
+                    cell(1, "Bridge", bridge),
+                    cell(2, "Attr", attr),
+                ],
+            }
+        )
+    table = {
+        "source_table_id": "source_1",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Bridge"},
+            {"column_index": 2, "column_name": "Attr"},
+        ],
+        "rows": rows,
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    write_jsonl(input_dir / "source_tables" / "part-00000.jsonl", [table])
+    (input_dir / "dataset_manifest.json").write_text(
+        json.dumps({"artifacts": {"source_tables": {"shards": [{"path": "source_tables/part-00000.jsonl", "records": 1}]}}}),
+        encoding="utf-8",
+    )
+    (input_dir / "splits.json").write_text(json.dumps({"train": {"source_table_ids": ["source_1"]}}), encoding="utf-8")
+
+    build_logic_connectivity(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(stage),
+            min_rows_per_fragment=2,
+            max_chains_per_table=10,
+            max_bridges_per_anchor=5,
+            max_target_attrs=1,
+            max_query_context_attrs=0,
+            seed=13,
+            min_ab_purity=0.95,
+            min_bc_purity=0.85,
+            min_support=2,
+            max_bridge_unique_ratio=0.85,
+            table_only=True,
+        )
+    )
+
+    fragments = [json.loads(line) for line in (stage / "logic_fragments.jsonl").read_text().splitlines()]
+    qrels = [json.loads(line) for line in (stage / "qrels.jsonl").read_text().splitlines()]
+    pairs = [json.loads(line) for line in (stage / "logic_pairs.jsonl").read_text().splitlines()]
+    assert {fragment["role"] for fragment in fragments} == {"left_visible", "right_target"}
+    assert {qrel["query_role"] for qrel in qrels} == {"left_visible"}
+    fragment_roles = {fragment["fragment_id"]: fragment["role"] for fragment in fragments}
+    assert {fragment_roles[pair["query_fragment_id"]] for pair in pairs} == {"left_visible"}
 
 
 def test_same_source_targets_with_query_bridge_column_are_positive():
@@ -858,6 +928,140 @@ def test_connection_viewer_shows_only_referenced_text_chunk(tmp_path):
     assert "First chunk" not in path["asset_content_snippet"]
 
 
+def test_recall_viewer_cards_show_recalled_targets_and_bridge_path():
+    fragments = {
+        "q": {
+            "fragment_id": "q",
+            "role": "left_hidden",
+            "split": "test",
+            "chain_id": "c1",
+            "page_title": "Query Page",
+            "statement": "A -> hidden(B)",
+            "columns": [{"column_name": "A"}],
+            "rows": [{"cells": [{"text": "Alpha"}]}],
+        },
+        "t_hit": {
+            "fragment_id": "t_hit",
+            "role": "right_target",
+            "split": "test",
+            "chain_id": "c1",
+            "page_title": "Target Page",
+            "statement": "B -> C",
+            "columns": [{"column_name": "B"}],
+            "rows": [{"cells": [{"text": "Beta"}]}],
+        },
+        "t_miss": {
+            "fragment_id": "t_miss",
+            "role": "right_target",
+            "split": "test",
+            "chain_id": "c2",
+            "page_title": "Other Page",
+            "statement": "X -> Y",
+            "columns": [{"column_name": "X"}],
+            "rows": [{"cells": [{"text": "Other"}]}],
+        },
+    }
+    qrels = [{"query_id": "q", "target_id": "t_hit", "rel": 2, "split": "test", "query_role": "left_hidden", "chain_id": "c1"}]
+    direct_by_query = {"q": [{"target_id": "t_miss", "score": 0.8, "path": [("q", "table_fragment"), ("t_miss", "table_fragment")]}]}
+    path_by_query = {
+        "q": [
+            {
+                "target_id": "t_hit",
+                "score": 0.7,
+                "path": [("q", "table_fragment"), ("asset_a", "text_asset"), ("t_hit", "table_fragment")],
+            }
+        ]
+    }
+    path_records = {
+        ("q", "asset_a", "t_hit"): {
+            "path_id": "path_a",
+            "query_fragment_id": "q",
+            "asset_id": "asset_a",
+            "target_fragment_id": "t_hit",
+            "bridge_col_name": "Bridge",
+            "bridge_value": "Beta",
+        }
+    }
+    assets = {"asset_a": {"asset_id": "asset_a", "asset_type": "text", "entity_wiki_title": "Alpha", "content": "Alpha mentions Beta."}}
+
+    cards = assemble_query_cards(qrels, fragments, direct_by_query, path_by_query, path_records, assets, max_rows=5)
+
+    assert len(cards) == 1
+    assert cards[0]["relevant_targets"][0]["target_fragment"]["rows"] == [{"B": "Beta"}]
+    assert cards[0]["direct_targets"][0]["target_id"] == "t_miss"
+    assert not cards[0]["direct_targets"][0]["is_relevant"]
+    assert cards[0]["direct_targets"][0]["target_fragment"]["rows"] == [{"X": "Other"}]
+    path_target = cards[0]["path_targets"][0]
+    assert path_target["target_id"] == "t_hit"
+    assert path_target["is_relevant"]
+    assert path_target["target_fragment"]["rows"] == [{"B": "Beta"}]
+    assert "<td>Beta</td>" in render_targets([path_target], "path")
+    assert path_target["has_bridge"]
+    bridge_node = path_target["path_nodes"][1]
+    assert bridge_node["type"] == "text_asset"
+    assert bridge_node["bridge"] == "Bridge = Beta"
+    assert bridge_node["path_id"] == "path_a"
+
+
+def test_eval_recall_records_can_drive_recall_viewer(tmp_path):
+    write_jsonl(
+        tmp_path / "logic_fragments.jsonl",
+        [
+            {
+                "fragment_id": "q",
+                "role": "left_hidden",
+                "split": "test",
+                "chain_id": "c1",
+                "page_title": "Query Page",
+                "statement": "A -> hidden(B)",
+                "columns": [{"column_name": "A"}],
+                "rows": [{"cells": [{"text": "Alpha"}]}],
+            },
+            {
+                "fragment_id": "t",
+                "role": "right_target",
+                "split": "test",
+                "chain_id": "c1",
+                "page_title": "Target Page",
+                "statement": "B -> C",
+                "columns": [{"column_name": "B"}],
+                "rows": [{"cells": [{"text": "Beta"}]}],
+            },
+        ],
+    )
+    qrels = [{"query_id": "q", "target_id": "t", "rel": 2, "split": "test", "query_role": "left_hidden", "chain_id": "c1"}]
+    direct_records = direct_recall_records(qrels, {"q": ["t"]}, topk=1)
+    bridge_record = bridge_recall_record(
+        "q",
+        qrels,
+        ["t"],
+        {"t": {"score": 0.75, "path": [("q", "table_fragment"), ("asset_a", "text_asset"), ("t", "table_fragment")]}},
+        {
+            ("q", "asset_a", "t"): {
+                "path_id": "path_a",
+                "asset_id": "asset_a",
+                "asset_type": "text",
+                "bridge_col_name": "Bridge",
+                "bridge_value": "Beta",
+                "claim_text": "Alpha -> Beta",
+            }
+        },
+        topk=1,
+    )
+    write_jsonl(tmp_path / "recall_rankings.jsonl", [*direct_records, bridge_record])
+    args = argparse.Namespace(stage1_dir=str(tmp_path), recall_records=None, max_rows=5)
+
+    cards = load_recorded_recall_cards(args)
+
+    assert cards is not None
+    assert cards[0]["direct_targets"][0]["target_id"] == "t"
+    assert cards[0]["direct_targets"][0]["is_relevant"]
+    path_target = cards[0]["path_targets"][0]
+    assert path_target["score"] == 0.75
+    assert path_target["path_nodes"][1]["bridge"] == "Bridge = Beta"
+    assert path_target["path_nodes"][1]["path_id"] == "path_a"
+
+
 def test_train_pairs_do_not_auto_positive_unlabeled_assets(tmp_path):
     stage = tmp_path
     write_jsonl(
@@ -900,13 +1104,17 @@ def test_table_only_train_pairs_exclude_path_labels(tmp_path):
         stage / "logic_fragments.jsonl",
         [
             {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment", "split": "train", "chain_id": "c1", "source_table_id": "s1"},
+            {"fragment_id": "qh", "role": "left_hidden", "object_type": "table_fragment", "split": "train", "chain_id": "c1", "source_table_id": "s1"},
             {"fragment_id": "t", "role": "right_target", "object_type": "table_fragment", "split": "train", "chain_id": "c1", "source_table_id": "s1"},
             {"fragment_id": "tneg", "role": "right_target", "object_type": "table_fragment", "split": "train", "chain_id": "c2", "source_table_id": "s2"},
         ],
     )
     write_jsonl(
         stage / "logic_pairs.jsonl",
-        [{"pair_id": "p", "source_table_id": "s1", "split": "train", "chain_id": "c1", "query_fragment_id": "qv", "target_fragment_id": "t", "label": 1, "weight": 1.0}],
+        [
+            {"pair_id": "p_visible", "source_table_id": "s1", "split": "train", "chain_id": "c1", "query_fragment_id": "qv", "target_fragment_id": "t", "label": 1, "weight": 1.0},
+            {"pair_id": "p_hidden", "source_table_id": "s1", "split": "train", "chain_id": "c1", "query_fragment_id": "qh", "target_fragment_id": "t", "label": 1, "weight": 0.4},
+        ],
     )
     write_jsonl(
         stage / "hitl_pool.jsonl",
@@ -937,6 +1145,7 @@ def test_table_only_train_pairs_exclude_path_labels(tmp_path):
     records = [json.loads(line) for line in out.read_text().splitlines()]
     assert records
     assert {r["sample_kind"] for r in records} == {"pair"}
+    assert {r["object_id_a"] for r in records} == {"qv"}
     assert not any("asset_id" in r for r in records)
 
 
@@ -1023,17 +1232,18 @@ def test_table_only_eval_uses_hnsw_table_index(tmp_path):
     write_jsonl(
         stage / "logic_fragments.jsonl",
         [
-            {"fragment_id": "q", "role": "left_hidden", "object_type": "table_fragment"},
+            {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment"},
+            {"fragment_id": "qh", "role": "left_hidden", "object_type": "table_fragment"},
             {"fragment_id": "t_good", "role": "right_target", "object_type": "table_fragment"},
             {"fragment_id": "t_bad", "role": "right_target", "object_type": "table_fragment"},
         ],
     )
-    projected_ids = ["q", "t_good", "t_bad"]
-    projected_arr = np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype="float32")
+    projected_ids = ["qv", "qh", "t_good", "t_bad"]
+    projected_arr = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype="float32")
     np.save(index_emb_dir / "table_fragment.npy", projected_arr)
     (index_emb_dir / "table_fragment_ids.json").write_text(json.dumps(projected_ids), encoding="utf-8")
     index_ids = ["t_good", "t_bad"]
-    index_arr = projected_arr[[1, 2]]
+    index_arr = projected_arr[[2, 3]]
     index = hnswlib.Index(space="cosine", dim=2)
     index.init_index(max_elements=2, ef_construction=20, M=8)
     index.add_items(index_arr, np.arange(2))
@@ -1052,8 +1262,9 @@ def test_table_only_eval_uses_hnsw_table_index(tmp_path):
         torch.device("cpu"),
         [1],
     )
-    assert rankings["q"][0] == "t_good"
-    assert "q" not in rankings["q"]
+    assert rankings["qv"][0] == "t_good"
+    assert "qh" not in rankings
+    assert "qv" not in rankings["qv"]
 
 
 def test_eval_infers_table_only_from_hnsw_stats(tmp_path):
@@ -1062,6 +1273,15 @@ def test_eval_infers_table_only_from_hnsw_stats(tmp_path):
     (hnsw_dir / "hnsw_stats.json").write_text(json.dumps({"table_only": True}), encoding="utf-8")
     args = argparse.Namespace(table_only=False, hnsw_dir=str(hnsw_dir))
     assert infer_table_only(args, tmp_path)
+
+
+def test_table_only_direct_eval_qrels_keep_only_visible_queries():
+    qrels = [
+        {"query_id": "qv", "target_id": "t", "query_role": "left_visible"},
+        {"query_id": "qh", "target_id": "t", "query_role": "left_hidden"},
+    ]
+    assert direct_eval_qrels(qrels, table_only=True) == [qrels[0]]
+    assert direct_eval_qrels(qrels, table_only=False) == qrels
 
 
 def test_hnsw_table_index_contains_only_right_targets(tmp_path):

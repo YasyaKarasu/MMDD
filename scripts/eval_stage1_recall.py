@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from stage1_io import iter_jsonl, update_stage1_manifest, write_json
+from stage1_io import iter_jsonl, update_stage1_manifest, write_json, write_jsonl
 from train_student import Student, TYPES, load_embeddings
 
 try:
@@ -97,6 +97,127 @@ def metrics_for(qrels: list[dict[str, Any]], rankings: dict[str, list[str]], top
     return out
 
 
+def qrels_by_query(qrels: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for qrel in qrels:
+        grouped[qrel["query_id"]].append(qrel)
+    return grouped
+
+
+def relevant_by_target(qrels: list[dict[str, Any]]) -> dict[str, int]:
+    return {qrel["target_id"]: int(qrel.get("rel", 1)) for qrel in qrels}
+
+
+def recall_record_header(query_id: str, qrels: list[dict[str, Any]], retrieval_mode: str, topk: int) -> dict[str, Any]:
+    first = qrels[0] if qrels else {}
+    return {
+        "sample_kind": "recall_ranking",
+        "retrieval_mode": retrieval_mode,
+        "query_id": query_id,
+        "query_role": first.get("query_role"),
+        "split": first.get("split"),
+        "chain_id": first.get("chain_id"),
+        "topk": topk,
+        "relevant_targets": [
+            {
+                "target_id": qrel["target_id"],
+                "rel": int(qrel.get("rel", 1)),
+                "chain_id": qrel.get("chain_id"),
+                "target_role": qrel.get("target_role"),
+            }
+            for qrel in qrels
+        ],
+    }
+
+
+def direct_recall_records(qrels: list[dict[str, Any]], rankings: dict[str, list[str]], topk: int) -> list[dict[str, Any]]:
+    records = []
+    for query_id, query_qrels in sorted(qrels_by_query(qrels).items()):
+        relevant = relevant_by_target(query_qrels)
+        record = recall_record_header(query_id, query_qrels, "direct_table", topk)
+        record["targets"] = [
+            {
+                "rank": rank,
+                "target_id": target_id,
+                "is_relevant": target_id in relevant,
+                "rel": relevant.get(target_id),
+            }
+            for rank, target_id in enumerate(rankings.get(query_id, [])[:topk], 1)
+        ]
+        records.append(record)
+    return records
+
+
+def direct_eval_qrels(qrels: list[dict[str, Any]], table_only: bool) -> list[dict[str, Any]]:
+    if not table_only:
+        return qrels
+    return [qrel for qrel in qrels if qrel.get("query_role") == "left_visible"]
+
+
+def serialize_path_nodes(path: list[tuple[str, str]]) -> list[dict[str, str]]:
+    return [{"node_id": node_id, "node_type": node_type} for node_id, node_type in path]
+
+
+def bridge_path_metadata(
+    query_id: str,
+    target_id: str,
+    path: list[tuple[str, str]],
+    paths_by_query_asset_target: dict[tuple[str, str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    for node_id, node_type in path:
+        if node_type not in {"text_asset", "image_asset"}:
+            continue
+        record = paths_by_query_asset_target.get((query_id, node_id, target_id))
+        if not record:
+            continue
+        return {
+            "path_id": record.get("path_id"),
+            "asset_id": record.get("asset_id"),
+            "asset_type": record.get("asset_type"),
+            "entity_text": record.get("entity_text"),
+            "bridge_col_name": record.get("bridge_col_name"),
+            "bridge_value": record.get("bridge_value"),
+            "target_bridge_col_name": record.get("target_bridge_col_name"),
+            "claim_text": record.get("claim_text"),
+            "weak_label": record.get("weak_label"),
+            "weak_score": record.get("weak_score"),
+            "human_label": record.get("human_label"),
+            "teacher_score": record.get("teacher_score"),
+        }
+    return {}
+
+
+def bridge_recall_record(
+    query_id: str,
+    query_qrels: list[dict[str, Any]],
+    ranked: list[str],
+    best_paths: dict[str, dict[str, Any]],
+    paths_by_query_asset_target: dict[tuple[str, str, str], dict[str, Any]],
+    topk: int,
+) -> dict[str, Any]:
+    relevant = relevant_by_target(query_qrels)
+    record = recall_record_header(query_id, query_qrels, "bridge_aware", topk)
+    targets = []
+    for rank, target_id in enumerate(ranked[:topk], 1):
+        payload = best_paths.get(target_id, {})
+        path = payload.get("path", [])
+        path_metadata = bridge_path_metadata(query_id, target_id, path, paths_by_query_asset_target)
+        targets.append(
+            {
+                "rank": rank,
+                "target_id": target_id,
+                "score": payload.get("score"),
+                "is_relevant": target_id in relevant,
+                "rel": relevant.get(target_id),
+                "path": serialize_path_nodes(path),
+                "has_bridge": any(node_type in {"text_asset", "image_asset"} for _, node_type in path),
+                "path_metadata": path_metadata,
+            }
+        )
+    record["targets"] = targets
+    return record
+
+
 def table_rankings(
     args: argparse.Namespace,
     stage1_dir: Path,
@@ -106,7 +227,8 @@ def table_rankings(
     topks: list[int],
 ) -> dict[str, list[str]]:
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
-    queries = [f for f in fragments.values() if f.get("role") in {"left_visible", "left_hidden"} and f["fragment_id"] in vectors]
+    query_roles = {"left_visible"} if getattr(args, "table_only", False) else {"left_visible", "left_hidden"}
+    queries = [f for f in fragments.values() if f.get("role") in query_roles and f["fragment_id"] in vectors]
     targets = [f for f in fragments.values() if f.get("role") == "right_target" and f["fragment_id"] in vectors]
     if getattr(args, "table_only", False):
         return hnsw_table_rankings(args, model, queries, targets, device, topks)
@@ -302,7 +424,15 @@ def beam_search_tables(
     return ranked, best_tables
 
 
-def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Student, vectors: dict[str, np.ndarray], device: torch.device, topks: list[int]) -> dict[str, Any]:
+def path_aware_metrics(
+    args: argparse.Namespace,
+    stage1_dir: Path,
+    model: Student,
+    vectors: dict[str, np.ndarray],
+    device: torch.device,
+    topks: list[int],
+    recall_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     student_dir = Path(args.student_dir)
     emb_dir = student_dir / "index_embeddings"
     table_arr = np.load(emb_dir / "table_fragment.npy")
@@ -323,6 +453,7 @@ def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Studen
     for path in pool_iter:
         paths_by_query_asset_target[(path["query_fragment_id"], path["asset_id"], path["target_fragment_id"])] = path
     qrels = [rec for rec in iter_jsonl(Path(args.qrels))]
+    qrels_by_qid = qrels_by_query(qrels)
     hidden_q = sorted({q["query_id"] for q in qrels if q.get("query_role") == "left_hidden"})
     correct = defaultdict(set)
     for q in qrels:
@@ -343,6 +474,17 @@ def path_aware_metrics(args: argparse.Namespace, stage1_dir: Path, model: Studen
         if qid not in projected:
             continue
         ranked, best_paths = beam_search_tables(args, model, vectors, projected, indexes, ids_by_type, qid, device)
+        if recall_records is not None:
+            recall_records.append(
+                bridge_recall_record(
+                    qid,
+                    qrels_by_qid.get(qid, []),
+                    ranked,
+                    best_paths,
+                    paths_by_query_asset_target,
+                    max(topks),
+                )
+            )
         total_retrieved_tables += len(ranked)
         for tid, payload in best_paths.items():
             path_nodes = payload["path"]
@@ -380,13 +522,28 @@ def run(args: argparse.Namespace) -> None:
     model = load_student(Path(args.student_dir), device)
     qrels = list(iter_jsonl(Path(args.qrels)))
     rankings = table_rankings(args, stage1_dir, model, vectors, device, topks)
+    direct_qrels = direct_eval_qrels(qrels, getattr(args, "table_only", False))
+    recall_records = direct_recall_records(direct_qrels, rankings, max(topks)) if getattr(args, "write_recall_records", True) else []
     results: dict[str, Any] = {}
+    roles = ("left_visible",) if getattr(args, "table_only", False) else ("left_visible", "left_hidden")
     for split in ("dev", "test"):
-        for role in ("left_visible", "left_hidden"):
-            subset = [q for q in qrels if q.get("split") == split and q.get("query_role") == role]
+        for role in roles:
+            subset = [q for q in direct_qrels if q.get("split") == split and q.get("query_role") == role]
             results[f"{split}_{role}"] = metrics_for(subset, rankings, topks)
     if not getattr(args, "table_only", False):
-        results["path_aware"] = path_aware_metrics(args, stage1_dir, model, vectors, device, topks)
+        results["path_aware"] = path_aware_metrics(
+            args,
+            stage1_dir,
+            model,
+            vectors,
+            device,
+            topks,
+            recall_records if getattr(args, "write_recall_records", True) else None,
+        )
+    if getattr(args, "write_recall_records", True):
+        recall_records_path = Path(getattr(args, "recall_records", "") or stage1_dir / "recall_rankings.jsonl")
+        write_jsonl(recall_records_path, recall_records)
+        results["recall_records"] = {"path": str(recall_records_path), "records": len(recall_records), "topk": max(topks)}
     write_json(stage1_dir / "eval_results.json", results)
     update_stage1_manifest(stage1_dir, "eval", {"results": results, "args": vars(args)})
     print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -405,6 +562,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--table_only", action="store_true", help="Only compute direct table-to-table recall; skip path-aware metrics.")
+    parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
+    parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument(
         "--table_hnsw_k",
         type=int,
@@ -412,7 +571,7 @@ def parse_args() -> argparse.Namespace:
         help="right_target table neighbors to retrieve for table-only HNSW eval; 0 means all indexed target tables.",
     )
     parser.add_argument("--no_progress", dest="progress", action="store_false")
-    parser.set_defaults(progress=True)
+    parser.set_defaults(progress=True, write_recall_records=True)
     return parser.parse_args()
 
 
