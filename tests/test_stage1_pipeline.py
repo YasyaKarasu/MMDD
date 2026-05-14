@@ -1149,6 +1149,188 @@ def test_table_only_train_pairs_exclude_path_labels(tmp_path):
     assert not any("asset_id" in r for r in records)
 
 
+def test_table_only_train_pairs_include_same_source_non_joinable_hard_negatives(tmp_path):
+    stage = tmp_path
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {
+                "fragment_id": "qv",
+                "role": "left_visible",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c1",
+                "source_table_id": "s1",
+                "visible_bridge_col": 1,
+                "source_column_indices": [0, 1],
+            },
+            {
+                "fragment_id": "t_pos",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c1",
+                "source_table_id": "s1",
+                "source_column_indices": [1, 2],
+            },
+            {
+                "fragment_id": "t_hard",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c2",
+                "source_table_id": "s1",
+                "source_column_indices": [3],
+            },
+            {
+                "fragment_id": "t_joinable",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c3",
+                "source_table_id": "s1",
+                "source_column_indices": [1, 4],
+            },
+            {
+                "fragment_id": "t_other_source",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c4",
+                "source_table_id": "s2",
+                "source_column_indices": [9],
+            },
+        ],
+    )
+    write_jsonl(
+        stage / "logic_pairs.jsonl",
+        [
+            {
+                "pair_id": "p_visible",
+                "source_table_id": "s1",
+                "split": "train",
+                "chain_id": "c1",
+                "query_fragment_id": "qv",
+                "target_fragment_id": "t_pos",
+                "label": 1,
+                "weight": 1.0,
+            },
+        ],
+    )
+    from build_teacher_training_data import run as build_train
+
+    out = stage / "train_pairs.jsonl"
+    build_train(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            output=str(out),
+            include_pseudo_labels="false",
+            pseudo_pos_threshold=0.9,
+            pseudo_neg_threshold=0.1,
+            seed=13,
+            table_only=True,
+            hard_negatives_per_positive=3,
+        )
+    )
+    records = [json.loads(line) for line in out.read_text().splitlines()]
+    hard = [record for record in records if record.get("label_source") == "hard_negative"]
+    assert len(hard) == 1
+    assert hard[0]["object_id_b"] == "t_hard"
+    assert hard[0]["label"] == 0.0
+    assert hard[0]["reason"] == "same_source_non_joinable_target"
+    assert not any(record["object_id_b"] == "t_joinable" and record.get("label_source") == "hard_negative" for record in records)
+
+
+def test_hidden_train_pairs_include_same_source_non_joinable_hard_negatives(tmp_path):
+    stage = tmp_path
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {
+                "fragment_id": "qh",
+                "role": "left_hidden",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c1",
+                "source_table_id": "s1",
+                "hidden_bridge_col": 1,
+                "source_column_indices": [0],
+            },
+            {
+                "fragment_id": "t_pos",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c1",
+                "source_table_id": "s1",
+                "source_column_indices": [1, 2],
+            },
+            {
+                "fragment_id": "t_hard",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c2",
+                "source_table_id": "s1",
+                "source_column_indices": [3],
+            },
+            {
+                "fragment_id": "t_joinable",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c3",
+                "source_table_id": "s1",
+                "source_column_indices": [1, 4],
+            },
+            {
+                "fragment_id": "t_other_source",
+                "role": "right_target",
+                "object_type": "table_fragment",
+                "split": "train",
+                "chain_id": "c4",
+                "source_table_id": "s2",
+                "source_column_indices": [9],
+            },
+        ],
+    )
+    write_jsonl(
+        stage / "logic_pairs.jsonl",
+        [
+            {
+                "pair_id": "p_hidden",
+                "source_table_id": "s1",
+                "split": "train",
+                "chain_id": "c1",
+                "query_fragment_id": "qh",
+                "target_fragment_id": "t_pos",
+                "label": 1,
+                "weight": 0.4,
+            },
+        ],
+    )
+    from build_teacher_training_data import run as build_train
+
+    out = stage / "train_pairs.jsonl"
+    build_train(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            output=str(out),
+            include_pseudo_labels="false",
+            pseudo_pos_threshold=0.9,
+            pseudo_neg_threshold=0.1,
+            seed=13,
+            hard_negatives_per_positive=3,
+        )
+    )
+    records = [json.loads(line) for line in out.read_text().splitlines()]
+    hard = [record for record in records if record.get("label_source") == "hard_negative"]
+    assert len(hard) == 1
+    assert hard[0]["object_id_a"] == "qh"
+    assert hard[0]["object_id_b"] == "t_hard"
+    assert not any(record["object_id_b"] == "t_joinable" and record.get("label_source") == "hard_negative" for record in records)
+
+
 def test_table_only_student_distill_records_exclude_paths(tmp_path):
     stage = tmp_path
     scores = stage / "teacher_scores.jsonl"

@@ -44,17 +44,81 @@ def path_label(path: dict[str, Any]) -> tuple[float, float, str] | None:
     return None
 
 
+def int_set(values: list[Any] | None) -> set[int]:
+    cols: set[int] = set()
+    for value in values or []:
+        try:
+            cols.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return cols
+
+
+def query_bridge_columns(fragment: dict[str, Any]) -> set[int]:
+    bridge_cols: set[int] = set()
+    for key in ("visible_bridge_col", "hidden_bridge_col"):
+        value = fragment.get(key)
+        if value is None:
+            continue
+        try:
+            bridge_cols.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return bridge_cols
+
+
+def add_pair_sample(
+    samples: list[dict[str, Any]],
+    emitted: set[tuple[str, str, str]],
+    *,
+    sample_id: str,
+    qid: str,
+    tid: str,
+    label: float,
+    weight: float,
+    split: str | None,
+    chain_id: str | None,
+    label_source: str,
+    reason: str | None,
+) -> None:
+    key = (qid, tid, label_source)
+    if key in emitted:
+        return
+    emitted.add(key)
+    samples.append(
+        {
+            "sample_id": sample_id,
+            "sample_kind": "pair",
+            "object_id_a": qid,
+            "object_type_a": "table_fragment",
+            "object_id_b": tid,
+            "object_type_b": "table_fragment",
+            "label": label,
+            "weight": weight,
+            "split": split,
+            "chain_id": chain_id,
+            "label_source": label_source,
+            "reason": reason,
+        }
+    )
+
+
 def run(args: argparse.Namespace) -> None:
     setup_logging()
     rng = random.Random(args.seed)
     stage1_dir = Path(args.stage1_dir)
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     targets_by_split: dict[str, list[dict[str, Any]]] = {}
+    targets_by_source_split: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
     for frag in fragments.values():
         if frag.get("role") == "right_target":
             targets_by_split.setdefault(frag.get("split", "unknown"), []).append(frag)
+            source_split = (frag.get("source_table_id"), frag.get("split", "unknown"))
+            targets_by_source_split.setdefault(source_split, []).append(frag)
     samples: list[dict[str, Any]] = []
     logic_pairs = list(iter_jsonl(stage1_dir / "logic_pairs.jsonl"))
+    positive_pairs = {(pair.get("query_fragment_id"), pair.get("target_fragment_id")) for pair in logic_pairs}
+    emitted_pairs: set[tuple[str, str, str]] = set()
     for pair in logic_pairs:
         q = fragments.get(pair["query_fragment_id"])
         t = fragments.get(pair["target_fragment_id"])
@@ -66,21 +130,18 @@ def run(args: argparse.Namespace) -> None:
         label_source = "self_supervised" if q.get("role") == "left_visible" else "weak"
         if q.get("role") == "left_hidden":
             weight = min(weight, 0.4)
-        samples.append(
-            {
-                "sample_id": f"train_{stable_hash(pair['pair_id'])}",
-                "sample_kind": "pair",
-                "object_id_a": q["fragment_id"],
-                "object_type_a": "table_fragment",
-                "object_id_b": t["fragment_id"],
-                "object_type_b": "table_fragment",
-                "label": float(pair["label"]),
-                "weight": weight,
-                "split": pair.get("split"),
-                "chain_id": pair.get("chain_id"),
-                "label_source": label_source,
-                "reason": pair.get("reason"),
-            }
+        add_pair_sample(
+            samples,
+            emitted_pairs,
+            sample_id=f"train_{stable_hash(pair['pair_id'])}",
+            qid=q["fragment_id"],
+            tid=t["fragment_id"],
+            label=float(pair["label"]),
+            weight=weight,
+            split=pair.get("split"),
+            chain_id=pair.get("chain_id"),
+            label_source=label_source,
+            reason=pair.get("reason"),
         )
         negatives = [
             cand
@@ -89,22 +150,42 @@ def run(args: argparse.Namespace) -> None:
         ]
         rng.shuffle(negatives)
         for neg in negatives[:1]:
-            samples.append(
-                {
-                    "sample_id": f"train_neg_{stable_hash(q['fragment_id'], neg['fragment_id'])}",
-                    "sample_kind": "pair",
-                    "object_id_a": q["fragment_id"],
-                    "object_type_a": "table_fragment",
-                    "object_id_b": neg["fragment_id"],
-                    "object_type_b": "table_fragment",
-                    "label": 0.0,
-                    "weight": 1.0,
-                    "split": pair.get("split"),
-                    "chain_id": pair.get("chain_id"),
-                    "label_source": "negative",
-                    "reason": "same_split_different_source_chain_target",
-                }
+            add_pair_sample(
+                samples,
+                emitted_pairs,
+                sample_id=f"train_neg_{stable_hash(q['fragment_id'], neg['fragment_id'])}",
+                qid=q["fragment_id"],
+                tid=neg["fragment_id"],
+                label=0.0,
+                weight=1.0,
+                split=pair.get("split"),
+                chain_id=pair.get("chain_id"),
+                label_source="negative",
+                reason="same_split_different_source_chain_target",
             )
+        bridge_cols = query_bridge_columns(q)
+        if bridge_cols:
+            hard_negatives = [
+                cand
+                for cand in targets_by_source_split.get((pair.get("source_table_id"), pair.get("split", "unknown")), [])
+                if (q["fragment_id"], cand["fragment_id"]) not in positive_pairs
+                and not bridge_cols.intersection(int_set(cand.get("source_column_indices")))
+            ]
+            rng.shuffle(hard_negatives)
+            for neg in hard_negatives[: int(getattr(args, "hard_negatives_per_positive", 1))]:
+                add_pair_sample(
+                    samples,
+                    emitted_pairs,
+                    sample_id=f"train_hard_neg_{stable_hash(q['fragment_id'], neg['fragment_id'])}",
+                    qid=q["fragment_id"],
+                    tid=neg["fragment_id"],
+                    label=0.0,
+                    weight=1.0,
+                    split=pair.get("split"),
+                    chain_id=pair.get("chain_id"),
+                    label_source="hard_negative",
+                    reason="same_source_non_joinable_target",
+                )
 
     if not getattr(args, "table_only", False):
         for path in load_paths(stage1_dir):
@@ -178,6 +259,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo_pos_threshold", type=float, default=0.9)
     parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--hard_negatives_per_positive", type=int, default=1)
     parser.add_argument("--table_only", action="store_true", help="Only emit table-table pair samples; skip path, HITL, and pseudo-label samples.")
     return parser.parse_args()
 
