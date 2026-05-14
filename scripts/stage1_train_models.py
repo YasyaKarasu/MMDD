@@ -26,6 +26,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
                 pseudo_pos_threshold=args.pseudo_pos_threshold,
                 pseudo_neg_threshold=args.pseudo_neg_threshold,
                 seed=args.seed,
+                hard_negatives_per_positive=args.hard_negatives_per_positive,
                 teacher_epochs=args.teacher_epochs,
                 teacher_batch_size=args.teacher_batch_size,
                 teacher_lr=args.teacher_lr,
@@ -53,6 +54,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
                 include_pseudo_labels=args.include_pseudo_labels,
                 pseudo_pos_threshold=args.pseudo_pos_threshold,
                 pseudo_neg_threshold=args.pseudo_neg_threshold,
+                hard_negatives_per_positive=args.hard_negatives_per_positive,
                 allow_reselect_previous=args.allow_reselect_previous,
                 allow_reselect_labeled=args.allow_reselect_labeled,
                 gui=args.gui,
@@ -78,6 +80,7 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
             pseudo_pos_threshold=args.pseudo_pos_threshold,
             pseudo_neg_threshold=args.pseudo_neg_threshold,
             seed=args.seed,
+            hard_negatives_per_positive=args.hard_negatives_per_positive,
             teacher_epochs=args.teacher_epochs,
             teacher_batch_size=args.teacher_batch_size,
             teacher_lr=args.teacher_lr,
@@ -146,6 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include_pseudo_labels", default="false")
     parser.add_argument("--pseudo_pos_threshold", type=float, default=0.9)
     parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
+    parser.add_argument("--hard_negatives_per_positive", type=int, default=1)
     parser.add_argument("--allow_reselect_previous", action="store_true")
     parser.add_argument("--allow_reselect_labeled", action="store_true")
     parser.add_argument("--gui", dest="gui", action="store_true", default=True)

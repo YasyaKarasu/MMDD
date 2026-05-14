@@ -65,6 +65,7 @@ def run_teacher_cycle(args: argparse.Namespace, round_id: int, final: bool = Fal
             pseudo_pos_threshold=args.pseudo_pos_threshold,
             pseudo_neg_threshold=args.pseudo_neg_threshold,
             seed=args.seed,
+            hard_negatives_per_positive=getattr(args, "hard_negatives_per_positive", 1),
             table_only=getattr(args, "table_only", False),
         )
     )
@@ -196,6 +197,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include_pseudo_labels", default="false")
     parser.add_argument("--pseudo_pos_threshold", type=float, default=0.9)
     parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
+    parser.add_argument("--hard_negatives_per_positive", type=int, default=1)
     parser.add_argument("--allow_reselect_previous", action="store_true")
     parser.add_argument("--allow_reselect_labeled", action="store_true")
     parser.add_argument("--gui", dest="gui", action="store_true", default=True)
