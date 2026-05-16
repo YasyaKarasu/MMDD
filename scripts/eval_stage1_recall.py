@@ -39,6 +39,19 @@ def infer_table_only(args: argparse.Namespace, stage1_dir: Path) -> bool:
     return False
 
 
+def infer_raw_embedding_hnsw(args: argparse.Namespace, stage1_dir: Path) -> bool:
+    if getattr(args, "raw_embedding_hnsw", False):
+        return True
+    hnsw_dir = Path(getattr(args, "hnsw_dir", stage1_dir / "hnsw_indices"))
+    stats_path = hnsw_dir / "hnsw_stats.json"
+    if stats_path.exists():
+        try:
+            return json.loads(stats_path.read_text(encoding="utf-8")).get("embedding_backend") == "raw"
+        except (json.JSONDecodeError, OSError):
+            return False
+    return False
+
+
 def load_student(student_dir: Path, device: torch.device) -> Student:
     ckpt = torch.load(student_dir / "student.pt", map_location=device)
     model = Student(int(ckpt["in_dim"]), int(ckpt["student_dim"])).to(device)
@@ -52,6 +65,33 @@ def score_pair(model: Student, vectors: dict[str, np.ndarray], a: str, ta: str, 
         za = torch.tensor(vectors[a], dtype=torch.float32, device=device).unsqueeze(0)
         zb = torch.tensor(vectors[b], dtype=torch.float32, device=device).unsqueeze(0)
         return float(torch.sigmoid(model.score(za, ta, zb, tb))[0].cpu())
+
+
+def raw_cosine_score(vectors: dict[str, np.ndarray], a: str, b: str) -> float:
+    va = vectors[a].astype("float32")
+    vb = vectors[b].astype("float32")
+    denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+    if denom <= 1e-12:
+        return 0.0
+    cosine = float(np.dot(va, vb) / denom)
+    return max(0.0, min(1.0, (cosine + 1.0) / 2.0))
+
+
+def edge_score(
+    args: argparse.Namespace,
+    model: Student | None,
+    vectors: dict[str, np.ndarray],
+    a: str,
+    ta: str,
+    b: str,
+    tb: str,
+    device: torch.device,
+) -> float:
+    if getattr(args, "raw_embedding_hnsw", False):
+        return raw_cosine_score(vectors, a, b)
+    if model is None:
+        raise SystemExit("Student model is required unless --raw_embedding_hnsw is set.")
+    return score_pair(model, vectors, a, ta, b, tb, device)
 
 
 def relation_query_from_projected(model: Student, projected_vec: np.ndarray, source_type: str, target_type: str, device: torch.device) -> np.ndarray:
@@ -228,7 +268,7 @@ def bridge_recall_record(
 def table_rankings(
     args: argparse.Namespace,
     stage1_dir: Path,
-    model: Student,
+    model: Student | None,
     vectors: dict[str, np.ndarray],
     device: torch.device,
     topks: list[int],
@@ -237,8 +277,10 @@ def table_rankings(
     query_roles = {"left_visible"} if getattr(args, "table_only", False) else {"left_visible", "left_hidden"}
     queries = [f for f in fragments.values() if f.get("role") in query_roles and f["fragment_id"] in vectors]
     targets = [f for f in fragments.values() if f.get("role") == "right_target" and f["fragment_id"] in vectors]
-    if getattr(args, "table_only", False):
+    if getattr(args, "table_only", False) or getattr(args, "raw_embedding_hnsw", False):
         return hnsw_table_rankings(args, model, queries, targets, device, topks)
+    if model is None:
+        raise SystemExit("Student model is required unless --raw_embedding_hnsw is set.")
     rankings: dict[str, list[str]] = {}
     total_pairs = len(queries) * len(targets)
     progress = None
@@ -277,16 +319,18 @@ def table_rankings(
 
 def hnsw_table_rankings(
     args: argparse.Namespace,
-    model: Student,
+    model: Student | None,
     queries: list[dict[str, Any]],
     targets: list[dict[str, Any]],
     device: torch.device,
     topks: list[int],
 ) -> dict[str, list[str]]:
-    projected = load_projected(Path(args.student_dir))
+    raw_embedding_hnsw = bool(getattr(args, "raw_embedding_hnsw", False))
+    projected = load_index_vectors(Path(args.embedding_dir)) if raw_embedding_hnsw else load_projected(Path(args.student_dir))
     table_projected = {oid: vec for oid, (object_type, vec) in projected.items() if object_type == "table_fragment"}
     if not table_projected:
-        raise SystemExit("table-only HNSW evaluation requires student/index_embeddings/table_fragment.npy")
+        location = "embeddings/table_fragment.npy" if raw_embedding_hnsw else "student/index_embeddings/table_fragment.npy"
+        raise SystemExit(f"HNSW table evaluation requires {location}")
     dim = len(next(iter(table_projected.values())))
     index, table_ids = load_hnsw(Path(args.hnsw_dir), "table_fragment", dim)
     if index is None:
@@ -312,7 +356,12 @@ def hnsw_table_rankings(
         if qid not in table_projected:
             rankings[qid] = []
             continue
-        query = relation_query_from_projected(model, table_projected[qid], "table_fragment", "table_fragment", device)
+        if raw_embedding_hnsw:
+            query = table_projected[qid].reshape(1, -1).astype("float32")
+        else:
+            if model is None:
+                raise SystemExit("Student model is required unless --raw_embedding_hnsw is set.")
+            query = relation_query_from_projected(model, table_projected[qid], "table_fragment", "table_fragment", device)
         labels, _ = index.knn_query(query, k=hnsw_k)
         rankings[qid] = [table_ids[int(label)] for label in labels[0]]
     return rankings
@@ -335,8 +384,11 @@ def load_hnsw(hnsw_dir: Path, object_type: str, dim: int):
 
 
 def load_projected(student_dir: Path) -> dict[str, tuple[str, np.ndarray]]:
+    return load_index_vectors(student_dir / "index_embeddings")
+
+
+def load_index_vectors(emb_dir: Path) -> dict[str, tuple[str, np.ndarray]]:
     projected = {}
-    emb_dir = student_dir / "index_embeddings"
     for object_type in TYPES:
         npy = emb_dir / f"{object_type}.npy"
         ids_path = emb_dir / f"{object_type}_ids.json"
@@ -354,7 +406,8 @@ def compose_path_score(prev_score: float, edge_score: float, composition: str) -
 
 
 def relation_aware_neighbors(
-    model: Student,
+    args: argparse.Namespace,
+    model: Student | None,
     projected: dict[str, tuple[str, np.ndarray]],
     indexes: dict[str, Any],
     ids_by_type: dict[str, list[str]],
@@ -366,14 +419,17 @@ def relation_aware_neighbors(
 ) -> list[str]:
     if target_type not in indexes or not ids_by_type.get(target_type) or node_id not in projected:
         return []
-    query = relation_query_from_projected(model, projected[node_id][1], source_type, target_type, device)
+    if getattr(args, "raw_embedding_hnsw", False):
+        query = projected[node_id][1].reshape(1, -1).astype("float32")
+    else:
+        query = relation_query_from_projected(model, projected[node_id][1], source_type, target_type, device)
     labels, _ = indexes[target_type].knn_query(query, k=min(k, len(ids_by_type[target_type])))
     return [ids_by_type[target_type][int(label)] for label in labels[0]]
 
 
 def beam_search_tables(
     args: argparse.Namespace,
-    model: Student,
+    model: Student | None,
     vectors: dict[str, np.ndarray],
     projected: dict[str, tuple[str, np.ndarray]],
     indexes: dict[str, Any],
@@ -399,6 +455,7 @@ def beam_search_tables(
         for state in frontier:
             for target_type in TYPES:
                 neighbors = relation_aware_neighbors(
+                    args,
                     model,
                     projected,
                     indexes,
@@ -414,8 +471,8 @@ def beam_search_tables(
                         continue
                     if state["node_id"] not in vectors or next_id not in vectors:
                         continue
-                    edge_score = score_pair(model, vectors, state["node_id"], state["node_type"], next_id, target_type, device)
-                    path_score = compose_path_score(float(state["score"]), edge_score, args.path_composition)
+                    next_edge_score = edge_score(args, model, vectors, state["node_id"], state["node_type"], next_id, target_type, device)
+                    path_score = compose_path_score(float(state["score"]), next_edge_score, args.path_composition)
                     path = [*state["path"], (next_id, target_type)]
                     next_state = {"node_id": next_id, "node_type": target_type, "score": path_score, "path": path}
                     candidates.append(next_state)
@@ -434,14 +491,14 @@ def beam_search_tables(
 def path_aware_metrics(
     args: argparse.Namespace,
     stage1_dir: Path,
-    model: Student,
+    model: Student | None,
     vectors: dict[str, np.ndarray],
     device: torch.device,
     topks: list[int],
     recall_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     student_dir = Path(args.student_dir)
-    emb_dir = student_dir / "index_embeddings"
+    emb_dir = Path(args.embedding_dir) if getattr(args, "raw_embedding_hnsw", False) else student_dir / "index_embeddings"
     table_arr = np.load(emb_dir / "table_fragment.npy")
     dim = int(table_arr.shape[1])
     indexes: dict[str, Any] = {}
@@ -453,7 +510,7 @@ def path_aware_metrics(
             ids_by_type[object_type] = ids
     if "table_fragment" not in indexes:
         return {"available": False}
-    projected = load_projected(student_dir)
+    projected = load_index_vectors(emb_dir) if getattr(args, "raw_embedding_hnsw", False) else load_projected(student_dir)
     human = {rec["path_id"]: rec.get("human_label") for rec in iter_jsonl(stage1_dir / "human_labeled_paths.jsonl")} if (stage1_dir / "human_labeled_paths.jsonl").exists() else {}
     paths_by_query_asset_target = {}
     pool_iter = iter_jsonl(stage1_dir / "hitl_pool.jsonl") if (stage1_dir / "hitl_pool.jsonl").exists() else []
@@ -524,9 +581,12 @@ def run(args: argparse.Namespace) -> None:
     topks = [int(k) for k in args.topk]
     stage1_dir = Path(args.stage1_dir)
     args.table_only = infer_table_only(args, stage1_dir)
+    if getattr(args, "embedding_dir", None) is None:
+        args.embedding_dir = str(stage1_dir / "embeddings")
+    args.raw_embedding_hnsw = infer_raw_embedding_hnsw(args, stage1_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vectors, _, _, _ = load_embeddings(Path(args.embedding_dir if hasattr(args, "embedding_dir") else stage1_dir / "embeddings"))
-    model = load_student(Path(args.student_dir), device)
+    vectors, _, _, _ = load_embeddings(Path(args.embedding_dir))
+    model = None if getattr(args, "raw_embedding_hnsw", False) else load_student(Path(args.student_dir), device)
     qrels = list(iter_jsonl(Path(args.qrels)))
     rankings = table_rankings(args, stage1_dir, model, vectors, device, topks)
     direct_qrels = direct_eval_qrels(qrels, getattr(args, "table_only", False))
@@ -560,6 +620,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage1_dir", default="output_stage1_logic")
     parser.add_argument("--student_dir", default="output_stage1_logic/student")
+    parser.add_argument("--embedding_dir", default=None)
     parser.add_argument("--hnsw_dir", default="output_stage1_logic/hnsw_indices")
     parser.add_argument("--qrels", default="output_stage1_logic/qrels.jsonl")
     parser.add_argument("--topk", nargs="+", default=["10", "50", "100"])
@@ -569,6 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--table_only", action="store_true", help="Only compute direct table-to-table recall; skip path-aware metrics.")
+    parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Evaluate HNSW recall directly over frozen raw embeddings without loading a teacher/student model.")
     parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
     parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument(

@@ -32,9 +32,11 @@ from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
 from train_student import Student, build_distill_records, build_ranking_groups, train_loss
 from eval_stage1_recall import (
+    beam_search_tables,
     bridge_recall_record,
     direct_eval_qrels,
     direct_recall_records,
+    infer_raw_embedding_hnsw,
     infer_table_only,
     recall_fraction,
     relation_query_from_projected,
@@ -1543,6 +1545,14 @@ def test_eval_infers_table_only_from_hnsw_stats(tmp_path):
     assert infer_table_only(args, tmp_path)
 
 
+def test_eval_infers_raw_embedding_hnsw_from_stats(tmp_path):
+    hnsw_dir = tmp_path / "hnsw_indices"
+    hnsw_dir.mkdir()
+    (hnsw_dir / "hnsw_stats.json").write_text(json.dumps({"embedding_backend": "raw"}), encoding="utf-8")
+    args = argparse.Namespace(raw_embedding_hnsw=False, hnsw_dir=str(hnsw_dir))
+    assert infer_raw_embedding_hnsw(args, tmp_path)
+
+
 def test_table_only_direct_eval_qrels_keep_only_visible_queries():
     qrels = [
         {"query_id": "qv", "target_id": "t", "query_role": "left_visible"},
@@ -1592,6 +1602,135 @@ def test_hnsw_table_index_contains_only_right_targets(tmp_path):
     stats = json.loads((stage / "hnsw_indices" / "hnsw_stats.json").read_text(encoding="utf-8"))
     assert indexed_ids == ["t"]
     assert stats["objects"][0]["indexed_role"] == "right_target"
+
+
+def test_raw_embedding_hnsw_index_uses_embedding_dir(tmp_path):
+    pytest.importorskip("hnswlib")
+    from build_hnsw_indices import run as build_hnsw
+
+    stage = tmp_path
+    emb_dir = stage / "embeddings"
+    emb_dir.mkdir()
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment"},
+            {"fragment_id": "t", "role": "right_target", "object_type": "table_fragment"},
+        ],
+    )
+    np.save(emb_dir / "table_fragment.npy", np.eye(2, dtype="float32"))
+    (emb_dir / "table_fragment_ids.json").write_text(json.dumps(["qv", "t"]), encoding="utf-8")
+    build_hnsw(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            student_dir=str(stage / "student"),
+            embedding_dir=str(emb_dir),
+            hnsw_dir=str(stage / "hnsw_indices"),
+            space="cosine",
+            m=8,
+            ef_construction=20,
+            ef_search=20,
+            table_only=True,
+            raw_embedding_hnsw=True,
+        )
+    )
+    indexed_ids = json.loads((stage / "hnsw_indices" / "table_fragment_ids.json").read_text(encoding="utf-8"))
+    stats = json.loads((stage / "hnsw_indices" / "hnsw_stats.json").read_text(encoding="utf-8"))
+    assert indexed_ids == ["t"]
+    assert stats["embedding_backend"] == "raw"
+    assert stats["embedding_dir"] == str(emb_dir)
+
+
+def test_raw_embedding_table_rankings_use_hnsw_without_student(tmp_path):
+    hnswlib = pytest.importorskip("hnswlib")
+    stage = tmp_path
+    emb_dir = stage / "embeddings"
+    hnsw_dir = stage / "hnsw_indices"
+    emb_dir.mkdir()
+    hnsw_dir.mkdir()
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "qv", "role": "left_visible", "object_type": "table_fragment"},
+            {"fragment_id": "qh", "role": "left_hidden", "object_type": "table_fragment"},
+            {"fragment_id": "t_good", "role": "right_target", "object_type": "table_fragment"},
+            {"fragment_id": "t_bad", "role": "right_target", "object_type": "table_fragment"},
+        ],
+    )
+    ids = ["qv", "qh", "t_good", "t_bad"]
+    arr = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype="float32")
+    np.save(emb_dir / "table_fragment.npy", arr)
+    (emb_dir / "table_fragment_ids.json").write_text(json.dumps(ids), encoding="utf-8")
+    index = hnswlib.Index(space="cosine", dim=2)
+    index.init_index(max_elements=2, ef_construction=20, M=8)
+    index.add_items(arr[[2, 3]], np.arange(2))
+    index.save_index(str(hnsw_dir / "table_fragment.bin"))
+    (hnsw_dir / "table_fragment_ids.json").write_text(json.dumps(["t_good", "t_bad"]), encoding="utf-8")
+    rankings = table_rankings(
+        argparse.Namespace(
+            embedding_dir=str(emb_dir),
+            student_dir=str(stage / "student"),
+            hnsw_dir=str(hnsw_dir),
+            table_only=False,
+            raw_embedding_hnsw=True,
+            table_hnsw_k=0,
+            progress=False,
+        ),
+        stage,
+        None,
+        {oid: arr[idx] for idx, oid in enumerate(ids)},
+        torch.device("cpu"),
+        [1],
+    )
+    assert rankings["qv"][0] == "t_good"
+    assert rankings["qh"][0] == "t_good"
+    assert "qv" not in rankings["qv"]
+
+
+def test_raw_embedding_beam_search_keeps_multihop_recall(tmp_path):
+    hnswlib = pytest.importorskip("hnswlib")
+    hnsw_dir = tmp_path / "hnsw_indices"
+    hnsw_dir.mkdir()
+    vectors = {
+        "qh": np.array([1.0, 0.0], dtype="float32"),
+        "txt": np.array([0.8, 0.6], dtype="float32"),
+        "t": np.array([0.7, 0.7], dtype="float32"),
+    }
+    ids_by_type = {
+        "table_fragment": ["t"],
+        "text_asset": ["txt"],
+    }
+    indexes = {}
+    for object_type, ids in ids_by_type.items():
+        arr = np.stack([vectors[oid] for oid in ids]).astype("float32")
+        index = hnswlib.Index(space="cosine", dim=2)
+        index.init_index(max_elements=len(ids), ef_construction=20, M=8)
+        index.add_items(arr, np.arange(len(ids)))
+        index.save_index(str(hnsw_dir / f"{object_type}.bin"))
+        indexes[object_type] = index
+    projected = {
+        "qh": ("table_fragment", vectors["qh"]),
+        "txt": ("text_asset", vectors["txt"]),
+        "t": ("table_fragment", vectors["t"]),
+    }
+    ranked, best_paths = beam_search_tables(
+        argparse.Namespace(
+            raw_embedding_hnsw=True,
+            beam_neighbors=1,
+            max_hops=2,
+            beam_width=4,
+            path_composition="min",
+        ),
+        None,
+        vectors,
+        projected,
+        indexes,
+        ids_by_type,
+        "qh",
+        torch.device("cpu"),
+    )
+    assert ranked[0] == "t"
+    assert best_paths["t"]["path"] == [("qh", "table_fragment"), ("txt", "text_asset"), ("t", "table_fragment")]
 
 
 def test_hnsw_index_build_query():

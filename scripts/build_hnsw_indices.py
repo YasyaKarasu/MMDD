@@ -27,8 +27,9 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit("hnswlib is required. Install it in MMDD, e.g. conda run -n MMDD python -m pip install hnswlib") from exc
 
     stage1_dir = Path(args.stage1_dir)
-    emb_dir = Path(args.student_dir) / "index_embeddings"
-    out_dir = stage1_dir / "hnsw_indices"
+    raw_embedding_hnsw = bool(getattr(args, "raw_embedding_hnsw", False))
+    emb_dir = Path(getattr(args, "embedding_dir", "") or stage1_dir / "embeddings") if raw_embedding_hnsw else Path(args.student_dir) / "index_embeddings"
+    out_dir = Path(getattr(args, "hnsw_dir", "") or stage1_dir / "hnsw_indices")
     out_dir.mkdir(parents=True, exist_ok=True)
     stats = []
     object_types = ("table_fragment",) if getattr(args, "table_only", False) else ("table_fragment", "text_asset", "image_asset")
@@ -67,6 +68,8 @@ def run(args: argparse.Namespace) -> None:
             "ef_construction": args.ef_construction,
             "ef_search": args.ef_search,
             "table_only": bool(getattr(args, "table_only", False)),
+            "embedding_backend": "raw" if raw_embedding_hnsw else "student",
+            "embedding_dir": str(emb_dir),
             "objects": stats,
         },
     )
@@ -78,11 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage1_dir", default="output_stage1_logic")
     parser.add_argument("--student_dir", default="output_stage1_logic/student")
+    parser.add_argument("--embedding_dir", default=None)
+    parser.add_argument("--hnsw_dir", default=None)
     parser.add_argument("--space", "--hnsw_space", dest="space", default="cosine")
     parser.add_argument("--m", "--hnsw_m", dest="m", type=int, default=32)
     parser.add_argument("--ef_construction", "--hnsw_ef_construction", dest="ef_construction", type=int, default=200)
     parser.add_argument("--ef_search", "--hnsw_ef_search", dest="ef_search", type=int, default=100)
     parser.add_argument("--table_only", action="store_true", help="Build only the table_fragment index.")
+    parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Build HNSW indexes directly from frozen raw embeddings instead of student projections.")
     return parser.parse_args()
 
 

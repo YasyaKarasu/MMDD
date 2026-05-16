@@ -13,6 +13,8 @@ from stage1_io import update_stage1_manifest
 
 
 def run(args: argparse.Namespace) -> None:
+    if getattr(args, "embedding_dir", None) is None:
+        args.embedding_dir = str(Path(args.stage1_dir) / "embeddings")
     if args.student_dir is None:
         args.student_dir = str(Path(args.stage1_dir) / "student")
     if args.hnsw_dir is None:
@@ -25,11 +27,14 @@ def run(args: argparse.Namespace) -> None:
             argparse.Namespace(
                 stage1_dir=args.stage1_dir,
                 student_dir=args.student_dir,
+                embedding_dir=args.embedding_dir,
+                hnsw_dir=args.hnsw_dir,
                 space=args.hnsw_space,
                 m=args.hnsw_m,
                 ef_construction=args.hnsw_ef_construction,
                 ef_search=args.hnsw_ef_search,
                 table_only=getattr(args, "table_only", False),
+                raw_embedding_hnsw=getattr(args, "raw_embedding_hnsw", False),
             )
         )
     if not args.skip_eval:
@@ -38,6 +43,7 @@ def run(args: argparse.Namespace) -> None:
             argparse.Namespace(
                 stage1_dir=args.stage1_dir,
                 student_dir=args.student_dir,
+                embedding_dir=args.embedding_dir,
                 hnsw_dir=args.hnsw_dir,
                 qrels=args.qrels,
                 topk=[str(k) for k in args.topk],
@@ -48,6 +54,7 @@ def run(args: argparse.Namespace) -> None:
                 progress=getattr(args, "progress", True),
                 seed=args.seed,
                 table_only=getattr(args, "table_only", False),
+                raw_embedding_hnsw=getattr(args, "raw_embedding_hnsw", False),
                 table_hnsw_k=args.table_hnsw_k,
                 recall_records=args.recall_records,
                 write_recall_records=getattr(args, "write_recall_records", True),
@@ -60,6 +67,7 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage1_dir", default="output_stage1_logic")
+    parser.add_argument("--embedding_dir", default=None)
     parser.add_argument("--student_dir", default=None)
     parser.add_argument("--hnsw_dir", default=None)
     parser.add_argument("--qrels", default=None)
@@ -76,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beam_neighbors", type=int, default=50)
     parser.add_argument("--path_composition", choices=["min", "product"], default="min")
     parser.add_argument("--table_only", action="store_true", help="Build/evaluate only direct table-to-table retrieval; skip path-aware metrics.")
+    parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Build/evaluate HNSW recall directly from frozen raw embeddings, bypassing teacher/student training outputs.")
     parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
     parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument(

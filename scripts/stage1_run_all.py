@@ -49,7 +49,7 @@ def run(args: argparse.Namespace) -> None:
                 progress=getattr(args, "progress", True),
             )
         )
-    if not args.prepare_only:
+    if not args.prepare_only and not getattr(args, "raw_embedding_hnsw", False):
         run_train_models(
             argparse.Namespace(
                 stage1_dir=args.stage1_dir,
@@ -93,10 +93,13 @@ def run(args: argparse.Namespace) -> None:
                 table_only=args.table_only,
             )
         )
+    elif not args.prepare_only:
+        print("=== Stage-1 train: raw embedding HNSW mode skips teacher/student training ===")
     if not args.prepare_only and not args.train_only:
         run_index_eval(
             argparse.Namespace(
                 stage1_dir=args.stage1_dir,
+                embedding_dir=args.embedding_dir,
                 student_dir=args.student_dir,
                 hnsw_dir=args.hnsw_dir,
                 qrels=args.qrels,
@@ -114,6 +117,7 @@ def run(args: argparse.Namespace) -> None:
                 path_composition=args.path_composition,
                 progress=getattr(args, "progress", True),
                 table_only=args.table_only,
+                raw_embedding_hnsw=getattr(args, "raw_embedding_hnsw", False),
                 table_hnsw_k=args.table_hnsw_k,
                 recall_records=args.recall_records,
                 write_recall_records=getattr(args, "write_recall_records", True),
@@ -133,6 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--train_only", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Run Stage-1 using only table-table connectivity; skip multimodal evidence, HITL, path distillation, and path-aware eval.")
+    parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Bypass teacher/student training and evaluate HNSW recall directly over frozen raw embeddings.")
     parser.add_argument("--min_rows_per_fragment", type=int, default=5)
     parser.add_argument("--max_chains_per_table", type=int, default=10)
     parser.add_argument("--max_bridges_per_anchor", type=int, default=5)

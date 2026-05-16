@@ -93,6 +93,14 @@ def train_teacher_and_hitl(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    if getattr(args, "raw_embedding_hnsw", False):
+        update_stage1_manifest(
+            Path(args.stage1_dir),
+            "stage1_train_models",
+            {"skipped": True, "reason": "raw_embedding_hnsw", "args": vars(args)},
+        )
+        print("Skipping teacher/student training because --raw_embedding_hnsw was set.")
+        return
     if args.embedding_dir is None:
         args.embedding_dir = str(Path(args.stage1_dir) / "embeddings")
     if args.student_dir is None:
@@ -161,6 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force_retrain", action="store_true", help="Clear generated teacher/student/HITL training outputs before training.")
     parser.add_argument("--reset_human_labels", action="store_true", help="With --force_retrain, also delete merged human labels.")
     parser.add_argument("--table_only", action="store_true", help="Train only table-table connectivity; skip HITL/path samples and multimodal distillation.")
+    parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Skip teacher/student training for raw embedding HNSW recall mode.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--lan", action="store_true", help="Expose the HITL GUI on the LAN by binding to 0.0.0.0.")
     parser.add_argument("--port", type=int, default=7860)
