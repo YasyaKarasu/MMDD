@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from stage1_io import (
     setup_logging,
     stable_hash,
     update_stage1_manifest,
+    write_json,
     write_jsonl,
 )
 
@@ -278,8 +280,474 @@ Embedding serialization is intentionally leakage-safe. `role`, `chain_id`, hidde
     (stage1_dir / "README.md").write_text(text, encoding="utf-8")
 
 
+def normalize_column_name(value: Any) -> str:
+    return clean_text(value).casefold()
+
+
+def webtable_metadata_path(input_dir: Path, configured: str | None, default_name: str) -> Path:
+    if configured:
+        return Path(configured)
+    return input_dir / default_name
+
+
+def webtable_table_root(input_dir: Path, configured: str | None) -> Path:
+    if configured:
+        return Path(configured)
+    default = input_dir / "data" / "benchmark" / "webtable" / "large" / "split_1"
+    return default if default.exists() else input_dir
+
+
+def read_webtable_queries(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    queries: dict[tuple[str, str], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            query_table = clean_text(row.get("query_table"))
+            query_column = clean_text(row.get("query_column"))
+            if not query_table or not query_column:
+                continue
+            queries[(query_table, query_column)] = {"query_table": query_table, "query_column": query_column}
+    return queries
+
+
+def read_webtable_ground_truth(path: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            query_table = clean_text(row.get("query_table"))
+            candidate_table = clean_text(row.get("candidate_table"))
+            query_column = clean_text(row.get("query_column"))
+            candidate_column = clean_text(row.get("candidate_column"))
+            if not query_table or not candidate_table or not query_column or not candidate_column:
+                continue
+            records.append(
+                {
+                    "query_table": query_table,
+                    "candidate_table": candidate_table,
+                    "query_column": query_column,
+                    "candidate_column": candidate_column,
+                }
+            )
+    return records
+
+
+def parse_split_ratios(values: list[float] | tuple[float, float, float]) -> tuple[float, float, float]:
+    if len(values) != 3:
+        raise ValueError("--webtable_split_ratios requires exactly three values: train dev test")
+    train, dev, test = (float(value) for value in values)
+    if train < 0 or dev < 0 or test < 0:
+        raise ValueError("--webtable_split_ratios values must be non-negative")
+    total = train + dev + test
+    if total <= 0:
+        raise ValueError("--webtable_split_ratios must sum to a positive value")
+    return train / total, dev / total, test / total
+
+
+def build_query_table_splits(
+    query_tables: set[str],
+    ratios: tuple[float, float, float],
+    seed: int,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    ordered = sorted(query_tables, key=lambda table: stable_hash("webtable_split", seed, table))
+    total = len(ordered)
+    train_n = int(total * ratios[0])
+    dev_n = int(total * ratios[1])
+    if total >= 3:
+        if ratios[0] > 0 and train_n == 0:
+            train_n = 1
+        if ratios[1] > 0 and dev_n == 0:
+            dev_n = 1
+        if train_n + dev_n >= total:
+            dev_n = max(0, total - train_n - 1)
+    split_map: dict[str, str] = {}
+    for idx, table in enumerate(ordered):
+        if idx < train_n:
+            split = "train"
+        elif idx < train_n + dev_n:
+            split = "dev"
+        else:
+            split = "test"
+        split_map[table] = split
+    return split_map, {
+        "policy": "query_table",
+        "seed": seed,
+        "ratios": {"train": ratios[0], "dev": ratios[1], "test": ratios[2]},
+        "query_tables": {
+            "train": [table for table in ordered if split_map[table] == "train"],
+            "dev": [table for table in ordered if split_map[table] == "dev"],
+            "test": [table for table in ordered if split_map[table] == "test"],
+        },
+    }
+
+
+def resolve_webtable_csv(table_root: Path, table_name: str, recursive_lookup: bool = False) -> Path | None:
+    direct = table_root / table_name
+    if direct.exists():
+        return direct
+    if table_root.name != "split_1":
+        nested = table_root / "data" / "benchmark" / "webtable" / "large" / "split_1" / table_name
+        if nested.exists():
+            return nested
+    if not recursive_lookup:
+        return None
+    matches = list(table_root.glob(f"**/{table_name}"))
+    return matches[0] if matches else None
+
+
+def load_webtable_csv(
+    table_root: Path,
+    table_name: str,
+    max_rows: int,
+    recursive_lookup: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    path = resolve_webtable_csv(table_root, table_name, recursive_lookup=recursive_lookup)
+    if path is None:
+        return None, "missing_table_file"
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return None, "empty_csv"
+            columns = [
+                {"column_index": idx, "column_name": clean_text(name) or f"col_{idx}"}
+                for idx, name in enumerate(header)
+            ]
+            rows: list[dict[str, Any]] = []
+            for row_idx, values in enumerate(reader):
+                if max_rows > 0 and len(rows) >= max_rows:
+                    break
+                cells = []
+                for col_idx, column in enumerate(columns):
+                    text = clean_text(values[col_idx]) if col_idx < len(values) else ""
+                    cells.append(
+                        {
+                            "column_index": col_idx,
+                            "source_column_index": col_idx,
+                            "column_name": column["column_name"],
+                            "text": text,
+                        }
+                    )
+                rows.append({"row_id": row_idx, "source_row_id": row_idx, "cells": cells})
+    except UnicodeDecodeError:
+        with path.open("r", encoding="latin-1", newline="") as handle:
+            reader = csv.reader(handle)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return None, "empty_csv"
+            columns = [
+                {"column_index": idx, "column_name": clean_text(name) or f"col_{idx}"}
+                for idx, name in enumerate(header)
+            ]
+            rows = []
+            for row_idx, values in enumerate(reader):
+                if max_rows > 0 and len(rows) >= max_rows:
+                    break
+                cells = []
+                for col_idx, column in enumerate(columns):
+                    text = clean_text(values[col_idx]) if col_idx < len(values) else ""
+                    cells.append(
+                        {
+                            "column_index": col_idx,
+                            "source_column_index": col_idx,
+                            "column_name": column["column_name"],
+                            "text": text,
+                        }
+                    )
+                rows.append({"row_id": row_idx, "source_row_id": row_idx, "cells": cells})
+    if not columns:
+        return None, "no_columns"
+    return {
+        "source_table_id": table_name,
+        "page_title": Path(table_name).stem,
+        "caption": "",
+        "section_title": "",
+        "columns": columns,
+        "rows": rows,
+        "source_file": str(path),
+        "metadata": {"dataset": "webtable", "loaded_rows": len(rows), "row_limit": max_rows},
+    }, None
+
+
+def webtable_column_index(table: dict[str, Any], column_name: str) -> int | None:
+    wanted = normalize_column_name(column_name)
+    fallback: int | None = None
+    for column in table.get("columns", []):
+        try:
+            idx = int(column.get("column_index"))
+        except (TypeError, ValueError):
+            continue
+        current = clean_text(column.get("column_name"))
+        if current == column_name:
+            return idx
+        if fallback is None and normalize_column_name(current) == wanted:
+            fallback = idx
+    return fallback
+
+
+def reorder_columns(primary: list[int], all_columns: list[dict[str, Any]], max_context_cols: int | None = None) -> list[int]:
+    ordered: list[int] = []
+    for idx in primary:
+        if idx not in ordered:
+            ordered.append(idx)
+    limit = max_context_cols if max_context_cols is not None and max_context_cols >= 0 else len(all_columns)
+    added = 0
+    for column in all_columns:
+        try:
+            idx = int(column.get("column_index"))
+        except (TypeError, ValueError):
+            continue
+        if idx in ordered:
+            continue
+        if added >= limit:
+            break
+        ordered.append(idx)
+        added += 1
+    return ordered
+
+
+def webtable_fragment(
+    table: dict[str, Any],
+    *,
+    fragment_id: str,
+    role: str,
+    column_indices: list[int],
+    statement: str,
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    rows, source_rows = project_rows(table, column_indices, dedupe_col=None, min_required_cols=0)
+    return {
+        "fragment_id": fragment_id,
+        "object_id": fragment_id,
+        "object_type": "table_fragment",
+        "role": role,
+        "split": "test",
+        "chain_id": fragment_id,
+        "source_table_id": table["source_table_id"],
+        "page_title": clean_text(table.get("page_title")),
+        "caption": clean_text(table.get("caption")),
+        "section_title": clean_text(table.get("section_title")),
+        "columns": make_columns(table, column_indices),
+        "rows": rows,
+        "source_column_indices": column_indices,
+        "source_row_indices": source_rows,
+        "statement": statement,
+        "provenance": {
+            "builder": "build_stage1_logic_connectivity.py",
+            "dataset_mode": "webtable",
+            "source_file": table.get("source_file"),
+        },
+        **extra,
+    }
+
+
+def run_webtable(args: argparse.Namespace) -> None:
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    query_path = webtable_metadata_path(input_dir, getattr(args, "webtable_query_file", None), "webtable_join_query.csv")
+    truth_path = webtable_metadata_path(input_dir, getattr(args, "webtable_ground_truth_file", None), "webtable_join_ground_truth.csv")
+    table_root = webtable_table_root(input_dir, getattr(args, "webtable_table_dir", None))
+    queries = read_webtable_queries(query_path)
+    truth = read_webtable_ground_truth(truth_path)
+    split_ratios = parse_split_ratios(getattr(args, "webtable_split_ratios", [0.7, 0.1, 0.2]))
+    split_seed = int(getattr(args, "webtable_split_seed", getattr(args, "seed", 13)))
+    query_split_map, split_payload = build_query_table_splits(
+        {query["query_table"] for query in queries.values()},
+        split_ratios,
+        split_seed,
+    )
+
+    needed_tables = {row["query_table"] for row in queries.values()}
+    needed_tables.update(row["candidate_table"] for row in truth)
+    tables: dict[str, dict[str, Any]] = {}
+    skipped_tables: list[dict[str, str]] = []
+    for table_name in sorted(needed_tables):
+        table, reason = load_webtable_csv(
+            table_root,
+            table_name,
+            int(getattr(args, "webtable_max_rows", 200)),
+            bool(getattr(args, "webtable_recursive_lookup", False)),
+        )
+        if table is None:
+            skipped_tables.append({"table": table_name, "reason": reason or "load_failed"})
+            continue
+        tables[table_name] = table
+
+    candidate_columns_by_table: dict[str, set[str]] = defaultdict(set)
+    truth_by_query_target: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+    skipped_truth: list[dict[str, str]] = []
+    for rec in truth:
+        query_table = tables.get(rec["query_table"])
+        candidate_table = tables.get(rec["candidate_table"])
+        if query_table is None or candidate_table is None:
+            skipped_truth.append({**rec, "reason": "missing_query_or_candidate_table"})
+            continue
+        if webtable_column_index(query_table, rec["query_column"]) is None:
+            skipped_truth.append({**rec, "reason": "missing_query_column"})
+            continue
+        if webtable_column_index(candidate_table, rec["candidate_column"]) is None:
+            skipped_truth.append({**rec, "reason": "missing_candidate_column"})
+            continue
+        candidate_columns_by_table[rec["candidate_table"]].add(rec["candidate_column"])
+        truth_by_query_target[(rec["query_table"], rec["query_column"], rec["candidate_table"])].append(rec)
+
+    fragments: list[dict[str, Any]] = []
+    pairs: list[dict[str, Any]] = []
+    qrels: list[dict[str, Any]] = []
+    debug_examples: list[dict[str, Any]] = []
+    query_fragment_ids: dict[tuple[str, str], str] = {}
+    target_fragment_ids: dict[str, str] = {}
+
+    for table_name, table in sorted(tables.items()):
+        candidate_col_indices = [
+            idx
+            for idx in (webtable_column_index(table, col) for col in sorted(candidate_columns_by_table.get(table_name, set())))
+            if idx is not None
+        ]
+        columns = reorder_columns(candidate_col_indices, table.get("columns", []), None)
+        target_id = f"webtable_target_{stable_hash(table_name)}"
+        target_fragment_ids[table_name] = target_id
+        fragments.append(
+            webtable_fragment(
+                table,
+                fragment_id=target_id,
+                role="right_target",
+                column_indices=columns,
+                statement=f"webtable candidate table {table_name}",
+                extra={
+                    "split": "corpus",
+                    "webtable_table": table_name,
+                    "webtable_candidate_columns": sorted(candidate_columns_by_table.get(table_name, set())),
+                    "target_bridge_col_names": sorted(candidate_columns_by_table.get(table_name, set())),
+                },
+            )
+        )
+
+    for (query_table_name, query_column), query in sorted(queries.items()):
+        table = tables.get(query_table_name)
+        if table is None:
+            continue
+        query_col_idx = webtable_column_index(table, query_column)
+        if query_col_idx is None:
+            continue
+        columns = reorder_columns([query_col_idx], table.get("columns", []), int(args.max_query_context_attrs))
+        query_id = f"webtable_query_{stable_hash(query_table_name, query_column)}"
+        query_split = query_split_map.get(query_table_name, "test")
+        query_fragment_ids[(query_table_name, query_column)] = query_id
+        fragment = webtable_fragment(
+            table,
+            fragment_id=query_id,
+            role="left_visible",
+            column_indices=columns,
+            statement=f"webtable query column {query_column}",
+            extra={
+                "split": query_split,
+                "visible_bridge": True,
+                "visible_bridge_col": query_col_idx,
+                "visible_bridge_col_name": query_column,
+                "webtable_query_table": query_table_name,
+                "webtable_query_column": query_column,
+            },
+        )
+        fragments.append(fragment)
+        if len(debug_examples) < 25:
+            debug_examples.append(
+                {
+                    "chain_id": query_id,
+                    "source_table_id": query_table_name,
+                    "split": query_split,
+                    "columns": {"query_column": query_column},
+                    "rows": fragment["rows"][:3],
+                }
+            )
+
+    for (query_table, query_column, candidate_table), records in sorted(truth_by_query_target.items()):
+        query_id = query_fragment_ids.get((query_table, query_column))
+        target_id = target_fragment_ids.get(candidate_table)
+        if query_id is None or target_id is None:
+            continue
+        candidate_columns = sorted({rec["candidate_column"] for rec in records})
+        query_split = query_split_map.get(query_table, "test")
+        pair_id = f"pair_{stable_hash(query_id, target_id, ','.join(candidate_columns))}"
+        pairs.append(
+            {
+                "pair_id": pair_id,
+                "source_table_id": query_table,
+                "split": query_split,
+                "chain_id": query_id,
+                "query_fragment_id": query_id,
+                "target_fragment_id": target_id,
+                "label": 1,
+                "weight": 1.0,
+                "reason": f"webtable_join:{query_column}->{','.join(candidate_columns)}",
+                "webtable_query_column": query_column,
+                "webtable_candidate_columns": candidate_columns,
+            }
+        )
+        qrels.append(
+            {
+                "query_id": query_id,
+                "target_id": target_id,
+                "rel": 3,
+                "split": query_split,
+                "chain_id": query_id,
+                "target_chain_id": target_id,
+                "query_role": "left_visible",
+                "target_role": "right_target",
+                "reason": f"webtable_join:{query_column}->{','.join(candidate_columns)}",
+                "webtable_query_table": query_table,
+                "webtable_candidate_table": candidate_table,
+                "webtable_query_column": query_column,
+                "webtable_candidate_columns": candidate_columns,
+            }
+        )
+
+    counts = {
+        "logic_fragments": write_jsonl(output_dir / "logic_fragments.jsonl", fragments),
+        "logic_pairs": write_jsonl(output_dir / "logic_pairs.jsonl", pairs),
+        "qrels": write_jsonl(output_dir / "qrels.jsonl", qrels),
+        "debug_examples": write_jsonl(output_dir / "debug_chain_examples.jsonl", debug_examples),
+        "webtable_loaded_tables": len(tables),
+        "webtable_query_fragments": len(query_fragment_ids),
+        "webtable_target_fragments": len(target_fragment_ids),
+        "webtable_skipped_tables": write_jsonl(output_dir / "webtable_skipped_tables.jsonl", skipped_tables),
+        "webtable_skipped_ground_truth": write_jsonl(output_dir / "webtable_skipped_ground_truth.jsonl", skipped_truth),
+        "chains": len(query_fragment_ids),
+        "same_source_bridge_positive_pairs": 0,
+    }
+    split_payload["counts"] = {
+        split: sum(1 for value in query_split_map.values() if value == split)
+        for split in ("train", "dev", "test")
+    }
+    split_payload["query_fragments"] = {
+        split: sum(1 for (table, _column), _qid in query_fragment_ids.items() if query_split_map.get(table, "test") == split)
+        for split in ("train", "dev", "test")
+    }
+    write_json(output_dir / "webtable_splits.json", split_payload)
+    build_readme(output_dir)
+    update_stage1_manifest(
+        output_dir,
+        "logic_connectivity",
+        {
+            "input_dir": args.input_dir,
+            "dataset_mode": "webtable",
+            "table_only": True,
+            "webtable_splits": split_payload,
+            "counts": counts,
+            "args": vars(args),
+        },
+    )
+    print(json.dumps(counts, ensure_ascii=False, indent=2))
+
+
 def run(args: argparse.Namespace) -> None:
     setup_logging()
+    if getattr(args, "webtable_mode", False):
+        args.table_only = True
+        run_webtable(args)
+        return
     rng = random.Random(args.seed)
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
@@ -507,6 +975,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_support", type=int, default=6)
     parser.add_argument("--max_bridge_unique_ratio", type=float, default=0.85)
     parser.add_argument("--table_only", action="store_true", help="Build only visible table-table connectivity; do not create hidden bridge queries.")
+    parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark CSV files and build table-only Stage-1 artifacts.")
+    parser.add_argument("--webtable_query_file", default=None, help="Path to webtable_join_query.csv. Defaults to --input_dir/webtable_join_query.csv.")
+    parser.add_argument("--webtable_ground_truth_file", default=None, help="Path to webtable_join_ground_truth.csv. Defaults to --input_dir/webtable_join_ground_truth.csv.")
+    parser.add_argument("--webtable_table_dir", default=None, help="Directory containing WebTable CSV files. Defaults to --input_dir/data/benchmark/webtable/large/split_1.")
+    parser.add_argument("--webtable_max_rows", type=int, default=200, help="Maximum rows loaded per WebTable CSV; 0 keeps all rows.")
+    parser.add_argument("--webtable_recursive_lookup", action="store_true", help="Recursively search --webtable_table_dir when a listed CSV is not found directly.")
+    parser.add_argument("--webtable_split_ratios", nargs=3, type=float, default=[0.7, 0.1, 0.2], metavar=("TRAIN", "DEV", "TEST"))
+    parser.add_argument("--webtable_split_seed", type=int, default=13, help="Seed for deterministic WebTable query_table train/dev/test split.")
     return parser.parse_args()
 
 

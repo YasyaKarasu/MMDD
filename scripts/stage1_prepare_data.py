@@ -16,6 +16,8 @@ from stage1_io import update_stage1_manifest
 
 def run(args: argparse.Namespace) -> None:
     stage1_dir = Path(args.stage1_dir)
+    if getattr(args, "webtable_mode", False):
+        args.table_only = True
     print("=== Stage-1 prepare: logic connectivity ===")
     build_logic_connectivity(
         argparse.Namespace(
@@ -32,6 +34,14 @@ def run(args: argparse.Namespace) -> None:
             min_support=args.min_support,
             max_bridge_unique_ratio=args.max_bridge_unique_ratio,
             table_only=getattr(args, "table_only", False),
+            webtable_mode=getattr(args, "webtable_mode", False),
+            webtable_query_file=getattr(args, "webtable_query_file", None),
+            webtable_ground_truth_file=getattr(args, "webtable_ground_truth_file", None),
+            webtable_table_dir=getattr(args, "webtable_table_dir", None),
+            webtable_max_rows=getattr(args, "webtable_max_rows", 200),
+            webtable_recursive_lookup=getattr(args, "webtable_recursive_lookup", False),
+            webtable_split_ratios=getattr(args, "webtable_split_ratios", [0.7, 0.1, 0.2]),
+            webtable_split_seed=getattr(args, "webtable_split_seed", args.seed),
         )
     )
     if getattr(args, "table_only", False):
@@ -87,6 +97,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_image_pixels", type=int, default=178_956_970)
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Build only table-fragment artifacts and embeddings; skip multimodal evidence artifacts.")
+    parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark format and automatically use table-only Stage-1 mode.")
+    parser.add_argument("--webtable_query_file", default=None, help="Path to webtable_join_query.csv. Defaults to --input_dir/webtable_join_query.csv.")
+    parser.add_argument("--webtable_ground_truth_file", default=None, help="Path to webtable_join_ground_truth.csv. Defaults to --input_dir/webtable_join_ground_truth.csv.")
+    parser.add_argument("--webtable_table_dir", default=None, help="Directory containing WebTable CSV files. Defaults to --input_dir/data/benchmark/webtable/large/split_1.")
+    parser.add_argument("--webtable_max_rows", type=int, default=200, help="Maximum rows loaded per WebTable CSV; 0 keeps all rows.")
+    parser.add_argument("--webtable_recursive_lookup", action="store_true", help="Recursively search --webtable_table_dir when a listed CSV is not found directly.")
+    parser.add_argument("--webtable_split_ratios", nargs=3, type=float, default=[0.7, 0.1, 0.2], metavar=("TRAIN", "DEV", "TEST"))
+    parser.add_argument("--webtable_split_seed", type=int, default=13, help="Seed for deterministic WebTable query_table train/dev/test split.")
     parser.add_argument("--no_progress", dest="progress", action="store_false")
     parser.set_defaults(progress=True)
     return parser.parse_args()

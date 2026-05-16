@@ -30,6 +30,7 @@ output_medium/
 
 # Local input datasets and downloaded assets
 dataset/
+webtable/
 hf_models/
 
 # Large model / index / tensor artifacts

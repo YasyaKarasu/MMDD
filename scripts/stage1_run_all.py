@@ -12,6 +12,8 @@ from stage1_train_models import run as run_train_models
 
 
 def run(args: argparse.Namespace) -> None:
+    if getattr(args, "webtable_mode", False):
+        args.table_only = True
     if args.embedding_dir is None:
         args.embedding_dir = f"{args.stage1_dir}/embeddings"
     if args.student_dir is None:
@@ -36,6 +38,14 @@ def run(args: argparse.Namespace) -> None:
                 min_bc_purity=args.min_bc_purity,
                 min_support=args.min_support,
                 max_bridge_unique_ratio=args.max_bridge_unique_ratio,
+                webtable_mode=getattr(args, "webtable_mode", False),
+                webtable_query_file=getattr(args, "webtable_query_file", None),
+                webtable_ground_truth_file=getattr(args, "webtable_ground_truth_file", None),
+                webtable_table_dir=getattr(args, "webtable_table_dir", None),
+                webtable_max_rows=getattr(args, "webtable_max_rows", 200),
+                webtable_recursive_lookup=getattr(args, "webtable_recursive_lookup", False),
+                webtable_split_ratios=getattr(args, "webtable_split_ratios", [0.7, 0.1, 0.2]),
+                webtable_split_seed=getattr(args, "webtable_split_seed", args.seed),
                 skip_embeddings=args.skip_embeddings,
                 encoder_path=args.encoder_path,
                 embedding_batch_size=args.embedding_batch_size,
@@ -137,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--train_only", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Run Stage-1 using only table-table connectivity; skip multimodal evidence, HITL, path distillation, and path-aware eval.")
+    parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark format and automatically use table-only Stage-1 mode.")
     parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Bypass teacher/student training and evaluate HNSW recall directly over frozen raw embeddings.")
     parser.add_argument("--min_rows_per_fragment", type=int, default=5)
     parser.add_argument("--max_chains_per_table", type=int, default=10)
@@ -147,6 +158,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_bc_purity", type=float, default=0.85)
     parser.add_argument("--min_support", type=int, default=6)
     parser.add_argument("--max_bridge_unique_ratio", type=float, default=0.85)
+    parser.add_argument("--webtable_query_file", default=None, help="Path to webtable_join_query.csv. Defaults to --input_dir/webtable_join_query.csv.")
+    parser.add_argument("--webtable_ground_truth_file", default=None, help="Path to webtable_join_ground_truth.csv. Defaults to --input_dir/webtable_join_ground_truth.csv.")
+    parser.add_argument("--webtable_table_dir", default=None, help="Directory containing WebTable CSV files. Defaults to --input_dir/data/benchmark/webtable/large/split_1.")
+    parser.add_argument("--webtable_max_rows", type=int, default=200, help="Maximum rows loaded per WebTable CSV; 0 keeps all rows.")
+    parser.add_argument("--webtable_recursive_lookup", action="store_true", help="Recursively search --webtable_table_dir when a listed CSV is not found directly.")
+    parser.add_argument("--webtable_split_ratios", nargs=3, type=float, default=[0.7, 0.1, 0.2], metavar=("TRAIN", "DEV", "TEST"))
+    parser.add_argument("--webtable_split_seed", type=int, default=13, help="Seed for deterministic WebTable query_table train/dev/test split.")
     parser.add_argument("--skip_embeddings", action="store_true")
     parser.add_argument("--encoder_path", default="./Qwen3-VL-Embedding-2B")
     parser.add_argument("--embedding_batch_size", type=int, default=8)

@@ -201,6 +201,135 @@ def test_table_only_logic_connectivity_does_not_create_hidden_queries(tmp_path):
     assert {fragment_roles[pair["query_fragment_id"]] for pair in pairs} == {"left_visible"}
 
 
+def test_webtable_mode_builds_table_only_fragments_from_csv_benchmark(tmp_path):
+    input_dir = tmp_path / "webtable"
+    table_dir = input_dir / "data" / "benchmark" / "webtable" / "large" / "split_1"
+    stage = tmp_path / "stage"
+    table_dir.mkdir(parents=True)
+    (input_dir / "webtable_join_query.csv").write_text(
+        "query_table,query_column\nquery.csv,Player\n",
+        encoding="utf-8",
+    )
+    (input_dir / "webtable_join_ground_truth.csv").write_text(
+        "query_table,candidate_table,query_column,candidate_column\n"
+        "query.csv,candidate.csv,Player,Name\n",
+        encoding="utf-8",
+    )
+    (table_dir / "query.csv").write_text(
+        "Player,Team,Age\n"
+        "Messi,Inter Miami,36\n"
+        "Morgan,San Diego,34\n",
+        encoding="utf-8",
+    )
+    (table_dir / "candidate.csv").write_text(
+        "Name,Country,Club\n"
+        "Messi,Argentina,Inter Miami\n"
+        "Morgan,USA,San Diego\n",
+        encoding="utf-8",
+    )
+
+    build_logic_connectivity(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(stage),
+            min_rows_per_fragment=1,
+            max_chains_per_table=10,
+            max_bridges_per_anchor=5,
+            max_target_attrs=1,
+            max_query_context_attrs=1,
+            seed=13,
+            min_ab_purity=0.95,
+            min_bc_purity=0.85,
+            min_support=1,
+            max_bridge_unique_ratio=0.85,
+            table_only=False,
+            webtable_mode=True,
+            webtable_query_file=None,
+            webtable_ground_truth_file=None,
+            webtable_table_dir=None,
+            webtable_max_rows=20,
+            webtable_recursive_lookup=False,
+            webtable_split_ratios=[0.7, 0.1, 0.2],
+            webtable_split_seed=13,
+        )
+    )
+
+    fragments = [json.loads(line) for line in (stage / "logic_fragments.jsonl").read_text().splitlines()]
+    qrels = [json.loads(line) for line in (stage / "qrels.jsonl").read_text().splitlines()]
+    pairs = [json.loads(line) for line in (stage / "logic_pairs.jsonl").read_text().splitlines()]
+    manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+
+    assert {fragment["role"] for fragment in fragments} == {"left_visible", "right_target"}
+    assert len([fragment for fragment in fragments if fragment["role"] == "left_visible"]) == 1
+    assert len([fragment for fragment in fragments if fragment["role"] == "right_target"]) == 2
+    assert len(qrels) == 1
+    assert qrels[0]["query_role"] == "left_visible"
+    assert qrels[0]["webtable_query_column"] == "Player"
+    assert qrels[0]["webtable_candidate_columns"] == ["Name"]
+    assert len(pairs) == 1
+    assert manifest["logic_connectivity"]["dataset_mode"] == "webtable"
+    assert manifest["logic_connectivity"]["table_only"] is True
+
+
+def test_webtable_mode_splits_by_query_table(tmp_path):
+    input_dir = tmp_path / "webtable"
+    table_dir = input_dir / "data" / "benchmark" / "webtable" / "large" / "split_1"
+    stage = tmp_path / "stage"
+    table_dir.mkdir(parents=True)
+    query_lines = ["query_table,query_column"]
+    truth_lines = ["query_table,candidate_table,query_column,candidate_column"]
+    for idx in range(5):
+        query_name = f"query_{idx}.csv"
+        candidate_name = f"candidate_{idx}.csv"
+        query_lines.append(f"{query_name},Key")
+        truth_lines.append(f"{query_name},{candidate_name},Key,Key")
+        (table_dir / query_name).write_text("Key,Value\na,1\nb,2\n", encoding="utf-8")
+        (table_dir / candidate_name).write_text("Key,Other\na,x\nb,y\n", encoding="utf-8")
+    (input_dir / "webtable_join_query.csv").write_text("\n".join(query_lines) + "\n", encoding="utf-8")
+    (input_dir / "webtable_join_ground_truth.csv").write_text("\n".join(truth_lines) + "\n", encoding="utf-8")
+
+    build_logic_connectivity(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(stage),
+            min_rows_per_fragment=1,
+            max_chains_per_table=10,
+            max_bridges_per_anchor=5,
+            max_target_attrs=1,
+            max_query_context_attrs=1,
+            seed=13,
+            min_ab_purity=0.95,
+            min_bc_purity=0.85,
+            min_support=1,
+            max_bridge_unique_ratio=0.85,
+            table_only=False,
+            webtable_mode=True,
+            webtable_query_file=None,
+            webtable_ground_truth_file=None,
+            webtable_table_dir=None,
+            webtable_max_rows=20,
+            webtable_recursive_lookup=False,
+            webtable_split_ratios=[0.6, 0.2, 0.2],
+            webtable_split_seed=13,
+        )
+    )
+
+    fragments = [json.loads(line) for line in (stage / "logic_fragments.jsonl").read_text().splitlines()]
+    qrels = [json.loads(line) for line in (stage / "qrels.jsonl").read_text().splitlines()]
+    split_payload = json.loads((stage / "webtable_splits.json").read_text(encoding="utf-8"))
+
+    query_splits = [fragment["split"] for fragment in fragments if fragment["role"] == "left_visible"]
+    target_splits = {fragment["split"] for fragment in fragments if fragment["role"] == "right_target"}
+    assert {split: query_splits.count(split) for split in ("train", "dev", "test")} == {"train": 3, "dev": 1, "test": 1}
+    assert target_splits == {"corpus"}
+    assert {split: sum(1 for qrel in qrels if qrel["split"] == split) for split in ("train", "dev", "test")} == {
+        "train": 3,
+        "dev": 1,
+        "test": 1,
+    }
+    assert split_payload["counts"] == {"train": 3, "dev": 1, "test": 1}
+
+
 def test_same_source_targets_with_query_bridge_column_are_positive():
     def frag(fragment_id, role, source_cols, chain_id="c1", source_table_id="s1", **extra):
         return {
