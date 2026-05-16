@@ -103,6 +103,50 @@ def add_pair_sample(
     )
 
 
+def sample_negative_targets(
+    pool: list[dict[str, Any]],
+    positive_pairs: set[tuple[Any, Any]],
+    *,
+    qid: str,
+    source_table_id: Any,
+    chain_id: Any,
+    rng: random.Random,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0 or not pool:
+        return []
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+
+    def valid(candidate: dict[str, Any]) -> bool:
+        target_id = candidate.get("fragment_id")
+        return (
+            target_id not in selected_ids
+            and candidate.get("source_table_id") != source_table_id
+            and candidate.get("chain_id") != chain_id
+            and (qid, target_id) not in positive_pairs
+        )
+
+    attempts = min(len(pool), max(100, limit * 50))
+    for _ in range(attempts):
+        candidate = rng.choice(pool)
+        if not valid(candidate):
+            continue
+        selected.append(candidate)
+        selected_ids.add(candidate["fragment_id"])
+        if len(selected) >= limit:
+            return selected
+
+    for candidate in pool:
+        if not valid(candidate):
+            continue
+        selected.append(candidate)
+        selected_ids.add(candidate["fragment_id"])
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def run(args: argparse.Namespace) -> None:
     setup_logging()
     rng = random.Random(args.seed)
@@ -110,8 +154,10 @@ def run(args: argparse.Namespace) -> None:
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     targets_by_split: dict[str, list[dict[str, Any]]] = {}
     targets_by_source_split: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
+    all_targets: list[dict[str, Any]] = []
     for frag in fragments.values():
         if frag.get("role") == "right_target":
+            all_targets.append(frag)
             targets_by_split.setdefault(frag.get("split", "unknown"), []).append(frag)
             source_split = (frag.get("source_table_id"), frag.get("split", "unknown"))
             targets_by_source_split.setdefault(source_split, []).append(frag)
@@ -143,13 +189,20 @@ def run(args: argparse.Namespace) -> None:
             label_source=label_source,
             reason=pair.get("reason"),
         )
-        negatives = [
-            cand
-            for cand in targets_by_split.get(pair.get("split", "unknown"), [])
-            if cand.get("source_table_id") != pair.get("source_table_id") and cand.get("chain_id") != pair.get("chain_id")
-        ]
-        rng.shuffle(negatives)
-        for neg in negatives[:1]:
+        negative_pool = (
+            targets_by_split.get(pair.get("split", "unknown"))
+            or targets_by_split.get("corpus")
+            or all_targets
+        )
+        for neg in sample_negative_targets(
+            negative_pool,
+            positive_pairs,
+            qid=q["fragment_id"],
+            source_table_id=pair.get("source_table_id"),
+            chain_id=pair.get("chain_id"),
+            rng=rng,
+            limit=1,
+        ):
             add_pair_sample(
                 samples,
                 emitted_pairs,
