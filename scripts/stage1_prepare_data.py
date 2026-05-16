@@ -64,6 +64,7 @@ def run(args: argparse.Namespace) -> None:
                 max_table_rows=args.max_table_rows,
                 max_text_chars=args.max_text_chars,
                 max_image_pixels=args.max_image_pixels,
+                embedding_prompt_mode=getattr(args, "embedding_prompt_mode", "connectivity"),
                 force_recompute=args.force_recompute_embeddings,
                 table_only=getattr(args, "table_only", False),
                 progress=bool(getattr(args, "progress", True)),
@@ -95,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_table_rows", type=int, default=5)
     parser.add_argument("--max_text_chars", type=int, default=2048)
     parser.add_argument("--max_image_pixels", type=int, default=178_956_970)
+    parser.add_argument(
+        "--embedding_prompt_mode",
+        choices=["connectivity", "content_only"],
+        default="connectivity",
+        help="Embedding instruction style: connectivity preserves cross-asset retrieval prompts; content_only encodes each table/text/image by its own content.",
+    )
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Build only table-fragment artifacts and embeddings; skip multimodal evidence artifacts.")
     parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark format and automatically use table-only Stage-1 mode.")

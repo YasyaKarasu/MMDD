@@ -21,9 +21,32 @@ from stage1_serialization import (
     serialize_text_asset_for_embedding,
 )
 
-TABLE_INSTRUCTION = "Represent the logical statement of this table for retrieval. Focus on how this table can connect to another table or multimodal evidence."
-TEXT_INSTRUCTION = "Represent this text as evidence for recovering hidden table attributes and logical connections."
-IMAGE_INSTRUCTION = "Represent this image as evidence for multimodal table discovery. Focus on what factual attributes about the entity can be inferred from the image."
+EMBEDDING_INSTRUCTIONS = {
+    "connectivity": {
+        "table": "Represent the logical statement of this table for retrieval. Focus on how this table can connect to another table or multimodal evidence.",
+        "text": "Represent this text as evidence for recovering hidden table attributes and logical connections.",
+        "image": "Represent this image as evidence for multimodal table discovery. Focus on what factual attributes about the entity can be inferred from the image.",
+    },
+    "content_only": {
+        "table": "Represent the intrinsic content, schema, values, and factual meaning of this table for retrieval.",
+        "text": "Represent the intrinsic content, facts, entities, and semantics of this text for retrieval.",
+        "image": "Represent the intrinsic visual content, entities, objects, scene, and factual attributes visible in this image for retrieval.",
+    },
+}
+DEFAULT_EMBEDDING_PROMPT_MODE = "connectivity"
+EMBEDDING_PROMPT_MODE_CHOICES = tuple(EMBEDDING_INSTRUCTIONS)
+
+
+def embedding_prompt_mode(args: argparse.Namespace) -> str:
+    mode = getattr(args, "embedding_prompt_mode", DEFAULT_EMBEDDING_PROMPT_MODE)
+    if mode not in EMBEDDING_INSTRUCTIONS:
+        choices = ", ".join(EMBEDDING_PROMPT_MODE_CHOICES)
+        raise ValueError(f"Unsupported embedding_prompt_mode {mode!r}; use one of: {choices}")
+    return mode
+
+
+def embedding_instructions(args: argparse.Namespace) -> dict[str, str]:
+    return EMBEDDING_INSTRUCTIONS[embedding_prompt_mode(args)]
 
 
 def save_embeddings(out_dir: Path, object_type: str, ids: list[str], embeddings: np.ndarray) -> None:
@@ -32,20 +55,34 @@ def save_embeddings(out_dir: Path, object_type: str, ids: list[str], embeddings:
     write_json(out_dir / f"{object_type}_ids.json", ids)
 
 
-def existing(out_dir: Path, object_type: str, force: bool) -> bool:
+def prompt_cache_compatible(out_dir: Path, mode: str) -> bool:
+    stats_path = out_dir / "embedding_stats.json"
+    if not stats_path.exists():
+        return mode == DEFAULT_EMBEDDING_PROMPT_MODE
+    try:
+        payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return payload.get("embedding_prompt_mode", DEFAULT_EMBEDDING_PROMPT_MODE) == mode
+
+
+def existing(out_dir: Path, object_type: str, force: bool, cache_compatible: bool = True) -> bool:
+    if not cache_compatible:
+        return False
     return not force and (out_dir / f"{object_type}.npy").exists() and (out_dir / f"{object_type}_ids.json").exists()
 
 
 def encode_table_fragments(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, emb_dir: Path) -> dict[str, Any]:
     object_type = "table_fragment"
-    if existing(emb_dir, object_type, args.force_recompute):
+    mode = embedding_prompt_mode(args)
+    if existing(emb_dir, object_type, args.force_recompute, prompt_cache_compatible(emb_dir, mode)):
         ids = json.loads((emb_dir / f"{object_type}_ids.json").read_text(encoding="utf-8"))
         arr = np.load(emb_dir / f"{object_type}.npy", mmap_mode="r")
         return {"object_type": object_type, "count": len(ids), "dimension": int(arr.shape[1]), "cached": True}
     fragments = list(iter_jsonl(Path(args.stage1_dir) / "logic_fragments.jsonl"))
     ids = [frag["fragment_id"] for frag in fragments]
     texts = [serialize_table_for_embedding(frag, max_rows=args.max_table_rows) for frag in fragments]
-    embeddings = encoder.encode_tables(texts, instruction=TABLE_INSTRUCTION)
+    embeddings = encoder.encode_tables(texts, instruction=embedding_instructions(args)["table"])
     save_embeddings(emb_dir, object_type, ids, embeddings)
     return {"object_type": object_type, "count": len(ids), "dimension": int(embeddings.shape[1]), "cached": False}
 
@@ -59,8 +96,11 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
     image_prompts: list[str] = []
     skipped_images: list[dict[str, str]] = []
     resized_images: list[dict[str, Any]] = []
-    need_text = not existing(emb_dir, "text_asset", args.force_recompute)
-    need_image = not existing(emb_dir, "image_asset", args.force_recompute)
+    mode = embedding_prompt_mode(args)
+    cache_compatible = prompt_cache_compatible(emb_dir, mode)
+    instructions = embedding_instructions(args)
+    need_text = not existing(emb_dir, "text_asset", args.force_recompute, cache_compatible)
+    need_image = not existing(emb_dir, "image_asset", args.force_recompute, cache_compatible)
     if not need_text and not need_image:
         for object_type in ("text_asset", "image_asset"):
             ids = json.loads((emb_dir / f"{object_type}_ids.json").read_text(encoding="utf-8"))
@@ -96,11 +136,11 @@ def encode_assets(args: argparse.Namespace, encoder: Qwen3VLEmbeddingEncoder, em
             image_prompts.append(serialize_image_asset_prompt(asset))
 
     if need_text:
-        embeddings = encoder.encode_texts(text_inputs, instruction=TEXT_INSTRUCTION)
+        embeddings = encoder.encode_texts(text_inputs, instruction=instructions["text"])
         save_embeddings(emb_dir, "text_asset", text_ids, embeddings)
         stats.append({"object_type": "text_asset", "count": len(text_ids), "dimension": int(embeddings.shape[1]), "cached": False})
     if need_image:
-        embeddings = encoder.encode_images(image_paths, prompts=image_prompts, instruction=IMAGE_INSTRUCTION)
+        embeddings = encoder.encode_images(image_paths, prompts=image_prompts, instruction=instructions["image"])
         save_embeddings(emb_dir, "image_asset", image_ids, embeddings)
         write_json(emb_dir / "skipped_images.json", skipped_images)
         write_json(emb_dir / "resized_images.json", resized_images)
@@ -138,6 +178,8 @@ def run(args: argparse.Namespace) -> None:
         "device": args.device,
         "dtype": args.dtype,
         "batch_size": args.batch_size,
+        "embedding_prompt_mode": embedding_prompt_mode(args),
+        "embedding_instructions": embedding_instructions(args),
         "max_image_pixels": getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
         "table_only": bool(getattr(args, "table_only", False)),
         "objects": stats,
@@ -158,6 +200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_table_rows", type=int, default=5)
     parser.add_argument("--max_text_chars", type=int, default=2048)
     parser.add_argument("--max_image_pixels", type=int, default=DEFAULT_MAX_IMAGE_PIXELS)
+    parser.add_argument("--embedding_prompt_mode", choices=EMBEDDING_PROMPT_MODE_CHOICES, default=DEFAULT_EMBEDDING_PROMPT_MODE)
     parser.add_argument("--force_recompute", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Only encode table fragments; skip text/image asset embeddings.")
     parser.add_argument("--no_progress", dest="progress", action="store_false")

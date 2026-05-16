@@ -413,6 +413,66 @@ def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
     assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
 
 
+def test_content_only_embedding_prompt_mode_uses_intrinsic_instructions():
+    instructions = stage1_embeddings.embedding_instructions(argparse.Namespace(embedding_prompt_mode="content_only"))
+
+    assert set(instructions) == {"table", "text", "image"}
+    assert all("intrinsic" in instruction for instruction in instructions.values())
+    assert "connect" not in instructions["table"].casefold()
+    assert "hidden table attributes" not in instructions["text"].casefold()
+    assert "multimodal table discovery" not in instructions["image"].casefold()
+
+
+def test_embedding_prompt_mode_invalidates_incompatible_cache(tmp_path):
+    emb_dir = tmp_path / "embeddings"
+    emb_dir.mkdir()
+
+    assert stage1_embeddings.prompt_cache_compatible(emb_dir, "connectivity")
+    assert not stage1_embeddings.prompt_cache_compatible(emb_dir, "content_only")
+
+    (emb_dir / "embedding_stats.json").write_text(
+        json.dumps({"embedding_prompt_mode": "content_only"}),
+        encoding="utf-8",
+    )
+
+    assert stage1_embeddings.prompt_cache_compatible(emb_dir, "content_only")
+    assert not stage1_embeddings.prompt_cache_compatible(emb_dir, "connectivity")
+
+
+def test_table_embedding_uses_selected_prompt_mode(tmp_path):
+    stage1_dir = tmp_path / "stage1"
+    write_jsonl(
+        stage1_dir / "logic_fragments.jsonl",
+        [
+            {
+                "fragment_id": "f1",
+                "page_title": "Players",
+                "columns": [{"column_index": 0, "column_name": "Name"}],
+                "rows": [{"cells": [{"column_index": 0, "column_name": "Name", "text": "Messi"}]}],
+            }
+        ],
+    )
+    seen: dict[str, str | None] = {}
+
+    class RecordingEncoder:
+        def encode_tables(self, texts, instruction=None):
+            seen["instruction"] = instruction
+            return np.ones((len(texts), 2), dtype="float32")
+
+    stage1_embeddings.encode_table_fragments(
+        argparse.Namespace(
+            stage1_dir=str(stage1_dir),
+            max_table_rows=5,
+            force_recompute=False,
+            embedding_prompt_mode="content_only",
+        ),
+        RecordingEncoder(),
+        stage1_dir / "embeddings",
+    )
+
+    assert seen["instruction"] == stage1_embeddings.EMBEDDING_INSTRUCTIONS["content_only"]["table"]
+
+
 def test_qwen_encoder_progress_bar_updates_by_item(monkeypatch):
     events: list[tuple[str, object]] = []
 
