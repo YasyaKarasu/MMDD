@@ -31,7 +31,15 @@ from stage1_serialization import serialize_table_for_embedding
 from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
 from train_student import Student, build_distill_records, build_ranking_groups, train_loss
-from eval_stage1_recall import bridge_recall_record, direct_eval_qrels, direct_recall_records, infer_table_only, relation_query_from_projected, table_rankings
+from eval_stage1_recall import (
+    bridge_recall_record,
+    direct_eval_qrels,
+    direct_recall_records,
+    infer_table_only,
+    recall_fraction,
+    relation_query_from_projected,
+    table_rankings,
+)
 
 
 def cell(idx, name, text):
@@ -1542,6 +1550,13 @@ def test_table_only_direct_eval_qrels_keep_only_visible_queries():
     ]
     assert direct_eval_qrels(qrels, table_only=True) == [qrels[0]]
     assert direct_eval_qrels(qrels, table_only=False) == qrels
+
+
+def test_path_aware_recall_fraction_counts_all_relevant_targets():
+    ranked = ["t1", "bad", "t2"]
+    correct = {"t1", "t2", "t3"}
+    assert recall_fraction(ranked, correct, 1) == pytest.approx(1 / 3)
+    assert recall_fraction(ranked, correct, 3) == pytest.approx(2 / 3)
 
 
 def test_hnsw_table_index_contains_only_right_targets(tmp_path):

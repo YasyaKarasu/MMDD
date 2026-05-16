@@ -108,6 +108,13 @@ def relevant_by_target(qrels: list[dict[str, Any]]) -> dict[str, int]:
     return {qrel["target_id"]: int(qrel.get("rel", 1)) for qrel in qrels}
 
 
+def recall_fraction(ranked: list[str], correct: set[str], k: int) -> float:
+    if not correct:
+        return 0.0
+    hits = sum(1 for target_id in ranked[:k] if target_id in correct)
+    return hits / len(correct)
+
+
 def recall_record_header(query_id: str, qrels: list[dict[str, Any]], retrieval_mode: str, topk: int) -> dict[str, Any]:
     first = qrels[0] if qrels else {}
     return {
@@ -498,7 +505,7 @@ def path_aware_metrics(
                     elif human[path["path_id"]] == 0:
                         related_only += 1
         for k in topks:
-            recalls[f"Bridge-aware Table Recall@{k}"] += float(any(t in correct[qid] for t in ranked[:k]))
+            recalls[f"Bridge-aware Table Recall@{k}"] += recall_fraction(ranked, correct[qid], k)
     denom = max(1, len(hidden_q))
     return {
         "available": True,
