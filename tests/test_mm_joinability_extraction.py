@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -14,11 +15,13 @@ from build_mm_joinability_dataset import (
     build_bridge_assets_parallel,
     extraction_cache_key,
     normalize_extracted_attributes,
+    precompute_extraction_task_groups,
     reparse_extraction_record,
     resolve_extraction_tasks,
     safe_json_object,
 )
 from build_mm_table_dataset import ShardedJsonlWriter
+from run_mm_joinability_dynamic_vllm import VllmServerSpec, build_builder_command, default_vllm_extra_args, start_server
 
 
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
@@ -231,6 +234,226 @@ def _parallel_args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _extractor_args(**overrides):
+    values = {
+        "text_model_base_url": "http://localhost:8001/v1",
+        "text_model_base_urls": None,
+        "text_model_base_urls_file": None,
+        "text_model_name": "Qwen3.5-9B",
+        "text_model_api_key": None,
+        "image_model_base_url": "http://localhost:8000/v1",
+        "image_model_base_urls": None,
+        "image_model_base_urls_file": None,
+        "image_model_name": "Qwen3-VL-8B-Thinking",
+        "image_model_api_key": None,
+        "model_timeout_seconds": 120.0,
+        "model_temperature": 0.0,
+        "model_max_tokens": 1024,
+        "disable_thinking": True,
+        "model_max_retries": 0,
+        "model_retry_sleep_seconds": 0.0,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_endpoint_pools_add_urls_from_runtime_files(tmp_path):
+    text_endpoint_file = tmp_path / "text_endpoints.txt"
+    endpoint_file = tmp_path / "image_endpoints.txt"
+    text_endpoint_file.write_text("http://localhost:8001/v1\n", encoding="utf-8")
+    endpoint_file.write_text("http://localhost:8000/v1\n", encoding="utf-8")
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            image_model_base_url="http://localhost:8000/v1",
+            text_model_base_urls_file=str(text_endpoint_file),
+            image_model_base_urls_file=str(endpoint_file),
+        )
+    )
+
+    assert extractor.next_text_model_base_url() == "http://localhost:8001/v1"
+    assert extractor.next_image_model_base_url() == "http://localhost:8000/v1"
+
+    text_endpoint_file.write_text(
+        "http://localhost:8001/v1\nhttp://localhost:8003/v1\n",
+        encoding="utf-8",
+    )
+    endpoint_file.write_text(
+        "http://localhost:8000/v1\nhttp://localhost:8002/v1\n",
+        encoding="utf-8",
+    )
+
+    text_urls = [extractor.next_text_model_base_url() for _ in range(4)]
+    urls = [extractor.next_image_model_base_url() for _ in range(4)]
+    assert text_urls == [
+        "http://localhost:8003/v1",
+        "http://localhost:8001/v1",
+        "http://localhost:8003/v1",
+        "http://localhost:8001/v1",
+    ]
+    assert urls == [
+        "http://localhost:8002/v1",
+        "http://localhost:8000/v1",
+        "http://localhost:8002/v1",
+        "http://localhost:8000/v1",
+    ]
+
+
+def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(tmp_path):
+    text_server = VllmServerSpec(
+        role="text",
+        model_path="/models/text",
+        served_model_name="Qwen3.5-9B",
+        gpu="1",
+        port=8001,
+        extra_args=[],
+    )
+    image_server = VllmServerSpec(
+        role="image-primary",
+        model_path="/models/vl",
+        served_model_name="Qwen3-VL-8B-Thinking",
+        gpu="0",
+        port=8000,
+        extra_args=[],
+    )
+
+    command = build_builder_command(
+        python_executable="/usr/bin/python",
+        builder_script=Path("/repo/scripts/build_mm_joinability_dataset.py"),
+        input_dir=Path("/data/input"),
+        output_dir=Path("/data/output"),
+        text_server=text_server,
+        primary_image_server=image_server,
+        text_endpoints_file=tmp_path / "text_endpoints.txt",
+        image_endpoints_file=tmp_path / "image_endpoints.txt",
+        text_done_marker=tmp_path / "text_done.json",
+        image_done_marker=tmp_path / "image_done.json",
+        passthrough_args=["--max_source_tables", "10"],
+    )
+
+    assert "--precompute_model_cache" in command
+    assert "--model_text_done_marker" in command
+    assert "--model_image_done_marker" in command
+    assert "--text_model_base_urls_file" in command
+    assert "--image_model_base_urls_file" in command
+    assert "http://127.0.0.1:8001/v1" in command
+    assert "http://127.0.0.1:8000/v1" in command
+    assert command[-2:] == ["--max_source_tables", "10"]
+
+
+def test_dynamic_vllm_defaults_limit_startup_kv_cache_memory():
+    args = argparse.Namespace(
+        vllm_dtype="bfloat16",
+        vllm_max_model_len=8192,
+        vllm_gpu_memory_utilization=0.9,
+        vllm_max_num_batched_tokens=1024,
+        vllm_max_num_seqs=8,
+        vllm_mm_processor_cache_gb=0,
+        no_default_vllm_memory_args=False,
+    )
+
+    assert default_vllm_extra_args(args) == [
+        "--trust-remote-code",
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "8192",
+        "--gpu-memory-utilization",
+        "0.9",
+        "--enforce-eager",
+        "--skip-mm-profiling",
+        "--mm-processor-cache-gb",
+        "0",
+        "--max-num-batched-tokens",
+        "1024",
+        "--max-num-seqs",
+        "8",
+    ]
+
+
+def test_start_server_discards_vllm_output_by_default(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            captured["stdout"] = kwargs["stdout"]
+            captured["stderr"] = kwargs["stderr"]
+            captured["text"] = kwargs["text"]
+            captured["start_new_session"] = kwargs["start_new_session"]
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    spec = VllmServerSpec(
+        role="text",
+        model_path="/models/text",
+        served_model_name="Qwen3.5-9B",
+        gpu="1",
+        port=8001,
+        extra_args=[],
+    )
+
+    start_server(spec)
+
+    assert captured["command"] == spec.command()
+    assert captured["stdout"] == subprocess.DEVNULL
+    assert captured["stderr"] == subprocess.DEVNULL
+    assert captured["text"] is True
+    assert captured["start_new_session"] is True
+
+
+def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
+    release_text = threading.Event()
+    text_started = threading.Event()
+
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            if asset["asset_type"] == "text":
+                text_started.set()
+                release_text.wait(timeout=2.0)
+            attrs = [{"name": "State", "value": "Alabama", "evidence": asset["asset_type"]}]
+            return {"attributes": attrs, "raw_response": '{"attributes":[]}', "error": ""}
+
+    args = _parallel_args(
+        model_text_done_marker=str(tmp_path / "text_done.json"),
+        model_image_done_marker=str(tmp_path / "image_done.json"),
+        reparse_cached_model_outputs=True,
+    )
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    tasks_by_kind = {
+        "text": [_task("text", "1")],
+        "image": [_task("image", "2")],
+    }
+
+    worker = threading.Thread(
+        target=precompute_extraction_task_groups,
+        kwargs={
+            "extractor": FakeExtractor(),
+            "cache": cache,
+            "tasks_by_kind": tasks_by_kind,
+            "args": args,
+            "state": state,
+            "progress": None,
+        },
+    )
+    worker.start()
+    assert text_started.wait(timeout=2.0)
+
+    image_done = tmp_path / "image_done.json"
+    for _ in range(20):
+        if image_done.exists():
+            break
+        threading.Event().wait(0.05)
+
+    assert image_done.exists()
+    assert not (tmp_path / "text_done.json").exists()
+
+    release_text.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert (tmp_path / "text_done.json").exists()
 
 
 def test_resolve_extraction_tasks_runs_text_and_image_pools_concurrently(tmp_path):
