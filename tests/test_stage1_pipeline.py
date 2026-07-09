@@ -134,6 +134,36 @@ def test_query_fragments_keep_irrelevant_context_without_target_leakage():
     assert 1 not in [cell["source_column_index"] for cell in qh_rows[0]["cells"]]
 
 
+def test_project_rows_sanitizes_url_cells_in_output_text():
+    table = {
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Reference"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    cell(0, "Entity", "Alpha"),
+                    cell(1, "Reference", "https://example.com/" + "a" * 200),
+                ],
+            },
+            {
+                "row_id": 1,
+                "cells": [
+                    cell(0, "Entity", "Beta"),
+                    cell(1, "Reference", "see https://example.org/ref?token=" + "b" * 160 + " mirror"),
+                ],
+            },
+        ],
+    }
+
+    rows, _source_rows = project_rows(table, [0, 1], min_required_cols=1)
+
+    assert rows[0]["cells"][1]["text"] == "[url]"
+    assert rows[1]["cells"][1]["text"] == "see mirror"
+
+
 def test_table_only_logic_connectivity_does_not_create_hidden_queries(tmp_path):
     input_dir = tmp_path / "input"
     stage = tmp_path / "stage"
@@ -560,6 +590,38 @@ def test_table_serialization_excludes_shared_page_context():
     assert "shared_source" not in text
     assert "Player" in text
     assert "Messi" in text
+
+
+def test_table_serialization_sanitizes_cell_urls_for_model_context():
+    table = {
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Reference"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    cell(0, "Entity", "Alpha"),
+                    cell(1, "Reference", "https://example.com/" + "a" * 200),
+                ],
+            },
+            {
+                "row_id": 1,
+                "cells": [
+                    cell(0, "Entity", "Beta"),
+                    cell(1, "Reference", "Official page: https://example.org/wiki/Beta?token=" + "b" * 160 + " archived"),
+                ],
+            },
+        ],
+    }
+
+    text = serialize_table_for_embedding(table)
+
+    assert "[url]" in text
+    assert "Official page: archived" in text
+    assert "example.com" not in text
+    assert "example.org" not in text
 
 
 def test_qwen_encoder_wrapper_dummy_text_mock_normalized():

@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from stage1_io import clean_text, compute_profile_from_values, get_cell_text
+from stage1_io import clean_text, compute_profile_from_values, get_cell_text, sanitize_cell_text_for_model
 
 FORBIDDEN_SERIALIZATION_KEYS = {
     "role",
@@ -51,9 +51,9 @@ def _row_values(row: dict[str, Any], width: int) -> list[str]:
         value = ""
         if isinstance(cells, list):
             if idx < len(cells) and isinstance(cells[idx], dict):
-                value = clean_text(cells[idx].get("text"))
+                value = sanitize_cell_text_for_model(cells[idx].get("text"))
             if not value:
-                value = clean_text(get_cell_text(row, idx))
+                value = sanitize_cell_text_for_model(get_cell_text(row, idx))
         values.append(value)
     return values
 

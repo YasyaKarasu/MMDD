@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import logging
 import mimetypes
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -52,6 +54,7 @@ from build_mm_table_dataset import (
     write_sharded_jsonl,
     write_table_asset_links_from_jsonl,
 )
+from image_preprocessing import target_size
 from stage1_io import (
     clean_text,
     column_profiles,
@@ -59,6 +62,7 @@ from stage1_io import (
     get_cell_text,
     get_column_name,
     make_columns,
+    sanitize_cell_text_for_model,
     setup_logging,
     stable_hash,
     write_json,
@@ -68,6 +72,8 @@ from stage1_io import (
 
 PROMPT_VERSION = "entity_attribute_extraction_v2_entity_connection"
 DEFAULT_SHARED_CACHE_DIR = Path("cache") / "mm_joinability"
+DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
+_MODEL_ERROR_LOG_LOCK = threading.Lock()
 
 
 def resolve_shared_cache_paths(args: argparse.Namespace) -> dict[str, Path]:
@@ -185,6 +191,57 @@ def image_data_url(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{data}"
+
+
+def image_mode_has_alpha(mode: str, info: dict[str, Any]) -> bool:
+    return mode in {"RGBA", "LA"} or "transparency" in info
+
+
+def resized_image_data_url(path: Path, max_pixels: int) -> str:
+    if max_pixels <= 0:
+        return image_data_url(path)
+    try:
+        from PIL import Image
+        from PIL import ImageFile
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to resize images after VL context-length errors") from exc
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    previous_limit = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with Image.open(path) as image:
+                width, height = image.size
+                new_width, new_height = target_size(width, height, max_pixels)
+                has_alpha = image_mode_has_alpha(image.mode, image.info)
+                image.draft("RGB", (new_width, new_height))
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                image.thumbnail((new_width, new_height), resampling)
+                if image.width * image.height > max_pixels:
+                    image = image.resize(target_size(image.width, image.height, max_pixels), resampling)
+
+                buffer = io.BytesIO()
+                if has_alpha:
+                    if image.mode != "RGBA":
+                        image = image.convert("RGBA")
+                    image.save(buffer, format="PNG", optimize=True)
+                    mime = "image/png"
+                else:
+                    if image.mode != "RGB":
+                        image = image.convert("RGB")
+                    image.save(buffer, format="JPEG", quality=85, optimize=True)
+                    mime = "image/jpeg"
+                data = base64.b64encode(buffer.getvalue()).decode("ascii")
+                return f"data:{mime};base64,{data}"
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous_limit
+
+
+def is_context_length_error(message: Any) -> bool:
+    text = clean_text(message).casefold()
+    return "input length" in text and "maximum context length" in text
 
 
 def usage_token_count(usage: dict[str, Any], *keys: str) -> int:
@@ -323,6 +380,10 @@ class LocalAttributeExtractor:
         self.disable_thinking = args.disable_thinking
         self.max_retries = args.model_max_retries
         self.retry_sleep = args.model_retry_sleep_seconds
+        self.context_retry_image_max_pixels = max(
+            1,
+            int(getattr(args, "context_retry_image_max_pixels", DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS) or 1),
+        )
         self.model_call_stats = ModelCallStats()
 
     def current_text_model_base_urls(self) -> list[str]:
@@ -430,7 +491,7 @@ class LocalAttributeExtractor:
     ) -> str:
         return (
             "You extract factual attributes about one entity from one evidence item.\n"
-            f"Entity display text: {entity_text}\n"
+            f"Entity display text: {sanitize_cell_text_for_model(entity_text)}\n"
             f"Entity Wikipedia title: {entity_wiki_title}\n"
             "Candidate attribute names from the table:\n"
             + "\n".join(f"- {name}" for name in candidate_attributes)
@@ -465,8 +526,9 @@ class LocalAttributeExtractor:
         elif asset.get("asset_type") == "image":
             image_url = clean_text(asset.get("image_url"))
             local_path = clean_text(asset.get("local_path"))
-            if local_path and Path(local_path).exists():
-                image_url = image_data_url(Path(local_path))
+            local_image_path = Path(local_path) if local_path and Path(local_path).exists() else None
+            if local_image_path is not None:
+                image_url = image_data_url(local_image_path)
             if not image_url:
                 raise ValueError(f"Image asset {asset.get('asset_id')} has no usable image URL or local path")
             messages = [
@@ -479,13 +541,39 @@ class LocalAttributeExtractor:
                     ],
                 },
             ]
-            raw = self.chat(
-                base_url=self.next_image_model_base_url(),
-                model=self.image_model_name,
-                api_key=self.image_model_api_key,
-                messages=messages,
-                model_kind="image",
-            )
+            try:
+                raw = self.chat(
+                    base_url=self.next_image_model_base_url(),
+                    model=self.image_model_name,
+                    api_key=self.image_model_api_key,
+                    messages=messages,
+                    model_kind="image",
+                )
+            except Exception as exc:
+                if local_image_path is None or not is_context_length_error(exc):
+                    raise
+                retry_messages = [
+                    dict(message)
+                    for message in messages
+                ]
+                retry_content = [
+                    dict(item)
+                    for item in retry_messages[1]["content"]
+                ]
+                retry_content[1] = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": resized_image_data_url(local_image_path, self.context_retry_image_max_pixels),
+                    },
+                }
+                retry_messages[1]["content"] = retry_content
+                raw = self.chat(
+                    base_url=self.next_image_model_base_url(),
+                    model=self.image_model_name,
+                    api_key=self.image_model_api_key,
+                    messages=retry_messages,
+                    model_kind="image",
+                )
         else:
             return {"attributes": [], "raw_response": "", "error": f"unsupported_asset_type:{asset.get('asset_type')}"}
         payload = safe_json_object(raw)
@@ -587,26 +675,57 @@ class ModelConcurrencyState:
     image_workers: int
     text_oom_downgrades: int = 0
     image_oom_downgrades: int = 0
+    target_text_workers: int | None = None
+    target_image_workers: int | None = None
+
+    def __post_init__(self) -> None:
+        self.text_workers = max(1, int(self.text_workers or 1))
+        self.image_workers = max(1, int(self.image_workers or 1))
+        if self.target_text_workers is None:
+            self.target_text_workers = self.text_workers
+        else:
+            self.target_text_workers = max(1, int(self.target_text_workers or 1))
+        if self.target_image_workers is None:
+            self.target_image_workers = self.image_workers
+        else:
+            self.target_image_workers = max(1, int(self.target_image_workers or 1))
+        self.target_text_workers = max(self.target_text_workers, self.text_workers)
+        self.target_image_workers = max(self.target_image_workers, self.image_workers)
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "ModelConcurrencyState":
+        text_workers = max(1, int(getattr(args, "text_model_workers", 1) or 1))
+        image_workers = max(1, int(getattr(args, "image_model_workers", 1) or 1))
         return cls(
-            text_workers=max(1, int(getattr(args, "text_model_workers", 1) or 1)),
-            image_workers=max(1, int(getattr(args, "image_model_workers", 1) or 1)),
+            text_workers=text_workers,
+            image_workers=image_workers,
+            target_text_workers=text_workers,
+            target_image_workers=image_workers,
         )
 
     def workers_for(self, model_kind: str) -> int:
         return self.image_workers if model_kind == "image" else self.text_workers
 
-    def downgrade_after_oom(self, model_kind: str) -> None:
+    def downgrade_after_oom(self, model_kind: str, attempted_workers: int | None = None) -> int:
+        attempted_workers = max(1, int(attempted_workers or self.workers_for(model_kind)))
+        next_workers = max(1, (attempted_workers + 1) // 2)
         if model_kind == "image":
             if self.image_workers > 1:
                 self.image_oom_downgrades += 1
-            self.image_workers = 1
+            self.image_workers = next_workers
+            return self.image_workers
         else:
             if self.text_workers > 1:
                 self.text_oom_downgrades += 1
-            self.text_workers = 1
+            self.text_workers = next_workers
+            return self.text_workers
+
+    def recover_after_non_oom_window(self, model_kind: str) -> int:
+        if model_kind == "image":
+            self.image_workers = min(self.target_image_workers or self.image_workers, self.image_workers + 1)
+            return self.image_workers
+        self.text_workers = min(self.target_text_workers or self.text_workers, self.text_workers + 1)
+        return self.text_workers
 
     def summary(self) -> dict[str, int]:
         return {
@@ -668,12 +787,19 @@ def run_extraction_task_group(
     extractor: LocalAttributeExtractor,
     tasks: list[ExtractionTask],
     workers: int,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not tasks:
         return {}
     workers = max(1, min(workers, len(tasks)))
     if workers == 1:
-        return {task.cache_key: run_extraction_task(extractor, task) for task in tasks}
+        records = {}
+        for task in tasks:
+            record = run_extraction_task(extractor, task)
+            records[task.cache_key] = record
+            if on_record is not None:
+                on_record(task.cache_key, record)
+        return records
 
     records: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -687,6 +813,8 @@ def run_extraction_task_group(
                     task,
                     {"attributes": [], "raw_response": "", "error": str(exc)},
                 )
+            if on_record is not None:
+                on_record(task.cache_key, records[task.cache_key])
     return records
 
 
@@ -696,24 +824,50 @@ def run_extraction_kind_adaptive(
     tasks: list[ExtractionTask],
     model_kind: str,
     state: ModelConcurrencyState,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    workers = state.workers_for(model_kind)
-    records = run_extraction_task_group(extractor=extractor, tasks=tasks, workers=workers)
+    configured_workers = state.workers_for(model_kind)
+    workers = max(1, min(configured_workers, len(tasks)))
+    delayed_oom_records: dict[str, dict[str, Any]] = {}
+
+    def handle_initial_record(cache_key: str, record: dict[str, Any]) -> None:
+        if workers > 1 and is_oom_error(record.get("error")):
+            delayed_oom_records[cache_key] = record
+            return
+        if on_record is not None:
+            on_record(cache_key, record)
+
+    records = run_extraction_task_group(
+        extractor=extractor,
+        tasks=tasks,
+        workers=workers,
+        on_record=handle_initial_record,
+    )
     oom_tasks = [
         task
         for task in tasks
-        if is_oom_error(records.get(task.cache_key, {}).get("error"))
+        if task.cache_key in delayed_oom_records
     ]
     if oom_tasks and workers > 1:
+        next_workers = state.downgrade_after_oom(model_kind, attempted_workers=workers)
         logging.warning(
-            "%s model hit OOM-like errors with %d workers; retrying %d failed tasks serially and downgrading future %s workers to 1",
+            "%s model hit OOM-like errors with %d workers; retrying %d failed tasks serially and downgrading future %s workers to %d",
             model_kind,
             workers,
             len(oom_tasks),
             model_kind,
+            next_workers,
         )
-        state.downgrade_after_oom(model_kind)
-        records.update(run_extraction_task_group(extractor=extractor, tasks=oom_tasks, workers=1))
+        records.update(
+            run_extraction_task_group(
+                extractor=extractor,
+                tasks=oom_tasks,
+                workers=1,
+                on_record=on_record,
+            )
+        )
+    elif tasks and workers == configured_workers:
+        state.recover_after_non_oom_window(model_kind)
     return records
 
 
@@ -722,6 +876,7 @@ def run_uncached_extraction_tasks(
     extractor: LocalAttributeExtractor,
     tasks: list[ExtractionTask],
     state: ModelConcurrencyState,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     groups: dict[str, list[ExtractionTask]] = {"text": [], "image": []}
     for task in tasks:
@@ -737,6 +892,7 @@ def run_uncached_extraction_tasks(
                     tasks=group_tasks,
                     model_kind=kind,
                     state=state,
+                    on_record=on_record,
                 )
             )
         return records
@@ -749,6 +905,7 @@ def run_uncached_extraction_tasks(
                 tasks=group_tasks,
                 model_kind=kind,
                 state=state,
+                on_record=on_record,
             ): kind
             for kind, group_tasks in active_groups
         }
@@ -763,6 +920,16 @@ def cached_extraction_is_reusable(record: dict[str, Any], args: argparse.Namespa
     if getattr(args, "refresh_invalid_model_cache", False) and should_refresh_cached_extraction(record):
         return False
     return True
+
+
+def append_model_error_record(path_value: str, record: dict[str, Any]) -> None:
+    if not clean_text(path_value) or not clean_text(record.get("error")):
+        return
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _MODEL_ERROR_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def resolve_extraction_tasks(
@@ -797,18 +964,25 @@ def resolve_extraction_tasks(
                 continue
         uncached_by_key[task.cache_key] = task
 
-    model_records = run_uncached_extraction_tasks(
-        extractor=extractor,
-        tasks=list(uncached_by_key.values()),
-        state=state,
-    )
-    for cache_key, record in model_records.items():
+    def store_model_record(cache_key: str, record: dict[str, Any]) -> None:
         resolved_by_key[cache_key] = record
         has_error = bool(clean_text(record.get("error")))
         if not has_error or getattr(args, "cache_failed_model_outputs", False):
             cache.put(cache_key, record)
+        if has_error:
+            append_model_error_record(getattr(args, "model_attribute_errors_path", ""), record)
         if progress is not None:
             progress.mark(cache_key, "error" if has_error else "model")
+
+    model_records = run_uncached_extraction_tasks(
+        extractor=extractor,
+        tasks=list(uncached_by_key.values()),
+        state=state,
+        on_record=store_model_record,
+    )
+    for cache_key, record in model_records.items():
+        if cache_key not in resolved_by_key:
+            store_model_record(cache_key, record)
 
     return [(task, resolved_by_key[task.cache_key]) for task in tasks if task.cache_key in resolved_by_key]
 
@@ -917,7 +1091,7 @@ def project_selected_rows(
             cell["column_index"] = out_idx
             cell["source_column_index"] = source_idx
             cell["column_name"] = get_column_name(table, source_idx)
-            cell["text"] = values.get(source_idx, "")
+            cell["text"] = sanitize_cell_text_for_model(values.get(source_idx, ""))
             cells.append(cell)
         rows.append({"row_id": len(rows), "source_row_id": source_row_id, "cells": cells})
         source_rows.append(source_row_id)
@@ -1855,6 +2029,13 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_paths = resolve_shared_cache_paths(args)
+    model_attribute_errors_path = clean_text(getattr(args, "model_attribute_errors_path", ""))
+    if not model_attribute_errors_path:
+        model_attribute_errors_path = str(output_dir / "model_attribute_errors.jsonl")
+        setattr(args, "model_attribute_errors_path", model_attribute_errors_path)
+    error_log_path = Path(model_attribute_errors_path)
+    error_log_path.parent.mkdir(parents=True, exist_ok=True)
+    error_log_path.write_text("", encoding="utf-8")
 
     records_per_shard = max(1, args.records_per_shard)
     flush_every = max(1, args.flush_every_records)
@@ -2172,6 +2353,8 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "reparse_cached_model_outputs": args.reparse_cached_model_outputs,
             "refresh_invalid_model_cache": args.refresh_invalid_model_cache,
             "cache_failed_model_outputs": args.cache_failed_model_outputs,
+            "model_attribute_errors_path": model_attribute_errors_path,
+            "context_retry_image_max_pixels": args.context_retry_image_max_pixels,
             "configured_text_model_workers": args.text_model_workers,
             "configured_image_model_workers": args.image_model_workers,
             "final_model_concurrency": stats["model_concurrency"],
@@ -2255,6 +2438,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_retry_sleep_seconds", type=float, default=2.0)
     parser.add_argument("--no_reuse_model_cache", action="store_true")
     parser.add_argument("--cache_failed_model_outputs", action="store_true", help="Persist failed model calls in the extraction cache. By default failures are written only to this run's output so the next run retries them.")
+    parser.add_argument("--model_attribute_errors_path", default="", help="JSONL path for failed model extraction records. Defaults to <output_dir>/model_attribute_errors.jsonl.")
+    parser.add_argument("--context_retry_image_max_pixels", type=int, default=DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS, help="Temporary max pixel count for local images retried after VL context-length errors. Original image files are not modified.")
     parser.add_argument("--no_model_progress", dest="model_progress", action="store_false", help="Disable the local model analysis progress bar.")
     parser.add_argument("--precompute_model_cache", action="store_true", help="Run text and image extraction tasks into the shared model cache before table processing, writing per-modality done markers as each modality finishes.")
     parser.add_argument("--precompute_text_model_cache", action="store_true", help="Run all text extraction tasks into the shared model cache before image-heavy table processing.")

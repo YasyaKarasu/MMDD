@@ -15,13 +15,20 @@ from build_mm_joinability_dataset import (
     build_bridge_assets_parallel,
     extraction_cache_key,
     normalize_extracted_attributes,
+    project_selected_rows,
     precompute_extraction_task_groups,
     reparse_extraction_record,
     resolve_extraction_tasks,
     safe_json_object,
 )
 from build_mm_table_dataset import ShardedJsonlWriter
-from run_mm_joinability_dynamic_vllm import VllmServerSpec, build_builder_command, default_vllm_extra_args, start_server
+from run_mm_joinability_dynamic_vllm import (
+    VllmServerSpec,
+    build_builder_command,
+    default_vllm_extra_args,
+    parse_args as parse_dynamic_vllm_args,
+    start_server,
+)
 
 
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
@@ -184,6 +191,141 @@ def test_chat_records_model_request_time_and_token_usage_by_kind(monkeypatch):
     assert summary["image"]["total_tokens"] == 10
 
 
+def test_image_extraction_keeps_image_url_but_sanitizes_entity_cell_url(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    image_url = "https://upload.wikimedia.org/example/large-image.jpg"
+    extractor.extract(
+        asset={
+            "asset_id": "img_1",
+            "asset_type": "image",
+            "image_url": image_url,
+        },
+        entity={
+            "cell_text": "https://example.com/entity/" + "a" * 200,
+            "wiki_title": "Alpha",
+        },
+        candidate_attributes=["State"],
+    )
+
+    user_content = captured["json"]["messages"][1]["content"]
+    assert user_content[0]["type"] == "text"
+    assert "Entity display text: [url]" in user_content[0]["text"]
+    assert "example.com/entity" not in user_content[0]["text"]
+    assert user_content[1] == {"type": "image_url", "image_url": {"url": image_url}}
+
+
+def test_image_extraction_retries_context_length_error_with_resized_local_image(monkeypatch, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "large.jpg"
+    image = Image.new("RGB", (500, 500))
+    pixels = image.load()
+    for y in range(500):
+        for x in range(500):
+            pixels[x, y] = ((x * 17) % 256, (y * 31) % 256, ((x + y) * 13) % 256)
+    image.save(image_path, format="JPEG", quality=95)
+    sent_urls = []
+
+    class Response:
+        def __init__(self, status_code, text="", content='{"attributes":[]}'):
+            self.status_code = status_code
+            self.text = text
+            self._content = content
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": self._content}}]}
+
+    def fake_post(url, headers, json, timeout):
+        sent_urls.append(json["messages"][1]["content"][1]["image_url"]["url"])
+        if len(sent_urls) == 1:
+            return Response(
+                400,
+                '{"error":{"message":"Input length (9000) exceeds model\'s maximum context length (4096)."}}',
+            )
+        return Response(200)
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args(model_max_retries=0))
+
+    result = extractor.extract(
+        asset={
+            "asset_id": "img_1",
+            "asset_type": "image",
+            "local_path": str(image_path),
+        },
+        entity={
+            "entity_id": "ent_1",
+            "cell_text": "Alpha",
+            "wiki_title": "Alpha",
+        },
+        candidate_attributes=["State"],
+    )
+
+    assert result["error"] == ""
+    assert len(sent_urls) == 2
+    assert sent_urls[0].startswith("data:image/")
+    assert sent_urls[1].startswith("data:image/")
+    assert len(sent_urls[1]) < len(sent_urls[0])
+
+
+def test_joinability_projected_rows_sanitize_cell_urls_for_model_tables():
+    source_table = {
+        "source_table_id": "src",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Image Source"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {"column_index": 0, "column_name": "Entity", "text": "Alpha"},
+                    {"column_index": 1, "column_name": "Image Source", "text": "https://example.com/" + "x" * 200},
+                ],
+            },
+            {
+                "row_id": 1,
+                "cells": [
+                    {"column_index": 0, "column_name": "Entity", "text": "Beta"},
+                    {
+                        "column_index": 1,
+                        "column_name": "Image Source",
+                        "text": "shown at https://example.org/image.png?cache=" + "y" * 200 + " source",
+                    },
+                ],
+            },
+        ],
+    }
+
+    rows, _source_rows = project_selected_rows(
+        source_table,
+        [0, 1],
+        {0, 1},
+        min_required_cols=1,
+    )
+
+    assert rows[0]["cells"][1]["text"] == "[url]"
+    assert rows[1]["cells"][1]["text"] == "shown at source"
+
+
 def test_old_cache_key_is_preserved_when_disabling_thinking():
     base = dict(
         asset_id="asset_1",
@@ -231,6 +373,7 @@ def _parallel_args(**overrides):
         "text_model_workers": 1,
         "image_model_workers": 1,
         "cache_failed_model_outputs": False,
+        "model_attribute_errors_path": "",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -372,6 +515,23 @@ def test_dynamic_vllm_defaults_limit_startup_kv_cache_memory():
     ]
 
 
+def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
+    args, _passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+        ]
+    )
+
+    assert args.vllm_max_model_len == 8192
+
+
 def test_start_server_discards_vllm_output_by_default(monkeypatch):
     captured = {}
 
@@ -482,6 +642,51 @@ def test_resolve_extraction_tasks_runs_text_and_image_pools_concurrently(tmp_pat
     assert all(not record["error"] for _task_item, record in records)
 
 
+def test_resolve_extraction_tasks_marks_progress_as_each_model_task_finishes(tmp_path):
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    quick_marked = threading.Event()
+
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            if entity["entity_id"] == "ent_1":
+                slow_started.set()
+                release_slow.wait(timeout=2.0)
+            attrs = [{"name": "State", "value": "Alabama", "evidence": entity["entity_id"]}]
+            return {"attributes": attrs, "raw_response": '{"attributes":[]}', "error": ""}
+
+    class FakeProgress:
+        def mark(self, cache_key, status):
+            if cache_key == "cache_text_2" and status == "model":
+                quick_marked.set()
+
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    tasks = [_task("text", "1"), _task("text", "2")]
+    state = ModelConcurrencyState(text_workers=2, image_workers=1)
+
+    worker = threading.Thread(
+        target=resolve_extraction_tasks,
+        kwargs={
+            "extractor": FakeExtractor(),
+            "cache": cache,
+            "tasks": tasks,
+            "args": _parallel_args(text_model_workers=2),
+            "state": state,
+            "progress": FakeProgress(),
+        },
+    )
+    worker.start()
+    assert slow_started.wait(timeout=2.0)
+
+    assert quick_marked.wait(timeout=2.0)
+    assert worker.is_alive()
+
+    release_slow.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+
+
 def test_resolve_extraction_tasks_downgrades_after_oom_and_retries_serially(tmp_path):
     active = 0
     calls = 0
@@ -526,6 +731,80 @@ def test_resolve_extraction_tasks_downgrades_after_oom_and_retries_serially(tmp_
     assert cache.get("cache_image_2") is not None
 
 
+def test_resolve_extraction_tasks_recovers_workers_additively_after_halving_on_oom(tmp_path):
+    class ActiveCountingExtractor:
+        def __init__(self, *, barrier_parties: int, oom_above_active: int | None = None):
+            self.active = 0
+            self.calls = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            self.barrier = threading.Barrier(barrier_parties, timeout=2.0)
+            self.barrier_parties = barrier_parties
+            self.oom_above_active = oom_above_active
+
+        def extract(self, asset, entity, candidate_attribute_names):
+            with self.lock:
+                self.active += 1
+                self.calls += 1
+                current_active = self.active
+                call_number = self.calls
+                self.max_active = max(self.max_active, current_active)
+            try:
+                if call_number <= self.barrier_parties:
+                    self.barrier.wait()
+                if self.oom_above_active is not None and current_active > self.oom_above_active:
+                    raise RuntimeError("CUDA out of memory")
+                attrs = [{"name": "State", "value": "Alabama", "evidence": entity["entity_id"]}]
+                return {"attributes": attrs, "raw_response": '{"attributes":[]}', "error": ""}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    state = ModelConcurrencyState(text_workers=1, image_workers=4)
+
+    oom_extractor = ActiveCountingExtractor(barrier_parties=4, oom_above_active=2)
+    records = resolve_extraction_tasks(
+        extractor=oom_extractor,
+        cache=cache,
+        tasks=[_task("image", f"oom_{idx}") for idx in range(4)],
+        args=_parallel_args(image_model_workers=4),
+        state=state,
+        progress=None,
+    )
+
+    assert oom_extractor.max_active == 4
+    assert state.image_workers == 2
+    assert state.image_oom_downgrades == 1
+    assert all(not record["error"] for _task_item, record in records)
+
+    first_recovery = ActiveCountingExtractor(barrier_parties=2)
+    resolve_extraction_tasks(
+        extractor=first_recovery,
+        cache=cache,
+        tasks=[_task("image", f"recover_a_{idx}") for idx in range(2)],
+        args=_parallel_args(image_model_workers=4),
+        state=state,
+        progress=None,
+    )
+
+    assert first_recovery.max_active == 2
+    assert state.image_workers == 3
+
+    second_recovery = ActiveCountingExtractor(barrier_parties=3)
+    resolve_extraction_tasks(
+        extractor=second_recovery,
+        cache=cache,
+        tasks=[_task("image", f"recover_b_{idx}") for idx in range(3)],
+        args=_parallel_args(image_model_workers=4),
+        state=state,
+        progress=None,
+    )
+
+    assert second_recovery.max_active == 3
+    assert state.image_workers == 4
+
+
 def test_resolve_extraction_tasks_does_not_cache_failed_model_outputs(tmp_path):
     class FakeExtractor:
         def extract(self, asset, entity, candidate_attribute_names):
@@ -547,6 +826,32 @@ def test_resolve_extraction_tasks_does_not_cache_failed_model_outputs(tmp_path):
     assert records[0][1]["error"]
     assert cache.get(task.cache_key) is None
     assert not (tmp_path / "model_cache.jsonl").exists() or not (tmp_path / "model_cache.jsonl").read_text(encoding="utf-8").strip()
+
+
+def test_resolve_extraction_tasks_writes_failed_model_outputs_to_error_log(tmp_path):
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            raise RuntimeError("Input length (6749) exceeds model's maximum context length (4096).")
+
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    task = _task("image", "1")
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    error_log = tmp_path / "model_attribute_errors.jsonl"
+
+    records = resolve_extraction_tasks(
+        extractor=FakeExtractor(),
+        cache=cache,
+        tasks=[task],
+        args=_parallel_args(model_attribute_errors_path=str(error_log)),
+        state=state,
+        progress=None,
+    )
+
+    assert records[0][1]["error"]
+    assert cache.get(task.cache_key) is None
+    lines = [line for line in error_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "Input length (6749)" in lines[0]
 
 
 def test_parallel_bridge_asset_builder_fetches_entities_concurrently(tmp_path):

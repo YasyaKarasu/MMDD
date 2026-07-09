@@ -17,6 +17,7 @@ from typing import Any, Iterable, Iterator
 LOG = logging.getLogger("stage1")
 WHITESPACE_RE = re.compile(r"\s+")
 NUMERIC_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?%?$")
+URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 USELESS_COLUMN_NAMES = {
     "no",
     "no.",
@@ -45,6 +46,17 @@ def clean_text(value: Any) -> str:
         return ""
     text = html.unescape(str(value)).replace("\xa0", " ").strip()
     return WHITESPACE_RE.sub(" ", text)
+
+
+def sanitize_cell_text_for_model(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    if not URL_RE.search(text):
+        return text
+    without_urls = URL_RE.sub(" ", text)
+    without_urls = WHITESPACE_RE.sub(" ", without_urls).strip(" ,;:-|()[]{}")
+    return without_urls or "[url]"
 
 
 def stable_hash(*parts: Any, length: int = 16) -> str:
@@ -295,7 +307,7 @@ def project_rows(
             original["column_index"] = out_idx
             original["source_column_index"] = source_idx
             original["column_name"] = get_column_name(source_table, source_idx)
-            original["text"] = values.get(source_idx, "")
+            original["text"] = sanitize_cell_text_for_model(values.get(source_idx, ""))
             cells.append(original)
         output_rows.append({"row_id": len(output_rows), "source_row_id": row_id(row, fallback), "cells": cells})
         source_row_indices.append(row_id(row, fallback))

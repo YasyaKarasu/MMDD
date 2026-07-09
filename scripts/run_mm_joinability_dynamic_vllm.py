@@ -270,7 +270,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--builder_script", default=str(Path(__file__).with_name("build_mm_joinability_dataset.py")))
     parser.add_argument("--python_executable", default=sys.executable)
     parser.add_argument("--vllm_dtype", default="bfloat16")
-    parser.add_argument("--vllm_max_model_len", type=int, default=4096)
+    parser.add_argument("--vllm_max_model_len", type=int, default=8192)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90)
     parser.add_argument("--vllm_max_num_batched_tokens", type=int, default=1024)
     parser.add_argument("--vllm_max_num_seqs", type=int, default=1)
