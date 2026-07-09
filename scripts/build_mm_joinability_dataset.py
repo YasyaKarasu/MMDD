@@ -71,9 +71,11 @@ from stage1_io import (
 )
 
 
-PROMPT_VERSION = "entity_attribute_extraction_v2_entity_connection"
+PROMPT_VERSION = "entity_attribute_extraction_v3_short_empty_precompressed_image"
 DEFAULT_SHARED_CACHE_DIR = Path("cache") / "mm_joinability"
 DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
+DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
+DEFAULT_IMAGE_MODEL_MAX_TOKENS = 384
 _MODEL_ERROR_LOG_LOCK = threading.Lock()
 
 
@@ -378,9 +380,17 @@ class LocalAttributeExtractor:
         self.timeout = args.model_timeout_seconds
         self.temperature = args.model_temperature
         self.max_tokens = args.model_max_tokens
+        self.image_max_tokens = max(
+            1,
+            int(getattr(args, "image_model_max_tokens", DEFAULT_IMAGE_MODEL_MAX_TOKENS) or DEFAULT_IMAGE_MODEL_MAX_TOKENS),
+        )
         self.disable_thinking = args.disable_thinking
         self.max_retries = args.model_max_retries
         self.retry_sleep = args.model_retry_sleep_seconds
+        self.image_request_max_pixels = max(
+            0,
+            int(getattr(args, "image_request_max_pixels", DEFAULT_IMAGE_REQUEST_MAX_PIXELS) or 0),
+        )
         self.context_retry_image_max_pixels = max(
             1,
             int(getattr(args, "context_retry_image_max_pixels", DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS) or 1),
@@ -443,7 +453,7 @@ class LocalAttributeExtractor:
             "model": model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.image_max_tokens if model_kind == "image" else self.max_tokens,
         }
         if self.disable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
@@ -499,6 +509,7 @@ class LocalAttributeExtractor:
             + "\nReturn strict JSON only in this shape:\n"
             '{"attributes":[{"name":"<one candidate attribute name>","value":"<extracted value>","evidence":"<short quote or visual evidence>","connection_evidence":"<why this evidence item itself can be linked to the entity>"}]}\n'
             "Only include attributes directly supported by the evidence item. "
+            'If no candidate attribute is directly supported, return exactly {"attributes":[]}. '
             "Only include an attribute when the evidence item itself lets a reader connect the evidence to this entity, "
             "for example through the entity name, an alias, a visible/quoted identifier, or an entity-specific attribute. "
             "Do not rely on Wikipedia page provenance, source URL, or the fact that the asset was collected from the entity page. "
@@ -529,7 +540,7 @@ class LocalAttributeExtractor:
             local_path = clean_text(asset.get("local_path"))
             local_image_path = Path(local_path) if local_path and Path(local_path).exists() else None
             if local_image_path is not None:
-                image_url = image_data_url(local_image_path)
+                image_url = resized_image_data_url(local_image_path, self.image_request_max_pixels)
             if not image_url:
                 raise ValueError(f"Image asset {asset.get('asset_id')} has no usable image URL or local path")
             messages = [
@@ -1373,6 +1384,34 @@ def write_model_done_marker(path_value: str, *, model_kind: str, task_count: int
     )
 
 
+def write_model_start_marker(path_value: str, *, text_task_count: int, image_task_count: int) -> None:
+    if not clean_text(path_value):
+        return
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "status": "model_cache_ready_to_start",
+                "text_task_count": text_task_count,
+                "image_task_count": image_task_count,
+                "timestamp": time.time(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def wait_for_model_ready_marker(path_value: str, *, poll_seconds: float = 2.0) -> None:
+    if not clean_text(path_value):
+        return
+    path = Path(path_value)
+    while not path.exists():
+        time.sleep(poll_seconds)
+
+
 def write_text_done_marker(path_value: str, *, task_count: int) -> None:
     write_model_done_marker(path_value, model_kind="text", task_count=task_count)
 
@@ -2142,7 +2181,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     splits = source_splits(source_split_records, args)
     source_to_split = split_map(splits)
     assets = load_assets(bridge_assets_writer.paths())
-    extractor = LocalAttributeExtractor(args)
     cache = ExtractionCache(cache_paths["model_attribute_extractions"], reuse=not args.no_reuse_model_cache)
     concurrency_state = ModelConcurrencyState.from_args(args)
     progress: ModelAnalysisProgress | None = None
@@ -2163,6 +2201,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     precomputed_text_task_count = 0
     precomputed_image_task_count = 0
+    extractor: LocalAttributeExtractor | None = None
     if getattr(args, "precompute_model_cache", False) or getattr(args, "precompute_text_model_cache", False):
         text_tasks = collect_extraction_tasks_from_tables(
             source_paths=source_writer.paths(),
@@ -2189,6 +2228,13 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             precomputed_text_task_count,
             precomputed_image_task_count,
         )
+        write_model_start_marker(
+            clean_text(getattr(args, "model_start_marker", "")),
+            text_task_count=precomputed_text_task_count,
+            image_task_count=precomputed_image_task_count,
+        )
+        wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
+        extractor = LocalAttributeExtractor(args)
         tasks_by_kind = {"text": text_tasks}
         if getattr(args, "precompute_model_cache", False):
             tasks_by_kind["image"] = image_tasks
@@ -2200,6 +2246,17 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             state=concurrency_state,
             progress=progress,
         )
+    else:
+        write_model_start_marker(
+            clean_text(getattr(args, "model_start_marker", "")),
+            text_task_count=0,
+            image_task_count=0,
+        )
+        wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
+        extractor = LocalAttributeExtractor(args)
+
+    if extractor is None:
+        extractor = LocalAttributeExtractor(args)
 
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)
     data_lake_writer = ShardedJsonlWriter(data_lake_tables_dir, records_per_shard)
@@ -2324,8 +2381,12 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "image_model_base_urls_file": getattr(args, "image_model_base_urls_file", None),
             "image_model_name": args.image_model_name,
             "prompt_version": PROMPT_VERSION,
+            "image_model_max_tokens": getattr(args, "image_model_max_tokens", DEFAULT_IMAGE_MODEL_MAX_TOKENS),
+            "image_request_max_pixels": getattr(args, "image_request_max_pixels", DEFAULT_IMAGE_REQUEST_MAX_PIXELS),
             "precompute_model_cache": getattr(args, "precompute_model_cache", False),
             "precompute_text_model_cache": getattr(args, "precompute_text_model_cache", False),
+            "model_start_marker": getattr(args, "model_start_marker", None),
+            "model_ready_marker": getattr(args, "model_ready_marker", None),
             "model_text_done_marker": getattr(args, "model_text_done_marker", None),
             "model_image_done_marker": getattr(args, "model_image_done_marker", None),
             "disable_thinking": args.disable_thinking,
@@ -2418,6 +2479,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
     parser.add_argument("--model_temperature", type=float, default=0.0)
     parser.add_argument("--model_max_tokens", type=int, default=1024)
+    parser.add_argument("--image_model_max_tokens", type=int, default=DEFAULT_IMAGE_MODEL_MAX_TOKENS, help="Maximum completion tokens for image-model extraction calls.")
+    parser.add_argument("--image_request_max_pixels", type=int, default=DEFAULT_IMAGE_REQUEST_MAX_PIXELS, help="Resize local images to this pixel budget before image-model requests. Use 0 to send original local images.")
     parser.add_argument("--text_model_workers", type=int, default=1, help="Concurrent text-model requests. Default 1 is conservative for 24GB GPUs.")
     parser.add_argument("--image_model_workers", type=int, default=1, help="Concurrent image-model requests. Default 1 is conservative for 24GB GPUs.")
     parser.add_argument("--enable_thinking", dest="disable_thinking", action="store_false", help="Allow Qwen thinking mode. By default, chat_template_kwargs disables thinking for extraction calls.")
@@ -2432,6 +2495,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_model_progress", dest="model_progress", action="store_false", help="Disable the local model analysis progress bar.")
     parser.add_argument("--precompute_model_cache", action="store_true", help="Run text and image extraction tasks into the shared model cache before table processing, writing per-modality done markers as each modality finishes.")
     parser.add_argument("--precompute_text_model_cache", action="store_true", help="Run all text extraction tasks into the shared model cache before image-heavy table processing.")
+    parser.add_argument("--model_start_marker", default=None, help="Write this JSON marker after Wikipedia/material preparation is complete and model requests are about to start.")
+    parser.add_argument("--model_ready_marker", default=None, help="Wait for this JSON marker before issuing model requests. Dynamic vLLM runners write it after servers are healthy.")
     parser.add_argument("--model_text_done_marker", default=None, help="Write this JSON marker after --precompute_text_model_cache completes.")
     parser.add_argument("--model_image_done_marker", default=None, help="Write this JSON marker after image model cache precompute completes.")
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)

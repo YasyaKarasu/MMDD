@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -95,6 +96,8 @@ def build_builder_command(
     primary_image_server: VllmServerSpec,
     text_endpoints_file: Path,
     image_endpoints_file: Path,
+    model_start_marker: Path,
+    model_ready_marker: Path,
     text_done_marker: Path,
     image_done_marker: Path,
     passthrough_args: list[str],
@@ -119,6 +122,10 @@ def build_builder_command(
         "--image_model_name",
         primary_image_server.served_model_name,
         "--precompute_model_cache",
+        "--model_start_marker",
+        str(model_start_marker),
+        "--model_ready_marker",
+        str(model_ready_marker),
         "--model_text_done_marker",
         str(text_done_marker),
         "--model_image_done_marker",
@@ -191,6 +198,14 @@ def write_endpoint_file(path: Path, urls: Iterable[str]) -> None:
     path.write_text("\n".join(deduped) + "\n", encoding="utf-8")
 
 
+def write_ready_marker(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"status": "vllm_servers_ready", "timestamp": time.time()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def wait_for_marker_or_builder_exit(
     *,
     marker: Path,
@@ -202,9 +217,9 @@ def wait_for_marker_or_builder_exit(
     while not marker.exists():
         code = builder.poll()
         if code is not None:
-            raise RuntimeError(f"Builder exited with code {code} before text done marker was written")
+            raise RuntimeError(f"Builder exited with code {code} before marker was written: {marker}")
         if timeout_seconds is not None and time.time() - started > timeout_seconds:
-            raise RuntimeError(f"Timed out waiting for text done marker: {marker}")
+            raise RuntimeError(f"Timed out waiting for marker: {marker}")
         time.sleep(poll_seconds)
 
 
@@ -264,6 +279,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--vllm_bin", default="vllm")
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
+    parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
@@ -288,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime_dir = output_dir / "_dynamic_vllm"
     text_endpoints_file = runtime_dir / "text_endpoints.txt"
     image_endpoints_file = runtime_dir / "image_endpoints.txt"
+    model_start_marker = runtime_dir / "model_start.json"
+    model_ready_marker = runtime_dir / "model_ready.json"
     text_done_marker = runtime_dir / "text_done.json"
     image_done_marker = runtime_dir / "image_done.json"
     first_done_timeout = args.first_done_timeout_seconds
@@ -343,16 +361,11 @@ def main(argv: list[str] | None = None) -> int:
     builder_proc: subprocess.Popen[str] | None = None
     try:
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        for marker in (text_done_marker, image_done_marker):
+        for marker in (model_start_marker, model_ready_marker, text_done_marker, image_done_marker):
             if marker.exists():
                 marker.unlink()
         write_endpoint_file(text_endpoints_file, [text_server.base_url])
         write_endpoint_file(image_endpoints_file, [primary_image_server.base_url])
-
-        text_proc = start_server(text_server)
-        primary_image_proc = start_server(primary_image_server)
-        wait_for_server(text_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
-        wait_for_server(primary_image_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
 
         builder_passthrough_args = with_default_model_workers(passthrough_args, args.dynamic_model_workers)
         builder_command = build_builder_command(
@@ -364,11 +377,25 @@ def main(argv: list[str] | None = None) -> int:
             primary_image_server=primary_image_server,
             text_endpoints_file=text_endpoints_file,
             image_endpoints_file=image_endpoints_file,
+            model_start_marker=model_start_marker,
+            model_ready_marker=model_ready_marker,
             text_done_marker=text_done_marker,
             image_done_marker=image_done_marker,
             passthrough_args=builder_passthrough_args,
         )
         builder_proc = subprocess.Popen(builder_command, text=True, start_new_session=True)
+        wait_for_marker_or_builder_exit(
+            marker=model_start_marker,
+            builder=builder_proc,
+            timeout_seconds=args.model_start_timeout_seconds,
+        )
+
+        text_proc = start_server(text_server)
+        primary_image_proc = start_server(primary_image_server)
+        wait_for_server(text_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
+        wait_for_server(primary_image_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
+        write_ready_marker(model_ready_marker)
+
         completed = wait_for_any_marker_or_builder_exit(
             markers={"text": text_done_marker, "image": image_done_marker},
             builder=builder_proc,

@@ -14,6 +14,7 @@ from build_mm_joinability_dataset import (
     LocalAttributeExtractor,
     build_bridge_assets_parallel,
     extraction_cache_key,
+    image_data_url,
     normalize_extracted_attributes,
     project_selected_rows,
     precompute_extraction_task_groups,
@@ -26,9 +27,16 @@ from run_mm_joinability_dynamic_vllm import (
     VllmServerSpec,
     build_builder_command,
     default_vllm_extra_args,
+    main as dynamic_vllm_main,
     parse_args as parse_dynamic_vllm_args,
     start_server,
 )
+
+
+def test_prompt_version_invalidates_cache_after_image_prompt_changes():
+    import build_mm_joinability_dataset as joinability_dataset
+
+    assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v3_short_empty_precompressed_image"
 
 
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
@@ -127,6 +135,46 @@ def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
     assert "connection_evidence" in prompt
     assert "Do not rely on Wikipedia page provenance" in prompt
     assert captured["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_extraction_prompt_requires_short_empty_json_response():
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    prompt = extractor.extraction_prompt(
+        entity_text="Alpha",
+        entity_wiki_title="Alpha",
+        candidate_attributes=["State"],
+    )
+
+    assert 'If no candidate attribute is directly supported, return exactly {"attributes":[]}' in prompt
+
+
+def test_image_chat_uses_default_visual_token_limit(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args(model_max_tokens=1024))
+
+    extractor.chat(
+        model_kind="image",
+        base_url="http://localhost:8000/v1",
+        model="Qwen3-VL-8B-Thinking",
+        api_key=None,
+        messages=[],
+    )
+
+    assert captured["json"]["max_tokens"] == 384
 
 
 def test_chat_records_model_request_time_and_token_usage_by_kind(monkeypatch):
@@ -233,10 +281,10 @@ def test_image_extraction_retries_context_length_error_with_resized_local_image(
     from PIL import Image
 
     image_path = tmp_path / "large.jpg"
-    image = Image.new("RGB", (500, 500))
+    image = Image.new("RGB", (1000, 1000))
     pixels = image.load()
-    for y in range(500):
-        for x in range(500):
+    for y in range(1000):
+        for x in range(1000):
             pixels[x, y] = ((x * 17) % 256, (y * 31) % 256, ((x + y) * 13) % 256)
     image.save(image_path, format="JPEG", quality=95)
     sent_urls = []
@@ -284,6 +332,48 @@ def test_image_extraction_retries_context_length_error_with_resized_local_image(
     assert sent_urls[0].startswith("data:image/")
     assert sent_urls[1].startswith("data:image/")
     assert len(sent_urls[1]) < len(sent_urls[0])
+
+
+def test_image_extraction_resizes_local_image_before_first_request(monkeypatch, tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "large.jpg"
+    image = Image.new("RGB", (1000, 1000), color=(20, 80, 140))
+    image.save(image_path, format="JPEG", quality=95)
+    sent_urls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
+
+    def fake_post(url, headers, json, timeout):
+        sent_urls.append(json["messages"][1]["content"][1]["image_url"]["url"])
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    extractor.extract(
+        asset={
+            "asset_id": "img_1",
+            "asset_type": "image",
+            "local_path": str(image_path),
+        },
+        entity={
+            "entity_id": "ent_1",
+            "cell_text": "Alpha",
+            "wiki_title": "Alpha",
+        },
+        candidate_attributes=["State"],
+    )
+
+    original_url = image_data_url(image_path)
+    assert len(sent_urls) == 1
+    assert sent_urls[0].startswith("data:image/")
+    assert len(sent_urls[0]) < len(original_url)
 
 
 def test_joinability_projected_rows_sanitize_cell_urls_for_model_tables():
@@ -470,12 +560,16 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
         primary_image_server=image_server,
         text_endpoints_file=tmp_path / "text_endpoints.txt",
         image_endpoints_file=tmp_path / "image_endpoints.txt",
+        model_start_marker=tmp_path / "model_start.json",
+        model_ready_marker=tmp_path / "model_ready.json",
         text_done_marker=tmp_path / "text_done.json",
         image_done_marker=tmp_path / "image_done.json",
         passthrough_args=["--max_source_tables", "10"],
     )
 
     assert "--precompute_model_cache" in command
+    assert "--model_start_marker" in command
+    assert "--model_ready_marker" in command
     assert "--model_text_done_marker" in command
     assert "--model_image_done_marker" in command
     assert "--text_model_base_urls_file" in command
@@ -530,6 +624,7 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     )
 
     assert args.vllm_max_model_len == 8192
+    assert args.model_start_timeout_seconds is None
 
 
 def test_start_server_discards_vllm_output_by_default(monkeypatch):
@@ -560,6 +655,54 @@ def test_start_server_discards_vllm_output_by_default(monkeypatch):
     assert captured["stderr"] == subprocess.DEVNULL
     assert captured["text"] is True
     assert captured["start_new_session"] is True
+
+
+def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypatch, tmp_path):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("{}", encoding="utf-8")
+                Path(command[command.index("--model_text_done_marker") + 1]).write_text("{}", encoding="utf-8")
+                Path(command[command.index("--model_image_done_marker") + 1]).write_text("{}", encoding="utf-8")
+            else:
+                events.append(f"server_started:{command[command.index('--served-model-name') + 1]}")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.wait_for_server", lambda *args, **kwargs: events.append("server_ready"))
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events[0] == "builder_started"
+    assert events[1].startswith("server_started:")
 
 
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
