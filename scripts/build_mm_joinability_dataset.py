@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs.
     tqdm = None  # type: ignore[assignment]
 
 from build_mm_table_dataset import (
+    DEFAULT_WIKIPEDIA_USER_AGENT,
     ShardedJsonlWriter,
     WikipediaClient,
     build_bridge_assets,
@@ -2105,49 +2106,27 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     entities_writer = write_sharded_jsonl(entities_dir, entities, records_per_shard)
 
     wikipedia_client: WikipediaClient | None = None
-    wikipedia_client_factory: Callable[[], WikipediaClient] | None = None
     if not args.no_wikipedia:
-        def make_wikipedia_client() -> WikipediaClient:
-            return WikipediaClient(
-                cache_dir=cache_paths["wikipedia_cache_dir"],
-                image_output_dir=cache_paths["wikipedia_image_dir"],
-                output_dir=output_dir,
-                sleep=args.sleep,
-                user_agent=(
-                    "MMJoinabilityDatasetBuilder/0.2 "
-                    "(https://example.invalid; research dataset construction)"
-                ),
-            )
-
-        wikipedia_client_factory = make_wikipedia_client
-        wikipedia_client = make_wikipedia_client()
+        wikipedia_client = WikipediaClient(
+            cache_dir=cache_paths["wikipedia_cache_dir"],
+            image_output_dir=cache_paths["wikipedia_image_dir"],
+            output_dir=output_dir,
+            sleep=args.sleep,
+            user_agent=args.wikipedia_user_agent,
+        )
     bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
     with bridge_assets_writer:
-        if max(1, int(getattr(args, "wikipedia_workers", 1) or 1)) <= 1:
-            entity_to_assets, api_failures, text_asset_count, image_asset_count = build_bridge_assets(
-                entities,
-                args.max_entities,
-                args.max_images_per_entity,
-                args.text_asset_chunk_chars,
-                args.min_text_asset_chunk_chars,
-                args.max_text_asset_chunks_per_entity,
-                wikipedia_client,
-                bridge_assets_writer,
-                flush_every,
-            )
-        else:
-            entity_to_assets, api_failures, text_asset_count, image_asset_count = build_bridge_assets_parallel(
-                entities=entities,
-                max_entities=args.max_entities,
-                max_images_per_entity=args.max_images_per_entity,
-                text_asset_chunk_chars=args.text_asset_chunk_chars,
-                min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
-                max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
-                wikipedia_client_factory=wikipedia_client_factory,
-                asset_writer=bridge_assets_writer,
-                flush_every_records=flush_every,
-                workers=args.wikipedia_workers,
-            )
+        entity_to_assets, api_failures, text_asset_count, image_asset_count = build_bridge_assets(
+            entities,
+            args.max_entities,
+            args.max_images_per_entity,
+            args.text_asset_chunk_chars,
+            args.min_text_asset_chunk_chars,
+            args.max_text_asset_chunks_per_entity,
+            wikipedia_client,
+            bridge_assets_writer,
+            flush_every,
+        )
 
     table_asset_links_writer = ShardedJsonlWriter(table_asset_links_dir, records_per_shard)
     with table_asset_links_writer:
@@ -2303,7 +2282,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "model_concurrency": concurrency_state.summary(),
         "precomputed_text_model_cache_tasks": precomputed_text_task_count,
         "precomputed_image_model_cache_tasks": precomputed_image_task_count,
-        "wikipedia_workers": max(1, int(getattr(args, "wikipedia_workers", 1) or 1)),
+        "wikipedia_workers": 1,
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
         "skipped_reasons": dict(skip_reasons),
@@ -2369,7 +2348,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "wikipedia_cache": {
             "cache_dir": str(cache_paths["wikipedia_cache_dir"]),
             "image_dir": str(cache_paths["wikipedia_image_dir"]),
-            "workers": max(1, int(getattr(args, "wikipedia_workers", 1) or 1)),
+            "workers": 1,
         },
         "note": "Read shards listed in this manifest; stale files from older runs may exist if an output directory is reused.",
     }
@@ -2398,7 +2377,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_cols", type=int, default=2)
     parser.add_argument("--min_rows_per_output_table", type=int, default=2)
     parser.add_argument("--sleep", type=float, default=0.2)
-    parser.add_argument("--wikipedia_workers", type=int, default=1, help="Parallel Wikipedia entity/material fetch workers. Default 1 preserves the old serial fetch path.")
+    parser.add_argument(
+        "--wikipedia_user_agent",
+        default=DEFAULT_WIKIPEDIA_USER_AGENT,
+        help="Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address.",
+    )
+    parser.add_argument(
+        "--wikipedia_workers",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option. Wikipedia fetching is always serial to avoid MediaWiki rate limits.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--flush_every_records", type=int, default=500)
     parser.add_argument("--records_per_shard", type=int, default=50000)

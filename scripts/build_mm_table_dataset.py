@@ -39,6 +39,12 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs.
 
 
 MEDIAWIKI_API_URL = "https://en.wikipedia.org/w/api.php"
+DEFAULT_WIKIPEDIA_USER_AGENT = (
+    "MMJoinabilityDatasetBuilder/0.3 "
+    "(research dataset construction; set --wikipedia_user_agent with contact info)"
+)
+MEDIAWIKI_BATCH_TITLE_LIMIT = 50
+MEDIAWIKI_RETRY_STATUS_CODES = {429, 503}
 NON_ENTITY_NAMESPACES = {
     "category",
     "file",
@@ -279,6 +285,13 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_jsonl_records(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
@@ -967,74 +980,234 @@ class WikipediaClient:
         self.output_dir = output_dir
         self.sleep = max(0.0, sleep)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": user_agent})
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept-Encoding": "gzip, deflate",
+            }
+        )
         self.page_cache_path = cache_dir / "wiki_pages.jsonl"
         self.image_cache_path = cache_dir / "wiki_images.jsonl"
         self.page_cache = load_jsonl_cache(self.page_cache_path, "wiki_title")
         self.image_cache = load_jsonl_cache(self.image_cache_path, "file_title")
         self.last_request_time = 0.0
         self.api_failures = 0
+        self.max_retries = 5
+        self.retry_base_sleep = 1.0
+        self.retry_max_sleep = 60.0
 
     def _wait(self) -> None:
         elapsed = time.time() - self.last_request_time
         if elapsed < self.sleep:
             time.sleep(self.sleep - elapsed)
 
+    def _retry_delay(self, response: Any, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after:
+            try:
+                return max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+        return min(self.retry_base_sleep * (2**attempt), self.retry_max_sleep)
+
     def _get(self, params: dict[str, Any]) -> dict[str, Any] | None:
-        self._wait()
-        try:
-            response = self.session.get(MEDIAWIKI_API_URL, params=params, timeout=30)
-            self.last_request_time = time.time()
-            response.raise_for_status()
-            return response.json()
-        except Exception as exc:
-            self.api_failures += 1
-            logging.warning("MediaWiki API request failed: %s", exc)
-            return None
+        request_params = dict(params)
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            self._wait()
+            try:
+                response = self.session.get(MEDIAWIKI_API_URL, params=request_params, timeout=30)
+                self.last_request_time = time.time()
+                if response.status_code in MEDIAWIKI_RETRY_STATUS_CODES and attempt < self.max_retries:
+                    delay = self._retry_delay(response, attempt)
+                    logging.warning(
+                        "MediaWiki API returned HTTP %s; retrying in %.1fs",
+                        response.status_code,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                return payload
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    delay = min(self.retry_base_sleep * (2**attempt), self.retry_max_sleep)
+                    logging.warning("MediaWiki API request failed; retrying in %.1fs: %s", delay, exc)
+                    time.sleep(delay)
+                    continue
+                self.api_failures += 1
+                logging.warning("MediaWiki API request failed: %s", exc)
+                return None
+        self.api_failures += 1
+        logging.warning("MediaWiki API request failed: %s", last_error)
+        return None
+
+    def get_pages(self, wiki_titles: Iterable[str]) -> dict[str, dict[str, Any]]:
+        normalized_titles = []
+        seen_titles: set[str] = set()
+        for wiki_title in wiki_titles:
+            normalized = normalize_title(wiki_title)
+            if normalized and normalized not in seen_titles:
+                seen_titles.add(normalized)
+                normalized_titles.append(normalized)
+
+        results: dict[str, dict[str, Any]] = {}
+        missing_titles = [title for title in normalized_titles if title not in self.page_cache]
+
+        for start in range(0, len(missing_titles), MEDIAWIKI_BATCH_TITLE_LIMIT):
+            batch = missing_titles[start : start + MEDIAWIKI_BATCH_TITLE_LIMIT]
+            if not batch:
+                continue
+            params = {
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "redirects": 1,
+                "titles": "|".join(batch),
+                "prop": "extracts|pageimages|images|info",
+                "explaintext": 1,
+                "piprop": "thumbnail|original|name",
+                "pithumbsize": 600,
+                "imlimit": 50,
+                "inprop": "url",
+            }
+            payload = self._get(params)
+            if not payload:
+                continue
+            query = payload.get("query", {})
+            title_map = {title: title for title in batch}
+            for item in query.get("normalized", []) or []:
+                source = normalize_title(item.get("from", ""))
+                target = normalize_title(item.get("to", ""))
+                if source and target:
+                    title_map[source] = target
+            for item in query.get("redirects", []) or []:
+                source = normalize_title(item.get("from", ""))
+                target = normalize_title(item.get("to", ""))
+                if source and target:
+                    title_map[source] = target
+
+            pages_by_title = {
+                normalize_title(page.get("title", "")): page
+                for page in query.get("pages", []) or []
+                if isinstance(page, dict) and page.get("title")
+            }
+            new_records = []
+            for requested_title in batch:
+                final_title = title_map.get(requested_title, requested_title)
+                page = pages_by_title.get(final_title)
+                if page is None:
+                    page = {
+                        "title": final_title,
+                        "missing": True,
+                    }
+                record = {
+                    "wiki_title": requested_title,
+                    "pageid": page.get("pageid"),
+                    "title": page.get("title", final_title),
+                    "extract": page.get("extract", ""),
+                    "canonicalurl": page.get("canonicalurl")
+                    or f"https://en.wikipedia.org/wiki/{quote(final_title.replace(' ', '_'))}",
+                    "pageimage": page.get("pageimage"),
+                    "thumbnail": page.get("thumbnail"),
+                    "original": page.get("original"),
+                    "images": page.get("images", []),
+                    "missing": bool(page.get("missing") or page.get("invalid")),
+                }
+                self.page_cache[requested_title] = record
+                new_records.append(record)
+            append_jsonl_records(self.page_cache_path, new_records)
+
+        for title in normalized_titles:
+            if title in self.page_cache:
+                results[title] = self.page_cache[title]
+        return results
 
     def get_page(self, wiki_title: str) -> dict[str, Any] | None:
         normalized = normalize_title(wiki_title)
         if not normalized:
             return None
-        if normalized in self.page_cache:
-            return self.page_cache[normalized]
+        return self.get_pages([normalized]).get(normalized)
 
-        params = {
-            "action": "query",
-            "format": "json",
-            "formatversion": 2,
-            "redirects": 1,
-            "titles": normalized,
-            "prop": "extracts|pageimages|images|info",
-            "explaintext": 1,
-            "piprop": "thumbnail|original|name",
-            "pithumbsize": 600,
-            "imlimit": 50,
-            "inprop": "url",
-        }
-        payload = self._get(params)
-        if not payload:
-            return None
-        pages = payload.get("query", {}).get("pages", [])
-        if not pages:
-            return None
-        page = pages[0]
-        record = {
-            "wiki_title": normalized,
-            "pageid": page.get("pageid"),
-            "title": page.get("title", normalized),
-            "extract": page.get("extract", ""),
-            "canonicalurl": page.get("canonicalurl")
-            or f"https://en.wikipedia.org/wiki/{quote(normalized.replace(' ', '_'))}",
-            "pageimage": page.get("pageimage"),
-            "thumbnail": page.get("thumbnail"),
-            "original": page.get("original"),
-            "images": page.get("images", []),
-            "missing": bool(page.get("missing")),
-        }
-        self.page_cache[normalized] = record
-        append_jsonl(self.page_cache_path, record)
-        return record
+    def get_imageinfos(self, file_titles: Iterable[str]) -> dict[str, dict[str, Any]]:
+        normalized_titles = []
+        seen_titles: set[str] = set()
+        for file_title in file_titles:
+            normalized = normalize_title(file_title)
+            if not normalized:
+                continue
+            if not normalized.lower().startswith("file:"):
+                normalized = f"File:{normalized}"
+            if normalized not in seen_titles:
+                seen_titles.add(normalized)
+                normalized_titles.append(normalized)
+
+        results: dict[str, dict[str, Any]] = {}
+        missing_titles = [title for title in normalized_titles if title not in self.image_cache]
+
+        for start in range(0, len(missing_titles), MEDIAWIKI_BATCH_TITLE_LIMIT):
+            batch = missing_titles[start : start + MEDIAWIKI_BATCH_TITLE_LIMIT]
+            if not batch:
+                continue
+            params = {
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "redirects": 1,
+                "titles": "|".join(batch),
+                "prop": "imageinfo",
+                "iiprop": "url|size|mime|mediatype|extmetadata",
+            }
+            payload = self._get(params)
+            if not payload:
+                continue
+            query = payload.get("query", {})
+            title_map = {title: title for title in batch}
+            for item in query.get("normalized", []) or []:
+                source = normalize_title(item.get("from", ""))
+                target = normalize_title(item.get("to", ""))
+                if source and target:
+                    title_map[source] = target
+            for item in query.get("redirects", []) or []:
+                source = normalize_title(item.get("from", ""))
+                target = normalize_title(item.get("to", ""))
+                if source and target:
+                    title_map[source] = target
+
+            pages_by_title = {
+                normalize_title(page.get("title", "")): page
+                for page in query.get("pages", []) or []
+                if isinstance(page, dict) and page.get("title")
+            }
+            new_records = []
+            for requested_title in batch:
+                final_title = title_map.get(requested_title, requested_title)
+                page = pages_by_title.get(final_title) or {"title": final_title, "missing": True}
+                infos = page.get("imageinfo") or []
+                info = infos[0] if infos else {}
+                record = {
+                    "file_title": requested_title,
+                    "pageid": page.get("pageid"),
+                    "url": info.get("url"),
+                    "descriptionurl": info.get("descriptionurl"),
+                    "mime": info.get("mime"),
+                    "mediatype": info.get("mediatype"),
+                    "width": info.get("width"),
+                    "height": info.get("height"),
+                    "size": info.get("size"),
+                    "extmetadata": info.get("extmetadata") or {},
+                    "missing": bool(page.get("missing") or page.get("invalid")),
+                }
+                self.image_cache[requested_title] = record
+                new_records.append(record)
+            append_jsonl_records(self.image_cache_path, new_records)
+
+        for title in normalized_titles:
+            if title in self.image_cache:
+                results[title] = self.image_cache[title]
+        return results
 
     def get_imageinfo(self, file_title: str) -> dict[str, Any] | None:
         normalized = normalize_title(file_title)
@@ -1042,43 +1215,7 @@ class WikipediaClient:
             return None
         if not normalized.lower().startswith("file:"):
             normalized = f"File:{normalized}"
-        if normalized in self.image_cache:
-            return self.image_cache[normalized]
-
-        params = {
-            "action": "query",
-            "format": "json",
-            "formatversion": 2,
-            "redirects": 1,
-            "titles": normalized,
-            "prop": "imageinfo",
-            "iiprop": "url|size|mime|mediatype|extmetadata",
-        }
-        payload = self._get(params)
-        if not payload:
-            return None
-        pages = payload.get("query", {}).get("pages", [])
-        if not pages:
-            return None
-        page = pages[0]
-        infos = page.get("imageinfo") or []
-        info = infos[0] if infos else {}
-        record = {
-            "file_title": normalized,
-            "pageid": page.get("pageid"),
-            "url": info.get("url"),
-            "descriptionurl": info.get("descriptionurl"),
-            "mime": info.get("mime"),
-            "mediatype": info.get("mediatype"),
-            "width": info.get("width"),
-            "height": info.get("height"),
-            "size": info.get("size"),
-            "extmetadata": info.get("extmetadata") or {},
-            "missing": bool(page.get("missing")),
-        }
-        self.image_cache[normalized] = record
-        append_jsonl(self.image_cache_path, record)
-        return record
+        return self.get_imageinfos([normalized]).get(normalized)
 
     def download_image(self, imageinfo: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
         url = imageinfo.get("url")
@@ -1387,9 +1524,16 @@ def build_bridge_assets(
     text_asset_count = 0
     image_asset_count = 0
     written_assets = 0
+    if hasattr(wikipedia_client, "get_pages"):
+        pages = wikipedia_client.get_pages(entity["wiki_title"] for entity in selected_entities)
+    else:
+        pages = {
+            normalize_title(entity["wiki_title"]): wikipedia_client.get_page(entity["wiki_title"])
+            for entity in selected_entities
+        }
 
     for entity in iter_with_progress(selected_entities, "Fetching Wikipedia assets"):
-        page = wikipedia_client.get_page(entity["wiki_title"])
+        page = pages.get(normalize_title(entity["wiki_title"]))
         if not page or page.get("missing"):
             continue
 
@@ -1431,6 +1575,9 @@ def build_bridge_assets(
             if flush_every_records > 0 and written_assets % flush_every_records == 0:
                 asset_writer.flush()
 
+        if max_images_per_entity <= 0:
+            continue
+
         image_titles: list[str] = []
         if page.get("pageimage"):
             image_titles.append(f"File:{page['pageimage']}")
@@ -1441,12 +1588,24 @@ def build_bridge_assets(
 
         seen_images: set[str] = set()
         kept = 0
+        useful_image_titles: list[str] = []
         for image_title in image_titles:
             normalized_title = normalize_title(image_title)
             if normalized_title in seen_images or not is_useful_image(normalized_title):
                 continue
             seen_images.add(normalized_title)
-            imageinfo = wikipedia_client.get_imageinfo(normalized_title)
+            useful_image_titles.append(normalized_title)
+
+        if hasattr(wikipedia_client, "get_imageinfos"):
+            imageinfos = wikipedia_client.get_imageinfos(useful_image_titles)
+        else:
+            imageinfos = {
+                title: wikipedia_client.get_imageinfo(title)
+                for title in useful_image_titles
+                if hasattr(wikipedia_client, "get_imageinfo")
+            }
+        for normalized_title in useful_image_titles:
+            imageinfo = imageinfos.get(normalized_title)
             if not imageinfo or not imageinfo.get("url"):
                 continue
             if not is_useful_image(normalized_title, imageinfo):
@@ -1845,10 +2004,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             image_output_dir=output_dir / "images",
             output_dir=output_dir,
             sleep=args.sleep,
-            user_agent=(
-                "MMTableDatasetBuilder/0.1 "
-                "(https://example.invalid; research dataset construction)"
-            ),
+            user_agent=args.wikipedia_user_agent,
         )
     bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
     with bridge_assets_writer:
@@ -1994,6 +2150,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_rows", type=int, default=2)
     parser.add_argument("--min_cols", type=int, default=2)
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between API requests.")
+    parser.add_argument(
+        "--wikipedia_user_agent",
+        default=DEFAULT_WIKIPEDIA_USER_AGENT,
+        help="Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(
         "--flush_every_records",

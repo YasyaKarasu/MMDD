@@ -823,6 +823,232 @@ def test_wikipedia_extract_text_assets_are_chunked(tmp_path):
     assert {record["text_chunk_count"] for record in records} == {len(records)}
 
 
+def test_wikipedia_client_get_pages_batches_titles_with_pipe(tmp_path):
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "query": {
+                    "normalized": [{"from": "Alpha_Page", "to": "Alpha Page"}],
+                    "redirects": [{"from": "Beta", "to": "Beta Target"}],
+                    "pages": [
+                        {
+                            "pageid": 1,
+                            "title": "Alpha Page",
+                            "extract": "Alpha extract",
+                            "canonicalurl": "https://example.test/wiki/Alpha_Page",
+                            "images": [],
+                        },
+                        {
+                            "pageid": 2,
+                            "title": "Beta Target",
+                            "extract": "Beta extract",
+                            "canonicalurl": "https://example.test/wiki/Beta_Target",
+                            "images": [],
+                        },
+                    ],
+                }
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+
+        def get(self, url, params=None, timeout=30):
+            self.calls.append((url, params))
+            return FakeResponse()
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="test",
+    )
+    client.session = FakeSession()
+
+    pages = client.get_pages(["Alpha_Page", "Beta"])
+
+    assert len(client.session.calls) == 1
+    assert client.session.calls[0][1]["titles"] == "Alpha Page|Beta"
+    assert pages["Alpha Page"]["title"] == "Alpha Page"
+    assert pages["Beta"]["title"] == "Beta Target"
+    assert client.get_page("Alpha Page")["extract"] == "Alpha extract"
+
+
+def test_wikipedia_client_retries_rate_limit_with_retry_after(tmp_path, monkeypatch):
+    sleeps = []
+
+    class FakeResponse:
+        headers = {}
+
+        def __init__(self, status_code, payload=None, headers=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.calls = 0
+
+        def get(self, url, params=None, timeout=30):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResponse(429, headers={"Retry-After": "3"})
+            return FakeResponse(200, {"query": {"pages": []}})
+
+    monkeypatch.setattr(mm_table_dataset.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.session = FakeSession()
+
+    assert client._get({"action": "query"}) == {"query": {"pages": []}}
+    assert client.session.calls == 2
+    assert sleeps == [3.0]
+    assert client.api_failures == 0
+
+
+def test_wikipedia_client_uses_descriptive_user_agent(tmp_path):
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+
+    assert "DatasetBot/1.0" in client.session.headers["User-Agent"]
+    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
+
+
+def test_build_bridge_assets_fetches_wikipedia_pages_in_batches(tmp_path):
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self):
+            self.page_batches = []
+            self.imageinfo_batches = []
+
+        def get_pages(self, wiki_titles):
+            titles = list(wiki_titles)
+            self.page_batches.append(titles)
+            return {
+                title: {
+                    "wiki_title": title,
+                    "title": title,
+                    "extract": f"{title} extract",
+                    "canonicalurl": f"https://example.test/wiki/{title}",
+                    "images": [],
+                }
+                for title in titles
+            }
+
+        def get_imageinfos(self, file_titles):
+            self.imageinfo_batches.append(list(file_titles))
+            return {}
+
+    client = FakeWikipediaClient()
+    writer = ShardedJsonlWriter(tmp_path / "bridge_assets", max_records_per_shard=10)
+    entities = [
+        {"entity_id": "ent_alpha", "wiki_title": "Alpha", "display_texts": ["Alpha"]},
+        {"entity_id": "ent_beta", "wiki_title": "Beta", "display_texts": ["Beta"]},
+    ]
+
+    with writer:
+        entity_to_assets, api_failures, text_count, image_count = build_bridge_assets(
+            entities,
+            max_entities=None,
+            max_images_per_entity=0,
+            text_asset_chunk_chars=120,
+            min_text_asset_chunk_chars=10,
+            max_text_asset_chunks_per_entity=1,
+            wikipedia_client=client,
+            asset_writer=writer,
+            flush_every_records=10,
+        )
+
+    assert client.page_batches == [["Alpha", "Beta"]]
+    assert client.imageinfo_batches == []
+    assert api_failures == 0
+    assert text_count == 2
+    assert image_count == 0
+    assert sorted(entity_to_assets) == ["ent_alpha", "ent_beta"]
+
+
+def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatch):
+    calls = {"serial": 0, "parallel": 0}
+    output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(join_dataset, "read_entitables_json", lambda _input_dir: [])
+    monkeypatch.setattr(join_dataset, "parse_source_table", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        join_dataset,
+        "write_sharded_jsonl",
+        lambda output_path, *_args, **_kwargs: ShardedJsonlWriter(output_path, 10),
+    )
+
+    def fake_build_bridge_assets(*_args, **_kwargs):
+        calls["serial"] += 1
+        return {}, 0, 0, 0
+
+    def fake_build_bridge_assets_parallel(*_args, **_kwargs):
+        calls["parallel"] += 1
+        return {}, 0, 0, 0
+
+    monkeypatch.setattr(join_dataset, "build_bridge_assets", fake_build_bridge_assets)
+    monkeypatch.setattr(join_dataset, "build_bridge_assets_parallel", fake_build_bridge_assets_parallel)
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(join_dataset, "WikipediaClient", FakeWikipediaClient)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_mm_joinability_dataset.py",
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(output_dir),
+            "--wikipedia_workers",
+            "4",
+        ],
+    )
+
+    join_dataset.main()
+
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+    stats = json.loads((output_dir / "stats.json").read_text(encoding="utf-8"))
+    assert calls == {"serial": 1, "parallel": 0}
+    assert stats["wikipedia_workers"] == 1
+    assert manifest["wikipedia_cache"]["workers"] == 1
+
+
 def test_text_asset_chunk_limit_keeps_relevant_chunk(tmp_path):
     content = (
         "Alpha has a long public biography with unrelated background details.\n\n"
