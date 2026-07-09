@@ -39,6 +39,7 @@ def run(args: argparse.Namespace) -> None:
                 min_support=args.min_support,
                 max_bridge_unique_ratio=args.max_bridge_unique_ratio,
                 webtable_mode=getattr(args, "webtable_mode", False),
+                data_lake_split_mode=getattr(args, "data_lake_split_mode", "auto"),
                 webtable_query_file=getattr(args, "webtable_query_file", None),
                 webtable_ground_truth_file=getattr(args, "webtable_ground_truth_file", None),
                 webtable_table_dir=getattr(args, "webtable_table_dir", None),
@@ -129,6 +130,7 @@ def run(args: argparse.Namespace) -> None:
                 progress=getattr(args, "progress", True),
                 table_only=args.table_only,
                 raw_embedding_hnsw=getattr(args, "raw_embedding_hnsw", False),
+                data_lake_split_mode=getattr(args, "data_lake_split_mode", "auto"),
                 table_hnsw_k=args.table_hnsw_k,
                 recall_records=args.recall_records,
                 write_recall_records=getattr(args, "write_recall_records", True),
@@ -149,6 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_only", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Run Stage-1 using only table-table connectivity; skip multimodal evidence, HITL, path distillation, and path-aware eval.")
     parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark format and automatically use table-only Stage-1 mode.")
+    parser.add_argument(
+        "--data_lake_split_mode",
+        choices=["auto", "strict", "query_corpus"],
+        default="auto",
+        help="Candidate data lake split mode: auto keeps legacy defaults, strict splits targets by original table, query_corpus shares all targets as a corpus.",
+    )
     parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Bypass teacher/student training and evaluate HNSW recall directly over frozen raw embeddings.")
     parser.add_argument("--min_rows_per_fragment", type=int, default=5)
     parser.add_argument("--max_chains_per_table", type=int, default=10)
@@ -178,7 +186,7 @@ def parse_args() -> argparse.Namespace:
         "--embedding_prompt_mode",
         choices=["connectivity", "content_only"],
         default="connectivity",
-        help="Embedding instruction style: connectivity preserves cross-asset retrieval prompts; content_only encodes each table/text/image by its own content.",
+        help="Embedding instruction style: connectivity focuses on table/evidence connections; content_only focuses on intrinsic content.",
     )
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--hitl_rounds", type=int, default=1)

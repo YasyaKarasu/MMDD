@@ -1781,7 +1781,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 skip_reasons["malformed_json_file"] += 1
                 continue
             for table_id, table_obj in payload.items():
-                if args.max_tables is not None and processed_tables >= args.max_tables:
+                if args.max_source_tables is not None and source_table_count >= args.max_source_tables:
                     stop = True
                     break
                 processed_tables += 1
@@ -1946,7 +1946,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--input_dir", required=True, help="Directory containing EntiTables .json files.")
     parser.add_argument("--output_dir", required=True, help="Directory where dataset artifacts are written.")
-    parser.add_argument("--max_tables", type=int, default=None, help="Maximum number of raw tables to process.")
+    parser.add_argument(
+        "--max_source_tables",
+        type=int,
+        default=None,
+        help="Stop after writing this many source tables (after filtering). Reads input files until the target is reached.",
+    )
+    parser.add_argument(
+        "--max_tables",
+        type=int,
+        default=None,
+        dest="max_source_tables",
+        help="(Deprecated) Use --max_source_tables instead.",
+    )
     parser.add_argument(
         "--max_query_views_per_source_table",
         type=int,

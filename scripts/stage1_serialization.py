@@ -98,11 +98,11 @@ def serialize_table_for_embedding(
     max_rows: int = 5,
     max_values_per_col: int = 8,
 ) -> str:
-    """Serialize only online-visible table content.
+    """Serialize only intrinsic table content.
 
-    The function deliberately ignores provenance, role, qrel, chain, hidden
-    bridge, and training-label fields. It is shared by training fragments and
-    online query tables to avoid train-test mismatch.
+    The function deliberately ignores outer page context, provenance, role,
+    qrel, chain, hidden bridge, and training-label fields. It is shared by
+    training fragments and online query tables to avoid train-test mismatch.
     """
 
     columns = _visible_columns(table_like_object)
@@ -110,16 +110,7 @@ def serialize_table_for_embedding(
     rows = [row for row in table_like_object.get("rows", []) if isinstance(row, dict)]
     row_values = [_row_values(row, len(columns)) for row in rows]
 
-    lines: list[str] = ["[Table Context]"]
-    title = clean_text(table_like_object.get("title") or table_like_object.get("page_title"))
-    caption = clean_text(table_like_object.get("caption"))
-    section = clean_text(table_like_object.get("section_title"))
-    if title:
-        lines.append(f"Title: {title}")
-    if caption:
-        lines.append(f"Caption: {caption}")
-    if section:
-        lines.append(f"Section: {section}")
+    lines: list[str] = ["[Table Content]"]
 
     lines.append("")
     lines.append("[Columns]")

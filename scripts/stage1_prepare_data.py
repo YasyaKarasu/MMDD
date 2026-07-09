@@ -35,6 +35,7 @@ def run(args: argparse.Namespace) -> None:
             max_bridge_unique_ratio=args.max_bridge_unique_ratio,
             table_only=getattr(args, "table_only", False),
             webtable_mode=getattr(args, "webtable_mode", False),
+            data_lake_split_mode=getattr(args, "data_lake_split_mode", "auto"),
             webtable_query_file=getattr(args, "webtable_query_file", None),
             webtable_ground_truth_file=getattr(args, "webtable_ground_truth_file", None),
             webtable_table_dir=getattr(args, "webtable_table_dir", None),
@@ -100,11 +101,17 @@ def parse_args() -> argparse.Namespace:
         "--embedding_prompt_mode",
         choices=["connectivity", "content_only"],
         default="connectivity",
-        help="Embedding instruction style: connectivity preserves cross-asset retrieval prompts; content_only encodes each table/text/image by its own content.",
+        help="Embedding instruction style: connectivity focuses on table/evidence connections; content_only focuses on intrinsic content.",
     )
     parser.add_argument("--force_recompute_embeddings", action="store_true")
     parser.add_argument("--table_only", action="store_true", help="Build only table-fragment artifacts and embeddings; skip multimodal evidence artifacts.")
     parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark format and automatically use table-only Stage-1 mode.")
+    parser.add_argument(
+        "--data_lake_split_mode",
+        choices=["auto", "strict", "query_corpus"],
+        default="auto",
+        help="Candidate data lake split mode: auto keeps legacy defaults, strict splits targets by original table, query_corpus shares all targets as a corpus.",
+    )
     parser.add_argument("--webtable_query_file", default=None, help="Path to webtable_join_query.csv. Defaults to --input_dir/webtable_join_query.csv.")
     parser.add_argument("--webtable_ground_truth_file", default=None, help="Path to webtable_join_ground_truth.csv. Defaults to --input_dir/webtable_join_ground_truth.csv.")
     parser.add_argument("--webtable_table_dir", default=None, help="Directory containing WebTable CSV files. Defaults to --input_dir/data/benchmark/webtable/large/split_1.")

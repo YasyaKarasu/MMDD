@@ -30,6 +30,22 @@ from stage1_io import (
     write_jsonl,
 )
 
+DATA_LAKE_SPLIT_MODE_CHOICES = ("auto", "strict", "query_corpus")
+
+
+def resolve_data_lake_split_mode(args: argparse.Namespace) -> str:
+    mode = getattr(args, "data_lake_split_mode", "auto") or "auto"
+    if mode not in DATA_LAKE_SPLIT_MODE_CHOICES:
+        choices = ", ".join(DATA_LAKE_SPLIT_MODE_CHOICES)
+        raise ValueError(f"Unsupported data_lake_split_mode {mode!r}; use one of: {choices}")
+    if mode != "auto":
+        return mode
+    return "query_corpus" if getattr(args, "webtable_mode", False) else "strict"
+
+
+def target_split_for_query(query_split: str, data_lake_split_mode: str) -> str:
+    return "corpus" if data_lake_split_mode == "query_corpus" else query_split
+
 
 def valid_bridge_profile(profile: dict[str, Any], max_bridge_unique_ratio: float) -> bool:
     return (
@@ -177,6 +193,7 @@ def add_same_source_bridge_positive_pairs(
     fragments: list[dict[str, Any]],
     pairs: list[dict[str, Any]],
     qrels: list[dict[str, Any]],
+    data_lake_split_mode: str = "strict",
 ) -> int:
     existing_pairs = {
         (pair.get("query_fragment_id"), pair.get("target_fragment_id"))
@@ -201,52 +218,60 @@ def add_same_source_bridge_positive_pairs(
         query_id = query["fragment_id"]
         source_table_id = query.get("source_table_id")
         split = query.get("split")
-        for target, target_cols in targets_by_group.get((source_table_id, split), []):
-            matched_cols = sorted(bridge_cols & target_cols)
-            if not matched_cols:
-                continue
-            target_id = target["fragment_id"]
-            if (query_id, target_id) in existing_pairs:
-                continue
+        target_groups = [(source_table_id, split)]
+        if data_lake_split_mode == "query_corpus":
+            target_groups.append((source_table_id, "corpus"))
+        seen_targets: set[str] = set()
+        for group_key in target_groups:
+            for target, target_cols in targets_by_group.get(group_key, []):
+                target_id = target["fragment_id"]
+                if target_id in seen_targets:
+                    continue
+                seen_targets.add(target_id)
+                matched_cols = sorted(bridge_cols & target_cols)
+                if not matched_cols:
+                    continue
+                if (query_id, target_id) in existing_pairs:
+                    continue
 
-            bridge_col = matched_cols[0]
-            bridge_name = (
-                query.get("hidden_bridge_col_name")
-                or query.get("visible_bridge_col_name")
-                or get_column_name(query, bridge_col)
-            )
-            is_hidden = query.get("role") == "left_hidden"
-            pairs.append(
-                {
-                    "pair_id": f"pair_{stable_hash(query_id, target_id, 'same_source_bridge')}",
-                    "source_table_id": source_table_id,
-                    "split": split,
-                    "chain_id": query.get("chain_id"),
-                    "target_chain_id": target.get("chain_id"),
-                    "query_fragment_id": query_id,
-                    "target_fragment_id": target_id,
-                    "label": 1,
-                    "weight": 0.4 if is_hidden else 1.0,
-                    "reason": f"same_source_bridge_column:{bridge_name}",
-                }
-            )
-            existing_pairs.add((query_id, target_id))
-            if (query_id, target_id) not in existing_qrels:
-                qrels.append(
+                bridge_col = matched_cols[0]
+                bridge_name = (
+                    query.get("hidden_bridge_col_name")
+                    or query.get("visible_bridge_col_name")
+                    or get_column_name(query, bridge_col)
+                )
+                is_hidden = query.get("role") == "left_hidden"
+                pairs.append(
                     {
-                        "query_id": query_id,
-                        "target_id": target_id,
-                        "rel": 2 if is_hidden else 3,
+                        "pair_id": f"pair_{stable_hash(query_id, target_id, 'same_source_bridge')}",
+                        "source_table_id": source_table_id,
                         "split": split,
                         "chain_id": query.get("chain_id"),
                         "target_chain_id": target.get("chain_id"),
-                        "query_role": query.get("role"),
-                        "target_role": "right_target",
+                        "query_fragment_id": query_id,
+                        "target_fragment_id": target_id,
+                        "label": 1,
+                        "weight": 0.4 if is_hidden else 1.0,
                         "reason": f"same_source_bridge_column:{bridge_name}",
                     }
                 )
-                existing_qrels.add((query_id, target_id))
-            added += 1
+                existing_pairs.add((query_id, target_id))
+                if (query_id, target_id) not in existing_qrels:
+                    qrels.append(
+                        {
+                            "query_id": query_id,
+                            "target_id": target_id,
+                            "rel": 2 if is_hidden else 3,
+                            "split": split,
+                            "chain_id": query.get("chain_id"),
+                            "target_chain_id": target.get("chain_id"),
+                            "query_role": query.get("role"),
+                            "target_role": "right_target",
+                            "reason": f"same_source_bridge_column:{bridge_name}",
+                        }
+                    )
+                    existing_qrels.add((query_id, target_id))
+                added += 1
     return added
 
 
@@ -546,21 +571,25 @@ def run_webtable(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    data_lake_split_mode = resolve_data_lake_split_mode(args)
     query_path = webtable_metadata_path(input_dir, getattr(args, "webtable_query_file", None), "webtable_join_query.csv")
     truth_path = webtable_metadata_path(input_dir, getattr(args, "webtable_ground_truth_file", None), "webtable_join_ground_truth.csv")
     table_root = webtable_table_root(input_dir, getattr(args, "webtable_table_dir", None))
     queries = read_webtable_queries(query_path)
     truth = read_webtable_ground_truth(truth_path)
+    query_tables = {row["query_table"] for row in queries.values()}
+    needed_tables = set(query_tables)
+    needed_tables.update(row["candidate_table"] for row in truth)
     split_ratios = parse_split_ratios(getattr(args, "webtable_split_ratios", [0.7, 0.1, 0.2]))
     split_seed = int(getattr(args, "webtable_split_seed", getattr(args, "seed", 13)))
-    query_split_map, split_payload = build_query_table_splits(
-        {query["query_table"] for query in queries.values()},
+    split_tables = needed_tables if data_lake_split_mode == "strict" else query_tables
+    table_split_map, split_payload = build_query_table_splits(
+        split_tables,
         split_ratios,
         split_seed,
     )
+    query_split_map = table_split_map
 
-    needed_tables = {row["query_table"] for row in queries.values()}
-    needed_tables.update(row["candidate_table"] for row in truth)
     tables: dict[str, dict[str, Any]] = {}
     skipped_tables: list[dict[str, str]] = []
     for table_name in sorted(needed_tables):
@@ -597,6 +626,7 @@ def run_webtable(args: argparse.Namespace) -> None:
     pairs: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
     debug_examples: list[dict[str, Any]] = []
+    skipped_split_mismatch_qrels: list[dict[str, str]] = []
     query_fragment_ids: dict[tuple[str, str], str] = {}
     target_fragment_ids: dict[str, str] = {}
 
@@ -608,6 +638,7 @@ def run_webtable(args: argparse.Namespace) -> None:
         ]
         columns = reorder_columns(candidate_col_indices, table.get("columns", []), None)
         target_id = f"webtable_target_{stable_hash(table_name)}"
+        target_split = "corpus" if data_lake_split_mode == "query_corpus" else table_split_map.get(table_name, "test")
         target_fragment_ids[table_name] = target_id
         fragments.append(
             webtable_fragment(
@@ -617,7 +648,7 @@ def run_webtable(args: argparse.Namespace) -> None:
                 column_indices=columns,
                 statement=f"webtable candidate table {table_name}",
                 extra={
-                    "split": "corpus",
+                    "split": target_split,
                     "webtable_table": table_name,
                     "webtable_candidate_columns": sorted(candidate_columns_by_table.get(table_name, set())),
                     "target_bridge_col_names": sorted(candidate_columns_by_table.get(table_name, set())),
@@ -670,6 +701,20 @@ def run_webtable(args: argparse.Namespace) -> None:
             continue
         candidate_columns = sorted({rec["candidate_column"] for rec in records})
         query_split = query_split_map.get(query_table, "test")
+        target_split = "corpus" if data_lake_split_mode == "query_corpus" else table_split_map.get(candidate_table, "test")
+        if data_lake_split_mode == "strict" and target_split != query_split:
+            skipped_split_mismatch_qrels.append(
+                {
+                    "query_table": query_table,
+                    "candidate_table": candidate_table,
+                    "query_column": query_column,
+                    "candidate_columns": ",".join(candidate_columns),
+                    "query_split": query_split,
+                    "target_split": target_split,
+                    "reason": "strict_data_lake_split_mismatch",
+                }
+            )
+            continue
         pair_id = f"pair_{stable_hash(query_id, target_id, ','.join(candidate_columns))}"
         pairs.append(
             {
@@ -714,16 +759,26 @@ def run_webtable(args: argparse.Namespace) -> None:
         "webtable_target_fragments": len(target_fragment_ids),
         "webtable_skipped_tables": write_jsonl(output_dir / "webtable_skipped_tables.jsonl", skipped_tables),
         "webtable_skipped_ground_truth": write_jsonl(output_dir / "webtable_skipped_ground_truth.jsonl", skipped_truth),
+        "webtable_split_mismatch_qrels": write_jsonl(output_dir / "webtable_skipped_split_mismatch_qrels.jsonl", skipped_split_mismatch_qrels),
         "chains": len(query_fragment_ids),
         "same_source_bridge_positive_pairs": 0,
     }
+    split_payload["data_lake_split_mode"] = data_lake_split_mode
+    split_payload["table_counts"] = {
+        split: sum(1 for table in tables if table_split_map.get(table) == split)
+        for split in ("train", "dev", "test")
+    }
     split_payload["counts"] = {
-        split: sum(1 for value in query_split_map.values() if value == split)
+        split: sum(1 for table in query_tables if query_split_map.get(table) == split)
         for split in ("train", "dev", "test")
     }
     split_payload["query_fragments"] = {
         split: sum(1 for (table, _column), _qid in query_fragment_ids.items() if query_split_map.get(table, "test") == split)
         for split in ("train", "dev", "test")
+    }
+    split_payload["target_fragments"] = {
+        split: sum(1 for fragment in fragments if fragment.get("role") == "right_target" and fragment.get("split") == split)
+        for split in ("train", "dev", "test", "corpus")
     }
     write_json(output_dir / "webtable_splits.json", split_payload)
     build_readme(output_dir)
@@ -734,6 +789,7 @@ def run_webtable(args: argparse.Namespace) -> None:
             "input_dir": args.input_dir,
             "dataset_mode": "webtable",
             "table_only": True,
+            "data_lake_split_mode": data_lake_split_mode,
             "webtable_splits": split_payload,
             "counts": counts,
             "args": vars(args),
@@ -752,6 +808,7 @@ def run(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     table_only = bool(getattr(args, "table_only", False))
+    data_lake_split_mode = resolve_data_lake_split_mode(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     split_map = load_split_map(input_dir)
 
@@ -868,7 +925,7 @@ def run(args: argparse.Namespace) -> None:
                     )
                 target = make_fragment(
                     table,
-                    split,
+                    target_split_for_query(split, data_lake_split_mode),
                     chain_id,
                     "right_target",
                     t_cols,
@@ -945,7 +1002,7 @@ def run(args: argparse.Namespace) -> None:
         if table_idx % 500 == 0:
             print(f"processed_tables={table_idx} chains={chain_count}")
 
-    bridge_positive_pairs = add_same_source_bridge_positive_pairs(fragments, pairs, qrels)
+    bridge_positive_pairs = add_same_source_bridge_positive_pairs(fragments, pairs, qrels, data_lake_split_mode=data_lake_split_mode)
     rng.shuffle(debug_examples)
     counts = {
         "logic_fragments": write_jsonl(output_dir / "logic_fragments.jsonl", fragments),
@@ -956,7 +1013,11 @@ def run(args: argparse.Namespace) -> None:
         "same_source_bridge_positive_pairs": bridge_positive_pairs,
     }
     build_readme(output_dir)
-    update_stage1_manifest(output_dir, "logic_connectivity", {"input_dir": args.input_dir, "counts": counts, "args": vars(args)})
+    update_stage1_manifest(
+        output_dir,
+        "logic_connectivity",
+        {"input_dir": args.input_dir, "data_lake_split_mode": data_lake_split_mode, "counts": counts, "args": vars(args)},
+    )
     print(json.dumps(counts, ensure_ascii=False, indent=2))
 
 
@@ -976,6 +1037,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_bridge_unique_ratio", type=float, default=0.85)
     parser.add_argument("--table_only", action="store_true", help="Build only visible table-table connectivity; do not create hidden bridge queries.")
     parser.add_argument("--webtable_mode", action="store_true", help="Read WebTable benchmark CSV files and build table-only Stage-1 artifacts.")
+    parser.add_argument(
+        "--data_lake_split_mode",
+        choices=DATA_LAKE_SPLIT_MODE_CHOICES,
+        default="auto",
+        help="Candidate data lake split mode: auto keeps legacy defaults, strict splits target tables by source table, query_corpus shares all targets as a corpus.",
+    )
     parser.add_argument("--webtable_query_file", default=None, help="Path to webtable_join_query.csv. Defaults to --input_dir/webtable_join_query.csv.")
     parser.add_argument("--webtable_ground_truth_file", default=None, help="Path to webtable_join_ground_truth.csv. Defaults to --input_dir/webtable_join_ground_truth.csv.")
     parser.add_argument("--webtable_table_dir", default=None, help="Directory containing WebTable CSV files. Defaults to --input_dir/data/benchmark/webtable/large/split_1.")

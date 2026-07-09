@@ -380,7 +380,15 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 
 这个 viewer 会按 `chain_id` 分页展示，每页包含 visible query、hidden query、target fragment、logic pairs、qrels 和 evidence paths。
 
-默认情况下，Flask GUI 绑定 `127.0.0.1`，只能在本机访问。给 `stage1_train_models.py`、`stage1_run_all.py`、`run_hitl_training_rounds.py`、`hitl_annotation_app.py` 或 `stage1_connection_viewer.py` 加上 `--lan` 后会绑定到 `0.0.0.0`，启动日志会同时打印本机 URL 和内网设备可访问的 URL。如果内网 URL 仍然打不开，检查主机防火墙是否放行对应端口，并确认设备在同一个网络里。
+如果想在浏览器里查看 `build_mm_joinability_dataset.py` 已生成的数据集，可以运行：
+
+```bash
+conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir output_mm_joinability --port 7863
+```
+
+这个 viewer 会按 `qrels.jsonl` 里的 `query_table_id -> target_table_id` 组合分页展示，每页包含 query table、target table、evidence recovery paths，以及路径上引用到的文本/图片素材。
+
+默认情况下，Flask GUI 绑定 `127.0.0.1`，只能在本机访问。给 `stage1_train_models.py`、`stage1_run_all.py`、`run_hitl_training_rounds.py`、`hitl_annotation_app.py`、`stage1_connection_viewer.py` 或 `mm_joinability_dataset_viewer.py` 加上 `--lan` 后会绑定到 `0.0.0.0`，启动日志会同时打印本机 URL 和内网设备可访问的 URL。如果内网 URL 仍然打不开，检查主机防火墙是否放行对应端口，并确认设备在同一个网络里。
 
 如果想忽略之前跑到一半留下的训练输出，并让 training/HITL loop 干净重跑，加上 `--force_retrain`。它会删除 teacher/student 模型、teacher scores、train pairs、未完成的 HITL 选择、标注模板和标注状态文件，但保留准备阶段数据、embeddings 和已经 merge 的人工标签。只有在你也想丢弃已合并人工标签时，才额外加 `--reset_human_labels`。
 

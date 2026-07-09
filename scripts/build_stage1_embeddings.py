@@ -23,7 +23,7 @@ from stage1_serialization import (
 
 EMBEDDING_INSTRUCTIONS = {
     "connectivity": {
-        "table": "Represent the logical statement of this table for retrieval. Focus on how this table can connect to another table or multimodal evidence.",
+        "table": "Represent this table for retrieval. Focus on how its fields, column profiles, and values can connect to related table or multimodal evidence.",
         "text": "Represent this text as evidence for recovering hidden table attributes and logical connections.",
         "image": "Represent this image as evidence for multimodal table discovery. Focus on what factual attributes about the entity can be inferred from the image.",
     },
@@ -35,6 +35,7 @@ EMBEDDING_INSTRUCTIONS = {
 }
 DEFAULT_EMBEDDING_PROMPT_MODE = "connectivity"
 EMBEDDING_PROMPT_MODE_CHOICES = tuple(EMBEDDING_INSTRUCTIONS)
+TABLE_SERIALIZATION_VERSION = "table_content_no_shared_context_v1"
 
 
 def embedding_prompt_mode(args: argparse.Namespace) -> str:
@@ -58,12 +59,14 @@ def save_embeddings(out_dir: Path, object_type: str, ids: list[str], embeddings:
 def prompt_cache_compatible(out_dir: Path, mode: str) -> bool:
     stats_path = out_dir / "embedding_stats.json"
     if not stats_path.exists():
-        return mode == DEFAULT_EMBEDDING_PROMPT_MODE
+        return False
     try:
         payload = json.loads(stats_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return False
-    return payload.get("embedding_prompt_mode", DEFAULT_EMBEDDING_PROMPT_MODE) == mode
+    if payload.get("embedding_prompt_mode", DEFAULT_EMBEDDING_PROMPT_MODE) != mode:
+        return False
+    return payload.get("table_serialization_version") == TABLE_SERIALIZATION_VERSION
 
 
 def existing(out_dir: Path, object_type: str, force: bool, cache_compatible: bool = True) -> bool:
@@ -180,6 +183,7 @@ def run(args: argparse.Namespace) -> None:
         "batch_size": args.batch_size,
         "embedding_prompt_mode": embedding_prompt_mode(args),
         "embedding_instructions": embedding_instructions(args),
+        "table_serialization_version": TABLE_SERIALIZATION_VERSION,
         "max_image_pixels": getattr(args, "max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS),
         "table_only": bool(getattr(args, "table_only", False)),
         "objects": stats,

@@ -228,7 +228,15 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 
 The viewer paginates by `chain_id` and shows the visible query, hidden query, target fragment, logic pairs, qrels, and evidence paths for each group.
 
-By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, or `stage1_connection_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
+To inspect `build_mm_joinability_dataset.py` outputs in a browser, run:
+
+```bash
+conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir output_mm_joinability --port 7863
+```
+
+The viewer paginates through every `query_table_id -> target_table_id` pair in `qrels.jsonl` and shows the query table, target table, evidence recovery paths, and the referenced text/image material for each path.
+
+By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, `stage1_connection_viewer.py`, or `mm_joinability_dataset_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
 
 Use `--force_retrain` when you want to ignore partially generated training outputs and start the training/HITL loop cleanly. It removes teacher/student models, teacher scores, train pairs, open HITL selections, templates, and annotation status files while preserving prepared data, embeddings, and merged human labels. Add `--reset_human_labels` only when you also want to discard previously merged human labels.
 

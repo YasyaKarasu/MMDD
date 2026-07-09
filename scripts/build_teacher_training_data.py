@@ -11,9 +11,31 @@ from typing import Any
 
 from stage1_io import iter_jsonl, setup_logging, stable_hash, update_stage1_manifest, write_jsonl
 
+DATA_LAKE_SPLIT_MODE_CHOICES = ("auto", "strict", "query_corpus")
+
 
 def bool_arg(value: str) -> bool:
     return str(value).lower() in {"1", "true", "yes", "y"}
+
+
+def infer_data_lake_split_mode(stage1_dir: Path, requested: str = "auto") -> str:
+    if requested and requested != "auto":
+        return requested
+    manifest_path = stage1_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            mode = manifest.get("logic_connectivity", {}).get("data_lake_split_mode")
+            if mode in {"strict", "query_corpus"}:
+                return mode
+        except json.JSONDecodeError:
+            pass
+    target_splits = {
+        rec.get("split")
+        for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")
+        if rec.get("role") == "right_target"
+    }
+    return "query_corpus" if "corpus" in target_splits else "strict"
 
 
 def load_paths(stage1_dir: Path) -> list[dict[str, Any]]:
@@ -151,6 +173,8 @@ def run(args: argparse.Namespace) -> None:
     setup_logging()
     rng = random.Random(args.seed)
     stage1_dir = Path(args.stage1_dir)
+    data_lake_split_mode = infer_data_lake_split_mode(stage1_dir, getattr(args, "data_lake_split_mode", "auto"))
+    args.data_lake_split_mode = data_lake_split_mode
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     targets_by_split: dict[str, list[dict[str, Any]]] = {}
     targets_by_source_split: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
@@ -218,9 +242,12 @@ def run(args: argparse.Namespace) -> None:
             )
         bridge_cols = query_bridge_columns(q)
         if bridge_cols:
+            hard_negative_pool = list(targets_by_source_split.get((pair.get("source_table_id"), pair.get("split", "unknown")), []))
+            if data_lake_split_mode == "query_corpus":
+                hard_negative_pool.extend(targets_by_source_split.get((pair.get("source_table_id"), "corpus"), []))
             hard_negatives = [
                 cand
-                for cand in targets_by_source_split.get((pair.get("source_table_id"), pair.get("split", "unknown")), [])
+                for cand in hard_negative_pool
                 if (q["fragment_id"], cand["fragment_id"]) not in positive_pairs
                 and not bridge_cols.intersection(int_set(cand.get("source_column_indices")))
             ]
@@ -313,6 +340,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudo_neg_threshold", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--hard_negatives_per_positive", type=int, default=1)
+    parser.add_argument(
+        "--data_lake_split_mode",
+        choices=DATA_LAKE_SPLIT_MODE_CHOICES,
+        default="auto",
+        help="Candidate data lake split mode for hard-negative sampling; auto reads stage metadata.",
+    )
     parser.add_argument("--table_only", action="store_true", help="Only emit table-table pair samples; skip path, HITL, and pseudo-label samples.")
     return parser.parse_args()
 

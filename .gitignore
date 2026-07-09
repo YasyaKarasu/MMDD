@@ -23,6 +23,7 @@ venv/
 tmp/
 
 # Generated Stage-1 / dataset outputs
+cache/
 output/
 output_*/
 output_stage1_logic/

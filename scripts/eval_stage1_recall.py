@@ -13,8 +13,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from stage1_io import iter_jsonl, update_stage1_manifest, write_json, write_jsonl
+from stage1_io import clean_text, iter_jsonl, iter_manifest_records, load_json, update_stage1_manifest, write_json, write_jsonl
 from train_student import Student, TYPES, load_embeddings
+
+DATA_LAKE_SPLIT_MODE_CHOICES = ("auto", "strict", "query_corpus")
 
 try:
     from tqdm import tqdm
@@ -50,6 +52,37 @@ def infer_raw_embedding_hnsw(args: argparse.Namespace, stage1_dir: Path) -> bool
         except (json.JSONDecodeError, OSError):
             return False
     return False
+
+
+def infer_data_lake_split_mode(args: argparse.Namespace, stage1_dir: Path) -> str:
+    requested = getattr(args, "data_lake_split_mode", "auto") or "auto"
+    if requested != "auto":
+        return requested
+    hnsw_dir = Path(getattr(args, "hnsw_dir", stage1_dir / "hnsw_indices"))
+    for path in (hnsw_dir / "hnsw_stats.json", stage1_dir / "manifest.json"):
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        mode = payload.get("data_lake_split_mode")
+        if path.name == "manifest.json":
+            mode = payload.get("logic_connectivity", {}).get("data_lake_split_mode")
+        if mode in {"strict", "query_corpus"}:
+            return mode
+    target_splits = {
+        rec.get("split")
+        for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")
+        if rec.get("role") == "right_target"
+    }
+    return "query_corpus" if "corpus" in target_splits else "strict"
+
+
+def target_visible_for_query(query: dict[str, Any], target: dict[str, Any], data_lake_split_mode: str) -> bool:
+    if data_lake_split_mode != "strict":
+        return True
+    return target.get("split") == query.get("split")
 
 
 def load_student(student_dir: Path, device: torch.device) -> Student:
@@ -205,32 +238,77 @@ def serialize_path_nodes(path: list[tuple[str, str]]) -> list[dict[str, str]]:
     return [{"node_id": node_id, "node_type": node_type} for node_id, node_type in path]
 
 
+def stage1_input_dir(stage1_dir: Path) -> Path:
+    manifest_path = stage1_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = load_json(manifest_path)
+        input_dir = (
+            manifest.get("evidence_paths", {}).get("input_dir")
+            or manifest.get("logic_connectivity", {}).get("input_dir")
+            or "output_medium"
+        )
+        return Path(input_dir)
+    return Path("output_medium")
+
+
+def load_bridge_asset_previews(stage1_dir: Path) -> dict[str, dict[str, Any]]:
+    input_dir = stage1_input_dir(stage1_dir)
+    if not (input_dir / "dataset_manifest.json").exists():
+        return {}
+    previews = {}
+    for asset in iter_manifest_records(input_dir, "bridge_assets", log_every=50000):
+        asset_id = clean_text(asset.get("asset_id"))
+        if asset_id:
+            previews[asset_id] = {
+                "asset_id": asset_id,
+                "asset_type": clean_text(asset.get("asset_type")),
+                "title": clean_text(asset.get("entity_wiki_title")) or clean_text(asset.get("title")),
+                "source": clean_text(asset.get("source")),
+                "url": clean_text(asset.get("url") or asset.get("description_url") or asset.get("image_url")),
+                "content_snippet": clean_text(asset.get("content"))[:1600],
+                "file_name": clean_text(asset.get("file_name")),
+                "local_path": clean_text(asset.get("local_path")),
+                "relative_path": clean_text(asset.get("relative_path")),
+                "text_chunk_index": asset.get("text_chunk_index"),
+                "text_chunk_count": asset.get("text_chunk_count"),
+            }
+    return previews
+
+
 def bridge_path_metadata(
     query_id: str,
     target_id: str,
     path: list[tuple[str, str]],
     paths_by_query_asset_target: dict[tuple[str, str, str], dict[str, Any]],
+    asset_previews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     for node_id, node_type in path:
         if node_type not in {"text_asset", "image_asset"}:
             continue
-        record = paths_by_query_asset_target.get((query_id, node_id, target_id))
-        if not record:
-            continue
-        return {
-            "path_id": record.get("path_id"),
-            "asset_id": record.get("asset_id"),
-            "asset_type": record.get("asset_type"),
-            "entity_text": record.get("entity_text"),
-            "bridge_col_name": record.get("bridge_col_name"),
-            "bridge_value": record.get("bridge_value"),
-            "target_bridge_col_name": record.get("target_bridge_col_name"),
-            "claim_text": record.get("claim_text"),
-            "weak_label": record.get("weak_label"),
-            "weak_score": record.get("weak_score"),
-            "human_label": record.get("human_label"),
-            "teacher_score": record.get("teacher_score"),
+        metadata: dict[str, Any] = {
+            "asset_id": node_id,
+            "asset_object_type": node_type,
+            "asset_preview": (asset_previews or {}).get(node_id, {}),
         }
+        record = paths_by_query_asset_target.get((query_id, node_id, target_id))
+        if record:
+            metadata.update(
+                {
+                    "path_id": record.get("path_id"),
+                    "asset_id": record.get("asset_id") or node_id,
+                    "asset_type": record.get("asset_type"),
+                    "entity_text": record.get("entity_text"),
+                    "bridge_col_name": record.get("bridge_col_name"),
+                    "bridge_value": record.get("bridge_value"),
+                    "target_bridge_col_name": record.get("target_bridge_col_name"),
+                    "claim_text": record.get("claim_text"),
+                    "weak_label": record.get("weak_label"),
+                    "weak_score": record.get("weak_score"),
+                    "human_label": record.get("human_label"),
+                    "teacher_score": record.get("teacher_score"),
+                }
+            )
+        return metadata
     return {}
 
 
@@ -240,6 +318,7 @@ def bridge_recall_record(
     ranked: list[str],
     best_paths: dict[str, dict[str, Any]],
     paths_by_query_asset_target: dict[tuple[str, str, str], dict[str, Any]],
+    asset_previews: dict[str, dict[str, Any]] | None,
     topk: int,
 ) -> dict[str, Any]:
     relevant = relevant_by_target(query_qrels)
@@ -248,7 +327,7 @@ def bridge_recall_record(
     for rank, target_id in enumerate(ranked[:topk], 1):
         payload = best_paths.get(target_id, {})
         path = payload.get("path", [])
-        path_metadata = bridge_path_metadata(query_id, target_id, path, paths_by_query_asset_target)
+        path_metadata = bridge_path_metadata(query_id, target_id, path, paths_by_query_asset_target, asset_previews)
         targets.append(
             {
                 "rank": rank,
@@ -273,6 +352,8 @@ def table_rankings(
     device: torch.device,
     topks: list[int],
 ) -> dict[str, list[str]]:
+    if getattr(args, "data_lake_split_mode", "auto") == "auto":
+        args.data_lake_split_mode = infer_data_lake_split_mode(args, stage1_dir)
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     query_roles = {"left_visible"} if getattr(args, "table_only", False) else {"left_visible", "left_hidden"}
     queries = [f for f in fragments.values() if f.get("role") in query_roles and f["fragment_id"] in vectors]
@@ -293,6 +374,8 @@ def table_rankings(
                 print(f"Scoring table recall: {q_idx}/{len(queries)} queries", flush=True)
             scored = []
             for t in targets:
+                if not target_visible_for_query(q, t, getattr(args, "data_lake_split_mode", "strict")):
+                    continue
                 scored.append(
                     (
                         score_pair(
@@ -317,6 +400,22 @@ def table_rankings(
     return rankings
 
 
+def split_index_name(object_type: str, split: str) -> str:
+    safe_split = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(split))
+    return f"{object_type}_{safe_split or 'unknown'}"
+
+
+def hnsw_current_count(index: Any, ids: list[str]) -> int:
+    if hasattr(index, "get_current_count"):
+        return min(len(ids), int(index.get_current_count()))
+    return len(ids)
+
+
+def requested_hnsw_k(args: argparse.Namespace, indexed_count: int) -> int:
+    requested_k = int(getattr(args, "table_hnsw_k", 0) or 0)
+    return min(requested_k if requested_k > 0 else indexed_count, indexed_count)
+
+
 def hnsw_table_rankings(
     args: argparse.Namespace,
     model: Student | None,
@@ -332,18 +431,25 @@ def hnsw_table_rankings(
         location = "embeddings/table_fragment.npy" if raw_embedding_hnsw else "student/index_embeddings/table_fragment.npy"
         raise SystemExit(f"HNSW table evaluation requires {location}")
     dim = len(next(iter(table_projected.values())))
-    index, table_ids = load_hnsw(Path(args.hnsw_dir), "table_fragment", dim)
-    if index is None:
-        raise SystemExit("table-only HNSW evaluation requires hnsw_indices/table_fragment.bin")
     target_ids = {target["fragment_id"] for target in targets}
-    unexpected_ids = [table_id for table_id in table_ids if table_id not in target_ids]
-    if unexpected_ids:
-        raise SystemExit(
-            "table-only HNSW evaluation expects hnsw_indices/table_fragment_ids.json to contain only right_target fragments. "
-            "Rebuild the index with scripts/stage1_index_eval.py --table_only."
-        )
-    requested_k = int(getattr(args, "table_hnsw_k", 0) or 0)
-    hnsw_k = min(requested_k if requested_k > 0 else len(table_ids), len(table_ids))
+    targets_by_id = {target["fragment_id"]: target for target in targets}
+    data_lake_split_mode = getattr(args, "data_lake_split_mode", "strict")
+    global_index = None
+    global_table_ids: list[str] = []
+    if data_lake_split_mode != "strict":
+        global_index, global_table_ids = load_hnsw(Path(args.hnsw_dir), "table_fragment", dim)
+        if global_index is None:
+            raise SystemExit("table-only HNSW evaluation requires hnsw_indices/table_fragment.bin")
+        unexpected_ids = [table_id for table_id in global_table_ids if table_id not in target_ids]
+        if unexpected_ids:
+            raise SystemExit(
+                "table-only HNSW evaluation expects hnsw_indices/table_fragment_ids.json to contain only right_target fragments. "
+                "Rebuild the index with scripts/stage1_index_eval.py --table_only."
+            )
+    target_ids_by_split: dict[str, set[str]] = defaultdict(set)
+    for target in targets:
+        target_ids_by_split[str(target.get("split", "unknown"))].add(target["fragment_id"])
+    split_indexes: dict[str, tuple[Any, list[str]]] = {}
     rankings: dict[str, list[str]] = {}
     query_iter = queries
     if tqdm is not None and progress_enabled(args):
@@ -362,8 +468,42 @@ def hnsw_table_rankings(
             if model is None:
                 raise SystemExit("Student model is required unless --raw_embedding_hnsw is set.")
             query = relation_query_from_projected(model, table_projected[qid], "table_fragment", "table_fragment", device)
+        if data_lake_split_mode == "strict":
+            split = str(q.get("split", "unknown"))
+            if split not in split_indexes:
+                split_object_type = split_index_name("table_fragment", split)
+                split_index, split_table_ids = load_hnsw(Path(args.hnsw_dir), split_object_type, dim)
+                if split_index is None:
+                    if target_ids_by_split.get(split):
+                        raise SystemExit(
+                            f"strict HNSW evaluation requires hnsw_indices/{split_object_type}.bin for query split {split!r}. "
+                            "Rebuild the index with scripts/stage1_index_eval.py --data_lake_split_mode strict."
+                        )
+                    rankings[qid] = []
+                    continue
+                unexpected_ids = [table_id for table_id in split_table_ids if table_id not in target_ids_by_split.get(split, set())]
+                if unexpected_ids:
+                    raise SystemExit(
+                        f"strict HNSW index {split_object_type} must contain only right_target fragments from split {split!r}. "
+                        "Rebuild the index with scripts/stage1_index_eval.py --data_lake_split_mode strict."
+                    )
+                split_indexes[split] = (split_index, split_table_ids)
+            index, table_ids = split_indexes[split]
+        else:
+            index, table_ids = global_index, global_table_ids
+        indexed_count = hnsw_current_count(index, table_ids)
+        hnsw_k = requested_hnsw_k(args, indexed_count)
+        if hnsw_k <= 0:
+            rankings[qid] = []
+            continue
+        index.set_ef(max(100, hnsw_k))
         labels, _ = index.knn_query(query, k=hnsw_k)
-        rankings[qid] = [table_ids[int(label)] for label in labels[0]]
+        ranked_ids = [table_ids[int(label)] for label in labels[0]]
+        rankings[qid] = [
+            target_id
+            for target_id in ranked_ids
+            if target_visible_for_query(q, targets_by_id.get(target_id, {}), data_lake_split_mode)
+        ]
     return rankings
 
 
@@ -516,6 +656,7 @@ def path_aware_metrics(
     pool_iter = iter_jsonl(stage1_dir / "hitl_pool.jsonl") if (stage1_dir / "hitl_pool.jsonl").exists() else []
     for path in pool_iter:
         paths_by_query_asset_target[(path["query_fragment_id"], path["asset_id"], path["target_fragment_id"])] = path
+    asset_previews = load_bridge_asset_previews(stage1_dir) if recall_records is not None else {}
     qrels = [rec for rec in iter_jsonl(Path(args.qrels))]
     qrels_by_qid = qrels_by_query(qrels)
     hidden_q = sorted({q["query_id"] for q in qrels if q.get("query_role") == "left_hidden"})
@@ -546,6 +687,7 @@ def path_aware_metrics(
                     ranked,
                     best_paths,
                     paths_by_query_asset_target,
+                    asset_previews,
                     max(topks),
                 )
             )
@@ -584,6 +726,7 @@ def run(args: argparse.Namespace) -> None:
     if getattr(args, "embedding_dir", None) is None:
         args.embedding_dir = str(stage1_dir / "embeddings")
     args.raw_embedding_hnsw = infer_raw_embedding_hnsw(args, stage1_dir)
+    args.data_lake_split_mode = infer_data_lake_split_mode(args, stage1_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vectors, _, _, _ = load_embeddings(Path(args.embedding_dir))
     model = None if getattr(args, "raw_embedding_hnsw", False) else load_student(Path(args.student_dir), device)
@@ -631,6 +774,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--table_only", action="store_true", help="Only compute direct table-to-table recall; skip path-aware metrics.")
     parser.add_argument("--raw_embedding_hnsw", action="store_true", help="Evaluate HNSW recall directly over frozen raw embeddings without loading a teacher/student model.")
+    parser.add_argument(
+        "--data_lake_split_mode",
+        choices=DATA_LAKE_SPLIT_MODE_CHOICES,
+        default="auto",
+        help="Candidate data lake split mode for direct recall; auto reads stage metadata.",
+    )
     parser.add_argument("--recall_records", default=None, help="Output JSONL path for per-query recalled targets and bridge paths.")
     parser.add_argument("--no_recall_records", dest="write_recall_records", action="store_false", help="Skip writing per-query recall_rankings.jsonl.")
     parser.add_argument(

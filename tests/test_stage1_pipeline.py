@@ -12,9 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_mm_table_dataset as mm_table_dataset
+import build_mm_joinability_dataset as join_dataset
 import build_stage1_embeddings as stage1_embeddings
 import qwen3_vl_embedding
-from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_target_rows, choose_query_context_cols
+from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_query_table_splits, build_target_rows, choose_query_context_cols
 from build_stage1_logic_connectivity import run as build_logic_connectivity
 from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
@@ -201,6 +202,77 @@ def test_table_only_logic_connectivity_does_not_create_hidden_queries(tmp_path):
     assert {fragment_roles[pair["query_fragment_id"]] for pair in pairs} == {"left_visible"}
 
 
+def test_table_only_query_corpus_mode_marks_targets_as_shared_corpus(tmp_path):
+    input_dir = tmp_path / "input"
+    stage = tmp_path / "stage"
+    rows = []
+    for row_id, (entity, bridge, attr) in enumerate(
+        [
+            ("a1", "b1", "c1"),
+            ("a2", "b1", "c1"),
+            ("a3", "b1", "c1"),
+            ("a4", "b2", "c2"),
+            ("a5", "b2", "c2"),
+            ("a6", "b2", "c2"),
+        ]
+    ):
+        rows.append(
+            {
+                "row_id": row_id,
+                "cells": [
+                    cell(0, "Entity", entity),
+                    cell(1, "Bridge", bridge),
+                    cell(2, "Attr", attr),
+                ],
+            }
+        )
+    table = {
+        "source_table_id": "source_1",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Bridge"},
+            {"column_index": 2, "column_name": "Attr"},
+        ],
+        "rows": rows,
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    (input_dir / "source_tables").mkdir(parents=True)
+    write_jsonl(input_dir / "source_tables" / "part-00000.jsonl", [table])
+    (input_dir / "dataset_manifest.json").write_text(
+        json.dumps({"artifacts": {"source_tables": {"shards": [{"path": "source_tables/part-00000.jsonl", "records": 1}]}}}),
+        encoding="utf-8",
+    )
+    (input_dir / "splits.json").write_text(json.dumps({"train": {"source_table_ids": ["source_1"]}}), encoding="utf-8")
+
+    build_logic_connectivity(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(stage),
+            min_rows_per_fragment=2,
+            max_chains_per_table=10,
+            max_bridges_per_anchor=5,
+            max_target_attrs=1,
+            max_query_context_attrs=0,
+            seed=13,
+            min_ab_purity=0.95,
+            min_bc_purity=0.85,
+            min_support=2,
+            max_bridge_unique_ratio=0.85,
+            table_only=True,
+            data_lake_split_mode="query_corpus",
+        )
+    )
+
+    fragments = [json.loads(line) for line in (stage / "logic_fragments.jsonl").read_text().splitlines()]
+    qrels = [json.loads(line) for line in (stage / "qrels.jsonl").read_text().splitlines()]
+    manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+
+    assert {fragment["split"] for fragment in fragments if fragment["role"] == "left_visible"} == {"train"}
+    assert {fragment["split"] for fragment in fragments if fragment["role"] == "right_target"} == {"corpus"}
+    assert {qrel["split"] for qrel in qrels} == {"train"}
+    assert manifest["logic_connectivity"]["data_lake_split_mode"] == "query_corpus"
+
+
 def test_webtable_mode_builds_table_only_fragments_from_csv_benchmark(tmp_path):
     input_dir = tmp_path / "webtable"
     table_dir = input_dir / "data" / "benchmark" / "webtable" / "large" / "split_1"
@@ -330,6 +402,68 @@ def test_webtable_mode_splits_by_query_table(tmp_path):
     assert split_payload["counts"] == {"train": 3, "dev": 1, "test": 1}
 
 
+def test_webtable_strict_mode_splits_targets_and_drops_cross_split_qrels(tmp_path):
+    input_dir = tmp_path / "webtable"
+    table_dir = input_dir / "data" / "benchmark" / "webtable" / "large" / "split_1"
+    stage = tmp_path / "stage"
+    table_dir.mkdir(parents=True)
+    ratios = [0.5, 0.0, 0.5]
+    query_candidate_pairs = [(f"query_{idx}.csv", f"candidate_{idx}.csv") for idx in range(20)]
+    split_map, _ = build_query_table_splits({name for pair in query_candidate_pairs for name in pair}, ratios, 13)
+    same_split_pairs = [(query, candidate) for query, candidate in query_candidate_pairs if split_map[query] == split_map[candidate]]
+    cross_split_pairs = [(query, candidate) for query, candidate in query_candidate_pairs if split_map[query] != split_map[candidate]]
+    assert same_split_pairs
+    assert cross_split_pairs
+
+    query_lines = ["query_table,query_column"]
+    truth_lines = ["query_table,candidate_table,query_column,candidate_column"]
+    for query_name, candidate_name in query_candidate_pairs:
+        query_lines.append(f"{query_name},Key")
+        truth_lines.append(f"{query_name},{candidate_name},Key,Key")
+        (table_dir / query_name).write_text("Key,Value\na,1\nb,2\n", encoding="utf-8")
+        (table_dir / candidate_name).write_text("Key,Other\na,x\nb,y\n", encoding="utf-8")
+    (input_dir / "webtable_join_query.csv").write_text("\n".join(query_lines) + "\n", encoding="utf-8")
+    (input_dir / "webtable_join_ground_truth.csv").write_text("\n".join(truth_lines) + "\n", encoding="utf-8")
+
+    build_logic_connectivity(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            output_dir=str(stage),
+            min_rows_per_fragment=1,
+            max_chains_per_table=10,
+            max_bridges_per_anchor=5,
+            max_target_attrs=1,
+            max_query_context_attrs=1,
+            seed=13,
+            min_ab_purity=0.95,
+            min_bc_purity=0.85,
+            min_support=1,
+            max_bridge_unique_ratio=0.85,
+            table_only=False,
+            webtable_mode=True,
+            data_lake_split_mode="strict",
+            webtable_query_file=None,
+            webtable_ground_truth_file=None,
+            webtable_table_dir=None,
+            webtable_max_rows=20,
+            webtable_recursive_lookup=False,
+            webtable_split_ratios=ratios,
+            webtable_split_seed=13,
+        )
+    )
+
+    fragments = [json.loads(line) for line in (stage / "logic_fragments.jsonl").read_text().splitlines()]
+    qrels = [json.loads(line) for line in (stage / "qrels.jsonl").read_text().splitlines()]
+    manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+    target_by_id = {fragment["fragment_id"]: fragment for fragment in fragments if fragment["role"] == "right_target"}
+
+    assert len(qrels) == len(same_split_pairs)
+    assert manifest["logic_connectivity"]["data_lake_split_mode"] == "strict"
+    assert manifest["logic_connectivity"]["counts"]["webtable_split_mismatch_qrels"] == len(cross_split_pairs)
+    assert "corpus" not in {target["split"] for target in target_by_id.values()}
+    assert all(target_by_id[qrel["target_id"]]["split"] == qrel["split"] for qrel in qrels)
+
+
 def test_same_source_targets_with_query_bridge_column_are_positive():
     def frag(fragment_id, role, source_cols, chain_id="c1", source_table_id="s1", **extra):
         return {
@@ -401,9 +535,31 @@ def test_table_serialization_excludes_hidden_fields_and_values():
     assert "left_hidden" not in text
     assert "chain_secret" not in text
     assert "hidden(Country)" not in text
+    assert "Football players" not in text
     assert "Argentina" not in text
     assert "Country" not in text
     assert "Player" in text
+
+
+def test_table_serialization_excludes_shared_page_context():
+    table = {
+        **synthetic_table(),
+        "page_title": "Shared Wikipedia Page",
+        "title": "Shared Title",
+        "caption": "Shared Caption",
+        "section_title": "Shared Section",
+        "source_table_id": "shared_source",
+    }
+
+    text = serialize_table_for_embedding(table)
+
+    assert "Shared Wikipedia Page" not in text
+    assert "Shared Title" not in text
+    assert "Shared Caption" not in text
+    assert "Shared Section" not in text
+    assert "shared_source" not in text
+    assert "Player" in text
+    assert "Messi" in text
 
 
 def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
@@ -427,11 +583,23 @@ def test_embedding_prompt_mode_invalidates_incompatible_cache(tmp_path):
     emb_dir = tmp_path / "embeddings"
     emb_dir.mkdir()
 
-    assert stage1_embeddings.prompt_cache_compatible(emb_dir, "connectivity")
+    assert not stage1_embeddings.prompt_cache_compatible(emb_dir, "connectivity")
     assert not stage1_embeddings.prompt_cache_compatible(emb_dir, "content_only")
 
     (emb_dir / "embedding_stats.json").write_text(
         json.dumps({"embedding_prompt_mode": "content_only"}),
+        encoding="utf-8",
+    )
+
+    assert not stage1_embeddings.prompt_cache_compatible(emb_dir, "content_only")
+
+    (emb_dir / "embedding_stats.json").write_text(
+        json.dumps(
+            {
+                "embedding_prompt_mode": "content_only",
+                "table_serialization_version": stage1_embeddings.TABLE_SERIALIZATION_VERSION,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -452,11 +620,12 @@ def test_table_embedding_uses_selected_prompt_mode(tmp_path):
             }
         ],
     )
-    seen: dict[str, str | None] = {}
+    seen: dict[str, object] = {}
 
     class RecordingEncoder:
         def encode_tables(self, texts, instruction=None):
             seen["instruction"] = instruction
+            seen["texts"] = texts
             return np.ones((len(texts), 2), dtype="float32")
 
     stage1_embeddings.encode_table_fragments(
@@ -471,6 +640,8 @@ def test_table_embedding_uses_selected_prompt_mode(tmp_path):
     )
 
     assert seen["instruction"] == stage1_embeddings.EMBEDDING_INSTRUCTIONS["content_only"]["table"]
+    assert "Players" not in seen["texts"][0]
+    assert "Messi" in seen["texts"][0]
 
 
 def test_qwen_encoder_progress_bar_updates_by_item(monkeypatch):
@@ -641,6 +812,283 @@ def test_text_asset_chunk_limit_keeps_relevant_chunk(tmp_path):
     assert records[0]["text_chunk_index"] == 1
     assert records[0]["selected_text_chunk_count"] == 1
     assert records[0]["text_chunk_relevance_score"] > 0
+
+
+def read_manifest_artifact(root: Path, artifact: str) -> list[dict[str, object]]:
+    manifest = json.loads((root / "dataset_manifest.json").read_text(encoding="utf-8"))
+    records = []
+    for shard in manifest["artifacts"][artifact]["shards"]:
+        records.extend(json.loads(line) for line in (root / shard["path"]).read_text(encoding="utf-8").splitlines())
+    return records
+
+
+def test_joinability_dataset_keeps_note_like_columns_as_candidates_and_context():
+    table = {
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "City"},
+            {"column_index": 2, "column_name": "Role"},
+            {"column_index": 3, "column_name": "Notes"},
+            {"column_index": 4, "column_name": "Source"},
+        ],
+        "metadata": {
+            "column_profiles": [
+                {"column_index": idx, "non_empty_ratio": 1.0, "unique_ratio": 0.5}
+                for idx in range(5)
+            ]
+        },
+    }
+
+    assert join_dataset.candidate_attribute_columns(table, entity_col=0, min_non_empty_ratio=0.5) == [1, 2, 3, 4]
+    assert set(join_dataset.context_columns(table, excluded={0, 1}, limit=0)) == {2, 3, 4}
+
+
+def test_joinability_dataset_accepts_external_wikipedia_cache_dirs(tmp_path, monkeypatch):
+    input_dir = tmp_path / "entitables"
+    output_dir = tmp_path / "joinability"
+    old_cache_dir = tmp_path / "previous_joinability" / "cache"
+    old_image_dir = tmp_path / "previous_joinability" / "images"
+    input_dir.mkdir()
+    (input_dir / "tables.json").write_text("{}", encoding="utf-8")
+    captured: dict[str, Path] = {}
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, cache_dir, image_output_dir, output_dir, sleep, user_agent):
+            captured["cache_dir"] = Path(cache_dir)
+            captured["image_output_dir"] = Path(image_output_dir)
+            captured["output_dir"] = Path(output_dir)
+
+        def get_page(self, wiki_title):
+            raise AssertionError("empty input should not request Wikipedia pages")
+
+    monkeypatch.setattr(join_dataset, "WikipediaClient", FakeWikipediaClient)
+    args = join_dataset.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--cache_dir",
+            str(tmp_path / "shared_cache"),
+            "--wikipedia_cache_dir",
+            str(old_cache_dir),
+            "--wikipedia_image_dir",
+            str(old_image_dir),
+            "--no_model_progress",
+        ]
+    )
+
+    stats = join_dataset.build_dataset(args)
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+
+    assert stats["source_tables"] == 0
+    assert captured["cache_dir"] == old_cache_dir.resolve()
+    assert captured["image_output_dir"] == old_image_dir.resolve()
+    assert captured["output_dir"] == output_dir.resolve()
+    assert manifest["wikipedia_cache"]["cache_dir"] == str(old_cache_dir.resolve())
+    assert manifest["wikipedia_cache"]["image_dir"] == str(old_image_dir.resolve())
+
+
+def test_joinability_dataset_uses_shared_cache_dir_by_default(tmp_path, monkeypatch):
+    input_dir = tmp_path / "entitables"
+    output_dir = tmp_path / "joinability"
+    input_dir.mkdir()
+    (input_dir / "tables.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, Path] = {}
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, cache_dir, image_output_dir, output_dir, sleep, user_agent):
+            captured["cache_dir"] = Path(cache_dir)
+            captured["image_output_dir"] = Path(image_output_dir)
+
+        def get_page(self, wiki_title):
+            raise AssertionError("empty input should not request Wikipedia pages")
+
+    monkeypatch.setattr(join_dataset, "WikipediaClient", FakeWikipediaClient)
+    args = join_dataset.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--no_model_progress",
+        ]
+    )
+
+    join_dataset.build_dataset(args)
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+    shared_cache_dir = (tmp_path / "cache" / "mm_joinability").resolve()
+
+    assert captured["cache_dir"] == shared_cache_dir / "wikipedia"
+    assert captured["image_output_dir"] == shared_cache_dir / "images"
+    assert manifest["cache"]["root_dir"] == str(shared_cache_dir)
+    assert manifest["cache"]["model_attribute_extractions"] == str(shared_cache_dir / "model_attribute_extractions.jsonl")
+    assert not (output_dir / "cache").exists()
+
+
+def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, monkeypatch):
+    input_dir = tmp_path / "entitables"
+    input_dir.mkdir()
+    output_dir = tmp_path / "joinability"
+    queryable_table = {
+        "title": ["Entity", "City", "Team"],
+        "numCols": 3,
+        "numericColumns": [],
+        "pgTitle": "Queryable Page",
+        "numDataRows": 4,
+        "secondTitle": "Section",
+        "caption": "Caption",
+        "data": [
+            ["[Alpha_Page|Alpha]", "Paris", "Red"],
+            ["[Beta_Page|Beta]", "Paris", "Red"],
+            ["[Gamma_Page|Gamma]", "Oslo", "Blue"],
+            ["[Delta_Page|Delta]", "Rome", "Green"],
+        ],
+    }
+    rejected_table = {
+        "title": ["Entity", "City", "Team"],
+        "numCols": 3,
+        "numericColumns": [],
+        "pgTitle": "Rejected Page",
+        "numDataRows": 4,
+        "secondTitle": "Section",
+        "caption": "Caption",
+        "data": [
+            ["[No_A|No A]", "Madrid", "One"],
+            ["[No_B|No B]", "Berlin", "Two"],
+            ["[No_C|No C]", "Lisbon", "Three"],
+            ["[No_D|No D]", "Dublin", "Four"],
+        ],
+    }
+    (input_dir / "tables.json").write_text(json.dumps({"table_1": queryable_table, "table_2": rejected_table}), encoding="utf-8")
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_page(self, wiki_title):
+            city_by_title = {
+                "Alpha Page": "Paris",
+                "Beta Page": "Paris",
+                "Gamma Page": "Oslo",
+                "Delta Page": "Rome",
+            }
+            city = city_by_title.get(wiki_title, "")
+            return {
+                "extract": f"{wiki_title} biography. City: {city}." if city else f"{wiki_title} biography without recoverable table attributes.",
+                "canonicalurl": f"https://example.test/wiki/{wiki_title}",
+                "images": [],
+            }
+
+    class FakeAttributeExtractor:
+        def __init__(self, args):
+            pass
+
+        def extract(self, asset, entity, candidate_attribute_names):
+            content = asset.get("content", "")
+            attrs = []
+            for city in ("Paris", "Oslo", "Rome"):
+                if city in content:
+                    attrs.append({"name": "City", "value": city, "evidence": f"City: {city}"})
+            return {"attributes": attrs, "raw_response": json.dumps({"attributes": attrs}), "error": ""}
+
+    monkeypatch.setattr(join_dataset, "WikipediaClient", FakeWikipediaClient)
+    monkeypatch.setattr(join_dataset, "LocalAttributeExtractor", FakeAttributeExtractor)
+    args = join_dataset.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--cache_dir",
+            str(tmp_path / "shared_cache"),
+            "--max_source_tables",
+            "2",
+            "--max_entities",
+            "10",
+            "--max_images_per_entity",
+            "0",
+            "--text_asset_chunk_chars",
+            "300",
+            "--min_text_asset_chunk_chars",
+            "20",
+            "--max_text_asset_chunks_per_entity",
+            "1",
+            "--wiki_link_threshold",
+            "0.5",
+            "--min_rows",
+            "4",
+            "--min_cols",
+            "3",
+            "--min_rows_per_output_table",
+            "2",
+            "--min_recovered_value_ratio",
+            "0.75",
+            "--min_recovery_denominator",
+            "4",
+            "--max_query_context_attrs",
+            "1",
+            "--max_target_context_attrs",
+            "1",
+            "--sleep",
+            "0",
+            "--records_per_shard",
+            "10",
+            "--flush_every_records",
+            "2",
+            "--split_by",
+            "source_table_id",
+        ]
+    )
+
+    stats = join_dataset.build_dataset(args)
+
+    assert stats["query_tables"] == 1
+    assert stats["data_lake_tables"] == 2
+    assert stats["queryable_source_tables"] == 1
+    assert stats["rejected_source_tables"] == 1
+    assert stats["qrels"] == 1
+    assert stats["evidence_recoveries"] == 4
+    assert stats["attribute_extractions"] == 8
+
+    query = read_manifest_artifact(output_dir, "query_tables")[0]
+    data_lake = read_manifest_artifact(output_dir, "data_lake_tables")
+    target = next(item for item in data_lake if item["role"] == "target_data_lake_table")
+    rejected = next(item for item in data_lake if item["role"] == "raw_data_lake_table")
+    recoveries = read_manifest_artifact(output_dir, "evidence_recoveries")
+    extractions = read_manifest_artifact(output_dir, "attribute_extractions")
+    qrels = [json.loads(line) for line in (output_dir / "qrels.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert [column["column_name"] for column in query["columns"]] == ["Entity", "Team"]
+    assert query["hidden_attributes"][0]["column_name"] == "City"
+    assert query["hidden_attributes"][0]["recovered_value_ratio"] == 1.0
+    assert [column["column_name"] for column in target["columns"]] == ["City", "Team"]
+    assert rejected["queryable"] is False
+    assert qrels[0]["query_table_id"] == query["table_id"]
+    assert qrels[0]["data_lake_table_id"] == target["table_id"]
+    assert any(item["attributes"] for item in extractions)
+
+    alpha = next(item for item in recoveries if item["query_entity"]["cell_text"] == "Alpha")
+    assert alpha["source_row_id"] == 0
+    assert alpha["query_row_id"] == 0
+    assert alpha["recovered_attribute"] == {
+        "column_index": 1,
+        "column_name": "City",
+        "value": "Paris",
+        "model_value": "Paris",
+        "hidden_in_query": True,
+    }
+    assert [node["node_type"] for node in alpha["path_nodes"]] == ["query_table", "text_asset", "target_table"]
+    assert alpha["evidence"]["asset_type"] == "text"
+    assert "City: Paris" in alpha["evidence"]["content_snippet"]
+    assert alpha["evidence"]["model_evidence"] == "City: Paris"
 
 
 def test_wikipedia_svg_download_converts_to_png_without_thumbnail(tmp_path, monkeypatch):
@@ -1245,6 +1693,7 @@ def test_eval_recall_records_can_drive_recall_viewer(tmp_path):
                 "claim_text": "Alpha -> Beta",
             }
         },
+        {"asset_a": {"asset_id": "asset_a", "asset_type": "text", "title": "Alpha", "content_snippet": "Alpha mentions Beta."}},
         topk=1,
     )
     write_jsonl(tmp_path / "recall_rankings.jsonl", [*direct_records, bridge_record])
@@ -1259,6 +1708,7 @@ def test_eval_recall_records_can_drive_recall_viewer(tmp_path):
     assert path_target["score"] == 0.75
     assert path_target["path_nodes"][1]["bridge"] == "Bridge = Beta"
     assert path_target["path_nodes"][1]["path_id"] == "path_a"
+    assert path_target["path_nodes"][1]["content"] == "Alpha mentions Beta."
 
 
 def test_train_pairs_do_not_auto_positive_unlabeled_assets(tmp_path):
@@ -1714,7 +2164,14 @@ def test_table_only_eval_uses_hnsw_table_index(tmp_path):
             proj.weight.copy_(torch.eye(2))
         model.rel["table_fragment__table_fragment"].copy_(torch.eye(2))
     rankings = table_rankings(
-        argparse.Namespace(student_dir=str(student_dir), hnsw_dir=str(hnsw_dir), table_only=True, table_hnsw_k=0, progress=False),
+        argparse.Namespace(
+            student_dir=str(student_dir),
+            hnsw_dir=str(hnsw_dir),
+            table_only=True,
+            table_hnsw_k=0,
+            progress=False,
+            data_lake_split_mode="query_corpus",
+        ),
         stage,
         model,
         {oid: projected_arr[idx] for idx, oid in enumerate(projected_ids)},
@@ -1785,6 +2242,7 @@ def test_hnsw_table_index_contains_only_right_targets(tmp_path):
             ef_construction=20,
             ef_search=20,
             table_only=True,
+            data_lake_split_mode="query_corpus",
         )
     )
     indexed_ids = json.loads((stage / "hnsw_indices" / "table_fragment_ids.json").read_text(encoding="utf-8"))
@@ -1821,6 +2279,7 @@ def test_raw_embedding_hnsw_index_uses_embedding_dir(tmp_path):
             ef_search=20,
             table_only=True,
             raw_embedding_hnsw=True,
+            data_lake_split_mode="query_corpus",
         )
     )
     indexed_ids = json.loads((stage / "hnsw_indices" / "table_fragment_ids.json").read_text(encoding="utf-8"))
@@ -1828,6 +2287,118 @@ def test_raw_embedding_hnsw_index_uses_embedding_dir(tmp_path):
     assert indexed_ids == ["t"]
     assert stats["embedding_backend"] == "raw"
     assert stats["embedding_dir"] == str(emb_dir)
+
+
+def test_strict_hnsw_table_index_is_split_specific(tmp_path):
+    pytest.importorskip("hnswlib")
+    from build_hnsw_indices import run as build_hnsw
+
+    stage = tmp_path
+    emb_dir = stage / "embeddings"
+    emb_dir.mkdir()
+    write_jsonl(
+        stage / "logic_fragments.jsonl",
+        [
+            {"fragment_id": "q_train", "role": "left_visible", "object_type": "table_fragment", "split": "train"},
+            {"fragment_id": "q_test", "role": "left_visible", "object_type": "table_fragment", "split": "test"},
+            {"fragment_id": "t_train", "role": "right_target", "object_type": "table_fragment", "split": "train"},
+            {"fragment_id": "t_test", "role": "right_target", "object_type": "table_fragment", "split": "test"},
+        ],
+    )
+    ids = ["q_train", "q_test", "t_train", "t_test"]
+    np.save(emb_dir / "table_fragment.npy", np.eye(4, dtype="float32"))
+    (emb_dir / "table_fragment_ids.json").write_text(json.dumps(ids), encoding="utf-8")
+
+    build_hnsw(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            student_dir=str(stage / "student"),
+            embedding_dir=str(emb_dir),
+            hnsw_dir=str(stage / "hnsw_indices"),
+            space="cosine",
+            m=8,
+            ef_construction=20,
+            ef_search=20,
+            table_only=True,
+            raw_embedding_hnsw=True,
+            data_lake_split_mode="strict",
+        )
+    )
+
+    hnsw_dir = stage / "hnsw_indices"
+    stats = json.loads((hnsw_dir / "hnsw_stats.json").read_text(encoding="utf-8"))
+
+    assert not (hnsw_dir / "table_fragment.bin").exists()
+    assert json.loads((hnsw_dir / "table_fragment_train_ids.json").read_text(encoding="utf-8")) == ["t_train"]
+    assert json.loads((hnsw_dir / "table_fragment_test_ids.json").read_text(encoding="utf-8")) == ["t_test"]
+    assert {(item["split"], item["index_name"]) for item in stats["objects"]} == {
+        ("train", "table_fragment_train"),
+        ("test", "table_fragment_test"),
+    }
+
+
+def test_strict_raw_embedding_table_rankings_use_query_split_index(tmp_path):
+    pytest.importorskip("hnswlib")
+    from build_hnsw_indices import run as build_hnsw
+
+    stage = tmp_path
+    emb_dir = stage / "embeddings"
+    emb_dir.mkdir()
+    fragments = [
+        {"fragment_id": "q_train", "role": "left_visible", "object_type": "table_fragment", "split": "train"},
+        {"fragment_id": "q_test", "role": "left_visible", "object_type": "table_fragment", "split": "test"},
+        {"fragment_id": "t_train", "role": "right_target", "object_type": "table_fragment", "split": "train"},
+        {"fragment_id": "t_test", "role": "right_target", "object_type": "table_fragment", "split": "test"},
+    ]
+    write_jsonl(stage / "logic_fragments.jsonl", fragments)
+    ids = ["q_train", "q_test", "t_train", "t_test"]
+    arr = np.array(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype="float32",
+    )
+    np.save(emb_dir / "table_fragment.npy", arr)
+    (emb_dir / "table_fragment_ids.json").write_text(json.dumps(ids), encoding="utf-8")
+    build_hnsw(
+        argparse.Namespace(
+            stage1_dir=str(stage),
+            student_dir=str(stage / "student"),
+            embedding_dir=str(emb_dir),
+            hnsw_dir=str(stage / "hnsw_indices"),
+            space="cosine",
+            m=8,
+            ef_construction=20,
+            ef_search=20,
+            table_only=True,
+            raw_embedding_hnsw=True,
+            data_lake_split_mode="strict",
+        )
+    )
+
+    rankings = table_rankings(
+        argparse.Namespace(
+            embedding_dir=str(emb_dir),
+            student_dir=str(stage / "student"),
+            hnsw_dir=str(stage / "hnsw_indices"),
+            table_only=True,
+            raw_embedding_hnsw=True,
+            table_hnsw_k=1,
+            progress=False,
+            data_lake_split_mode="strict",
+        ),
+        stage,
+        None,
+        {oid: arr[idx] for idx, oid in enumerate(ids)},
+        torch.device("cpu"),
+        [1],
+    )
+
+    assert rankings["q_test"] == ["t_test"]
+    assert rankings["q_train"] == ["t_train"]
 
 
 def test_raw_embedding_table_rankings_use_hnsw_without_student(tmp_path):
@@ -1864,6 +2435,7 @@ def test_raw_embedding_table_rankings_use_hnsw_without_student(tmp_path):
             raw_embedding_hnsw=True,
             table_hnsw_k=0,
             progress=False,
+            data_lake_split_mode="query_corpus",
         ),
         stage,
         None,

@@ -335,16 +335,28 @@ def make_path_nodes(
             )
         else:
             asset = assets.get(node_id, {})
-            content = clean_text(asset.get("content"))
+            preview = {}
+            if path_record and clean_text(path_record.get("asset_id")) == node_id:
+                preview = path_record.get("asset_preview") if isinstance(path_record.get("asset_preview"), dict) else {}
+            merged_asset = {**asset, **preview}
+            content = clean_text(merged_asset.get("content_snippet") or merged_asset.get("content"))
+            title = (
+                clean_text(merged_asset.get("title"))
+                or clean_text(merged_asset.get("entity_wiki_title"))
+                or clean_text(path_record.get("entity_text") if path_record else "")
+                or node_id
+            )
             nodes.append(
                 {
                     "id": node_id,
                     "type": node_type,
                     "type_label": object_type_label(node_type),
-                    "title": asset_label(asset, node_id),
-                    "subtitle": clean_text(asset.get("source")),
+                    "title": title,
+                    "subtitle": clean_text(merged_asset.get("source")),
                     "content": content[:700],
                     "asset_id": node_id if node_type == "image_asset" else "",
+                    "file_name": clean_text(merged_asset.get("file_name") or merged_asset.get("local_path") or merged_asset.get("relative_path")),
+                    "url": clean_text(merged_asset.get("url")),
                 }
             )
     if path_record:
@@ -356,6 +368,8 @@ def make_path_nodes(
                 if bridge:
                     node["bridge"] = bridge
                 node["path_id"] = clean_text(path_record.get("path_id"))
+                if path_record.get("claim_text"):
+                    node["claim_text"] = clean_text(path_record.get("claim_text"))
     return nodes
 
 
@@ -594,7 +608,7 @@ def load_recorded_recall_cards(args: argparse.Namespace) -> list[dict[str, Any]]
         return None
     stage1_dir = Path(args.stage1_dir)
     fragments = load_fragments(stage1_dir)
-    assets, _ = load_assets(stage1_dir)
+    assets: dict[str, dict[str, Any]] = {}
     path_records = load_path_records(stage1_dir)
     qrels_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     direct_by_query: dict[str, list[dict[str, Any]]] = {}
@@ -879,8 +893,15 @@ def render_targets(targets: list[dict[str, Any]], mode: str) -> str:
                     chunks.append(f'<div><span class="label">Bridge</span>{escape_html(node.get("bridge"))}</div>')
                 if node.get("path_id"):
                     chunks.append(f'<div><span class="label">Path ID</span>{escape_html(node.get("path_id"))}</div>')
+                if node.get("claim_text"):
+                    chunks.append(f'<div><span class="label">Claim</span>{escape_html(node.get("claim_text"))}</div>')
                 if node.get("content"):
+                    chunks.append('<span class="label">Text snippet</span>')
                     chunks.append(f'<div class="asset-text">{escape_html(node.get("content"))}</div>')
+                if node.get("file_name") and not node.get("content"):
+                    chunks.append(f'<div><span class="label">Image/file</span>{escape_html(node.get("file_name"))}</div>')
+                if node.get("url"):
+                    chunks.append(f'<div><a href="{escape_html(node.get("url"))}" target="_blank" rel="noreferrer">{escape_html(node.get("url"))}</a></div>')
                 if node.get("asset_id"):
                     chunks.append(
                         f'<img class="asset-image" src="/asset/{escape_html(node.get("asset_id"))}" '
