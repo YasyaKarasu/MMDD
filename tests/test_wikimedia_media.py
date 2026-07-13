@@ -326,6 +326,116 @@ def test_shared_cooldown_blocks_a_second_new_attempt(tmp_path):
         assert second.result(timeout=2)["bytes"] == 4
 
 
+def test_queued_waiter_rechecks_cooldown_before_starting_request(
+    tmp_path,
+    monkeypatch,
+):
+    fake = ControlledTime()
+    first_started = threading.Event()
+    allow_rate_limit = threading.Event()
+    queued_checked_cooldown = threading.Event()
+    classification_started = threading.Event()
+    allow_classification = threading.Event()
+    queued_attempt_started = threading.Event()
+    first_calls = 0
+    results = {}
+    errors = []
+
+    downloader = wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(
+            workers=1,
+            max_mbps=24.0,
+            max_retries=1,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        failure_recorder=_DiscardingFailureRecorder(),
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+        jitter=lambda: 0.0,
+    )
+
+    original_wait = downloader.cooldown.wait
+
+    def observed_wait():
+        if threading.current_thread().name == "queued-worker":
+            queued_checked_cooldown.set()
+        return original_wait()
+
+    downloader.cooldown.wait = observed_wait
+
+    original_classifier = wikimedia_media.classify_media_failure
+
+    def blocking_classifier(*args, **kwargs):
+        classification_started.set()
+        assert allow_classification.wait(timeout=2)
+        return original_classifier(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikimedia_media,
+        "classify_media_failure",
+        blocking_classifier,
+    )
+
+    def rate_limited_attempt(limiter):
+        nonlocal first_calls
+        first_calls += 1
+        if first_calls == 1:
+            first_started.set()
+            assert allow_rate_limit.wait(timeout=2)
+            raise MediaHTTPError(429, {"Retry-After": "5"}, "request limit")
+        return {"local_path": "retried.jpg", "bytes": 3}
+
+    def queued_attempt(limiter):
+        queued_attempt_started.set()
+        return {"local_path": "queued.jpg", "bytes": 4}
+
+    def run(name, attempt):
+        try:
+            results[name] = downloader.run(
+                cache_key=name,
+                attempt=attempt,
+                failure_context={"url": name},
+            )
+        except Exception as error:
+            errors.append(error)
+
+    rate_limited = threading.Thread(
+        target=run,
+        args=("rate-limited", rate_limited_attempt),
+        name="rate-limited-worker",
+    )
+    queued = threading.Thread(
+        target=run,
+        args=("queued", queued_attempt),
+        name="queued-worker",
+    )
+    rate_limited.start()
+    assert first_started.wait(timeout=2)
+    queued.start()
+    assert queued_checked_cooldown.wait(timeout=2)
+    allow_rate_limit.set()
+    assert classification_started.wait(timeout=2)
+
+    started_before_cooldown_was_published = queued_attempt_started.wait(
+        timeout=0.1
+    )
+    allow_classification.set()
+    if not started_before_cooldown_was_published:
+        assert fake.sleeping.wait(timeout=2)
+        assert not queued_attempt_started.is_set()
+    fake.release.set()
+    rate_limited.join(timeout=2)
+    queued.join(timeout=2)
+
+    assert not rate_limited.is_alive()
+    assert not queued.is_alive()
+    assert errors == []
+    assert results["rate-limited"]["bytes"] == 3
+    assert results["queued"]["bytes"] == 4
+    assert started_before_cooldown_was_published is False
+
+
 def test_shared_cooldown_does_not_cancel_active_success(tmp_path):
     fake = ControlledTime()
     active_started = threading.Event()

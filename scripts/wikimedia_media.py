@@ -392,23 +392,35 @@ class WikimediaMediaDownloader:
             for attempt_index in range(self.config.max_retries + 1):
                 cooldown_wait = self.cooldown.wait()
                 self.stats.increment("cooldown_wait_seconds", cooldown_wait)
-                try:
-                    with self._media_slots:
+                attempt_error: Exception | None = None
+                decision: RetryDecision | None = None
+                should_retry = False
+                with self._media_slots:
+                    cooldown_wait = self.cooldown.wait()
+                    self.stats.increment("cooldown_wait_seconds", cooldown_wait)
+                    try:
                         result = attempt(self.bandwidth)
-                except Exception as error:
-                    decision = classify_media_failure(
-                        error,
-                        attempt=attempt_index,
-                        config=self.config,
-                        jitter=self._jitter(),
-                    )
-                    if (
-                        not decision.retryable
-                        or attempt_index >= self.config.max_retries
-                    ):
+                    except Exception as error:
+                        attempt_error = error
+                        decision = classify_media_failure(
+                            error,
+                            attempt=attempt_index,
+                            config=self.config,
+                            jitter=self._jitter(),
+                        )
+                        should_retry = (
+                            decision.retryable
+                            and attempt_index < self.config.max_retries
+                        )
+                        if should_retry and decision.shared_cooldown:
+                            self.cooldown.extend(decision.delay_seconds)
+                            self.stats.increment("shared_cooldown_events")
+                if attempt_error is not None:
+                    assert decision is not None
+                    if not should_retry:
                         self.failure_recorder.record(
                             failure_context,
-                            error,
+                            attempt_error,
                             attempt_index + 1,
                             delays,
                         )
@@ -417,10 +429,7 @@ class WikimediaMediaDownloader:
                         return None
                     delays.append(decision.delay_seconds)
                     self.stats.increment("retry_attempts")
-                    if decision.shared_cooldown:
-                        self.cooldown.extend(decision.delay_seconds)
-                        self.stats.increment("shared_cooldown_events")
-                    else:
+                    if not decision.shared_cooldown:
                         self._sleep(decision.delay_seconds)
                     continue
                 flight.result = result
