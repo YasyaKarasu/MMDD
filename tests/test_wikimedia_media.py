@@ -1,4 +1,7 @@
+import json
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -6,6 +9,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+
+import wikimedia_media
 
 from wikimedia_media import (
     MediaBandwidthLimiter,
@@ -17,6 +22,32 @@ from wikimedia_media import (
     classify_media_failure,
     parse_retry_after,
 )
+
+
+class _DiscardingFailureRecorder:
+    count = 0
+
+    def record(self, context, error, attempts, retry_delays):
+        self.count += 1
+
+
+def make_downloader(tmp_path, **overrides):
+    values = {
+        "workers": 2,
+        "max_mbps": 24.0,
+        "max_retries": 0,
+        "retry_base_seconds": 0.0,
+        "retry_max_seconds": 0.0,
+        "chunk_bytes": 128 * 1024,
+    }
+    values.update(overrides)
+    recorder = wikimedia_media.MediaFailureRecorder(tmp_path / "failures.jsonl")
+    recorder.reset()
+    return wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(**values),
+        failure_recorder=recorder,
+        jitter=lambda: 0.0,
+    )
 
 
 def test_media_policy_config_rejects_values_outside_wikimedia_limits():
@@ -57,6 +88,24 @@ class FakeTime:
     def sleep(self, seconds):
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+class ControlledTime:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeping = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def monotonic(self):
+        with self._lock:
+            return self.now
+
+    def sleep(self, seconds):
+        self.sleeping.set()
+        assert self.release.wait(timeout=2)
+        with self._lock:
+            self.now += seconds
 
 
 def test_bandwidth_limiter_paces_aggregate_bytes_across_callers():
@@ -173,3 +222,225 @@ def test_failure_classifier_treats_configuration_and_other_4xx_as_terminal():
 def test_non_image_media_error_message_is_only_sanitized_content_type():
     error = NonImageMediaError("  text/html\r\n charset=utf-8  ")
     assert str(error) == "text/html charset=utf-8"
+
+
+def test_connection_error_retries_only_current_media(tmp_path):
+    calls = []
+
+    def attempt(limiter):
+        calls.append("attempt")
+        if len(calls) == 1:
+            raise ConnectionError("reset")
+        return {"local_path": str(tmp_path / "ok.jpg"), "bytes": 3}
+
+    downloader = make_downloader(
+        tmp_path,
+        max_retries=1,
+        retry_base_seconds=0,
+    )
+    result = downloader.run(
+        cache_key="url-a",
+        attempt=attempt,
+        failure_context={"url": "a"},
+    )
+
+    assert result["bytes"] == 3
+    assert calls == ["attempt", "attempt"]
+    assert downloader.summary()["shared_cooldown_events"] == 0
+
+
+def test_retry_exhaustion_records_failure_without_negative_cache(tmp_path):
+    downloader = make_downloader(
+        tmp_path,
+        max_retries=1,
+        retry_base_seconds=0,
+    )
+
+    result = downloader.run(
+        cache_key="bad-url",
+        attempt=lambda limiter: (_ for _ in ()).throw(TimeoutError("slow")),
+        failure_context={
+            "url": "https://upload.wikimedia.org/bad.jpg",
+            "asset_id": "a1",
+        },
+    )
+
+    assert result is None
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "failures.jsonl").read_text().splitlines()
+    ]
+    assert records[0]["attempts"] == 2
+    assert records[0]["asset_id"] == "a1"
+    assert records[0]["exception_class"] == "TimeoutError"
+    assert downloader.summary()["failure_records"] == 1
+
+
+def test_shared_cooldown_blocks_a_second_new_attempt(tmp_path):
+    fake = ControlledTime()
+    first_calls = 0
+    second_started = threading.Event()
+
+    def first_attempt(limiter):
+        nonlocal first_calls
+        first_calls += 1
+        if first_calls == 1:
+            raise MediaHTTPError(429, {"Retry-After": "5"}, "request limit")
+        return {"local_path": "first.jpg", "bytes": 3}
+
+    def second_attempt(limiter):
+        second_started.set()
+        return {"local_path": "second.jpg", "bytes": 4}
+
+    downloader = wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(
+            workers=2,
+            max_mbps=24.0,
+            max_retries=1,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        failure_recorder=_DiscardingFailureRecorder(),
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+        jitter=lambda: 0.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            downloader.run,
+            cache_key="first",
+            attempt=first_attempt,
+            failure_context={"url": "first"},
+        )
+        assert fake.sleeping.wait(timeout=2)
+        second = pool.submit(
+            downloader.run,
+            cache_key="second",
+            attempt=second_attempt,
+            failure_context={"url": "second"},
+        )
+        assert not second_started.wait(timeout=0.05)
+        fake.release.set()
+        assert first.result(timeout=2)["bytes"] == 3
+        assert second.result(timeout=2)["bytes"] == 4
+
+
+def test_shared_cooldown_does_not_cancel_active_success(tmp_path):
+    fake = ControlledTime()
+    active_started = threading.Event()
+    allow_active_finish = threading.Event()
+    rate_limited_calls = 0
+
+    def active_attempt(limiter):
+        active_started.set()
+        assert allow_active_finish.wait(timeout=2)
+        return {"local_path": "active.jpg", "bytes": 7}
+
+    def rate_limited_attempt(limiter):
+        nonlocal rate_limited_calls
+        rate_limited_calls += 1
+        if rate_limited_calls == 1:
+            raise MediaHTTPError(429, {"Retry-After": "5"}, "request limit")
+        return {"local_path": "retried.jpg", "bytes": 2}
+
+    downloader = wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(
+            workers=2,
+            max_mbps=24.0,
+            max_retries=1,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        failure_recorder=_DiscardingFailureRecorder(),
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+        jitter=lambda: 0.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        active = pool.submit(
+            downloader.run,
+            cache_key="active",
+            attempt=active_attempt,
+            failure_context={"url": "active"},
+        )
+        assert active_started.wait(timeout=2)
+        rate_limited = pool.submit(
+            downloader.run,
+            cache_key="rate-limited",
+            attempt=rate_limited_attempt,
+            failure_context={"url": "rate-limited"},
+        )
+        assert fake.sleeping.wait(timeout=2)
+        allow_active_finish.set()
+        assert active.result(timeout=2)["bytes"] == 7
+        fake.release.set()
+        assert rate_limited.result(timeout=2)["bytes"] == 2
+
+
+def test_singleflight_runs_one_attempt_for_duplicate_key(tmp_path):
+    calls = 0
+    lock = threading.Lock()
+
+    def attempt(limiter):
+        nonlocal calls
+        with lock:
+            calls += 1
+        return {"local_path": "shared.jpg", "bytes": 3}
+
+    downloader = make_downloader(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: downloader.run(
+                    cache_key="same",
+                    attempt=attempt,
+                    failure_context={"url": "same"},
+                ),
+                range(2),
+            )
+        )
+
+    assert calls == 1
+    assert results[0] == results[1]
+    assert downloader.summary()["singleflight_followers"] == 1
+
+
+def test_terminal_failure_is_skipped_this_run_but_retryable_next_run(tmp_path):
+    calls = 0
+
+    def attempt(limiter):
+        nonlocal calls
+        calls += 1
+        raise MediaHTTPError(404, {}, "not found")
+
+    downloader = make_downloader(tmp_path)
+    assert (
+        downloader.run(
+            cache_key="missing",
+            attempt=attempt,
+            failure_context={"url": "missing"},
+        )
+        is None
+    )
+    assert (
+        downloader.run(
+            cache_key="missing",
+            attempt=attempt,
+            failure_context={"url": "missing"},
+        )
+        is None
+    )
+    assert calls == 1
+
+    next_run = make_downloader(tmp_path)
+    assert (
+        next_run.run(
+            cache_key="missing",
+            attempt=attempt,
+            failure_context={"url": "missing"},
+        )
+        is None
+    )
+    assert calls == 2

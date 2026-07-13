@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import email.utils
+import json
 import math
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
@@ -282,3 +284,154 @@ def classify_media_failure(
         return RetryDecision(True, False, delay, "connection_or_timeout")
 
     return RetryDecision(False, False, 0.0, "terminal_error")
+
+
+class MediaFailureRecorder:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text("", encoding="utf-8")
+            self._count = 0
+
+    def record(
+        self,
+        context: Mapping[str, Any],
+        error: Exception,
+        attempts: int,
+        retry_delays: list[float],
+    ) -> None:
+        headers = getattr(error, "headers", {})
+        retry_after_present = (
+            bool(_retry_after_header(headers))
+            if isinstance(headers, Mapping)
+            else False
+        )
+        record = {
+            **context,
+            "timestamp": time.time(),
+            "attempts": attempts,
+            "retry_delays": list(retry_delays),
+            "status_code": getattr(error, "status_code", None),
+            "exception_class": type(error).__name__,
+            "retry_after_present": retry_after_present,
+            "error": str(error)[:500],
+        }
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._count += 1
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+@dataclass
+class _Flight:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, Any] | None = None
+
+
+class WikimediaMediaDownloader:
+    def __init__(
+        self,
+        *,
+        config: MediaPolicyConfig,
+        failure_recorder: Any,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        jitter: Callable[[], float] = lambda: 0.0,
+    ) -> None:
+        self.config = config.validate()
+        self.stats = MediaStats()
+        self.bandwidth = MediaBandwidthLimiter(
+            max_mbps=config.max_mbps,
+            capacity_bytes=config.chunk_bytes,
+            clock=clock,
+            sleep=sleep,
+        )
+        self.cooldown = MediaCooldown(clock=clock, sleep=sleep)
+        self.failure_recorder = failure_recorder
+        self._media_slots = threading.BoundedSemaphore(config.workers)
+        self._jitter = jitter
+        self._sleep = sleep
+        self._flights: dict[str, _Flight] = {}
+        self._flights_lock = threading.Lock()
+
+    def _get_or_create_flight(self, cache_key: str) -> tuple[_Flight, bool]:
+        with self._flights_lock:
+            existing = self._flights.get(cache_key)
+            if existing is not None:
+                return existing, False
+            created = _Flight()
+            self._flights[cache_key] = created
+            return created, True
+
+    def run(
+        self,
+        *,
+        cache_key: str,
+        attempt: Callable[[MediaBandwidthLimiter], dict[str, Any]],
+        failure_context: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        flight, leader = self._get_or_create_flight(cache_key)
+        if not leader:
+            self.stats.increment("singleflight_followers")
+            flight.done.wait()
+            return flight.result
+
+        delays: list[float] = []
+        try:
+            for attempt_index in range(self.config.max_retries + 1):
+                cooldown_wait = self.cooldown.wait()
+                self.stats.increment("cooldown_wait_seconds", cooldown_wait)
+                try:
+                    with self._media_slots:
+                        result = attempt(self.bandwidth)
+                except Exception as error:
+                    decision = classify_media_failure(
+                        error,
+                        attempt=attempt_index,
+                        config=self.config,
+                        jitter=self._jitter(),
+                    )
+                    if (
+                        not decision.retryable
+                        or attempt_index >= self.config.max_retries
+                    ):
+                        self.failure_recorder.record(
+                            failure_context,
+                            error,
+                            attempt_index + 1,
+                            delays,
+                        )
+                        self.stats.increment("terminal_failures")
+                        flight.result = None
+                        return None
+                    delays.append(decision.delay_seconds)
+                    self.stats.increment("retry_attempts")
+                    if decision.shared_cooldown:
+                        self.cooldown.extend(decision.delay_seconds)
+                        self.stats.increment("shared_cooldown_events")
+                    else:
+                        self._sleep(decision.delay_seconds)
+                    continue
+                flight.result = result
+                self.stats.increment("successful_downloads")
+                return result
+            return None
+        finally:
+            flight.done.set()
+
+    def summary(self) -> dict[str, int | float]:
+        summary = self.stats.summary()
+        summary.setdefault("shared_cooldown_events", 0)
+        summary["failure_records"] = self.failure_recorder.count
+        return summary
