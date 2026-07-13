@@ -15,12 +15,15 @@ import json
 import logging
 import mimetypes
 import math
+import os
 import random
 import re
 import shutil
 import sys
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,8 +46,14 @@ DEFAULT_WIKIPEDIA_USER_AGENT = (
     "MMJoinabilityDatasetBuilder/0.3 "
     "(research dataset construction; set --wikipedia_user_agent with contact info)"
 )
+WIKIPEDIA_USER_AGENT_ENV_VAR = "WIKIPEDIA_USER_AGENT"
 MEDIAWIKI_BATCH_TITLE_LIMIT = 50
 MEDIAWIKI_RETRY_STATUS_CODES = {429, 503}
+MAX_ACTION_API_REQUESTS_PER_SECOND = 5.0
+DEFAULT_IMAGE_THUMB_WIDTH = 768
+MAX_MEDIA_DOWNLOAD_WORKERS = 2
+_ACTION_API_LOCK = threading.Lock()
+_ACTION_API_LAST_REQUEST_TIME = 0.0
 NON_ENTITY_NAMESPACES = {
     "category",
     "file",
@@ -71,6 +80,10 @@ YEAR_RE = re.compile(r"^(?:1[5-9]\d{2}|20\d{2}|21\d{2})(?:[-/]\d{1,2}(?:[-/]\d{1
 ORDINAL_RE = re.compile(r"^\d+(?:st|nd|rd|th)?$", re.IGNORECASE)
 SCORE_RE = re.compile(r"^\(?\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*\)?$")
 WHITESPACE_RE = re.compile(r"\s+")
+
+
+def default_wikipedia_user_agent() -> str:
+    return os.environ.get(WIKIPEDIA_USER_AGENT_ENV_VAR, DEFAULT_WIKIPEDIA_USER_AGENT)
 PARAGRAPH_BREAK_RE = re.compile(r"(?:\r?\n){2,}")
 SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
 
@@ -990,16 +1003,19 @@ class WikipediaClient:
         self.image_cache_path = cache_dir / "wiki_images.jsonl"
         self.page_cache = load_jsonl_cache(self.page_cache_path, "wiki_title")
         self.image_cache = load_jsonl_cache(self.image_cache_path, "file_title")
-        self.last_request_time = 0.0
         self.api_failures = 0
         self.max_retries = 5
         self.retry_base_sleep = 1.0
         self.retry_max_sleep = 60.0
 
-    def _wait(self) -> None:
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.sleep:
-            time.sleep(self.sleep - elapsed)
+    def _action_api_interval(self) -> float:
+        return max(self.sleep, 1.0 / MAX_ACTION_API_REQUESTS_PER_SECOND)
+
+    def _wait_for_action_api(self) -> None:
+        elapsed = time.monotonic() - _ACTION_API_LAST_REQUEST_TIME
+        wait_seconds = self._action_api_interval() - elapsed
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
 
     def _retry_delay(self, response: Any, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After") if response is not None else None
@@ -1013,11 +1029,16 @@ class WikipediaClient:
     def _get(self, params: dict[str, Any]) -> dict[str, Any] | None:
         request_params = dict(params)
         last_error: Exception | None = None
+        global _ACTION_API_LAST_REQUEST_TIME
         for attempt in range(self.max_retries + 1):
-            self._wait()
             try:
-                response = self.session.get(MEDIAWIKI_API_URL, params=request_params, timeout=30)
-                self.last_request_time = time.time()
+                with _ACTION_API_LOCK:
+                    self._wait_for_action_api()
+                    started_request = time.monotonic()
+                    try:
+                        response = self.session.get(MEDIAWIKI_API_URL, params=request_params, timeout=30)
+                    finally:
+                        _ACTION_API_LAST_REQUEST_TIME = started_request
                 if response.status_code in MEDIAWIKI_RETRY_STATUS_CODES and attempt < self.max_retries:
                     delay = self._retry_delay(response, attempt)
                     logging.warning(
@@ -1159,6 +1180,7 @@ class WikipediaClient:
                 "titles": "|".join(batch),
                 "prop": "imageinfo",
                 "iiprop": "url|size|mime|mediatype|extmetadata",
+                "iiurlwidth": DEFAULT_IMAGE_THUMB_WIDTH,
             }
             payload = self._get(params)
             if not payload:
@@ -1196,6 +1218,9 @@ class WikipediaClient:
                     "mediatype": info.get("mediatype"),
                     "width": info.get("width"),
                     "height": info.get("height"),
+                    "thumburl": info.get("thumburl"),
+                    "thumbwidth": info.get("thumbwidth"),
+                    "thumbheight": info.get("thumbheight"),
                     "size": info.get("size"),
                     "extmetadata": info.get("extmetadata") or {},
                     "missing": bool(page.get("missing") or page.get("invalid")),
@@ -1217,19 +1242,42 @@ class WikipediaClient:
             normalized = f"File:{normalized}"
         return self.get_imageinfos([normalized]).get(normalized)
 
+    def _image_download_url(self, imageinfo: dict[str, Any]) -> tuple[str, str]:
+        original_url = str(imageinfo.get("url") or "")
+        thumburl = str(imageinfo.get("thumburl") or "")
+        if not thumburl:
+            return original_url, "original"
+        if is_svg_image(imageinfo):
+            return thumburl, "thumbnail"
+        try:
+            width = int(imageinfo.get("width") or 0)
+            height = int(imageinfo.get("height") or 0)
+            thumbwidth = int(imageinfo.get("thumbwidth") or 0)
+            thumbheight = int(imageinfo.get("thumbheight") or 0)
+        except (TypeError, ValueError):
+            return original_url, "original"
+        if width > 0 and height > 0 and thumbwidth > 0 and thumbheight > 0:
+            if thumbwidth <= width and thumbheight <= height:
+                return thumburl, "thumbnail"
+        return original_url, "original"
+
     def download_image(self, imageinfo: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
-        url = imageinfo.get("url")
+        url, download_kind = self._image_download_url(imageinfo)
         if not url:
             return None
 
         source_is_svg = is_svg_image(imageinfo)
+        downloaded_svg_source = source_is_svg and download_kind == "original"
         extension = ".png" if source_is_svg else infer_image_extension(imageinfo)
         self.image_output_dir.mkdir(parents=True, exist_ok=True)
         image_path = self.image_output_dir / f"{asset_id}{extension}"
         tmp_path = image_path.with_suffix(image_path.suffix + ".tmp")
         if image_path.exists():
-            return file_download_record(image_path, self.output_dir, downloaded=False)
-        if source_is_svg:
+            record = file_download_record(image_path, self.output_dir, downloaded=False)
+            record["download_url"] = url
+            record["download_kind"] = download_kind
+            return record
+        if downloaded_svg_source:
             legacy_svg_path = self.image_output_dir / f"{asset_id}.svg"
             if legacy_svg_path.exists():
                 converted, reason = rasterize_svg_to_png(legacy_svg_path, tmp_path, imageinfo)
@@ -1247,13 +1295,11 @@ class WikipediaClient:
                 except OSError:
                     pass
 
-        download_tmp_path = image_path.with_suffix(".svg.tmp") if source_is_svg else tmp_path
+        download_tmp_path = image_path.with_suffix(".svg.tmp") if downloaded_svg_source else tmp_path
         digest = hashlib.sha256()
         total_bytes = 0
-        self._wait()
         try:
             with self.session.get(url, stream=True, timeout=60) as response:
-                self.last_request_time = time.time()
                 response.raise_for_status()
                 content_type = response.headers.get("Content-Type", "")
                 if content_type and not content_type.lower().startswith("image/"):
@@ -1266,7 +1312,7 @@ class WikipediaClient:
                         handle.write(chunk)
                         digest.update(chunk)
                         total_bytes += len(chunk)
-            if source_is_svg:
+            if downloaded_svg_source:
                 converted, reason = rasterize_svg_to_png(download_tmp_path, tmp_path, imageinfo)
                 if not converted:
                     raise RuntimeError(f"SVG rasterization failed: {reason}")
@@ -1276,7 +1322,9 @@ class WikipediaClient:
                     pass
             tmp_path.replace(image_path)
             record = file_download_record(image_path, self.output_dir, downloaded=True)
-            if source_is_svg:
+            record["download_url"] = url
+            record["download_kind"] = download_kind
+            if downloaded_svg_source:
                 record["converted_from"] = "image/svg+xml"
                 record["source_bytes"] = total_bytes
                 record["source_sha256"] = digest.hexdigest()
@@ -1505,6 +1553,44 @@ def is_useful_image(file_title: str, imageinfo: dict[str, Any] | None = None) ->
     return True
 
 
+def bridge_image_asset_record(
+    *,
+    entity: dict[str, Any],
+    asset_id: str,
+    imageinfo: dict[str, Any],
+    downloaded_image: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "asset_id": asset_id,
+        "entity_id": entity["entity_id"],
+        "entity_wiki_title": entity["wiki_title"],
+        "asset_type": "image",
+        "image_url": imageinfo.get("url"),
+        "description_url": imageinfo.get("descriptionurl"),
+        "local_path": downloaded_image["local_path"],
+        "relative_path": downloaded_image["relative_path"],
+        "file_name": downloaded_image["file_name"],
+        "bytes": downloaded_image["bytes"],
+        "sha256": downloaded_image["sha256"],
+        "metadata": {
+            "file_title": imageinfo.get("file_title"),
+            "mime": imageinfo.get("mime"),
+            "mediatype": imageinfo.get("mediatype"),
+            "width": imageinfo.get("width"),
+            "height": imageinfo.get("height"),
+            "thumburl": imageinfo.get("thumburl"),
+            "thumbwidth": imageinfo.get("thumbwidth"),
+            "thumbheight": imageinfo.get("thumbheight"),
+            "size": imageinfo.get("size"),
+            "extmetadata": imageinfo.get("extmetadata") or {},
+            "downloaded": downloaded_image["downloaded"],
+            "download_url": downloaded_image.get("download_url"),
+            "download_kind": downloaded_image.get("download_kind"),
+        },
+        "source": "wikipedia_image_download",
+    }
+
+
 def build_bridge_assets(
     entities: list[dict[str, Any]],
     max_entities: int | None,
@@ -1524,6 +1610,9 @@ def build_bridge_assets(
     text_asset_count = 0
     image_asset_count = 0
     written_assets = 0
+    pending_image_downloads: list[tuple[Any, dict[str, Any], str, dict[str, Any]]] = []
+    max_download_workers = MAX_MEDIA_DOWNLOAD_WORKERS
+    image_download_pool: ThreadPoolExecutor | None = None
     if hasattr(wikipedia_client, "get_pages"):
         pages = wikipedia_client.get_pages(entity["wiki_title"] for entity in selected_entities)
     else:
@@ -1611,44 +1700,55 @@ def build_bridge_assets(
             if not is_useful_image(normalized_title, imageinfo):
                 continue
             asset_id = f"asset_img_{stable_hash(entity['entity_id'], normalized_title)}"
-            downloaded_image = wikipedia_client.download_image(imageinfo, asset_id)
-            if downloaded_image is None:
-                continue
-            write_jsonl_record(
-                asset_writer,
-                {
-                    "asset_id": asset_id,
-                    "entity_id": entity["entity_id"],
-                    "entity_wiki_title": entity["wiki_title"],
-                    "asset_type": "image",
-                    "image_url": imageinfo.get("url"),
-                    "description_url": imageinfo.get("descriptionurl"),
-                    "local_path": downloaded_image["local_path"],
-                    "relative_path": downloaded_image["relative_path"],
-                    "file_name": downloaded_image["file_name"],
-                    "bytes": downloaded_image["bytes"],
-                    "sha256": downloaded_image["sha256"],
-                    "metadata": {
-                        "file_title": imageinfo.get("file_title"),
-                        "mime": imageinfo.get("mime"),
-                        "mediatype": imageinfo.get("mediatype"),
-                        "width": imageinfo.get("width"),
-                        "height": imageinfo.get("height"),
-                        "size": imageinfo.get("size"),
-                        "extmetadata": imageinfo.get("extmetadata") or {},
-                        "downloaded": downloaded_image["downloaded"],
-                    },
-                    "source": "wikipedia_image_download",
-                },
-            )
-            entity_to_assets[entity["entity_id"]].append(asset_id)
-            image_asset_count += 1
-            written_assets += 1
+            if len(selected_entities) > 1:
+                if image_download_pool is None:
+                    image_download_pool = ThreadPoolExecutor(max_workers=max_download_workers)
+                future = image_download_pool.submit(wikipedia_client.download_image, imageinfo, asset_id)
+                pending_image_downloads.append((future, entity, asset_id, imageinfo))
+            else:
+                downloaded_image = wikipedia_client.download_image(imageinfo, asset_id)
+                if downloaded_image is None:
+                    continue
+                write_jsonl_record(
+                    asset_writer,
+                    bridge_image_asset_record(
+                        entity=entity,
+                        asset_id=asset_id,
+                        imageinfo=imageinfo,
+                        downloaded_image=downloaded_image,
+                    ),
+                )
+                entity_to_assets[entity["entity_id"]].append(asset_id)
+                image_asset_count += 1
+                written_assets += 1
+                if flush_every_records > 0 and written_assets % flush_every_records == 0:
+                    asset_writer.flush()
             kept += 1
-            if flush_every_records > 0 and written_assets % flush_every_records == 0:
-                asset_writer.flush()
             if kept >= max_images_per_entity:
                 break
+
+    if image_download_pool is not None:
+        try:
+            for future, entity, asset_id, imageinfo in pending_image_downloads:
+                downloaded_image = future.result()
+                if downloaded_image is None:
+                    continue
+                write_jsonl_record(
+                    asset_writer,
+                    bridge_image_asset_record(
+                        entity=entity,
+                        asset_id=asset_id,
+                        imageinfo=imageinfo,
+                        downloaded_image=downloaded_image,
+                    ),
+                )
+                entity_to_assets[entity["entity_id"]].append(asset_id)
+                image_asset_count += 1
+                written_assets += 1
+                if flush_every_records > 0 and written_assets % flush_every_records == 0:
+                    asset_writer.flush()
+        finally:
+            image_download_pool.shutdown(wait=True)
     asset_writer.flush()
 
     return entity_to_assets, wikipedia_client.api_failures, text_asset_count, image_asset_count
@@ -2152,8 +2252,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between API requests.")
     parser.add_argument(
         "--wikipedia_user_agent",
-        default=DEFAULT_WIKIPEDIA_USER_AGENT,
-        help="Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address.",
+        default=default_wikipedia_user_agent(),
+        help=(
+            "Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address. "
+            "Defaults to $WIKIPEDIA_USER_AGENT when set."
+        ),
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(

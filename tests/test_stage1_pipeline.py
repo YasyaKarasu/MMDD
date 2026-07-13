@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -882,6 +883,135 @@ def test_wikipedia_client_get_pages_batches_titles_with_pipe(tmp_path):
     assert client.get_page("Alpha Page")["extract"] == "Alpha extract"
 
 
+def test_wikipedia_user_agent_defaults_to_environment(monkeypatch):
+    env_user_agent = "MMDDDatasetBuilder/1.0 (mailto:mmdd@example.com)"
+    monkeypatch.setenv("WIKIPEDIA_USER_AGENT", env_user_agent)
+
+    table_args = mm_table_dataset.parse_args(["--input_dir", "in", "--output_dir", "out"])
+    join_args = join_dataset.parse_args(["--input_dir", "in", "--output_dir", "out"])
+
+    assert table_args.wikipedia_user_agent == env_user_agent
+    assert join_args.wikipedia_user_agent == env_user_agent
+
+
+def test_wikipedia_user_agent_cli_overrides_environment(monkeypatch):
+    monkeypatch.setenv("WIKIPEDIA_USER_AGENT", "MMDDDatasetBuilder/1.0 (mailto:env@example.com)")
+
+    args = join_dataset.parse_args(
+        [
+            "--input_dir",
+            "in",
+            "--output_dir",
+            "out",
+            "--wikipedia_user_agent",
+            "MMDDDatasetBuilder/1.0 (mailto:cli@example.com)",
+        ]
+    )
+
+    assert args.wikipedia_user_agent == "MMDDDatasetBuilder/1.0 (mailto:cli@example.com)"
+
+
+def test_wikipedia_client_limits_action_api_to_five_requests_per_second(tmp_path, monkeypatch):
+    now = [100.0]
+    sleeps = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"query": {"pages": []}}
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.calls = 0
+
+        def get(self, url, params=None, timeout=30):
+            self.calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(mm_table_dataset, "_ACTION_API_LAST_REQUEST_TIME", 0.0, raising=False)
+    monkeypatch.setattr(mm_table_dataset.time, "monotonic", lambda: now[0])
+
+    def fake_sleep(seconds):
+        sleeps.append(round(seconds, 6))
+        now[0] += seconds
+
+    monkeypatch.setattr(mm_table_dataset.time, "sleep", fake_sleep)
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.session = FakeSession()
+
+    assert client._get({"action": "query"}) == {"query": {"pages": []}}
+    assert client._get({"action": "query"}) == {"query": {"pages": []}}
+
+    assert client.session.calls == 2
+    assert sleeps == [0.2]
+
+
+def test_wikipedia_action_api_rate_limit_is_shared_across_clients(tmp_path, monkeypatch):
+    now = [200.0]
+    sleeps = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"query": {"pages": []}}
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, params=None, timeout=30):
+            return FakeResponse()
+
+    monkeypatch.setattr(mm_table_dataset, "_ACTION_API_LAST_REQUEST_TIME", 0.0, raising=False)
+    monkeypatch.setattr(mm_table_dataset.time, "monotonic", lambda: now[0])
+
+    def fake_sleep(seconds):
+        sleeps.append(round(seconds, 6))
+        now[0] += seconds
+
+    monkeypatch.setattr(mm_table_dataset.time, "sleep", fake_sleep)
+
+    client_a = WikipediaClient(
+        cache_dir=tmp_path / "cache_a",
+        image_output_dir=tmp_path / "images_a",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client_b = WikipediaClient(
+        cache_dir=tmp_path / "cache_b",
+        image_output_dir=tmp_path / "images_b",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client_a.session = FakeSession()
+    client_b.session = FakeSession()
+
+    assert client_a._get({"action": "query"}) == {"query": {"pages": []}}
+    assert client_b._get({"action": "query"}) == {"query": {"pages": []}}
+
+    assert sleeps == [0.2]
+
+
 def test_wikipedia_client_retries_rate_limit_with_retry_after(tmp_path, monkeypatch):
     sleeps = []
 
@@ -912,6 +1042,7 @@ def test_wikipedia_client_retries_rate_limit_with_retry_after(tmp_path, monkeypa
             return FakeResponse(200, {"query": {"pages": []}})
 
     monkeypatch.setattr(mm_table_dataset.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(mm_table_dataset, "_ACTION_API_LAST_REQUEST_TIME", 0.0, raising=False)
 
     client = WikipediaClient(
         cache_dir=tmp_path / "cache",
@@ -924,7 +1055,7 @@ def test_wikipedia_client_retries_rate_limit_with_retry_after(tmp_path, monkeypa
 
     assert client._get({"action": "query"}) == {"query": {"pages": []}}
     assert client.session.calls == 2
-    assert sleeps == [3.0]
+    assert sleeps[0] == 3.0
     assert client.api_failures == 0
 
 
@@ -993,6 +1124,257 @@ def test_build_bridge_assets_fetches_wikipedia_pages_in_batches(tmp_path):
     assert text_count == 2
     assert image_count == 0
     assert sorted(entity_to_assets) == ["ent_alpha", "ent_beta"]
+
+
+def test_wikipedia_client_imageinfo_requests_thumbnail_url_and_caches_fields(tmp_path):
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "query": {
+                    "pages": [
+                        {
+                            "pageid": 10,
+                            "title": "File:Alpha.jpg",
+                            "imageinfo": [
+                                {
+                                    "url": "https://upload.wikimedia.org/original/Alpha.jpg",
+                                    "thumburl": "https://upload.wikimedia.org/thumb/Alpha.jpg/768px-Alpha.jpg",
+                                    "descriptionurl": "https://commons.wikimedia.org/wiki/File:Alpha.jpg",
+                                    "mime": "image/jpeg",
+                                    "mediatype": "BITMAP",
+                                    "width": 1200,
+                                    "height": 800,
+                                    "thumbwidth": 768,
+                                    "thumbheight": 512,
+                                    "size": 12345,
+                                    "extmetadata": {"Artist": {"value": "Someone"}},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+
+        def get(self, url, params=None, timeout=30):
+            self.calls.append((url, params))
+            return FakeResponse()
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.session = FakeSession()
+
+    imageinfos = client.get_imageinfos(["File:Alpha.jpg"])
+
+    assert client.session.calls[0][1]["iiurlwidth"] == 768
+    assert imageinfos["File:Alpha.jpg"]["thumburl"].endswith("768px-Alpha.jpg")
+    assert imageinfos["File:Alpha.jpg"]["thumbwidth"] == 768
+    assert imageinfos["File:Alpha.jpg"]["thumbheight"] == 512
+
+
+def test_wikipedia_download_image_prefers_safe_thumbnail_url(tmp_path):
+    image_bytes = b"fake-jpeg-bytes"
+
+    class FakeResponse:
+        headers = {"Content-Type": "image/jpeg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield image_bytes
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.urls = []
+
+        def get(self, url, stream=True, timeout=60):
+            self.urls.append(url)
+            return FakeResponse()
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.session = FakeSession()
+
+    record = client.download_image(
+        {
+            "url": "https://upload.wikimedia.org/original/Alpha.jpg",
+            "thumburl": "https://upload.wikimedia.org/thumb/Alpha.jpg/768px-Alpha.jpg",
+            "mime": "image/jpeg",
+            "width": 1200,
+            "height": 800,
+            "thumbwidth": 768,
+            "thumbheight": 512,
+        },
+        "asset_alpha",
+    )
+
+    assert record is not None
+    assert client.session.urls == ["https://upload.wikimedia.org/thumb/Alpha.jpg/768px-Alpha.jpg"]
+    assert record["download_url"] == "https://upload.wikimedia.org/thumb/Alpha.jpg/768px-Alpha.jpg"
+    assert record["download_kind"] == "thumbnail"
+
+
+def test_wikipedia_download_image_avoids_upscaled_raster_thumbnail(tmp_path):
+    image_bytes = b"fake-jpeg-bytes"
+
+    class FakeResponse:
+        headers = {"Content-Type": "image/jpeg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield image_bytes
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.urls = []
+
+        def get(self, url, stream=True, timeout=60):
+            self.urls.append(url)
+            return FakeResponse()
+
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.session = FakeSession()
+
+    record = client.download_image(
+        {
+            "url": "https://upload.wikimedia.org/original/Small.jpg",
+            "thumburl": "https://upload.wikimedia.org/thumb/Small.jpg/768px-Small.jpg",
+            "mime": "image/jpeg",
+            "width": 320,
+            "height": 200,
+            "thumbwidth": 768,
+            "thumbheight": 480,
+        },
+        "asset_small",
+    )
+
+    assert record is not None
+    assert client.session.urls == ["https://upload.wikimedia.org/original/Small.jpg"]
+    assert record["download_kind"] == "original"
+
+
+def test_build_bridge_assets_does_not_block_imageinfo_on_prior_image_download(tmp_path):
+    events = []
+    beta_imageinfo_seen = threading.Event()
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def get_pages(self, wiki_titles):
+            return {
+                "Alpha": {
+                    "extract": "Alpha extract",
+                    "canonicalurl": "https://example.test/wiki/Alpha",
+                    "images": [{"title": "File:Alpha.jpg"}],
+                },
+                "Beta": {
+                    "extract": "Beta extract",
+                    "canonicalurl": "https://example.test/wiki/Beta",
+                    "images": [{"title": "File:Beta.jpg"}],
+                },
+            }
+
+        def get_imageinfos(self, file_titles):
+            titles = list(file_titles)
+            events.append(("imageinfos", tuple(titles)))
+            if "File:Beta.jpg" in titles:
+                beta_imageinfo_seen.set()
+            return {
+                title: {
+                    "file_title": title,
+                    "url": f"https://upload.wikimedia.org/original/{title.removeprefix('File:')}",
+                    "mime": "image/jpeg",
+                    "mediatype": "BITMAP",
+                    "width": 1200,
+                    "height": 800,
+                    "size": 100,
+                    "extmetadata": {},
+                }
+                for title in titles
+            }
+
+        def download_image(self, imageinfo, asset_id):
+            file_title = imageinfo["file_title"]
+            events.append(("download_start", file_title))
+            if file_title == "File:Alpha.jpg":
+                beta_imageinfo_seen.wait(timeout=0.5)
+            events.append(("download_done", file_title))
+            path = tmp_path / f"{asset_id}.jpg"
+            path.write_bytes(b"image")
+            return {
+                "local_path": str(path),
+                "relative_path": path.name,
+                "file_name": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": "sha",
+                "downloaded": True,
+            }
+
+    client = FakeWikipediaClient()
+    writer = ShardedJsonlWriter(tmp_path / "bridge_assets", max_records_per_shard=20)
+    entities = [
+        {"entity_id": "ent_alpha", "wiki_title": "Alpha", "display_texts": ["Alpha"]},
+        {"entity_id": "ent_beta", "wiki_title": "Beta", "display_texts": ["Beta"]},
+    ]
+
+    with writer:
+        _entity_to_assets, _api_failures, _text_count, image_count = build_bridge_assets(
+            entities,
+            max_entities=None,
+            max_images_per_entity=1,
+            text_asset_chunk_chars=120,
+            min_text_asset_chunk_chars=10,
+            max_text_asset_chunks_per_entity=1,
+            wikipedia_client=client,
+            asset_writer=writer,
+            flush_every_records=20,
+        )
+
+    assert image_count == 2
+    assert events.index(("imageinfos", ("File:Beta.jpg",))) < events.index(("download_done", "File:Alpha.jpg"))
 
 
 def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatch):

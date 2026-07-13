@@ -37,10 +37,10 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs.
     tqdm = None  # type: ignore[assignment]
 
 from build_mm_table_dataset import (
-    DEFAULT_WIKIPEDIA_USER_AGENT,
     ShardedJsonlWriter,
     WikipediaClient,
     build_bridge_assets,
+    default_wikipedia_user_agent,
     finalize_entities,
     iter_jsonl_records,
     iter_with_progress,
@@ -2440,8 +2440,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.2)
     parser.add_argument(
         "--wikipedia_user_agent",
-        default=DEFAULT_WIKIPEDIA_USER_AGENT,
-        help="Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address.",
+        default=default_wikipedia_user_agent(),
+        help=(
+            "Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address. "
+            "Defaults to $WIKIPEDIA_USER_AGENT when set."
+        ),
     )
     parser.add_argument(
         "--wikipedia_workers",
