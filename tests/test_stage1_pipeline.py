@@ -1702,11 +1702,13 @@ def test_download_attempt_throttles_http_error_body_before_classification(tmp_pa
     class ErrorResponse:
         status_code = 429
         headers = {"Retry-After": "0"}
+        closed = False
 
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc, traceback):
+            self.closed = True
             return False
 
         @property
@@ -1714,8 +1716,12 @@ def test_download_attempt_throttles_http_error_body_before_classification(tmp_pa
             raise AssertionError("error body must be streamed through the limiter")
 
         def iter_content(self, chunk_size):
+            events.append(("chunk_size", chunk_size))
             events.append(("read", len(b"slow down")))
             yield b"slow down"
+            for _ in range(1000):
+                events.append(("read", chunk_size))
+                yield b"x" * chunk_size
 
     class RecordingLimiter:
         def acquire(self, byte_count):
@@ -1725,8 +1731,9 @@ def test_download_attempt_throttles_http_error_body_before_classification(tmp_pa
         def refund(self, byte_count):
             events.append(("refund", byte_count))
 
-    client = make_wikipedia_client(tmp_path, chunk_bytes=16)
-    client.session = SequenceImageSession([ErrorResponse()])
+    response = ErrorResponse()
+    client = make_wikipedia_client(tmp_path)
+    client.session = SequenceImageSession([response])
     info = jpeg_info("RateLimited.jpg")
 
     with pytest.raises(mm_table_dataset.MediaHTTPError) as error:
@@ -1740,8 +1747,14 @@ def test_download_attempt_throttles_http_error_body_before_classification(tmp_pa
 
     assert error.value.status_code == 429
     assert error.value.body_excerpt == "slow down"
-    assert events.index(("acquire", 16)) < events.index(("read", 9))
-    assert ("refund", 7) in events
+    assert events == [
+        ("acquire", 4096),
+        ("chunk_size", 4096),
+        ("read", 9),
+        ("refund", 4087),
+    ]
+    assert response.closed is True
+    assert not list((tmp_path / "images").glob("*.tmp"))
 
 
 def test_download_attempt_promotes_complete_file_atomically(tmp_path):

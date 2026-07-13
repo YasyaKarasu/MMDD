@@ -58,6 +58,7 @@ DEFAULT_WIKIPEDIA_USER_AGENT = (
 WIKIPEDIA_USER_AGENT_ENV_VAR = "WIKIPEDIA_USER_AGENT"
 MEDIAWIKI_BATCH_TITLE_LIMIT = 50
 MEDIAWIKI_RETRY_STATUS_CODES = {429, 503}
+MEDIA_ERROR_DIAGNOSTIC_BYTES = 4096
 MAX_ACTION_API_REQUESTS_PER_SECOND = 5.0
 DEFAULT_IMAGE_THUMB_WIDTH = 960
 MAX_MEDIA_DOWNLOAD_WORKERS = 2
@@ -1328,12 +1329,19 @@ class WikipediaClient:
         self,
         response: Any,
         limiter: MediaBandwidthLimiter,
+        *,
+        chunk_bytes: int | None = None,
+        max_chunks: int | None = None,
     ) -> Iterable[bytes]:
+        reservation_bytes = chunk_bytes or self.media_config.chunk_bytes
         iterator = iter(
-            response.iter_content(chunk_size=self.media_config.chunk_bytes)
+            response.iter_content(chunk_size=reservation_bytes)
         )
+        chunks_read = 0
         while True:
-            reserved = self.media_config.chunk_bytes
+            if max_chunks is not None and chunks_read >= max_chunks:
+                return
+            reserved = reservation_bytes
             waited = limiter.acquire(reserved)
             self.media_downloader.stats.increment(
                 "bandwidth_wait_seconds",
@@ -1352,6 +1360,7 @@ class WikipediaClient:
                     "media response chunk exceeded configured reservation"
                 )
             limiter.refund(reserved - len(chunk))
+            chunks_read += 1
             yield chunk
 
     def _download_image_attempt(
@@ -1378,13 +1387,17 @@ class WikipediaClient:
             with self.session.get(url, stream=True, timeout=60) as response:
                 if response.status_code >= 400:
                     diagnostic = bytearray()
+                    diagnostic_bytes = min(
+                        MEDIA_ERROR_DIAGNOSTIC_BYTES,
+                        self.media_config.chunk_bytes,
+                    )
                     for chunk in self._iter_limited_response_chunks(
                         response,
                         limiter,
+                        chunk_bytes=diagnostic_bytes,
+                        max_chunks=1,
                     ):
-                        remaining = 4096 - len(diagnostic)
-                        if remaining > 0:
-                            diagnostic.extend(chunk[:remaining])
+                        diagnostic.extend(chunk)
                     encoding = getattr(response, "encoding", None) or "utf-8"
                     body_excerpt = clean_text(
                         diagnostic.decode(encoding, errors="replace")

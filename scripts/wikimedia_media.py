@@ -11,6 +11,22 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
+MEDIA_SUMMARY_DEFAULTS: dict[str, int | float] = {
+    "legacy_cache_hits": 0,
+    "shared_cache_hits": 0,
+    "singleflight_followers": 0,
+    "successful_downloads": 0,
+    "downloaded_bytes": 0,
+    "retry_attempts": 0,
+    "http_429_responses": 0,
+    "http_503_responses": 0,
+    "bandwidth_wait_seconds": 0.0,
+    "cooldown_wait_seconds": 0.0,
+    "shared_cooldown_events": 0,
+    "terminal_failures": 0,
+}
+
+
 @dataclass(frozen=True)
 class MediaPolicyConfig:
     workers: int = 2
@@ -220,6 +236,21 @@ def _backoff_delay(
     ) + jitter
 
 
+def _server_backoff_delay(
+    *,
+    attempt: int,
+    config: MediaPolicyConfig,
+    jitter: float,
+) -> float:
+    return max(
+        5.0,
+        min(
+            config.retry_base_seconds * 2**attempt,
+            config.retry_max_seconds,
+        ),
+    ) + jitter
+
+
 def _is_connection_or_timeout(error: Exception) -> bool:
     network_exception_names = {
         "BrokenPipeError",
@@ -257,7 +288,7 @@ def classify_media_failure(
         if error.status_code == 429:
             delay = retry_after
             if delay is None:
-                delay = _backoff_delay(
+                delay = _server_backoff_delay(
                     attempt=attempt,
                     config=config,
                     jitter=jitter,
@@ -268,11 +299,12 @@ def classify_media_failure(
             return RetryDecision(True, True, retry_after, "http_503_retry_after")
 
         if error.status_code in {408, 500, 502, 503, 504}:
-            delay = _backoff_delay(
-                attempt=attempt,
-                config=config,
-                jitter=jitter,
+            delay_function = (
+                _server_backoff_delay
+                if error.status_code == 503
+                else _backoff_delay
             )
+            delay = delay_function(attempt=attempt, config=config, jitter=jitter)
             return RetryDecision(
                 True, False, delay, f"http_{error.status_code}"
             )
@@ -411,6 +443,13 @@ class WikimediaMediaDownloader:
                         result = attempt(self.bandwidth)
                     except Exception as error:
                         attempt_error = error
+                        if (
+                            isinstance(error, MediaHTTPError)
+                            and error.status_code in {429, 503}
+                        ):
+                            self.stats.increment(
+                                f"http_{error.status_code}_responses"
+                            )
                         decision = classify_media_failure(
                             error,
                             attempt=attempt_index,
@@ -421,7 +460,7 @@ class WikimediaMediaDownloader:
                             decision.retryable
                             and attempt_index < self.config.max_retries
                         )
-                        if should_retry and decision.shared_cooldown:
+                        if decision.shared_cooldown:
                             self.cooldown.extend(decision.delay_seconds)
                             self.stats.increment("shared_cooldown_events")
                 if attempt_error is not None:
@@ -449,7 +488,7 @@ class WikimediaMediaDownloader:
             flight.done.set()
 
     def summary(self) -> dict[str, int | float]:
-        summary = self.stats.summary()
-        summary.setdefault("shared_cooldown_events", 0)
+        summary = dict(MEDIA_SUMMARY_DEFAULTS)
+        summary.update(self.stats.summary())
         summary["failure_records"] = self.failure_recorder.count
         return summary

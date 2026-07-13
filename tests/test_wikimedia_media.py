@@ -182,7 +182,7 @@ def test_failure_classifier_distinguishes_shared_and_per_item_retries():
     )
     assert unavailable.retryable is True
     assert unavailable.shared_cooldown is False
-    assert unavailable.delay_seconds == 3.25
+    assert unavailable.delay_seconds == 5.25
 
     connection = classify_media_failure(
         ConnectionError("reset"),
@@ -193,6 +193,45 @@ def test_failure_classifier_distinguishes_shared_and_per_item_retries():
     assert connection.retryable is True
     assert connection.shared_cooldown is False
     assert connection.delay_seconds == 3.25
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_shared"),
+    [(429, True), (503, False)],
+)
+def test_429_and_503_without_retry_after_wait_at_least_five_seconds(
+    status_code,
+    expected_shared,
+):
+    config = MediaPolicyConfig(
+        retry_base_seconds=0.0,
+        retry_max_seconds=0.0,
+    )
+
+    decision = classify_media_failure(
+        MediaHTTPError(status_code, {}, "server busy"),
+        attempt=0,
+        config=config,
+        jitter=0.0,
+    )
+
+    assert decision.retryable is True
+    assert decision.shared_cooldown is expected_shared
+    assert decision.delay_seconds == 5.0
+
+
+def test_five_second_floor_does_not_apply_to_other_per_item_backoff():
+    decision = classify_media_failure(
+        ConnectionError("reset"),
+        attempt=0,
+        config=MediaPolicyConfig(
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        jitter=0.0,
+    )
+
+    assert decision.delay_seconds == 0.0
 
 
 def test_failure_classifier_treats_configuration_and_other_4xx_as_terminal():
@@ -274,6 +313,95 @@ def test_retry_exhaustion_records_failure_without_negative_cache(tmp_path):
     assert records[0]["asset_id"] == "a1"
     assert records[0]["exception_class"] == "TimeoutError"
     assert downloader.summary()["failure_records"] == 1
+
+
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_retry_after_extends_shared_cooldown_after_budget_is_exhausted(
+    tmp_path,
+    status_code,
+):
+    fake = FakeTime()
+    downloader = wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(
+            max_retries=0,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        failure_recorder=_DiscardingFailureRecorder(),
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+        jitter=lambda: 0.0,
+    )
+
+    result = downloader.run(
+        cache_key=f"status-{status_code}",
+        attempt=lambda limiter: (_ for _ in ()).throw(
+            MediaHTTPError(status_code, {"Retry-After": "7"}, "server busy")
+        ),
+        failure_context={"url": "rate-limited"},
+    )
+
+    assert result is None
+    assert downloader.cooldown.wait() == 7.0
+    summary = downloader.summary()
+    assert summary["shared_cooldown_events"] == 1
+    assert summary[f"http_{status_code}_responses"] == 1
+
+
+def test_http_response_counts_are_per_attempt_without_duplicates(tmp_path):
+    fake = FakeTime()
+    downloader = wikimedia_media.WikimediaMediaDownloader(
+        config=MediaPolicyConfig(
+            max_retries=2,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        ),
+        failure_recorder=_DiscardingFailureRecorder(),
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+        jitter=lambda: 0.0,
+    )
+    errors = [
+        MediaHTTPError(429, {}, "request limit"),
+        MediaHTTPError(503, {}, "unavailable"),
+    ]
+
+    def attempt(limiter):
+        if errors:
+            raise errors.pop(0)
+        return {"local_path": "ok.jpg", "bytes": 3}
+
+    result = downloader.run(
+        cache_key="eventual-success",
+        attempt=attempt,
+        failure_context={"url": "eventual-success"},
+    )
+
+    assert result["bytes"] == 3
+    summary = downloader.summary()
+    assert summary["http_429_responses"] == 1
+    assert summary["http_503_responses"] == 1
+    assert summary["retry_attempts"] == 2
+
+
+def test_downloader_summary_always_exposes_all_manifest_metrics(tmp_path):
+    downloader = make_downloader(tmp_path)
+
+    assert downloader.summary() == {
+        "legacy_cache_hits": 0,
+        "shared_cache_hits": 0,
+        "singleflight_followers": 0,
+        "successful_downloads": 0,
+        "downloaded_bytes": 0,
+        "retry_attempts": 0,
+        "http_429_responses": 0,
+        "http_503_responses": 0,
+        "bandwidth_wait_seconds": 0.0,
+        "cooldown_wait_seconds": 0.0,
+        "shared_cooldown_events": 0,
+        "terminal_failures": 0,
+        "failure_records": 0,
+    }
 
 
 def test_shared_cooldown_blocks_a_second_new_attempt(tmp_path):
