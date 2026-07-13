@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs.
     tqdm = None  # type: ignore[assignment]
 
 from build_mm_table_dataset import (
+    DEFAULT_WIKIPEDIA_USER_AGENT,
     ShardedJsonlWriter,
     WikipediaClient,
     build_bridge_assets,
@@ -69,7 +70,7 @@ from stage1_io import (
     write_json,
     write_jsonl,
 )
-from wikimedia_media import MediaFailureRecorder
+from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 
 
 PROMPT_VERSION = "entity_attribute_extraction_v3_short_empty_precompressed_image"
@@ -98,6 +99,17 @@ def resolve_shared_cache_paths(args: argparse.Namespace) -> dict[str, Path]:
         "wikipedia_image_dir": wikipedia_image_dir,
         "model_attribute_extractions": root_dir / "model_attribute_extractions.jsonl",
     }
+
+
+def media_policy_config_from_args(args: argparse.Namespace) -> MediaPolicyConfig:
+    return MediaPolicyConfig(
+        workers=args.media_download_workers,
+        max_mbps=args.media_max_mbps,
+        max_retries=args.media_max_retries,
+        retry_base_seconds=args.media_retry_base_seconds,
+        retry_max_seconds=args.media_retry_max_seconds,
+        chunk_bytes=args.media_chunk_bytes,
+    ).validate()
 
 
 def normalize(value: Any) -> str:
@@ -2066,9 +2078,14 @@ def build_bridge_assets_parallel(
 
 
 def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    media_config = media_policy_config_from_args(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    media_failure_recorder = MediaFailureRecorder(
+        output_dir / "media_download_failures.jsonl"
+    )
+    media_failure_recorder.reset()
     cache_paths = resolve_shared_cache_paths(args)
     model_attribute_errors_path = clean_text(getattr(args, "model_attribute_errors_path", ""))
     if not model_attribute_errors_path:
@@ -2147,15 +2164,18 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
-        MediaFailureRecorder(
-            output_dir / "media_download_failures.jsonl"
-        ).reset()
+        if args.wikipedia_user_agent == DEFAULT_WIKIPEDIA_USER_AGENT:
+            logging.warning(
+                "The built-in Wikipedia User-Agent is a placeholder; set project/operator contact information before Wikimedia access."
+            )
         wikipedia_client = WikipediaClient(
             cache_dir=cache_paths["wikipedia_cache_dir"],
             image_output_dir=cache_paths["wikipedia_image_dir"],
             output_dir=output_dir,
             sleep=args.sleep,
             user_agent=args.wikipedia_user_agent,
+            media_config=media_config,
+            media_failure_recorder=media_failure_recorder,
         )
     bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
     with bridge_assets_writer:
@@ -2170,6 +2190,11 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             bridge_assets_writer,
             flush_every,
         )
+    wikimedia_media = (
+        wikipedia_client.media_summary()
+        if wikipedia_client is not None and hasattr(wikipedia_client, "media_summary")
+        else {}
+    )
 
     table_asset_links_writer = ShardedJsonlWriter(table_asset_links_dir, records_per_shard)
     with table_asset_links_writer:
@@ -2352,6 +2377,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "query_tables are created only for source columns whose row values are model-recoverable from entity assets above the threshold",
             "data_lake_tables contain generated targets for queryable source tables and raw source tables for rejected source tables",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
+            "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
         ],
     }
     write_json(output_dir / "stats.json", stats)
@@ -2415,6 +2441,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "image_dir": str(cache_paths["wikipedia_image_dir"]),
             "workers": 1,
         },
+        "wikimedia_media": wikimedia_media,
         "note": "Read shards listed in this manifest; stale files from older runs may exist if an output directory is reused.",
     }
     write_json(output_dir / "dataset_manifest.json", manifest)
@@ -2441,7 +2468,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_rows", type=int, default=2)
     parser.add_argument("--min_cols", type=int, default=2)
     parser.add_argument("--min_rows_per_output_table", type=int, default=2)
-    parser.add_argument("--sleep", type=float, default=0.2)
+    parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Action API requests; does not control media downloads.")
     parser.add_argument(
         "--wikipedia_user_agent",
         default=default_wikipedia_user_agent(),
@@ -2454,7 +2481,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wikipedia_workers",
         type=int,
         default=1,
-        help="Deprecated compatibility option. Wikipedia fetching is always serial to avoid MediaWiki rate limits.",
+        help="Deprecated compatibility option. Action API fetching is always serial and this does not control media downloads.",
+    )
+    parser.add_argument(
+        "--media_download_workers",
+        type=int,
+        default=2,
+        help="Concurrent Wikimedia media responses; accepted range 1..2. Independent of Action API request pacing.",
+    )
+    parser.add_argument(
+        "--media_max_mbps",
+        type=float,
+        default=24.0,
+        help="Aggregate Wikimedia media bandwidth in Mbps; accepted range (0, 25].",
+    )
+    parser.add_argument(
+        "--media_max_retries",
+        type=int,
+        default=5,
+        help="Retries per Wikimedia media item after the initial attempt.",
+    )
+    parser.add_argument(
+        "--media_retry_base_seconds",
+        type=float,
+        default=5.0,
+        help="Base delay in seconds for retryable Wikimedia media failures.",
+    )
+    parser.add_argument(
+        "--media_retry_max_seconds",
+        type=float,
+        default=60.0,
+        help="Maximum local backoff in seconds for Wikimedia media retries.",
+    )
+    parser.add_argument(
+        "--media_chunk_bytes",
+        type=int,
+        default=131072,
+        help="Stream chunk size in bytes for Wikimedia media bandwidth accounting.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--flush_every_records", type=int, default=500)

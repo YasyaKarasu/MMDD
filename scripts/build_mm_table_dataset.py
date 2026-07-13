@@ -93,6 +93,19 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 def default_wikipedia_user_agent() -> str:
     return os.environ.get(WIKIPEDIA_USER_AGENT_ENV_VAR, DEFAULT_WIKIPEDIA_USER_AGENT)
+
+
+def media_policy_config_from_args(args: argparse.Namespace) -> MediaPolicyConfig:
+    return MediaPolicyConfig(
+        workers=args.media_download_workers,
+        max_mbps=args.media_max_mbps,
+        max_retries=args.media_max_retries,
+        retry_base_seconds=args.media_retry_base_seconds,
+        retry_max_seconds=args.media_retry_max_seconds,
+        chunk_bytes=args.media_chunk_bytes,
+    ).validate()
+
+
 PARAGRAPH_BREAK_RE = re.compile(r"(?:\r?\n){2,}")
 SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
 
@@ -1028,6 +1041,9 @@ class WikipediaClient:
             failure_recorder=self.media_failure_recorder,
         )
 
+    def media_summary(self) -> dict[str, int | float]:
+        return self.media_downloader.summary()
+
     def _action_api_interval(self) -> float:
         return max(self.sleep, 1.0 / MAX_ACTION_API_REQUESTS_PER_SECOND)
 
@@ -1105,6 +1121,7 @@ class WikipediaClient:
                 "action": "query",
                 "format": "json",
                 "formatversion": 2,
+                "maxlag": 5,
                 "redirects": 1,
                 "titles": "|".join(batch),
                 "prop": "extracts|pageimages|images|info",
@@ -1196,6 +1213,7 @@ class WikipediaClient:
                 "action": "query",
                 "format": "json",
                 "formatversion": 2,
+                "maxlag": 5,
                 "redirects": 1,
                 "titles": "|".join(batch),
                 "prop": "imageinfo",
@@ -1877,7 +1895,18 @@ def build_bridge_assets(
 
     if image_download_pool is not None:
         try:
-            for future, entity, asset_id, imageinfo in pending_image_downloads:
+            pending_iterator: Iterable[
+                tuple[Any, dict[str, Any], str, dict[str, Any]]
+            ] = pending_image_downloads
+            if tqdm is not None:
+                pending_iterator = tqdm(
+                    pending_image_downloads,
+                    total=len(pending_image_downloads),
+                    desc="Resolving Wikimedia media",
+                    unit="asset",
+                    dynamic_ncols=True,
+                )
+            for future, entity, asset_id, imageinfo in pending_iterator:
                 downloaded_image = future.result()
                 if downloaded_image is None:
                     continue
@@ -2148,9 +2177,14 @@ def read_entitables_json(path: Path) -> dict[str, Any] | None:
 
 
 def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    media_config = media_policy_config_from_args(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    media_failure_recorder = MediaFailureRecorder(
+        output_dir / "media_download_failures.jsonl"
+    )
+    media_failure_recorder.reset()
 
     source_tables_dir = output_dir / "source_tables"
     query_views_dir = output_dir / "query_views"
@@ -2247,15 +2281,18 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
-        MediaFailureRecorder(
-            output_dir / "media_download_failures.jsonl"
-        ).reset()
+        if args.wikipedia_user_agent == DEFAULT_WIKIPEDIA_USER_AGENT:
+            logging.warning(
+                "The built-in Wikipedia User-Agent is a placeholder; set project/operator contact information before Wikimedia access."
+            )
         wikipedia_client = WikipediaClient(
             cache_dir=output_dir / "cache",
             image_output_dir=output_dir / "images",
             output_dir=output_dir,
             sleep=args.sleep,
             user_agent=args.wikipedia_user_agent,
+            media_config=media_config,
+            media_failure_recorder=media_failure_recorder,
         )
     bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
     with bridge_assets_writer:
@@ -2270,6 +2307,11 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             bridge_assets_writer,
             flush_every,
         )
+    wikimedia_media = (
+        wikipedia_client.media_summary()
+        if wikipedia_client is not None and hasattr(wikipedia_client, "media_summary")
+        else {}
+    )
 
     table_asset_links_writer = ShardedJsonlWriter(table_asset_links_dir, records_per_shard)
     with table_asset_links_writer:
@@ -2319,6 +2361,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "hidden_columns are provenance only, not augmentation targets",
             "no positive/negative pairs or joinability labels are generated",
             "large JSONL artifacts are written incrementally into sharded part files",
+            "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
         ],
     }
     with (output_dir / "stats.json").open("w", encoding="utf-8") as handle:
@@ -2337,6 +2380,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "splits": "splits.json",
             "stats": "stats.json",
         },
+        "wikimedia_media": wikimedia_media,
         "note": "Read shards listed in this manifest; stale files from older runs may exist if an output directory is reused.",
     }
     with (output_dir / "dataset_manifest.json").open("w", encoding="utf-8") as handle:
@@ -2400,7 +2444,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wiki_link_threshold", type=float, default=0.3)
     parser.add_argument("--min_rows", type=int, default=2)
     parser.add_argument("--min_cols", type=int, default=2)
-    parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between API requests.")
+    parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Action API requests; does not control media downloads.")
     parser.add_argument(
         "--wikipedia_user_agent",
         default=default_wikipedia_user_agent(),
@@ -2408,6 +2452,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address. "
             "Defaults to $WIKIPEDIA_USER_AGENT when set."
         ),
+    )
+    parser.add_argument(
+        "--media_download_workers",
+        type=int,
+        default=2,
+        help="Concurrent Wikimedia media responses; accepted range 1..2. Independent of Action API request pacing.",
+    )
+    parser.add_argument(
+        "--media_max_mbps",
+        type=float,
+        default=24.0,
+        help="Aggregate Wikimedia media bandwidth in Mbps; accepted range (0, 25].",
+    )
+    parser.add_argument(
+        "--media_max_retries",
+        type=int,
+        default=5,
+        help="Retries per Wikimedia media item after the initial attempt.",
+    )
+    parser.add_argument(
+        "--media_retry_base_seconds",
+        type=float,
+        default=5.0,
+        help="Base delay in seconds for retryable Wikimedia media failures.",
+    )
+    parser.add_argument(
+        "--media_retry_max_seconds",
+        type=float,
+        default=60.0,
+        help="Maximum local backoff in seconds for Wikimedia media retries.",
+    )
+    parser.add_argument(
+        "--media_chunk_bytes",
+        type=int,
+        default=131072,
+        help="Stream chunk size in bytes for Wikimedia media bandwidth accounting.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(

@@ -880,6 +880,7 @@ def test_wikipedia_client_get_pages_batches_titles_with_pipe(tmp_path):
 
     assert len(client.session.calls) == 1
     assert client.session.calls[0][1]["titles"] == "Alpha Page|Beta"
+    assert client.session.calls[0][1]["maxlag"] == 5
     assert pages["Alpha Page"]["title"] == "Alpha Page"
     assert pages["Beta"]["title"] == "Beta Target"
     assert client.get_page("Alpha Page")["extract"] == "Alpha extract"
@@ -911,6 +912,206 @@ def test_wikipedia_user_agent_cli_overrides_environment(monkeypatch):
     )
 
     assert args.wikipedia_user_agent == "MMDDDatasetBuilder/1.0 (mailto:cli@example.com)"
+
+
+@pytest.mark.parametrize(
+    "parser",
+    [mm_table_dataset.parse_args, join_dataset.parse_args],
+)
+def test_media_cli_defaults_follow_wikimedia_policy(parser):
+    args = parser(["--input_dir", "in", "--output_dir", "out"])
+
+    assert args.media_download_workers == 2
+    assert args.media_max_mbps == 24.0
+    assert args.media_max_retries == 5
+    assert args.media_retry_base_seconds == 5.0
+    assert args.media_retry_max_seconds == 60.0
+    assert args.media_chunk_bytes == 131072
+
+
+@pytest.mark.parametrize(
+    ("builder", "parser", "field", "value", "message"),
+    [
+        (
+            mm_table_dataset,
+            mm_table_dataset.parse_args,
+            "media_download_workers",
+            3,
+            "media workers must be in the range 1..2",
+        ),
+        (
+            join_dataset,
+            join_dataset.parse_args,
+            "media_download_workers",
+            3,
+            "media workers must be in the range 1..2",
+        ),
+        (
+            mm_table_dataset,
+            mm_table_dataset.parse_args,
+            "media_max_mbps",
+            25.1,
+            r"media max_mbps must be in the range \(0, 25\]",
+        ),
+        (
+            join_dataset,
+            join_dataset.parse_args,
+            "media_max_mbps",
+            25.1,
+            r"media max_mbps must be in the range \(0, 25\]",
+        ),
+    ],
+)
+def test_media_cli_invalid_policy_fails_before_network_client(
+    tmp_path,
+    monkeypatch,
+    builder,
+    parser,
+    field,
+    value,
+    message,
+):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    args = parser(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    setattr(args, field, value)
+
+    def fail_if_constructed(**_kwargs):
+        raise AssertionError("network client must not be constructed")
+
+    monkeypatch.setattr(builder, "WikipediaClient", fail_if_constructed)
+
+    with pytest.raises(ValueError, match=message):
+        builder.build_dataset(args)
+
+
+@pytest.mark.parametrize(
+    ("builder", "parser"),
+    [
+        (mm_table_dataset, mm_table_dataset.parse_args),
+        (join_dataset, join_dataset.parse_args),
+    ],
+)
+def test_media_policy_is_wired_to_builder_client_and_manifest(
+    tmp_path,
+    monkeypatch,
+    builder,
+    parser,
+):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    failure_path = output_dir / "media_download_failures.jsonl"
+    failure_path.write_text('{"old": true}\n', encoding="utf-8")
+    captured = {}
+    media_summary = {"successful_downloads": 2, "failure_records": 1}
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def media_summary(self):
+            return media_summary
+
+    monkeypatch.setattr(builder, "WikipediaClient", FakeWikipediaClient)
+    argv = [
+        "--input_dir",
+        str(input_dir),
+        "--output_dir",
+        str(output_dir),
+        "--media_download_workers",
+        "1",
+        "--media_max_mbps",
+        "12.5",
+        "--media_max_retries",
+        "2",
+        "--media_retry_base_seconds",
+        "1.5",
+        "--media_retry_max_seconds",
+        "9",
+        "--media_chunk_bytes",
+        "4096",
+    ]
+    if builder is join_dataset:
+        argv.append("--no_model_progress")
+
+    stats = builder.build_dataset(parser(argv))
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+
+    assert captured["media_config"] == MediaPolicyConfig(
+        workers=1,
+        max_mbps=12.5,
+        max_retries=2,
+        retry_base_seconds=1.5,
+        retry_max_seconds=9.0,
+        chunk_bytes=4096,
+    )
+    assert captured["media_failure_recorder"].path == failure_path
+    assert failure_path.read_text(encoding="utf-8") == ""
+    assert manifest["wikimedia_media"] == media_summary
+    assert (
+        "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters"
+        in stats["notes"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "parser"),
+    [
+        (mm_table_dataset, mm_table_dataset.parse_args),
+        (join_dataset, join_dataset.parse_args),
+    ],
+)
+def test_builder_warns_once_for_placeholder_wikipedia_user_agent(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    builder,
+    parser,
+):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def media_summary(self):
+            return {}
+
+    monkeypatch.delenv("WIKIPEDIA_USER_AGENT", raising=False)
+    monkeypatch.setattr(builder, "WikipediaClient", FakeWikipediaClient)
+    argv = [
+        "--input_dir",
+        str(input_dir),
+        "--output_dir",
+        str(tmp_path / "output"),
+    ]
+    if builder is join_dataset:
+        argv.append("--no_model_progress")
+
+    with caplog.at_level("WARNING"):
+        builder.build_dataset(parser(argv))
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "operator contact information" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert mm_table_dataset.DEFAULT_WIKIPEDIA_USER_AGENT not in caplog.text
 
 
 def test_wikipedia_client_limits_action_api_to_five_requests_per_second(tmp_path, monkeypatch):
@@ -1074,6 +1275,19 @@ def test_wikipedia_client_uses_descriptive_user_agent(tmp_path):
     assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
 
 
+def test_wikipedia_client_exposes_media_summary(tmp_path):
+    client = WikipediaClient(
+        cache_dir=tmp_path / "cache",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+    )
+    client.media_downloader.stats.increment("retry_attempts", 2)
+
+    assert client.media_summary()["retry_attempts"] == 2
+
+
 def test_build_bridge_assets_fetches_wikipedia_pages_in_batches(tmp_path):
     class FakeWikipediaClient:
         api_failures = 0
@@ -1184,6 +1398,7 @@ def test_wikipedia_client_imageinfo_requests_thumbnail_url_and_caches_fields(tmp
     imageinfos = client.get_imageinfos(["File:Alpha.jpg"])
 
     assert client.session.calls[0][1]["iiurlwidth"] == 960
+    assert client.session.calls[0][1]["maxlag"] == 5
     assert imageinfos["File:Alpha.jpg"]["thumburl"].endswith("960px-Alpha.jpg")
     assert imageinfos["File:Alpha.jpg"]["thumbwidth"] == 960
     assert imageinfos["File:Alpha.jpg"]["thumbheight"] == 640
@@ -1665,9 +1880,16 @@ def test_wikipedia_download_image_avoids_upscaled_raster_thumbnail(tmp_path):
     assert record["download_kind"] == "original"
 
 
-def test_build_bridge_assets_does_not_block_imageinfo_on_prior_image_download(tmp_path):
+def test_build_bridge_assets_does_not_block_imageinfo_on_prior_image_download(tmp_path, monkeypatch):
     events = []
+    progress_events = []
     beta_imageinfo_seen = threading.Event()
+
+    def fake_tqdm(iterable, **kwargs):
+        progress_events.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(mm_table_dataset, "tqdm", fake_tqdm)
 
     class FakeWikipediaClient:
         api_failures = 0
@@ -1744,6 +1966,12 @@ def test_build_bridge_assets_does_not_block_imageinfo_on_prior_image_download(tm
 
     assert image_count == 2
     assert events.index(("imageinfos", ("File:Beta.jpg",))) < events.index(("download_done", "File:Alpha.jpg"))
+    assert {
+        "total": 2,
+        "desc": "Resolving Wikimedia media",
+        "unit": "asset",
+        "dynamic_ncols": True,
+    } in progress_events
 
 
 def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatch):
@@ -1897,7 +2125,17 @@ def test_joinability_dataset_accepts_external_wikipedia_cache_dirs(tmp_path, mon
     class FakeWikipediaClient:
         api_failures = 0
 
-        def __init__(self, cache_dir, image_output_dir, output_dir, sleep, user_agent):
+        def __init__(
+            self,
+            cache_dir,
+            image_output_dir,
+            output_dir,
+            sleep,
+            user_agent,
+            *,
+            media_config,
+            media_failure_recorder,
+        ):
             captured["cache_dir"] = Path(cache_dir)
             captured["image_output_dir"] = Path(image_output_dir)
             captured["output_dir"] = Path(output_dir)
@@ -1977,7 +2215,17 @@ def test_joinability_dataset_uses_shared_cache_dir_by_default(tmp_path, monkeypa
     class FakeWikipediaClient:
         api_failures = 0
 
-        def __init__(self, cache_dir, image_output_dir, output_dir, sleep, user_agent):
+        def __init__(
+            self,
+            cache_dir,
+            image_output_dir,
+            output_dir,
+            sleep,
+            user_agent,
+            *,
+            media_config,
+            media_failure_recorder,
+        ):
             captured["cache_dir"] = Path(cache_dir)
             captured["image_output_dir"] = Path(image_output_dir)
 
