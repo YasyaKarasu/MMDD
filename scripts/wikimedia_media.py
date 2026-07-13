@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import email.utils
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -79,9 +80,25 @@ class MediaBandwidthLimiter:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.rate_bytes_per_second = max_mbps * 1_000_000 / 8
-        self.capacity_bytes = float(capacity_bytes)
-        self._tokens = float(capacity_bytes)
+        try:
+            normalized_max_mbps = float(max_mbps)
+        except (TypeError, ValueError) as error:
+            raise ValueError("media max_mbps must be finite and positive") from error
+        if not math.isfinite(normalized_max_mbps) or normalized_max_mbps <= 0:
+            raise ValueError("media max_mbps must be finite and positive")
+
+        try:
+            normalized_capacity = float(capacity_bytes)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "media capacity_bytes must be finite and positive"
+            ) from error
+        if not math.isfinite(normalized_capacity) or normalized_capacity <= 0:
+            raise ValueError("media capacity_bytes must be finite and positive")
+
+        self.rate_bytes_per_second = normalized_max_mbps * 1_000_000 / 8
+        self.capacity_bytes = normalized_capacity
+        self._tokens = normalized_capacity
         self._updated_at = clock()
         self._clock = clock
         self._sleep = sleep
@@ -105,7 +122,8 @@ class MediaBandwidthLimiter:
                 delay = (
                     0.0
                     if remaining <= 0
-                    else remaining / self.rate_bytes_per_second
+                    else min(remaining, self.capacity_bytes)
+                    / self.rate_bytes_per_second
                 )
             if delay > 0:
                 self._sleep(delay)

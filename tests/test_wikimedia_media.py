@@ -72,6 +72,37 @@ def test_bandwidth_limiter_paces_aggregate_bytes_across_callers():
     assert sum(fake.sleeps) == pytest.approx(0.1)
 
 
+def test_bandwidth_limiter_paces_requests_larger_than_bucket_capacity():
+    fake = FakeTime()
+    limiter = MediaBandwidthLimiter(
+        max_mbps=8.0,
+        capacity_bytes=100_000,
+        clock=fake.monotonic,
+        sleep=fake.sleep,
+    )
+
+    waited = limiter.acquire(300_000)
+
+    assert waited == pytest.approx(0.2)
+    assert sum(fake.sleeps) == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("max_mbps", [0.0, -1.0, float("inf"), float("nan")])
+def test_bandwidth_limiter_rejects_non_positive_or_non_finite_rate(max_mbps):
+    with pytest.raises(ValueError, match="max_mbps"):
+        MediaBandwidthLimiter(max_mbps=max_mbps, capacity_bytes=100_000)
+
+
+@pytest.mark.parametrize(
+    "capacity_bytes", [0, -1, float("inf"), float("nan")]
+)
+def test_bandwidth_limiter_rejects_non_positive_or_non_finite_capacity(
+    capacity_bytes,
+):
+    with pytest.raises(ValueError, match="capacity_bytes"):
+        MediaBandwidthLimiter(max_mbps=8.0, capacity_bytes=capacity_bytes)
+
+
 def test_shared_cooldown_uses_latest_deadline():
     fake = FakeTime()
     cooldown = MediaCooldown(clock=fake.monotonic, sleep=fake.sleep)
