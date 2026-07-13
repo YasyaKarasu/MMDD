@@ -1389,6 +1389,8 @@ class WikipediaClient:
                         digest.update(chunk)
                         total_bytes += len(chunk)
 
+            if total_bytes == 0:
+                raise NonImageMediaError("empty response body")
             if downloaded_svg_source:
                 converted, reason = rasterize_svg_to_png(
                     source_tmp_path,

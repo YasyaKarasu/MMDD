@@ -1394,6 +1394,49 @@ def test_download_image_rejects_non_image_and_removes_temporary_file(tmp_path):
     assert failure["exception_class"] == NonImageMediaError.__name__
 
 
+def test_empty_200_response_is_terminal_for_current_run_and_retryable_next_run(
+    tmp_path,
+):
+    info = jpeg_info("Empty.jpg")
+    client = make_wikipedia_client(tmp_path)
+    session = SequenceImageSession(
+        [
+            FakeStreamingResponse(
+                200,
+                b"",
+                {"Content-Type": "image/jpeg"},
+                chunks=[b"", b""],
+            )
+        ]
+    )
+    client.session = session
+    shared_path = client._shared_media_path(info["thumburl"], ".jpg")
+
+    first = client.download_image(info, "asset_empty_a")
+    repeated = client.download_image(info, "asset_empty_b")
+
+    assert first is None
+    assert repeated is None
+    assert session.calls == 1
+    assert not shared_path.exists()
+    assert not list((tmp_path / "images").glob("*.tmp"))
+    failure = json.loads((tmp_path / "failures.jsonl").read_text().strip())
+    assert failure["exception_class"] == NonImageMediaError.__name__
+    assert client.media_downloader.summary().get("successful_downloads", 0) == 0
+
+    next_run = make_wikipedia_client(tmp_path)
+    next_session = SequenceImageSession(
+        [FakeStreamingResponse(200, b"image", {"Content-Type": "image/jpeg"})]
+    )
+    next_run.session = next_session
+
+    retried = next_run.download_image(info, "asset_empty_c")
+
+    assert retried is not None
+    assert Path(retried["local_path"]).read_bytes() == b"image"
+    assert next_session.calls == 1
+
+
 def test_download_attempt_reserves_before_read_and_refunds_short_chunk(tmp_path):
     events = []
 
