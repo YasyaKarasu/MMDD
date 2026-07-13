@@ -69,6 +69,7 @@ from stage1_io import (
     write_json,
     write_jsonl,
 )
+from wikimedia_media import MediaFailureRecorder
 
 
 PROMPT_VERSION = "entity_attribute_extraction_v3_short_empty_precompressed_image"
@@ -2146,6 +2147,9 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
+        MediaFailureRecorder(
+            output_dir / "media_download_failures.jsonl"
+        ).reset()
         wikipedia_client = WikipediaClient(
             cache_dir=cache_paths["wikipedia_cache_dir"],
             image_output_dir=cache_paths["wikipedia_image_dir"],

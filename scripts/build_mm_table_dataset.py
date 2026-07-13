@@ -40,6 +40,15 @@ try:
 except ImportError:  # pragma: no cover - exercised only in minimal envs.
     tqdm = None  # type: ignore[assignment]
 
+from wikimedia_media import (
+    MediaBandwidthLimiter,
+    MediaFailureRecorder,
+    MediaHTTPError,
+    MediaPolicyConfig,
+    NonImageMediaError,
+    WikimediaMediaDownloader,
+)
+
 
 MEDIAWIKI_API_URL = "https://en.wikipedia.org/w/api.php"
 DEFAULT_WIKIPEDIA_USER_AGENT = (
@@ -50,7 +59,7 @@ WIKIPEDIA_USER_AGENT_ENV_VAR = "WIKIPEDIA_USER_AGENT"
 MEDIAWIKI_BATCH_TITLE_LIMIT = 50
 MEDIAWIKI_RETRY_STATUS_CODES = {429, 503}
 MAX_ACTION_API_REQUESTS_PER_SECOND = 5.0
-DEFAULT_IMAGE_THUMB_WIDTH = 768
+DEFAULT_IMAGE_THUMB_WIDTH = 960
 MAX_MEDIA_DOWNLOAD_WORKERS = 2
 _ACTION_API_LOCK = threading.Lock()
 _ACTION_API_LAST_REQUEST_TIME = 0.0
@@ -985,6 +994,9 @@ class WikipediaClient:
         output_dir: Path,
         sleep: float,
         user_agent: str,
+        *,
+        media_config: MediaPolicyConfig | None = None,
+        media_failure_recorder: MediaFailureRecorder | None = None,
     ) -> None:
         if requests is None:
             raise RuntimeError("requests is required unless --no_wikipedia is used")
@@ -1007,6 +1019,14 @@ class WikipediaClient:
         self.max_retries = 5
         self.retry_base_sleep = 1.0
         self.retry_max_sleep = 60.0
+        self.media_config = (media_config or MediaPolicyConfig()).validate()
+        self.media_failure_recorder = media_failure_recorder or MediaFailureRecorder(
+            output_dir / "media_download_failures.jsonl"
+        )
+        self.media_downloader = WikimediaMediaDownloader(
+            config=self.media_config,
+            failure_recorder=self.media_failure_recorder,
+        )
 
     def _action_api_interval(self) -> float:
         return max(self.sleep, 1.0 / MAX_ACTION_API_REQUESTS_PER_SECOND)
@@ -1261,67 +1281,131 @@ class WikipediaClient:
                 return thumburl, "thumbnail"
         return original_url, "original"
 
-    def download_image(self, imageinfo: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
-        url, download_kind = self._image_download_url(imageinfo)
-        if not url:
-            return None
+    def _shared_media_path(self, url: str, extension: str) -> Path:
+        media_key = stable_hash(url, extension, length=24)
+        return self.image_output_dir / f"media_{media_key}{extension}"
 
+    @staticmethod
+    def _nonempty_file(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            if path.stat().st_size > 0:
+                return True
+            path.unlink()
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _remove_paths(*paths: Path) -> None:
+        for path in paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+
+    def _iter_limited_response_chunks(
+        self,
+        response: Any,
+        limiter: MediaBandwidthLimiter,
+    ) -> Iterable[bytes]:
+        iterator = iter(
+            response.iter_content(chunk_size=self.media_config.chunk_bytes)
+        )
+        while True:
+            reserved = self.media_config.chunk_bytes
+            waited = limiter.acquire(reserved)
+            self.media_downloader.stats.increment(
+                "bandwidth_wait_seconds",
+                waited,
+            )
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                limiter.refund(reserved)
+                return
+            if not chunk:
+                limiter.refund(reserved)
+                continue
+            if len(chunk) > reserved:
+                raise RuntimeError(
+                    "media response chunk exceeded configured reservation"
+                )
+            limiter.refund(reserved - len(chunk))
+            yield chunk
+
+    def _download_image_attempt(
+        self,
+        imageinfo: dict[str, Any],
+        url: str,
+        download_kind: str,
+        image_path: Path,
+        limiter: MediaBandwidthLimiter,
+    ) -> dict[str, Any]:
         source_is_svg = is_svg_image(imageinfo)
         downloaded_svg_source = source_is_svg and download_kind == "original"
-        extension = ".png" if source_is_svg else infer_image_extension(imageinfo)
-        self.image_output_dir.mkdir(parents=True, exist_ok=True)
-        image_path = self.image_output_dir / f"{asset_id}{extension}"
-        tmp_path = image_path.with_suffix(image_path.suffix + ".tmp")
-        if image_path.exists():
-            record = file_download_record(image_path, self.output_dir, downloaded=False)
-            record["download_url"] = url
-            record["download_kind"] = download_kind
-            return record
-        if downloaded_svg_source:
-            legacy_svg_path = self.image_output_dir / f"{asset_id}.svg"
-            if legacy_svg_path.exists():
-                converted, reason = rasterize_svg_to_png(legacy_svg_path, tmp_path, imageinfo)
-                if converted:
-                    tmp_path.replace(image_path)
-                    record = file_download_record(image_path, self.output_dir, downloaded=False)
-                    record["converted_from"] = "image/svg+xml"
-                    record["source_bytes"] = legacy_svg_path.stat().st_size
-                    record["source_sha256"] = sha256_file(legacy_svg_path)
-                    return record
-                logging.warning("Existing SVG conversion failed for %s: %s", legacy_svg_path, reason)
-                try:
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-                except OSError:
-                    pass
+        output_tmp_path = image_path.with_suffix(image_path.suffix + ".tmp")
+        source_tmp_path = image_path.with_suffix(".svg.tmp")
+        download_tmp_path = (
+            source_tmp_path if downloaded_svg_source else output_tmp_path
+        )
+        self._remove_paths(output_tmp_path, source_tmp_path)
 
-        download_tmp_path = image_path.with_suffix(".svg.tmp") if downloaded_svg_source else tmp_path
         digest = hashlib.sha256()
         total_bytes = 0
+        promoted = False
         try:
             with self.session.get(url, stream=True, timeout=60) as response:
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    diagnostic = bytearray()
+                    for chunk in self._iter_limited_response_chunks(
+                        response,
+                        limiter,
+                    ):
+                        remaining = 4096 - len(diagnostic)
+                        if remaining > 0:
+                            diagnostic.extend(chunk[:remaining])
+                    encoding = getattr(response, "encoding", None) or "utf-8"
+                    body_excerpt = clean_text(
+                        diagnostic.decode(encoding, errors="replace")
+                    )[:500]
+                    raise MediaHTTPError(
+                        response.status_code,
+                        dict(response.headers),
+                        body_excerpt,
+                    )
                 content_type = response.headers.get("Content-Type", "")
                 if content_type and not content_type.lower().startswith("image/"):
-                    logging.warning("Skipping non-image response for %s: %s", url, content_type)
-                    return None
+                    raise NonImageMediaError(content_type)
+
                 with download_tmp_path.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 128):
-                        if not chunk:
-                            continue
+                    for chunk in self._iter_limited_response_chunks(
+                        response,
+                        limiter,
+                    ):
                         handle.write(chunk)
                         digest.update(chunk)
                         total_bytes += len(chunk)
+
             if downloaded_svg_source:
-                converted, reason = rasterize_svg_to_png(download_tmp_path, tmp_path, imageinfo)
+                converted, reason = rasterize_svg_to_png(
+                    source_tmp_path,
+                    output_tmp_path,
+                    imageinfo,
+                )
                 if not converted:
                     raise RuntimeError(f"SVG rasterization failed: {reason}")
-                try:
-                    download_tmp_path.unlink()
-                except OSError:
-                    pass
-            tmp_path.replace(image_path)
-            record = file_download_record(image_path, self.output_dir, downloaded=True)
+                self._remove_paths(source_tmp_path)
+            output_tmp_path.replace(image_path)
+            promoted = True
+
+            record = file_download_record(
+                image_path,
+                self.output_dir,
+                downloaded=True,
+            )
             record["download_url"] = url
             record["download_kind"] = download_kind
             if downloaded_svg_source:
@@ -1331,18 +1415,80 @@ class WikipediaClient:
             else:
                 record["sha256"] = digest.hexdigest()
                 record["bytes"] = total_bytes
+            self.media_downloader.stats.increment("downloaded_bytes", total_bytes)
             return record
-        except Exception as exc:
-            self.api_failures += 1
-            logging.warning("Image download failed for %s: %s", url, exc)
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-                if download_tmp_path.exists():
-                    download_tmp_path.unlink()
-            except OSError:
-                pass
+        finally:
+            if not promoted:
+                self._remove_paths(output_tmp_path, source_tmp_path)
+
+    def download_image(self, imageinfo: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
+        url, download_kind = self._image_download_url(imageinfo)
+        if not url:
             return None
+
+        source_is_svg = is_svg_image(imageinfo)
+        downloaded_svg_source = source_is_svg and download_kind == "original"
+        extension = ".png" if source_is_svg else infer_image_extension(imageinfo)
+        self.image_output_dir.mkdir(parents=True, exist_ok=True)
+        legacy_path = self.image_output_dir / f"{asset_id}{extension}"
+        if self._nonempty_file(legacy_path):
+            record = file_download_record(legacy_path, self.output_dir, downloaded=False)
+            record["download_url"] = url
+            record["download_kind"] = download_kind
+            self.media_downloader.stats.increment("legacy_cache_hits")
+            return record
+
+        shared_path = self._shared_media_path(url, extension)
+        if self._nonempty_file(shared_path):
+            record = file_download_record(shared_path, self.output_dir, downloaded=False)
+            record["download_url"] = url
+            record["download_kind"] = download_kind
+            self.media_downloader.stats.increment("shared_cache_hits")
+            return record
+
+        if downloaded_svg_source:
+            legacy_svg_path = self.image_output_dir / f"{asset_id}.svg"
+            legacy_tmp_path = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+            if self._nonempty_file(legacy_svg_path):
+                converted, reason = rasterize_svg_to_png(
+                    legacy_svg_path,
+                    legacy_tmp_path,
+                    imageinfo,
+                )
+                if converted:
+                    legacy_tmp_path.replace(legacy_path)
+                    record = file_download_record(
+                        legacy_path,
+                        self.output_dir,
+                        downloaded=False,
+                    )
+                    record["converted_from"] = "image/svg+xml"
+                    record["source_bytes"] = legacy_svg_path.stat().st_size
+                    record["source_sha256"] = sha256_file(legacy_svg_path)
+                    record["download_url"] = url
+                    record["download_kind"] = download_kind
+                    self.media_downloader.stats.increment("legacy_cache_hits")
+                    return record
+                logging.warning("Existing SVG conversion failed for %s: %s", legacy_svg_path, reason)
+                self._remove_paths(legacy_tmp_path)
+
+        media_key = stable_hash(url, extension, length=24)
+        return self.media_downloader.run(
+            cache_key=media_key,
+            attempt=lambda limiter: self._download_image_attempt(
+                imageinfo,
+                url,
+                download_kind,
+                shared_path,
+                limiter,
+            ),
+            failure_context={
+                "media_key": media_key,
+                "url": url,
+                "file_title": imageinfo.get("file_title"),
+                "asset_id": asset_id,
+            },
+        )
 
 
 def is_svg_image(imageinfo: dict[str, Any]) -> bool:
@@ -2099,6 +2245,9 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
+        MediaFailureRecorder(
+            output_dir / "media_download_failures.jsonl"
+        ).reset()
         wikipedia_client = WikipediaClient(
             cache_dir=output_dir / "cache",
             image_output_dir=output_dir / "images",

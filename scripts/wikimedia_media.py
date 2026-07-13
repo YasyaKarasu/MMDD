@@ -132,6 +132,15 @@ class MediaBandwidthLimiter:
                 waited += delay
         return waited
 
+    def refund(self, byte_count: int) -> None:
+        if byte_count <= 0:
+            return
+        with self._lock:
+            self._tokens = min(
+                self.capacity_bytes,
+                self._tokens + float(byte_count),
+            )
+
 
 class MediaCooldown:
     def __init__(

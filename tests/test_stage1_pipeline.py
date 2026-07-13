@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,7 @@ from stage1_serialization import serialize_table_for_embedding
 from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
 from train_student import Student, build_distill_records, build_ranking_groups, train_loss
+from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig, NonImageMediaError
 from eval_stage1_recall import (
     beam_search_tables,
     bridge_recall_record,
@@ -1144,14 +1146,14 @@ def test_wikipedia_client_imageinfo_requests_thumbnail_url_and_caches_fields(tmp
                             "imageinfo": [
                                 {
                                     "url": "https://upload.wikimedia.org/original/Alpha.jpg",
-                                    "thumburl": "https://upload.wikimedia.org/thumb/Alpha.jpg/768px-Alpha.jpg",
+                                    "thumburl": "https://upload.wikimedia.org/thumb/Alpha.jpg/960px-Alpha.jpg",
                                     "descriptionurl": "https://commons.wikimedia.org/wiki/File:Alpha.jpg",
                                     "mime": "image/jpeg",
                                     "mediatype": "BITMAP",
                                     "width": 1200,
                                     "height": 800,
-                                    "thumbwidth": 768,
-                                    "thumbheight": 512,
+                                    "thumbwidth": 960,
+                                    "thumbheight": 640,
                                     "size": 12345,
                                     "extmetadata": {"Artist": {"value": "Someone"}},
                                 }
@@ -1181,17 +1183,339 @@ def test_wikipedia_client_imageinfo_requests_thumbnail_url_and_caches_fields(tmp
 
     imageinfos = client.get_imageinfos(["File:Alpha.jpg"])
 
-    assert client.session.calls[0][1]["iiurlwidth"] == 768
-    assert imageinfos["File:Alpha.jpg"]["thumburl"].endswith("768px-Alpha.jpg")
-    assert imageinfos["File:Alpha.jpg"]["thumbwidth"] == 768
-    assert imageinfos["File:Alpha.jpg"]["thumbheight"] == 512
+    assert client.session.calls[0][1]["iiurlwidth"] == 960
+    assert imageinfos["File:Alpha.jpg"]["thumburl"].endswith("960px-Alpha.jpg")
+    assert imageinfos["File:Alpha.jpg"]["thumbwidth"] == 960
+    assert imageinfos["File:Alpha.jpg"]["thumbheight"] == 640
+
+
+def jpeg_info(name):
+    return {
+        "file_title": f"File:{name}",
+        "url": f"https://upload.wikimedia.org/original/{name}",
+        "thumburl": f"https://upload.wikimedia.org/thumb/{name}/960px-{name}",
+        "mime": "image/jpeg",
+        "mediatype": "BITMAP",
+        "width": 1200,
+        "height": 800,
+        "thumbwidth": 960,
+        "thumbheight": 640,
+    }
+
+
+class SessionThatFailsOnGet:
+    headers = {}
+
+    def get(self, *args, **kwargs):
+        raise AssertionError("cache hit must not access the network")
+
+
+class FakeStreamingResponse:
+    def __init__(self, status_code, body=b"", headers=None, chunks=None):
+        self.status_code = status_code
+        self.body = body
+        self.headers = dict(headers or {})
+        self.text = body.decode("utf-8", errors="replace")
+        self.chunks = list(chunks) if chunks is not None else [body]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def iter_content(self, chunk_size):
+        yield from self.chunks
+
+
+class SequenceImageSession:
+    def __init__(self, responses):
+        self.headers = {}
+        self.responses = list(responses)
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def get(self, *args, **kwargs):
+        with self._lock:
+            self.calls += 1
+            return self.responses.pop(0)
+
+
+def make_wikipedia_client(tmp_path, **media_overrides):
+    recorder = MediaFailureRecorder(tmp_path / "failures.jsonl")
+    recorder.reset()
+    config = {
+        "max_retries": 0,
+        "retry_base_seconds": 0,
+        "retry_max_seconds": 0,
+    }
+    config.update(media_overrides)
+    return WikipediaClient(
+        cache_dir=tmp_path / "metadata",
+        image_output_dir=tmp_path / "images",
+        output_dir=tmp_path,
+        sleep=0,
+        user_agent="DatasetBot/1.0 (mailto:test@example.com)",
+        media_config=MediaPolicyConfig(**config),
+        media_failure_recorder=recorder,
+    )
+
+
+def test_download_image_reuses_legacy_asset_file(tmp_path):
+    client = make_wikipedia_client(tmp_path)
+    legacy = tmp_path / "images" / "asset_alpha.jpg"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy")
+    client.session = SessionThatFailsOnGet()
+
+    record = client.download_image(jpeg_info("Alpha.jpg"), "asset_alpha")
+
+    assert Path(record["local_path"]) == legacy
+    assert record["downloaded"] is False
+    assert client.media_downloader.summary()["legacy_cache_hits"] == 1
+
+
+def test_download_image_reuses_url_keyed_file_for_distinct_assets(tmp_path):
+    client = make_wikipedia_client(tmp_path)
+    session = SequenceImageSession(
+        [FakeStreamingResponse(200, b"image", {"Content-Type": "image/jpeg"})]
+    )
+    client.session = session
+
+    first = client.download_image(jpeg_info("Shared.jpg"), "asset_a")
+    second = client.download_image(jpeg_info("Shared.jpg"), "asset_b")
+
+    assert first["local_path"] == second["local_path"]
+    assert Path(first["local_path"]).name.startswith("media_")
+    assert first["downloaded"] is True
+    assert second["downloaded"] is False
+    assert session.calls == 1
+    assert client.media_downloader.summary()["shared_cache_hits"] == 1
+
+
+def test_download_image_singleflight_shares_one_network_attempt(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    callers_ready = threading.Barrier(2)
+
+    class BlockingResponse(FakeStreamingResponse):
+        def iter_content(self, chunk_size):
+            started.set()
+            assert release.wait(timeout=2)
+            yield self.body
+
+    client = make_wikipedia_client(tmp_path)
+    session = SequenceImageSession(
+        [BlockingResponse(200, b"image", {"Content-Type": "image/jpeg"})]
+    )
+    client.session = session
+    original_shared_media_path = client._shared_media_path
+
+    def synchronized_shared_media_path(url, extension):
+        path = original_shared_media_path(url, extension)
+        callers_ready.wait(timeout=2)
+        return path
+
+    client._shared_media_path = synchronized_shared_media_path
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.download_image, jpeg_info("Shared.jpg"), "asset_a")
+        second = pool.submit(client.download_image, jpeg_info("Shared.jpg"), "asset_b")
+        assert started.wait(timeout=2)
+        release.set()
+        records = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert records[0] == records[1]
+    assert session.calls == 1
+    assert client.media_downloader.summary()["singleflight_followers"] == 1
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_calls", "expect_success"),
+    [
+        (
+            [
+                FakeStreamingResponse(429, b"slow down", {"Retry-After": "0"}),
+                FakeStreamingResponse(200, b"image", {"Content-Type": "image/jpeg"}),
+            ],
+            2,
+            True,
+        ),
+        (
+            [
+                FakeStreamingResponse(503, b"unavailable"),
+                FakeStreamingResponse(200, b"image", {"Content-Type": "image/jpeg"}),
+            ],
+            2,
+            True,
+        ),
+        ([FakeStreamingResponse(404, b"missing")], 1, False),
+        (
+            [
+                FakeStreamingResponse(
+                    429,
+                    b"Use thumbnail steps",
+                    {"Retry-After": "0"},
+                )
+            ],
+            1,
+            False,
+        ),
+    ],
+)
+def test_download_image_coordinates_retryable_and_terminal_http_responses(
+    tmp_path,
+    responses,
+    expected_calls,
+    expect_success,
+):
+    client = make_wikipedia_client(tmp_path, max_retries=1)
+    session = SequenceImageSession(responses)
+    client.session = session
+
+    record = client.download_image(jpeg_info("Retry.jpg"), "asset_retry")
+
+    assert (record is not None) is expect_success
+    assert session.calls == expected_calls
+    assert not list((tmp_path / "images").glob("*.tmp"))
+
+
+def test_download_image_rejects_non_image_and_removes_temporary_file(tmp_path):
+    client = make_wikipedia_client(tmp_path)
+    client.session = SequenceImageSession(
+        [FakeStreamingResponse(200, b"<html>no</html>", {"Content-Type": "text/html"})]
+    )
+
+    record = client.download_image(jpeg_info("NotImage.jpg"), "asset_html")
+
+    assert record is None
+    assert not list((tmp_path / "images").glob("*.tmp"))
+    failure = json.loads((tmp_path / "failures.jsonl").read_text().strip())
+    assert failure["exception_class"] == NonImageMediaError.__name__
+
+
+def test_download_attempt_reserves_before_read_and_refunds_short_chunk(tmp_path):
+    events = []
+
+    class OrderedResponse(FakeStreamingResponse):
+        def iter_content(self, chunk_size):
+            events.append(("read", len(self.body)))
+            yield self.body
+
+    class RecordingLimiter:
+        def __init__(self):
+            self.acquires = 0
+
+        def acquire(self, byte_count):
+            self.acquires += 1
+            events.append(("acquire", byte_count))
+            return 0.25 if self.acquires == 1 else 0.0
+
+        def refund(self, byte_count):
+            events.append(("refund", byte_count))
+
+    client = make_wikipedia_client(tmp_path, chunk_bytes=16)
+    client.session = SequenceImageSession(
+        [OrderedResponse(200, b"short", {"Content-Type": "image/jpeg"})]
+    )
+    image_path = client._shared_media_path(
+        jpeg_info("Ordered.jpg")["thumburl"],
+        ".jpg",
+    )
+    image_path.parent.mkdir(parents=True)
+
+    record = client._download_image_attempt(
+        jpeg_info("Ordered.jpg"),
+        jpeg_info("Ordered.jpg")["thumburl"],
+        "thumbnail",
+        image_path,
+        RecordingLimiter(),
+    )
+
+    assert events.index(("acquire", 16)) < events.index(("read", 5))
+    assert ("refund", 11) in events
+    assert record["bytes"] == 5
+    assert client.media_downloader.summary()["bandwidth_wait_seconds"] == 0.25
+
+
+def test_download_attempt_throttles_http_error_body_before_classification(tmp_path):
+    events = []
+
+    class ErrorResponse:
+        status_code = 429
+        headers = {"Retry-After": "0"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        @property
+        def text(self):
+            raise AssertionError("error body must be streamed through the limiter")
+
+        def iter_content(self, chunk_size):
+            events.append(("read", len(b"slow down")))
+            yield b"slow down"
+
+    class RecordingLimiter:
+        def acquire(self, byte_count):
+            events.append(("acquire", byte_count))
+            return 0.0
+
+        def refund(self, byte_count):
+            events.append(("refund", byte_count))
+
+    client = make_wikipedia_client(tmp_path, chunk_bytes=16)
+    client.session = SequenceImageSession([ErrorResponse()])
+    info = jpeg_info("RateLimited.jpg")
+
+    with pytest.raises(mm_table_dataset.MediaHTTPError) as error:
+        client._download_image_attempt(
+            info,
+            info["thumburl"],
+            "thumbnail",
+            client._shared_media_path(info["thumburl"], ".jpg"),
+            RecordingLimiter(),
+        )
+
+    assert error.value.status_code == 429
+    assert error.value.body_excerpt == "slow down"
+    assert events.index(("acquire", 16)) < events.index(("read", 9))
+    assert ("refund", 7) in events
+
+
+def test_download_attempt_promotes_complete_file_atomically(tmp_path):
+    client = make_wikipedia_client(tmp_path)
+    info = jpeg_info("Atomic.jpg")
+    image_path = client._shared_media_path(info["thumburl"], ".jpg")
+    tmp_pathname = image_path.with_suffix(image_path.suffix + ".tmp")
+
+    class AtomicResponse(FakeStreamingResponse):
+        def iter_content(self, chunk_size):
+            assert tmp_pathname.exists()
+            assert not image_path.exists()
+            yield self.body
+
+    client.session = SequenceImageSession(
+        [AtomicResponse(200, b"complete", {"Content-Type": "image/jpeg"})]
+    )
+
+    record = client.download_image(info, "asset_atomic")
+
+    assert Path(record["local_path"]) == image_path
+    assert image_path.read_bytes() == b"complete"
+    assert not tmp_pathname.exists()
 
 
 def test_wikipedia_download_image_prefers_safe_thumbnail_url(tmp_path):
     image_bytes = b"fake-jpeg-bytes"
 
     class FakeResponse:
+        status_code = 200
         headers = {"Content-Type": "image/jpeg"}
+        text = ""
 
         def __enter__(self):
             return self
@@ -1246,7 +1570,9 @@ def test_wikipedia_download_image_avoids_upscaled_raster_thumbnail(tmp_path):
     image_bytes = b"fake-jpeg-bytes"
 
     class FakeResponse:
+        status_code = 200
         headers = {"Content-Type": "image/jpeg"}
+        text = ""
 
         def __enter__(self):
             return self
@@ -1519,6 +1845,9 @@ def test_joinability_dataset_accepts_external_wikipedia_cache_dirs(tmp_path, mon
     old_cache_dir = tmp_path / "previous_joinability" / "cache"
     old_image_dir = tmp_path / "previous_joinability" / "images"
     input_dir.mkdir()
+    output_dir.mkdir()
+    failure_ledger = output_dir / "media_download_failures.jsonl"
+    failure_ledger.write_text('{"old": true}\n', encoding="utf-8")
     (input_dir / "tables.json").write_text("{}", encoding="utf-8")
     captured: dict[str, Path] = {}
 
@@ -1557,8 +1886,41 @@ def test_joinability_dataset_accepts_external_wikipedia_cache_dirs(tmp_path, mon
     assert captured["cache_dir"] == old_cache_dir.resolve()
     assert captured["image_output_dir"] == old_image_dir.resolve()
     assert captured["output_dir"] == output_dir.resolve()
+    assert failure_ledger.read_text(encoding="utf-8") == ""
     assert manifest["wikipedia_cache"]["cache_dir"] == str(old_cache_dir.resolve())
     assert manifest["wikipedia_cache"]["image_dir"] == str(old_image_dir.resolve())
+
+
+def test_table_builder_resets_media_failure_ledger_before_wikipedia_work(
+    tmp_path,
+    monkeypatch,
+):
+    input_dir = tmp_path / "entitables"
+    output_dir = tmp_path / "table_dataset"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    failure_ledger = output_dir / "media_download_failures.jsonl"
+    failure_ledger.write_text('{"old": true}\n', encoding="utf-8")
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(mm_table_dataset, "WikipediaClient", FakeWikipediaClient)
+    args = mm_table_dataset.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+        ]
+    )
+
+    mm_table_dataset.build_dataset(args)
+
+    assert failure_ledger.read_text(encoding="utf-8") == ""
 
 
 def test_joinability_dataset_uses_shared_cache_dir_by_default(tmp_path, monkeypatch):
@@ -1765,16 +2127,15 @@ def test_wikipedia_svg_download_converts_to_png_without_thumbnail(tmp_path, monk
     svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800"></svg>'
 
     class FakeResponse:
+        status_code = 200
         headers = {"Content-Type": "image/svg+xml"}
+        text = ""
 
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc, tb):
             return False
-
-        def raise_for_status(self):
-            return None
 
         def iter_content(self, chunk_size):
             yield svg_bytes
@@ -1815,12 +2176,54 @@ def test_wikipedia_svg_download_converts_to_png_without_thumbnail(tmp_path, monk
     )
 
     assert record is not None
-    assert record["file_name"] == "asset_svg.png"
+    assert record["file_name"].startswith("media_")
+    assert record["file_name"].endswith(".png")
     assert Path(record["local_path"]).read_bytes().startswith(b"\x89PNG")
     assert record["converted_from"] == "image/svg+xml"
     assert record["source_bytes"] == len(svg_bytes)
-    assert not (tmp_path / "images" / "asset_svg.svg.tmp").exists()
+    assert not list((tmp_path / "images").glob("*.tmp"))
     assert client.session.urls == ["https://example.test/original.svg"]
+
+
+def test_wikipedia_svg_conversion_failure_removes_source_and_output_temps(
+    tmp_path,
+    monkeypatch,
+):
+    def failing_rasterize(svg_path, png_path, imageinfo):
+        assert svg_path.exists()
+        png_path.write_bytes(b"partial")
+        return False, "bad svg"
+
+    monkeypatch.setattr(
+        mm_table_dataset,
+        "rasterize_svg_to_png",
+        failing_rasterize,
+    )
+    client = make_wikipedia_client(tmp_path)
+    client.session = SequenceImageSession(
+        [
+            FakeStreamingResponse(
+                200,
+                b"<svg></svg>",
+                {"Content-Type": "image/svg+xml"},
+            )
+        ]
+    )
+
+    record = client.download_image(
+        {
+            "file_title": "File:Broken.svg",
+            "url": "https://example.test/Broken.svg",
+            "mime": "image/svg+xml",
+            "width": 1200,
+            "height": 800,
+        },
+        "asset_broken_svg",
+    )
+
+    assert record is None
+    assert not list((tmp_path / "images").glob("*.tmp"))
+    assert not list((tmp_path / "images").glob("media_*.png"))
 
 
 def test_svg_rasterization_handles_wikimedia_namespace_entities(tmp_path):
