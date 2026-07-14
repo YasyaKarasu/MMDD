@@ -21,6 +21,8 @@ from build_mm_joinability_dataset import (
     reparse_extraction_record,
     resolve_extraction_tasks,
     safe_json_object,
+    select_best_qualified_column,
+    tasks_requiring_model_analysis,
 )
 from build_mm_table_dataset import ShardedJsonlWriter
 from run_mm_joinability_dynamic_vllm import (
@@ -37,6 +39,16 @@ def test_prompt_version_invalidates_cache_after_image_prompt_changes():
     import build_mm_joinability_dataset as joinability_dataset
 
     assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v3_short_empty_precompressed_image"
+
+
+def test_select_best_qualified_column_uses_highest_recovery_ratio():
+    qualified = [
+        {"column_index": 1, "recovered_value_ratio": 0.75},
+        {"column_index": 2, "recovered_value_ratio": 1.0},
+        {"column_index": 3, "recovered_value_ratio": 0.8},
+    ]
+
+    assert select_best_qualified_column(qualified) == [qualified[1]]
 
 
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
@@ -705,6 +717,53 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
     assert events[1].startswith("server_started:")
 
 
+def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks(monkeypatch, tmp_path):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    '{"text_task_count": 0, "image_task_count": 0}',
+                    encoding="utf-8",
+                )
+            else:
+                events.append("server_started")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events == ["builder_started"]
+
+
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
     release_text = threading.Event()
     text_started = threading.Event()
@@ -757,6 +816,60 @@ def test_precompute_task_groups_write_each_modality_done_marker_independently(tm
 
     assert not worker.is_alive()
     assert (tmp_path / "text_done.json").exists()
+
+
+def test_precompute_task_groups_immediately_marks_empty_modality_done(tmp_path):
+    image_started = threading.Event()
+    release_image = threading.Event()
+
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            image_started.set()
+            release_image.wait(timeout=2.0)
+            return {"attributes": [], "raw_response": '{"attributes":[]}', "error": ""}
+
+    args = _parallel_args(
+        model_text_done_marker=str(tmp_path / "text_done.json"),
+        model_image_done_marker=str(tmp_path / "image_done.json"),
+    )
+    worker = threading.Thread(
+        target=precompute_extraction_task_groups,
+        kwargs={
+            "extractor": FakeExtractor(),
+            "cache": ExtractionCache(tmp_path / "model_cache.jsonl"),
+            "tasks_by_kind": {"text": [], "image": [_task("image", "pending")]},
+            "args": args,
+            "state": ModelConcurrencyState(text_workers=1, image_workers=1),
+            "progress": None,
+        },
+    )
+    worker.start()
+    assert image_started.wait(timeout=2.0)
+
+    assert (tmp_path / "text_done.json").exists()
+    assert not (tmp_path / "image_done.json").exists()
+
+    release_image.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+
+def test_tasks_requiring_model_analysis_excludes_reusable_cached_tasks(tmp_path):
+    tasks = [_task("text", "cached"), _task("image", "missing")]
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    cache.put(
+        tasks[0].cache_key,
+        {
+            "cache_key": tasks[0].cache_key,
+            "attributes": [{"name": "State", "value": "Alabama", "evidence": "cached"}],
+            "raw_response": '{"attributes":[]}',
+            "error": "",
+        },
+    )
+
+    pending = tasks_requiring_model_analysis(tasks, cache, _parallel_args())
+
+    assert pending == [tasks[1]]
 
 
 def test_resolve_extraction_tasks_runs_text_and_image_pools_concurrently(tmp_path):

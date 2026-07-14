@@ -947,6 +947,34 @@ def cached_extraction_is_reusable(record: dict[str, Any], args: argparse.Namespa
     return True
 
 
+def tasks_requiring_model_analysis(
+    tasks: list[ExtractionTask],
+    cache: ExtractionCache,
+    args: argparse.Namespace,
+) -> list[ExtractionTask]:
+    pending: list[ExtractionTask] = []
+    seen: set[str] = set()
+    for task in tasks:
+        if task.cache_key in seen:
+            continue
+        seen.add(task.cache_key)
+        cached = cache.get(task.cache_key)
+        if cached:
+            cached_record = cached
+            if getattr(args, "reparse_cached_model_outputs", True):
+                cached_record, changed = reparse_extraction_record(
+                    cached_record,
+                    task.candidate_attribute_names,
+                    require_connection_evidence=True,
+                )
+                if changed:
+                    cache.put(task.cache_key, cached_record)
+            if cached_extraction_is_reusable(cached_record, args):
+                continue
+        pending.append(task)
+    return pending
+
+
 def append_model_error_record(path_value: str, record: dict[str, Any]) -> None:
     if not clean_text(path_value) or not clean_text(record.get("error")):
         return
@@ -959,7 +987,7 @@ def append_model_error_record(path_value: str, record: dict[str, Any]) -> None:
 
 def resolve_extraction_tasks(
     *,
-    extractor: LocalAttributeExtractor,
+    extractor: LocalAttributeExtractor | None,
     cache: ExtractionCache,
     tasks: list[ExtractionTask],
     args: argparse.Namespace,
@@ -999,11 +1027,17 @@ def resolve_extraction_tasks(
         if progress is not None:
             progress.mark(cache_key, "error" if has_error else "model")
 
-    model_records = run_uncached_extraction_tasks(
-        extractor=extractor,
-        tasks=list(uncached_by_key.values()),
-        state=state,
-        on_record=store_model_record,
+    if uncached_by_key and extractor is None:
+        raise RuntimeError("Model analysis is required but no extractor was initialized")
+    model_records = (
+        run_uncached_extraction_tasks(
+            extractor=extractor,
+            tasks=list(uncached_by_key.values()),
+            state=state,
+            on_record=store_model_record,
+        )
+        if uncached_by_key and extractor is not None
+        else {}
     )
     for cache_key, record in model_records.items():
         if cache_key not in resolved_by_key:
@@ -1196,6 +1230,12 @@ def context_columns(table: dict[str, Any], excluded: set[int], limit: int) -> li
     if limit <= 0:
         return [idx for _non_empty, _unique, idx in candidates]
     return [idx for _non_empty, _unique, idx in candidates[:limit]]
+
+
+def select_best_qualified_column(qualified_cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not qualified_cols:
+        return []
+    return [max(qualified_cols, key=lambda item: float(item["recovered_value_ratio"]))]
 
 
 def extraction_cache_key(
@@ -1450,9 +1490,10 @@ def precompute_extraction_task_groups(
         if kind in {"text", "image"} and tasks
     }
     counts = {kind: len(tasks) for kind, tasks in tasks_by_kind.items() if kind in {"text", "image"}}
-    if not active_groups:
-        for kind, count in counts.items():
+    for kind, count in counts.items():
+        if kind not in active_groups:
             write_model_done_marker(model_done_marker_for_kind(args, kind), model_kind=kind, task_count=count)
+    if not active_groups:
         return counts
 
     with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
@@ -1476,9 +1517,6 @@ def precompute_extraction_task_groups(
                 model_kind=kind,
                 task_count=task_count,
             )
-    for kind, count in counts.items():
-        if kind not in active_groups:
-            write_model_done_marker(model_done_marker_for_kind(args, kind), model_kind=kind, task_count=count)
     return counts
 
 
@@ -1564,7 +1602,7 @@ def build_table_join_records(
     assets: dict[str, dict[str, Any]],
     entity_to_assets: dict[str, list[str]],
     wiki_to_entity_id: dict[str, str],
-    extractor: LocalAttributeExtractor,
+    extractor: LocalAttributeExtractor | None,
     cache: ExtractionCache,
     progress: ModelAnalysisProgress | None,
     concurrency_state: ModelConcurrencyState,
@@ -1727,12 +1765,11 @@ def build_table_join_records(
             "qualified_columns": [],
         }
 
+    qualified_cols = select_best_qualified_column(qualified_cols)
+
     query_tables: list[dict[str, Any]] = []
     data_lake_tables: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
-    if args.max_query_tables_per_source_table > 0:
-        qualified_cols = qualified_cols[: args.max_query_tables_per_source_table]
-
     for qualified in qualified_cols:
         join_col = int(qualified["column_index"])
         eligible_source_rows = eligible_rows_by_col[join_col]
@@ -2250,10 +2287,12 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 asset_types={"image"},
             )
-        precomputed_text_task_count = len(text_tasks)
-        precomputed_image_task_count = len(image_tasks)
+        pending_text_tasks = tasks_requiring_model_analysis(text_tasks, cache, args)
+        pending_image_tasks = tasks_requiring_model_analysis(image_tasks, cache, args)
+        precomputed_text_task_count = len(pending_text_tasks)
+        precomputed_image_task_count = len(pending_image_tasks)
         logging.info(
-            "Precomputing model extraction cache before table processing: text=%d image=%d",
+            "Pending model extraction tasks before table processing: text=%d image=%d",
             precomputed_text_task_count,
             precomputed_image_task_count,
         )
@@ -2262,19 +2301,33 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             text_task_count=precomputed_text_task_count,
             image_task_count=precomputed_image_task_count,
         )
-        wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
-        extractor = LocalAttributeExtractor(args)
-        tasks_by_kind = {"text": text_tasks}
-        if getattr(args, "precompute_model_cache", False):
-            tasks_by_kind["image"] = image_tasks
-        precompute_extraction_task_groups(
-            extractor=extractor,
-            cache=cache,
-            tasks_by_kind=tasks_by_kind,
-            args=args,
-            state=concurrency_state,
-            progress=progress,
-        )
+        if pending_text_tasks or pending_image_tasks:
+            wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
+            extractor = LocalAttributeExtractor(args)
+            tasks_by_kind = {"text": pending_text_tasks}
+            if getattr(args, "precompute_model_cache", False):
+                tasks_by_kind["image"] = pending_image_tasks
+            precompute_extraction_task_groups(
+                extractor=extractor,
+                cache=cache,
+                tasks_by_kind=tasks_by_kind,
+                args=args,
+                state=concurrency_state,
+                progress=progress,
+            )
+        else:
+            logging.info("All model extraction tasks are cached; skipping model analysis")
+            write_model_done_marker(
+                model_done_marker_for_kind(args, "text"),
+                model_kind="text",
+                task_count=0,
+            )
+            if getattr(args, "precompute_model_cache", False):
+                write_model_done_marker(
+                    model_done_marker_for_kind(args, "image"),
+                    model_kind="image",
+                    task_count=0,
+                )
     else:
         write_model_start_marker(
             clean_text(getattr(args, "model_start_marker", "")),
@@ -2282,9 +2335,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             image_task_count=0,
         )
         wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
-        extractor = LocalAttributeExtractor(args)
-
-    if extractor is None:
         extractor = LocalAttributeExtractor(args)
 
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)

@@ -206,6 +206,22 @@ def write_ready_marker(path: Path) -> None:
     )
 
 
+def read_pending_model_task_count(path: Path) -> int | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or not {
+        "text_task_count",
+        "image_task_count",
+    }.issubset(payload):
+        return None
+    try:
+        return max(0, int(payload["text_task_count"])) + max(0, int(payload["image_task_count"]))
+    except (TypeError, ValueError):
+        return None
+
+
 def wait_for_marker_or_builder_exit(
     *,
     marker: Path,
@@ -389,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
             builder=builder_proc,
             timeout_seconds=args.model_start_timeout_seconds,
         )
+
+        if read_pending_model_task_count(model_start_marker) == 0:
+            return int(builder_proc.wait())
 
         text_proc = start_server(text_server)
         primary_image_proc = start_server(primary_image_server)
