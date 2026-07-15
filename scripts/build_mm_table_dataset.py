@@ -58,6 +58,7 @@ DEFAULT_WIKIPEDIA_USER_AGENT = (
 WIKIPEDIA_USER_AGENT_ENV_VAR = "WIKIPEDIA_USER_AGENT"
 MEDIAWIKI_BATCH_TITLE_LIMIT = 50
 MEDIAWIKI_RETRY_STATUS_CODES = {429, 503}
+EXTERNAL_LINK_PREFIXES = ("//", "http://", "https://")
 MEDIA_ERROR_DIAGNOSTIC_BYTES = 4096
 MAX_ACTION_API_REQUESTS_PER_SECOND = 5.0
 DEFAULT_IMAGE_THUMB_WIDTH = 960
@@ -274,7 +275,8 @@ def parse_wiki_cell(cell: str) -> dict[str, Any]:
         page = normalize_title(match.group(1))
         label = clean_text(match.group(2) if match.group(2) is not None else page)
         namespace = page.split(":", 1)[0].lower() if ":" in page else ""
-        wiki_title = None if namespace in NON_ENTITY_NAMESPACES else page
+        is_external = page.lower().startswith(EXTERNAL_LINK_PREFIXES)
+        wiki_title = None if is_external or namespace in NON_ENTITY_NAMESPACES else page
         return {
             "raw": raw,
             "text": label,
