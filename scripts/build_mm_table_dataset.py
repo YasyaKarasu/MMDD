@@ -65,6 +65,12 @@ DEFAULT_IMAGE_THUMB_WIDTH = 960
 MAX_MEDIA_DOWNLOAD_WORKERS = 2
 _ACTION_API_LOCK = threading.Lock()
 _ACTION_API_LAST_REQUEST_TIME = 0.0
+
+
+class MediaWikiURITooLong(Exception):
+    """Signal that a MediaWiki title batch must be split."""
+
+
 NON_ENTITY_NAMESPACES = {
     "category",
     "file",
@@ -1078,6 +1084,8 @@ class WikipediaClient:
                         response = self.session.get(MEDIAWIKI_API_URL, params=request_params, timeout=30)
                     finally:
                         _ACTION_API_LAST_REQUEST_TIME = started_request
+                if response.status_code == 414:
+                    raise MediaWikiURITooLong
                 if response.status_code in MEDIAWIKI_RETRY_STATUS_CODES and attempt < self.max_retries:
                     delay = self._retry_delay(response, attempt)
                     logging.warning(
@@ -1090,6 +1098,8 @@ class WikipediaClient:
                 response.raise_for_status()
                 payload = response.json()
                 return payload
+            except MediaWikiURITooLong:
+                raise
             except Exception as exc:
                 last_error = exc
                 if attempt < self.max_retries:
@@ -1104,6 +1114,41 @@ class WikipediaClient:
         logging.warning("MediaWiki API request failed: %s", last_error)
         return None
 
+    def _get_title_batches(
+        self,
+        titles: list[str],
+        base_params: dict[str, Any],
+    ) -> Iterable[tuple[list[str], dict[str, Any]]]:
+        for start in range(0, len(titles), MEDIAWIKI_BATCH_TITLE_LIMIT):
+            batch = titles[start : start + MEDIAWIKI_BATCH_TITLE_LIMIT]
+            yield from self._get_title_batch(batch, base_params)
+
+    def _get_title_batch(
+        self,
+        batch: list[str],
+        base_params: dict[str, Any],
+    ) -> Iterable[tuple[list[str], dict[str, Any]]]:
+        if not batch:
+            return
+        params = dict(base_params)
+        params["titles"] = "|".join(batch)
+        try:
+            payload = self._get(params)
+        except MediaWikiURITooLong:
+            if len(batch) == 1:
+                self.api_failures += 1
+                logging.warning(
+                    "MediaWiki API rejected one title with HTTP 414: %.200s",
+                    batch[0],
+                )
+                return
+            midpoint = len(batch) // 2
+            yield from self._get_title_batch(batch[:midpoint], base_params)
+            yield from self._get_title_batch(batch[midpoint:], base_params)
+            return
+        if payload:
+            yield batch, payload
+
     def get_pages(self, wiki_titles: Iterable[str]) -> dict[str, dict[str, Any]]:
         normalized_titles = []
         seen_titles: set[str] = set()
@@ -1116,27 +1161,20 @@ class WikipediaClient:
         results: dict[str, dict[str, Any]] = {}
         missing_titles = [title for title in normalized_titles if title not in self.page_cache]
 
-        for start in range(0, len(missing_titles), MEDIAWIKI_BATCH_TITLE_LIMIT):
-            batch = missing_titles[start : start + MEDIAWIKI_BATCH_TITLE_LIMIT]
-            if not batch:
-                continue
-            params = {
-                "action": "query",
-                "format": "json",
-                "formatversion": 2,
-                "maxlag": 5,
-                "redirects": 1,
-                "titles": "|".join(batch),
-                "prop": "extracts|pageimages|images|info",
-                "explaintext": 1,
-                "piprop": "thumbnail|original|name",
-                "pithumbsize": 600,
-                "imlimit": 50,
-                "inprop": "url",
-            }
-            payload = self._get(params)
-            if not payload:
-                continue
+        base_params = {
+            "action": "query",
+            "format": "json",
+            "formatversion": 2,
+            "maxlag": 5,
+            "redirects": 1,
+            "prop": "extracts|pageimages|images|info",
+            "explaintext": 1,
+            "piprop": "thumbnail|original|name",
+            "pithumbsize": 600,
+            "imlimit": 50,
+            "inprop": "url",
+        }
+        for batch, payload in self._get_title_batches(missing_titles, base_params):
             query = payload.get("query", {})
             title_map = {title: title for title in batch}
             for item in query.get("normalized", []) or []:
@@ -1208,24 +1246,17 @@ class WikipediaClient:
         results: dict[str, dict[str, Any]] = {}
         missing_titles = [title for title in normalized_titles if title not in self.image_cache]
 
-        for start in range(0, len(missing_titles), MEDIAWIKI_BATCH_TITLE_LIMIT):
-            batch = missing_titles[start : start + MEDIAWIKI_BATCH_TITLE_LIMIT]
-            if not batch:
-                continue
-            params = {
-                "action": "query",
-                "format": "json",
-                "formatversion": 2,
-                "maxlag": 5,
-                "redirects": 1,
-                "titles": "|".join(batch),
-                "prop": "imageinfo",
-                "iiprop": "url|size|mime|mediatype|extmetadata",
-                "iiurlwidth": DEFAULT_IMAGE_THUMB_WIDTH,
-            }
-            payload = self._get(params)
-            if not payload:
-                continue
+        base_params = {
+            "action": "query",
+            "format": "json",
+            "formatversion": 2,
+            "maxlag": 5,
+            "redirects": 1,
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime|mediatype|extmetadata",
+            "iiurlwidth": DEFAULT_IMAGE_THUMB_WIDTH,
+        }
+        for batch, payload in self._get_title_batches(missing_titles, base_params):
             query = payload.get("query", {})
             title_map = {title: title for title in batch}
             for item in query.get("normalized", []) or []:
