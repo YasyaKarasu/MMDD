@@ -15,6 +15,7 @@ htmlcov/
 venv/
 .idea/
 .vscode/
+.worktrees/
 .DS_Store
 
 # Logs and temporary files
