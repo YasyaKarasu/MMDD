@@ -2276,14 +2276,16 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
         "numCols": 3,
         "numericColumns": [],
         "pgTitle": "Queryable Page",
-        "numDataRows": 4,
+        "numDataRows": 6,
         "secondTitle": "Section",
         "caption": "Caption",
         "data": [
             ["[Alpha_Page|Alpha]", "Paris", "Red"],
+            ["[Delta_Page|Delta]", "", "Green"],
             ["[Beta_Page|Beta]", "Paris", "Red"],
+            ["[Epsilon_Page|Epsilon]", "", "Yellow"],
             ["[Gamma_Page|Gamma]", "Oslo", "Blue"],
-            ["[Delta_Page|Delta]", "Rome", "Green"],
+            ["[Zeta_Page|Zeta]", "Madrid", "Black"],
         ],
     }
     rejected_table = {
@@ -2314,7 +2316,10 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
                 "Alpha Page": "Paris",
                 "Beta Page": "Paris",
                 "Gamma Page": "Oslo",
-                "Delta Page": "Rome",
+                "No A": "Madrid",
+                "No B": "Berlin",
+                "No C": "Lisbon",
+                "No D": "Dublin",
             }
             city = city_by_title.get(wiki_title, "")
             return {
@@ -2330,7 +2335,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
         def extract(self, asset, entity, candidate_attribute_names):
             content = asset.get("content", "")
             attrs = []
-            for city in ("Paris", "Oslo", "Rome"):
+            for city in ("Paris", "Oslo", "Madrid", "Berlin", "Lisbon", "Dublin"):
                 if city in content:
                     attrs.append({"name": "City", "value": city, "evidence": f"City: {city}"})
             return {"attributes": attrs, "raw_response": json.dumps({"attributes": attrs}), "error": ""}
@@ -2365,8 +2370,10 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
             "3",
             "--min_rows_per_output_table",
             "2",
+            "--query_rows_per_table",
+            "5",
             "--min_recovered_value_ratio",
-            "0.75",
+            "0.6",
             "--min_recovery_denominator",
             "4",
             "--max_query_context_attrs",
@@ -2391,11 +2398,13 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert stats["queryable_source_tables"] == 1
     assert stats["rejected_source_tables"] == 1
     assert stats["qrels"] == 1
-    assert stats["evidence_recoveries"] == 4
-    assert stats["attribute_extractions"] == 8
+    assert stats["evidence_recoveries"] == 3
+    assert stats["attribute_extractions"] == 10
+    assert stats["query_rows_per_table"] == 5
 
     query = read_manifest_artifact(output_dir, "query_tables")[0]
     data_lake = read_manifest_artifact(output_dir, "data_lake_tables")
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
     target = next(item for item in data_lake if item["role"] == "target_data_lake_table")
     rejected = next(item for item in data_lake if item["role"] == "raw_data_lake_table")
     recoveries = read_manifest_artifact(output_dir, "evidence_recoveries")
@@ -2404,9 +2413,17 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
 
     assert [column["column_name"] for column in query["columns"]] == ["Entity", "Team"]
     assert query["hidden_attributes"][0]["column_name"] == "City"
-    assert query["hidden_attributes"][0]["recovered_value_ratio"] == 1.0
+    assert query["hidden_attributes"][0]["valid_entity_rows"] == 6
+    assert query["hidden_attributes"][0]["required_recovered_rows"] == 3
+    assert query["hidden_attributes"][0]["recovered_value_ratio"] == 0.5
+    assert query["hidden_attributes"][0]["selected_rows"] == 5
+    assert len(query["rows"]) == 5
+    assert len(target["rows"]) == 5
+    assert query["source_row_indices"] == target["source_row_indices"] == [0, 1, 2, 3, 4]
+    assert [target["rows"][row_id]["cells"][0]["text"] for row_id in (1, 3)] == ["", ""]
     assert [column["column_name"] for column in target["columns"]] == ["City", "Team"]
     assert rejected["queryable"] is False
+    assert manifest["query_construction"]["query_rows_per_table"] == 5
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]
     assert any(item["attributes"] for item in extractions)

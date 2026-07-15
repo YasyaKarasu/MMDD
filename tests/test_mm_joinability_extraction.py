@@ -4,9 +4,12 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import build_mm_joinability_dataset as joinability_dataset
 from build_mm_joinability_dataset import (
     ExtractionCache,
     ExtractionTask,
@@ -19,8 +22,11 @@ from build_mm_joinability_dataset import (
     project_selected_rows,
     precompute_extraction_task_groups,
     reparse_extraction_record,
+    recovery_column_profile,
+    required_recovered_row_count,
     resolve_extraction_tasks,
     safe_json_object,
+    select_query_source_rows,
     select_best_qualified_column,
     tasks_requiring_model_analysis,
 )
@@ -49,6 +55,107 @@ def test_select_best_qualified_column_uses_highest_recovery_ratio():
     ]
 
     assert select_best_qualified_column(qualified) == [qualified[1]]
+
+
+def test_required_recovered_rows_caps_denominator_at_query_size():
+    assert required_recovered_row_count(4, 5, 0.6) == 3
+    assert required_recovered_row_count(5, 5, 0.6) == 3
+    assert required_recovered_row_count(20, 5, 0.6) == 3
+    assert required_recovered_row_count(100, 100, 0.07) == 7
+
+
+def test_recovery_profile_counts_empty_attribute_rows_as_failures():
+    profile = recovery_column_profile(
+        valid_source_rows={0, 1, 2, 3, 4, 5},
+        recovered_source_rows={0, 1, 2},
+        query_rows_per_table=5,
+        min_recovery_denominator=2,
+        min_ratio=0.6,
+    )
+
+    assert profile == {
+        "eligible_rows": 6,
+        "valid_entity_rows": 6,
+        "recovered_rows": 3,
+        "required_recovered_rows": 3,
+        "recovered_value_ratio": 0.5,
+    }
+
+
+def test_select_query_rows_uses_recovery_quota_then_failures():
+    assert select_query_source_rows(
+        source_row_order=[0, 1, 2, 3, 4, 5],
+        recovered_source_rows={0, 2, 4},
+        query_rows_per_table=5,
+        required_recovered_rows=3,
+    ) == [0, 2, 4, 1, 3]
+
+
+def test_select_query_rows_uses_extra_recoveries_when_failures_are_exhausted():
+    assert select_query_source_rows(
+        source_row_order=[0, 1, 2, 3, 4, 5],
+        recovered_source_rows={0, 1, 2, 3, 4},
+        query_rows_per_table=5,
+        required_recovered_rows=3,
+    ) == [0, 1, 2, 5, 3]
+
+
+def test_query_rows_per_table_defaults_to_five(tmp_path):
+    args = joinability_dataset.parse_args(
+        ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "out")]
+    )
+
+    assert args.query_rows_per_table == 5
+
+
+def test_query_rows_per_table_rejects_contradictory_output_minimum(tmp_path):
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--query_rows_per_table",
+            "4",
+            "--min_rows_per_output_table",
+            "5",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="min_rows_per_output_table"):
+        joinability_dataset.configured_query_rows_per_table(args)
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_query_rows_per_table_must_be_positive(tmp_path, value):
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--query_rows_per_table",
+            value,
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        joinability_dataset.configured_query_rows_per_table(args)
+
+
+def test_query_rows_per_table_accepts_explicit_override(tmp_path):
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--query_rows_per_table",
+            "3",
+        ]
+    )
+
+    assert joinability_dataset.configured_query_rows_per_table(args) == 3
 
 
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():

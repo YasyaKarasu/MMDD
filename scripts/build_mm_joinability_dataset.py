@@ -22,6 +22,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
@@ -1238,6 +1239,78 @@ def select_best_qualified_column(qualified_cols: list[dict[str, Any]]) -> list[d
     return [max(qualified_cols, key=lambda item: float(item["recovered_value_ratio"]))]
 
 
+def required_recovered_row_count(
+    valid_entity_rows: int,
+    query_rows_per_table: int,
+    min_ratio: float,
+) -> int:
+    denominator = min(valid_entity_rows, query_rows_per_table)
+    threshold = Decimal(denominator) * Decimal(str(min_ratio))
+    return int(threshold.to_integral_value(rounding=ROUND_CEILING))
+
+
+def recovery_column_profile(
+    *,
+    valid_source_rows: set[int],
+    recovered_source_rows: set[int],
+    query_rows_per_table: int,
+    min_recovery_denominator: int,
+    min_ratio: float,
+) -> dict[str, Any] | None:
+    valid_count = len(valid_source_rows)
+    recovered_count = len(recovered_source_rows & valid_source_rows)
+    required_count = required_recovered_row_count(
+        valid_count,
+        query_rows_per_table,
+        min_ratio,
+    )
+    if valid_count < min_recovery_denominator or recovered_count < required_count:
+        return None
+    return {
+        "eligible_rows": valid_count,
+        "valid_entity_rows": valid_count,
+        "recovered_rows": recovered_count,
+        "required_recovered_rows": required_count,
+        "recovered_value_ratio": round(recovered_count / max(1, valid_count), 6),
+    }
+
+
+def select_query_source_rows(
+    *,
+    source_row_order: list[int],
+    recovered_source_rows: set[int],
+    query_rows_per_table: int,
+    required_recovered_rows: int,
+) -> list[int]:
+    recovered = [row for row in source_row_order if row in recovered_source_rows]
+    unrecovered = [row for row in source_row_order if row not in recovered_source_rows]
+    if len(source_row_order) < query_rows_per_table or len(recovered) < required_recovered_rows:
+        return []
+    selected = recovered[:required_recovered_rows]
+    selected.extend(unrecovered[: query_rows_per_table - len(selected)])
+    if len(selected) < query_rows_per_table:
+        selected.extend(
+            recovered[
+                required_recovered_rows : required_recovered_rows
+                + query_rows_per_table
+                - len(selected)
+            ]
+        )
+    return selected
+
+
+def configured_query_rows_per_table(args: argparse.Namespace) -> int:
+    query_rows = int(getattr(args, "query_rows_per_table", 5))
+    min_output_rows = int(getattr(args, "min_rows_per_output_table", 2))
+    if query_rows <= 0:
+        raise ValueError("query_rows_per_table must be positive")
+    if min_output_rows > query_rows:
+        raise ValueError(
+            "min_rows_per_output_table cannot exceed query_rows_per_table"
+        )
+    return query_rows
+
+
 def extraction_cache_key(
     *,
     asset_id: str,
@@ -1610,6 +1683,7 @@ def build_table_join_records(
     recovery_writer: ShardedJsonlWriter,
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    query_rows_per_table = configured_query_rows_per_table(args)
     entity_col = choose_entity_column(source_table)
     if entity_col is None:
         raw = raw_data_lake_record(source_table, split)
@@ -1621,7 +1695,8 @@ def build_table_join_records(
         return [], [raw], [], {"reason": "no_candidate_attribute_columns", "qualified_columns": []}
 
     candidate_attribute_names = [get_column_name(source_table, col) for col in attribute_cols]
-    eligible_rows_by_col: dict[int, set[int]] = defaultdict(set)
+    valid_entity_source_rows: set[int] = set()
+    valid_entity_source_row_order: list[int] = []
     recovered_rows_by_col: dict[int, set[int]] = defaultdict(set)
     recoveries_by_col: dict[int, list[dict[str, Any]]] = defaultdict(list)
     extraction_count = 0
@@ -1639,9 +1714,8 @@ def build_table_join_records(
         entity_id = wiki_to_entity_id.get(wiki_title)
         if not wiki_title or not entity_id:
             continue
-        for attr_col in attribute_cols:
-            if clean_text(get_cell_text(source_row, attr_col)):
-                eligible_rows_by_col[attr_col].add(source_row_id)
+        valid_entity_source_rows.add(source_row_id)
+        valid_entity_source_row_order.append(source_row_id)
         asset_ids = entity_to_assets.get(entity_id, [])
         if not asset_ids:
             continue
@@ -1741,17 +1815,20 @@ def build_table_join_records(
 
     qualified_cols: list[dict[str, Any]] = []
     for attr_col in attribute_cols:
-        eligible = eligible_rows_by_col.get(attr_col, set())
         recovered = recovered_rows_by_col.get(attr_col, set())
-        ratio = len(recovered) / max(1, len(eligible))
-        if len(eligible) >= args.min_recovery_denominator and ratio >= args.min_recovered_value_ratio:
+        profile = recovery_column_profile(
+            valid_source_rows=valid_entity_source_rows,
+            recovered_source_rows=recovered,
+            query_rows_per_table=query_rows_per_table,
+            min_recovery_denominator=args.min_recovery_denominator,
+            min_ratio=args.min_recovered_value_ratio,
+        )
+        if profile is not None:
             qualified_cols.append(
                 {
                     "column_index": attr_col,
                     "column_name": get_column_name(source_table, attr_col),
-                    "eligible_rows": len(eligible),
-                    "recovered_rows": len(recovered),
-                    "recovered_value_ratio": round(ratio, 6),
+                    **profile,
                 }
             )
 
@@ -1772,7 +1849,15 @@ def build_table_join_records(
     qrels: list[dict[str, Any]] = []
     for qualified in qualified_cols:
         join_col = int(qualified["column_index"])
-        eligible_source_rows = eligible_rows_by_col[join_col]
+        selected_source_rows = select_query_source_rows(
+            source_row_order=valid_entity_source_row_order,
+            recovered_source_rows=recovered_rows_by_col.get(join_col, set()),
+            query_rows_per_table=query_rows_per_table,
+            required_recovered_rows=int(qualified["required_recovered_rows"]),
+        )
+        if len(selected_source_rows) != query_rows_per_table:
+            continue
+        selected_source_row_set = set(selected_source_rows)
         excluded = {entity_col, join_col}
         other_cols = context_columns(source_table, excluded, 0)
         if not other_cols:
@@ -1789,17 +1874,22 @@ def build_table_join_records(
         query_rows, query_source_rows = project_selected_rows(
             source_table,
             query_cols,
-            eligible_source_rows,
+            selected_source_row_set,
             min_required_cols=1,
         )
         target_rows, target_source_rows = project_selected_rows(
             source_table,
             target_cols,
-            eligible_source_rows,
-            min_required_cols=1,
+            selected_source_row_set,
+            min_required_cols=0,
         )
+        if query_source_rows != target_source_rows:
+            continue
+        if len(query_rows) != query_rows_per_table or len(target_rows) != query_rows_per_table:
+            continue
         if min(len(query_rows), len(target_rows)) < args.min_rows_per_output_table:
             continue
+        qualified["selected_rows"] = query_rows_per_table
         chain_id = f"chain_{stable_hash(source_table['source_table_id'], entity_col, join_col)}"
         query_table_id = f"query_{stable_hash(chain_id, 'query')}"
         target_table_id = f"target_{stable_hash(chain_id, 'target')}"
@@ -1808,8 +1898,11 @@ def build_table_join_records(
             "column_name": qualified["column_name"],
             "role": "model_recoverable_join_column",
             "eligible_rows": qualified["eligible_rows"],
+            "valid_entity_rows": qualified["valid_entity_rows"],
             "recovered_rows": qualified["recovered_rows"],
+            "required_recovered_rows": qualified["required_recovered_rows"],
             "recovered_value_ratio": qualified["recovered_value_ratio"],
+            "selected_rows": qualified["selected_rows"],
         }
         query_tables.append(
             table_record(
@@ -2115,6 +2208,7 @@ def build_bridge_assets_parallel(
 
 
 def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    args.query_rows_per_table = configured_query_rows_per_table(args)
     media_config = media_policy_config_from_args(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -2421,10 +2515,11 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "wikipedia_workers": 1,
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
+        "query_rows_per_table": args.query_rows_per_table,
         "skipped_reasons": dict(skip_reasons),
         "notes": [
             "source_tables are the fixed data-lake base pool",
-            "query_tables are created only for source columns whose row values are model-recoverable from entity assets above the threshold",
+            "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table aligned rows",
             "data_lake_tables contain generated targets for queryable source tables and raw source tables for rejected source tables",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
@@ -2450,6 +2545,12 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "splits": "splits.json",
             "stats": "stats.json",
             "table_queryability_decisions": "table_queryability_decisions.jsonl",
+        },
+        "query_construction": {
+            "query_rows_per_table": args.query_rows_per_table,
+            "min_rows_per_output_table": args.min_rows_per_output_table,
+            "min_recovered_value_ratio": args.min_recovered_value_ratio,
+            "min_recovery_denominator": args.min_recovery_denominator,
         },
         "model_endpoints": {
             "text_model_base_url": args.text_model_base_url,
@@ -2518,6 +2619,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_rows", type=int, default=2)
     parser.add_argument("--min_cols", type=int, default=2)
     parser.add_argument("--min_rows_per_output_table", type=int, default=2)
+    parser.add_argument(
+        "--query_rows_per_table",
+        type=int,
+        default=5,
+        help="Exact number of aligned source rows in each generated query/target pair.",
+    )
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Action API requests; does not control media downloads.")
     parser.add_argument(
         "--wikipedia_user_agent",
@@ -2581,8 +2688,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dev_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--min_column_non_empty_ratio", type=float, default=0.5)
-    parser.add_argument("--min_recovered_value_ratio", type=float, default=0.6, help="Minimum fraction of eligible row values recovered from entity assets for a column to become a join column.")
-    parser.add_argument("--min_recovery_denominator", type=int, default=2, help="Minimum eligible row count for a candidate join column.")
+    parser.add_argument(
+        "--min_recovered_value_ratio",
+        type=float,
+        default=0.6,
+        help="Minimum recovered fraction applied to min(valid entity rows, query_rows_per_table).",
+    )
+    parser.add_argument(
+        "--min_recovery_denominator",
+        type=int,
+        default=2,
+        help="Minimum valid entity row count for a candidate join column.",
+    )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0, help="0 means emit all qualifying join columns.")
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)
