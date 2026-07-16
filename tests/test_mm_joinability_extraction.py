@@ -554,6 +554,34 @@ def test_table_record_accepts_source_provenance_builder():
     assert record["provenance"]["builder"] == "wdc"
 
 
+@pytest.mark.parametrize(
+    "source_overrides",
+    [
+        {},
+        {"provenance_builder": ""},
+        {"provenance_builder": "   "},
+    ],
+    ids=["missing", "empty", "whitespace"],
+)
+def test_table_record_defaults_dataset_provenance_builder(source_overrides):
+    record = joinability_dataset.table_record(
+        table_id="table_1",
+        role="query_table",
+        split="train",
+        source_table={
+            "source_table_id": "source_1",
+            "columns": [],
+            **source_overrides,
+        },
+        column_indices=[],
+        rows=[],
+        source_row_indices=[],
+        extra={},
+    )
+
+    assert record["provenance"]["builder"] == "build_mm_joinability_dataset.py"
+
+
 def test_old_cache_key_is_preserved_when_disabling_thinking():
     base = dict(
         asset_id="asset_1",
