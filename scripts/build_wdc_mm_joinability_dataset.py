@@ -18,7 +18,11 @@ from urllib.parse import urljoin, urlsplit
 
 from PIL import Image
 
-from build_mm_table_dataset import rasterize_svg_to_png
+from build_mm_table_dataset import (
+    rasterize_svg_to_png,
+    select_relevant_text_chunks,
+    split_text_asset_content,
+)
 from stage1_io import clean_text, column_profiles, is_numeric_text, stable_hash
 
 try:
@@ -757,6 +761,91 @@ class WdcWebClient:
         if converted_from:
             record["converted_from"] = converted_from
         return record
+
+
+def build_wdc_bridge_assets_for_entity(
+    entity: dict[str, Any],
+    client: WdcWebClient,
+    max_images_per_entity: int,
+    text_asset_chunk_chars: int = 800,
+    min_text_asset_chunk_chars: int = 120,
+    max_text_asset_chunks_per_entity: int = 3,
+) -> list[dict[str, Any]]:
+    """Build webpage text and direct-first image assets for one WDC entity."""
+    page_url = clean_text(entity.get("page_url"))
+    try:
+        fetched_page = client.fetch_page(page_url)
+    except Exception:
+        fetched_page = None
+    page = fetched_page if isinstance(fetched_page, dict) else None
+    records: list[dict[str, Any]] = []
+
+    if page:
+        text_chunks = split_text_asset_content(
+            page.get("text"),
+            max_chars=text_asset_chunk_chars,
+            min_chars=min_text_asset_chunk_chars,
+            max_chunks=0,
+        )
+        selected_text_chunks = select_relevant_text_chunks(
+            text_chunks,
+            entity,
+            max_text_asset_chunks_per_entity,
+        )
+        source_asset_id = f"asset_text_{stable_hash(entity['entity_id'], 'wdc_page_text')}"
+        for chunk_index, chunk, chunk_score in selected_text_chunks:
+            records.append(
+                {
+                    "asset_id": f"{source_asset_id}_{chunk_index:03d}",
+                    "source_asset_id": source_asset_id,
+                    "entity_id": entity["entity_id"],
+                    "entity_wiki_title": entity["wiki_title"],
+                    "asset_type": "text",
+                    "content": chunk,
+                    "text_chunk_index": chunk_index,
+                    "text_chunk_count": len(text_chunks),
+                    "selected_text_chunk_count": len(selected_text_chunks),
+                    "text_chunk_relevance_score": round(chunk_score, 6),
+                    "source": "wdc_page_text_chunk",
+                    "url": clean_text(page.get("final_url")) or page_url,
+                }
+            )
+
+    image_quota = max(0, int(max_images_per_entity))
+    kept = 0
+    seen_image_urls: set[str] = set()
+    seen_image_hashes: set[str] = set()
+    image_sources = [
+        (entity.get("image_urls") or [], "wdc_image_column"),
+        ((page or {}).get("image_urls") or [], "wdc_page_image"),
+    ]
+    for image_urls, source in image_sources:
+        for image_url in image_urls:
+            if kept >= image_quota:
+                break
+            normalized_url = clean_text(image_url)
+            if not normalized_url or normalized_url in seen_image_urls:
+                continue
+            seen_image_urls.add(normalized_url)
+            try:
+                image_record = client.download_image(
+                    normalized_url,
+                    page_url=page_url,
+                    source=source,
+                    entity_id=entity["entity_id"],
+                )
+            except Exception:
+                continue
+            if not isinstance(image_record, dict):
+                continue
+            image_hash = clean_text(image_record.get("sha256"))
+            if image_hash and image_hash in seen_image_hashes:
+                continue
+            if image_hash:
+                seen_image_hashes.add(image_hash)
+            records.append(image_record)
+            kept += 1
+    return records
 
 
 def _cell_text(value: Any) -> str:

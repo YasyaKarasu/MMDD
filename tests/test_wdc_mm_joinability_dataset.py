@@ -102,6 +102,363 @@ class FakeClock:
         self.now += seconds
 
 
+class FakeWdcAssetClient:
+    def __init__(
+        self,
+        *,
+        page: dict[str, Any] | None | Exception,
+        image_outcomes: dict[str, str | None | Exception],
+    ) -> None:
+        self.page = page
+        self.image_outcomes = image_outcomes
+        self.fetch_page_calls: list[str] = []
+        self.download_image_calls: list[tuple[str, dict[str, str]]] = []
+
+    def fetch_page(self, page_url: str) -> dict[str, Any] | None:
+        self.fetch_page_calls.append(page_url)
+        if isinstance(self.page, Exception):
+            raise self.page
+        return self.page
+
+    def download_image(self, image_url: str, **kwargs: str) -> dict[str, Any] | None:
+        self.download_image_calls.append((image_url, kwargs))
+        outcome = self.image_outcomes.get(image_url)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is None:
+            return None
+        return {
+            "asset_id": f"asset_img_{stable_hash(kwargs['entity_id'], kwargs['source'], image_url)}",
+            "entity_id": kwargs["entity_id"],
+            "asset_type": "image",
+            "source": kwargs["source"],
+            "image_url": image_url,
+            "original_url": image_url,
+            "page_url": kwargs["page_url"],
+            "sha256": outcome,
+        }
+
+
+def wdc_asset_entity() -> dict[str, Any]:
+    return {
+        "entity_id": "ent_alpha",
+        "wiki_title": "wdc_alpha",
+        "display_texts": ["Alpha"],
+        "context_terms": ["bridge evidence"],
+        "appears_in": [{"column_name": "name"}],
+        "page_url": "https://x.test/entity",
+        "image_urls": [
+            "https://img.test/direct-1.jpg",
+            "https://img.test/direct-2.jpg",
+        ],
+    }
+
+
+def test_direct_images_take_quota_but_page_is_always_fetched():
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/final",
+            "text": "Alpha has useful bridge evidence on its entity page.",
+            "image_urls": [
+                "https://img.test/page-1.jpg",
+                "https://img.test/page-2.jpg",
+            ],
+        },
+        image_outcomes={
+            "https://img.test/direct-1.jpg": "sha-direct",
+            "https://img.test/direct-2.jpg": None,
+            "https://img.test/page-1.jpg": "sha-page",
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(),
+        client,
+        2,
+        800,
+        120,
+        3,
+    )
+
+    assert client.fetch_page_calls == ["https://x.test/entity"]
+    images = [record for record in records if record["asset_type"] == "image"]
+    assert [record["source"] for record in images] == [
+        "wdc_image_column",
+        "wdc_page_image",
+    ]
+    assert len(images) == 2
+    assert any(record["asset_type"] == "text" for record in records)
+
+
+def test_failed_direct_images_leave_full_quota_for_page_images():
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/entity",
+            "text": "Alpha page text.",
+            "image_urls": [
+                "https://img.test/page-1.jpg",
+                "https://img.test/page-2.jpg",
+            ],
+        },
+        image_outcomes={
+            "https://img.test/direct-1.jpg": None,
+            "https://img.test/direct-2.jpg": None,
+            "https://img.test/page-1.jpg": "sha-page-1",
+            "https://img.test/page-2.jpg": "sha-page-2",
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(), client, 2
+    )
+
+    images = [record for record in records if record["asset_type"] == "image"]
+    assert [record["source"] for record in images] == [
+        "wdc_page_image",
+        "wdc_page_image",
+    ]
+    assert [call[0] for call in client.download_image_calls] == [
+        "https://img.test/direct-1.jpg",
+        "https://img.test/direct-2.jpg",
+        "https://img.test/page-1.jpg",
+        "https://img.test/page-2.jpg",
+    ]
+
+
+def test_full_direct_quota_still_fetches_page_text_without_page_image_downloads():
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/entity",
+            "text": "Alpha page text remains mandatory.",
+            "image_urls": ["https://img.test/page-unused.jpg"],
+        },
+        image_outcomes={
+            "https://img.test/direct-1.jpg": "sha-direct-1",
+            "https://img.test/direct-2.jpg": "sha-direct-2",
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(), client, 2
+    )
+
+    assert client.fetch_page_calls == ["https://x.test/entity"]
+    assert [call[0] for call in client.download_image_calls] == [
+        "https://img.test/direct-1.jpg",
+        "https://img.test/direct-2.jpg",
+    ]
+    assert any(record["asset_type"] == "text" for record in records)
+
+
+def test_zero_image_quota_still_fetches_and_emits_page_text():
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/entity",
+            "text": "Alpha page text is emitted with a zero image quota.",
+            "image_urls": ["https://img.test/page-unused.jpg"],
+        },
+        image_outcomes={},
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(), client, 0
+    )
+
+    assert client.fetch_page_calls == ["https://x.test/entity"]
+    assert client.download_image_calls == []
+    assert [record["asset_type"] for record in records] == ["text"]
+
+
+def test_page_text_uses_unlimited_split_then_exact_relevance_limit(monkeypatch):
+    calls: dict[str, Any] = {}
+
+    def fake_split(content, *, max_chars, min_chars, max_chunks):
+        calls["split"] = (content, max_chars, min_chars, max_chunks)
+        return ["zero", "one Alpha", "two", "three bridge evidence"]
+
+    def fake_select(chunks, entity, max_chunks):
+        calls["select"] = (chunks, entity, max_chunks)
+        return [(1, chunks[1], 4.0), (3, chunks[3], 2.0)]
+
+    monkeypatch.setattr(wdc_builder, "split_text_asset_content", fake_split)
+    monkeypatch.setattr(wdc_builder, "select_relevant_text_chunks", fake_select)
+    entity = wdc_asset_entity()
+    client = FakeWdcAssetClient(
+        page={"final_url": "https://x.test/final", "text": "raw page", "image_urls": []},
+        image_outcomes={},
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        entity,
+        client,
+        max_images_per_entity=0,
+        text_asset_chunk_chars=91,
+        min_text_asset_chunk_chars=17,
+        max_text_asset_chunks_per_entity=2,
+    )
+
+    assert calls["split"] == ("raw page", 91, 17, 0)
+    assert calls["select"] == (
+        ["zero", "one Alpha", "two", "three bridge evidence"],
+        entity,
+        2,
+    )
+    assert [record["text_chunk_index"] for record in records] == [1, 3]
+    assert {record["text_chunk_count"] for record in records} == {4}
+    assert {record["selected_text_chunk_count"] for record in records} == {2}
+
+
+def test_page_text_chunk_defaults_remain_800_120_and_3(monkeypatch):
+    calls: dict[str, Any] = {}
+
+    def fake_split(content, *, max_chars, min_chars, max_chunks):
+        calls["split"] = (max_chars, min_chars, max_chunks)
+        return ["text"]
+
+    def fake_select(chunks, entity, max_chunks):
+        calls["select_limit"] = max_chunks
+        return [(0, chunks[0], 0.0)]
+
+    monkeypatch.setattr(wdc_builder, "split_text_asset_content", fake_split)
+    monkeypatch.setattr(wdc_builder, "select_relevant_text_chunks", fake_select)
+    client = FakeWdcAssetClient(
+        page={"final_url": "https://x.test/entity", "text": "raw", "image_urls": []},
+        image_outcomes={},
+    )
+
+    wdc_builder.build_wdc_bridge_assets_for_entity(wdc_asset_entity(), client, 0)
+
+    assert calls == {"split": (800, 120, 0), "select_limit": 3}
+
+
+def test_image_candidates_are_deduplicated_by_url_and_returned_sha():
+    entity = wdc_asset_entity()
+    entity["image_urls"] = [
+        "https://img.test/direct-1.jpg",
+        "https://img.test/direct-1.jpg",
+        "https://img.test/direct-same-sha.jpg",
+    ]
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/entity",
+            "text": "Alpha page text.",
+            "image_urls": [
+                "https://img.test/direct-1.jpg",
+                "https://img.test/page-same-sha.jpg",
+                "https://img.test/page-unique-1.jpg",
+                "https://img.test/page-unique-2.jpg",
+            ],
+        },
+        image_outcomes={
+            "https://img.test/direct-1.jpg": "sha-shared",
+            "https://img.test/direct-same-sha.jpg": "sha-shared",
+            "https://img.test/page-same-sha.jpg": "sha-shared",
+            "https://img.test/page-unique-1.jpg": "sha-page-1",
+            "https://img.test/page-unique-2.jpg": "sha-page-2",
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(entity, client, 3)
+
+    images = [record for record in records if record["asset_type"] == "image"]
+    assert [record["image_url"] for record in images] == [
+        "https://img.test/direct-1.jpg",
+        "https://img.test/page-unique-1.jpg",
+        "https://img.test/page-unique-2.jpg",
+    ]
+    assert [call[0] for call in client.download_image_calls] == [
+        "https://img.test/direct-1.jpg",
+        "https://img.test/direct-same-sha.jpg",
+        "https://img.test/page-same-sha.jpg",
+        "https://img.test/page-unique-1.jpg",
+        "https://img.test/page-unique-2.jpg",
+    ]
+
+
+def test_individual_download_exceptions_do_not_abort_remaining_candidates():
+    client = FakeWdcAssetClient(
+        page={
+            "final_url": "https://x.test/entity",
+            "text": "Alpha page text.",
+            "image_urls": [
+                "https://img.test/page-error.jpg",
+                "https://img.test/page-ok.jpg",
+            ],
+        },
+        image_outcomes={
+            "https://img.test/direct-1.jpg": RuntimeError("direct failed"),
+            "https://img.test/direct-2.jpg": "sha-direct",
+            "https://img.test/page-error.jpg": RuntimeError("page image failed"),
+            "https://img.test/page-ok.jpg": "sha-page",
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(), client, 2
+    )
+
+    images = [record for record in records if record["asset_type"] == "image"]
+    assert [record["source"] for record in images] == [
+        "wdc_image_column",
+        "wdc_page_image",
+    ]
+
+
+def test_fetch_page_exception_isolated_while_direct_images_are_still_attempted():
+    client = FakeWdcAssetClient(
+        page=RuntimeError("page failed"),
+        image_outcomes={
+            "https://img.test/direct-1.jpg": "sha-direct",
+            "https://img.test/direct-2.jpg": None,
+        },
+    )
+
+    records = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(), client, 1
+    )
+
+    assert client.fetch_page_calls == ["https://x.test/entity"]
+    assert [record["asset_type"] for record in records] == ["image"]
+    assert records[0]["source"] == "wdc_image_column"
+
+
+def test_page_text_records_keep_bridge_contract_and_stable_ids():
+    page = {
+        "final_url": "https://x.test/final",
+        "text": "Alpha has stable webpage text bridge evidence.",
+        "image_urls": [],
+    }
+
+    first = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(),
+        FakeWdcAssetClient(page=page, image_outcomes={}),
+        0,
+    )
+    second = wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(),
+        FakeWdcAssetClient(page=page, image_outcomes={}),
+        0,
+    )
+
+    assert [record["asset_id"] for record in first] == [
+        record["asset_id"] for record in second
+    ]
+    assert first[0] == {
+        "asset_id": first[0]["asset_id"],
+        "source_asset_id": first[0]["source_asset_id"],
+        "entity_id": "ent_alpha",
+        "entity_wiki_title": "wdc_alpha",
+        "asset_type": "text",
+        "content": "Alpha has stable webpage text bridge evidence.",
+        "text_chunk_index": 0,
+        "text_chunk_count": 1,
+        "selected_text_chunk_count": 1,
+        "text_chunk_relevance_score": 6.0,
+        "source": "wdc_page_text_chunk",
+        "url": "https://x.test/final",
+    }
+
+
 def test_extract_image_urls_recurses_resolves_and_deduplicates():
     value = {
         "contentUrl": "/a.jpg",
