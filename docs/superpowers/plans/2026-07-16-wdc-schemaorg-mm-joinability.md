@@ -6,7 +6,7 @@
 
 **Architecture:** A focused WDC module converts gzip JSONL host tables into the existing internal table contract and collects generic web bridge assets with a resumable SQLite cache. The existing joinability module remains the single implementation of model extraction, recovery qualification, query/target projection, qrels, and evidence paths.
 
-**Tech Stack:** Python 3.10, stdlib gzip/HTMLParser/sqlite3/concurrency, requests, Pillow, pytest, existing Stage-1 and joinability helpers.
+**Tech Stack:** Python 3.10, stdlib gzip/HTMLParser/sqlite3/concurrency/http.client/ssl, dnspython for deadline-bounded A/AAAA/CNAME resolution, Pillow, pytest, existing Stage-1 and joinability helpers.
 
 ## Global Constraints
 
@@ -18,6 +18,9 @@
 - Reuse the existing 800/120/3 text chunk behavior and query construction code.
 - Remove `image` from every emitted table.
 - Network failures are per-entity records, not fatal build errors.
+- Safe defaults are 100 accepted tables, 1,000 attempted gzip files, 100 rows per table, and 2 images per entity; unlimited modes require `--allow_unbounded`.
+- Network connections must be pinned to a validated public DNS answer while retaining the original HTTPS hostname for SNI and certificate verification.
+- Page bodies and images share a total cache budget and streaming disk-free guard. External SVG is rejected.
 
 ---
 
@@ -99,7 +102,7 @@ Expected: fails because HTML extraction/client behavior is missing.
 
 - [ ] **Step 3: Implement HTML parsing, SQLite page cache, throttled requests, and bounded image validation**
 
-Use `HTMLParser` with skip-depth tags, metadata/image attribute collection, `urljoin`, and URL-scheme validation. Store page extraction payloads and status in SQLite. Stream downloads to a temporary path, enforce byte limits, verify/rasterize, reject tiny/extreme images, atomically move valid images into the cache, and return bridge-asset metadata.
+Use `HTMLParser` with skip-depth tags, metadata/image attribute collection, `urljoin`, and URL-scheme validation. Store page extraction payloads and status in SQLite. Resolve once per redirect hop, reject any non-public address, and connect to the vetted IP while preserving the original HTTPS hostname for SNI/certificate checks. Stream downloads to a temporary path, enforce byte/pixel/deadline/total-cache/disk limits, reject external SVG and tiny/extreme rasters, atomically move valid images into the cache, and return bridge-asset metadata.
 
 - [ ] **Step 4: Run focused tests and confirm GREEN**
 
@@ -223,6 +226,16 @@ Run: `conda run -n MMDD python -m pytest tests/test_wdc_mm_joinability_dataset.p
 
 Expected: zero failures.
 
+#### Post-review safety amendments
+
+- Treat `--max_scanned_files` independently from `--max_source_tables`; count every attempted gzip, including malformed and rejected files.
+- Detect per-table row truncation with bounded lookahead and expose safety configuration/truncation counters in startup logs, final logs, and `stats.json`.
+- Use conservative defaults (`100` tables, `1000` attempted files, `100` rows, `2` images) and require `--allow_unbounded` for non-positive input bounds.
+- Resolve A/AAAA/CNAME records with dnspython using the remaining absolute response deadline and no unbounded stdlib fallback. Pin actual TCP connections to the already validated DNS answer. Keep the original host in the HTTP `Host` header and in HTTPS SNI/certificate verification, and repeat validation/pinning on each manual redirect.
+- Count page bodies and images under `--web_max_total_cache_bytes`, enforce the separate image quota, reserve quota and recheck free disk while streaming, and apply `--web_max_response_seconds` to drip responses.
+- Backfill legacy image byte counts from verified cache files and charge recovered orphan files to both image and total-cache quotas.
+- Reject untrusted SVG deliberately and enforce a decoded raster-pixel bound.
+
 ---
 
 ### Task 6: Validate extraction and launch the unattended build
@@ -245,7 +258,7 @@ Run a temporary one-table/five-entity fake-network or cached fixture build and i
 
 - [ ] **Step 3: Start a named tmux session**
 
-Run: `tmux new-session -d -s wdc-mm-joinability 'conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_mm_joinability --cache_dir cache/wdc_mm_joinability --max_source_tables 20000 --max_rows_per_source_table 100'`
+Run: `tmux new-session -d -s wdc-mm-joinability 'conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_mm_joinability_run_001 --cache_dir cache/wdc_mm_joinability_run_001 --max_source_tables 100 --max_scanned_files 1000 --max_rows_per_source_table 100 --max_images_per_entity 2'`
 
 - [ ] **Step 4: Monitor startup and correct any deterministic failure**
 

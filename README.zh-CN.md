@@ -323,6 +323,81 @@ python scripts/build_mm_table_dataset.py `
 
 后续读取数据时建议优先读取 `dataset_manifest.json` 中列出的 shards，而不是直接 glob 目录。这样即使复用旧的 `output_dir`，也不会误读旧 run 留下的 stale part 文件。
 
+## WDC Schema.org Joinability Builder
+
+`build_wdc_mm_joinability_dataset.py` 会读取本地 WDC Schema.org Table Corpus
+2023 的 gzip host tables，并直接复用现有 joinability core 来生成
+query/target、qrels 和 evidence paths。建议先用下面的有界配置运行：
+
+```bash
+conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_mm_joinability_run_001 \
+  --cache_dir cache/wdc_mm_joinability_run_001 \
+  --max_source_tables 100 \
+  --max_scanned_files 1000 \
+  --max_rows_per_source_table 100 \
+  --max_images_per_entity 2 \
+  --web_workers 4 \
+  --text_model_base_url http://127.0.0.1:8001/v1 \
+  --image_model_base_url http://127.0.0.1:8000/v1
+```
+
+直接运行时，两个 OpenAI-compatible 文本/图片模型 endpoint 必须在模型抽取
+阶段开始前可用。脚本会惰性地在 WDC class 目录之间轮转扫描，并限制同时在途的
+网页任务数量；source tables、entities、bridge assets、table-asset links、
+queries、targets、attribute extractions 和 evidence recoveries 都按 shard 写出。
+安全默认值是最多接受 100 个 source tables、尝试 1000 个 gzip 文件、每表保留
+100 行、每个实体保留 2 张图片。`--max_scanned_files` 会独立统计每个尝试过的
+gzip，包括损坏或被拒绝的文件，而不是只统计接受的表。只有同时显式添加
+`--allow_unbounded` 才允许把单表行数设为 `0` 或使用非正的扫描/表数量上限。
+启动与结束日志以及 `stats.json` 会记录安全配置，并报告扫描、source-table 或行截断。
+后续 query 阶段会在内存中维护 entity/asset 索引，因此建议
+始终采用分阶段、有明确上限的构建。WDC 原始 `image` 属性只用于发现图片，不会出现在任何
+source/query/target/raw table 中。
+
+每个被选中的实体都会抓取 `page_url`，以提取页面可见文本和页面图片候选；即使
+WDC `image` 属性里的直接图片已经下载成功，也不会跳过网页请求。直接图片优先，
+但直接图片和网页图片共同使用同一个 `--max_images_per_entity` 配额。网页缓存位于
+`<cache_dir>/wdc_web.sqlite3`，图片位于 `<cache_dir>/wdc_images`，模型抽取缓存位于
+`<cache_dir>/model_attribute_extractions.jsonl`。网络和媒体错误不会中止全局构建，
+而会分别写到输出目录的 `web_fetch_failures.jsonl` 和
+`media_download_failures.jsonl`。
+
+网页客户端会拒绝带 userinfo 的 URL 和解析到非公网 IP 的地址。每个重定向 hop
+只解析并验证一次，实际 TCP 连接固定到该已验证 IP；HTTPS 仍使用原始 hostname
+进行 SNI 和证书校验。A/AAAA 与 CNAME 解析使用 requirements 中声明的
+`dnspython`，并受响应剩余绝对 deadline 限制；不会回退到无界的 stdlib resolver。
+外部 SVG 会被明确拒绝，不进行光栅化。
+`--web_max_image_pixels`、`--web_max_image_bytes`、
+`--web_max_total_image_bytes`、`--web_max_total_cache_bytes`、
+`--min_free_disk_bytes` 和 `--web_max_response_seconds` 分别限制图片像素、单响应
+大小、图片缓存总量、页面 body 加图片的总缓存量、最低剩余磁盘空间和单次响应的
+总 wall-clock 时间。响应流式读取期间也会持续预留配额并检查磁盘空间。
+
+也可以使用动态双 vLLM runner，让它在网页素材准备期间启动模型，并在某个模态
+完成后重新分配 GPU：
+
+```bash
+conda run -n MMDD python scripts/run_mm_joinability_dynamic_vllm.py \
+  --builder_script scripts/build_wdc_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_mm_joinability_run_001 \
+  --text_model_path /path/to/text-model \
+  --image_model_path /path/to/vision-model \
+  --cache_dir cache/wdc_mm_joinability_run_001 \
+  --max_source_tables 100 \
+  --max_scanned_files 1000 \
+  --max_rows_per_source_table 100 \
+  --max_images_per_entity 2 \
+  --web_workers 4
+```
+
+runner 会自动传入 `--precompute_model_cache`、两个模态的 endpoint files，
+以及 model start/ready/done markers。若手工管理 endpoint 池，可使用
+`--text_model_base_urls_file` 和 `--image_model_base_urls_file`；builder 会在请求前
+重新读取文件。
+
 ## Stage-1 逻辑连通性 Pipeline
 
 Stage-1 会基于已有的 `output_medium` artifact 构造 coarse recall benchmark 和训练流程。它不会重新抓取 Wikipedia，不会重建 `output_medium`，也不会把 `query_views` 当成监督标签。

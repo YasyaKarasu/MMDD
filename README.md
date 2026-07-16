@@ -171,6 +171,89 @@ This builder intentionally does not generate:
 
 The output is a multimodal table dataset plus query workload, not a joinability benchmark label generator.
 
+## WDC Schema.org Joinability Builder
+
+`build_wdc_mm_joinability_dataset.py` adapts the local WDC Schema.org Table
+Corpus 2023 gzip host tables and delegates query/target, qrel, and evidence-path
+construction to the existing joinability core. A conservative bounded run is:
+
+```bash
+conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_mm_joinability_run_001 \
+  --cache_dir cache/wdc_mm_joinability_run_001 \
+  --max_source_tables 100 \
+  --max_scanned_files 1000 \
+  --max_rows_per_source_table 100 \
+  --max_images_per_entity 2 \
+  --web_workers 4 \
+  --text_model_base_url http://127.0.0.1:8001/v1 \
+  --image_model_base_url http://127.0.0.1:8000/v1
+```
+
+The text and image OpenAI-compatible endpoints must be running before this
+direct command reaches model extraction. The builder lazily rotates across WDC
+class directories, bounds the number of in-flight web jobs, and writes sharded
+source tables, entities, bridge assets, table-asset links, queries, targets,
+attribute extractions, and evidence recoveries. Safe defaults are 100 accepted
+source tables, 1,000 attempted gzip files, 100 rows per source table, and 2
+images per entity. `--max_scanned_files` counts every attempted gzip, including
+malformed or rejected tables, independently of `--max_source_tables`. A zero
+row cap or non-positive scan/table cap is rejected unless `--allow_unbounded`
+is also set. Startup/final logs and `stats.json` record the active safety
+configuration and whether scan, source-table, or row truncation occurred;
+prefer staged, capped builds because later query construction intentionally
+keeps entity/asset indexes in memory. The source WDC
+`image` attribute is used only to discover assets and is excluded from all
+source/query/target/raw tables.
+
+For every selected entity the builder always fetches `page_url` for visible
+text and page-image candidates, even if a direct URL from the WDC `image`
+attribute already downloaded successfully. Direct image URLs are attempted
+first, and direct plus webpage images share the single
+`--max_images_per_entity` quota. Page metadata is cached in
+`<cache_dir>/wdc_web.sqlite3`, images in `<cache_dir>/wdc_images`, and model
+extractions in `<cache_dir>/model_attribute_extractions.jsonl`. Network and
+media errors are isolated in `web_fetch_failures.jsonl` and
+`media_download_failures.jsonl` under the output directory.
+
+Web requests reject URL userinfo and non-public resolved addresses. Each
+redirect hop is resolved and validated once, then the actual TCP connection is
+pinned to that vetted IP; HTTPS still uses the original hostname for SNI and
+certificate verification. A/AAAA and CNAME resolution uses the declared
+`dnspython` dependency with the remaining absolute response deadline; there is
+no unbounded stdlib resolver fallback. Untrusted SVG is deliberately rejected. Raster
+pixel count, per-response bytes, image-cache bytes, combined page-body plus
+image-cache bytes, minimum free disk, and total response wall-clock time are
+bounded by `--web_max_image_pixels`, `--web_max_image_bytes`,
+`--web_max_total_image_bytes`, `--web_max_total_cache_bytes`,
+`--min_free_disk_bytes`, and `--web_max_response_seconds` respectively. Cache
+reservations and free-space checks are repeated while responses stream.
+
+The dynamic two-vLLM runner can start and reallocate the model servers while
+the WDC builder prepares web assets. Point it at the WDC builder; arguments it
+does not own are passed through:
+
+```bash
+conda run -n MMDD python scripts/run_mm_joinability_dynamic_vllm.py \
+  --builder_script scripts/build_wdc_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_mm_joinability_run_001 \
+  --text_model_path /path/to/text-model \
+  --image_model_path /path/to/vision-model \
+  --cache_dir cache/wdc_mm_joinability_run_001 \
+  --max_source_tables 100 \
+  --max_scanned_files 1000 \
+  --max_rows_per_source_table 100 \
+  --max_images_per_entity 2 \
+  --web_workers 4
+```
+
+The runner supplies `--precompute_model_cache`, per-modality endpoint files,
+and model start/ready/done markers automatically. For manually managed endpoint
+pools, use `--text_model_base_urls_file` and
+`--image_model_base_urls_file`; the builder re-reads them before requests.
+
 ## Stage-1 Logic Connectivity Pipeline
 
 Stage-1 builds a coarse recall benchmark and training pipeline from the existing `output_medium` artifacts only. It does not refetch Wikipedia, does not rebuild `output_medium`, and does not use `query_views` as supervision.

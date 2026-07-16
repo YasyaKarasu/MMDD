@@ -8,7 +8,7 @@ The source corpus contains one JSONL-Gzip table per schema.org class/host. Each 
 
 ## Confirmed requirements
 
-- Read all extracted `*.json.gz` host tables under `wdc_schemaorg_2023`, with `--max_source_tables` available for bounded runs.
+- Discover extracted `*.json.gz` host tables under `wdc_schemaorg_2023` lazily and rotate across class directories. Safe runs default to at most 1,000 attempted gzip files and 100 accepted source tables.
 - Always fetch every selected entity's `page_url` for visible text and page-image candidates.
 - Also try every usable URL found recursively in the row's `image` value.
 - Direct `image`-column downloads consume the shared `max_images_per_entity` quota first. Page images only fill the remaining quota.
@@ -30,11 +30,13 @@ The source corpus contains one JSONL-Gzip table per schema.org class/host. Each 
 - The selected entity cell receives an internal entity lookup key in its existing `wiki_title` compatibility field. The value is a stable hash of class, source file, source row id, page URL, and display text, so rows sharing a page remain distinct.
 - `metadata.candidate_entity_columns` contains only the selected entity column. Column profiles use the shared Stage-1 profiling helper.
 - Malformed lines are counted and skipped. A file with fewer than `min_rows` valid rows or fewer than `min_cols` output columns is rejected.
-- `--max_rows_per_source_table 0` means unlimited. Bounded operational runs may set a positive cap without changing query construction over the retained source rows.
+- The safe default retains at most 100 valid rows per source table. Zero/non-positive scan, source-table, or row limits are accepted only with the explicit `--allow_unbounded` escape hatch.
+- `--max_scanned_files` is independent from the accepted-table cap. Every attempted gzip file, including malformed or rejected files, consumes the scan budget and appears in run statistics.
+- Row truncation is detected with one-record lookahead and exposed through the startup/final logs and `stats.json` safety counters.
 
 ## Generic webpage and image assets
 
-The generic web client uses `requests`, a descriptive configurable User-Agent, bounded response sizes, retries, connect/read timeouts, and a host-level minimum interval. HTML parsing uses the standard library and extracts:
+The generic web client uses a pinned standard-library HTTP transport, a descriptive configurable User-Agent, bounded response sizes, retries, connect/read timeouts, a total response wall-clock deadline, and a host-level minimum interval. Before a request it resolves A/AAAA (including CNAME following) through the declared `dnspython` dependency with the remaining absolute deadline, rejects any non-global answer, and pins the actual TCP connection to one vetted IP. There is no unbounded stdlib resolver fallback. HTTPS still uses the original hostname for SNI and certificate verification. URL userinfo is rejected and every manually followed redirect is independently resolved, validated, and pinned. HTML parsing uses the standard library and extracts:
 
 - document title and description metadata;
 - visible paragraph/heading/list text while excluding script, style, template, SVG, navigation, footer, form, and noscript content;
@@ -46,12 +48,13 @@ For every entity, the client performs the page fetch regardless of direct-image 
 2. parsed page image URLs;
 3. stop when `max_images_per_entity` successful unique images have been saved.
 
-Downloads are streamed with a byte limit. Raster images are verified with Pillow; SVG is rasterized through the repository's existing SVG helper. Tiny or extreme-aspect images and duplicate hashes are rejected. Saved bridge asset records retain source (`wdc_image_column` or `wdc_page_image`), original/final URL, page URL, local/relative path, bytes, SHA-256, width, height, and MIME type.
+Downloads are streamed with per-response byte and wall-clock limits. Raster images are verified with Pillow and checked against a decoded-pixel limit before loading. External SVG is intentionally rejected instead of rasterized. Tiny or extreme-aspect images and duplicate hashes are rejected. Saved bridge asset records retain source (`wdc_image_column` or `wdc_page_image`), original/final URL, page URL, local/relative path, bytes, SHA-256, width, height, and MIME type.
 
 ## Cache, errors, and repeatability
 
 - A SQLite cache under `<cache_dir>/wdc_web.sqlite3` stores successful page extraction results and terminal/retryable failure metadata.
 - Images live under `<cache_dir>/wdc_images` using stable URL-derived names; successful files are verified before reuse.
+- Cache accounting covers page response bodies and images together, with a separate image sub-cap. Reservations are checked during streaming, and minimum-free-disk checks run at startup and during cache growth. Legacy image rows backfill byte counts from their files; recovered orphan files enter the quota before reuse.
 - The build writes `web_fetch_failures.jsonl` and `media_download_failures.jsonl` in the output directory.
 - Stable hashes determine source table, entity, asset, split, query, target, and recovery identifiers.
 - Output directories follow the existing sharded artifact layout and manifest schema. WDC-specific counts and cache paths are added to `stats.json` and `dataset_manifest.json`.
@@ -65,7 +68,7 @@ The only shared-code adjustment is to let `table_record()` take the provenance b
 
 ## CLI and operational launch
 
-The CLI keeps the existing query, model, sharding, and asset-limit parameter names. WDC-specific controls include generic HTTP timeouts, retries, response/image byte caps, web workers, host delay, row cap, and cache paths.
+The CLI keeps the existing query, model, sharding, and asset-limit parameter names. Its deliberate safe defaults are 100 accepted source tables, 1,000 attempted gzip files, 100 rows per table, and 2 images per entity. WDC-specific controls include pinned HTTP timeouts and response deadline, retries, redirect count, response/image/pixel/total-cache byte caps, minimum free disk, web workers, host delay, scan/table/row caps, and cache paths. Startup logs, final logs, and statistics record the active safety configuration and whether scan, table, or row truncation occurred.
 
 The initial unattended tmux run will use a separate output/cache directory and a conservative bounded configuration. It will be monitored through input discovery and the first successful/failing web entities. If startup is stable, the tmux process remains running.
 
@@ -78,7 +81,8 @@ Unit tests use temporary gzip JSONL fixtures and fake sessions/downloads. They c
 - HTML text/image extraction;
 - the shared image quota with direct-image priority plus mandatory page fetch;
 - exact reuse of text chunk limits;
-- malformed input isolation and source-table limits;
+- malformed input isolation, independent attempted-file/source-table limits, and row-truncation reporting;
+- DNS rebinding resistance through connection pinning, redirect validation, total cache/disk quotas, legacy cache accounting, and response deadlines;
 - one small end-to-end build with a fake asset client and fake model extractor that verifies query/target/qrel output and absence of the `image` column.
 
 ## Out of scope

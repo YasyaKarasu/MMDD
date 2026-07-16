@@ -2,14 +2,18 @@ import gzip
 import hashlib
 import io
 import json
+import socket
 import sqlite3
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
+import dns.resolver
 from PIL import Image
 
 
@@ -73,6 +77,9 @@ class FakeResponse:
     def iter_content(self, chunk_size: int):
         for offset in range(0, len(self.body), chunk_size):
             yield self.body[offset : offset + chunk_size]
+
+    def close(self) -> None:
+        pass
 
 
 class FakeSession:
@@ -188,6 +195,9 @@ def test_direct_images_take_quota_but_page_is_always_fetched():
     ]
     assert len(images) == 2
     assert any(record["asset_type"] == "text" for record in records)
+    text_record = next(record for record in records if record["asset_type"] == "text")
+    assert text_record["page_url"] == "https://x.test/entity"
+    assert text_record["final_url"] == "https://x.test/final"
 
 
 def test_failed_direct_images_leave_full_quota_for_page_images():
@@ -454,9 +464,11 @@ def test_page_text_records_keep_bridge_contract_and_stable_ids():
         "text_chunk_count": 1,
         "selected_text_chunk_count": 1,
         "text_chunk_relevance_score": 6.0,
-        "source": "wdc_page_text_chunk",
-        "url": "https://x.test/final",
-    }
+            "source": "wdc_page_text_chunk",
+            "url": "https://x.test/final",
+            "page_url": "https://x.test/entity",
+            "final_url": "https://x.test/final",
+        }
 
 
 def test_extract_image_urls_recurses_resolves_and_deduplicates():
@@ -537,6 +549,217 @@ def test_fetch_page_reuses_sqlite_cache_across_clients(tmp_path):
     assert second_client.fetch_page(page_url) == first
     assert offline_session.calls == []
     assert (tmp_path / "wdc_web.sqlite3").is_file()
+
+
+def test_web_client_requests_identity_content_encoding(tmp_path):
+    session = FakeSession([])
+
+    WdcWebClient(tmp_path, session=session, host_delay=0)
+
+    assert session.headers["Accept-Encoding"] == "identity"
+
+
+def test_fetch_page_rejects_and_records_unexpected_content_encoding(tmp_path):
+    failures: list[dict[str, Any]] = []
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    gzip.compress(b"<p>must not parse compressed bytes</p>"),
+                    headers={
+                        "Content-Type": "text/html; charset=utf-8",
+                        "Content-Encoding": "gzip",
+                    },
+                )
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+        web_failure_callback=failures.append,
+    )
+
+    assert client.fetch_page("https://example.test/compressed") is None
+    assert failures[-1]["status"] == "terminal"
+    assert "unsupported_content_encoding:gzip" in failures[-1]["error"]
+
+
+def test_page_deadline_includes_initial_dns_resolution(tmp_path):
+    clock = FakeClock()
+    session = FakeSession([FakeResponse(b"<p>too late</p>")])
+
+    def slow_resolver(_host: str) -> list[str]:
+        clock.now += 0.6
+        return ["93.184.216.34"]
+
+    client = WdcWebClient(
+        tmp_path,
+        session=session,
+        host_delay=0,
+        max_retries=0,
+        max_response_seconds=0.5,
+        monotonic_fn=clock.monotonic,
+        resolve_host_fn=slow_resolver,
+    )
+
+    assert client.fetch_page("https://example.com/slow-dns") is None
+    assert session.calls == []
+
+
+def test_production_dns_timeout_does_not_fall_back_to_blocked_getaddrinfo(
+    tmp_path,
+    monkeypatch,
+):
+    blackhole = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blackhole.bind(("127.0.0.1", 0))
+    blackhole.settimeout(1.0)
+    dns_port = int(blackhole.getsockname()[1])
+    dns_query_received = threading.Event()
+    stop_blackhole = threading.Event()
+
+    def discard_dns_query() -> None:
+        try:
+            try:
+                blackhole.recvfrom(4096)
+            except TimeoutError:
+                return
+            else:
+                dns_query_received.set()
+                stop_blackhole.wait(timeout=1.0)
+        finally:
+            blackhole.close()
+
+    blackhole_thread = threading.Thread(target=discard_dns_query, daemon=True)
+    blackhole_thread.start()
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = ["127.0.0.1"]
+    resolver.port = dns_port
+    resolver.timeout = 5.0
+    monkeypatch.setattr(dns.resolver, "Resolver", lambda: resolver)
+
+    stdlib_started = threading.Event()
+    release_stdlib = threading.Event()
+
+    def blocked_getaddrinfo(*_args: Any, **_kwargs: Any) -> list[Any]:
+        stdlib_started.set()
+        release_stdlib.wait(timeout=1.0)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
+    session = FakeSession([FakeResponse(b"<p>must not be fetched</p>")])
+    client = WdcWebClient(
+        tmp_path,
+        session=session,
+        host_delay=0,
+        max_retries=0,
+        max_response_seconds=0.1,
+    )
+    completed = threading.Event()
+
+    def fetch() -> None:
+        try:
+            client.fetch_page("https://blocked-dns.example/entity")
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=fetch)
+    worker.start()
+    try:
+        assert completed.wait(timeout=0.5), "DNS resolution exceeded its deadline"
+        assert dns_query_received.is_set()
+        assert not stdlib_started.is_set()
+        assert session.calls == []
+    finally:
+        release_stdlib.set()
+        stop_blackhole.set()
+        worker.join(timeout=1.0)
+        blackhole_thread.join(timeout=1.0)
+
+
+def test_pinned_response_deadline_interrupts_blocking_drip_read():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+
+    def serve_drip() -> None:
+        try:
+            connection, _address = server.accept()
+            with connection:
+                connection.recv(4096)
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/html\r\n"
+                    b"Content-Length: 40\r\n\r\n"
+                )
+                for _index in range(40):
+                    try:
+                        connection.sendall(b"x")
+                    except OSError:
+                        break
+                    time.sleep(0.02)
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve_drip, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    response = wdc_builder._pinned_http_get(
+        f"http://localhost:{port}/drip",
+        pinned_ip="127.0.0.1",
+        server_hostname="localhost",
+        port=port,
+        headers={"Accept-Encoding": "identity"},
+        timeout=(0.5, 0.5),
+        deadline=started + 0.1,
+        monotonic_fn=time.monotonic,
+    )
+
+    with response, pytest.raises(TimeoutError):
+        list(response.iter_content(chunk_size=64 * 1024))
+    assert time.monotonic() - started < 0.5
+    thread.join(timeout=1.0)
+
+
+def test_pinned_response_deadline_interrupts_dripping_headers():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+
+    def serve_drip() -> None:
+        try:
+            connection, _address = server.accept()
+            with connection:
+                connection.recv(4096)
+                for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n":
+                    try:
+                        connection.sendall(bytes([byte]))
+                    except OSError:
+                        break
+                    time.sleep(0.02)
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve_drip, daemon=True)
+    thread.start()
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        wdc_builder._pinned_http_get(
+            f"http://localhost:{port}/drip-headers",
+            pinned_ip="127.0.0.1",
+            server_hostname="localhost",
+            port=port,
+            headers={"Accept-Encoding": "identity"},
+            timeout=(0.5, 0.5),
+            deadline=started + 0.1,
+            monotonic_fn=time.monotonic,
+        )
+    assert time.monotonic() - started < 0.5
+    thread.join(timeout=1.0)
 
 
 def test_fetch_page_caches_terminal_failure_without_raising(tmp_path):
@@ -797,16 +1020,8 @@ def test_download_image_replaces_cache_file_when_sha_does_not_match_index(tmp_pa
     assert len(replacement_session.calls) == 1
 
 
-def test_download_image_rasterizes_svg_with_repository_helper(tmp_path, monkeypatch):
+def test_download_image_rejects_svg_without_rasterizing(tmp_path):
     svg_body = b'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="60"></svg>'
-
-    def fake_rasterize(svg_path, png_path, imageinfo):
-        assert svg_path.read_bytes() == svg_body
-        assert imageinfo["mime"] == "image/svg+xml"
-        png_path.write_bytes(png_bytes(80, 60))
-        return True, "fake"
-
-    monkeypatch.setattr(wdc_builder, "rasterize_svg_to_png", fake_rasterize)
     client = WdcWebClient(
         tmp_path,
         session=FakeSession(
@@ -829,12 +1044,27 @@ def test_download_image_rasterizes_svg_with_repository_helper(tmp_path, monkeypa
         entity_id="ent_svg",
     )
 
-    assert record is not None
-    assert record["mime_type"] == "image/png"
-    assert record["converted_from"] == "image/svg+xml"
-    assert record["width"] == 80
-    assert record["height"] == 60
+    assert record is None
     assert not list((tmp_path / "wdc_images").glob("*.tmp"))
+
+
+def test_download_image_rejects_raster_over_pixel_limit_before_load(tmp_path):
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [FakeResponse(png_bytes(100, 100), headers={"Content-Type": "image/png"})]
+        ),
+        host_delay=0,
+        max_retries=0,
+        max_image_pixels=5_000,
+    )
+
+    assert client.download_image(
+        "https://cdn.test/too-many-pixels.png",
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="ent_pixels",
+    ) is None
 
 
 @pytest.mark.parametrize(("width", "height"), [(16, 16), (1000, 32)])
@@ -1222,3 +1452,810 @@ def test_read_wdc_table_rejects_tables_below_thresholds(tmp_path):
     assert too_few_rows.skip_reason is not None
     assert too_few_cols.source_table is None
     assert too_few_cols.skip_reason is not None
+
+
+def _read_sharded_records(output_dir: Path, artifact: str) -> list[dict[str, Any]]:
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+    return [
+        json.loads(line)
+        for shard in manifest["artifacts"][artifact]["shards"]
+        for line in (output_dir / shard["path"]).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_build_dataset_small_wdc_end_to_end(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    rows = [
+        {
+            "row_id": index,
+            "name": f"Entity {index}",
+            "category": f"Category {index}",
+            "detail": f"Detail {index}",
+            "region": f"Region {index % 2}",
+            "page_url": f"https://pages.test/entity-{index}",
+            "image": [f"https://images.test/direct-{index}.png"],
+        }
+        for index in range(6)
+    ]
+    write_gzip_rows(input_dir, rows)
+
+    class FakeSharedWebClient:
+        def __init__(self) -> None:
+            self.fetch_page_calls: list[str] = []
+            self.download_image_calls: list[tuple[str, str]] = []
+
+        def fetch_page(self, page_url: str) -> dict[str, Any]:
+            self.fetch_page_calls.append(page_url)
+            entity_number = page_url.rsplit("-", 1)[-1]
+            chunks = [
+                f"Entity {entity_number} has useful bridge evidence in chunk {chunk}."
+                for chunk in range(3)
+            ]
+            return {
+                "final_url": page_url,
+                "text": "\n\n".join(chunks),
+                "image_urls": [
+                    f"https://images.test/page-{entity_number}-0.png",
+                    f"https://images.test/page-{entity_number}-1.png",
+                ],
+            }
+
+        def download_image(
+            self,
+            image_url: str,
+            *,
+            page_url: str,
+            source: str,
+            entity_id: str,
+        ) -> dict[str, Any]:
+            self.download_image_calls.append((image_url, source))
+            return {
+                "asset_id": f"asset_img_{stable_hash(entity_id, source, image_url)}",
+                "entity_id": entity_id,
+                "asset_type": "image",
+                "source": source,
+                "image_url": image_url,
+                "page_url": page_url,
+                "sha256": stable_hash(image_url, length=64),
+            }
+
+    class FakeExtractor:
+        def extract(
+            self,
+            asset: dict[str, Any],
+            entity: dict[str, Any],
+            candidate_attribute_names: list[str],
+        ) -> dict[str, Any]:
+            entity_number = int(entity["cell_text"].rsplit(" ", 1)[-1])
+            attributes = []
+            if entity_number < 3:
+                attributes.append(
+                    {
+                        "name": "category",
+                        "value": f"Category {entity_number}",
+                        "evidence": "visible category value",
+                        "connection_evidence": "visible entity name",
+                    }
+                )
+            return {"attributes": attributes, "raw_response": "", "error": ""}
+
+    shared_client = FakeSharedWebClient()
+    web_factory_calls: list[dict[str, Any]] = []
+
+    def web_client_factory(**kwargs: Any) -> FakeSharedWebClient:
+        web_factory_calls.append(kwargs)
+        return shared_client
+
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--cache_dir",
+            str(tmp_path / "cache"),
+            "--max_source_tables",
+            "1",
+            "--max_images_per_entity",
+            "2",
+            "--text_asset_chunk_chars",
+            "80",
+            "--min_text_asset_chunk_chars",
+            "1",
+            "--max_text_asset_chunks_per_entity",
+            "3",
+            "--min_recovered_value_ratio",
+            "0.6",
+            "--min_recovery_denominator",
+            "2",
+            "--web_workers",
+            "3",
+            "--records_per_shard",
+            "2",
+            "--no_model_progress",
+        ]
+    )
+
+    stats = wdc_builder.build_dataset(
+        args,
+        web_client_factory=web_client_factory,
+        extractor_factory=lambda _args: FakeExtractor(),
+    )
+
+    assert len(web_factory_calls) == 1
+    assert len(shared_client.fetch_page_calls) == 6
+    assert [source for _url, source in shared_client.download_image_calls].count(
+        "wdc_image_column"
+    ) == 6
+    assert [source for _url, source in shared_client.download_image_calls].count(
+        "wdc_page_image"
+    ) == 6
+
+    sources = _read_sharded_records(output_dir, "source_tables")
+    queries = _read_sharded_records(output_dir, "query_tables")
+    targets = _read_sharded_records(output_dir, "data_lake_tables")
+    recoveries = _read_sharded_records(output_dir, "evidence_recoveries")
+    qrels = [
+        json.loads(line)
+        for line in (output_dir / "qrels.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(sources) == len(queries) == len(targets) == len(qrels) == 1
+    assert recoveries
+    query = queries[0]
+    target = targets[0]
+    assert len(query["rows"]) == len(target["rows"]) == 5
+    assert query["source_row_indices"] == target["source_row_indices"]
+    assert qrels[0]["query_table_id"] == query["table_id"]
+    assert qrels[0]["target_table_id"] == target["table_id"]
+    assert query["provenance"]["builder"] == "build_wdc_mm_joinability_dataset.py"
+    assert target["provenance"]["builder"] == "build_wdc_mm_joinability_dataset.py"
+    for table in [*sources, *queries, *targets]:
+        assert "image" not in [column["column_name"] for column in table["columns"]]
+        assert '"column_name": "image"' not in json.dumps(table)
+
+    manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+    persisted_stats = json.loads((output_dir / "stats.json").read_text(encoding="utf-8"))
+    assert stats["source_tables"] == stats["query_tables"] == stats["qrels"] == 1
+    assert persisted_stats == stats
+    assert manifest["source_corpus"] == "WDC Schema.org Table Corpus 2023"
+    assert manifest["web_cache"]["database"].endswith("wdc_web.sqlite3")
+    assert manifest["artifacts"]["bridge_assets"]["total_records"] == 30
+
+
+def test_web_failure_callback_is_best_effort_and_structured(tmp_path):
+    failures: list[dict[str, Any]] = []
+
+    def failing_callback(record: dict[str, Any]) -> None:
+        failures.append(record)
+        raise RuntimeError("logging must not abort fetching")
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([FakeResponse(b"missing", status_code=404)]),
+        host_delay=0,
+        max_retries=0,
+        web_failure_callback=failing_callback,
+    )
+
+    assert client.fetch_page("https://example.test/missing") is None
+    assert failures == [
+        {
+            "failure_type": "web_fetch_failure",
+            "page_url": "https://example.test/missing",
+            "status": "terminal",
+            "http_status": 404,
+            "error": "HTTP 404",
+        }
+    ]
+
+
+def test_wdc_file_discovery_rotates_classes_without_path_rglob(tmp_path, monkeypatch):
+    for class_name in ("Alpha", "Beta"):
+        class_dir = tmp_path / class_name
+        class_dir.mkdir()
+        for index in range(3):
+            (class_dir / f"{class_name}_{index}.json.gz").touch()
+
+    monkeypatch.setattr(
+        Path,
+        "rglob",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Path.rglob may materialize scandir entries on Python 3.10")
+        ),
+    )
+    iterator = wdc_builder.iter_wdc_gzip_paths(tmp_path)
+
+    assert [next(iterator).parent.name for _ in range(4)] == [
+        "Alpha",
+        "Beta",
+        "Alpha",
+        "Beta",
+    ]
+
+
+def test_web_host_delay_does_not_block_a_different_host(tmp_path):
+    sleeping = threading.Event()
+    release_sleep = threading.Event()
+    other_host_done = threading.Event()
+
+    def blocking_sleep(_seconds: float) -> None:
+        sleeping.set()
+        release_sleep.wait(timeout=2)
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=1,
+        sleep_fn=blocking_sleep,
+        monotonic_fn=lambda: 0.0,
+    )
+    client._last_request_by_host["slow.test"] = 0.0
+    slow_thread = threading.Thread(
+        target=client._wait_for_host, args=("https://slow.test/a",)
+    )
+    other_thread = threading.Thread(
+        target=lambda: (
+            client._wait_for_host("https://other.test/b"),
+            other_host_done.set(),
+        )
+    )
+    slow_thread.start()
+    assert sleeping.wait(timeout=1)
+    other_thread.start()
+    try:
+        assert other_host_done.wait(timeout=0.2)
+    finally:
+        release_sleep.set()
+        slow_thread.join(timeout=2)
+        other_thread.join(timeout=2)
+
+
+def test_entity_fairness_lookahead_interleaves_contiguous_hosts():
+    entities = [
+        {"entity_id": f"a-{index}", "page_url": f"https://a.test/{index}"}
+        for index in range(3)
+    ] + [
+        {"entity_id": f"b-{index}", "page_url": f"https://b.test/{index}"}
+        for index in range(3)
+    ]
+
+    ordered = list(wdc_builder.iter_fair_entities(entities, lookahead=6))
+
+    assert [urlsplit(item["page_url"]).netloc for item in ordered[:4]] == [
+        "a.test",
+        "b.test",
+        "a.test",
+        "b.test",
+    ]
+
+
+def test_entity_fairness_tolerates_malformed_page_url():
+    entities = [
+        {"entity_id": "bad", "page_url": "http://["},
+        {"entity_id": "good", "page_url": "https://good.test/page"},
+    ]
+
+    assert list(wdc_builder.iter_fair_entities(entities, lookahead=2)) == entities
+
+
+def test_dynamic_runner_flags_parse_and_zero_pending_tasks_write_markers(tmp_path):
+    start_marker = tmp_path / "runtime" / "start.json"
+    ready_marker = tmp_path / "runtime" / "ready.json"
+    text_done_marker = tmp_path / "runtime" / "text-done.json"
+    image_done_marker = tmp_path / "runtime" / "image-done.json"
+    text_endpoints = tmp_path / "runtime" / "text-endpoints.txt"
+    image_endpoints = tmp_path / "runtime" / "image-endpoints.txt"
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "empty-input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--cache_dir",
+            str(tmp_path / "cache"),
+            "--text_model_base_url",
+            "http://127.0.0.1:8101/v1",
+            "--text_model_base_urls_file",
+            str(text_endpoints),
+            "--text_model_name",
+            "fake-text",
+            "--image_model_base_url",
+            "http://127.0.0.1:8100/v1",
+            "--image_model_base_urls_file",
+            str(image_endpoints),
+            "--image_model_name",
+            "fake-image",
+            "--precompute_model_cache",
+            "--model_start_marker",
+            str(start_marker),
+            "--model_ready_marker",
+            str(ready_marker),
+            "--model_text_done_marker",
+            str(text_done_marker),
+            "--model_image_done_marker",
+            str(image_done_marker),
+            "--text_model_workers",
+            "2",
+            "--image_model_workers",
+            "3",
+            "--no_model_progress",
+        ]
+    )
+    Path(args.input_dir).mkdir()
+    extractor_calls: list[bool] = []
+
+    class UnusedClient:
+        pass
+
+    stats = wdc_builder.build_dataset(
+        args,
+        web_client_factory=lambda **_kwargs: UnusedClient(),
+        extractor_factory=lambda _args: extractor_calls.append(True),
+    )
+
+    assert stats["source_tables"] == 0
+    assert extractor_calls == []
+    assert not ready_marker.exists()
+    assert json.loads(start_marker.read_text(encoding="utf-8"))[
+        "text_task_count"
+    ] == 0
+    assert json.loads(start_marker.read_text(encoding="utf-8"))[
+        "image_task_count"
+    ] == 0
+    assert json.loads(text_done_marker.read_text(encoding="utf-8"))[
+        "model_kind"
+    ] == "text"
+    assert json.loads(image_done_marker.read_text(encoding="utf-8"))[
+        "model_kind"
+    ] == "image"
+
+
+def test_media_failure_callback_is_best_effort_and_structured(tmp_path):
+    failures: list[dict[str, Any]] = []
+
+    def failing_callback(record: dict[str, Any]) -> None:
+        failures.append(record)
+        raise RuntimeError("logging must not abort image handling")
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        media_failure_callback=failing_callback,
+    )
+
+    assert client.download_image(
+        "not-an-image-url",
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="ent_failure",
+    ) is None
+    assert failures == [
+        {
+            "failure_type": "media_download_failure",
+            "entity_id": "ent_failure",
+            "page_url": "https://example.test/page",
+            "image_url": "not-an-image-url",
+            "source": "wdc_page_image",
+            "error": "invalid_image_url",
+        }
+    ]
+
+
+def test_cached_terminal_page_failure_is_reported_in_each_run(tmp_path):
+    page_url = "https://example.test/permanent-missing"
+    first_failures: list[dict[str, Any]] = []
+    first = WdcWebClient(
+        tmp_path,
+        session=FakeSession([FakeResponse(b"missing", status_code=404)]),
+        host_delay=0,
+        max_retries=0,
+        web_failure_callback=first_failures.append,
+    )
+    assert first.fetch_page(page_url) is None
+
+    cached_failures: list[dict[str, Any]] = []
+    second_session = FakeSession([])
+    second = WdcWebClient(
+        tmp_path,
+        session=second_session,
+        host_delay=0,
+        max_retries=0,
+        web_failure_callback=cached_failures.append,
+    )
+
+    assert second.fetch_page(page_url) is None
+    assert second_session.calls == []
+    assert cached_failures == first_failures
+
+
+def test_bridge_asset_helper_records_swallowed_fetch_and_download_exceptions():
+    client = FakeWdcAssetClient(
+        page=RuntimeError("page exploded"),
+        image_outcomes={
+            "https://img.test/direct-1.jpg": RuntimeError("image exploded"),
+            "https://img.test/direct-2.jpg": None,
+        },
+    )
+    web_failures: list[dict[str, Any]] = []
+    media_failures: list[dict[str, Any]] = []
+
+    wdc_builder.build_wdc_bridge_assets_for_entity(
+        wdc_asset_entity(),
+        client,
+        1,
+        web_failure_callback=web_failures.append,
+        media_failure_callback=media_failures.append,
+    )
+
+    assert web_failures[0]["failure_type"] == "web_fetch_failure"
+    assert "page exploded" in web_failures[0]["error"]
+    assert media_failures[0]["failure_type"] == "media_download_failure"
+    assert media_failures[0]["image_url"] == "https://img.test/direct-1.jpg"
+    assert "image exploded" in media_failures[0]["error"]
+
+
+def test_build_writes_swallowed_client_exceptions_to_failure_jsonl(tmp_path):
+    input_dir = tmp_path / "input"
+    write_gzip_rows(
+        input_dir,
+        [
+            {
+                "row_id": index,
+                "name": f"Entity {index}",
+                "detail": f"Detail {index}",
+                "page_url": f"https://pages.test/{index}",
+                "image": f"https://images.test/{index}.png",
+            }
+            for index in range(2)
+        ],
+    )
+    client = FakeWdcAssetClient(
+        page=RuntimeError("page exploded"),
+        image_outcomes={
+            "https://images.test/0.png": RuntimeError("image zero exploded"),
+            "https://images.test/1.png": RuntimeError("image one exploded"),
+        },
+    )
+    output_dir = tmp_path / "output"
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--cache_dir",
+            str(tmp_path / "cache"),
+            "--max_source_tables",
+            "1",
+            "--web_workers",
+            "1",
+            "--no_model_progress",
+        ]
+    )
+
+    wdc_builder.build_dataset(
+        args,
+        web_client_factory=lambda **_kwargs: client,
+        extractor_factory=lambda _args: object(),
+    )
+
+    web_records = [
+        json.loads(line)
+        for line in (output_dir / "web_fetch_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    media_records = [
+        json.loads(line)
+        for line in (output_dir / "media_download_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(web_records) == 2
+    assert all("page exploded" in record["error"] for record in web_records)
+    assert len(media_records) == 2
+    assert all("exploded" in record["error"] for record in media_records)
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "http://127.0.0.1/private",
+        "http://169.254.169.254/latest/meta-data",
+        "http://user:password@example.com/secret",
+    ],
+)
+def test_web_client_rejects_unsafe_or_userinfo_urls_before_request(tmp_path, unsafe_url):
+    failures: list[dict[str, Any]] = []
+    session = FakeSession([])
+    client = WdcWebClient(
+        tmp_path,
+        session=session,
+        host_delay=0,
+        web_failure_callback=failures.append,
+    )
+
+    assert client.fetch_page(unsafe_url) is None
+    assert session.calls == []
+    assert failures and failures[0]["status"] == "terminal"
+    assert failures[0]["error"].startswith("unsafe_url:")
+
+
+def test_web_client_validates_each_redirect_hop_against_ssrf(tmp_path):
+    failures: list[dict[str, Any]] = []
+    session = FakeSession(
+        [
+            FakeResponse(
+                b"redirect",
+                status_code=302,
+                url="https://public.test/start",
+                headers={"Location": "http://127.0.0.1/internal"},
+            )
+        ]
+    )
+    client = WdcWebClient(
+        tmp_path,
+        session=session,
+        host_delay=0,
+        max_retries=0,
+        resolve_host_fn=lambda _host: ["93.184.216.34"],
+        web_failure_callback=failures.append,
+    )
+
+    assert client.fetch_page("https://public.test/start") is None
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["allow_redirects"] is False
+    assert failures[0]["error"].startswith("unsafe_redirect:")
+
+
+def test_production_transport_pins_first_validated_dns_answer(tmp_path):
+    resolver_calls: list[str] = []
+    pinned_calls: list[tuple[str, str]] = []
+
+    def rebinding_resolver(host: str) -> list[str]:
+        resolver_calls.append(host)
+        return ["93.184.216.34"] if len(resolver_calls) == 1 else ["127.0.0.1"]
+
+    def pinned_request(url: str, *, pinned_ip: str, server_hostname: str, **_kwargs):
+        pinned_calls.append((pinned_ip, server_hostname))
+        return FakeResponse(b"<p>Pinned public response.</p>", url=url)
+
+    client = WdcWebClient(
+        tmp_path,
+        host_delay=0,
+        max_retries=0,
+        resolve_host_fn=rebinding_resolver,
+        pinned_request_fn=pinned_request,
+    )
+
+    assert client.fetch_page("https://rebind.test/page") is not None
+    assert resolver_calls == ["rebind.test"]
+    assert pinned_calls == [("93.184.216.34", "rebind.test")]
+
+
+def test_total_image_byte_quota_stops_cache_growth(tmp_path):
+    body = png_bytes()
+    failures: list[dict[str, Any]] = []
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [FakeResponse(body, headers={"Content-Type": "image/png"})]
+        ),
+        host_delay=0,
+        max_retries=0,
+        max_total_image_bytes=len(body) - 1,
+        media_failure_callback=failures.append,
+    )
+
+    assert client.download_image(
+        "https://cdn.test/quota.png",
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="ent_quota",
+    ) is None
+    assert failures[-1]["error"] == "download_or_validation_failed"
+    assert not list((tmp_path / "wdc_images").glob("image_*"))
+
+
+def test_unbounded_input_requires_explicit_opt_in(tmp_path):
+    base = ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "out")]
+
+    assert wdc_builder.parse_args(base).max_rows_per_source_table == 100
+    with pytest.raises(SystemExit):
+        wdc_builder.parse_args([*base, "--max_rows_per_source_table", "0"])
+    allowed = wdc_builder.parse_args(
+        [*base, "--max_rows_per_source_table", "0", "--allow_unbounded"]
+    )
+    assert allowed.allow_unbounded is True
+
+
+def test_legacy_image_cache_bytes_are_backfilled_from_actual_files(tmp_path):
+    image_dir = tmp_path / "wdc_images"
+    image_dir.mkdir()
+    body = png_bytes()
+    image_path = image_dir / "image_legacy.png"
+    image_path.write_bytes(body)
+    database_path = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE image_cache (
+                original_url TEXT PRIMARY KEY, final_url TEXT NOT NULL,
+                file_name TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE,
+                width INTEGER NOT NULL, height INTEGER NOT NULL,
+                mime_type TEXT NOT NULL, updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO image_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "https://cdn.test/legacy.png",
+                "https://cdn.test/legacy.png",
+                image_path.name,
+                hashlib.sha256(body).hexdigest(),
+                64,
+                48,
+                "image/png",
+                0.0,
+            ),
+        )
+
+    client = WdcWebClient(tmp_path, session=FakeSession([]), host_delay=0)
+
+    with sqlite3.connect(database_path) as connection:
+        indexed_bytes = connection.execute(
+            "SELECT bytes FROM image_cache WHERE original_url = ?",
+            ("https://cdn.test/legacy.png",),
+        ).fetchone()[0]
+    assert indexed_bytes == len(body)
+    assert client._image_bytes_total == len(body)
+
+
+def test_orphan_image_recovery_counts_bytes_against_total_quota(tmp_path):
+    image_url = "https://cdn.test/orphan-counted.png"
+    image_dir = tmp_path / "wdc_images"
+    image_dir.mkdir()
+    body = png_bytes()
+    orphan = image_dir / f"image_{stable_hash(image_url, length=24)}.png"
+    orphan.write_bytes(body)
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        max_total_image_bytes=len(body),
+    )
+
+    assert client.download_image(
+        image_url,
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="ent_orphan_counted",
+    ) is not None
+    assert client._image_bytes_total == len(body)
+
+
+def test_page_body_obeys_total_web_cache_byte_cap(tmp_path):
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([FakeResponse(b"<p>body exceeds quota</p>")]),
+        host_delay=0,
+        max_retries=0,
+        max_total_cache_bytes=5,
+    )
+
+    assert client.fetch_page("https://example.test/quota") is None
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT status FROM page_cache WHERE page_url = ?",
+            ("https://example.test/quota",),
+        ).fetchone() != ("success",)
+
+
+def test_page_stream_obeys_total_response_deadline(tmp_path):
+    clock = FakeClock()
+
+    class DripResponse(FakeResponse):
+        def iter_content(self, chunk_size: int):
+            for chunk in (b"<p>", b"slow</p>"):
+                clock.now += 0.4
+                yield chunk
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([DripResponse(b"")]),
+        host_delay=0,
+        max_retries=0,
+        max_response_seconds=0.5,
+        monotonic_fn=clock.monotonic,
+    )
+
+    assert client.fetch_page("https://example.test/drip") is None
+
+
+def test_safe_defaults_and_scan_cap_bound_rejected_file_walk(tmp_path):
+    input_dir = tmp_path / "input"
+    for index in range(5):
+        write_gzip_rows(
+            input_dir,
+            [{"name": f"Only {index}", "page_url": f"https://x.test/{index}"}],
+            name=f"Thing_{index}.json.gz",
+        )
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--cache_dir",
+            str(tmp_path / "cache"),
+            "--max_scanned_files",
+            "2",
+            "--no_model_progress",
+        ]
+    )
+    assert args.max_source_tables == 100
+    assert args.max_rows_per_source_table == 100
+    assert args.max_images_per_entity == 2
+
+    stats = wdc_builder.build_dataset(
+        args,
+        web_client_factory=lambda **_kwargs: FakeWdcAssetClient(
+            page=None, image_outcomes={}
+        ),
+        extractor_factory=lambda _args: object(),
+    )
+
+    assert stats["scanned_files"] == 2
+    assert stats["processed_tables"] == 2
+    assert stats["scanned_file_cap_reached"] is True
+
+
+def test_stats_and_logs_show_row_truncation_safety_config(tmp_path, caplog):
+    input_dir = tmp_path / "input"
+    write_gzip_rows(
+        input_dir,
+        [
+            {
+                "name": f"Entity {index}",
+                "detail": f"Detail {index}",
+                "page_url": f"https://x.test/{index}",
+            }
+            for index in range(3)
+        ],
+    )
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--cache_dir",
+            str(tmp_path / "cache"),
+            "--max_source_tables",
+            "1",
+            "--max_rows_per_source_table",
+            "2",
+            "--max_scanned_files",
+            "1",
+            "--no_model_progress",
+        ]
+    )
+
+    with caplog.at_level("INFO"):
+        stats = wdc_builder.build_dataset(
+            args,
+            web_client_factory=lambda **_kwargs: FakeWdcAssetClient(
+                page=None, image_outcomes={}
+            ),
+            extractor_factory=lambda _args: object(),
+        )
+
+    assert stats["row_capped_source_tables"] == 1
+    assert stats["safety_config"]["max_rows_per_source_table"] == 2
+    assert "WDC safety limits" in caplog.text

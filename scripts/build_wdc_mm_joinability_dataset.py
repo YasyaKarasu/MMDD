@@ -3,36 +3,234 @@
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
+import http.client
+import ipaddress
 import json
+import logging
+import os
+import shutil
+import socket
+import ssl
 import sqlite3
 import threading
 import time
 import uuid
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urljoin, urlsplit
 
+import dns.exception
+import dns.resolver
 from PIL import Image
 
+import build_mm_joinability_dataset as join_builder
 from build_mm_table_dataset import (
-    rasterize_svg_to_png,
+    ShardedJsonlWriter,
+    iter_jsonl_records,
+    normalize_title,
     select_relevant_text_chunks,
     split_text_asset_content,
+    write_jsonl_record,
+    write_table_asset_links_from_jsonl,
 )
-from stage1_io import clean_text, column_profiles, is_numeric_text, stable_hash
-
-try:
-    import requests
-except ImportError:  # pragma: no cover - requests is a declared runtime dependency.
-    requests = None  # type: ignore[assignment]
-
+from stage1_io import (
+    clean_text,
+    column_profiles,
+    is_numeric_text,
+    setup_logging,
+    stable_hash,
+    write_json,
+    write_jsonl,
+)
 
 ENTITY_COLUMN_PRIORITY = ("name", "headline", "title", "identifier", "page_url")
 EXCLUDED_COLUMNS = {"row_id", "image"}
+DEFAULT_CACHE_DIR = Path("cache") / "wdc_mm_joinability"
+
+
+@dataclass(frozen=True)
+class _ValidatedTarget:
+    url: str
+    host: str
+    port: int
+    pinned_ip: str
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect TCP to a vetted IP while retaining hostname TLS verification."""
+
+    def __init__(
+        self,
+        pinned_ip: str,
+        port: int,
+        *,
+        server_hostname: str,
+        timeout: float,
+    ) -> None:
+        super().__init__(
+            pinned_ip,
+            port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._verified_server_hostname = server_hostname
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        assert self.sock is not None
+        self.sock = self._context.wrap_socket(
+            self.sock,
+            server_hostname=self._verified_server_hostname,
+        )
+
+
+class _PinnedResponse:
+    def __init__(
+        self,
+        response: http.client.HTTPResponse,
+        connection: http.client.HTTPConnection,
+        url: str,
+        *,
+        deadline: float,
+        monotonic_fn: Callable[[], float],
+        deadline_timer: threading.Timer,
+    ) -> None:
+        self._response = response
+        self._connection = connection
+        self.status_code = int(response.status)
+        self.headers = response.headers
+        self.url = url
+        self._deadline = deadline
+        self._monotonic_fn = monotonic_fn
+        self._deadline_timer = deadline_timer
+        content_type = clean_text(response.headers.get("Content-Type"))
+        self.encoding = "utf-8"
+        if "charset=" in content_type.casefold():
+            self.encoding = content_type.rsplit("charset=", 1)[-1].split(";", 1)[0].strip()
+
+    def __enter__(self) -> "_PinnedResponse":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        self.close()
+        return False
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        read_size = max(1, min(int(chunk_size), 16 * 1024))
+        while True:
+            remaining = self._deadline - float(self._monotonic_fn())
+            if remaining <= 0:
+                raise TimeoutError("response deadline exceeded")
+            if self._connection.sock is not None:
+                self._connection.sock.settimeout(max(0.001, remaining))
+            try:
+                chunk = self._response.read1(read_size)
+            except OSError as exc:
+                if float(self._monotonic_fn()) >= self._deadline:
+                    raise TimeoutError("response deadline exceeded") from exc
+                raise
+            if float(self._monotonic_fn()) > self._deadline:
+                raise TimeoutError("response deadline exceeded")
+            if not chunk:
+                return
+            yield chunk
+
+    def close(self) -> None:
+        self._deadline_timer.cancel()
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+
+def _pinned_http_get(
+    url: str,
+    *,
+    pinned_ip: str,
+    server_hostname: str,
+    port: int,
+    headers: dict[str, str],
+    timeout: tuple[float, float],
+    deadline: float,
+    monotonic_fn: Callable[[], float],
+    **_kwargs: Any,
+) -> _PinnedResponse:
+    parsed = urlsplit(url)
+    remaining = deadline - float(monotonic_fn())
+    if remaining <= 0:
+        raise TimeoutError("response deadline exceeded")
+    connect_timeout = min(float(timeout[0]), remaining)
+    connection: http.client.HTTPConnection
+    if parsed.scheme.casefold() == "https":
+        connection = _PinnedHTTPSConnection(
+            pinned_ip,
+            port,
+            server_hostname=server_hostname,
+            timeout=connect_timeout,
+        )
+    else:
+        connection = http.client.HTTPConnection(
+            pinned_ip,
+            port,
+            timeout=connect_timeout,
+        )
+    request_target = parsed.path or "/"
+    if parsed.query:
+        request_target = f"{request_target}?{parsed.query}"
+    default_port = 443 if parsed.scheme.casefold() == "https" else 80
+    host_name = f"[{server_hostname}]" if ":" in server_hostname else server_hostname
+    host_header = host_name if port == default_port else f"{host_name}:{port}"
+    deadline_expired = threading.Event()
+
+    def abort_at_deadline() -> None:
+        deadline_expired.set()
+        if connection.sock is not None:
+            try:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    deadline_timer = threading.Timer(
+        max(0.0, deadline - float(monotonic_fn())),
+        abort_at_deadline,
+    )
+    deadline_timer.daemon = True
+    deadline_timer.start()
+    try:
+        connection.request(
+            "GET",
+            request_target,
+            headers={**headers, "Host": host_header},
+        )
+        remaining = deadline - float(monotonic_fn())
+        if remaining <= 0:
+            raise TimeoutError("response deadline exceeded")
+        if connection.sock is not None:
+            connection.sock.settimeout(min(float(timeout[1]), remaining))
+        response = connection.getresponse()
+        if deadline_expired.is_set() or float(monotonic_fn()) >= deadline:
+            raise TimeoutError("response deadline exceeded")
+    except BaseException as exc:
+        deadline_timer.cancel()
+        connection.close()
+        if deadline_expired.is_set() or float(monotonic_fn()) >= deadline:
+            raise TimeoutError("response deadline exceeded") from exc
+        raise
+    return _PinnedResponse(
+        response,
+        connection,
+        url,
+        deadline=deadline,
+        monotonic_fn=monotonic_fn,
+        deadline_timer=deadline_timer,
+    )
 
 
 @dataclass
@@ -42,6 +240,7 @@ class WdcTableResult:
     image_urls_by_entity: dict[str, list[str]]
     skip_reason: str | None
     malformed_rows: int
+    rows_truncated: bool = False
 
 
 def _looks_like_relative_url(value: str) -> bool:
@@ -194,32 +393,62 @@ class WdcWebClient:
         retry_base_seconds: float = 0.25,
         max_page_bytes: int = 2_000_000,
         max_image_bytes: int = 10_000_000,
+        max_image_pixels: int = 25_000_000,
+        max_total_image_bytes: int = 100_000_000_000,
+        max_total_cache_bytes: int = 120_000_000_000,
+        min_free_disk_bytes: int = 1_000_000_000,
+        max_response_seconds: float = 120.0,
         min_image_side: int = 32,
         max_image_aspect_ratio: float = 20.0,
+        max_redirects: int = 3,
         host_delay: float = 0.5,
         sleep_fn: Any = time.sleep,
         monotonic_fn: Any = time.monotonic,
+        resolve_host_fn: Callable[[str], Iterable[str]] | None = None,
+        pinned_request_fn: Callable[..., Any] | None = None,
+        web_failure_callback: Callable[[dict[str, Any]], None] | None = None,
+        media_failure_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        if session is None and requests is None:
-            raise RuntimeError("requests is required for WDC web asset fetching")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.database_path = self.cache_dir / "wdc_web.sqlite3"
         self.image_dir = self.cache_dir / "wdc_images"
-        self.session = session if session is not None else requests.Session()
-        self.session.headers.update({"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
+        self.session = session
+        self._session_injected = session is not None
+        self._session_headers = {
+            "User-Agent": user_agent,
+            "Accept-Encoding": "identity",
+        }
+        if self.session is not None:
+            self.session.headers.update(self._session_headers)
         self.timeout = (max(0.01, connect_timeout), max(0.01, read_timeout))
         self.max_retries = max(0, max_retries)
         self.retry_base_seconds = max(0.0, retry_base_seconds)
         self.max_page_bytes = max(1, max_page_bytes)
         self.max_image_bytes = max(1, max_image_bytes)
+        self.max_image_pixels = max(1, int(max_image_pixels))
+        self.max_total_image_bytes = max(1, int(max_total_image_bytes))
+        self.max_total_cache_bytes = max(1, int(max_total_cache_bytes))
+        self.min_free_disk_bytes = max(0, int(min_free_disk_bytes))
+        self.max_response_seconds = max(0.01, float(max_response_seconds))
         self.min_image_side = max(1, min_image_side)
         self.max_image_aspect_ratio = max(1.0, max_image_aspect_ratio)
+        self.max_redirects = max(0, int(max_redirects))
         self.host_delay = max(0.0, host_delay)
         self.sleep_fn = sleep_fn
         self.monotonic_fn = monotonic_fn
-        self._host_lock = threading.Lock()
+        self.web_failure_callback = web_failure_callback
+        self.media_failure_callback = media_failure_callback
+        self.resolve_host_fn = resolve_host_fn
+        self.pinned_request_fn = pinned_request_fn
+        self._host_map_lock = threading.Lock()
+        self._host_locks: dict[str, threading.Lock] = {}
         self._last_request_by_host: dict[str, float] = {}
+        self._image_quota_lock = threading.Lock()
+        self._image_bytes_total = 0
+        self._page_bytes_total = 0
+        self._image_bytes_in_flight = 0
+        self._cache_bytes_in_flight = 0
         self._image_locks = tuple(
             threading.Lock() for _ in range(self._IMAGE_LOCK_STRIPES)
         )
@@ -242,6 +471,7 @@ class WdcWebClient:
                     image_urls_json TEXT,
                     http_status INTEGER,
                     error TEXT,
+                    body_bytes INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 )
                 """
@@ -256,14 +486,234 @@ class WdcWebClient:
                     width INTEGER NOT NULL,
                     height INTEGER NOT NULL,
                     mime_type TEXT NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(image_cache)")
+            }
+            if "bytes" not in columns:
+                connection.execute(
+                    "ALTER TABLE image_cache ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0"
+                )
+            page_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(page_cache)")
+            }
+            if "body_bytes" not in page_columns:
+                connection.execute(
+                    "ALTER TABLE page_cache ADD COLUMN body_bytes INTEGER NOT NULL DEFAULT 0"
+                )
+            for row in connection.execute(
+                "SELECT original_url, file_name FROM image_cache WHERE bytes <= 0"
+            ):
+                path = self.image_dir / str(row["file_name"])
+                try:
+                    actual_bytes = path.stat().st_size
+                except OSError:
+                    actual_bytes = 0
+                connection.execute(
+                    "UPDATE image_cache SET bytes = ? WHERE original_url = ?",
+                    (actual_bytes, row["original_url"]),
+                )
+            for row in connection.execute(
+                """
+                SELECT page_url, text, image_urls_json
+                FROM page_cache WHERE status = 'success' AND body_bytes <= 0
+                """
+            ):
+                estimated_bytes = len((row["text"] or "").encode("utf-8")) + len(
+                    (row["image_urls_json"] or "").encode("utf-8")
+                )
+                connection.execute(
+                    "UPDATE page_cache SET body_bytes = ? WHERE page_url = ?",
+                    (estimated_bytes, row["page_url"]),
+                )
+            self._image_bytes_total = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(bytes), 0) FROM image_cache"
+                ).fetchone()[0]
+            )
+            self._page_bytes_total = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(body_bytes), 0) FROM page_cache WHERE status = 'success'"
+                ).fetchone()[0]
+            )
+
+    def _reserve_cache_bytes(self, amount: int, *, image: bool) -> bool:
+        amount = max(0, int(amount))
+        with self._image_quota_lock:
+            if image and (
+                self._image_bytes_total + self._image_bytes_in_flight + amount
+                > self.max_total_image_bytes
+            ):
+                return False
+            if (
+                self._image_bytes_total
+                + self._page_bytes_total
+                + self._cache_bytes_in_flight
+                + amount
+                > self.max_total_cache_bytes
+            ):
+                return False
+            try:
+                free = int(shutil.disk_usage(self.cache_dir).free)
+            except OSError:
+                return False
+            if free < self.min_free_disk_bytes + self._cache_bytes_in_flight + amount:
+                return False
+            self._cache_bytes_in_flight += amount
+            if image:
+                self._image_bytes_in_flight += amount
+            return True
+
+    def _release_cache_bytes(self, amount: int, *, image: bool) -> None:
+        amount = max(0, int(amount))
+        with self._image_quota_lock:
+            self._cache_bytes_in_flight = max(0, self._cache_bytes_in_flight - amount)
+            if image:
+                self._image_bytes_in_flight = max(
+                    0, self._image_bytes_in_flight - amount
+                )
+
+    def _resolved_addresses(self, host: str, *, deadline: float) -> list[str]:
+        if float(self.monotonic_fn()) >= deadline:
+            raise TimeoutError("dns deadline exceeded")
+        try:
+            return [str(ipaddress.ip_address(host))]
+        except ValueError:
+            pass
+        if self.resolve_host_fn is not None:
+            addresses = [clean_text(value) for value in self.resolve_host_fn(host)]
+            if float(self.monotonic_fn()) >= deadline:
+                raise TimeoutError("dns deadline exceeded")
+            return addresses
+        if self._session_injected and host.endswith(".test"):
+            # RFC 2606 test hosts are non-routable; allow injected fake sessions
+            # without depending on external DNS in unit tests.
+            return ["93.184.216.34"]
+        resolver = dns.resolver.Resolver()
+        addresses: set[str] = set()
+        for record_type in ("A", "AAAA"):
+            remaining = deadline - float(self.monotonic_fn())
+            if remaining <= 0:
+                raise TimeoutError("dns deadline exceeded")
+            try:
+                answer = resolver.resolve(
+                    host,
+                    record_type,
+                    lifetime=remaining,
+                    search=False,
+                )
+            except dns.resolver.NXDOMAIN:
+                return []
+            except dns.resolver.NoAnswer:
+                continue
+            except (dns.resolver.LifetimeTimeout, dns.exception.Timeout) as exc:
+                raise TimeoutError("dns deadline exceeded") from exc
+            except dns.resolver.NoNameservers as exc:
+                raise ValueError("dns_no_nameservers") from exc
+            addresses.update(clean_text(value) for value in answer)
+        return sorted(addresses)
+
+    def _validate_target(self, value: str, *, deadline: float) -> _ValidatedTarget:
+        url = clean_text(value)
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname
+            _port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"malformed:{exc}") from exc
+        if parsed.scheme.casefold() not in {"http", "https"} or not host:
+            raise ValueError("scheme_or_host")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("userinfo")
+        try:
+            normalized_host = host.encode("idna").decode("ascii").casefold().rstrip(".")
+        except UnicodeError as exc:
+            raise ValueError("invalid_hostname") from exc
+        addresses = self._resolved_addresses(normalized_host, deadline=deadline)
+        if not addresses:
+            raise ValueError("unresolved_host")
+        for address in addresses:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise ValueError(f"invalid_resolved_address:{address}") from exc
+            if not ip.is_global:
+                raise ValueError(f"non_global_address:{address}")
+        default_port = 443 if parsed.scheme.casefold() == "https" else 80
+        return _ValidatedTarget(
+            url=url,
+            host=normalized_host,
+            port=int(parsed.port or default_port),
+            pinned_ip=addresses[0],
+        )
+
+    def _validate_url(self, value: str, *, deadline: float) -> str:
+        return self._validate_target(value, deadline=deadline).url
+
+    def _request_with_redirects(
+        self,
+        url: str,
+        *,
+        initial_target: _ValidatedTarget | None = None,
+        deadline: float,
+        **kwargs: Any,
+    ) -> tuple[Any, str]:
+        current_target = initial_target or self._validate_target(url, deadline=deadline)
+        for redirect_index in range(self.max_redirects + 1):
+            if float(self.monotonic_fn()) >= deadline:
+                raise TimeoutError("response deadline exceeded")
+            current_url = current_target.url
+            self._wait_for_host(current_url)
+            if float(self.monotonic_fn()) >= deadline:
+                raise TimeoutError("response deadline exceeded")
+            response = self._session_get(
+                current_url,
+                pinned_target=current_target,
+                deadline=deadline,
+                allow_redirects=False,
+                **kwargs,
+            )
+            status = int(response.status_code)
+            if status not in {301, 302, 303, 307, 308}:
+                response_url = clean_text(getattr(response, "url", None)) or current_url
+                effective_url = current_url
+                if response_url != current_url:
+                    try:
+                        effective_url = self._validate_url(response_url, deadline=deadline)
+                    except Exception:
+                        response.close()
+                        raise
+                return response, effective_url
+            location = clean_text(response.headers.get("Location"))
+            response.close()
+            if not location:
+                raise ValueError("redirect_without_location")
+            next_url = urljoin(current_url, location)
+            try:
+                current_target = self._validate_target(next_url, deadline=deadline)
+            except Exception as exc:
+                raise ValueError(f"unsafe_redirect:{exc}") from exc
+            if float(self.monotonic_fn()) >= deadline:
+                raise TimeoutError("response deadline exceeded")
+            if redirect_index >= self.max_redirects:
+                raise ValueError("too_many_redirects")
+        raise ValueError("too_many_redirects")
 
     def _wait_for_host(self, url: str) -> None:
-        host = urlsplit(url).netloc.casefold()
-        with self._host_lock:
+        try:
+            parsed = urlsplit(url)
+            host = (parsed.hostname or parsed.netloc).casefold().rstrip(".")
+        except ValueError:
+            host = stable_hash(url, length=16)
+        with self._host_map_lock:
+            host_lock = self._host_locks.setdefault(host, threading.Lock())
+        with host_lock:
             now = float(self.monotonic_fn())
             last_request = self._last_request_by_host.get(host)
             if last_request is not None:
@@ -272,6 +722,39 @@ class WdcWebClient:
                     self.sleep_fn(wait_seconds)
                     now = float(self.monotonic_fn())
             self._last_request_by_host[host] = now
+
+    def _session_get(
+        self,
+        url: str,
+        *,
+        pinned_target: _ValidatedTarget | None = None,
+        deadline: float,
+        **kwargs: Any,
+    ) -> Any:
+        if self.session is not None:
+            return self.session.get(url, **kwargs)
+        target = pinned_target or self._validate_target(url, deadline=deadline)
+        request_fn = self.pinned_request_fn or _pinned_http_get
+        transport_kwargs = dict(kwargs)
+        transport_kwargs.pop("timeout", None)
+        return request_fn(
+            url,
+            pinned_ip=target.pinned_ip,
+            server_hostname=target.host,
+            port=target.port,
+            headers=self._session_headers,
+            timeout=self.timeout,
+            deadline=deadline,
+            monotonic_fn=self.monotonic_fn,
+            **transport_kwargs,
+        )
+
+    @staticmethod
+    def _unsupported_content_encoding(response: Any) -> str | None:
+        content_encoding = clean_text(response.headers.get("Content-Encoding")).casefold()
+        if not content_encoding or content_encoding == "identity":
+            return None
+        return content_encoding
 
     def _cached_page(self, page_url: str) -> tuple[str | None, dict[str, Any] | None]:
         with self._connect() as connection:
@@ -282,7 +765,13 @@ class WdcWebClient:
         if row is None:
             return None, None
         if row["status"] != "success":
-            return str(row["status"]), None
+            return str(row["status"]), {
+                "failure_type": "web_fetch_failure",
+                "page_url": page_url,
+                "status": str(row["status"]),
+                "http_status": row["http_status"],
+                "error": clean_text(row["error"]),
+            }
         try:
             image_urls = json.loads(row["image_urls_json"] or "[]")
         except json.JSONDecodeError:
@@ -302,8 +791,8 @@ class WdcWebClient:
                 """
                 INSERT INTO page_cache (
                     page_url, status, final_url, text, image_urls_json,
-                    http_status, error, updated_at
-                ) VALUES (?, 'success', ?, ?, ?, ?, NULL, ?)
+                    http_status, error, body_bytes, updated_at
+                ) VALUES (?, 'success', ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(page_url) DO UPDATE SET
                     status = excluded.status,
                     final_url = excluded.final_url,
@@ -311,6 +800,7 @@ class WdcWebClient:
                     image_urls_json = excluded.image_urls_json,
                     http_status = excluded.http_status,
                     error = NULL,
+                    body_bytes = excluded.body_bytes,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -319,6 +809,7 @@ class WdcWebClient:
                     payload["text"],
                     json.dumps(payload["image_urls"], ensure_ascii=False),
                     200,
+                    int(payload.get("body_bytes", 0)),
                     time.time(),
                 ),
             )
@@ -350,24 +841,89 @@ class WdcWebClient:
                 """,
                 (page_url, status, http_status, error[:1000], time.time()),
             )
+        self._report_failure(
+            self.web_failure_callback,
+            {
+                "failure_type": "web_fetch_failure",
+                "page_url": page_url,
+                "status": status,
+                "http_status": http_status,
+                "error": error[:1000],
+            },
+        )
+
+    @staticmethod
+    def _report_failure(
+        callback: Callable[[dict[str, Any]], None] | None,
+        record: dict[str, Any],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(record)
+        except Exception:
+            logging.exception("WDC failure callback raised; continuing")
 
     def fetch_page(self, page_url: str) -> dict[str, Any] | None:
         """Fetch, extract, and cache one page without retaining response HTML."""
+        deadline = float(self.monotonic_fn()) + self.max_response_seconds
         page_url = clean_text(page_url)
         if not extract_image_urls(page_url):
+            self._store_page_failure(
+                page_url,
+                status="terminal",
+                http_status=None,
+                error="unsafe_url:invalid_url",
+            )
+            return None
+        try:
+            initial_target = self._validate_target(page_url, deadline=deadline)
+            page_url = initial_target.url
+        except Exception as exc:
+            self._store_page_failure(
+                page_url,
+                status="terminal",
+                http_status=None,
+                error=f"unsafe_url:{exc}",
+            )
+            return None
+        if float(self.monotonic_fn()) >= deadline:
+            self._store_page_failure(
+                page_url,
+                status="terminal",
+                http_status=None,
+                error="page response deadline exceeded",
+            )
             return None
         cache_status, cached = self._cached_page(page_url)
         if cache_status == "success":
             return cached
         if cache_status == "terminal":
+            if isinstance(cached, dict):
+                self._report_failure(self.web_failure_callback, cached)
             return None
 
         last_error = "request failed"
         last_http_status: int | None = None
         for attempt in range(self.max_retries + 1):
+            reserved_bytes = 0
             try:
-                self._wait_for_host(page_url)
-                with self.session.get(page_url, stream=True, timeout=self.timeout) as response:
+                response, final_url = self._request_with_redirects(
+                    page_url,
+                    initial_target=initial_target,
+                    deadline=deadline,
+                    stream=True,
+                    timeout=self.timeout,
+                )
+                with response:
+                    if float(self.monotonic_fn()) >= deadline:
+                        self._store_page_failure(
+                            page_url,
+                            status="terminal",
+                            http_status=None,
+                            error="page response deadline exceeded",
+                        )
+                        return None
                     http_status = int(response.status_code)
                     if http_status >= 400:
                         retryable = (
@@ -384,10 +940,29 @@ class WdcWebClient:
                             error=f"HTTP {http_status}",
                         )
                         return None
+                    content_encoding = self._unsupported_content_encoding(response)
+                    if content_encoding is not None:
+                        self._store_page_failure(
+                            page_url,
+                            status="terminal",
+                            http_status=http_status,
+                            error=f"unsupported_content_encoding:{content_encoding}",
+                        )
+                        return None
                     body = bytearray()
                     for chunk in response.iter_content(chunk_size=64 * 1024):
                         if not chunk:
                             continue
+                        if (
+                            float(self.monotonic_fn()) >= deadline
+                        ):
+                            self._store_page_failure(
+                                page_url,
+                                status="terminal",
+                                http_status=http_status,
+                                error="page response deadline exceeded",
+                            )
+                            return None
                         if len(body) + len(chunk) > self.max_page_bytes:
                             self._store_page_failure(
                                 page_url,
@@ -396,32 +971,57 @@ class WdcWebClient:
                                 error="page response exceeded byte limit",
                             )
                             return None
+                        if not self._reserve_cache_bytes(len(chunk), image=False):
+                            self._store_page_failure(
+                                page_url,
+                                status="terminal",
+                                http_status=http_status,
+                                error="page cache or disk byte quota exceeded",
+                            )
+                            return None
+                        reserved_bytes += len(chunk)
                         body.extend(chunk)
                     encoding = getattr(response, "encoding", None) or "utf-8"
                     html_text = bytes(body).decode(encoding, errors="replace")
-                    final_url = clean_text(getattr(response, "url", None)) or page_url
                     text, image_urls = extract_html_assets(html_text, final_url)
                     payload = {
                         "page_url": page_url,
                         "final_url": final_url,
                         "text": text,
                         "image_urls": image_urls,
+                        "body_bytes": len(body),
                     }
                     self._store_page(payload)
+                    with self._image_quota_lock:
+                        self._page_bytes_total += len(body)
+                    payload.pop("body_bytes", None)
                     return payload
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 last_http_status = None
+                if "deadline exceeded" in str(exc):
+                    self._store_page_failure(
+                        page_url,
+                        status="terminal",
+                        http_status=None,
+                        error="page response deadline exceeded",
+                    )
+                    return None
                 if attempt < self.max_retries:
                     self.sleep_fn(self.retry_base_seconds * (2**attempt))
                     continue
+                status = "terminal" if "unsafe_redirect:" in str(exc) else "retryable"
+                error = str(exc) if "unsafe_redirect:" in str(exc) else last_error
                 self._store_page_failure(
                     page_url,
-                    status="retryable",
+                    status=status,
                     http_status=last_http_status,
-                    error=last_error,
+                    error=error,
                 )
                 return None
+            finally:
+                if reserved_bytes:
+                    self._release_cache_bytes(reserved_bytes, image=False)
 
         self._store_page_failure(
             page_url,
@@ -440,22 +1040,96 @@ class WdcWebClient:
         entity_id: str,
     ) -> dict[str, Any] | None:
         """Download one image candidate within the configured byte limit."""
+        deadline = float(self.monotonic_fn()) + self.max_response_seconds
         image_url = clean_text(image_url)
         if not extract_image_urls(image_url):
+            self._report_failure(
+                self.media_failure_callback,
+                {
+                    "failure_type": "media_download_failure",
+                    "entity_id": entity_id,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "source": source,
+                    "error": "invalid_image_url",
+                },
+            )
+            return None
+        if float(self.monotonic_fn()) >= deadline:
+            self._report_failure(
+                self.media_failure_callback,
+                {
+                    "failure_type": "media_download_failure",
+                    "entity_id": entity_id,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "source": source,
+                    "error": "image response deadline exceeded",
+                },
+            )
+            return None
+        try:
+            initial_target = self._validate_target(image_url, deadline=deadline)
+            image_url = initial_target.url
+        except Exception as exc:
+            self._report_failure(
+                self.media_failure_callback,
+                {
+                    "failure_type": "media_download_failure",
+                    "entity_id": entity_id,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "source": source,
+                    "error": f"unsafe_url:{exc}",
+                },
+            )
+            return None
+        try:
+            if urlsplit(image_url).path.casefold().endswith(".svg"):
+                self._report_failure(
+                    self.media_failure_callback,
+                    {
+                        "failure_type": "media_download_failure",
+                        "entity_id": entity_id,
+                        "page_url": page_url,
+                        "image_url": image_url,
+                        "source": source,
+                        "error": "svg_rejected",
+                    },
+                )
+                return None
+        except ValueError:
             return None
         lock_index = int(stable_hash(image_url, length=8), 16) % len(self._image_locks)
         with self._image_locks[lock_index]:
-            return self._download_image_locked(
+            record = self._download_image_locked(
                 image_url,
+                initial_target=initial_target,
+                deadline=deadline,
                 page_url=page_url,
                 source=source,
                 entity_id=entity_id,
             )
+        if record is None:
+            self._report_failure(
+                self.media_failure_callback,
+                {
+                    "failure_type": "media_download_failure",
+                    "entity_id": entity_id,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "source": source,
+                    "error": "download_or_validation_failed",
+                },
+            )
+        return record
 
     def _download_image_locked(
         self,
         image_url: str,
         *,
+        initial_target: _ValidatedTarget,
+        deadline: float,
         page_url: str,
         source: str,
         entity_id: str,
@@ -464,7 +1138,6 @@ class WdcWebClient:
         image_key = stable_hash(image_url, length=24)
         attempt_key = uuid.uuid4().hex
         temporary_path = self.image_dir / f".{image_key}.{attempt_key}.download.tmp"
-        converted_path = self.image_dir / f".{image_key}.{attempt_key}.raster.tmp.png"
 
         with self._connect() as connection:
             cached_row = connection.execute(
@@ -491,16 +1164,15 @@ class WdcWebClient:
                     height=height,
                     mime_type=mime_type,
                     downloaded=False,
-                    converted_from=(
-                        "image/svg+xml"
-                        if urlsplit(image_url).path.casefold().endswith(".svg")
-                        else None
-                    ),
                 )
             with self._connect() as connection:
                 connection.execute(
                     "DELETE FROM image_cache WHERE original_url = ?",
                     (image_url,),
+                )
+            with self._image_quota_lock:
+                self._image_bytes_total = max(
+                    0, self._image_bytes_total - int(cached_row["bytes"] or 0)
                 )
             try:
                 cached_path.unlink(missing_ok=True)
@@ -516,15 +1188,28 @@ class WdcWebClient:
                     pass
                 continue
             width, height, mime_type, _extension = raster
+            existing_bytes = cached_path.stat().st_size
             try:
-                self._store_image_index(
-                    original_url=image_url,
-                    final_url=image_url,
-                    path=cached_path,
-                    width=width,
-                    height=height,
-                    mime_type=mime_type,
-                )
+                with self._image_quota_lock:
+                    if (
+                        self._image_bytes_total + existing_bytes
+                        > self.max_total_image_bytes
+                        or self._image_bytes_total
+                        + self._page_bytes_total
+                        + existing_bytes
+                        > self.max_total_cache_bytes
+                    ):
+                        cached_path.unlink(missing_ok=True)
+                        return None
+                    self._store_image_index(
+                        original_url=image_url,
+                        final_url=image_url,
+                        path=cached_path,
+                        width=width,
+                        height=height,
+                        mime_type=mime_type,
+                    )
+                    self._image_bytes_total += existing_bytes
             except sqlite3.IntegrityError:
                 try:
                     cached_path.unlink(missing_ok=True)
@@ -542,19 +1227,24 @@ class WdcWebClient:
                 height=height,
                 mime_type=mime_type,
                 downloaded=False,
-                converted_from=(
-                    "image/svg+xml"
-                    if urlsplit(image_url).path.casefold().endswith(".svg")
-                    else None
-                ),
             )
 
         for attempt in range(self.max_retries + 1):
+            reserved_bytes = 0
             try:
                 temporary_path.unlink(missing_ok=True)
-                converted_path.unlink(missing_ok=True)
-                self._wait_for_host(image_url)
-                with self.session.get(image_url, stream=True, timeout=self.timeout) as response:
+                if float(self.monotonic_fn()) >= deadline:
+                    return None
+                response, final_url = self._request_with_redirects(
+                    image_url,
+                    initial_target=initial_target,
+                    deadline=deadline,
+                    stream=True,
+                    timeout=self.timeout,
+                )
+                with response:
+                    if float(self.monotonic_fn()) >= deadline:
+                        return None
                     http_status = int(response.status_code)
                     if http_status >= 400:
                         retryable = (
@@ -565,35 +1255,54 @@ class WdcWebClient:
                             self.sleep_fn(self.retry_base_seconds * (2**attempt))
                             continue
                         return None
+                    content_encoding = self._unsupported_content_encoding(response)
+                    if content_encoding is not None:
+                        self._report_failure(
+                            self.media_failure_callback,
+                            {
+                                "failure_type": "media_download_failure",
+                                "entity_id": entity_id,
+                                "page_url": page_url,
+                                "image_url": image_url,
+                                "source": source,
+                                "error": (
+                                    "unsupported_content_encoding:"
+                                    f"{content_encoding}"
+                                ),
+                            },
+                        )
+                        return None
                     content_type = clean_text(response.headers.get("Content-Type")).casefold()
                     if content_type and not content_type.startswith("image/"):
+                        return None
+                    if content_type.split(";", 1)[0] == "image/svg+xml":
                         return None
                     total_bytes = 0
                     with temporary_path.open("wb") as handle:
                         for chunk in response.iter_content(chunk_size=64 * 1024):
                             if not chunk:
                                 continue
+                            if (
+                                float(self.monotonic_fn()) >= deadline
+                            ):
+                                return None
                             total_bytes += len(chunk)
                             if total_bytes > self.max_image_bytes:
                                 return None
+                            if not self._reserve_cache_bytes(len(chunk), image=True):
+                                return None
+                            reserved_bytes += len(chunk)
                             handle.write(chunk)
-                    final_url = clean_text(getattr(response, "url", None)) or image_url
 
                 source_mime_type = content_type.split(";", 1)[0]
-                source_is_svg = (
-                    source_mime_type == "image/svg+xml"
-                    or urlsplit(final_url).path.casefold().endswith(".svg")
-                )
-                raster_path = temporary_path
-                if source_is_svg:
-                    converted, _reason = rasterize_svg_to_png(
-                        temporary_path,
-                        converted_path,
-                        {"mime": "image/svg+xml", "url": final_url},
-                    )
-                    if not converted:
+                if source_mime_type == "image/svg+xml":
+                    return None
+                try:
+                    if urlsplit(final_url).path.casefold().endswith(".svg"):
                         return None
-                    raster_path = converted_path
+                except ValueError:
+                    return None
+                raster_path = temporary_path
 
                 raster = self._validated_raster(raster_path)
                 if raster is None:
@@ -621,6 +1330,8 @@ class WdcWebClient:
                 except sqlite3.IntegrityError:
                     image_path.unlink(missing_ok=True)
                     return None
+                with self._image_quota_lock:
+                    self._image_bytes_total += image_path.stat().st_size
                 return self._image_record(
                     image_path,
                     original_url=image_url,
@@ -632,15 +1343,29 @@ class WdcWebClient:
                     height=height,
                     mime_type=mime_type,
                     downloaded=True,
-                    converted_from="image/svg+xml" if source_is_svg else None,
                 )
-            except Exception:
+            except Exception as exc:
+                if "deadline exceeded" in str(exc):
+                    self._report_failure(
+                        self.media_failure_callback,
+                        {
+                            "failure_type": "media_download_failure",
+                            "entity_id": entity_id,
+                            "page_url": page_url,
+                            "image_url": image_url,
+                            "source": source,
+                            "error": "image response deadline exceeded",
+                        },
+                    )
+                    return None
                 if attempt < self.max_retries:
                     self.sleep_fn(self.retry_base_seconds * (2**attempt))
                     continue
                 return None
             finally:
-                for cleanup_path in (temporary_path, converted_path):
+                if reserved_bytes:
+                    self._release_cache_bytes(reserved_bytes, image=True)
+                for cleanup_path in (temporary_path,):
                     try:
                         cleanup_path.unlink(missing_ok=True)
                     except OSError:
@@ -655,8 +1380,12 @@ class WdcWebClient:
             with Image.open(path) as image:
                 image_format = str(image.format or "").upper()
                 width, height = image.size
+                if width <= 0 or height <= 0 or width * height > self.max_image_pixels:
+                    return None
                 image.verify()
             with Image.open(path) as image:
+                if image.width * image.height > self.max_image_pixels:
+                    return None
                 image.load()
         except Exception:
             return None
@@ -701,8 +1430,8 @@ class WdcWebClient:
                 """
                 INSERT INTO image_cache (
                     original_url, final_url, file_name, sha256,
-                    width, height, mime_type, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    width, height, mime_type, bytes, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(original_url) DO UPDATE SET
                     final_url = excluded.final_url,
                     file_name = excluded.file_name,
@@ -710,6 +1439,7 @@ class WdcWebClient:
                     width = excluded.width,
                     height = excluded.height,
                     mime_type = excluded.mime_type,
+                    bytes = excluded.bytes,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -720,6 +1450,7 @@ class WdcWebClient:
                     width,
                     height,
                     mime_type,
+                    path.stat().st_size,
                     time.time(),
                 ),
             )
@@ -737,7 +1468,6 @@ class WdcWebClient:
         height: int,
         mime_type: str,
         downloaded: bool,
-        converted_from: str | None = None,
     ) -> dict[str, Any]:
         record = {
             "asset_id": f"asset_img_{stable_hash(entity_id, source, original_url, length=20)}",
@@ -758,8 +1488,6 @@ class WdcWebClient:
             "mime_type": mime_type,
             "downloaded": downloaded,
         }
-        if converted_from:
-            record["converted_from"] = converted_from
         return record
 
 
@@ -770,12 +1498,26 @@ def build_wdc_bridge_assets_for_entity(
     text_asset_chunk_chars: int = 800,
     min_text_asset_chunk_chars: int = 120,
     max_text_asset_chunks_per_entity: int = 3,
+    *,
+    web_failure_callback: Callable[[dict[str, Any]], None] | None = None,
+    media_failure_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Build webpage text and direct-first image assets for one WDC entity."""
     page_url = clean_text(entity.get("page_url"))
     try:
         fetched_page = client.fetch_page(page_url)
-    except Exception:
+    except Exception as exc:
+        WdcWebClient._report_failure(
+            web_failure_callback,
+            {
+                "failure_type": "web_fetch_failure",
+                "entity_id": entity.get("entity_id"),
+                "page_url": page_url,
+                "status": "client_exception",
+                "http_status": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
         fetched_page = None
     page = fetched_page if isinstance(fetched_page, dict) else None
     records: list[dict[str, Any]] = []
@@ -808,6 +1550,8 @@ def build_wdc_bridge_assets_for_entity(
                     "text_chunk_relevance_score": round(chunk_score, 6),
                     "source": "wdc_page_text_chunk",
                     "url": clean_text(page.get("final_url")) or page_url,
+                    "page_url": page_url,
+                    "final_url": clean_text(page.get("final_url")) or page_url,
                 }
             )
 
@@ -834,7 +1578,18 @@ def build_wdc_bridge_assets_for_entity(
                     source=source,
                     entity_id=entity["entity_id"],
                 )
-            except Exception:
+            except Exception as exc:
+                WdcWebClient._report_failure(
+                    media_failure_callback,
+                    {
+                        "failure_type": "media_download_failure",
+                        "entity_id": entity.get("entity_id"),
+                        "page_url": page_url,
+                        "image_url": normalized_url,
+                        "source": source,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
                 continue
             if not isinstance(image_record, dict):
                 continue
@@ -870,13 +1625,79 @@ def _schema_class(relative_source: str) -> str:
     return filename.split("_", 1)[0].removesuffix(".json.gz")
 
 
-def _read_rows(path: Path, max_rows: int) -> tuple[list[dict[str, Any]], int]:
+def _iter_scandir_gzip_files(root: Path, *, recursive: bool) -> Iterator[Path]:
+    """Walk with closeable scandir iterators and no per-directory file list."""
+    stack: list[Any] = []
+    try:
+        stack.append(os.scandir(root))
+        while stack:
+            iterator = stack[-1]
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                iterator.close()
+                stack.pop()
+                continue
+            try:
+                if recursive and entry.is_dir(follow_symlinks=False):
+                    stack.append(os.scandir(entry.path))
+                elif entry.is_file(follow_symlinks=False) and entry.name.endswith(
+                    ".json.gz"
+                ):
+                    yield Path(entry.path)
+            except OSError:
+                continue
+    finally:
+        for iterator in reversed(stack):
+            try:
+                iterator.close()
+            except Exception:
+                pass
+
+
+def iter_wdc_gzip_paths(input_root: Path) -> Iterator[Path]:
+    """Yield gzip host tables lazily, rotating across schema.org classes."""
+    input_root = Path(input_root)
+    class_dirs: list[Path] = []
+    with os.scandir(input_root) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    class_dirs.append(Path(entry.path))
+            except OSError:
+                continue
+    class_dirs.sort(key=lambda path: path.name)
+    iterators: list[Iterator[Path]] = [
+        _iter_scandir_gzip_files(input_root, recursive=False),
+        *(
+            _iter_scandir_gzip_files(class_dir, recursive=True)
+            for class_dir in class_dirs
+        ),
+    ]
+    active = list(iterators)
+    try:
+        while active:
+            next_active: list[Iterator[Path]] = []
+            for iterator in active:
+                try:
+                    yield next(iterator)
+                except StopIteration:
+                    continue
+                next_active.append(iterator)
+            active = next_active
+    finally:
+        for iterator in iterators:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+
+def _read_rows(path: Path, max_rows: int) -> tuple[list[dict[str, Any]], int, bool]:
     rows: list[dict[str, Any]] = []
     malformed_rows = 0
+    rows_truncated = False
     with gzip.open(path, "rb") as handle:
         for raw_line in handle:
-            if max_rows > 0 and len(rows) >= max_rows:
-                break
             if not raw_line.strip():
                 continue
             try:
@@ -888,8 +1709,11 @@ def _read_rows(path: Path, max_rows: int) -> tuple[list[dict[str, Any]], int]:
             if not isinstance(row, dict):
                 malformed_rows += 1
                 continue
+            if max_rows > 0 and len(rows) >= max_rows:
+                rows_truncated = True
+                break
             rows.append(row)
-    return rows, malformed_rows
+    return rows, malformed_rows, rows_truncated
 
 
 def _first_seen_columns(rows: list[dict[str, Any]]) -> list[str]:
@@ -940,6 +1764,7 @@ def _empty_result(reason: str, malformed_rows: int) -> WdcTableResult:
         image_urls_by_entity={},
         skip_reason=reason,
         malformed_rows=malformed_rows,
+        rows_truncated=False,
     )
 
 
@@ -951,7 +1776,7 @@ def read_wdc_table(
     max_rows: int = 0,
 ) -> WdcTableResult:
     """Read one WDC gzip host table and adapt it to the internal table contract."""
-    raw_rows, malformed_rows = _read_rows(path, max_rows)
+    raw_rows, malformed_rows, rows_truncated = _read_rows(path, max_rows)
     if len(raw_rows) < min_rows:
         return _empty_result("too_few_rows", malformed_rows)
 
@@ -1028,6 +1853,7 @@ def read_wdc_table(
         "num_cols": len(columns),
         "columns": columns,
         "rows": rows,
+        "provenance_builder": "build_wdc_mm_joinability_dataset.py",
         "metadata": {"candidate_entity_columns": [entity_column], "column_profiles": []},
     }
     profiles = column_profiles(source_table)
@@ -1049,4 +1875,876 @@ def read_wdc_table(
         image_urls_by_entity=image_urls_by_entity,
         skip_reason=None,
         malformed_rows=malformed_rows,
+        rows_truncated=rows_truncated,
     )
+
+
+class _FailureJsonlRecorder:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self.count = 0
+
+    def reset(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
+        self.count = 0
+
+    def record(self, record: dict[str, Any]) -> None:
+        try:
+            payload = dict(record)
+            payload.setdefault("timestamp", time.time())
+            with self._lock:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                self.count += 1
+        except Exception:
+            logging.exception("Could not write WDC failure record to %s", self.path)
+
+
+def _ensure_free_space(path: Path, minimum_free_bytes: int) -> None:
+    required = max(0, int(minimum_free_bytes))
+    if required <= 0:
+        return
+    free = int(shutil.disk_usage(path).free)
+    if free < required:
+        raise RuntimeError(
+            f"insufficient disk space under {path}: free={free} required={required}"
+        )
+
+
+def iter_fair_entities(
+    entities: Iterable[dict[str, Any]],
+    *,
+    lookahead: int = 256,
+) -> Iterator[dict[str, Any]]:
+    """Interleave hosts inside a bounded lookahead buffer."""
+    iterator = iter(entities)
+    lookahead = max(1, int(lookahead))
+    while True:
+        groups: dict[str, deque[dict[str, Any]]] = {}
+        for _ in range(lookahead):
+            try:
+                entity = next(iterator)
+            except StopIteration:
+                break
+            try:
+                parsed = urlsplit(clean_text(entity.get("page_url")))
+                host = (parsed.hostname or parsed.netloc).casefold().rstrip(".")
+            except ValueError:
+                host = ""
+            key = host or clean_text(entity.get("entity_id"))
+            groups.setdefault(key, deque()).append(entity)
+        if not groups:
+            return
+        active = list(groups)
+        while active:
+            next_active: list[str] = []
+            for key in active:
+                group = groups[key]
+                yield group.popleft()
+                if group:
+                    next_active.append(key)
+            active = next_active
+
+
+def _build_wdc_assets_parallel(
+    *,
+    entities: Iterable[dict[str, Any]],
+    client: WdcWebClient,
+    asset_writer: ShardedJsonlWriter,
+    max_entities: int | None,
+    max_images_per_entity: int,
+    text_asset_chunk_chars: int,
+    min_text_asset_chunk_chars: int,
+    max_text_asset_chunks_per_entity: int,
+    workers: int,
+    max_in_flight: int,
+    fairness_lookahead: int,
+    flush_every_records: int,
+    failure_recorder: _FailureJsonlRecorder,
+    media_failure_recorder: _FailureJsonlRecorder,
+) -> tuple[dict[str, list[str]], int, int]:
+    """Fetch entity assets with one shared client and bounded future batches."""
+    workers = max(1, int(workers or 1))
+    max_in_flight = max(workers, int(max_in_flight or workers * 2))
+    entity_to_assets: dict[str, list[str]] = defaultdict(list)
+    text_asset_count = 0
+    image_asset_count = 0
+    written_assets = 0
+    selected_count = 0
+    iterator = iter(iter_fair_entities(entities, lookahead=fairness_lookahead))
+
+    def fetch(entity: dict[str, Any]) -> list[dict[str, Any]]:
+        return build_wdc_bridge_assets_for_entity(
+            entity,
+            client,
+            max_images_per_entity,
+            text_asset_chunk_chars,
+            min_text_asset_chunk_chars,
+            max_text_asset_chunks_per_entity,
+            web_failure_callback=failure_recorder.record,
+            media_failure_callback=media_failure_recorder.record,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        exhausted = False
+        while not exhausted:
+            batch: list[tuple[int, dict[str, Any]]] = []
+            while len(batch) < max_in_flight:
+                if max_entities is not None and max_entities > 0 and selected_count >= max_entities:
+                    exhausted = True
+                    break
+                try:
+                    entity = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                batch.append((selected_count, entity))
+                selected_count += 1
+            if not batch:
+                break
+
+            future_to_item = {
+                pool.submit(fetch, entity): (index, entity)
+                for index, entity in batch
+            }
+            completed: dict[int, list[dict[str, Any]]] = {}
+            for future in as_completed(future_to_item):
+                index, entity = future_to_item[future]
+                try:
+                    completed[index] = future.result()
+                except Exception as exc:
+                    failure_recorder.record(
+                        {
+                            "failure_type": "web_fetch_failure",
+                            "entity_id": entity.get("entity_id"),
+                            "page_url": entity.get("page_url"),
+                            "status": "worker_error",
+                            "http_status": None,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    completed[index] = []
+
+            for index, _entity in batch:
+                for record in completed.get(index, []):
+                    write_jsonl_record(asset_writer, record)
+                    entity_to_assets[record["entity_id"]].append(record["asset_id"])
+                    if record.get("asset_type") == "image":
+                        image_asset_count += 1
+                    else:
+                        text_asset_count += 1
+                    written_assets += 1
+                    if flush_every_records > 0 and written_assets % flush_every_records == 0:
+                        asset_writer.flush()
+    asset_writer.flush()
+    return entity_to_assets, text_asset_count, image_asset_count
+
+
+def _new_web_client(
+    args: argparse.Namespace,
+    *,
+    cache_dir: Path,
+    web_failure_recorder: _FailureJsonlRecorder,
+    media_failure_recorder: _FailureJsonlRecorder,
+    factory: Callable[..., WdcWebClient] | None,
+) -> WdcWebClient:
+    constructor: Callable[..., WdcWebClient] = factory or WdcWebClient
+    return constructor(
+        cache_dir=cache_dir,
+        user_agent=args.web_user_agent,
+        connect_timeout=args.web_connect_timeout,
+        read_timeout=args.web_read_timeout,
+        max_retries=args.web_max_retries,
+        retry_base_seconds=args.web_retry_base_seconds,
+        max_page_bytes=args.web_max_page_bytes,
+        max_image_bytes=args.web_max_image_bytes,
+        max_image_pixels=args.web_max_image_pixels,
+        max_total_image_bytes=args.web_max_total_image_bytes,
+        max_total_cache_bytes=args.web_max_total_cache_bytes,
+        min_free_disk_bytes=args.min_free_disk_bytes,
+        max_response_seconds=args.web_max_response_seconds,
+        min_image_side=args.web_min_image_side,
+        max_image_aspect_ratio=args.web_max_image_aspect_ratio,
+        max_redirects=args.web_max_redirects,
+        host_delay=args.web_host_delay,
+        web_failure_callback=web_failure_recorder.record,
+        media_failure_callback=media_failure_recorder.record,
+    )
+
+
+def _new_extractor(
+    args: argparse.Namespace,
+    factory: Callable[..., Any] | None,
+) -> Any:
+    return factory(args) if factory is not None else join_builder.LocalAttributeExtractor(args)
+
+
+def build_dataset(
+    args: argparse.Namespace,
+    *,
+    web_client_factory: Callable[..., WdcWebClient] | None = None,
+    extractor_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Build the WDC multimodal joinability dataset using the shared query core."""
+    if not getattr(args, "allow_unbounded", False) and (
+        int(args.max_source_tables) <= 0
+        or int(args.max_scanned_files) <= 0
+        or int(args.max_rows_per_source_table) <= 0
+    ):
+        raise ValueError(
+            "unbounded WDC input requires --allow_unbounded; use positive source/row caps"
+        )
+    args.query_rows_per_table = join_builder.configured_query_rows_per_table(args)
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    cache_dir = Path(args.cache_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_free_space(output_dir, args.min_free_disk_bytes)
+    if cache_dir != output_dir:
+        _ensure_free_space(cache_dir, args.min_free_disk_bytes)
+    logging.info(
+        "WDC safety limits: max_scanned_files=%d max_source_tables=%d "
+        "max_rows_per_source_table=%d max_images_per_entity=%d "
+        "max_total_cache_bytes=%d min_free_disk_bytes=%d allow_unbounded=%s",
+        args.max_scanned_files,
+        args.max_source_tables,
+        args.max_rows_per_source_table,
+        args.max_images_per_entity,
+        args.web_max_total_cache_bytes,
+        args.min_free_disk_bytes,
+        args.allow_unbounded,
+    )
+
+    web_failures = _FailureJsonlRecorder(output_dir / "web_fetch_failures.jsonl")
+    media_failures = _FailureJsonlRecorder(output_dir / "media_download_failures.jsonl")
+    web_failures.reset()
+    media_failures.reset()
+    model_errors_path = clean_text(getattr(args, "model_attribute_errors_path", ""))
+    if not model_errors_path:
+        model_errors_path = str(output_dir / "model_attribute_errors.jsonl")
+        args.model_attribute_errors_path = model_errors_path
+    model_error_file = Path(model_errors_path)
+    model_error_file.parent.mkdir(parents=True, exist_ok=True)
+    model_error_file.write_text("", encoding="utf-8")
+
+    records_per_shard = max(1, int(args.records_per_shard))
+    flush_every = max(1, int(args.flush_every_records))
+    source_writer = ShardedJsonlWriter(output_dir / "source_tables", records_per_shard)
+    entities_writer = ShardedJsonlWriter(output_dir / "entities", records_per_shard)
+    source_split_records: list[dict[str, str]] = []
+    wiki_to_entity_id: dict[str, str] = {}
+    skip_reasons: Counter[str] = Counter()
+    processed_tables = 0
+    scanned_files = 0
+    scanned_file_cap_reached = False
+    source_table_cap_reached = False
+    skipped_tables = 0
+    malformed_rows = 0
+    source_table_count = 0
+    entity_count = 0
+    row_capped_source_tables = 0
+
+    with source_writer as source_handle, entities_writer as entity_handle:
+        for gzip_path in iter_wdc_gzip_paths(input_dir):
+            if args.max_scanned_files > 0 and scanned_files >= args.max_scanned_files:
+                scanned_file_cap_reached = True
+                break
+            if args.max_source_tables > 0 and source_table_count >= args.max_source_tables:
+                source_table_cap_reached = True
+                break
+            scanned_files += 1
+            processed_tables += 1
+            try:
+                result = read_wdc_table(
+                    gzip_path,
+                    input_dir,
+                    args.min_rows,
+                    args.min_cols,
+                    args.max_rows_per_source_table,
+                )
+            except Exception as exc:
+                skipped_tables += 1
+                skip_reasons["gzip_read_error"] += 1
+                logging.warning("Skipping WDC host table %s: %s", gzip_path, exc)
+                continue
+            malformed_rows += result.malformed_rows
+            if result.rows_truncated:
+                row_capped_source_tables += 1
+            if result.source_table is None:
+                skipped_tables += 1
+                skip_reasons[result.skip_reason or "unknown"] += 1
+                continue
+            source_table = result.source_table
+            write_jsonl_record(source_handle, source_table)
+            source_table_count += 1
+            source_split_records.append(
+                {
+                    "source_table_id": source_table["source_table_id"],
+                    "page_title": clean_text(source_table.get("page_title")),
+                }
+            )
+            for entity in result.entities:
+                write_jsonl_record(entity_handle, entity)
+                entity_count += 1
+                wiki_title = clean_text(entity.get("wiki_title"))
+                entity_id = clean_text(entity.get("entity_id"))
+                if wiki_title and entity_id:
+                    wiki_to_entity_id[wiki_title] = entity_id
+                    wiki_to_entity_id[normalize_title(wiki_title)] = entity_id
+            if source_table_count % flush_every == 0:
+                source_handle.flush()
+                entity_handle.flush()
+    logging.info(
+        "WDC input scan finished: scanned_files=%d accepted_source_tables=%d "
+        "row_capped_source_tables=%d scan_cap_reached=%s source_cap_reached=%s",
+        scanned_files,
+        source_table_count,
+        row_capped_source_tables,
+        scanned_file_cap_reached,
+        source_table_cap_reached,
+    )
+
+    web_client = _new_web_client(
+        args,
+        cache_dir=cache_dir,
+        web_failure_recorder=web_failures,
+        media_failure_recorder=media_failures,
+        factory=web_client_factory,
+    )
+    bridge_assets_writer = ShardedJsonlWriter(output_dir / "bridge_assets", records_per_shard)
+    with bridge_assets_writer as asset_handle:
+        entity_to_assets, text_asset_count, image_asset_count = _build_wdc_assets_parallel(
+            entities=iter_jsonl_records(entities_writer.paths()),
+            client=web_client,
+            asset_writer=asset_handle,
+            max_entities=args.max_entities,
+            max_images_per_entity=args.max_images_per_entity,
+            text_asset_chunk_chars=args.text_asset_chunk_chars,
+            min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
+            max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
+            workers=args.web_workers,
+            max_in_flight=args.web_max_in_flight,
+            fairness_lookahead=args.web_fairness_lookahead,
+            flush_every_records=flush_every,
+            failure_recorder=web_failures,
+            media_failure_recorder=media_failures,
+        )
+
+    table_asset_links_writer = ShardedJsonlWriter(
+        output_dir / "table_asset_links", records_per_shard
+    )
+    with table_asset_links_writer as link_handle:
+        table_asset_link_count = write_table_asset_links_from_jsonl(
+            source_writer.paths(),
+            [],
+            link_handle,
+            wiki_to_entity_id,
+            entity_to_assets,
+            flush_every,
+        )
+
+    splits = join_builder.source_splits(source_split_records, args)
+    source_to_split = join_builder.split_map(splits)
+    assets = join_builder.load_assets(bridge_assets_writer.paths())
+    model_cache_path = cache_dir / "model_attribute_extractions.jsonl"
+    cache = join_builder.ExtractionCache(
+        model_cache_path,
+        reuse=not args.no_reuse_model_cache,
+    )
+    concurrency_state = join_builder.ModelConcurrencyState.from_args(args)
+    progress: Any | None = None
+    if getattr(args, "model_progress", True):
+        planned_keys = join_builder.estimate_model_analysis_keys(
+            source_paths=source_writer.paths(),
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wiki_to_entity_id=wiki_to_entity_id,
+            args=args,
+        )
+        cached_keys = {
+            key
+            for key in planned_keys
+            if key in cache.items
+            and join_builder.cached_extraction_is_reusable(cache.items[key], args)
+        }
+        progress = join_builder.ModelAnalysisProgress(
+            total=len(planned_keys), cached_keys=cached_keys, enabled=True
+        )
+
+    precomputed_text_task_count = 0
+    precomputed_image_task_count = 0
+    extractor: Any | None = None
+    if args.precompute_model_cache or args.precompute_text_model_cache:
+        text_tasks = join_builder.collect_extraction_tasks_from_tables(
+            source_paths=source_writer.paths(),
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wiki_to_entity_id=wiki_to_entity_id,
+            args=args,
+            asset_types={"text"},
+        )
+        image_tasks = (
+            join_builder.collect_extraction_tasks_from_tables(
+                source_paths=source_writer.paths(),
+                assets=assets,
+                entity_to_assets=entity_to_assets,
+                wiki_to_entity_id=wiki_to_entity_id,
+                args=args,
+                asset_types={"image"},
+            )
+            if args.precompute_model_cache
+            else []
+        )
+        pending_text_tasks = join_builder.tasks_requiring_model_analysis(
+            text_tasks, cache, args
+        )
+        pending_image_tasks = join_builder.tasks_requiring_model_analysis(
+            image_tasks, cache, args
+        )
+        precomputed_text_task_count = len(pending_text_tasks)
+        precomputed_image_task_count = len(pending_image_tasks)
+        join_builder.write_model_start_marker(
+            clean_text(args.model_start_marker),
+            text_task_count=precomputed_text_task_count,
+            image_task_count=precomputed_image_task_count,
+        )
+        if pending_text_tasks or pending_image_tasks:
+            join_builder.wait_for_model_ready_marker(clean_text(args.model_ready_marker))
+            extractor = _new_extractor(args, extractor_factory)
+            task_groups = {"text": pending_text_tasks}
+            if args.precompute_model_cache:
+                task_groups["image"] = pending_image_tasks
+            join_builder.precompute_extraction_task_groups(
+                extractor=extractor,
+                cache=cache,
+                tasks_by_kind=task_groups,
+                args=args,
+                state=concurrency_state,
+                progress=progress,
+            )
+        else:
+            join_builder.write_model_done_marker(
+                join_builder.model_done_marker_for_kind(args, "text"),
+                model_kind="text",
+                task_count=0,
+            )
+            if args.precompute_model_cache:
+                join_builder.write_model_done_marker(
+                    join_builder.model_done_marker_for_kind(args, "image"),
+                    model_kind="image",
+                    task_count=0,
+                )
+        if not args.precompute_model_cache and image_asset_count:
+            extractor = extractor or _new_extractor(args, extractor_factory)
+    else:
+        join_builder.write_model_start_marker(
+            clean_text(args.model_start_marker), text_task_count=0, image_task_count=0
+        )
+        join_builder.wait_for_model_ready_marker(clean_text(args.model_ready_marker))
+        extractor = _new_extractor(args, extractor_factory)
+
+    query_writer = ShardedJsonlWriter(output_dir / "query_tables", records_per_shard)
+    data_lake_writer = ShardedJsonlWriter(
+        output_dir / "data_lake_tables", records_per_shard
+    )
+    extraction_writer = ShardedJsonlWriter(
+        output_dir / "attribute_extractions", records_per_shard
+    )
+    recovery_writer = ShardedJsonlWriter(
+        output_dir / "evidence_recoveries", records_per_shard
+    )
+    qrels: list[dict[str, Any]] = []
+    table_decisions: list[dict[str, Any]] = []
+    query_table_count = 0
+    data_lake_table_count = 0
+    queryable_source_tables = 0
+    rejected_source_tables = 0
+    try:
+        with (
+            query_writer as query_handle,
+            data_lake_writer as data_lake_handle,
+            extraction_writer as extraction_handle,
+            recovery_writer as recovery_handle,
+        ):
+            for source_table in iter_jsonl_records(source_writer.paths()):
+                split = source_to_split.get(source_table["source_table_id"], "test")
+                query_tables, data_lake_tables, table_qrels, decision = (
+                    join_builder.build_table_join_records(
+                        source_table=source_table,
+                        split=split,
+                        assets=assets,
+                        entity_to_assets=entity_to_assets,
+                        wiki_to_entity_id=wiki_to_entity_id,
+                        extractor=extractor,
+                        cache=cache,
+                        progress=progress,
+                        concurrency_state=concurrency_state,
+                        extraction_writer=extraction_handle,
+                        recovery_writer=recovery_handle,
+                        args=args,
+                    )
+                )
+                if query_tables:
+                    queryable_source_tables += 1
+                else:
+                    rejected_source_tables += 1
+                decision["source_table_id"] = source_table["source_table_id"]
+                decision["split"] = split
+                table_decisions.append(decision)
+                for record in query_tables:
+                    write_jsonl_record(query_handle, record)
+                    query_table_count += 1
+                    splits[split]["query_table_ids"].append(record["table_id"])
+                for record in data_lake_tables:
+                    write_jsonl_record(data_lake_handle, record)
+                    data_lake_table_count += 1
+                    splits[split]["data_lake_table_ids"].append(record["table_id"])
+                qrels.extend(table_qrels)
+                if (query_table_count + data_lake_table_count) % flush_every == 0:
+                    query_handle.flush()
+                    data_lake_handle.flush()
+                    extraction_handle.flush()
+                    recovery_handle.flush()
+    finally:
+        if progress is not None:
+            progress.close()
+
+    for split in ("train", "dev", "test"):
+        splits[split]["query_table_ids"] = sorted(splits[split]["query_table_ids"])
+        splits[split]["data_lake_table_ids"] = sorted(
+            splits[split]["data_lake_table_ids"]
+        )
+    qrels_count = write_jsonl(output_dir / "qrels.jsonl", qrels)
+    write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
+    write_json(output_dir / "splits.json", splits)
+
+    stats = {
+        "processed_tables": processed_tables,
+        "scanned_files": scanned_files,
+        "scanned_file_cap_reached": scanned_file_cap_reached,
+        "source_table_cap_reached": source_table_cap_reached,
+        "skipped_tables": skipped_tables,
+        "source_tables": source_table_count,
+        "malformed_rows": malformed_rows,
+        "row_capped_source_tables": row_capped_source_tables,
+        "source_entities": entity_count,
+        "queryable_source_tables": queryable_source_tables,
+        "rejected_source_tables": rejected_source_tables,
+        "query_tables": query_table_count,
+        "data_lake_tables": data_lake_table_count,
+        "qrels": qrels_count,
+        "text_assets": text_asset_count,
+        "image_assets": image_asset_count,
+        "table_asset_links": table_asset_link_count,
+        "web_fetch_failures": web_failures.count,
+        "media_download_failures": media_failures.count,
+        "attribute_extractions": extraction_writer.total_records,
+        "evidence_recoveries": recovery_writer.total_records,
+        "model_inference": join_builder.model_call_stats_summary(extractor),
+        "model_concurrency": concurrency_state.summary(),
+        "precomputed_text_model_cache_tasks": precomputed_text_task_count,
+        "precomputed_image_model_cache_tasks": precomputed_image_task_count,
+        "web_workers": max(1, int(args.web_workers)),
+        "web_max_in_flight": max(
+            max(1, int(args.web_workers)), int(args.web_max_in_flight or args.web_workers * 2)
+        ),
+        "max_rows_per_source_table": args.max_rows_per_source_table,
+        "max_source_tables": args.max_source_tables,
+        "allow_unbounded": args.allow_unbounded,
+        "min_free_disk_bytes": args.min_free_disk_bytes,
+        "max_total_image_bytes": args.web_max_total_image_bytes,
+        "max_total_cache_bytes": args.web_max_total_cache_bytes,
+        "max_response_seconds": args.web_max_response_seconds,
+        "web_fairness_lookahead": args.web_fairness_lookahead,
+        "min_recovered_value_ratio": args.min_recovered_value_ratio,
+        "min_recovery_denominator": args.min_recovery_denominator,
+        "query_rows_per_table": args.query_rows_per_table,
+        "skipped_reasons": dict(skip_reasons),
+        "safety_config": {
+            "max_scanned_files": args.max_scanned_files,
+            "max_source_tables": args.max_source_tables,
+            "max_rows_per_source_table": args.max_rows_per_source_table,
+            "max_entities": args.max_entities,
+            "max_images_per_entity": args.max_images_per_entity,
+            "max_total_cache_bytes": args.web_max_total_cache_bytes,
+            "min_free_disk_bytes": args.min_free_disk_bytes,
+            "allow_unbounded": args.allow_unbounded,
+        },
+        "notes": [
+            "WDC page_url is fetched for every selected entity even when direct images succeed",
+            "direct image-column URLs and webpage images share one per-entity quota",
+            "the source image attribute is excluded from every emitted table",
+            "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
+        ],
+    }
+    write_json(output_dir / "stats.json", stats)
+
+    manifest = {
+        "format": "sharded_jsonl",
+        "source_corpus": "WDC Schema.org Table Corpus 2023",
+        "records_per_shard": records_per_shard,
+        "artifacts": {
+            "source_tables": source_writer.manifest(output_dir),
+            "query_tables": query_writer.manifest(output_dir),
+            "data_lake_tables": data_lake_writer.manifest(output_dir),
+            "entities": entities_writer.manifest(output_dir),
+            "bridge_assets": bridge_assets_writer.manifest(output_dir),
+            "table_asset_links": table_asset_links_writer.manifest(output_dir),
+            "attribute_extractions": extraction_writer.manifest(output_dir),
+            "evidence_recoveries": recovery_writer.manifest(output_dir),
+        },
+        "single_files": {
+            "qrels": "qrels.jsonl",
+            "splits": "splits.json",
+            "stats": "stats.json",
+            "table_queryability_decisions": "table_queryability_decisions.jsonl",
+            "web_fetch_failures": "web_fetch_failures.jsonl",
+            "media_download_failures": "media_download_failures.jsonl",
+            "model_attribute_errors": str(model_error_file.relative_to(output_dir))
+            if model_error_file.is_relative_to(output_dir)
+            else str(model_error_file),
+        },
+        "query_construction": {
+            "query_rows_per_table": args.query_rows_per_table,
+            "min_rows_per_output_table": args.min_rows_per_output_table,
+            "min_recovered_value_ratio": args.min_recovered_value_ratio,
+            "min_recovery_denominator": args.min_recovery_denominator,
+        },
+        "model_endpoints": {
+            "text_model_base_url": args.text_model_base_url,
+            "text_model_base_urls": args.text_model_base_urls,
+            "text_model_base_urls_file": args.text_model_base_urls_file,
+            "text_model_name": args.text_model_name,
+            "image_model_base_url": args.image_model_base_url,
+            "image_model_base_urls": args.image_model_base_urls,
+            "image_model_base_urls_file": args.image_model_base_urls_file,
+            "image_model_name": args.image_model_name,
+            "prompt_version": join_builder.PROMPT_VERSION,
+            "precompute_model_cache": args.precompute_model_cache,
+            "precompute_text_model_cache": args.precompute_text_model_cache,
+            "model_start_marker": args.model_start_marker,
+            "model_ready_marker": args.model_ready_marker,
+            "model_text_done_marker": args.model_text_done_marker,
+            "model_image_done_marker": args.model_image_done_marker,
+            "configured_text_model_workers": args.text_model_workers,
+            "configured_image_model_workers": args.image_model_workers,
+            "final_model_concurrency": stats["model_concurrency"],
+            "inference_stats": stats["model_inference"],
+        },
+        "web_cache": {
+            "cache_dir": str(cache_dir),
+            "database": str(cache_dir / "wdc_web.sqlite3"),
+            "image_dir": str(cache_dir / "wdc_images"),
+            "workers": stats["web_workers"],
+            "max_in_flight": stats["web_max_in_flight"],
+            "fairness_lookahead": stats["web_fairness_lookahead"],
+            "always_fetch_page_url": True,
+            "direct_images_have_priority": True,
+            "shared_max_images_per_entity": args.max_images_per_entity,
+            "max_image_pixels": args.web_max_image_pixels,
+            "max_total_image_bytes": args.web_max_total_image_bytes,
+            "max_total_cache_bytes": args.web_max_total_cache_bytes,
+            "max_response_seconds": args.web_max_response_seconds,
+            "min_free_disk_bytes": args.min_free_disk_bytes,
+        },
+        "cache": {
+            "root_dir": str(cache_dir),
+            "model_attribute_extractions": str(model_cache_path),
+        },
+        "note": "Read only shards listed here; a reused output directory may contain stale unlisted files.",
+    }
+    write_json(output_dir / "dataset_manifest.json", manifest)
+    return stats
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build a multimodal joinability dataset from WDC Schema.org 2023 "
+            "gzip host tables and generic webpage assets."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--cache_dir", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--max_source_tables", type=int, default=100)
+    parser.add_argument(
+        "--max_tables",
+        type=int,
+        dest="max_source_tables",
+        default=argparse.SUPPRESS,
+        help="Deprecated alias for --max_source_tables.",
+    )
+    parser.add_argument(
+        "--max_rows_per_source_table",
+        type=int,
+        default=100,
+        help="Maximum retained valid rows per WDC host table; 0 requires --allow_unbounded.",
+    )
+    parser.add_argument(
+        "--max_scanned_files",
+        type=int,
+        default=1000,
+        help="Maximum gzip files attempted, including malformed or rejected files.",
+    )
+    parser.add_argument(
+        "--allow_unbounded",
+        action="store_true",
+        help=(
+            "Explicitly allow non-positive scan/source-table caps or a zero "
+            "per-table row cap."
+        ),
+    )
+    parser.add_argument(
+        "--min_free_disk_bytes",
+        type=int,
+        default=1_000_000_000,
+        help="Abort before building when output/cache storage has less free space.",
+    )
+    parser.add_argument("--max_entities", type=int, default=None)
+    parser.add_argument("--min_rows", type=int, default=2)
+    parser.add_argument("--min_cols", type=int, default=2)
+    parser.add_argument("--records_per_shard", type=int, default=50000)
+    parser.add_argument("--flush_every_records", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=13)
+
+    parser.add_argument("--max_images_per_entity", type=int, default=2)
+    parser.add_argument("--text_asset_chunk_chars", type=int, default=800)
+    parser.add_argument("--min_text_asset_chunk_chars", type=int, default=120)
+    parser.add_argument("--max_text_asset_chunks_per_entity", type=int, default=3)
+    parser.add_argument("--web_workers", type=int, default=4)
+    parser.add_argument(
+        "--web_max_in_flight",
+        type=int,
+        default=0,
+        help="Maximum submitted web futures per bounded batch; 0 uses 2*web_workers.",
+    )
+    parser.add_argument(
+        "--web_fairness_lookahead",
+        type=int,
+        default=256,
+        help="Bounded entity lookahead used to interleave different page hosts.",
+    )
+    parser.add_argument(
+        "--web_user_agent",
+        default="MMDD-WDC-DatasetBuilder/0.1 (research dataset construction)",
+    )
+    parser.add_argument("--web_connect_timeout", type=float, default=10.0)
+    parser.add_argument("--web_read_timeout", type=float, default=30.0)
+    parser.add_argument("--web_max_retries", type=int, default=2)
+    parser.add_argument("--web_retry_base_seconds", type=float, default=0.25)
+    parser.add_argument("--web_max_page_bytes", type=int, default=2_000_000)
+    parser.add_argument("--web_max_image_bytes", type=int, default=10_000_000)
+    parser.add_argument("--web_max_image_pixels", type=int, default=25_000_000)
+    parser.add_argument(
+        "--web_max_total_image_bytes", type=int, default=100_000_000_000
+    )
+    parser.add_argument(
+        "--web_max_total_cache_bytes", type=int, default=120_000_000_000
+    )
+    parser.add_argument("--web_max_response_seconds", type=float, default=120.0)
+    parser.add_argument("--web_max_redirects", type=int, default=3)
+    parser.add_argument("--web_min_image_side", type=int, default=32)
+    parser.add_argument("--web_max_image_aspect_ratio", type=float, default=20.0)
+    parser.add_argument("--web_host_delay", type=float, default=0.5)
+
+    parser.add_argument(
+        "--split_by", choices=["source_table_id", "page_title"], default="page_title"
+    )
+    parser.add_argument("--train_ratio", type=float, default=0.8)
+    parser.add_argument("--dev_ratio", type=float, default=0.1)
+    parser.add_argument("--test_ratio", type=float, default=0.1)
+    parser.add_argument("--min_column_non_empty_ratio", type=float, default=0.5)
+    parser.add_argument("--min_recovered_value_ratio", type=float, default=0.6)
+    parser.add_argument("--min_recovery_denominator", type=int, default=2)
+    parser.add_argument("--min_rows_per_output_table", type=int, default=2)
+    parser.add_argument("--query_rows_per_table", type=int, default=5)
+    parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
+    parser.add_argument("--max_query_context_attrs", type=int, default=1)
+    parser.add_argument("--max_target_context_attrs", type=int, default=2)
+
+    parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
+    parser.add_argument("--text_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--text_model_base_urls_file", default=None)
+    parser.add_argument("--text_model_name", default="Qwen3.5-9B")
+    parser.add_argument("--text_model_api_key", default=None)
+    parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
+    parser.add_argument("--image_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--image_model_base_urls_file", default=None)
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--image_model_api_key", default=None)
+    parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
+    parser.add_argument("--model_temperature", type=float, default=0.0)
+    parser.add_argument("--model_max_tokens", type=int, default=1024)
+    parser.add_argument(
+        "--image_model_max_tokens",
+        type=int,
+        default=join_builder.DEFAULT_IMAGE_MODEL_MAX_TOKENS,
+    )
+    parser.add_argument(
+        "--image_request_max_pixels",
+        type=int,
+        default=join_builder.DEFAULT_IMAGE_REQUEST_MAX_PIXELS,
+    )
+    parser.add_argument("--text_model_workers", type=int, default=1)
+    parser.add_argument("--image_model_workers", type=int, default=1)
+    parser.add_argument(
+        "--enable_thinking", dest="disable_thinking", action="store_false"
+    )
+    parser.add_argument(
+        "--no_reparse_cached_model_outputs",
+        dest="reparse_cached_model_outputs",
+        action="store_false",
+    )
+    parser.add_argument("--refresh_invalid_model_cache", action="store_true")
+    parser.add_argument("--model_max_retries", type=int, default=2)
+    parser.add_argument("--model_retry_sleep_seconds", type=float, default=2.0)
+    parser.add_argument("--no_reuse_model_cache", action="store_true")
+    parser.add_argument("--cache_failed_model_outputs", action="store_true")
+    parser.add_argument("--model_attribute_errors_path", default="")
+    parser.add_argument(
+        "--context_retry_image_max_pixels",
+        type=int,
+        default=join_builder.DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS,
+    )
+    parser.add_argument(
+        "--no_model_progress", dest="model_progress", action="store_false"
+    )
+    parser.add_argument("--precompute_model_cache", action="store_true")
+    parser.add_argument("--precompute_text_model_cache", action="store_true")
+    parser.add_argument("--model_start_marker", default=None)
+    parser.add_argument("--model_ready_marker", default=None)
+    parser.add_argument("--model_text_done_marker", default=None)
+    parser.add_argument("--model_image_done_marker", default=None)
+    parser.set_defaults(
+        disable_thinking=True,
+        reparse_cached_model_outputs=True,
+        model_progress=True,
+    )
+    args = parser.parse_args(argv)
+    if args.max_rows_per_source_table < 0:
+        parser.error("--max_rows_per_source_table must be >= 0")
+    if not args.allow_unbounded and (
+        args.max_source_tables <= 0
+        or args.max_scanned_files <= 0
+        or args.max_rows_per_source_table == 0
+    ):
+        parser.error(
+            "non-positive --max_source_tables/--max_scanned_files or zero "
+            "--max_rows_per_source_table requires --allow_unbounded"
+        )
+    return args
+
+
+def main() -> None:
+    setup_logging()
+    stats = build_dataset(parse_args())
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
