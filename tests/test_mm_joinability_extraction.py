@@ -535,6 +535,25 @@ def test_joinability_projected_rows_sanitize_cell_urls_for_model_tables():
     assert rows[1]["cells"][1]["text"] == "shown at source"
 
 
+def test_table_record_accepts_source_provenance_builder():
+    record = joinability_dataset.table_record(
+        table_id="table_1",
+        role="query_table",
+        split="train",
+        source_table={
+            "source_table_id": "source_1",
+            "columns": [],
+            "provenance_builder": "wdc",
+        },
+        column_indices=[],
+        rows=[],
+        source_row_indices=[],
+        extra={},
+    )
+
+    assert record["provenance"]["builder"] == "wdc"
+
+
 def test_old_cache_key_is_preserved_when_disabling_thinking():
     base = dict(
         asset_id="asset_1",

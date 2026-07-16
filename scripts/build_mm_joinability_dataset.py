@@ -1184,7 +1184,7 @@ def table_record(
         "source_column_indices": column_indices,
         "source_row_indices": source_row_indices,
         "provenance": {
-            "builder": "build_mm_joinability_dataset.py",
+            "builder": clean_text(source_table.get("provenance_builder")) or "build_mm_joinability_dataset.py",
             "source_file": source_table.get("source_file"),
         },
         **extra,
