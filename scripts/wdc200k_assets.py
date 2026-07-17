@@ -187,14 +187,49 @@ class MaterializedAssetShards:
     table_asset_links: int
 
 
+@dataclass(frozen=True)
+class ImageUrlLease:
+    owner: str
+    lease_id: str
+    lease_until: float
+
+
+@dataclass(frozen=True)
+class ImageUrlClaimDecision:
+    outcome: dict[str, Any] | None = None
+    lease: ImageUrlLease | None = None
+    retry_at: float | None = None
+
+
+@dataclass(frozen=True)
+class ImageJobExecution:
+    outcome: dict[str, Any]
+    lease: ImageUrlLease | None
+
+
 class ImageOutcomeStore:
     """Durable policy-scoped terminal outcomes for unique image URLs."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        connection = self._connect()
+        try:
+            journal_deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    connection.execute(
+                        "PRAGMA journal_mode=WAL"
+                    ).fetchone()
+                    break
+                except sqlite3.OperationalError as error:
+                    if (
+                        "locked" not in str(error).casefold()
+                        or time.monotonic() >= journal_deadline
+                    ):
+                        raise
+                    time.sleep(0.01)
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS image_outcomes (
@@ -209,6 +244,43 @@ class ImageOutcomeStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_url_claims (
+                    policy_fingerprint TEXT NOT NULL,
+                    url_key TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    lease_until REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (policy_fingerprint, url_key)
+                )
+                """
+            )
+            claim_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(image_url_claims)"
+                )
+            }
+            required_claim_columns = {
+                "policy_fingerprint",
+                "url_key",
+                "owner",
+                "lease_id",
+                "lease_until",
+                "status",
+                "updated_at",
+            }
+            if not required_claim_columns <= claim_columns:
+                raise ValueError("image URL claim schema is incompatible")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -244,13 +316,12 @@ class ImageOutcomeStore:
             raise ValueError("image outcome payload is not an object")
         return payload
 
-    def put(
-        self,
+    @staticmethod
+    def _encode_outcome(
         policy_fingerprint: str,
-        url_key: str,
         image_url: str,
         outcome: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str, str]:
         status = str(outcome.get("status") or "")
         if status not in {"success", "terminal"}:
             raise ValueError(f"non-terminal image outcome: {status}")
@@ -270,6 +341,21 @@ class ImageOutcomeStore:
             separators=(",", ":"),
         )
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return canonical, encoded, digest
+
+    def put(
+        self,
+        policy_fingerprint: str,
+        url_key: str,
+        image_url: str,
+        outcome: dict[str, Any],
+    ) -> dict[str, Any]:
+        canonical, encoded, digest = self._encode_outcome(
+            policy_fingerprint,
+            image_url,
+            outcome,
+        )
+        status = str(canonical["status"])
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -305,6 +391,247 @@ class ImageOutcomeStore:
                     "conflicting terminal image outcome for URL"
                 )
             return persisted
+
+    def claim_url(
+        self,
+        policy_fingerprint: str,
+        url_key: str,
+        *,
+        owner: str,
+        lease_seconds: float,
+        now: float | None = None,
+    ) -> ImageUrlClaimDecision:
+        """Atomically return an outcome, acquire an expired URL, or wait."""
+        if not owner:
+            raise ValueError("URL claim owner must not be empty")
+        if lease_seconds <= 0:
+            raise ValueError("URL claim lease_seconds must be positive")
+        current_time = time.time() if now is None else float(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            outcome_row = connection.execute(
+                """
+                SELECT outcome_json, payload_sha256
+                FROM image_outcomes
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            ).fetchone()
+            if outcome_row is not None:
+                outcome = self._decode(outcome_row)
+                connection.execute(
+                    """
+                    DELETE FROM image_url_claims
+                    WHERE policy_fingerprint = ? AND url_key = ?
+                    """,
+                    (policy_fingerprint, url_key),
+                )
+                connection.commit()
+                return ImageUrlClaimDecision(outcome=outcome)
+
+            current = connection.execute(
+                """
+                SELECT owner, lease_id, lease_until, status
+                FROM image_url_claims
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            ).fetchone()
+            if (
+                current is not None
+                and str(current["status"]) == "leased"
+                and float(current["lease_until"]) > current_time
+            ):
+                retry_at = float(current["lease_until"])
+                connection.commit()
+                return ImageUrlClaimDecision(retry_at=retry_at)
+
+            lease = ImageUrlLease(
+                owner=owner,
+                lease_id=uuid.uuid4().hex,
+                lease_until=current_time + lease_seconds,
+            )
+            connection.execute(
+                """
+                INSERT INTO image_url_claims (
+                    policy_fingerprint, url_key, owner, lease_id,
+                    lease_until, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'leased', ?)
+                ON CONFLICT(policy_fingerprint, url_key) DO UPDATE SET
+                    owner = excluded.owner,
+                    lease_id = excluded.lease_id,
+                    lease_until = excluded.lease_until,
+                    status = 'leased',
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    policy_fingerprint,
+                    url_key,
+                    lease.owner,
+                    lease.lease_id,
+                    lease.lease_until,
+                    current_time,
+                ),
+            )
+            connection.commit()
+            return ImageUrlClaimDecision(lease=lease)
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def put_claimed(
+        self,
+        policy_fingerprint: str,
+        url_key: str,
+        image_url: str,
+        outcome: dict[str, Any],
+        *,
+        lease: ImageUrlLease,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist an outcome only while the exact fenced URL lease is live."""
+        current_time = time.time() if now is None else float(now)
+        canonical, encoded, digest = self._encode_outcome(
+            policy_fingerprint,
+            image_url,
+            outcome,
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                """
+                SELECT owner, lease_id, lease_until, status
+                FROM image_url_claims
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            ).fetchone()
+            if (
+                claim is None
+                or str(claim["owner"]) != lease.owner
+                or str(claim["lease_id"]) != lease.lease_id
+                or str(claim["status"]) != "leased"
+                or float(claim["lease_until"]) <= current_time
+            ):
+                raise ValueError("stale or expired image URL claim")
+            existing = connection.execute(
+                """
+                SELECT outcome_json, payload_sha256
+                FROM image_outcomes
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO image_outcomes (
+                        policy_fingerprint, url_key, image_url, status,
+                        outcome_json, payload_sha256, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        policy_fingerprint,
+                        url_key,
+                        image_url,
+                        str(canonical["status"]),
+                        encoded,
+                        digest,
+                        current_time,
+                    ),
+                )
+                persisted = canonical
+            else:
+                persisted = self._decode(existing)
+                if persisted != canonical:
+                    raise ValueError(
+                        "conflicting terminal image outcome for URL"
+                    )
+            connection.commit()
+            return persisted
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_claim(
+        self,
+        policy_fingerprint: str,
+        url_key: str,
+        *,
+        lease: ImageUrlLease,
+        now: float | None = None,
+    ) -> bool:
+        """Release only the exact URL lease; stale owners are fenced out."""
+        current_time = time.time() if now is None else float(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM image_url_claims
+                WHERE policy_fingerprint = ? AND url_key = ?
+                  AND owner = ? AND lease_id = ? AND status = 'leased'
+                  AND lease_until > ?
+                """,
+                (
+                    policy_fingerprint,
+                    url_key,
+                    lease.owner,
+                    lease.lease_id,
+                    current_time,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def clear_claim_if_outcome(
+        self,
+        policy_fingerprint: str,
+        url_key: str,
+    ) -> bool:
+        """Fence any leftover claimant after a durable outcome is visible."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            outcome_exists = (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM image_outcomes
+                    WHERE policy_fingerprint = ? AND url_key = ?
+                    """,
+                    (policy_fingerprint, url_key),
+                ).fetchone()
+                is not None
+            )
+            if not outcome_exists:
+                connection.commit()
+                return False
+            cursor = connection.execute(
+                """
+                DELETE FROM image_url_claims
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def iter(
         self,
@@ -1332,6 +1659,52 @@ def _fetch_image_job(
     }
 
 
+def _execute_image_job(
+    payload: dict[str, Any],
+    *,
+    transport: Any,
+    image_dir: Path,
+    outcome_store: ImageOutcomeStore,
+    policy_fingerprint: str,
+    claim_owner: str,
+    claim_lease_seconds: float,
+    claim_poll_seconds: float,
+    after_url_claim: Callable[[ImageUrlLease], None] | None,
+) -> ImageJobExecution:
+    """Wait for or acquire the shared policy+URL claim before networking."""
+    url_key = str(payload["url_key"])
+    while True:
+        decision = outcome_store.claim_url(
+            policy_fingerprint,
+            url_key,
+            owner=claim_owner,
+            lease_seconds=claim_lease_seconds,
+        )
+        if decision.outcome is not None:
+            return ImageJobExecution(
+                outcome=decision.outcome,
+                lease=None,
+            )
+        if decision.lease is not None:
+            if after_url_claim is not None:
+                after_url_claim(decision.lease)
+            return ImageJobExecution(
+                outcome=_fetch_image_job(
+                    payload,
+                    transport=transport,
+                    image_dir=image_dir,
+                ),
+                lease=decision.lease,
+            )
+        if decision.retry_at is None:
+            raise RuntimeError("image URL claim made no decision")
+        wait_seconds = min(
+            claim_poll_seconds,
+            max(0.001, decision.retry_at - time.time()),
+        )
+        time.sleep(wait_seconds)
+
+
 def fetch_unique_images(
     unique_jobs: UniqueImageJobs,
     store: SqliteJobStore,
@@ -1344,6 +1717,9 @@ def fetch_unique_images(
     image_dir: Path,
     claim_buffer: int | None = None,
     lease_seconds: float | None = None,
+    url_claim_lease_seconds: float | None = None,
+    url_claim_poll_seconds: float = 0.05,
+    after_url_claim: Callable[[ImageUrlLease], None] | None = None,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
 ) -> ImageFetchResult:
     """Fetch globally unique image URLs with bounded fair durable jobs."""
@@ -1401,6 +1777,15 @@ def fetch_unique_images(
     )
     if buffer_limit < policy.global_concurrency:
         raise ValueError("claim_buffer must be at least global_concurrency")
+    if url_claim_poll_seconds <= 0:
+        raise ValueError("url_claim_poll_seconds must be positive")
+    effective_url_claim_lease = (
+        policy.deadline_seconds + 30.0
+        if url_claim_lease_seconds is None
+        else float(url_claim_lease_seconds)
+    )
+    if effective_url_claim_lease <= 0:
+        raise ValueError("url_claim_lease_seconds must be positive")
     effective_lease = (
         float(lease_seconds)
         if lease_seconds is not None
@@ -1410,7 +1795,7 @@ def fetch_unique_images(
     active_by_host: dict[str, int] = {}
     ready_hosts: deque[str] = deque()
     ready_set: set[str] = set()
-    futures: dict[Future[dict[str, Any]], tuple[Any, str]] = {}
+    futures: dict[Future[ImageJobExecution], tuple[Any, str]] = {}
     claimed_buffered = 0
     maximum_claimed = 0
     maximum_inflight = 0
@@ -1422,6 +1807,10 @@ def fetch_unique_images(
             ready_hosts.append(host)
 
     def finish_cached(job: Any, outcome: dict[str, Any]) -> None:
+        outcome_store.clear_claim_if_outcome(
+            fingerprint,
+            str(job.payload["url_key"]),
+        )
         store.finish(
             job.job_id,
             status=str(outcome["status"]),
@@ -1493,10 +1882,18 @@ def fetch_unique_images(
             claimed_buffered -= 1
             active_by_host[host] = active_by_host.get(host, 0) + 1
             future = pool.submit(
-                _fetch_image_job,
+                _execute_image_job,
                 job.payload,
                 transport=transport,
                 image_dir=Path(image_dir),
+                outcome_store=outcome_store,
+                policy_fingerprint=fingerprint,
+                claim_owner=(
+                    f"{owner}:{job.job_id}:{job.lease_id}"
+                ),
+                claim_lease_seconds=effective_url_claim_lease,
+                claim_poll_seconds=float(url_claim_poll_seconds),
+                after_url_claim=after_url_claim,
             )
             futures[future] = (job, host)
             add_ready(host)
@@ -1530,15 +1927,33 @@ def fetch_unique_images(
                 else:
                     host_queues.pop(host, None)
                     ready_set.discard(host)
-                outcome = future.result()
-                persisted = outcome_store.put(
-                    fingerprint,
-                    str(job.payload["url_key"]),
-                    str(job.payload["image_url"]),
-                    outcome,
-                )
-                if after_cache_write is not None:
-                    after_cache_write(persisted)
+                execution = future.result()
+                if execution.lease is None:
+                    persisted = execution.outcome
+                    outcome_store.clear_claim_if_outcome(
+                        fingerprint,
+                        str(job.payload["url_key"]),
+                    )
+                else:
+                    persisted = outcome_store.put_claimed(
+                        fingerprint,
+                        str(job.payload["url_key"]),
+                        str(job.payload["image_url"]),
+                        execution.outcome,
+                        lease=execution.lease,
+                    )
+                    if after_cache_write is not None:
+                        after_cache_write(persisted)
+                    released = outcome_store.finish_claim(
+                        fingerprint,
+                        str(job.payload["url_key"]),
+                        lease=execution.lease,
+                    )
+                    if not released:
+                        outcome_store.clear_claim_if_outcome(
+                            fingerprint,
+                            str(job.payload["url_key"]),
+                        )
                 store.finish(
                     job.job_id,
                     status=str(persisted["status"]),

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import multiprocessing
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from wdc200k_assets import (  # noqa: E402
     ImageBudget,
+    ImageOutcomeStore,
     build_unique_image_jobs,
     fetch_unique_images,
     iter_entity_page_join,
@@ -34,6 +36,17 @@ from wdc200k_fetch import (  # noqa: E402
 from wdc200k_io import SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
+
+
+def _open_image_outcome_store_process(
+    path: str,
+    results,
+) -> None:
+    try:
+        ImageOutcomeStore(Path(path))
+        results.put(("ok",))
+    except BaseException as error:
+        results.put(("error", type(error).__name__, str(error)))
 
 
 def test_assets_module_supports_package_import() -> None:
@@ -782,6 +795,48 @@ class FakeImageTransport:
         return success
 
 
+class ColdStartBarrierImageTransport(FakeImageTransport):
+    def __init__(self, root: Path, image_url: str) -> None:
+        super().__init__(root, {image_url: "unique"})
+        self.network_barrier = threading.Barrier(2)
+        self.call_lock = threading.Lock()
+
+    def download_image(
+        self,
+        image_url: str,
+        *,
+        page_url: str,
+        source: str,
+        entity_id: str,
+    ) -> dict | None:
+        with self.call_lock:
+            call_index = len(self.calls)
+            self.calls.append(image_url)
+        try:
+            self.network_barrier.wait(timeout=0.3)
+        except threading.BrokenBarrierError:
+            pass
+        file_path = self.root / f"cold-{call_index}.png"
+        Image.new("RGB", (64, 48), color=(31, 41, 59)).save(file_path)
+        digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        return {
+            "status": "success",
+            "image_url": image_url,
+            "original_url": image_url,
+            "final_url": image_url,
+            "file_name": file_path.name,
+            "local_path": str(file_path),
+            "relative_path": file_path.name,
+            "sha256": digest,
+            "width": 64,
+            "height": 48,
+            "mime_type": "image/png",
+            "bytes": file_path.stat().st_size,
+            "downloaded": True,
+            "policy_fingerprint": self.network_policy_fingerprint,
+        }
+
+
 def write_unique_jobs(path: Path, urls: list[str]):
     planned = persist_entity_asset_plans(
         [
@@ -818,6 +873,142 @@ def write_named_job_set(
         chunk_records=17,
     )
     return planned, jobs
+
+
+def test_image_outcome_store_cold_open_is_process_safe(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cold-outcomes.sqlite3"
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_open_image_outcome_store_process,
+            args=(str(path), results),
+        )
+        for _index in range(6)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert [results.get(timeout=1) for _process in processes] == [
+        ("ok",)
+    ] * len(processes)
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            )
+        }
+    assert {"image_outcomes", "image_url_claims"} <= tables
+
+
+def test_image_outcome_store_rolls_back_incompatible_schema_init(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "incompatible-outcomes.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE image_url_claims (
+                policy_fingerprint TEXT NOT NULL,
+                url_key TEXT NOT NULL,
+                PRIMARY KEY (policy_fingerprint, url_key)
+            )
+            """
+        )
+
+    with pytest.raises(ValueError, match="claim schema"):
+        ImageOutcomeStore(path)
+
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            )
+        }
+    assert tables == {"image_url_claims"}
+
+
+def test_cold_concurrent_job_sets_make_one_shared_url_request(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/cold-shared.jpg"
+    _planned_left, jobs_left = write_named_job_set(
+        tmp_path,
+        "cold-left",
+        [image_url],
+    )
+    _planned_right, jobs_right = write_named_job_set(
+        tmp_path,
+        "cold-right",
+        [image_url],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "cold-outcomes.sqlite3"
+    transport = ColdStartBarrierImageTransport(tmp_path, image_url)
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    start_barrier = threading.Barrier(2)
+    results = []
+    failures: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def run(current_jobs) -> None:
+        try:
+            start_barrier.wait(timeout=2)
+            result = fetch_unique_images(
+                current_jobs,
+                store,
+                transport,
+                policy,
+                outcomes_path=outcomes_path,
+                image_dir=tmp_path / "content",
+            )
+            with result_lock:
+                results.append(result)
+        except BaseException as error:
+            with result_lock:
+                failures.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(current_jobs,))
+        for current_jobs in (jobs_left, jobs_right)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert len(results) == 2
+    assert all(result.complete for result in results)
+    assert transport.calls == [image_url]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT status, COUNT(*), COUNT(DISTINCT kind)
+            FROM jobs
+            GROUP BY status
+            """
+        ).fetchall() == [("success", 2, 2)]
 
 
 def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
@@ -1434,6 +1625,208 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
     )
     assert resumed.success == 1
     assert transport.calls == [image_url]
+    with sqlite3.connect(resumed.outcomes_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_url_claims"
+        ).fetchone() == (0,)
+
+
+def test_url_claim_crash_before_request_expires_and_reclaims(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/claim-crash.jpg"
+    unique_jobs = write_unique_jobs(
+        tmp_path / "unique.jsonl",
+        [image_url],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: "unique"},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+
+    with pytest.raises(RuntimeError, match="after claim"):
+        fetch_unique_images(
+            unique_jobs,
+            store,
+            transport,
+            policy,
+            outcomes_path=tmp_path / "outcomes.sqlite3",
+            image_dir=tmp_path / "content",
+            lease_seconds=-1,
+            url_claim_lease_seconds=0.05,
+            url_claim_poll_seconds=0.005,
+            after_url_claim=lambda _lease: (
+                _ for _ in ()
+            ).throw(RuntimeError("after claim")),
+        )
+    assert transport.calls == []
+    time.sleep(0.06)
+
+    resumed = fetch_unique_images(
+        unique_jobs,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+        url_claim_lease_seconds=0.05,
+        url_claim_poll_seconds=0.005,
+    )
+
+    assert resumed.complete is True
+    assert resumed.success == 1
+    assert transport.calls == [image_url]
+
+
+def test_terminal_outcome_before_claim_finish_repairs_without_request(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/terminal-claim-crash.jpg"
+    unique_jobs = write_unique_jobs(
+        tmp_path / "unique.jsonl",
+        [image_url],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: TimeoutError()},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+
+    with pytest.raises(RuntimeError, match="after outcome"):
+        fetch_unique_images(
+            unique_jobs,
+            store,
+            transport,
+            policy,
+            outcomes_path=tmp_path / "outcomes.sqlite3",
+            image_dir=tmp_path / "content",
+            lease_seconds=-1,
+            url_claim_lease_seconds=60,
+            after_cache_write=lambda _outcome: (
+                _ for _ in ()
+            ).throw(RuntimeError("after outcome")),
+        )
+
+    resumed = fetch_unique_images(
+        unique_jobs,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+
+    assert resumed.complete is True
+    assert resumed.terminal == 1
+    assert transport.calls == [image_url]
+    with sqlite3.connect(resumed.outcomes_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_url_claims"
+        ).fetchone() == (0,)
+
+
+def test_url_claim_lease_fences_stale_owner_and_is_policy_scoped(
+    tmp_path: Path,
+) -> None:
+    store = ImageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    image_url = "https://i.test/fenced.jpg"
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    first = store.claim_url(
+        "policy-one",
+        url_key,
+        owner="first",
+        lease_seconds=1,
+        now=10,
+    ).lease
+    assert first is not None
+    second = store.claim_url(
+        "policy-one",
+        url_key,
+        owner="second",
+        lease_seconds=1,
+        now=12,
+    ).lease
+    assert second is not None
+    assert second.lease_id != first.lease_id
+
+    with pytest.raises(ValueError, match="stale or expired"):
+        store.put_claimed(
+            "policy-one",
+            url_key,
+            image_url,
+            {
+                "status": "terminal",
+                "error_class": "stale",
+            },
+            lease=first,
+            now=12,
+        )
+    assert store.finish_claim(
+        "policy-one",
+        url_key,
+        lease=first,
+    ) is False
+    persisted = store.put_claimed(
+        "policy-one",
+        url_key,
+        image_url,
+        {
+            "status": "terminal",
+            "error_class": "current",
+        },
+        lease=second,
+        now=12.5,
+    )
+    assert persisted["error_class"] == "current"
+    waiter = store.claim_url(
+        "policy-one",
+        url_key,
+        owner="waiter",
+        lease_seconds=1,
+        now=12.5,
+    )
+    assert waiter.outcome["error_class"] == "current"
+    assert store.finish_claim(
+        "policy-one",
+        url_key,
+        lease=second,
+    ) is False
+
+    other_policy = store.claim_url(
+        "policy-two",
+        url_key,
+        owner="other-policy",
+        lease_seconds=1,
+        now=12.5,
+    )
+    assert other_policy.lease is not None
+    expired_url = "https://i.test/expired-fence.jpg"
+    expired_key = hashlib.sha256(
+        expired_url.encode("utf-8")
+    ).hexdigest()
+    expired = store.claim_url(
+        "policy-three",
+        expired_key,
+        owner="expired",
+        lease_seconds=1,
+        now=20,
+    ).lease
+    assert expired is not None
+    assert store.finish_claim(
+        "policy-three",
+        expired_key,
+        lease=expired,
+        now=22,
+    ) is False
 
 
 def test_live_foreign_lease_reports_incomplete_then_repairs_from_cache(
@@ -1524,7 +1917,7 @@ class TrackingTerminalTransport:
                 self.maximum_by_host.get(host, 0),
                 active,
             )
-        time.sleep(0.002)
+        time.sleep(0.01)
         with self.lock:
             self.active -= 1
             self.active_by_host[host] -= 1
