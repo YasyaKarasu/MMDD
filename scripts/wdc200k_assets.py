@@ -379,6 +379,101 @@ class ImageOutcomeStore:
             "url_key_digest": key_digest.hexdigest(),
         }
 
+    def snapshot_for_jobs(
+        self,
+        policy_fingerprint: str,
+        jobs: UniqueImageJobs,
+        *,
+        commit_every: int = 10_000,
+    ) -> dict[str, Any]:
+        """Digest only the current job-set outcomes using a disk-backed join."""
+        if commit_every <= 0:
+            raise ValueError("commit_every must be positive")
+        digest = hashlib.sha256()
+        key_digest = hashlib.sha256()
+        success = 0
+        terminal = 0
+        count = 0
+        missing = 0
+        inserted = 0
+        previous: str | None = None
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute(
+                """
+                CREATE TEMP TABLE current_image_job_keys (
+                    url_key TEXT PRIMARY KEY
+                ) WITHOUT ROWID
+                """
+            )
+            for record in _iter_jsonl([jobs.output_path]):
+                url_key = str(record.get("url_key") or "")
+                if (
+                    not url_key
+                    or (previous is not None and url_key <= previous)
+                ):
+                    raise ValueError(
+                        "unique image jobs are not strictly ordered"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO current_image_job_keys (url_key)
+                    VALUES (?)
+                    """,
+                    (url_key,),
+                )
+                inserted += 1
+                previous = url_key
+                if inserted % commit_every == 0:
+                    connection.commit()
+            connection.commit()
+            if inserted != jobs.records:
+                raise ValueError("unique image job record count mismatch")
+
+            rows = connection.execute(
+                """
+                SELECT
+                    keys.url_key,
+                    outcomes.status,
+                    outcomes.outcome_json,
+                    outcomes.payload_sha256
+                FROM current_image_job_keys AS keys
+                LEFT JOIN image_outcomes AS outcomes
+                  ON outcomes.policy_fingerprint = ?
+                 AND outcomes.url_key = keys.url_key
+                ORDER BY keys.url_key
+                """,
+                (policy_fingerprint,),
+            )
+            for row in rows:
+                if row["outcome_json"] is None:
+                    missing += 1
+                    continue
+                self._decode(row)
+                url_key = str(row["url_key"])
+                payload_sha256 = str(row["payload_sha256"])
+                digest.update(url_key.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(payload_sha256.encode("ascii"))
+                digest.update(b"\n")
+                key_digest.update(url_key.encode("utf-8"))
+                key_digest.update(b"\n")
+                status = str(row["status"])
+                success += int(status == "success")
+                terminal += int(status == "terminal")
+                count += 1
+        finally:
+            connection.close()
+        return {
+            "count": count,
+            "success": success,
+            "terminal": terminal,
+            "missing": missing,
+            "digest": digest.hexdigest(),
+            "url_key_digest": key_digest.hexdigest(),
+        }
+
 
 class _BoundedShardWriter:
     def __init__(
@@ -926,13 +1021,31 @@ def _image_kind(
     policy_fingerprint: str,
     unique_jobs: UniqueImageJobs,
 ) -> str:
-    job_set_fingerprint = stable_hash(
+    return (
+        f"wdc200k-image:{policy_fingerprint}:"
+        f"{_image_job_set_fingerprint(unique_jobs)}"
+    )
+
+
+def _image_job_set_fingerprint(
+    unique_jobs: UniqueImageJobs,
+) -> str:
+    return stable_hash(
         unique_jobs.input_fingerprint,
         unique_jobs.parameter_fingerprint,
         unique_jobs.completed_shard.sha256,
         length=40,
     )
-    return f"wdc200k-image:{policy_fingerprint}:{job_set_fingerprint}"
+
+
+def _image_fetch_manifest_path(
+    outcomes_path: Path,
+    kind: str,
+) -> Path:
+    manifest_root = outcomes_path.with_suffix(
+        outcomes_path.suffix + ".fetch-manifests"
+    )
+    return manifest_root / f"{stable_hash(kind, length=40)}.json"
 
 
 def _enqueue_unique_images(
@@ -971,7 +1084,7 @@ def _enqueue_unique_images(
                 ) VALUES (?, ?, ?, 'pending', ?)
                 """,
                 (
-                    f"{policy_fingerprint}:{url_key}",
+                    f"{kind}:{url_key}",
                     kind,
                     json.dumps(payload, ensure_ascii=False),
                     time.time(),
@@ -1276,7 +1389,10 @@ def fetch_unique_images(
         kind=kind,
         policy_fingerprint=fingerprint,
     )
-    unique = _job_count(store, kind)
+    unique = unique_jobs.records
+    enqueued = _job_count(store, kind)
+    if enqueued != unique:
+        raise ValueError("image job set was not enqueued completely")
     owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
     buffer_limit = (
         policy.global_concurrency * 4
@@ -1435,7 +1551,10 @@ def fetch_unique_images(
                 )
             submit_ready(pool)
 
-    outcome_snapshot = outcome_store.snapshot(fingerprint)
+    outcome_snapshot = outcome_store.snapshot_for_jobs(
+        fingerprint,
+        unique_jobs,
+    )
     success = int(outcome_snapshot["success"])
     terminal = int(outcome_snapshot["terminal"])
     job_snapshot = _job_snapshot(store, kind)
@@ -1449,10 +1568,12 @@ def fetch_unique_images(
         and job_snapshot["pending"] == 0
         and job_snapshot["retryable"] == 0
         and job_snapshot["leased"] == 0
+        and int(outcome_snapshot["missing"]) == 0
         and outcome_snapshot["url_key_digest"] == unique_key_digest
     )
-    fetch_manifest_path = outcomes_path.with_suffix(
-        outcomes_path.suffix + ".fetch-manifest.json"
+    fetch_manifest_path = _image_fetch_manifest_path(
+        outcomes_path,
+        kind,
     )
     fetch_manifest = {
         "stage": "wdc200k-image-fetch-v1",
@@ -1500,10 +1621,13 @@ def fetch_unique_images(
             outcome_snapshot["url_key_digest"]
         ),
         leased=job_snapshot["leased"],
-        remaining=(
-            job_snapshot["pending"]
-            + job_snapshot["retryable"]
-            + job_snapshot["leased"]
+        remaining=max(
+            (
+                job_snapshot["pending"]
+                + job_snapshot["retryable"]
+                + job_snapshot["leased"]
+            ),
+            unique - success - terminal,
         ),
     )
 
@@ -1750,6 +1874,20 @@ def _validate_complete_image_fetch(
     if not result.complete:
         raise ValueError("image fetch result is not complete")
     unique_jobs = _validated_unique_image_jobs(result.unique_jobs)
+    expected_kind = _image_kind(
+        result.policy_fingerprint,
+        unique_jobs,
+    )
+    expected_manifest_path = _image_fetch_manifest_path(
+        result.outcomes_path,
+        expected_kind,
+    )
+    if (
+        result.job_kind != expected_kind
+        or result.fetch_manifest_path.resolve()
+        != expected_manifest_path.resolve()
+    ):
+        raise ValueError("image fetch job-set identity mismatch")
     if not result.fetch_manifest_path.is_file():
         raise ValueError("image fetch manifest is missing")
     actual_manifest_sha256 = _sha256_file(result.fetch_manifest_path)
@@ -1789,7 +1927,10 @@ def _validate_complete_image_fetch(
     if not result.outcomes_path.is_file():
         raise ValueError("image fetch outcome store is missing")
     outcome_store = ImageOutcomeStore(result.outcomes_path)
-    outcome_snapshot = outcome_store.snapshot(result.policy_fingerprint)
+    outcome_snapshot = outcome_store.snapshot_for_jobs(
+        result.policy_fingerprint,
+        unique_jobs,
+    )
     if (
         int(outcome_snapshot["count"]) != result.outcomes_count
         or str(outcome_snapshot["digest"]) != result.outcome_digest
@@ -1803,6 +1944,7 @@ def _validate_complete_image_fetch(
                 "count",
                 "success",
                 "terminal",
+                "missing",
                 "digest",
                 "url_key_digest",
             )
@@ -1813,6 +1955,7 @@ def _validate_complete_image_fetch(
     if (
         outcome_snapshot["url_key_digest"]
         != expected_unique["url_key_digest"]
+        or int(outcome_snapshot["missing"]) != 0
     ):
         raise ValueError("image fetch outcome job set mismatch")
 

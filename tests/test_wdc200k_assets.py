@@ -796,6 +796,30 @@ def write_unique_jobs(path: Path, urls: list[str]):
     return build_unique_image_jobs(planned, path, chunk_records=17)
 
 
+def write_named_job_set(
+    root: Path,
+    name: str,
+    urls: list[str],
+) -> tuple:
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity(f"{name}-{index}", image_urls=[url]),
+                page(),
+            )
+            for index, url in enumerate(urls)
+        ],
+        output_root=root / f"{name}-plans",
+        input_fingerprint=f"{name}-entities-v1",
+    )
+    jobs = build_unique_image_jobs(
+        planned,
+        root / f"{name}-unique.jsonl",
+        chunk_records=17,
+    )
+    return planned, jobs
+
+
 def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
     tmp_path: Path,
 ) -> None:
@@ -968,6 +992,370 @@ def test_terminal_image_outcome_is_not_replayed_on_resume(
 
     assert first.terminal == second.terminal == 1
     assert transport.calls == [image_url]
+
+
+def test_image_fetch_isolates_overlapping_job_sets_and_scopes_outcomes(
+    tmp_path: Path,
+) -> None:
+    a = "https://i.test/a.jpg"
+    b = "https://i.test/b.jpg"
+    c = "https://other.test/c.jpg"
+    planned_ab, jobs_ab = write_named_job_set(
+        tmp_path,
+        "ab",
+        [a, b],
+    )
+    planned_a, jobs_a = write_named_job_set(tmp_path, "a", [a])
+    planned_c, jobs_c = write_named_job_set(tmp_path, "c", [c])
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    transport = FakeImageTransport(
+        tmp_path,
+        {a: "unique", b: "unique", c: "unique"},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=2,
+        per_host_concurrency=1,
+    )
+
+    fetched_ab = fetch_unique_images(
+        jobs_ab,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    ab_manifest_mtime = fetched_ab.fetch_manifest_path.stat().st_mtime_ns
+    fetched_a = fetch_unique_images(
+        jobs_a,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    a_manifest_mtime = fetched_a.fetch_manifest_path.stat().st_mtime_ns
+    resumed_ab = fetch_unique_images(
+        jobs_ab,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    fetched_c = fetch_unique_images(
+        jobs_c,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    final_ab = fetch_unique_images(
+        jobs_ab,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    assert transport.calls.count(a) == 1
+    assert transport.calls.count(b) == 1
+    assert transport.calls.count(c) == 1
+    assert fetched_ab.complete is fetched_a.complete is True
+    assert fetched_c.complete is final_ab.complete is True
+    assert (fetched_ab.unique, fetched_ab.outcomes_count) == (2, 2)
+    assert (fetched_a.unique, fetched_a.outcomes_count) == (1, 1)
+    assert (fetched_c.unique, fetched_c.outcomes_count) == (1, 1)
+    assert final_ab.outcome_digest == fetched_ab.outcome_digest
+    assert len(
+        {
+            fetched_ab.fetch_manifest_path,
+            fetched_a.fetch_manifest_path,
+            fetched_c.fetch_manifest_path,
+        }
+    ) == 3
+    assert fetched_ab.fetch_manifest_path.stat().st_mtime_ns == (
+        ab_manifest_mtime
+    )
+    assert fetched_a.fetch_manifest_path.stat().st_mtime_ns == (
+        a_manifest_mtime
+    )
+    assert resumed_ab.fetch_manifest_sha256 == (
+        fetched_ab.fetch_manifest_sha256
+    )
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone() == (4,)
+        assert connection.execute(
+            """
+            SELECT COUNT(DISTINCT kind), COUNT(DISTINCT job_id)
+            FROM jobs
+            """
+        ).fetchone() == (3, 4)
+
+    for name, planned, fetched, expected_urls in (
+        ("ab", planned_ab, final_ab, {a, b}),
+        ("a", planned_a, fetched_a, {a}),
+        ("c", planned_c, fetched_c, {c}),
+    ):
+        materialized = materialize_asset_shards(
+            planned,
+            fetch_result=fetched,
+            output_root=tmp_path / f"{name}-materialized",
+            input_fingerprint=f"{name}-assets-v1",
+        )
+        assets = read_jsonl(materialized.bridge_asset_paths)
+        assert {
+            record["image_url"]
+            for record in assets
+            if record["asset_type"] == "image"
+        } == expected_urls
+
+    c_key = hashlib.sha256(c.encode("utf-8")).hexdigest()
+    with sqlite3.connect(outcomes_path) as connection:
+        connection.execute(
+            """
+            DELETE FROM image_outcomes
+            WHERE policy_fingerprint = ? AND url_key = ?
+            """,
+            (fetched_c.policy_fingerprint, c_key),
+        )
+    incomplete_c = fetch_unique_images(
+        jobs_c,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    assert incomplete_c.complete is False
+    assert incomplete_c.outcomes_count == 0
+    assert incomplete_c.remaining == 1
+    assert transport.calls.count(c) == 1
+    assert materialize_asset_shards(
+        planned_ab,
+        fetch_result=final_ab,
+        output_root=tmp_path / "ab-materialized",
+        input_fingerprint="ab-assets-v1",
+    )
+    with pytest.raises(ValueError, match="not complete"):
+        materialize_asset_shards(
+            planned_c,
+            fetch_result=incomplete_c,
+            output_root=tmp_path / "c-incomplete-materialized",
+            input_fingerprint="c-assets-incomplete",
+        )
+
+
+def test_image_fetch_expands_to_overlapping_larger_job_set(
+    tmp_path: Path,
+) -> None:
+    a = "https://i.test/grow-a.jpg"
+    b = "https://i.test/grow-b.jpg"
+    planned_a, jobs_a = write_named_job_set(tmp_path, "small", [a])
+    planned_ab, jobs_ab = write_named_job_set(
+        tmp_path,
+        "large",
+        [a, b],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {a: "unique", b: "unique"},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+
+    fetched_a = fetch_unique_images(
+        jobs_a,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    fetched_ab = fetch_unique_images(
+        jobs_ab,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    assert fetched_a.complete is fetched_ab.complete is True
+    assert (fetched_a.unique, fetched_a.outcomes_count) == (1, 1)
+    assert (fetched_ab.unique, fetched_ab.outcomes_count) == (2, 2)
+    assert transport.calls.count(a) == 1
+    assert transport.calls.count(b) == 1
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT kind) FROM jobs"
+        ).fetchone() == (3, 2)
+    materialized = materialize_asset_shards(
+        planned_ab,
+        fetch_result=fetched_ab,
+        output_root=tmp_path / "large-materialized",
+        input_fingerprint="large-assets-v1",
+    )
+    assert {
+        record["image_url"]
+        for record in read_jsonl(materialized.bridge_asset_paths)
+        if record["asset_type"] == "image"
+    } == {a, b}
+    assert materialize_asset_shards(
+        planned_a,
+        fetch_result=fetched_a,
+        output_root=tmp_path / "small-materialized",
+        input_fingerprint="small-assets-v1",
+    )
+
+
+def test_terminal_outcome_repairs_each_overlapping_job_set_without_network(
+    tmp_path: Path,
+) -> None:
+    broken = "https://i.test/broken.jpg"
+    _planned_first, jobs_first = write_named_job_set(
+        tmp_path,
+        "first",
+        [broken],
+    )
+    _planned_second, jobs_second = write_named_job_set(
+        tmp_path,
+        "second",
+        [broken],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {broken: TimeoutError()},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+
+    first = fetch_unique_images(
+        jobs_first,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+    second = fetch_unique_images(
+        jobs_second,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+
+    assert first.complete is second.complete is True
+    assert first.terminal == second.terminal == 1
+    assert first.job_kind != second.job_kind
+    assert first.fetch_manifest_path != second.fetch_manifest_path
+    assert transport.calls == [broken]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            GROUP BY status
+            """
+        ).fetchall() == [("terminal", 2)]
+
+
+def test_concurrent_overlapping_job_sets_repair_independent_jobs(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/shared-concurrent.jpg"
+    _planned_seed, jobs_seed = write_named_job_set(
+        tmp_path,
+        "seed",
+        [image_url],
+    )
+    _planned_left, jobs_left = write_named_job_set(
+        tmp_path,
+        "left",
+        [image_url],
+    )
+    _planned_right, jobs_right = write_named_job_set(
+        tmp_path,
+        "right",
+        [image_url],
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: "unique"},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    fetch_unique_images(
+        jobs_seed,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    barrier = threading.Barrier(2)
+    results: list = []
+    failures: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def run(current_jobs) -> None:
+        try:
+            barrier.wait(timeout=2)
+            result = fetch_unique_images(
+                current_jobs,
+                store,
+                transport,
+                policy,
+                outcomes_path=outcomes_path,
+                image_dir=tmp_path / "content",
+            )
+            with result_lock:
+                results.append(result)
+        except BaseException as error:
+            with result_lock:
+                failures.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(current_jobs,))
+        for current_jobs in (jobs_left, jobs_right)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert len(results) == 2
+    assert all(result.complete for result in results)
+    assert len({result.job_kind for result in results}) == 2
+    assert len({result.fetch_manifest_path for result in results}) == 2
+    assert transport.calls == [image_url]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT kind) FROM jobs"
+        ).fetchone() == (3, 3)
 
 
 def test_image_outcome_stream_detects_payload_checksum_corruption(
@@ -1364,7 +1752,7 @@ def test_materialization_streams_canonical_shards_and_resumes(
         sqlite3.connect(forged_outcomes_path) as target,
     ):
         source.backup(target)
-    with pytest.raises(ValueError, match="outcome path"):
+    with pytest.raises(ValueError, match="job-set identity"):
         materialize_asset_shards(
             planned,
             fetch_result=replace(
@@ -1401,11 +1789,11 @@ def test_materialization_streams_canonical_shards_and_resumes(
             ),
         )
 
-    with pytest.raises(ValueError, match="outcome"):
-        materialize_asset_shards(
-            planned,
-            fetch_result=fetched,
-            output_root=tmp_path / "materialized",
-            input_fingerprint="assets-v1",
-            records_per_shard=1,
-        )
+    resumed_after_unrelated_outcome = materialize_asset_shards(
+        planned,
+        fetch_result=fetched,
+        output_root=tmp_path / "materialized",
+        input_fingerprint="assets-v1",
+        records_per_shard=1,
+    )
+    assert resumed_after_unrelated_outcome == materialized
