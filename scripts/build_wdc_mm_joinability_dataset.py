@@ -11,6 +11,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -375,6 +376,16 @@ def extract_html_assets(html_text: str, base_url: str) -> tuple[str, list[str]]:
     return text, images
 
 
+def _cache_error_class(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return "fetch_failed"
+    candidate = text.split(":", 1)[0].replace(" ", "_")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", candidate):
+        return candidate
+    return "fetch_failed"
+
+
 class WdcWebClient:
     """Bounded generic HTTP client backed by a durable SQLite page cache."""
 
@@ -408,6 +419,7 @@ class WdcWebClient:
         pinned_request_fn: Callable[..., Any] | None = None,
         web_failure_callback: Callable[[dict[str, Any]], None] | None = None,
         media_failure_callback: Callable[[dict[str, Any]], None] | None = None,
+        network_policy_version: str = "wdc-web-v1",
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +451,7 @@ class WdcWebClient:
         self.monotonic_fn = monotonic_fn
         self.web_failure_callback = web_failure_callback
         self.media_failure_callback = media_failure_callback
+        self.network_policy_version = clean_text(network_policy_version) or "wdc-web-v1"
         self.resolve_host_fn = resolve_host_fn
         self.pinned_request_fn = pinned_request_fn
         self._host_map_lock = threading.Lock()
@@ -472,6 +485,7 @@ class WdcWebClient:
                     http_status INTEGER,
                     error TEXT,
                     body_bytes INTEGER NOT NULL DEFAULT 0,
+                    policy_fingerprint TEXT NOT NULL DEFAULT 'wdc-web-v1',
                     updated_at REAL NOT NULL
                 )
                 """
@@ -487,7 +501,21 @@ class WdcWebClient:
                     height INTEGER NOT NULL,
                     mime_type TEXT NOT NULL,
                     bytes INTEGER NOT NULL DEFAULT 0,
+                    policy_fingerprint TEXT NOT NULL DEFAULT 'wdc-web-v1',
                     updated_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_failure_cache (
+                    original_url TEXT NOT NULL,
+                    policy_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_class TEXT NOT NULL,
+                    http_status INTEGER,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (original_url, policy_fingerprint)
                 )
                 """
             )
@@ -499,6 +527,14 @@ class WdcWebClient:
                 connection.execute(
                     "ALTER TABLE image_cache ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0"
                 )
+            if "policy_fingerprint" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE image_cache
+                    ADD COLUMN policy_fingerprint TEXT NOT NULL
+                    DEFAULT 'wdc-web-v1'
+                    """
+                )
             page_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(page_cache)")
@@ -506,6 +542,14 @@ class WdcWebClient:
             if "body_bytes" not in page_columns:
                 connection.execute(
                     "ALTER TABLE page_cache ADD COLUMN body_bytes INTEGER NOT NULL DEFAULT 0"
+                )
+            if "policy_fingerprint" not in page_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE page_cache
+                    ADD COLUMN policy_fingerprint TEXT NOT NULL
+                    DEFAULT 'wdc-web-v1'
+                    """
                 )
             for row in connection.execute(
                 "SELECT original_url, file_name FROM image_cache WHERE bytes <= 0"
@@ -759,8 +803,11 @@ class WdcWebClient:
     def _cached_page(self, page_url: str) -> tuple[str | None, dict[str, Any] | None]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM page_cache WHERE page_url = ?",
-                (page_url,),
+                """
+                SELECT * FROM page_cache
+                WHERE page_url = ? AND policy_fingerprint = ?
+                """,
+                (page_url, self.network_policy_version),
             ).fetchone()
         if row is None:
             return None, None
@@ -785,14 +832,110 @@ class WdcWebClient:
                 "image_urls": image_urls,
             }
 
+    def cached_page_outcome(self, page_url: str) -> dict[str, Any] | None:
+        """Return the current durable page outcome without making a request."""
+        page_url = clean_text(page_url)
+        status, payload = self._cached_page(page_url)
+        if status is None or not isinstance(payload, dict):
+            return None
+        if status == "success":
+            return {
+                "status": "success",
+                **payload,
+                "policy_fingerprint": self.network_policy_version,
+            }
+        return {
+            "status": status,
+            "page_url": page_url,
+            "error_class": _cache_error_class(payload.get("error")),
+            "http_status": payload.get("http_status"),
+            "policy_fingerprint": self.network_policy_version,
+        }
+
+    def cached_image_outcome(self, image_url: str) -> dict[str, Any] | None:
+        """Return a durable image success/failure without network or mutation."""
+        image_url = clean_text(image_url)
+        with self._connect() as connection:
+            success = connection.execute(
+                """
+                SELECT * FROM image_cache
+                WHERE original_url = ? AND policy_fingerprint = ?
+                """,
+                (image_url, self.network_policy_version),
+            ).fetchone()
+            failure = connection.execute(
+                """
+                SELECT *
+                FROM image_failure_cache
+                WHERE original_url = ? AND policy_fingerprint = ?
+                """,
+                (image_url, self.network_policy_version),
+            ).fetchone()
+        if success is not None:
+            return {
+                "status": "success",
+                "image_url": image_url,
+                "final_url": str(success["final_url"]),
+                "file_name": str(success["file_name"]),
+                "sha256": str(success["sha256"]),
+                "width": int(success["width"]),
+                "height": int(success["height"]),
+                "mime_type": str(success["mime_type"]),
+                "bytes": int(success["bytes"]),
+                "policy_fingerprint": self.network_policy_version,
+            }
+        if failure is None:
+            return None
+        return {
+            "status": str(failure["status"]),
+            "image_url": image_url,
+            "error_class": str(failure["error_class"]),
+            "policy_fingerprint": self.network_policy_version,
+            **(
+                {}
+                if failure["http_status"] is None
+                else {"http_status": int(failure["http_status"])}
+            ),
+        }
+
+    def _store_image_failure(
+        self,
+        image_url: str,
+        *,
+        error_class: str,
+        http_status: int | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO image_failure_cache (
+                    original_url, policy_fingerprint, status,
+                    error_class, http_status, updated_at
+                ) VALUES (?, ?, 'terminal', ?, ?, ?)
+                ON CONFLICT(original_url, policy_fingerprint) DO UPDATE SET
+                    status = 'terminal',
+                    error_class = excluded.error_class,
+                    http_status = excluded.http_status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    image_url,
+                    self.network_policy_version,
+                    clean_text(error_class)[:200] or "download_or_validation_failed",
+                    http_status,
+                    time.time(),
+                ),
+            )
+
     def _store_page(self, payload: dict[str, Any]) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO page_cache (
                     page_url, status, final_url, text, image_urls_json,
-                    http_status, error, body_bytes, updated_at
-                ) VALUES (?, 'success', ?, ?, ?, ?, NULL, ?, ?)
+                    http_status, error, body_bytes, policy_fingerprint,
+                    updated_at
+                ) VALUES (?, 'success', ?, ?, ?, ?, NULL, ?, ?, ?)
                 ON CONFLICT(page_url) DO UPDATE SET
                     status = excluded.status,
                     final_url = excluded.final_url,
@@ -801,6 +944,7 @@ class WdcWebClient:
                     http_status = excluded.http_status,
                     error = NULL,
                     body_bytes = excluded.body_bytes,
+                    policy_fingerprint = excluded.policy_fingerprint,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -810,6 +954,7 @@ class WdcWebClient:
                     json.dumps(payload["image_urls"], ensure_ascii=False),
                     200,
                     int(payload.get("body_bytes", 0)),
+                    self.network_policy_version,
                     time.time(),
                 ),
             )
@@ -827,8 +972,8 @@ class WdcWebClient:
                 """
                 INSERT INTO page_cache (
                     page_url, status, final_url, text, image_urls_json,
-                    http_status, error, updated_at
-                ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?)
+                    http_status, error, policy_fingerprint, updated_at
+                ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
                 ON CONFLICT(page_url) DO UPDATE SET
                     status = excluded.status,
                     final_url = NULL,
@@ -836,10 +981,20 @@ class WdcWebClient:
                     image_urls_json = NULL,
                     http_status = excluded.http_status,
                     error = excluded.error,
+                    policy_fingerprint = excluded.policy_fingerprint,
                     updated_at = excluded.updated_at
                 WHERE page_cache.status != 'success'
+                   OR page_cache.policy_fingerprint
+                      != excluded.policy_fingerprint
                 """,
-                (page_url, status, http_status, error[:1000], time.time()),
+                (
+                    page_url,
+                    status,
+                    http_status,
+                    error[:1000],
+                    self.network_policy_version,
+                    time.time(),
+                ),
             )
         self._report_failure(
             self.web_failure_callback,
@@ -864,9 +1019,25 @@ class WdcWebClient:
         except Exception:
             logging.exception("WDC failure callback raised; continuing")
 
-    def fetch_page(self, page_url: str) -> dict[str, Any] | None:
+    def fetch_page(
+        self,
+        page_url: str,
+        *,
+        deadline_seconds: float | None = None,
+        max_retries: int | None = None,
+    ) -> dict[str, Any] | None:
         """Fetch, extract, and cache one page without retaining response HTML."""
-        deadline = float(self.monotonic_fn()) + self.max_response_seconds
+        response_seconds = (
+            self.max_response_seconds
+            if deadline_seconds is None
+            else max(0.01, float(deadline_seconds))
+        )
+        request_retries = (
+            self.max_retries
+            if max_retries is None
+            else max(0, int(max_retries))
+        )
+        deadline = float(self.monotonic_fn()) + response_seconds
         page_url = clean_text(page_url)
         if not extract_image_urls(page_url):
             self._store_page_failure(
@@ -905,7 +1076,7 @@ class WdcWebClient:
 
         last_error = "request failed"
         last_http_status: int | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(request_retries + 1):
             reserved_bytes = 0
             try:
                 response, final_url = self._request_with_redirects(
@@ -930,7 +1101,7 @@ class WdcWebClient:
                             http_status in self._RETRYABLE_HTTP_STATUSES
                             or http_status >= 500
                         )
-                        if retryable and attempt < self.max_retries:
+                        if retryable and attempt < request_retries:
                             self.sleep_fn(self.retry_base_seconds * (2**attempt))
                             continue
                         self._store_page_failure(
@@ -1007,7 +1178,7 @@ class WdcWebClient:
                         error="page response deadline exceeded",
                     )
                     return None
-                if attempt < self.max_retries:
+                if attempt < request_retries:
                     self.sleep_fn(self.retry_base_seconds * (2**attempt))
                     continue
                 status = "terminal" if "unsafe_redirect:" in str(exc) else "retryable"
@@ -1042,7 +1213,29 @@ class WdcWebClient:
         """Download one image candidate within the configured byte limit."""
         deadline = float(self.monotonic_fn()) + self.max_response_seconds
         image_url = clean_text(image_url)
+        cached_outcome = self.cached_image_outcome(image_url)
+        if (
+            isinstance(cached_outcome, dict)
+            and cached_outcome.get("status") == "terminal"
+        ):
+            self._report_failure(
+                self.media_failure_callback,
+                {
+                    "failure_type": "media_download_failure",
+                    "entity_id": entity_id,
+                    "page_url": page_url,
+                    "image_url": image_url,
+                    "source": source,
+                    "error": cached_outcome.get("error_class")
+                    or "download_or_validation_failed",
+                },
+            )
+            return None
         if not extract_image_urls(image_url):
+            self._store_image_failure(
+                image_url,
+                error_class="invalid_image_url",
+            )
             self._report_failure(
                 self.media_failure_callback,
                 {
@@ -1056,6 +1249,10 @@ class WdcWebClient:
             )
             return None
         if float(self.monotonic_fn()) >= deadline:
+            self._store_image_failure(
+                image_url,
+                error_class="image_response_deadline_exceeded",
+            )
             self._report_failure(
                 self.media_failure_callback,
                 {
@@ -1072,6 +1269,10 @@ class WdcWebClient:
             initial_target = self._validate_target(image_url, deadline=deadline)
             image_url = initial_target.url
         except Exception as exc:
+            self._store_image_failure(
+                image_url,
+                error_class=f"unsafe_url:{type(exc).__name__}",
+            )
             self._report_failure(
                 self.media_failure_callback,
                 {
@@ -1086,6 +1287,10 @@ class WdcWebClient:
             return None
         try:
             if urlsplit(image_url).path.casefold().endswith(".svg"):
+                self._store_image_failure(
+                    image_url,
+                    error_class="svg_rejected",
+                )
                 self._report_failure(
                     self.media_failure_callback,
                     {
@@ -1111,6 +1316,10 @@ class WdcWebClient:
                 entity_id=entity_id,
             )
         if record is None:
+            self._store_image_failure(
+                image_url,
+                error_class="download_or_validation_failed",
+            )
             self._report_failure(
                 self.media_failure_callback,
                 {
@@ -1146,7 +1355,15 @@ class WdcWebClient:
             ).fetchone()
         if cached_row is not None:
             cached_path = self.image_dir / cached_row["file_name"]
-            raster = self._validated_raster(cached_path)
+            policy_matches = (
+                str(cached_row["policy_fingerprint"])
+                == self.network_policy_version
+            )
+            raster = (
+                self._validated_raster(cached_path)
+                if policy_matches
+                else None
+            )
             sha_matches = (
                 raster is not None
                 and self._sha256_path(cached_path) == cached_row["sha256"]
@@ -1430,8 +1647,9 @@ class WdcWebClient:
                 """
                 INSERT INTO image_cache (
                     original_url, final_url, file_name, sha256,
-                    width, height, mime_type, bytes, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    width, height, mime_type, bytes, policy_fingerprint,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(original_url) DO UPDATE SET
                     final_url = excluded.final_url,
                     file_name = excluded.file_name,
@@ -1440,6 +1658,7 @@ class WdcWebClient:
                     height = excluded.height,
                     mime_type = excluded.mime_type,
                     bytes = excluded.bytes,
+                    policy_fingerprint = excluded.policy_fingerprint,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1451,6 +1670,7 @@ class WdcWebClient:
                     height,
                     mime_type,
                     path.stat().st_size,
+                    self.network_policy_version,
                     time.time(),
                 ),
             )
