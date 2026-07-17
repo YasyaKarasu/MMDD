@@ -179,25 +179,31 @@ def _candidate_from_record(
 
 
 def _record_for_fingerprint(record: TableCandidate | dict[str, Any]) -> str:
+    return json.dumps(
+        _canonical_selection_record(record),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_selection_record(
+    record: TableCandidate | dict[str, Any],
+) -> dict[str, Any]:
     candidate = _candidate_from_record(record)
     selection_seed = (
         int(record.get("selection_seed", 13))
         if isinstance(record, dict)
         else 13
     )
-    return json.dumps(
-        {
-            "schema_class": candidate.schema_class,
-            "subset": candidate.subset,
-            "host": candidate.host,
-            "relative_path": candidate.relative_path,
-            "rows": candidate.rows,
-            "columns": candidate.columns,
-            "selection_seed": selection_seed,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return {
+        "schema_class": candidate.schema_class,
+        "subset": candidate.subset,
+        "host": candidate.host,
+        "relative_path": candidate.relative_path,
+        "rows": candidate.rows,
+        "columns": candidate.columns,
+        "selection_seed": selection_seed,
+    }
 
 
 def _selection_fingerprint(
@@ -227,6 +233,75 @@ def _selection_fingerprint(
             "input_fingerprint is required when selection_records is "
             "a streamed iterable"
         )
+
+
+def _iter_selection_spool(
+    path: Path,
+) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def _prepare_selection_records(
+    records: Iterable[TableCandidate | dict[str, Any]],
+    *,
+    shard_id: str,
+    explicit_fingerprint: str | None,
+    spool_root: Path,
+) -> tuple[
+    Iterable[TableCandidate | dict[str, Any]],
+    str,
+    Path | None,
+]:
+    if isinstance(records, Sequence):
+        return (
+            records,
+            _selection_fingerprint(
+                records,
+                shard_id=shard_id,
+                explicit=explicit_fingerprint,
+            ),
+            None,
+        )
+    if not explicit_fingerprint:
+        raise ValueError(
+            "input_fingerprint is required when selection_records is "
+            "a streamed iterable"
+        )
+
+    spool_path = spool_root / "selection-records.jsonl"
+    digest = hashlib.sha256()
+    try:
+        with spool_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                canonical = _canonical_selection_record(record)
+                encoded = json.dumps(
+                    canonical,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                digest.update(encoded.encode("utf-8"))
+                digest.update(b"\n")
+                handle.write(encoded)
+                handle.write("\n")
+    except BaseException:
+        spool_path.unlink(missing_ok=True)
+        raise
+    combined_fingerprint = stable_hash(
+        STRUCTURAL_SCHEMA_VERSION,
+        shard_id,
+        explicit_fingerprint,
+        digest.hexdigest(),
+        length=40,
+    )
+    return (
+        _iter_selection_spool(spool_path),
+        combined_fingerprint,
+        spool_path,
+    )
 
 
 def _paths(output_root: Path, shard_id: str) -> StructuralExpansionResult:
@@ -656,36 +731,110 @@ def _validated_shard_from_manifest(
         raise StructuralExpansionError(
             f"structural manifest has no shards: {manifest_path}"
         )
+    manifest_prefix = "structural-"
+    if (
+        not manifest_path.stem.startswith(manifest_prefix)
+        or len(manifest_path.stem) == len(manifest_prefix)
+    ):
+        raise StructuralExpansionError(
+            f"invalid structural manifest name: {manifest_path}"
+        )
+    shard_id = manifest_path.stem.removeprefix(manifest_prefix)
+    expected_paths = {
+        "source_tables": f"source_tables/part-{shard_id}.jsonl",
+        "entities": f"entities/part-{shard_id}.jsonl",
+        "page_refs": f"page_refs/part-{shard_id}.jsonl",
+        "direct_image_refs": (
+            f"direct_image_refs/part-{shard_id}.jsonl"
+        ),
+        "structural_failures": (
+            f"structural_failures/part-{shard_id}.jsonl"
+        ),
+        "validated_selection": (
+            f"selection/validated-{shard_id}.jsonl"
+        ),
+    }
+    completed_paths = [shard.path for shard in completed]
+    if (
+        len(completed_paths) != len(expected_paths)
+        or set(completed_paths) != set(expected_paths.values())
+    ):
+        raise StructuralExpansionError(
+            "structural manifest artifact set is incomplete, "
+            "duplicated, or unknown"
+        )
+    artifacts = {
+        artifact_type: next(
+            shard
+            for shard in completed
+            if shard.path == expected_path
+        )
+        for artifact_type, expected_path in expected_paths.items()
+    }
     for shard in completed:
         if not validate_completed_shard(shard, output_root):
             raise StructuralExpansionError(
                 "structural shard checksum validation failed: "
                 f"{shard.path}"
             )
-    validated = [
-        shard
-        for shard in completed
-        if shard.path.startswith("selection/validated-")
-        and shard.path.endswith(".jsonl")
-    ]
-    sources = [
-        shard
-        for shard in completed
-        if shard.path.startswith("source_tables/")
-        and shard.path.endswith(".jsonl")
-    ]
-    if len(validated) != 1 or len(sources) != 1:
-        raise StructuralExpansionError(
-            "structural manifest must contain exactly one validated "
-            "selection shard and one source-table shard"
-        )
-    if validated[0].records != sources[0].records:
+    validated = artifacts["validated_selection"]
+    source = artifacts["source_tables"]
+    entities = artifacts["entities"]
+    page_refs = artifacts["page_refs"]
+    structural_failures = artifacts["structural_failures"]
+    if validated.records != source.records:
         raise StructuralExpansionError(
             "structural source and validated-selection counts differ"
         )
+    validated_path = output_root / validated.path
+    validated_entity_rows = 0
+    try:
+        with validated_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                rows = int(record["rows"])
+                if rows < 0:
+                    raise ValueError("negative rows")
+                validated_entity_rows += rows
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StructuralExpansionError(
+            "validated selection rows are invalid"
+        ) from error
+    if entities.records != validated_entity_rows:
+        raise StructuralExpansionError(
+            f"structural entity count {entities.records} does not match "
+            f"validated rows {validated_entity_rows}"
+        )
+
+    terminal_page_failures = 0
+    failures_path = output_root / structural_failures.path
+    try:
+        with failures_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                failure = json.loads(line)
+                if (
+                    failure.get("failure_type")
+                    == "structural_page_url_failure"
+                    and failure.get("status") == "terminal"
+                ):
+                    terminal_page_failures += 1
+    except (AttributeError, json.JSONDecodeError) as error:
+        raise StructuralExpansionError(
+            "structural failure record is invalid"
+        ) from error
+    page_coverage = page_refs.records + terminal_page_failures
+    if page_coverage != entities.records:
+        raise StructuralExpansionError(
+            f"structural page coverage {page_coverage} does not match "
+            f"entity count {entities.records}"
+        )
     return (
-        output_root / validated[0].path,
-        validated[0].records,
+        validated_path,
+        validated.records,
         _sha256_path(manifest_path),
     )
 
@@ -959,13 +1108,24 @@ def expand_selected_shard(
     output_root = Path(output_root)
     input_root = Path(input_root)
     paths = _paths(output_root, shard_id)
+    spool_root = output_root / ".structural_spool" / shard_id
+    spool_root.mkdir(parents=True, exist_ok=True)
+    for stale_spool_file in spool_root.iterdir():
+        if stale_spool_file.is_file():
+            stale_spool_file.unlink()
+    (
+        selection_records,
+        prepared_selection_fingerprint,
+        selection_spool_path,
+    ) = _prepare_selection_records(
+        selection_records,
+        shard_id=shard_id,
+        explicit_fingerprint=input_fingerprint,
+        spool_root=spool_root,
+    )
     fingerprint = StageFingerprint(
         stage="wdc200k_structural",
-        input_fingerprint=_selection_fingerprint(
-            selection_records,
-            shard_id=shard_id,
-            explicit=input_fingerprint,
-        ),
+        input_fingerprint=prepared_selection_fingerprint,
         parameter_fingerprint=stable_hash(
             STRUCTURAL_SCHEMA_VERSION,
             min_rows,
@@ -974,38 +1134,49 @@ def expand_selected_shard(
             length=40,
         ),
     )
-    manifest = StageManifest(paths.manifest, fingerprint)
+    try:
+        manifest = StageManifest(paths.manifest, fingerprint)
+    except BaseException:
+        if selection_spool_path is not None:
+            selection_spool_path.unlink(missing_ok=True)
+        raise
     if manifest.complete:
-        if not manifest.completed_shards or not all(
-            validate_completed_shard(shard, output_root)
-            for shard in manifest.completed_shards
-        ):
-            raise StructuralExpansionError(
-                "completed structural output failed checksum validation"
+        try:
+            if not manifest.completed_shards or not all(
+                validate_completed_shard(shard, output_root)
+                for shard in manifest.completed_shards
+            ):
+                raise StructuralExpansionError(
+                    "completed structural output failed checksum validation"
+                )
+            _acknowledge_validated_replacements(
+                paths.validated_selection,
+                reserve_manager,
             )
-        _acknowledge_validated_replacements(
-            paths.validated_selection,
-            reserve_manager,
-        )
-        return _completed_result(paths)
+            return _completed_result(paths)
+        finally:
+            if selection_spool_path is not None:
+                selection_spool_path.unlink(missing_ok=True)
 
-    spool_root = output_root / ".structural_spool" / shard_id
-    spool_root.mkdir(parents=True, exist_ok=True)
-    for stale_spool_file in spool_root.iterdir():
-        if stale_spool_file.is_file():
-            stale_spool_file.unlink()
-    writers = {
-        "source_tables": _AtomicSourceTableShard(paths.source_tables),
-        "entities": AtomicJsonlShard(paths.entities),
-        "page_refs": AtomicJsonlShard(paths.page_refs),
-        "direct_image_refs": AtomicJsonlShard(paths.direct_image_refs),
-        "structural_failures": AtomicJsonlShard(
-            paths.structural_failures
-        ),
-        "validated_selection": AtomicJsonlShard(
-            paths.validated_selection
-        ),
-    }
+    try:
+        writers = {
+            "source_tables": _AtomicSourceTableShard(paths.source_tables),
+            "entities": AtomicJsonlShard(paths.entities),
+            "page_refs": AtomicJsonlShard(paths.page_refs),
+            "direct_image_refs": AtomicJsonlShard(
+                paths.direct_image_refs
+            ),
+            "structural_failures": AtomicJsonlShard(
+                paths.structural_failures
+            ),
+            "validated_selection": AtomicJsonlShard(
+                paths.validated_selection
+            ),
+        }
+    except BaseException:
+        if selection_spool_path is not None:
+            selection_spool_path.unlink(missing_ok=True)
+        raise
     selected_count = 0
     successful_tables = 0
     entities_count = 0
@@ -1177,8 +1348,12 @@ def expand_selected_shard(
     except BaseException:
         for writer in writers.values():
             writer.abort()
+        if selection_spool_path is not None:
+            selection_spool_path.unlink(missing_ok=True)
         raise
 
+    if selection_spool_path is not None:
+        selection_spool_path.unlink(missing_ok=True)
     _acknowledge_validated_replacements(
         paths.validated_selection,
         reserve_manager,

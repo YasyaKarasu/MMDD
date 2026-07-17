@@ -83,6 +83,37 @@ def read_records(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def read_manifest(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def refresh_manifest_shard(
+    manifest: dict[str, Any],
+    *,
+    relative_path: str,
+    absolute_path: Path,
+) -> None:
+    shard = next(
+        record
+        for record in manifest["completed_shards"]
+        if record["path"] == relative_path
+    )
+    content = absolute_path.read_bytes()
+    shard["records"] = sum(
+        1 for line in content.splitlines() if line.strip()
+    )
+    shard["bytes"] = len(content)
+    shard["sha256"] = hashlib.sha256(content).hexdigest()
+
+
 def candidate(
     path: Path,
     root: Path,
@@ -224,6 +255,62 @@ def test_selection_seed_changes_structural_resume_fingerprint(
             input_root=tmp_path,
             input_fingerprint="same-upstream-fingerprint",
         )
+
+
+def test_streamed_selection_seed_changes_resume_fingerprint(
+    tmp_path: Path,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    record = selection_record(path, tmp_path, rows=1, columns=2)
+    output_root = tmp_path / "structural"
+    expand_selected_shard(
+        iter([record]),
+        output_root=output_root,
+        input_root=tmp_path,
+        input_fingerprint="same-upstream-fingerprint",
+    )
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        expand_selected_shard(
+            iter([{**record, "selection_seed": 99}]),
+            output_root=output_root,
+            input_root=tmp_path,
+            input_fingerprint="same-upstream-fingerprint",
+        )
+
+
+def test_streamed_selection_input_is_iterated_exactly_once(
+    tmp_path: Path,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    record = selection_record(path, tmp_path, rows=1, columns=2)
+
+    class OneShotSelection:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self) -> Any:
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("selection iterable was replayed")
+            yield record
+
+    selection = OneShotSelection()
+    result = expand_selected_shard(
+        selection,
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+        input_fingerprint="selection-shard-checksum",
+    )
+
+    assert result.tables == 1
+    assert selection.iterations == 1
 
 
 def test_structural_module_imports_through_scripts_package() -> None:
@@ -403,6 +490,23 @@ def test_global_finalize_is_exact_validated_and_idempotent(
     )
     assert resumed.validated_selection.stat().st_mtime_ns == mtime
 
+    damaged_manifest = read_manifest(manifests[0])
+    damaged_manifest["completed_shards"] = [
+        shard
+        for shard in damaged_manifest["completed_shards"]
+        if not shard["path"].startswith("direct_image_refs/")
+    ]
+    write_manifest(manifests[0], damaged_manifest)
+    with pytest.raises(
+        StructuralExpansionError,
+        match="artifact",
+    ):
+        finalize_validated_selection(
+            manifests,
+            output_root=output_root,
+            target_tables=2,
+        )
+
 
 @pytest.mark.parametrize("target_tables", [1, 3])
 def test_global_finalize_rejects_non_exact_target(
@@ -518,6 +622,188 @@ def test_global_finalize_rejects_missing_or_corrupt_structural_shard(
             output_root=output_root,
             target_tables=1,
         )
+
+
+@pytest.mark.parametrize(
+    "missing_prefix",
+    [
+        "entities/",
+        "page_refs/",
+        "direct_image_refs/",
+        "structural_failures/",
+    ],
+)
+def test_global_finalize_requires_every_structural_artifact(
+    tmp_path: Path,
+    missing_prefix: str,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": ""}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=1)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    manifest = read_manifest(result.manifest)
+    manifest["completed_shards"] = [
+        shard
+        for shard in manifest["completed_shards"]
+        if not shard["path"].startswith(missing_prefix)
+    ]
+    write_manifest(result.manifest, manifest)
+
+    with pytest.raises(StructuralExpansionError, match="artifact"):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=1,
+        )
+
+
+@pytest.mark.parametrize("damage", ["duplicate", "unknown"])
+def test_global_finalize_rejects_duplicate_or_unknown_artifact(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=2)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    manifest = read_manifest(result.manifest)
+    if damage == "duplicate":
+        entity_shard = next(
+            shard
+            for shard in manifest["completed_shards"]
+            if shard["path"].startswith("entities/")
+        )
+        manifest["completed_shards"].append(dict(entity_shard))
+    else:
+        unknown = output_root / "unknown" / "part-00000.jsonl"
+        unknown.parent.mkdir(parents=True)
+        unknown.write_text("{}\n", encoding="utf-8")
+        content = unknown.read_bytes()
+        manifest["completed_shards"].append(
+            {
+                "path": "unknown/part-00000.jsonl",
+                "records": 1,
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    write_manifest(result.manifest, manifest)
+
+    with pytest.raises(StructuralExpansionError, match="artifact"):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=1,
+        )
+
+
+def test_global_finalize_checks_entity_count_against_validated_rows(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=2)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    validated = read_records(result.validated_selection)
+    validated[0]["rows"] = 2
+    result.validated_selection.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in validated
+        ),
+        encoding="utf-8",
+    )
+    manifest = read_manifest(result.manifest)
+    refresh_manifest_shard(
+        manifest,
+        relative_path=(
+            result.validated_selection.relative_to(output_root).as_posix()
+        ),
+        absolute_path=result.validated_selection,
+    )
+    write_manifest(result.manifest, manifest)
+
+    with pytest.raises(StructuralExpansionError, match="entity count"):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=1,
+        )
+
+
+def test_global_finalize_checks_page_ref_or_terminal_failure_per_entity(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": ""}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=1)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    result.structural_failures.write_text("", encoding="utf-8")
+    manifest = read_manifest(result.manifest)
+    refresh_manifest_shard(
+        manifest,
+        relative_path=(
+            result.structural_failures.relative_to(output_root).as_posix()
+        ),
+        absolute_path=result.structural_failures,
+    )
+    write_manifest(result.manifest, manifest)
+
+    with pytest.raises(StructuralExpansionError, match="page coverage"):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=1,
+        )
+
+
+def test_global_finalize_accepts_zero_page_and_direct_image_ref_shards(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": ""}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=1)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    finalized = finalize_validated_selection(
+        [result.manifest],
+        output_root=output_root,
+        target_tables=1,
+    )
+
+    assert finalized.tables == 1
+    assert result.page_refs.stat().st_size == 0
+    assert result.direct_image_refs.stat().st_size == 0
 
 
 def test_each_selection_shard_requires_its_own_exact_success_count(
