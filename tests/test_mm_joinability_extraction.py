@@ -74,6 +74,7 @@ def strict_start_marker(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    payload["timestamp"] = 0.0
     return payload
 
 
@@ -103,6 +104,7 @@ def strict_done_marker(
         "text_task_count": text_tasks,
         "image_task_count": image_tasks,
         "start_fingerprint": start_fingerprint,
+        "timestamp": 0.0,
     }
 
 
@@ -795,7 +797,12 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
         model_ready_marker=tmp_path / "model_ready.json",
         text_done_marker=tmp_path / "text_done.json",
         image_done_marker=tmp_path / "image_done.json",
-        passthrough_args=["--max_source_tables", "10"],
+        passthrough_args=[
+            "--max_source_tables",
+            "10",
+            "--run_fingerprint",
+            "run-v1",
+        ],
     )
 
     assert "--precompute_model_cache" in command
@@ -807,7 +814,12 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
     assert "--image_model_base_urls_file" in command
     assert "http://127.0.0.1:8001/v1" in command
     assert "http://127.0.0.1:8000/v1" in command
-    assert command[-2:] == ["--max_source_tables", "10"]
+    assert command[-4:] == [
+        "--max_source_tables",
+        "10",
+        "--run_fingerprint",
+        "run-v1",
+    ]
 
 
 def test_dynamic_vllm_defaults_limit_startup_kv_cache_memory():
@@ -876,6 +888,113 @@ def test_dynamic_vllm_accepts_staged_run_fingerprint():
 
     assert args.run_fingerprint == "wdc-run-v1"
     assert "--run_fingerprint" not in passthrough
+
+
+def test_real_builder_and_default_runner_share_strict_marker_contract(
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--run_fingerprint",
+            "run-real-v1",
+            "--text_model_name",
+            "text-real-v1",
+            "--image_model_name",
+            "image-real-v1",
+        ]
+    )
+    tasks_by_kind = {
+        "text": [_task("text", "one")],
+        "image": [_task("image", "two")],
+    }
+    context = joinability_dataset.build_model_marker_context(
+        args=args,
+        tasks_by_kind=tasks_by_kind,
+        upstream_identities=[
+            {
+                "path": "/data/source-00000.jsonl",
+                "sha256": "a" * 64,
+            }
+        ],
+    )
+    changed_context = joinability_dataset.build_model_marker_context(
+        args=args,
+        tasks_by_kind={
+            **tasks_by_kind,
+            "text": [_task("text", "changed")],
+        },
+        upstream_identities=[
+            {
+                "path": "/data/source-00000.jsonl",
+                "sha256": "a" * 64,
+            }
+        ],
+    )
+    assert (
+        changed_context.text_jobset_fingerprint
+        != context.text_jobset_fingerprint
+    )
+
+    start = tmp_path / "start.json"
+    ready = tmp_path / "ready.json"
+    text_done = tmp_path / "text-done.json"
+    image_done = tmp_path / "image-done.json"
+    joinability_dataset.write_model_start_marker(
+        str(start),
+        context=context,
+    )
+    assert runner.marker_matches_run(
+        start,
+        "run-real-v1",
+        expected_status="model_cache_ready_to_start",
+    )
+    assert runner.read_pending_model_task_count(start) == 2
+
+    runner.write_ready_marker(
+        ready,
+        run_fingerprint=context.run_fingerprint,
+        text_jobset_fingerprint=context.text_jobset_fingerprint,
+        image_jobset_fingerprint=context.image_jobset_fingerprint,
+        text_task_count=context.text_task_count,
+        image_task_count=context.image_task_count,
+        start_fingerprint=context.start_fingerprint,
+    )
+    assert joinability_dataset.model_ready_marker_matches(
+        str(ready),
+        context=context,
+    )
+
+    for kind, path in (("text", text_done), ("image", image_done)):
+        joinability_dataset.write_model_done_marker(
+            str(path),
+            model_kind=kind,
+            task_count=1,
+            context=context,
+        )
+        assert runner.marker_matches_run(
+            path,
+            context.run_fingerprint,
+            context.fingerprint_for(kind),
+            expected_status=f"{kind}_model_cache_precomputed",
+            expected_model_kind=kind,
+            expected_task_count=1,
+            expected_text_jobset_fingerprint=(
+                context.text_jobset_fingerprint
+            ),
+            expected_image_jobset_fingerprint=(
+                context.image_jobset_fingerprint
+            ),
+            expected_text_task_count=context.text_task_count,
+            expected_image_task_count=context.image_task_count,
+            expected_start_fingerprint=context.start_fingerprint,
+        )
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_start_server_passes_vllm_output_through_to_tmux(monkeypatch):
@@ -1107,6 +1226,7 @@ def test_dynamic_markers_reject_legacy_and_ready_binds_start(
     payload = json.loads(ready.read_text(encoding="utf-8"))
     assert payload["stage"] == "wdc200k_model_ready"
     assert payload["schema_version"] == "wdc200k-model-markers-v1"
+    assert payload["model_kind"] == "text+image"
     assert payload["start_fingerprint"] == "a" * 64
     assert not ready.with_suffix(".json.tmp").exists()
 
@@ -1563,6 +1683,11 @@ def test_precompute_task_groups_write_each_modality_done_marker_independently(tm
         "text": [_task("text", "1")],
         "image": [_task("image", "2")],
     }
+    marker_context = joinability_dataset.build_model_marker_context(
+        args=args,
+        tasks_by_kind=tasks_by_kind,
+        upstream_identities=[],
+    )
 
     worker = threading.Thread(
         target=precompute_extraction_task_groups,
@@ -1573,6 +1698,7 @@ def test_precompute_task_groups_write_each_modality_done_marker_independently(tm
             "args": args,
             "state": state,
             "progress": None,
+            "marker_context": marker_context,
         },
     )
     worker.start()
@@ -1608,15 +1734,25 @@ def test_precompute_task_groups_immediately_marks_empty_modality_done(tmp_path):
         model_text_done_marker=str(tmp_path / "text_done.json"),
         model_image_done_marker=str(tmp_path / "image_done.json"),
     )
+    tasks_by_kind = {
+        "text": [],
+        "image": [_task("image", "pending")],
+    }
+    marker_context = joinability_dataset.build_model_marker_context(
+        args=args,
+        tasks_by_kind=tasks_by_kind,
+        upstream_identities=[],
+    )
     worker = threading.Thread(
         target=precompute_extraction_task_groups,
         kwargs={
             "extractor": FakeExtractor(),
             "cache": ExtractionCache(tmp_path / "model_cache.jsonl"),
-            "tasks_by_kind": {"text": [], "image": [_task("image", "pending")]},
+            "tasks_by_kind": tasks_by_kind,
             "args": args,
             "state": ModelConcurrencyState(text_workers=1, image_workers=1),
             "progress": None,
+            "marker_context": marker_context,
         },
     )
     worker.start()

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -58,6 +59,7 @@ from build_mm_table_dataset import (
     write_table_asset_links_from_jsonl,
 )
 from image_preprocessing import target_size
+import model_marker_protocol as model_markers
 from stage1_io import (
     clean_text,
     column_profiles,
@@ -1489,57 +1491,205 @@ def collect_extraction_tasks_from_tables(
     return tasks
 
 
-def write_model_done_marker(path_value: str, *, model_kind: str, task_count: int) -> None:
-    if not clean_text(path_value):
-        return
-    path = Path(path_value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "status": f"{model_kind}_model_cache_precomputed",
-                "model_kind": model_kind,
-                "task_count": task_count,
-                f"{model_kind}_task_count": task_count,
-                "timestamp": time.time(),
-            },
-            ensure_ascii=False,
-            indent=2,
+def model_jobset_policy_identity(
+    args: argparse.Namespace,
+    model_kind: str,
+) -> dict[str, Any]:
+    identity = {
+        "disable_thinking": bool(getattr(args, "disable_thinking", True)),
+        "model_temperature": float(
+            getattr(args, "model_temperature", 0.0)
         ),
-        encoding="utf-8",
+        "reparse_cached_model_outputs": bool(
+            getattr(args, "reparse_cached_model_outputs", True)
+        ),
+        "refresh_invalid_model_cache": bool(
+            getattr(args, "refresh_invalid_model_cache", False)
+        ),
+        "cache_failed_model_outputs": bool(
+            getattr(args, "cache_failed_model_outputs", False)
+        ),
+        "no_reuse_model_cache": bool(
+            getattr(args, "no_reuse_model_cache", False)
+        ),
+    }
+    if model_kind == "image":
+        identity.update(
+            {
+                "max_tokens": int(
+                    getattr(
+                        args,
+                        "image_model_max_tokens",
+                        DEFAULT_IMAGE_MODEL_MAX_TOKENS,
+                    )
+                ),
+                "request_max_pixels": int(
+                    getattr(
+                        args,
+                        "image_request_max_pixels",
+                        DEFAULT_IMAGE_REQUEST_MAX_PIXELS,
+                    )
+                ),
+                "context_retry_max_pixels": int(
+                    getattr(
+                        args,
+                        "context_retry_image_max_pixels",
+                        DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS,
+                    )
+                ),
+            }
+        )
+    else:
+        identity["max_tokens"] = int(
+            getattr(args, "model_max_tokens", 1024)
+        )
+    return identity
+
+
+def build_model_marker_context(
+    *,
+    args: argparse.Namespace,
+    tasks_by_kind: dict[str, list[ExtractionTask]],
+    upstream_identities: Iterable[dict[str, Any]],
+) -> model_markers.ModelMarkerContext:
+    tasks = {
+        kind: list(tasks_by_kind.get(kind, []))
+        for kind in ("text", "image")
+    }
+    fingerprints = {
+        kind: model_markers.task_jobset_fingerprint(
+            tasks[kind],
+            model_kind=kind,
+            model_identity=str(
+                getattr(
+                    args,
+                    f"{kind}_model_name",
+                    "Qwen3.5-9B"
+                    if kind == "text"
+                    else "Qwen3-VL-8B-Thinking",
+                )
+            ),
+            prompt_version=PROMPT_VERSION,
+            policy_identity=model_jobset_policy_identity(args, kind),
+        )
+        for kind in ("text", "image")
+    }
+    return model_markers.build_marker_context(
+        run_fingerprint=str(getattr(args, "run_fingerprint", "")),
+        text_jobset_fingerprint=fingerprints["text"],
+        image_jobset_fingerprint=fingerprints["image"],
+        text_task_count=len(tasks["text"]),
+        image_task_count=len(tasks["image"]),
+        upstream_identities=upstream_identities,
     )
 
 
-def write_model_start_marker(path_value: str, *, text_task_count: int, image_task_count: int) -> None:
+def source_shard_identities(
+    source_paths: Iterable[Path],
+) -> list[dict[str, str]]:
+    identities: list[dict[str, str]] = []
+    for value in source_paths:
+        path = Path(value).expanduser().resolve()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identities.append(
+            {
+                "path": str(path),
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return identities
+
+
+def write_model_done_marker(
+    path_value: str,
+    *,
+    model_kind: str,
+    task_count: int,
+    context: model_markers.ModelMarkerContext | None = None,
+) -> None:
     if not clean_text(path_value):
         return
-    path = Path(path_value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "status": "model_cache_ready_to_start",
-                "text_task_count": text_task_count,
-                "image_task_count": image_task_count,
-                "timestamp": time.time(),
-            },
-            ensure_ascii=False,
-            indent=2,
+    if context is None:
+        raise ValueError("strict model done markers require marker context")
+    model_markers.atomic_write_json(
+        Path(path_value),
+        model_markers.done_marker_payload(
+            context,
+            model_kind=model_kind,
+            task_count=task_count,
+            timestamp=time.time(),
         ),
-        encoding="utf-8",
     )
 
 
-def wait_for_model_ready_marker(path_value: str, *, poll_seconds: float = 2.0) -> None:
+def write_model_start_marker(
+    path_value: str,
+    *,
+    context: model_markers.ModelMarkerContext,
+) -> None:
     if not clean_text(path_value):
         return
-    path = Path(path_value)
-    while not path.exists():
+    model_markers.atomic_write_json(
+        Path(path_value),
+        model_markers.start_marker_payload(
+            context,
+            timestamp=time.time(),
+        ),
+    )
+
+
+def model_ready_marker_matches(
+    path_value: str,
+    *,
+    context: model_markers.ModelMarkerContext,
+) -> bool:
+    if not clean_text(path_value):
+        return False
+    return model_markers.marker_matches(
+        Path(path_value),
+        expected_stage=model_markers.MODEL_READY_STAGE,
+        expected_status="vllm_servers_ready",
+        context=context,
+        model_kind=model_markers.READY_MODEL_KIND,
+    )
+
+
+def wait_for_model_ready_marker(
+    path_value: str,
+    *,
+    context: model_markers.ModelMarkerContext,
+    timeout_seconds: float | None = None,
+    poll_seconds: float = 2.0,
+) -> None:
+    if not clean_text(path_value):
+        return
+    started = time.monotonic()
+    while not model_ready_marker_matches(path_value, context=context):
+        if (
+            timeout_seconds is not None
+            and time.monotonic() - started > timeout_seconds
+        ):
+            raise RuntimeError(
+                f"timed out waiting for ready marker: {path_value}"
+            )
         time.sleep(poll_seconds)
 
 
-def write_text_done_marker(path_value: str, *, task_count: int) -> None:
-    write_model_done_marker(path_value, model_kind="text", task_count=task_count)
+def write_text_done_marker(
+    path_value: str,
+    *,
+    task_count: int,
+    context: model_markers.ModelMarkerContext,
+) -> None:
+    write_model_done_marker(
+        path_value,
+        model_kind="text",
+        task_count=task_count,
+        context=context,
+    )
 
 
 def model_done_marker_for_kind(args: argparse.Namespace, model_kind: str) -> str:
@@ -1556,6 +1706,7 @@ def precompute_extraction_task_groups(
     args: argparse.Namespace,
     state: ModelConcurrencyState,
     progress: ModelAnalysisProgress | None = None,
+    marker_context: model_markers.ModelMarkerContext | None = None,
 ) -> dict[str, int]:
     active_groups = {
         kind: tasks
@@ -1565,7 +1716,12 @@ def precompute_extraction_task_groups(
     counts = {kind: len(tasks) for kind, tasks in tasks_by_kind.items() if kind in {"text", "image"}}
     for kind, count in counts.items():
         if kind not in active_groups:
-            write_model_done_marker(model_done_marker_for_kind(args, kind), model_kind=kind, task_count=count)
+            write_model_done_marker(
+                model_done_marker_for_kind(args, kind),
+                model_kind=kind,
+                task_count=count,
+                context=marker_context,
+            )
     if not active_groups:
         return counts
 
@@ -1589,6 +1745,7 @@ def precompute_extraction_task_groups(
                 model_done_marker_for_kind(args, kind),
                 model_kind=kind,
                 task_count=task_count,
+                context=marker_context,
             )
     return counts
 
@@ -2390,17 +2547,32 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             precomputed_text_task_count,
             precomputed_image_task_count,
         )
+        tasks_by_kind = {
+            "text": pending_text_tasks,
+            "image": pending_image_tasks,
+        }
+        marker_context = build_model_marker_context(
+            args=args,
+            tasks_by_kind=tasks_by_kind,
+            upstream_identities=source_shard_identities(
+                source_writer.paths()
+            ),
+        )
         write_model_start_marker(
             clean_text(getattr(args, "model_start_marker", "")),
-            text_task_count=precomputed_text_task_count,
-            image_task_count=precomputed_image_task_count,
+            context=marker_context,
         )
         if pending_text_tasks or pending_image_tasks:
-            wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
+            wait_for_model_ready_marker(
+                clean_text(getattr(args, "model_ready_marker", "")),
+                context=marker_context,
+                timeout_seconds=getattr(
+                    args,
+                    "model_ready_timeout_seconds",
+                    None,
+                ),
+            )
             extractor = LocalAttributeExtractor(args)
-            tasks_by_kind = {"text": pending_text_tasks}
-            if getattr(args, "precompute_model_cache", False):
-                tasks_by_kind["image"] = pending_image_tasks
             precompute_extraction_task_groups(
                 extractor=extractor,
                 cache=cache,
@@ -2408,27 +2580,29 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 state=concurrency_state,
                 progress=progress,
+                marker_context=marker_context,
             )
         else:
             logging.info("All model extraction tasks are cached; skipping model analysis")
-            write_model_done_marker(
-                model_done_marker_for_kind(args, "text"),
-                model_kind="text",
-                task_count=0,
-            )
-            if getattr(args, "precompute_model_cache", False):
+            for model_kind in ("text", "image"):
                 write_model_done_marker(
-                    model_done_marker_for_kind(args, "image"),
-                    model_kind="image",
+                    model_done_marker_for_kind(args, model_kind),
+                    model_kind=model_kind,
                     task_count=0,
+                    context=marker_context,
                 )
     else:
+        marker_context = build_model_marker_context(
+            args=args,
+            tasks_by_kind={"text": [], "image": []},
+            upstream_identities=source_shard_identities(
+                source_writer.paths()
+            ),
+        )
         write_model_start_marker(
             clean_text(getattr(args, "model_start_marker", "")),
-            text_task_count=0,
-            image_task_count=0,
+            context=marker_context,
         )
-        wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
         extractor = LocalAttributeExtractor(args)
 
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)
@@ -2734,8 +2908,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--precompute_text_model_cache", action="store_true", help="Run all text extraction tasks into the shared model cache before image-heavy table processing.")
     parser.add_argument("--model_start_marker", default=None, help="Write this JSON marker after Wikipedia/material preparation is complete and model requests are about to start.")
     parser.add_argument("--model_ready_marker", default=None, help="Wait for this JSON marker before issuing model requests. Dynamic vLLM runners write it after servers are healthy.")
+    parser.add_argument("--model_ready_timeout_seconds", type=float, default=None, help="Optional timeout while waiting for a matching strict model-ready marker.")
     parser.add_argument("--model_text_done_marker", default=None, help="Write this JSON marker after --precompute_text_model_cache completes.")
     parser.add_argument("--model_image_done_marker", default=None, help="Write this JSON marker after image model cache precompute completes.")
+    parser.add_argument("--run_fingerprint", default="", help="Staged-run identity used to fence stale model markers.")
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)
     parser.set_defaults(model_progress=True)
     return parser.parse_args(argv)

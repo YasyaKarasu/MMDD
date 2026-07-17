@@ -255,12 +255,14 @@ def write_strict_ready_marker(
                 "stage": "wdc200k_model_ready",
                 "schema_version": "wdc200k-model-markers-v1",
                 "status": "vllm_servers_ready",
+                "model_kind": "text+image",
                 "run_fingerprint": run_fingerprint,
                 "text_jobset_fingerprint": jobset.text_fingerprint,
                 "image_jobset_fingerprint": jobset.image_fingerprint,
                 "text_task_count": jobset.text_tasks,
                 "image_task_count": jobset.image_tasks,
                 "start_fingerprint": start_fingerprint,
+                "timestamp": 0.0,
             }
         ),
         encoding="utf-8",
@@ -1711,12 +1713,14 @@ def test_model_markers_require_schema_stage_and_start_identity(
     ready = tmp_path / "ready.json"
     base = {
         "status": "vllm_servers_ready",
+        "model_kind": "text+image",
         "run_fingerprint": "run-v1",
         "text_jobset_fingerprint": "text-v1",
         "image_jobset_fingerprint": "image-v1",
         "text_task_count": 2,
         "image_task_count": 3,
         "start_fingerprint": "a" * 64,
+        "timestamp": 0.0,
     }
     ready.write_text(json.dumps(base), encoding="utf-8")
     assert not marker_matches(

@@ -23,6 +23,8 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+import model_marker_protocol as model_markers
+
 try:
     from build_mm_joinability_dataset import (
         PROMPT_VERSION,
@@ -70,10 +72,10 @@ MODEL_QUEUE_SCHEMA_VERSION = "wdc200k-model-queues-v1"
 MODEL_OUTPUT_SCHEMA_VERSION = "wdc200k-model-outputs-v1"
 MODEL_POLICY_VERSION = "existing-extraction-semantics-v1"
 MODEL_PARSER_SCHEMA_VERSION = "connection-evidence-parser-v1"
-MODEL_MARKER_SCHEMA_VERSION = "wdc200k-model-markers-v1"
-MODEL_START_STAGE = "wdc200k_model_start"
-MODEL_READY_STAGE = "wdc200k_model_ready"
-MODEL_DONE_STAGE = "wdc200k_model_done"
+MODEL_MARKER_SCHEMA_VERSION = model_markers.MODEL_MARKER_SCHEMA_VERSION
+MODEL_START_STAGE = model_markers.MODEL_START_STAGE
+MODEL_READY_STAGE = model_markers.MODEL_READY_STAGE
+MODEL_DONE_STAGE = model_markers.MODEL_DONE_STAGE
 STRUCTURAL_STAGE_SCHEMA_VERSION = "wdc200k-structural-v2"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
@@ -2598,27 +2600,22 @@ def write_model_start_marker(
             "sha256": _sha256_path(assets_path),
         }
     )
-    payload = {
-        "stage": MODEL_START_STAGE,
-        "schema_version": MODEL_MARKER_SCHEMA_VERSION,
-        "status": "model_cache_ready_to_start",
-        "run_fingerprint": run_fingerprint,
-        "text_jobset_fingerprint": jobset.text_fingerprint,
-        "image_jobset_fingerprint": jobset.image_fingerprint,
-        "text_task_count": jobset.text_tasks,
-        "image_task_count": jobset.image_tasks,
-        "upstream_manifests": upstream,
-    }
-    start_fingerprint = _digest_json(payload)
-    _atomic_json(
-        Path(path),
-        {
-            **payload,
-            "start_fingerprint": start_fingerprint,
-            "timestamp": time.time(),
-        },
+    context = model_markers.build_marker_context(
+        run_fingerprint=run_fingerprint,
+        text_jobset_fingerprint=jobset.text_fingerprint,
+        image_jobset_fingerprint=jobset.image_fingerprint,
+        text_task_count=jobset.text_tasks,
+        image_task_count=jobset.image_tasks,
+        upstream_identities=upstream,
     )
-    return start_fingerprint
+    model_markers.atomic_write_json(
+        Path(path),
+        model_markers.start_marker_payload(
+            context,
+            timestamp=time.time(),
+        ),
+    )
+    return context.start_fingerprint
 
 
 def write_model_done_marker(
@@ -2636,24 +2633,27 @@ def write_model_done_marker(
 ) -> None:
     if model_kind not in {"text", "image"}:
         raise ValueError(f"unsupported model kind: {model_kind}")
-    _atomic_json(
+    context = model_markers.ModelMarkerContext(
+        run_fingerprint=run_fingerprint,
+        text_jobset_fingerprint=text_jobset_fingerprint,
+        image_jobset_fingerprint=image_jobset_fingerprint,
+        text_task_count=text_task_count,
+        image_task_count=image_task_count,
+        upstream_identities=(),
+        start_fingerprint=start_fingerprint,
+    )
+    if jobset_fingerprint != context.fingerprint_for(model_kind):
+        raise ValueError(
+            f"{model_kind} done jobset fingerprint is inconsistent"
+        )
+    model_markers.atomic_write_json(
         Path(path),
-        {
-            "stage": MODEL_DONE_STAGE,
-            "schema_version": MODEL_MARKER_SCHEMA_VERSION,
-            "status": f"{model_kind}_model_cache_precomputed",
-            "model_kind": model_kind,
-            "task_count": task_count,
-            f"{model_kind}_task_count": task_count,
-            "jobset_fingerprint": jobset_fingerprint,
-            "run_fingerprint": run_fingerprint,
-            "text_jobset_fingerprint": text_jobset_fingerprint,
-            "image_jobset_fingerprint": image_jobset_fingerprint,
-            "text_task_count": text_task_count,
-            "image_task_count": image_task_count,
-            "start_fingerprint": start_fingerprint,
-            "timestamp": time.time(),
-        },
+        model_markers.done_marker_payload(
+            context,
+            model_kind=model_kind,
+            task_count=task_count,
+            timestamp=time.time(),
+        ),
     )
 
 
@@ -2672,12 +2672,6 @@ def marker_matches(
     image_task_count: int | None = None,
     start_fingerprint: str | None = None,
 ) -> bool:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
     inferred_stage = expected_stage
     if inferred_stage is None:
         inferred_stage = {
@@ -2686,95 +2680,22 @@ def marker_matches(
             "text_model_cache_precomputed": MODEL_DONE_STAGE,
             "image_model_cache_precomputed": MODEL_DONE_STAGE,
         }.get(expected_status or "")
-    if (
-        payload.get("schema_version") != MODEL_MARKER_SCHEMA_VERSION
-        or inferred_stage is None
-        or payload.get("stage") != inferred_stage
-    ):
+    if inferred_stage is None or expected_status is None:
         return False
-    if (
-        not isinstance(payload.get("run_fingerprint"), str)
-        or not all(
-            isinstance(payload.get(field), str) and bool(payload[field])
-            for field in (
-                "text_jobset_fingerprint",
-                "image_jobset_fingerprint",
-            )
-        )
-        or not all(
-            isinstance(payload.get(field), int)
-            and not isinstance(payload[field], bool)
-            and payload[field] >= 0
-            for field in ("text_task_count", "image_task_count")
-        )
-        or not isinstance(payload.get("start_fingerprint"), str)
-        or not _is_sha256(str(payload["start_fingerprint"]))
-    ):
-        return False
-    if inferred_stage == MODEL_START_STAGE:
-        identity = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"start_fingerprint", "timestamp"}
-        }
-        if payload["start_fingerprint"] != _digest_json(identity):
-            return False
-    if inferred_stage == MODEL_DONE_STAGE:
-        current_kind = payload.get("model_kind")
-        if (
-            current_kind not in {"text", "image"}
-            or payload.get("status")
-            != f"{current_kind}_model_cache_precomputed"
-            or payload.get("jobset_fingerprint")
-            != payload.get(f"{current_kind}_jobset_fingerprint")
-            or payload.get("task_count")
-            != payload.get(f"{current_kind}_task_count")
-        ):
-            return False
-    if (
-        expected_status is not None
-        and payload.get("status") != expected_status
-    ):
-        return False
-    if model_kind is not None and payload.get("model_kind") != model_kind:
-        return False
-    if task_count is not None and payload.get("task_count") != task_count:
-        return False
-    if payload.get("run_fingerprint") != run_fingerprint:
-        return False
-    if (
-        jobset_fingerprint is not None
-        and payload.get("jobset_fingerprint") != jobset_fingerprint
-    ):
-        return False
-    if (
-        text_jobset_fingerprint is not None
-        and payload.get("text_jobset_fingerprint")
-        != text_jobset_fingerprint
-    ):
-        return False
-    if (
-        image_jobset_fingerprint is not None
-        and payload.get("image_jobset_fingerprint")
-        != image_jobset_fingerprint
-    ):
-        return False
-    if (
-        text_task_count is not None
-        and payload.get("text_task_count") != text_task_count
-    ):
-        return False
-    if (
-        image_task_count is not None
-        and payload.get("image_task_count") != image_task_count
-    ):
-        return False
-    if (
-        start_fingerprint is not None
-        and payload.get("start_fingerprint") != start_fingerprint
-    ):
-        return False
-    return True
+    return model_markers.marker_matches(
+        path,
+        expected_stage=inferred_stage,
+        expected_status=expected_status,
+        model_kind=model_kind,
+        task_count=task_count,
+        run_fingerprint=run_fingerprint,
+        jobset_fingerprint=jobset_fingerprint,
+        text_jobset_fingerprint=text_jobset_fingerprint,
+        image_jobset_fingerprint=image_jobset_fingerprint,
+        text_task_count=text_task_count,
+        image_task_count=image_task_count,
+        start_fingerprint=start_fingerprint,
+    )
 
 
 def wait_for_model_ready_marker(

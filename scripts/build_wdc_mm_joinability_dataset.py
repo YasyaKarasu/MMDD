@@ -2885,17 +2885,28 @@ def build_dataset(
         )
         precomputed_text_task_count = len(pending_text_tasks)
         precomputed_image_task_count = len(pending_image_tasks)
+        task_groups = {
+            "text": pending_text_tasks,
+            "image": pending_image_tasks,
+        }
+        marker_context = join_builder.build_model_marker_context(
+            args=args,
+            tasks_by_kind=task_groups,
+            upstream_identities=join_builder.source_shard_identities(
+                source_writer.paths()
+            ),
+        )
         join_builder.write_model_start_marker(
             clean_text(args.model_start_marker),
-            text_task_count=precomputed_text_task_count,
-            image_task_count=precomputed_image_task_count,
+            context=marker_context,
         )
         if pending_text_tasks or pending_image_tasks:
-            join_builder.wait_for_model_ready_marker(clean_text(args.model_ready_marker))
+            join_builder.wait_for_model_ready_marker(
+                clean_text(args.model_ready_marker),
+                context=marker_context,
+                timeout_seconds=args.model_ready_timeout_seconds,
+            )
             extractor = _new_extractor(args, extractor_factory)
-            task_groups = {"text": pending_text_tasks}
-            if args.precompute_model_cache:
-                task_groups["image"] = pending_image_tasks
             join_builder.precompute_extraction_task_groups(
                 extractor=extractor,
                 cache=cache,
@@ -2903,26 +2914,30 @@ def build_dataset(
                 args=args,
                 state=concurrency_state,
                 progress=progress,
+                marker_context=marker_context,
             )
         else:
-            join_builder.write_model_done_marker(
-                join_builder.model_done_marker_for_kind(args, "text"),
-                model_kind="text",
-                task_count=0,
-            )
-            if args.precompute_model_cache:
+            for model_kind in ("text", "image"):
                 join_builder.write_model_done_marker(
-                    join_builder.model_done_marker_for_kind(args, "image"),
-                    model_kind="image",
+                    join_builder.model_done_marker_for_kind(args, model_kind),
+                    model_kind=model_kind,
                     task_count=0,
+                    context=marker_context,
                 )
         if not args.precompute_model_cache and image_asset_count:
             extractor = extractor or _new_extractor(args, extractor_factory)
     else:
-        join_builder.write_model_start_marker(
-            clean_text(args.model_start_marker), text_task_count=0, image_task_count=0
+        marker_context = join_builder.build_model_marker_context(
+            args=args,
+            tasks_by_kind={"text": [], "image": []},
+            upstream_identities=join_builder.source_shard_identities(
+                source_writer.paths()
+            ),
         )
-        join_builder.wait_for_model_ready_marker(clean_text(args.model_ready_marker))
+        join_builder.write_model_start_marker(
+            clean_text(args.model_start_marker),
+            context=marker_context,
+        )
         extractor = _new_extractor(args, extractor_factory)
 
     query_writer = ShardedJsonlWriter(output_dir / "query_tables", records_per_shard)
@@ -3297,8 +3312,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--precompute_text_model_cache", action="store_true")
     parser.add_argument("--model_start_marker", default=None)
     parser.add_argument("--model_ready_marker", default=None)
+    parser.add_argument("--model_ready_timeout_seconds", type=float, default=None)
     parser.add_argument("--model_text_done_marker", default=None)
     parser.add_argument("--model_image_done_marker", default=None)
+    parser.add_argument("--run_fingerprint", default="")
     parser.set_defaults(
         disable_thinking=True,
         reparse_cached_model_outputs=True,

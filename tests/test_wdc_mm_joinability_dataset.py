@@ -2072,6 +2072,8 @@ def test_dynamic_runner_flags_parse_and_zero_pending_tasks_write_markers(tmp_pat
             str(text_done_marker),
             "--model_image_done_marker",
             str(image_done_marker),
+            "--run_fingerprint",
+            "wdc-zero-v1",
             "--text_model_workers",
             "2",
             "--image_model_workers",
@@ -2094,18 +2096,26 @@ def test_dynamic_runner_flags_parse_and_zero_pending_tasks_write_markers(tmp_pat
     assert stats["source_tables"] == 0
     assert extractor_calls == []
     assert not ready_marker.exists()
-    assert json.loads(start_marker.read_text(encoding="utf-8"))[
-        "text_task_count"
-    ] == 0
-    assert json.loads(start_marker.read_text(encoding="utf-8"))[
-        "image_task_count"
-    ] == 0
-    assert json.loads(text_done_marker.read_text(encoding="utf-8"))[
-        "model_kind"
-    ] == "text"
-    assert json.loads(image_done_marker.read_text(encoding="utf-8"))[
-        "model_kind"
-    ] == "image"
+    start_payload = json.loads(start_marker.read_text(encoding="utf-8"))
+    assert start_payload["stage"] == "wdc200k_model_start"
+    assert start_payload["schema_version"] == "wdc200k-model-markers-v1"
+    assert start_payload["run_fingerprint"] == "wdc-zero-v1"
+    assert start_payload["text_task_count"] == 0
+    assert start_payload["image_task_count"] == 0
+    assert len(start_payload["text_jobset_fingerprint"]) == 64
+    assert len(start_payload["image_jobset_fingerprint"]) == 64
+    for model_kind, marker in (
+        ("text", text_done_marker),
+        ("image", image_done_marker),
+    ):
+        done_payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert done_payload["model_kind"] == model_kind
+        assert done_payload["run_fingerprint"] == "wdc-zero-v1"
+        assert (
+            done_payload["start_fingerprint"]
+            == start_payload["start_fingerprint"]
+        )
+    assert not list(start_marker.parent.glob("*.tmp"))
 
 
 def test_media_failure_callback_is_best_effort_and_structured(tmp_path):
