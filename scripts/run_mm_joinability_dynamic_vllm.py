@@ -210,6 +210,11 @@ def restore_signal_handlers(previous_handlers: dict[int, object]) -> None:
             signal.signal(signum, previous)
 
 
+def mask_process_group_signals_for_cleanup() -> None:
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, signal.SIG_IGN)
+
+
 def stop_processes_best_effort(
     processes: Iterable[subprocess.Popen[str] | None],
 ) -> list[tuple[subprocess.Popen[str], Exception]]:
@@ -659,16 +664,19 @@ def main(argv: list[str] | None = None) -> int:
     except ForwardedSignal as exc:
         return 128 + exc.signum
     finally:
-        cleanup_errors = stop_processes_best_effort(
-            (
-                builder_proc,
-                text_proc,
-                primary_image_proc,
-                secondary_text_proc,
-                secondary_image_proc,
+        mask_process_group_signals_for_cleanup()
+        try:
+            cleanup_errors = stop_processes_best_effort(
+                (
+                    builder_proc,
+                    text_proc,
+                    primary_image_proc,
+                    secondary_text_proc,
+                    secondary_image_proc,
+                )
             )
-        )
-        restore_signal_handlers(previous_signal_handlers)
+        finally:
+            restore_signal_handlers(previous_signal_handlers)
         for process, error in cleanup_errors:
             print(
                 f"warning: failed to stop process group {process.pid}: {error}",

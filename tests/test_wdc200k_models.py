@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from build_mm_joinability_dataset import ExtractionCache
 from wdc200k_io import SqliteJobStore
 from wdc200k_models import (
+    AssetStageBarrier,
     MODEL_PARSER_SCHEMA_VERSION,
     adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
@@ -69,6 +70,43 @@ def asset(
             }
         )
     return record
+
+
+def task5_fingerprint(
+    *,
+    input_fingerprint: str = "assets-v1",
+) -> dict:
+    return {
+        "input_fingerprint": input_fingerprint,
+        "schema_version": "wdc200k-asset-materialization-v1",
+        "planning_manifest_sha256": "1" * 64,
+        "unique_job_manifest_sha256": "2" * 64,
+        "unique_job_sha256": "3" * 64,
+        "image_fetch_manifest_sha256": "4" * 64,
+        "image_policy_fingerprint": "image-policy-v1",
+        "image_outcome_digest": "5" * 64,
+        "image_outcome_count": 1,
+        "image_outcome_url_key_digest": "6" * 64,
+        "attempts_per_entity": 3,
+        "retained_per_entity": 3,
+        "text_asset_chunk_chars": 800,
+        "min_text_asset_chunk_chars": 120,
+        "max_text_asset_chunks_per_entity": 3,
+        "records_per_shard": 10_000,
+    }
+
+
+def task5_barrier(
+    *,
+    fingerprint: dict | None = None,
+    bridge_assets: int = 1,
+    table_asset_links: int = 1,
+) -> AssetStageBarrier:
+    return AssetStageBarrier(
+        fingerprint=fingerprint or task5_fingerprint(),
+        bridge_assets=bridge_assets,
+        table_asset_links=table_asset_links,
+    )
 
 
 def write_strict_upstream_barriers(
@@ -130,9 +168,7 @@ def write_strict_upstream_barriers(
         json.dumps(
             {
                 "stage": "wdc200k_asset_materialization",
-                "fingerprint": {
-                    "schema_version": "wdc200k-asset-materialization-v1"
-                },
+                "fingerprint": task5_fingerprint(),
                 "bridge_asset_shards": [asset_shard],
                 "table_asset_link_shards": [link_shard],
                 "complete": True,
@@ -290,6 +326,43 @@ def test_resume_manifest_rejects_record_provenance_even_with_new_checksum(
     assert validate_model_stage(result) is False
 
 
+def test_resume_manifest_rejects_duplicate_substitution_with_new_checksum(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a"), asset("b")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    path = result.extraction_paths[0]
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 2
+    records[1] = dict(records[0])
+    encoded = "".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        for record in records
+    ).encode("utf-8")
+    path.write_bytes(encoded)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    shard = manifest["extraction_shards"][0]
+    shard["bytes"] = len(encoded)
+    shard["sha256"] = hashlib.sha256(encoded).hexdigest()
+    result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert validate_model_stage(result) is False
+
+
 def test_result_written_before_finish_repairs_without_model_call(
     tmp_path: Path,
 ) -> None:
@@ -387,6 +460,9 @@ def test_existing_extraction_cache_repairs_job_without_model_call(
             "prompt_version": jobset.prompt_version,
             "model_identity": "text-v1",
             "asset_fingerprint": jobset.jobs[0].asset_fingerprint,
+            "entity_prompt_fingerprint": (
+                jobset.jobs[0].entity_prompt_fingerprint
+            ),
             "entity_id": "entity-a",
             "entity_text": "Entity a",
             "entity_wiki_title": "Entity a",
@@ -562,6 +638,216 @@ def test_jobsets_v1_v2_v1_are_physically_isolated_in_one_store(
     assert resumed_result.manifest_path == first_result.manifest_path
 
 
+@pytest.mark.parametrize(
+    ("first_ids", "second_ids"),
+    [
+        (["a", "b"], ["a"]),
+        (["a"], ["a", "b"]),
+        (["a", "b"], ["a", "c"]),
+    ],
+)
+def test_completed_jobset_rejects_exact_membership_changes_without_mutation(
+    tmp_path: Path,
+    first_ids: list[str],
+    second_ids: list[str],
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    first = enqueue_model_tasks(
+        [asset(value) for value in first_ids],
+        store,
+        args=model_args(),
+        input_fingerprint="same-input",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=first,
+        output_root=tmp_path / "outputs",
+    )
+    mtimes = {
+        path: path.stat().st_mtime_ns
+        for path in (result.manifest_path, *result.extraction_paths)
+    }
+
+    with pytest.raises(ValueError, match="membership"):
+        enqueue_model_tasks(
+            [asset(value) for value in second_ids],
+            store,
+            args=model_args(),
+            input_fingerprint="same-input",
+        )
+
+    resumed = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=first,
+        output_root=tmp_path / "outputs",
+    )
+    assert validate_model_stage(resumed)
+    assert {
+        path: path.stat().st_mtime_ns for path in mtimes
+    } == mtimes
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kind = ?",
+            (first.text_kind,),
+        ).fetchone()[0] == len(first_ids)
+
+
+def test_completed_jobset_accepts_reordered_duplicate_identical_members(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    first = enqueue_model_tasks(
+        [asset("a"), asset("b")],
+        store,
+        args=model_args(),
+        input_fingerprint="same-input",
+    )
+
+    resumed = enqueue_model_tasks(
+        [asset("b"), asset("a"), asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="same-input",
+    )
+
+    assert resumed.text_tasks == first.text_tasks == 2
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kind = ?",
+            (first.text_kind,),
+        ).fetchone()[0] == 2
+
+
+def test_incomplete_jobset_rejects_resume_missing_an_existing_member(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    first = enqueue_model_tasks(
+        [asset("a"), asset("b")],
+        store,
+        args=model_args(),
+        input_fingerprint="same-input",
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE model_jobsets SET enqueue_complete = 0
+            WHERE fingerprint = ?
+            """,
+            (first.text_fingerprint,),
+        )
+    with sqlite3.connect(store.path) as connection:
+        before_members = connection.execute(
+            """
+            SELECT job_id, cache_key, asset_fingerprint, payload_sha256
+            FROM model_job_members
+            WHERE jobset_fingerprint = ? ORDER BY job_id
+            """,
+            (first.text_fingerprint,),
+        ).fetchall()
+
+    with pytest.raises(ValueError, match="membership"):
+        enqueue_model_tasks(
+            [asset("a")],
+            store,
+            args=model_args(),
+            input_fingerprint="same-input",
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        after_members = connection.execute(
+            """
+            SELECT job_id, cache_key, asset_fingerprint, payload_sha256
+            FROM model_job_members
+            WHERE jobset_fingerprint = ? ORDER BY job_id
+            """,
+            (first.text_fingerprint,),
+        ).fetchall()
+        enqueue_complete = connection.execute(
+            """
+            SELECT enqueue_complete FROM model_jobsets
+            WHERE fingerprint = ?
+            """,
+            (first.text_fingerprint,),
+        ).fetchone()[0]
+    assert after_members == before_members
+    assert enqueue_complete == 0
+
+
+def test_entity_prompt_alias_changes_full_call_identity_and_can_revert(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+
+    def task(alias: str) -> dict:
+        return {
+            "extraction_task": {
+                "entity": {
+                    "entity_id": "entity-shared",
+                    "wiki_title": alias,
+                    "cell_text": alias,
+                    "context": ["context", alias],
+                    "entity_column_index": 0,
+                    "entity_column_name": "Name",
+                },
+                "asset": {
+                    "asset_id": "shared-asset",
+                    "asset_type": "text",
+                    "content": "shared bytes",
+                },
+                "candidate_attribute_names": ["State", "Year"],
+            }
+        }
+
+    jobsets = [
+        enqueue_model_tasks(
+            [task(alias)],
+            store,
+            args=model_args(),
+            input_fingerprint=f"input-{index}",
+        )
+        for index, alias in enumerate(
+            ("Alias One", "Alias Two", "Alias One")
+        )
+    ]
+
+    assert (
+        jobsets[0].jobs[0].model_call_key
+        != jobsets[1].jobs[0].model_call_key
+    )
+    assert (
+        jobsets[0].jobs[0].model_call_key
+        == jobsets[2].jobs[0].model_call_key
+    )
+    extractor = CountingExtractor()
+    records = []
+    for jobset in jobsets:
+        result = run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+        records.append(
+            json.loads(
+                result.extraction_paths[0].read_text(
+                    encoding="utf-8"
+                ).splitlines()[0]
+            )
+        )
+    assert extractor.asset_ids == ["shared-asset", "shared-asset"]
+    assert (
+        records[0]["entity_prompt_fingerprint"]
+        != records[1]["entity_prompt_fingerprint"]
+    )
+    assert (
+        records[0]["entity_prompt_fingerprint"]
+        == records[2]["entity_prompt_fingerprint"]
+    )
+
+
 def test_expanded_shrunk_and_disjoint_jobsets_publish_exact_manifests(
     tmp_path: Path,
 ) -> None:
@@ -729,6 +1015,62 @@ def test_legacy_cache_requires_complete_matching_provenance(
     )
 
     assert extractor.asset_ids == ["a"]
+
+
+def test_matching_legacy_cache_error_is_committed_as_terminal(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    with sqlite3.connect(store.path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id = ?",
+                (jobset.jobs[0].job_id,),
+            ).fetchone()[0]
+        )
+    record = {
+        "cache_key": payload["cache_key"],
+        "model_call_key": payload["model_call_key"],
+        "prompt_version": payload["prompt_version"],
+        "model_identity": payload["model_identity"],
+        "asset_fingerprint": payload["asset_fingerprint"],
+        "entity_prompt_fingerprint": payload[
+            "entity_prompt_fingerprint"
+        ],
+        "asset_type": payload["modality"],
+        "modality": payload["modality"],
+        "policy_fingerprint": payload["policy_fingerprint"],
+        "parser_schema_version": payload["parser_schema_version"],
+        "candidate_attribute_names": payload[
+            "candidate_attribute_names"
+        ],
+        "attributes": [],
+        "raw_response": "",
+        "error": "cached model failure",
+    }
+    cache = ExtractionCache(tmp_path / "legacy-error-cache.jsonl")
+    cache.put(payload["cache_key"], record)
+
+    result = run_model_stage(
+        store,
+        None,
+        jobset=jobset,
+        cache=cache,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.success == 0
+    assert result.terminal == 1
+    terminal = json.loads(
+        result.error_paths[0].read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert terminal["error"] == "cached model failure"
 
 
 def test_duplicate_extraction_key_across_tables_enqueues_one_model_call(
@@ -939,6 +1281,84 @@ def test_stolen_lease_fences_old_worker_result_and_cache(
         ).fetchone()[0] == 0
 
 
+def test_stolen_prepared_result_is_not_visible_as_shared_cache(
+    tmp_path: Path,
+) -> None:
+    prepared = threading.Event()
+    release = threading.Event()
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+
+    def pause_after_prepare(_job_id: str, _record: dict) -> None:
+        prepared.set()
+        release.wait(timeout=2)
+
+    old_extractor = CountingExtractor()
+    old_result = []
+
+    def old_worker() -> None:
+        old_result.append(
+            run_model_stage(
+                store,
+                old_extractor,
+                jobset=jobset,
+                owner="old-owner",
+                lease_seconds=5,
+                heartbeat_seconds=1,
+                output_root=tmp_path / "outputs",
+                after_result_write=pause_after_prepare,
+            )
+        )
+
+    worker = threading.Thread(target=old_worker)
+    worker.start()
+    assert prepared.wait(timeout=1)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET owner = 'new-owner', lease_id = 'new-lease',
+                lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (time.time() + 5, jobset.jobs[0].job_id),
+        )
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert old_result and old_result[0].complete is False
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_call_cache"
+        ).fetchone()[0] == 0
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'pending', owner = NULL,
+                lease_id = NULL, lease_expires = NULL
+            WHERE job_id = ?
+            """,
+            (jobset.jobs[0].job_id,),
+        )
+
+    new_extractor = CountingExtractor()
+    completed = run_model_stage(
+        store,
+        new_extractor,
+        jobset=jobset,
+        owner="new-owner",
+        output_root=tmp_path / "outputs",
+    )
+
+    assert completed.complete is True
+    assert new_extractor.asset_ids == ["a"]
+
+
 def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
     tmp_path: Path,
 ) -> None:
@@ -960,6 +1380,7 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
             jobset,
             network_manifests=[network],
             assets_manifest=faux_assets,
+            assets_barrier=task5_barrier(),
             run_fingerprint="run-v1",
         )
     assert not marker.exists()
@@ -969,6 +1390,7 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
         jobset,
         network_manifests=[network],
         assets_manifest=assets,
+        assets_barrier=task5_barrier(),
         run_fingerprint="run-v1",
     )
     payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -1013,6 +1435,7 @@ def test_model_stage_owns_start_ready_marker_handshake(
         ready_marker=ready,
         network_manifests=[network],
         assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
         run_fingerprint="run-v1",
     )
 
@@ -1078,6 +1501,59 @@ def test_faux_complete_network_barrier_is_rejected(tmp_path: Path) -> None:
             jobset,
             network_manifests=[network],
             assets_manifest=assets,
+            assets_barrier=task5_barrier(),
+            run_fingerprint="run-v1",
+        )
+
+
+def test_minimal_task5_fingerprint_is_rejected_by_start_barrier(
+    tmp_path: Path,
+) -> None:
+    network, assets = write_strict_upstream_barriers(tmp_path)
+    payload = json.loads(assets.read_text(encoding="utf-8"))
+    payload["fingerprint"] = {
+        "schema_version": "wdc200k-asset-materialization-v1"
+    }
+    assets.write_text(json.dumps(payload), encoding="utf-8")
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks([asset("a")], store, args=model_args())
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        write_model_start_marker(
+            tmp_path / "start.json",
+            jobset,
+            network_manifests=[network],
+            assets_manifest=assets,
+            assets_barrier=task5_barrier(),
+            run_fingerprint="run-v1",
+        )
+
+
+def test_task5_barrier_rejects_forged_fingerprint_and_wrong_counts(
+    tmp_path: Path,
+) -> None:
+    network, assets = write_strict_upstream_barriers(tmp_path)
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks([asset("a")], store, args=model_args())
+    forged = task5_fingerprint()
+    forged["planning_manifest_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        write_model_start_marker(
+            tmp_path / "forged-start.json",
+            jobset,
+            network_manifests=[network],
+            assets_manifest=assets,
+            assets_barrier=task5_barrier(fingerprint=forged),
+            run_fingerprint="run-v1",
+        )
+    with pytest.raises(ValueError, match="count"):
+        write_model_start_marker(
+            tmp_path / "wrong-count-start.json",
+            jobset,
+            network_manifests=[network],
+            assets_manifest=assets,
+            assets_barrier=task5_barrier(bridge_assets=2),
             run_fingerprint="run-v1",
         )
 
@@ -1115,9 +1591,7 @@ def test_task5_manifest_is_checksum_validated_before_streaming_assets(
         json.dumps(
                 {
                     "stage": "wdc200k_asset_materialization",
-                    "fingerprint": {
-                        "schema_version": "wdc200k-asset-materialization-v1"
-                    },
+                    "fingerprint": task5_fingerprint(),
                     "complete": True,
                     "bridge_asset_shards": [
                     {
@@ -1142,12 +1616,20 @@ def test_task5_manifest_is_checksum_validated_before_streaming_assets(
 
     assert [
         record["asset_id"]
-        for record in iter_assets_from_materialization_manifest(manifest)
+        for record in iter_assets_from_materialization_manifest(
+            manifest,
+            assets_barrier=task5_barrier(bridge_assets=2),
+        )
     ] == ["a"]
 
     (root / relative_path).write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="validation"):
-        list(iter_assets_from_materialization_manifest(manifest))
+        list(
+            iter_assets_from_materialization_manifest(
+                manifest,
+                assets_barrier=task5_barrier(bridge_assets=2),
+            )
+        )
 
     network, _ = write_strict_upstream_barriers(tmp_path / "strict")
     store = SqliteJobStore(tmp_path / "models.sqlite3")
@@ -1163,11 +1645,12 @@ def test_task5_manifest_is_checksum_validated_before_streaming_assets(
             jobset,
             network_manifests=[network],
             assets_manifest=manifest,
+            assets_barrier=task5_barrier(bridge_assets=2),
             run_fingerprint="run-v1",
         )
 
 
-def test_enqueue_from_task5_manifest_filters_non_success_assets(
+def test_enqueue_from_task5_manifest_requires_explicit_task_factory(
     tmp_path: Path,
 ) -> None:
     from wdc200k_io import AtomicJsonlShard
@@ -1200,11 +1683,28 @@ def test_enqueue_from_task5_manifest_filters_non_success_assets(
     )
     store = SqliteJobStore(tmp_path / "models.sqlite3")
 
+    with pytest.raises(ValueError, match="task_factory"):
+        enqueue_model_tasks_from_manifest(
+            manifest,
+            store,
+            args=model_args(),
+            input_fingerprint="assets-v1",
+        )
+
+
+def test_enqueue_from_strict_task5_manifest_with_factory(
+    tmp_path: Path,
+) -> None:
+    _network, manifest = write_strict_upstream_barriers(tmp_path)
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+
     jobset = enqueue_model_tasks_from_manifest(
         manifest,
         store,
         args=model_args(),
+        assets_barrier=task5_barrier(),
         input_fingerprint="assets-v1",
+        task_factory=lambda current_asset: current_asset,
     )
 
     assert jobset.text_tasks == 1
@@ -1215,6 +1715,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     tmp_path: Path,
 ) -> None:
     from dataclasses import asdict
+    from stage1_io import stable_hash
     from wdc200k_io import AtomicJsonlShard
 
     structural_root = tmp_path / "structural"
@@ -1339,12 +1840,26 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         / "stage_manifests"
         / "validated-selection-global.json"
     )
+    structural_manifest_sha = hashlib.sha256(
+        structural_manifest.read_bytes()
+    ).hexdigest()
     final_manifest.write_text(
         json.dumps(
             {
                 "stage": "wdc200k_validated_selection",
-                "input_fingerprint": "structural-v2",
-                "parameter_fingerprint": "validated-selection-global-v1",
+                "input_fingerprint": stable_hash(
+                    "wdc200k-structural-v2",
+                    (
+                        f"{structural_manifest.resolve()}:"
+                        f"{structural_manifest_sha}"
+                    ),
+                    length=40,
+                ),
+                "parameter_fingerprint": stable_hash(
+                    "validated-selection-global-v1",
+                    1,
+                    length=40,
+                ),
                 "completed_shards": [final_completed],
                 "complete": True,
             }
@@ -1377,9 +1892,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         json.dumps(
             {
                 "stage": "wdc200k_asset_materialization",
-                "fingerprint": {
-                    "schema_version": "wdc200k-asset-materialization-v1"
-                },
+                "fingerprint": task5_fingerprint(),
                 "bridge_asset_shards": [asset_completed],
                 "table_asset_link_shards": [link_completed],
                 "complete": True,
@@ -1393,6 +1906,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         structural_manifests=[structural_manifest],
         finalized_selection_manifest=final_manifest,
         assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
         output_root=tmp_path / "adapted",
         args=model_args(),
     )
@@ -1409,3 +1923,17 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         records[0]["extraction_task"]["entity"]["entity_id"]
         == "entity-alpha"
     )
+
+    corrupted = json.loads(final_manifest.read_text(encoding="utf-8"))
+    corrupted["input_fingerprint"] = "foreign-structural-set"
+    final_manifest.write_text(json.dumps(corrupted), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=tmp_path / "corrupt-adapted",
+            args=model_args(),
+        )

@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -80,6 +81,7 @@ class ModelJobInfo:
     model_call_key: str
     modality: str
     asset_fingerprint: str
+    entity_prompt_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,26 @@ class AdaptedModelTasks:
     input_fingerprint: str
     tasks: int
     errors: int
+
+
+@dataclass(frozen=True)
+class AssetStageBarrier:
+    """Authoritative Task-5 identity supplied by the stage orchestrator."""
+
+    fingerprint: dict[str, Any]
+    bridge_assets: int
+    table_asset_links: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fingerprint, dict):
+            raise TypeError("Task-5 barrier fingerprint must be an object")
+        object.__setattr__(
+            self,
+            "fingerprint",
+            json.loads(_canonical_json(self.fingerprint)),
+        )
+        if self.bridge_assets < 0 or self.table_asset_links < 0:
+            raise ValueError("Task-5 barrier counts must be non-negative")
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -212,11 +234,25 @@ def _initialize_tables(path: Path) -> None:
                 model_identity TEXT NOT NULL,
                 policy_fingerprint TEXT NOT NULL,
                 task_count INTEGER NOT NULL DEFAULT 0,
+                membership_digest TEXT NOT NULL DEFAULT '',
                 enqueue_complete INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
             )
             """
         )
+        jobset_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(model_jobsets)"
+            )
+        }
+        if "membership_digest" not in jobset_columns:
+            connection.execute(
+                """
+                ALTER TABLE model_jobsets
+                ADD COLUMN membership_digest TEXT NOT NULL DEFAULT ''
+                """
+            )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS model_job_members (
@@ -344,6 +380,7 @@ def _modality_fingerprint(
         prompt_version,
         model_identity,
         policy_fingerprint,
+        MODEL_PARSER_SCHEMA_VERSION,
         length=40,
     )
 
@@ -426,6 +463,12 @@ def _task_payload(
         args=args,
     )
     asset_fingerprint = _digest_json(asset)
+    entity_prompt_fingerprint = _digest_json(
+        {
+            "entity": entity,
+            "candidate_attribute_names": candidates,
+        }
+    )
     model_call_key = stable_hash(
         MODEL_QUEUE_SCHEMA_VERSION,
         legacy_cache_key,
@@ -435,6 +478,7 @@ def _task_payload(
         modality,
         policy_fingerprint,
         MODEL_PARSER_SCHEMA_VERSION,
+        entity_prompt_fingerprint,
         _canonical_json(candidates),
         length=64,
     )
@@ -452,6 +496,7 @@ def _task_payload(
         "asset": asset,
         "candidate_attribute_names": candidates,
         "asset_fingerprint": asset_fingerprint,
+        "entity_prompt_fingerprint": entity_prompt_fingerprint,
         "prompt_version": prompt_version,
         "model_identity": model_identity,
         "modality": modality,
@@ -460,6 +505,7 @@ def _task_payload(
         "jobset_fingerprint": jobset_fingerprint,
     }
     job_id = f"{jobset_fingerprint}:{model_call_key}"
+    payload["job_id"] = job_id
     return job_id, asset_fingerprint, payload
 
 
@@ -528,166 +574,319 @@ def enqueue_model_tasks(
                 ),
             )
     previews: list[ModelJobInfo] = []
-    buffered: list[
-        tuple[str, str, dict[str, Any], str, str, str]
-    ] = []
+    staging = sqlite3.connect("")
+    staging.row_factory = sqlite3.Row
+    staging.execute(
+        """
+        CREATE TABLE incoming (
+            job_id TEXT PRIMARY KEY,
+            modality TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            model_call_key TEXT NOT NULL,
+            asset_fingerprint TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    try:
+        for order, record in enumerate(assets):
+            if not isinstance(record, dict):
+                raise ValueError("model task input must be an object")
+            status = clean_text(record.get("status"))
+            if status and status != "success":
+                continue
+            nested = record.get("extraction_task")
+            nested_asset = (
+                nested.get("asset")
+                if isinstance(nested, dict)
+                and isinstance(nested.get("asset"), dict)
+                else None
+            )
+            modality = clean_text(
+                (nested_asset or record).get("asset_type")
+            )
+            if modality not in {"text", "image"}:
+                continue
+            job_id, asset_fingerprint, payload = _task_payload(
+                record,
+                order=order,
+                args=args,
+                prompt_version=prompt_version,
+                model_identity=identities[modality],
+                policy_fingerprint=policy_fingerprint,
+                jobset_fingerprint=fingerprints[modality],
+            )
+            encoded = _canonical_json(payload)
+            payload_digest = hashlib.sha256(
+                encoded.encode("utf-8")
+            ).hexdigest()
+            existing = staging.execute(
+                "SELECT * FROM incoming WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            values = (
+                job_id,
+                modality,
+                str(payload["cache_key"]),
+                str(payload["model_call_key"]),
+                asset_fingerprint,
+                payload_digest,
+                encoded,
+            )
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ValueError(
+                        f"conflicting incoming model member: {job_id}"
+                    )
+                continue
+            staging.execute(
+                """
+                INSERT INTO incoming (
+                    job_id, modality, cache_key, model_call_key,
+                    asset_fingerprint, payload_sha256, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            if len(previews) < _PREVIEW_LIMIT:
+                previews.append(
+                    ModelJobInfo(
+                        job_id=job_id,
+                        cache_key=str(payload["cache_key"]),
+                        model_call_key=str(payload["model_call_key"]),
+                        modality=modality,
+                        asset_fingerprint=asset_fingerprint,
+                        entity_prompt_fingerprint=str(
+                            payload["entity_prompt_fingerprint"]
+                        ),
+                    )
+                )
+        staging.commit()
 
-    def flush() -> None:
-        if not buffered:
-            return
-        committed_at = time.time()
+        counts: dict[str, int] = {}
+        membership_digests: dict[str, str] = {}
+        for modality in ("text", "image"):
+            digest = hashlib.sha256()
+            count = 0
+            for row in staging.execute(
+                """
+                SELECT job_id, cache_key, asset_fingerprint,
+                       payload_sha256
+                FROM incoming
+                WHERE modality = ?
+                ORDER BY job_id
+                """,
+                (modality,),
+            ):
+                digest.update(_canonical_json(tuple(row)).encode("utf-8"))
+                digest.update(b"\n")
+                count += 1
+            counts[modality] = count
+            membership_digests[modality] = digest.hexdigest()
+
         with _connect(store.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for (
-                modality,
-                job_id,
-                payload,
-                asset_fingerprint,
-                payload_digest,
-                encoded,
-            ) in buffered:
-                existing_job = connection.execute(
+            frozen: dict[str, bool] = {}
+            for modality in ("text", "image"):
+                jobset_row = connection.execute(
                     """
-                    SELECT kind, payload_json
-                    FROM jobs
-                    WHERE job_id = ?
-                    """,
-                    (job_id,),
-                ).fetchone()
-                if existing_job is not None and (
-                    str(existing_job["kind"]) != kinds[modality]
-                    or _canonical_json(
-                        json.loads(str(existing_job["payload_json"]))
-                    )
-                    != encoded
-                ):
-                    raise ValueError(
-                        f"conflicting durable model job: {job_id}"
-                    )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO jobs (
-                        job_id, kind, payload_json, status, updated_at
-                    ) VALUES (?, ?, ?, 'pending', ?)
-                    """,
-                    (
-                        job_id,
-                        kinds[modality],
-                        encoded,
-                        committed_at,
-                    ),
-                )
-                existing_member = connection.execute(
-                    """
-                    SELECT cache_key, asset_fingerprint, payload_sha256
-                    FROM model_job_members
-                    WHERE jobset_fingerprint = ? AND job_id = ?
-                    """,
-                    (fingerprints[modality], job_id),
-                ).fetchone()
-                if existing_member is not None and (
-                    str(existing_member["cache_key"])
-                    != str(payload["cache_key"])
-                    or str(existing_member["asset_fingerprint"])
-                    != asset_fingerprint
-                    or str(existing_member["payload_sha256"])
-                    != payload_digest
-                ):
-                    raise ValueError(
-                        f"conflicting model job member: {job_id}"
-                    )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO model_job_members (
-                        jobset_fingerprint, job_id, cache_key,
-                        asset_fingerprint, payload_sha256
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        fingerprints[modality],
-                        job_id,
-                        payload["cache_key"],
-                        asset_fingerprint,
-                        payload_digest,
-                    ),
-                )
-        buffered.clear()
-
-    for order, record in enumerate(assets):
-        if not isinstance(record, dict):
-            raise ValueError("model task input must be an object")
-        status = clean_text(record.get("status"))
-        if status and status != "success":
-            continue
-        nested = record.get("extraction_task")
-        nested_asset = (
-            nested.get("asset")
-            if isinstance(nested, dict)
-            and isinstance(nested.get("asset"), dict)
-            else None
-        )
-        modality = clean_text(
-            (nested_asset or record).get("asset_type")
-        )
-        if modality not in {"text", "image"}:
-            continue
-        job_id, asset_fingerprint, payload = _task_payload(
-            record,
-            order=order,
-            args=args,
-            prompt_version=prompt_version,
-            model_identity=identities[modality],
-            policy_fingerprint=policy_fingerprint,
-            jobset_fingerprint=fingerprints[modality],
-        )
-        encoded = _canonical_json(payload)
-        payload_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        buffered.append(
-            (
-                modality,
-                job_id,
-                payload,
-                asset_fingerprint,
-                payload_digest,
-                encoded,
-            )
-        )
-        if len(buffered) >= _ENQUEUE_BATCH_SIZE:
-            flush()
-        if len(previews) < _PREVIEW_LIMIT:
-            previews.append(
-                ModelJobInfo(
-                    job_id=job_id,
-                    cache_key=str(payload["cache_key"]),
-                    model_call_key=str(payload["model_call_key"]),
-                    modality=modality,
-                    asset_fingerprint=asset_fingerprint,
-                )
-            )
-    flush()
-    counts: dict[str, int] = {}
-    with _connect(store.path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        for modality in ("text", "image"):
-            count = int(
-                connection.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM model_job_members
-                    WHERE jobset_fingerprint = ?
+                    SELECT task_count, membership_digest,
+                           enqueue_complete
+                    FROM model_jobsets
+                    WHERE fingerprint = ?
                     """,
                     (fingerprints[modality],),
-                ).fetchone()[0]
-            )
-            counts[modality] = count
-            connection.execute(
-                """
-                UPDATE model_jobsets
-                SET task_count = ?, enqueue_complete = 1, updated_at = ?
-                WHERE fingerprint = ?
-                """,
-                (count, time.time(), fingerprints[modality]),
-            )
+                ).fetchone()
+                if jobset_row is None:
+                    raise ValueError("model jobset metadata disappeared")
+                frozen[modality] = (
+                    int(jobset_row["enqueue_complete"]) == 1
+                )
+                if not frozen[modality]:
+                    for durable in connection.execute(
+                        """
+                        SELECT members.job_id, members.cache_key,
+                               members.asset_fingerprint,
+                               members.payload_sha256, jobs.kind,
+                               jobs.payload_json
+                        FROM model_job_members AS members
+                        JOIN jobs USING (job_id)
+                        WHERE members.jobset_fingerprint = ?
+                        ORDER BY members.job_id
+                        """,
+                        (fingerprints[modality],),
+                    ):
+                        incoming = staging.execute(
+                            """
+                            SELECT cache_key, asset_fingerprint,
+                                   payload_sha256, payload_json
+                            FROM incoming WHERE job_id = ?
+                            """,
+                            (str(durable["job_id"]),),
+                        ).fetchone()
+                        if incoming is None or tuple(durable)[1:] != (
+                            str(incoming["cache_key"]),
+                            str(incoming["asset_fingerprint"]),
+                            str(incoming["payload_sha256"]),
+                            kinds[modality],
+                            str(incoming["payload_json"]),
+                        ):
+                            raise ValueError(
+                                f"incomplete {modality} jobset "
+                                "membership conflict"
+                            )
+                    continue
+                existing_digest = hashlib.sha256()
+                existing_count = 0
+                for member in connection.execute(
+                    """
+                    SELECT job_id, cache_key, asset_fingerprint,
+                           payload_sha256
+                    FROM model_job_members
+                    WHERE jobset_fingerprint = ?
+                    ORDER BY job_id
+                    """,
+                    (fingerprints[modality],),
+                ):
+                    existing_digest.update(
+                        _canonical_json(tuple(member)).encode("utf-8")
+                    )
+                    existing_digest.update(b"\n")
+                    existing_count += 1
+                actual_digest = existing_digest.hexdigest()
+                if (
+                    existing_count != counts[modality]
+                    or int(jobset_row["task_count"]) != existing_count
+                    or actual_digest != membership_digests[modality]
+                    or (
+                        clean_text(jobset_row["membership_digest"])
+                        and str(jobset_row["membership_digest"])
+                        != actual_digest
+                    )
+                ):
+                    raise ValueError(
+                        f"completed {modality} jobset membership conflict"
+                    )
+                for incoming in staging.execute(
+                    """
+                    SELECT job_id, cache_key, asset_fingerprint,
+                           payload_sha256, payload_json
+                    FROM incoming
+                    WHERE modality = ?
+                    ORDER BY job_id
+                    """,
+                    (modality,),
+                ):
+                    durable = connection.execute(
+                        """
+                        SELECT members.cache_key,
+                               members.asset_fingerprint,
+                               members.payload_sha256,
+                               jobs.kind, jobs.payload_json
+                        FROM model_job_members AS members
+                        JOIN jobs USING (job_id)
+                        WHERE members.jobset_fingerprint = ?
+                          AND members.job_id = ?
+                        """,
+                        (
+                            fingerprints[modality],
+                            str(incoming["job_id"]),
+                        ),
+                    ).fetchone()
+                    if durable is None or tuple(durable) != (
+                        str(incoming["cache_key"]),
+                        str(incoming["asset_fingerprint"]),
+                        str(incoming["payload_sha256"]),
+                        kinds[modality],
+                        str(incoming["payload_json"]),
+                    ):
+                        raise ValueError(
+                            f"completed {modality} jobset "
+                            "membership conflict"
+                        )
+
+            committed_at = time.time()
+            for modality in ("text", "image"):
+                if frozen[modality]:
+                    continue
+                for incoming in staging.execute(
+                    "SELECT * FROM incoming WHERE modality = ?",
+                    (modality,),
+                ):
+                    existing_job = connection.execute(
+                        """
+                        SELECT kind, payload_json
+                        FROM jobs WHERE job_id = ?
+                        """,
+                        (str(incoming["job_id"]),),
+                    ).fetchone()
+                    if existing_job is not None and tuple(existing_job) != (
+                        kinds[modality],
+                        str(incoming["payload_json"]),
+                    ):
+                        raise ValueError(
+                            "conflicting durable model job: "
+                            f"{incoming['job_id']}"
+                        )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO jobs (
+                            job_id, kind, payload_json, status, updated_at
+                        ) VALUES (?, ?, ?, 'pending', ?)
+                        """,
+                        (
+                            str(incoming["job_id"]),
+                            kinds[modality],
+                            str(incoming["payload_json"]),
+                            committed_at,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO model_job_members (
+                            jobset_fingerprint, job_id, cache_key,
+                            asset_fingerprint, payload_sha256
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            fingerprints[modality],
+                            str(incoming["job_id"]),
+                            str(incoming["cache_key"]),
+                            str(incoming["asset_fingerprint"]),
+                            str(incoming["payload_sha256"]),
+                        ),
+                    )
+                connection.execute(
+                    """
+                    UPDATE model_jobsets
+                    SET task_count = ?, membership_digest = ?,
+                        enqueue_complete = 1, updated_at = ?
+                    WHERE fingerprint = ?
+                    """,
+                    (
+                        counts[modality],
+                        membership_digests[modality],
+                        committed_at,
+                        fingerprints[modality],
+                    ),
+                )
+            for modality in ("text", "image"):
+                if frozen[modality]:
+                    connection.execute(
+                        """
+                        UPDATE model_jobsets
+                        SET membership_digest = ?
+                        WHERE fingerprint = ?
+                          AND membership_digest = ''
+                        """,
+                        (
+                            membership_digests[modality],
+                            fingerprints[modality],
+                        ),
+                    )
+    finally:
+        staging.close()
     result = ModelJobSet(
         database_path=store.path,
         input_fingerprint=input_fingerprint,
@@ -826,6 +1025,9 @@ def _record_matches_payload(
         "prompt_version": str(payload["prompt_version"]),
         "model_identity": str(payload["model_identity"]),
         "asset_fingerprint": str(payload["asset_fingerprint"]),
+        "entity_prompt_fingerprint": str(
+            payload["entity_prompt_fingerprint"]
+        ),
         "asset_type": str(payload["modality"]),
         "modality": str(payload["modality"]),
         "policy_fingerprint": str(payload["policy_fingerprint"]),
@@ -849,6 +1051,10 @@ def _canonical_extraction_record(
         "prompt_version": str(payload["prompt_version"]),
         "model_identity": str(payload["model_identity"]),
         "asset_fingerprint": str(payload["asset_fingerprint"]),
+        "entity_prompt_fingerprint": str(
+            payload["entity_prompt_fingerprint"]
+        ),
+        "job_id": str(payload["job_id"]),
         "asset_type": str(payload["modality"]),
         "modality": str(payload["modality"]),
         "policy_fingerprint": str(payload["policy_fingerprint"]),
@@ -874,7 +1080,9 @@ def _repair_durable_results(
                 """
                 SELECT jobs.job_id, jobs.owner, jobs.lease_id,
                        model_results.status,
-                       model_results.record_json
+                       model_results.record_json,
+                       model_results.record_sha256,
+                       jobs.payload_json
                 FROM jobs
                 JOIN model_results
                   ON model_results.job_id = jobs.job_id
@@ -911,6 +1119,26 @@ def _repair_durable_results(
                 )
                 if cursor.rowcount != 1:
                     continue
+                if str(row["status"]) == "success":
+                    payload = json.loads(str(row["payload_json"]))
+                    connection.execute(
+                        """
+                        INSERT INTO model_call_cache (
+                            model_call_key, record_json,
+                            record_sha256, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(model_call_key) DO UPDATE SET
+                            record_json = excluded.record_json,
+                            record_sha256 = excluded.record_sha256,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            str(payload["model_call_key"]),
+                            str(row["record_json"]),
+                            str(row["record_sha256"]),
+                            now,
+                        ),
+                    )
                 connection.execute(
                     """
                     UPDATE model_results
@@ -1075,25 +1303,6 @@ def _fenced_commit_model_record(
         ):
             connection.rollback()
             return False
-        if status == "success":
-            connection.execute(
-                """
-                INSERT INTO model_call_cache (
-                    model_call_key, record_json,
-                    record_sha256, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(model_call_key) DO UPDATE SET
-                    record_json = excluded.record_json,
-                    record_sha256 = excluded.record_sha256,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    str(payload["model_call_key"]),
-                    encoded,
-                    digest,
-                    now,
-                ),
-            )
         connection.execute(
             """
             INSERT INTO model_results (
@@ -1171,6 +1380,25 @@ def _fenced_commit_model_record(
         if cursor.rowcount != 1:
             connection.rollback()
             return False
+        if status == "success":
+            connection.execute(
+                """
+                INSERT INTO model_call_cache (
+                    model_call_key, record_json,
+                    record_sha256, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(model_call_key) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    record_sha256 = excluded.record_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(payload["model_call_key"]),
+                    encoded,
+                    digest,
+                    finish_time,
+                ),
+            )
         connection.execute(
             """
             UPDATE model_results
@@ -1234,7 +1462,11 @@ def _process_claimed_group(
                 expected_kind=job.kind,
                 payload=payload,
                 record=cached,
-                status="success",
+                status=(
+                    "terminal"
+                    if clean_text(cached.get("error"))
+                    else "success"
+                ),
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
@@ -1470,9 +1702,11 @@ def _validate_output_record_provenance(
     if not all(
         clean_text(record.get(field))
         for field in (
+            "job_id",
             "cache_key",
             "model_call_key",
             "asset_fingerprint",
+            "entity_prompt_fingerprint",
         )
     ):
         raise ValueError(
@@ -1567,30 +1801,123 @@ def _load_valid_manifest(
         != 0
     ):
         raise ValueError("model output manifest/store count mismatch")
-    for status, shards in (
-        ("success", extraction_shards),
-        ("terminal", error_shards),
-    ):
-        observed = 0
-        for shard in shards:
-            with (output_root / shard.path).open(
-                "r", encoding="utf-8"
-            ) as handle:
-                for line in handle:
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError(
-                            "model output shard record is not an object"
+    with _connect(jobset.database_path) as connection:
+        connection.execute(
+            "CREATE TEMP TABLE observed_outputs (job_id TEXT PRIMARY KEY)"
+        )
+        for status, shards in (
+            ("success", extraction_shards),
+            ("terminal", error_shards),
+        ):
+            observed = 0
+            for shard in shards:
+                with (output_root / shard.path).open(
+                    "r", encoding="utf-8"
+                ) as handle:
+                    for line in handle:
+                        record = json.loads(line)
+                        if not isinstance(record, dict):
+                            raise ValueError(
+                                "model output shard record is not an object"
+                            )
+                        _validate_output_record_provenance(
+                            record,
+                            status=status,
+                            jobset=jobset,
+                            expected=expected_provenance,
                         )
-                    _validate_output_record_provenance(
-                        record,
-                        status=status,
-                        jobset=jobset,
-                        expected=expected_provenance,
-                    )
-                    observed += 1
-        if observed != counts[status]:
-            raise ValueError("model output shard record count mismatch")
+                        error_text = clean_text(record.get("error"))
+                        if (
+                            (status == "success" and error_text)
+                            or (status == "terminal" and not error_text)
+                        ):
+                            raise ValueError(
+                                f"model output {status} error semantics "
+                                "are invalid"
+                            )
+                        job_id = str(record["job_id"])
+                        try:
+                            connection.execute(
+                                """
+                                INSERT INTO observed_outputs (job_id)
+                                VALUES (?)
+                                """,
+                                (job_id,),
+                            )
+                        except sqlite3.IntegrityError as error:
+                            raise ValueError(
+                                "duplicate model output job_id"
+                            ) from error
+                        durable = connection.execute(
+                            """
+                            SELECT results.status,
+                                   results.record_sha256,
+                                   results.jobset_fingerprint,
+                                   results.modality,
+                                   results.committed,
+                                   jobs.kind,
+                                   members.payload_sha256
+                            FROM model_results AS results
+                            JOIN jobs USING (job_id)
+                            JOIN model_job_members AS members
+                              ON members.job_id = results.job_id
+                             AND members.jobset_fingerprint =
+                                 results.jobset_fingerprint
+                            WHERE results.job_id = ?
+                            """,
+                            (job_id,),
+                        ).fetchone()
+                        record_digest = hashlib.sha256(
+                            _canonical_json(record).encode("utf-8")
+                        ).hexdigest()
+                        modality = str(record["modality"])
+                        if (
+                            durable is None
+                            or str(durable["status"]) != status
+                            or str(durable["record_sha256"])
+                            != record_digest
+                            or str(durable["jobset_fingerprint"])
+                            != jobset.fingerprint_for(modality)
+                            or str(durable["modality"]) != modality
+                            or int(durable["committed"]) != 1
+                            or str(durable["kind"])
+                            != jobset.kind_for(modality)
+                        ):
+                            raise ValueError(
+                                "model output does not match its durable "
+                                "member/result"
+                            )
+                        observed += 1
+            if observed != counts[status]:
+                raise ValueError(
+                    "model output shard record count mismatch"
+                )
+        missing = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM model_results AS results
+                JOIN model_job_members AS members
+                  ON members.job_id = results.job_id
+                 AND members.jobset_fingerprint =
+                     results.jobset_fingerprint
+                WHERE results.committed = 1
+                  AND results.jobset_fingerprint IN (?, ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM observed_outputs
+                      WHERE observed_outputs.job_id = results.job_id
+                  )
+                """,
+                (
+                    jobset.text_fingerprint,
+                    jobset.image_fingerprint,
+                ),
+            ).fetchone()[0]
+        )
+        if missing:
+            raise ValueError(
+                "model output manifest is missing durable results"
+            )
     return ModelStageResult(
         output_root=output_root,
         manifest_path=path,
@@ -1775,6 +2102,7 @@ def run_model_stage(
     ready_marker: Path | None = None,
     network_manifests: Iterable[Path] = (),
     assets_manifest: Path | None = None,
+    assets_barrier: AssetStageBarrier | None = None,
     ready_timeout_seconds: float | None = None,
     text_done_marker: Path | None = None,
     image_done_marker: Path | None = None,
@@ -1811,11 +2139,14 @@ def run_model_stage(
             raise ValueError(
                 "assets_manifest is required with start_marker"
             )
+        if assets_barrier is None:
+            raise ValueError("assets_barrier is required with start_marker")
         write_model_start_marker(
             start_marker,
             jobset,
             network_manifests=network_manifests,
             assets_manifest=assets_manifest,
+            assets_barrier=assets_barrier,
             run_fingerprint=run_fingerprint,
         )
         if jobset.total_tasks and ready_marker is not None:
@@ -2034,6 +2365,7 @@ def write_model_start_marker(
     *,
     network_manifests: Iterable[Path],
     assets_manifest: Path,
+    assets_barrier: AssetStageBarrier,
     run_fingerprint: str,
 ) -> None:
     """Publish exact staged counts only after upstream completion is proven."""
@@ -2053,7 +2385,7 @@ def write_model_start_marker(
             }
         )
     assets_path = Path(assets_manifest)
-    _strict_asset_manifest(assets_path)
+    _strict_asset_manifest(assets_path, barrier=assets_barrier)
     upstream.append(
         {
             "path": str(assets_path),
@@ -2174,21 +2506,16 @@ def wait_for_model_ready_marker(
 
 def iter_assets_from_materialization_manifest(
     manifest_path: Path,
+    *,
+    assets_barrier: AssetStageBarrier,
 ) -> Iterator[dict[str, Any]]:
     """Validate Task-5 output and stream only canonical successful assets."""
     manifest_path = Path(manifest_path)
-    payload = _validated_complete_manifest(manifest_path)
-    if payload.get("stage") != "wdc200k_asset_materialization":
-        raise ValueError("not a WDC asset materialization manifest")
-    root = manifest_path.parent
-    shards = [
-        _completed_from_payload(item)
-        for item in payload.get("bridge_asset_shards", [])
-    ]
-    if not all(validate_completed_shard(shard, root) for shard in shards):
-        raise ValueError("asset materialization shard validation failed")
-    for shard in shards:
-        path = root / shard.path
+    _payload, asset_paths, _link_paths = _strict_asset_manifest(
+        manifest_path,
+        barrier=assets_barrier,
+    )
+    for path in asset_paths:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 record = json.loads(line)
@@ -2262,6 +2589,8 @@ def _iter_jsonl_paths(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
 
 def _strict_asset_manifest(
     manifest_path: Path,
+    *,
+    barrier: AssetStageBarrier,
 ) -> tuple[dict[str, Any], list[Path], list[Path]]:
     payload = _validated_complete_manifest(manifest_path)
     if (
@@ -2271,6 +2600,88 @@ def _strict_asset_manifest(
         != "wdc200k-asset-materialization-v1"
     ):
         raise ValueError("invalid Task-5 asset materialization manifest")
+    fingerprint = payload["fingerprint"]
+    if fingerprint != barrier.fingerprint:
+        raise ValueError("Task-5 materialization fingerprint mismatch")
+    required_fields = {
+        "input_fingerprint",
+        "schema_version",
+        "planning_manifest_sha256",
+        "unique_job_manifest_sha256",
+        "unique_job_sha256",
+        "image_fetch_manifest_sha256",
+        "image_policy_fingerprint",
+        "image_outcome_digest",
+        "image_outcome_count",
+        "image_outcome_url_key_digest",
+        "attempts_per_entity",
+        "retained_per_entity",
+        "text_asset_chunk_chars",
+        "min_text_asset_chunk_chars",
+        "max_text_asset_chunks_per_entity",
+        "records_per_shard",
+    }
+    if set(fingerprint) != required_fields:
+        raise ValueError(
+            "Task-5 materialization fingerprint fields are incomplete"
+        )
+    digest_fields = {
+        "planning_manifest_sha256",
+        "unique_job_manifest_sha256",
+        "unique_job_sha256",
+        "image_fetch_manifest_sha256",
+        "image_outcome_digest",
+        "image_outcome_url_key_digest",
+    }
+    if any(
+        len(str(fingerprint[field])) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in str(fingerprint[field]).lower()
+        )
+        for field in digest_fields
+    ):
+        raise ValueError(
+            "Task-5 materialization fingerprint digest is invalid"
+        )
+    if (
+        not clean_text(fingerprint["input_fingerprint"])
+        or not clean_text(fingerprint["image_policy_fingerprint"])
+    ):
+        raise ValueError(
+            "Task-5 materialization fingerprint identity is empty"
+        )
+    try:
+        integer_values = {
+            field: int(fingerprint[field])
+            for field in (
+                "image_outcome_count",
+                "attempts_per_entity",
+                "retained_per_entity",
+                "text_asset_chunk_chars",
+                "min_text_asset_chunk_chars",
+                "max_text_asset_chunks_per_entity",
+                "records_per_shard",
+            )
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Task-5 materialization fingerprint count is invalid"
+        ) from error
+    if (
+        integer_values["image_outcome_count"] < 0
+        or integer_values["attempts_per_entity"] < 0
+        or integer_values["retained_per_entity"] < 0
+        or integer_values["text_asset_chunk_chars"] <= 0
+        or integer_values["min_text_asset_chunk_chars"] <= 0
+        or integer_values["min_text_asset_chunk_chars"]
+        > integer_values["text_asset_chunk_chars"]
+        or integer_values["max_text_asset_chunks_per_entity"] < 0
+        or integer_values["records_per_shard"] <= 0
+    ):
+        raise ValueError(
+            "Task-5 materialization fingerprint count is inconsistent"
+        )
     root = manifest_path.parent
     asset_shards = [
         _completed_from_payload(item)
@@ -2287,6 +2698,13 @@ def _strict_asset_manifest(
         for shard in (*asset_shards, *link_shards)
     ):
         raise ValueError("Task-5 manifest shard validation failed")
+    asset_count = sum(shard.records for shard in asset_shards)
+    link_count = sum(shard.records for shard in link_shards)
+    if (
+        asset_count != barrier.bridge_assets
+        or link_count != barrier.table_asset_links
+    ):
+        raise ValueError("Task-5 materialization count mismatch")
     return (
         payload,
         [root / shard.path for shard in asset_shards],
@@ -2300,6 +2718,7 @@ def adapt_model_tasks_from_manifests(
     structural_manifests: Iterable[Path],
     finalized_selection_manifest: Path,
     assets_manifest: Path,
+    assets_barrier: AssetStageBarrier,
     output_root: Path,
     args: argparse.Namespace,
     records_per_shard: int = 10_000,
@@ -2315,17 +2734,21 @@ def adapt_model_tasks_from_manifests(
         raise ValueError("structural manifests are required")
     source_paths: list[Path] = []
     entity_paths: list[Path] = []
+    validated_selection_paths: list[Path] = []
     table_count = 0
-    manifest_hashes: list[str] = []
+    manifest_hashes: list[tuple[Path, str]] = []
     for manifest_path in structural_paths:
-        _validated, records, manifest_hash = (
+        validated, records, manifest_hash = (
             structural._validated_shard_from_manifest(
                 manifest_path,
                 output_root=structural_output_root,
             )
         )
+        validated_selection_paths.append(validated)
         table_count += records
-        manifest_hashes.append(manifest_hash)
+        manifest_hashes.append(
+            (manifest_path.resolve(), manifest_hash)
+        )
         payload = _validated_complete_manifest(manifest_path)
         completed = [
             _completed_from_payload(item)
@@ -2354,20 +2777,58 @@ def adapt_model_tasks_from_manifests(
     final_shard = _completed_from_payload(
         final_payload["completed_shards"][0]
     )
+    expected_final_input = stable_hash(
+        structural.STRUCTURAL_SCHEMA_VERSION,
+        *(
+            f"{path.as_posix()}:{digest}"
+            for path, digest in manifest_hashes
+        ),
+        length=40,
+    )
+    expected_final_parameters = stable_hash(
+        "validated-selection-global-v1",
+        table_count,
+        length=40,
+    )
     if (
-        final_shard.records != table_count
+        final_payload.get("input_fingerprint") != expected_final_input
+        or final_payload.get("parameter_fingerprint")
+        != expected_final_parameters
+        or final_shard.records != table_count
         or not validate_completed_shard(
             final_shard,
             structural_output_root,
         )
     ):
-        raise ValueError("Task-3 finalized-selection validation failed")
+        raise ValueError(
+            "Task-3 finalized-selection fingerprint/validation failed"
+        )
+    sentinel = object()
+    expected_records = _iter_jsonl_paths(validated_selection_paths)
+    actual_records = _iter_jsonl_paths(
+        [structural_output_root / final_shard.path]
+    )
+    for expected_record, actual_record in zip_longest(
+        expected_records,
+        actual_records,
+        fillvalue=sentinel,
+    ):
+        if (
+            expected_record is sentinel
+            or actual_record is sentinel
+            or _canonical_json(expected_record)
+            != _canonical_json(actual_record)
+        ):
+            raise ValueError(
+                "Task-3 finalized-selection content binding failed"
+            )
     _, asset_paths, link_paths = _strict_asset_manifest(
-        Path(assets_manifest)
+        Path(assets_manifest),
+        barrier=assets_barrier,
     )
     input_fingerprint = stable_hash(
         MODEL_QUEUE_SCHEMA_VERSION,
-        *(manifest_hashes),
+        *(digest for _path, digest in manifest_hashes),
         _sha256_path(final_path),
         _sha256_path(Path(assets_manifest)),
         length=40,
@@ -2563,6 +3024,7 @@ def enqueue_model_tasks_from_manifest(
     store: SqliteJobStore,
     *,
     args: argparse.Namespace | None = None,
+    assets_barrier: AssetStageBarrier | None = None,
     input_fingerprint: str | None = None,
     task_factory: (
         Callable[
@@ -2578,13 +3040,24 @@ def enqueue_model_tasks_from_manifest(
 ) -> ModelJobSet:
     """Validate Task 5 and enqueue its assets without loading all of them."""
     manifest_path = Path(manifest_path)
+    if task_factory is None:
+        raise ValueError(
+            "task_factory is required; raw Task-5 bridge assets do not "
+            "contain candidate attributes"
+        )
+    if assets_barrier is None:
+        raise ValueError("assets_barrier is required for Task-5 input")
+    _manifest, asset_paths, _link_paths = _strict_asset_manifest(
+        manifest_path,
+        barrier=assets_barrier,
+    )
 
     def extraction_inputs() -> Iterator[dict[str, Any]]:
-        for current_asset in iter_assets_from_materialization_manifest(
-            manifest_path
-        ):
-            if task_factory is None:
-                yield current_asset
+        for current_asset in _iter_jsonl_paths(asset_paths):
+            status = clean_text(current_asset.get("status"))
+            if status and status != "success":
+                continue
+            if current_asset.get("asset_type") not in {"text", "image"}:
                 continue
             produced = task_factory(current_asset)
             if isinstance(produced, dict):

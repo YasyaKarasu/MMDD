@@ -1154,6 +1154,112 @@ def test_dynamic_vllm_signal_path_stops_builder_and_all_started_models(
     }
 
 
+def test_dynamic_vllm_masks_signal_handlers_during_best_effort_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    started = []
+    stopped = []
+    events = []
+    current_handlers = {}
+
+    class FakePopen:
+        def __init__(self, command, **_kwargs):
+            self.command = command
+            self.pid = 12345 + len(started)
+            self._poll = None
+            self.role = (
+                "builder"
+                if command[0] == "/usr/bin/python"
+                else command[command.index("--served-model-name") + 1]
+            )
+            started.append(self)
+            if self.role == "builder":
+                marker = Path(
+                    command[command.index("--model_start_marker") + 1]
+                )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    '{"status":"model_cache_ready_to_start",'
+                    '"text_task_count":1,"image_task_count":1}',
+                    encoding="utf-8",
+                )
+
+        def poll(self):
+            return self._poll
+
+    def previous_handler(signum, _frame):
+        events.append(("previous_handler", signum))
+
+    def fake_signal(signum, handler):
+        previous = current_handlers.get(signum, previous_handler)
+        current_handlers[signum] = handler
+        if handler == signal.SIG_IGN:
+            events.append(("mask", signum))
+        elif handler is previous_handler:
+            events.append(("restore", signum))
+        return previous
+
+    def fake_stop(process, **_kwargs):
+        stopped.append(process.role)
+        events.append(("stop", process.role))
+        if len(stopped) == 1:
+            handler = current_handlers[signal.SIGTERM]
+            if handler == signal.SIG_IGN:
+                events.append(("ignored", signal.SIGTERM))
+            else:
+                handler(signal.SIGTERM, None)
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_server",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_any_marker_or_builder_exit",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runner.ForwardedSignal(signal.SIGTERM)
+        ),
+    )
+    monkeypatch.setattr(runner, "stop_process", fake_stop)
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 128 + signal.SIGTERM
+    assert events.index(("mask", signal.SIGTERM)) < events.index(
+        ("stop", "builder")
+    )
+    assert ("ignored", signal.SIGTERM) in events
+    assert events.index(("restore", signal.SIGTERM)) > max(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "stop"
+    )
+    assert set(stopped) == {
+        "builder",
+        "Qwen3.5-9B",
+        "Qwen3-VL-8B-Thinking",
+    }
+
+
 def test_dynamic_vllm_forwards_signal_to_every_live_process_group():
     import run_mm_joinability_dynamic_vllm as runner
 
