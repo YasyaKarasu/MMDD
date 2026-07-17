@@ -45,6 +45,7 @@ try:
     )
     from wdc200k_models import (
         AdaptedModelTasks,
+        ModelStageAuthority,
         ModelStageResult,
         StructuralStageBarrier,
         model_adapter_input_fingerprint,
@@ -95,6 +96,7 @@ except ModuleNotFoundError as error:
         )
         from wdc200k_models import (
             AdaptedModelTasks,
+            ModelStageAuthority,
             ModelStageResult,
             StructuralStageBarrier,
             model_adapter_input_fingerprint,
@@ -149,6 +151,7 @@ class MaterializationInputs:
     materialized_assets: MaterializedAssetShards
     adapted_model_tasks: AdaptedModelTasks
     model_result: ModelStageResult
+    model_authority: ModelStageAuthority
     work_root: Path
 
 
@@ -188,7 +191,9 @@ class _ValidatedUpstream:
     extraction_paths: tuple[Path, ...]
     model_error_paths: tuple[Path, ...]
     adapter_error_paths: tuple[Path, ...]
+    asset_plan_result: AssetPlanShards
     image_fetch_result: ImageFetchResult
+    image_failure_aggregation_database: Path
     expected_tables: int
     expected_entities: int
     expected_assets: int
@@ -467,6 +472,7 @@ def _validate_upstream(
         inputs.model_result,
         adapted,
         args=args,
+        authority=inputs.model_authority,
         validation_store_path=validation_root / "model-membership.sqlite3",
     )
     asset_paths = materialized_assets.bridge_asset_paths
@@ -539,6 +545,7 @@ def _validate_upstream(
             adapted.manifest_path
         ),
         "model_adapter_input_fingerprint": adapted.input_fingerprint,
+        "model_authority": asdict(inputs.model_authority),
         "model_manifest_sha256": model_manifest_sha256,
         "model_jobsets": {
             "text": inputs.model_result.jobset.text_fingerprint,
@@ -568,7 +575,11 @@ def _validate_upstream(
             model_root / shard.path for shard in model_error_shards
         ),
         adapter_error_paths=adapted.error_paths,
+        asset_plan_result=planned,
         image_fetch_result=inputs.image_fetch_result,
+        image_failure_aggregation_database=(
+            validation_root / "image-failure-fanout.sqlite3"
+        ),
         expected_tables=tables,
         expected_entities=entities,
         expected_assets=assets_barrier.bridge_assets,
@@ -2532,7 +2543,13 @@ def _finalize_dataset(
         _deduplicated_failures(
             database_path,
             kind="media",
-            records=iter_image_failures(upstream.image_fetch_result),
+            records=iter_image_failures(
+                upstream.image_fetch_result,
+                planned=upstream.asset_plan_result,
+                aggregation_database=(
+                    upstream.image_failure_aggregation_database
+                ),
+            ),
         ),
     )
     if after_finalize_commit is not None:

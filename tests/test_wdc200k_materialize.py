@@ -54,6 +54,7 @@ from wdc200k_io import (
 )
 from wdc200k_models import (
     AssetStageBarrier,
+    ModelStageAuthority,
     StructuralStageBarrier,
     adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
@@ -832,6 +833,7 @@ def _authoritative_inputs(
             materialized_assets=materialized_assets,
             adapted_model_tasks=adapted,
             model_result=model_result,
+            model_authority=ModelStageAuthority.from_args(args),
             work_root=tmp_path / "work",
         ),
         args,
@@ -1366,6 +1368,7 @@ def test_real_fetch_and_model_failures_reach_canonical_diagnostics(
         "media_download_failure"
     )
     assert media_failures[0]["error_class"] == "TimeoutError"
+    assert media_failures[0]["affected_reference_count"] == 2
     assert model_failures
     assert {
         "web_fetch_failures",
@@ -1514,6 +1517,19 @@ def test_forged_barriers_and_missing_model_manifest_are_rejected(
     tmp_path: Path,
 ) -> None:
     inputs, args = _authoritative_inputs(tmp_path)
+
+    with pytest.raises(ValueError, match="model stage authority"):
+        materialize_dataset(
+            replace(
+                inputs,
+                model_authority=replace(
+                    inputs.model_authority,
+                    prompt_version="foreign-prompt-v0",
+                ),
+            ),
+            output_root=tmp_path / "foreign-authority-output",
+            args=args,
+        )
 
     with pytest.raises(ValueError, match="does not match manifest"):
         materialize_dataset(

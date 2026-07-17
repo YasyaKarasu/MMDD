@@ -2142,34 +2142,126 @@ def iter_image_outcomes(
 
 def iter_image_failures(
     result: ImageFetchResult,
+    *,
+    planned: AssetPlanShards,
+    aggregation_database: Path,
 ) -> Iterator[dict[str, Any]]:
-    """Stream terminal failures for exactly this fetch result's job set."""
+    """Aggregate current-jobset failure fanout without loading mappings."""
+    planned = _validated_planning_result(planned)
+    validate_unique_image_jobs(result.unique_jobs, planned=planned)
     validate_complete_image_fetch(
         result,
         unique_jobs=result.unique_jobs,
     )
     outcome_store = ImageOutcomeStore(result.outcomes_path)
-    for job in _iter_jsonl((result.unique_jobs.output_path,)):
-        url_key = clean_text(job.get("url_key"))
-        outcome = outcome_store.get(
-            result.policy_fingerprint,
-            url_key,
+    aggregation_database = Path(aggregation_database)
+    aggregation_database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(aggregation_database) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS current_image_failure_jobs (
+                url_key TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                page_url TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS current_image_failure_refs (
+                url_key TEXT NOT NULL,
+                reference_key TEXT NOT NULL,
+                PRIMARY KEY (url_key, reference_key)
+            );
+            DELETE FROM current_image_failure_jobs;
+            DELETE FROM current_image_failure_refs;
+            """
         )
-        if outcome is None or outcome.get("status") != "terminal":
-            continue
-        yield {
-            "failure_type": "media_download_failure",
-            "stage": "image_fetch",
-            "status": "terminal",
-            "entity_id": clean_text(job.get("entity_id")),
-            "page_url": clean_text(job.get("page_url")),
-            "source": clean_text(job.get("source")),
-            "image_url": clean_text(outcome.get("image_url")),
-            "url_key": url_key,
-            "error_class": clean_text(outcome.get("error_class")),
-            "http_status": outcome.get("http_status"),
-            "policy_fingerprint": result.policy_fingerprint,
-        }
+        for job in _iter_jsonl((result.unique_jobs.output_path,)):
+            url_key = clean_text(job.get("url_key"))
+            if not url_key:
+                raise ValueError("unique image failure job has no url_key")
+            connection.execute(
+                """
+                INSERT INTO current_image_failure_jobs (
+                    url_key, entity_id, page_url, source
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    url_key,
+                    clean_text(job.get("entity_id")),
+                    clean_text(job.get("page_url")),
+                    clean_text(job.get("source")),
+                ),
+            )
+        for mapping in _iter_jsonl(planned.image_mapping_paths):
+            url_key = clean_text(mapping.get("url_key"))
+            current = connection.execute(
+                """
+                SELECT 1 FROM current_image_failure_jobs
+                WHERE url_key = ?
+                """,
+                (url_key,),
+            ).fetchone()
+            if current is None:
+                continue
+            reference_key = stable_hash(
+                ASSET_PLANNING_SCHEMA_VERSION,
+                json.dumps(
+                    mapping,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                length=64,
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO current_image_failure_refs (
+                    url_key, reference_key
+                ) VALUES (?, ?)
+                """,
+                (url_key, reference_key),
+            )
+        connection.commit()
+        for job in connection.execute(
+            """
+            SELECT jobs.url_key, jobs.entity_id, jobs.page_url,
+                   jobs.source, COUNT(refs.reference_key) AS ref_count
+            FROM current_image_failure_jobs AS jobs
+            LEFT JOIN current_image_failure_refs AS refs
+              ON refs.url_key = jobs.url_key
+            GROUP BY jobs.url_key
+            ORDER BY jobs.url_key
+            """
+        ):
+            outcome = outcome_store.get(
+                result.policy_fingerprint,
+                str(job["url_key"]),
+            )
+            if outcome is None or outcome.get("status") != "terminal":
+                continue
+            affected_reference_count = int(job["ref_count"])
+            if affected_reference_count <= 0:
+                raise ValueError(
+                    "image failure job has no planning references"
+                )
+            yield {
+                "failure_type": "media_download_failure",
+                "stage": "image_fetch",
+                "status": "terminal",
+                "entity_id": str(job["entity_id"]),
+                "page_url": str(job["page_url"]),
+                "source": str(job["source"]),
+                "image_url": clean_text(outcome.get("image_url")),
+                "url_key": str(job["url_key"]),
+                "error_class": clean_text(
+                    outcome.get("error_class")
+                ),
+                "http_status": outcome.get("http_status"),
+                "affected_reference_count": (
+                    affected_reference_count
+                ),
+                "policy_fingerprint": result.policy_fingerprint,
+            }
 
 
 def _table_asset_links(

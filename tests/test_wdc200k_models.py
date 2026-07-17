@@ -20,6 +20,7 @@ import wdc200k_models as models
 from wdc200k_models import (
     AssetStageBarrier,
     MODEL_PARSER_SCHEMA_VERSION,
+    ModelStageAuthority,
     adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
     enqueue_model_tasks_from_manifest,
@@ -361,6 +362,7 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
         expected_input_fingerprint=adapter_input,
     )
     args = model_args()
+    authority = ModelStageAuthority.from_args(args)
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
         [asset("adapter")],
@@ -382,6 +384,7 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
         result,
         adapted,
         args=args,
+        authority=authority,
         validation_store_path=tmp_path / "validation-models.sqlite3",
     )
 
@@ -396,8 +399,57 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
             result,
             foreign_adapter,
             args=args,
+            authority=authority,
             validation_store_path=tmp_path / "foreign-models.sqlite3",
         )
+
+    foreign_runs = [
+        (
+            model_args(),
+            {
+                "prompt_version": "foreign-prompt-v0",
+            },
+        ),
+        (
+            model_args(text_model_name="foreign-text-model"),
+            {},
+        ),
+        (
+            model_args(),
+            {
+                "policy_fingerprint": "foreign-model-policy-v0",
+            },
+        ),
+    ]
+    for index, (foreign_args, options) in enumerate(foreign_runs):
+        foreign_store = SqliteJobStore(
+            tmp_path / f"foreign-authority-{index}.sqlite3"
+        )
+        foreign_jobset = enqueue_model_tasks(
+            [asset("adapter")],
+            foreign_store,
+            args=foreign_args,
+            input_fingerprint=adapter_input,
+            text_input_fingerprint=adapter_input,
+            image_input_fingerprint=adapter_input,
+            **options,
+        )
+        foreign_result = run_model_stage(
+            foreign_store,
+            CountingExtractor(),
+            jobset=foreign_jobset,
+            output_root=tmp_path / f"foreign-output-{index}",
+        )
+        with pytest.raises(ValueError, match="model stage authority"):
+            validate_model_stage_for_adapter(
+                foreign_result,
+                adapted,
+                args=args,
+                authority=authority,
+                validation_store_path=(
+                    tmp_path / f"foreign-validation-{index}.sqlite3"
+                ),
+            )
 
 
 def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:

@@ -140,6 +140,49 @@ class ModelStageResult:
 
 
 @dataclass(frozen=True)
+class ModelStageAuthority:
+    """Expected Task-6 configuration supplied by the stage orchestrator."""
+
+    text_model_identity: str
+    image_model_identity: str
+    prompt_version: str = PROMPT_VERSION
+    policy_fingerprint: str = MODEL_POLICY_VERSION
+    parser_schema_version: str = MODEL_PARSER_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        values = (
+            self.text_model_identity,
+            self.image_model_identity,
+            self.prompt_version,
+            self.policy_fingerprint,
+            self.parser_schema_version,
+        )
+        if any(not clean_text(value) for value in values):
+            raise ValueError("model stage authority values must not be empty")
+        if self.prompt_version != PROMPT_VERSION:
+            raise ValueError("model stage authority prompt version mismatch")
+        if self.parser_schema_version != MODEL_PARSER_SCHEMA_VERSION:
+            raise ValueError("model stage authority parser schema mismatch")
+
+    @classmethod
+    def from_args(
+        cls,
+        args: argparse.Namespace,
+        *,
+        prompt_version: str = PROMPT_VERSION,
+        policy_fingerprint: str = MODEL_POLICY_VERSION,
+        parser_schema_version: str = MODEL_PARSER_SCHEMA_VERSION,
+    ) -> ModelStageAuthority:
+        return cls(
+            text_model_identity=_model_identity(args, "text"),
+            image_model_identity=_model_identity(args, "image"),
+            prompt_version=prompt_version,
+            policy_fingerprint=policy_fingerprint,
+            parser_schema_version=parser_schema_version,
+        )
+
+
+@dataclass(frozen=True)
 class AdaptedModelTasks:
     output_root: Path
     task_paths: tuple[Path, ...]
@@ -3370,6 +3413,7 @@ def validate_model_stage_for_adapter(
     adapted: AdaptedModelTasks,
     *,
     args: argparse.Namespace,
+    authority: ModelStageAuthority,
     validation_store_path: Path,
 ) -> bool:
     """Rebuild adapter membership and compare it to the durable model run."""
@@ -3377,6 +3421,38 @@ def validate_model_stage_for_adapter(
         adapted,
         expected_input_fingerprint=adapted.input_fingerprint,
     )
+    if authority.parser_schema_version != MODEL_PARSER_SCHEMA_VERSION:
+        raise ValueError("model stage authority parser schema mismatch")
+    authority_identities = {
+        "text": authority.text_model_identity,
+        "image": authority.image_model_identity,
+    }
+    if any(
+        _model_identity(args, modality)
+        != authority_identities[modality]
+        for modality in ("text", "image")
+    ):
+        raise ValueError("model stage authority CLI identity mismatch")
+    if (
+        result.jobset.input_fingerprint != adapted.input_fingerprint
+        or result.jobset.prompt_version != authority.prompt_version
+    ):
+        raise ValueError("model stage authority jobset mismatch")
+    for modality in ("text", "image"):
+        expected_fingerprint = _modality_fingerprint(
+            modality=modality,
+            input_fingerprint=adapted.input_fingerprint,
+            prompt_version=authority.prompt_version,
+            model_identity=authority_identities[modality],
+            policy_fingerprint=authority.policy_fingerprint,
+        )
+        if (
+            result.jobset.fingerprint_for(modality)
+            != expected_fingerprint
+            or result.jobset.kind_for(modality)
+            != f"model-{modality}-{expected_fingerprint}"
+        ):
+            raise ValueError("model stage authority fingerprint mismatch")
     if not validate_model_stage(result):
         raise ValueError("model stage result validation failed")
     expected = enqueue_model_tasks(
@@ -3386,7 +3462,8 @@ def validate_model_stage_for_adapter(
         input_fingerprint=adapted.input_fingerprint,
         text_input_fingerprint=adapted.input_fingerprint,
         image_input_fingerprint=adapted.input_fingerprint,
-        prompt_version=result.jobset.prompt_version,
+        prompt_version=authority.prompt_version,
+        policy_fingerprint=authority.policy_fingerprint,
     )
     comparable_fields = (
         "input_fingerprint",
@@ -3409,7 +3486,8 @@ def validate_model_stage_for_adapter(
         with _connect(expected.database_path) as connection:
             expected_row = connection.execute(
                 """
-                SELECT input_fingerprint, task_count, membership_digest,
+                SELECT input_fingerprint, prompt_version, model_identity,
+                       policy_fingerprint, task_count, membership_digest,
                        enqueue_complete
                 FROM model_jobsets WHERE fingerprint = ?
                 """,
@@ -3418,7 +3496,8 @@ def validate_model_stage_for_adapter(
         with _connect(result.jobset.database_path) as connection:
             actual_row = connection.execute(
                 """
-                SELECT input_fingerprint, task_count, membership_digest,
+                SELECT input_fingerprint, prompt_version, model_identity,
+                       policy_fingerprint, task_count, membership_digest,
                        enqueue_complete
                 FROM model_jobsets WHERE fingerprint = ?
                 """,

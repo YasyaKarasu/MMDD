@@ -24,6 +24,7 @@ from wdc200k_assets import (  # noqa: E402
     build_unique_image_jobs,
     fetch_unique_images,
     iter_entity_page_join,
+    iter_image_failures,
     iter_image_outcomes,
     materialize_asset_shards,
     materialize_entity_assets,
@@ -2278,3 +2279,91 @@ def test_public_asset_validators_reconstruct_the_complete_producer_chain(
             image_fetch_result=fetched,
             expected_input_fingerprint="foreign-materialization-run",
         )
+
+
+def test_image_failures_fan_out_reference_counts_for_current_jobset(
+    tmp_path: Path,
+) -> None:
+    shared = "https://i.test/shared-failure.jpg"
+    planned = persist_entity_asset_plans(
+        [
+            (entity("e1", image_urls=[shared]), page()),
+            (entity("e2", image_urls=[shared]), page()),
+        ],
+        output_root=tmp_path / "plans-two",
+        input_fingerprint="two-entity-plan",
+    )
+    unique = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique-two.jsonl",
+    )
+    policy = FetchPolicy(
+        deadline_seconds=8.0,
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+    transport = FakeImageTransport(
+        tmp_path,
+        {shared: TimeoutError("shared failure")},
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    fetched = fetch_unique_images(
+        unique,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    failures = list(
+        iter_image_failures(
+            fetched,
+            planned=planned,
+            aggregation_database=tmp_path / "failure-fanout.sqlite3",
+        )
+    )
+
+    assert len(failures) == 1
+    assert failures[0]["affected_reference_count"] == 2
+    assert failures[0]["url_key"] == hashlib.sha256(
+        shared.encode("utf-8")
+    ).hexdigest()
+
+    one_entity_plan = persist_entity_asset_plans(
+        [(entity("e3", image_urls=[shared]), page())],
+        output_root=tmp_path / "plans-one",
+        input_fingerprint="one-entity-plan",
+    )
+    one_entity_unique = build_unique_image_jobs(
+        one_entity_plan,
+        tmp_path / "unique-one.jsonl",
+    )
+    one_entity_fetch = fetch_unique_images(
+        one_entity_unique,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    expected = list(
+        iter_image_failures(
+            one_entity_fetch,
+            planned=one_entity_plan,
+            aggregation_database=tmp_path / "failure-fanout.sqlite3",
+        )
+    )
+    resumed = list(
+        iter_image_failures(
+            one_entity_fetch,
+            planned=one_entity_plan,
+            aggregation_database=tmp_path / "failure-fanout.sqlite3",
+        )
+    )
+
+    assert len(expected) == 1
+    assert expected[0]["affected_reference_count"] == 1
+    assert expected[0]["entity_id"] == "e3"
+    assert resumed == expected
