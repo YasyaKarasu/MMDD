@@ -977,19 +977,26 @@ class WdcWebClient:
                 (image_url, self.network_policy_version),
             ).fetchone()
         if success is not None:
-            candidate_path = (self.image_dir / str(success["file_name"])).resolve()
-            image_root = self.image_dir.resolve()
-            if not candidate_path.is_relative_to(image_root):
-                return None
-            raster = self._validated_raster(candidate_path)
-            if (
-                raster is None
-                or self._sha256_path(candidate_path) != str(success["sha256"])
-                or raster[0] != int(success["width"])
-                or raster[1] != int(success["height"])
-                or raster[2] != str(success["mime_type"])
-                or candidate_path.stat().st_size != int(success["bytes"])
-            ):
+            try:
+                candidate_path = (
+                    self.image_dir / str(success["file_name"])
+                ).resolve()
+                image_root = self.image_dir.resolve()
+                if not candidate_path.is_relative_to(image_root):
+                    return None
+                raster = self._validated_raster(candidate_path)
+                if (
+                    raster is None
+                    or self._sha256_path(candidate_path)
+                    != str(success["sha256"])
+                    or raster[0] != int(success["width"])
+                    or raster[1] != int(success["height"])
+                    or raster[2] != str(success["mime_type"])
+                    or candidate_path.stat().st_size
+                    != int(success["bytes"])
+                ):
+                    return None
+            except (OSError, RuntimeError):
                 return None
             return {
                 "status": "success",

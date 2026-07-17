@@ -111,8 +111,10 @@ class PageOutcomeStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            connection.execute("BEGIN IMMEDIATE")
             counts_existed = (
                 connection.execute(
                     """
@@ -210,6 +212,12 @@ class PageOutcomeStore:
                     GROUP BY policy_fingerprint
                     """
                 )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -541,21 +549,21 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
-def _job_status_counts(
+def _leased_count(
     store: SqliteJobStore,
     kind: str,
-) -> dict[str, int]:
+) -> int:
     with store._connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT status, COUNT(*)
-            FROM jobs
-            WHERE kind = ?
-            GROUP BY status
-            """,
-            (kind,),
-        ).fetchall()
-    return {str(row[0]): int(row[1]) for row in rows}
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs
+                WHERE kind = ? AND status = 'leased'
+                """,
+                (kind,),
+            ).fetchone()[0]
+        )
 
 
 def _safe_error_class(value: Any) -> str:
@@ -802,8 +810,7 @@ def _publish_progress_unlocked(
     inflight: int,
 ) -> tuple[int, int]:
     success, terminal = outcome_store.counts(policy_fingerprint)
-    statuses = _job_status_counts(store, kind)
-    leased = statuses.get("leased", 0)
+    leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
     observed_inflight = max(inflight, leased)
     _atomic_json(
@@ -813,8 +820,7 @@ def _publish_progress_unlocked(
             "unique": unique,
             "success": success,
             "terminal": terminal,
-            "pending": statuses.get("pending", 0)
-            + statuses.get("retryable", 0),
+            "pending": max(0, remaining - leased),
             "leased": leased,
             "remaining": remaining,
             "complete": success + terminal == unique,
@@ -1146,9 +1152,8 @@ def fetch_unique_pages(
                         success_now, terminal_now = outcome_store.counts(
                             fingerprint
                         )
-                        statuses = _job_status_counts(store, kind)
                         unresolved = unique - success_now - terminal_now
-                        active_leases = statuses.get("leased", 0)
+                        active_leases = _leased_count(store, kind)
                         elapsed = time.monotonic() - wait_started
                         if (
                             active_leases
@@ -1245,8 +1250,7 @@ def fetch_unique_pages(
         progress_path=progress_path,
         inflight=0,
     )
-    statuses = _job_status_counts(store, kind)
-    leased = statuses.get("leased", 0)
+    leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
     return FetchResult(
         unique=unique,

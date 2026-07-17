@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import multiprocessing
 import socket
 import sqlite3
 import sys
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_wdc_mm_joinability_dataset as wdc_builder  # noqa: E402
+import wdc200k_fetch as fetch_module  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 from wdc200k_fetch import (  # noqa: E402
     FetchPolicy,
@@ -46,6 +48,17 @@ def png_bytes(color: tuple[int, int, int] = (20, 40, 60)) -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (64, 48), color=color).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def _open_outcome_store_process(
+    path: str,
+    results: Any,
+) -> None:
+    try:
+        store = PageOutcomeStore(Path(path))
+        results.put(("ok", store.counts("legacy-policy")))
+    except BaseException as error:
+        results.put(("error", type(error).__name__, str(error)))
 
 
 class CountingTransport:
@@ -342,6 +355,142 @@ def test_outcome_counts_are_transactional_idempotent_and_constant_time(
     count_sql = " ".join(statements).casefold()
     assert "policy_outcome_counts" in count_sql
     assert "group by" not in count_sql
+
+
+def test_legacy_outcome_schema_migrates_once_across_processes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-outcomes.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE page_outcomes (
+                policy_fingerprint TEXT NOT NULL,
+                url_key TEXT NOT NULL,
+                page_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                final_url TEXT,
+                text TEXT,
+                image_urls_json TEXT,
+                error_class TEXT,
+                http_status INTEGER,
+                payload_sha256 TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (policy_fingerprint, url_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE page_references (
+                policy_fingerprint TEXT NOT NULL,
+                url_key TEXT NOT NULL,
+                reference_key TEXT NOT NULL,
+                PRIMARY KEY (
+                    policy_fingerprint, url_key, reference_key
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO page_outcomes VALUES (
+                'legacy-policy', ?, 'https://e.test/legacy',
+                'success', 'https://e.test/legacy', 'legacy', '[]',
+                NULL, NULL, ?, 1.0
+            )
+            """,
+            ("a" * 64, "b" * 64),
+        )
+
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_open_outcome_store_process,
+            args=(str(path), results),
+        )
+        for _index in range(4)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert [results.get(timeout=1) for _index in processes] == [
+        ("ok", (1, 0))
+    ] * 4
+    store = PageOutcomeStore(path)
+    assert store.counts("legacy-policy") == (1, 0)
+    assert len(list(store.iter("legacy-policy"))) == 1
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(page_references)"
+            )
+        }
+        assert {
+            "entity_id",
+            "source_table_id",
+            "row_id_json",
+        }.issubset(columns)
+        assert connection.execute(
+            """
+            SELECT success, terminal, total
+            FROM policy_outcome_counts
+            WHERE policy_fingerprint = 'legacy-policy'
+            """
+        ).fetchone() == (1, 0, 1)
+
+
+def test_full_progress_query_uses_only_indexed_leased_status_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    kind = "wdc200k-page:policy"
+    for index in range(20):
+        job_store.enqueue(kind, f"job-{index}", {"index": index})
+    job_store.claim(kind, limit=2, owner="other", lease_seconds=60)
+    outcomes = PageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    statements: list[str] = []
+    original_connect = job_store._connect
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(job_store, "_connect", traced_connect)
+    fetch_module._publish_progress(
+        outcomes,
+        store=job_store,
+        kind=kind,
+        policy_fingerprint="policy",
+        unique=20,
+        progress_path=tmp_path / "progress.json",
+        inflight=0,
+    )
+
+    sql = " ".join(statements).casefold()
+    assert "group by" not in sql
+    assert "status = 'leased'" in sql
+    with original_connect() as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*) FROM jobs
+            WHERE kind = ? AND status = 'leased'
+            """,
+            (kind,),
+        ).fetchall()
+    assert any(
+        "jobs_kind_status" in str(row[3])
+        and "kind=?" in str(row[3])
+        and "status=?" in str(row[3])
+        for row in plan
+    )
 
 
 def test_fetch_rejects_transport_network_policy_mismatch_before_work(
@@ -1016,6 +1165,37 @@ def test_cached_image_success_validates_file_without_network_or_mutation(
             "SELECT COUNT(*) FROM image_cache WHERE original_url = ?",
             (image_url,),
         ).fetchone() == (1,)
+
+
+def test_cached_image_race_with_file_deletion_returns_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+    )
+    client.image_dir.mkdir()
+    path = client.image_dir / "racy.png"
+    path.write_bytes(png_bytes())
+    image_url = "https://i.test/racy.png"
+    client._store_image_index(
+        original_url=image_url,
+        final_url=image_url,
+        path=path,
+        width=64,
+        height=48,
+        mime_type="image/png",
+    )
+
+    def validate_then_delete(_path: Path) -> tuple[int, int, str, str]:
+        path.unlink()
+        return 64, 48, "image/png", ".png"
+
+    monkeypatch.setattr(client, "_validated_raster", validate_then_delete)
+
+    assert client.cached_image_outcome(image_url) is None
 
 
 def test_image_success_cache_keeps_independent_policy_rows(
