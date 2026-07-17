@@ -1692,6 +1692,17 @@ def iter_wdc_gzip_paths(input_root: Path) -> Iterator[Path]:
                 close()
 
 
+def iter_wdc_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield every JSON-object row from a WDC gzip table without a row cap."""
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                yield payload
+
+
 def _read_rows(path: Path, max_rows: int) -> tuple[list[dict[str, Any]], int, bool]:
     rows: list[dict[str, Any]] = []
     malformed_rows = 0
@@ -1768,15 +1779,17 @@ def _empty_result(reason: str, malformed_rows: int) -> WdcTableResult:
     )
 
 
-def read_wdc_table(
+def _adapt_wdc_rows(
+    raw_rows: list[dict[str, Any]],
     path: Path,
     input_root: Path,
     min_rows: int,
     min_cols: int,
-    max_rows: int = 0,
+    *,
+    malformed_rows: int = 0,
+    rows_truncated: bool = False,
 ) -> WdcTableResult:
-    """Read one WDC gzip host table and adapt it to the internal table contract."""
-    raw_rows, malformed_rows, rows_truncated = _read_rows(path, max_rows)
+    """Adapt already-read WDC rows to the internal table contract."""
     if len(raw_rows) < min_rows:
         return _empty_result("too_few_rows", malformed_rows)
 
@@ -1874,6 +1887,26 @@ def read_wdc_table(
         entities=entities,
         image_urls_by_entity=image_urls_by_entity,
         skip_reason=None,
+        malformed_rows=malformed_rows,
+        rows_truncated=rows_truncated,
+    )
+
+
+def read_wdc_table(
+    path: Path,
+    input_root: Path,
+    min_rows: int,
+    min_cols: int,
+    max_rows: int = 0,
+) -> WdcTableResult:
+    """Read one WDC gzip host table and adapt it to the internal table contract."""
+    raw_rows, malformed_rows, rows_truncated = _read_rows(path, max_rows)
+    return _adapt_wdc_rows(
+        raw_rows,
+        path,
+        input_root,
+        min_rows,
+        min_cols,
         malformed_rows=malformed_rows,
         rows_truncated=rows_truncated,
     )
