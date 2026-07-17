@@ -1545,22 +1545,11 @@ class WdcWebClient:
                     mime_type=mime_type,
                     downloaded=False,
                 )
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    DELETE FROM image_cache
-                    WHERE original_url = ? AND policy_fingerprint = ?
-                    """,
-                    (image_url, self.network_policy_version),
-                )
-            with self._image_quota_lock:
-                self._image_bytes_total = max(
-                    0, self._image_bytes_total - int(cached_row["bytes"] or 0)
-                )
-            try:
-                cached_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._invalidate_image_cache_entry(
+                original_url=image_url,
+                policy_fingerprint=self.network_policy_version,
+                file_name=str(cached_row["file_name"]),
+            )
 
         for cached_path in sorted(self.image_dir.glob(f"image_{image_key}.*")):
             raster = self._validated_raster(cached_path)
@@ -1855,6 +1844,101 @@ class WdcWebClient:
         if extension is None or mime_type is None:
             return None
         return width, height, mime_type, extension
+
+    def _invalidate_image_cache_entry(
+        self,
+        *,
+        original_url: str,
+        policy_fingerprint: str,
+        file_name: str,
+    ) -> None:
+        """Remove a stale alias without deleting content used by valid aliases."""
+        digest_match = re.fullmatch(
+            r"image_([0-9a-f]{64})\.[A-Za-z0-9]+",
+            file_name,
+        )
+        lock_key = (
+            digest_match.group(1)
+            if digest_match is not None
+            else stable_hash(file_name, length=64)
+        )
+        content_lock = self._image_content_locks[
+            int(lock_key[:8], 16) % len(self._image_content_locks)
+        ]
+        path = self.image_dir / file_name
+        with content_lock:
+            raster = self._validated_raster(path)
+            actual_sha256 = (
+                self._sha256_path(path)
+                if raster is not None
+                else None
+            )
+            remove_file = False
+            removed_bytes = 0
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """
+                    SELECT sha256
+                    FROM image_cache
+                    WHERE original_url = ? AND policy_fingerprint = ?
+                      AND file_name = ?
+                    """,
+                    (original_url, policy_fingerprint, file_name),
+                ).fetchone()
+                if current is None:
+                    return
+                removed_bytes = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(bytes), 0)
+                        FROM image_cache
+                        WHERE file_name = ?
+                        """,
+                        (file_name,),
+                    ).fetchone()[0]
+                )
+                if actual_sha256 is None:
+                    connection.execute(
+                        "DELETE FROM image_cache WHERE file_name = ?",
+                        (file_name,),
+                    )
+                    remove_file = True
+                elif str(current["sha256"]) != actual_sha256:
+                    connection.execute(
+                        """
+                        DELETE FROM image_cache
+                        WHERE file_name = ? AND sha256 != ?
+                        """,
+                        (file_name, actual_sha256),
+                    )
+                    valid_references = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM image_cache
+                            WHERE file_name = ? AND sha256 = ?
+                            """,
+                            (file_name, actual_sha256),
+                        ).fetchone()[0]
+                    )
+                    remove_file = valid_references == 0
+                    if remove_file:
+                        connection.execute(
+                            "DELETE FROM image_cache WHERE file_name = ?",
+                            (file_name,),
+                        )
+                else:
+                    return
+            if remove_file:
+                try:
+                    path.unlink(missing_ok=True)
+                finally:
+                    with self._image_quota_lock:
+                        self._image_bytes_total = max(
+                            0,
+                            self._image_bytes_total - removed_bytes,
+                        )
 
     @staticmethod
     def _sha256_path(path: Path) -> str:

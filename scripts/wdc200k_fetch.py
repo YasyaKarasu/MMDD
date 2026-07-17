@@ -113,7 +113,18 @@ class PageOutcomeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
-            connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            journal_deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL").fetchone()
+                    break
+                except sqlite3.OperationalError as error:
+                    if (
+                        "locked" not in str(error).casefold()
+                        or time.monotonic() >= journal_deadline
+                    ):
+                        raise
+                    time.sleep(0.01)
             connection.execute("BEGIN IMMEDIATE")
             counts_existed = (
                 connection.execute(

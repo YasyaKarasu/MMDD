@@ -3,6 +3,8 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,13 +19,18 @@ from wdc200k_assets import (  # noqa: E402
     ImageBudget,
     build_unique_image_jobs,
     fetch_unique_images,
+    iter_entity_page_join,
     iter_image_outcomes,
     materialize_asset_shards,
     materialize_entity_assets,
     persist_entity_asset_plans,
     plan_entity_assets,
 )
-from wdc200k_fetch import FetchPolicy  # noqa: E402
+from wdc200k_fetch import (  # noqa: E402
+    FetchPolicy,
+    fetch_unique_pages,
+    iter_page_fanout,
+)
 from wdc200k_io import SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
@@ -354,6 +361,52 @@ def test_text_asset_records_are_exactly_equal_to_current_wdc_builder() -> None:
     assert actual == expected
 
 
+def test_multi_chunk_text_assets_are_exactly_equal_to_current_wdc_builder() -> None:
+    current_entity = entity("e1")
+    current_page = page(
+        text="\n\n".join(
+            (
+                f"section {index} e1 "
+                + chr(ord("a") + index) * 390
+            )
+            for index in range(7)
+        )
+    )
+
+    class LegacyClient:
+        def fetch_page(self, _page_url: str) -> dict:
+            return {
+                "final_url": current_page["final_url"],
+                "text": current_page["text"],
+                "image_urls": [],
+            }
+
+        def download_image(self, *_args, **_kwargs):
+            raise AssertionError("zero image budget must not download")
+
+    expected = legacy_wdc_builder.build_wdc_bridge_assets_for_entity(
+        current_entity,
+        LegacyClient(),
+        max_images_per_entity=0,
+        text_asset_chunk_chars=800,
+        min_text_asset_chunk_chars=120,
+        max_text_asset_chunks_per_entity=3,
+    )
+    actual = materialize_entity_assets(
+        current_entity,
+        current_page,
+        {},
+        ImageBudget(attempts_per_entity=0, retained_per_entity=0),
+        text_asset_chunk_chars=800,
+        min_text_asset_chunk_chars=120,
+        max_text_asset_chunks_per_entity=3,
+    ).bridge_assets
+
+    assert expected[0]["text_chunk_count"] > 3
+    assert len(expected) == 3
+    assert actual == expected
+
+
 def test_image_and_link_schemas_match_current_reader() -> None:
     image_url = "https://i.test/a.jpg"
     result = materialize_entity_assets(
@@ -429,6 +482,111 @@ def read_jsonl(paths: list[Path] | tuple[Path, ...]) -> list[dict]:
     return records
 
 
+class FakePageTransport:
+    network_policy_fingerprint = "page-v1"
+
+    def __init__(self, outcomes: dict[str, dict | BaseException]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[str] = []
+
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        deadline_seconds: float,
+        max_retries: int,
+    ) -> dict | None:
+        assert deadline_seconds > 0
+        assert max_retries == 0
+        self.calls.append(url)
+        outcome = self.outcomes[url]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return {
+            "page_url": url,
+            "final_url": url,
+            "text": str(outcome.get("text") or ""),
+            "image_urls": list(outcome.get("image_urls") or []),
+        }
+
+
+def test_disk_join_streams_task3_entities_with_task4_page_fanout(
+    tmp_path: Path,
+) -> None:
+    successful = entity("success")
+    terminal = entity("terminal")
+    missing = entity("missing")
+    entity_path = tmp_path / "entities.jsonl"
+    entity_path.write_text(
+        "".join(
+            json.dumps(record, sort_keys=True) + "\n"
+            for record in (successful, terminal, missing)
+        ),
+        encoding="utf-8",
+    )
+    transport = FakePageTransport(
+        {
+            successful["page_url"]: {
+                "text": "durable page",
+                "image_urls": ["https://i.test/page.jpg"],
+            },
+            terminal["page_url"]: TimeoutError("timed out"),
+        }
+    )
+    fetched = fetch_unique_pages(
+        [
+            {
+                "entity_id": current["entity_id"],
+                "source_table_id": "st1",
+                "row_id": 7,
+                "page_url": current["page_url"],
+                "url_key": hashlib.sha256(
+                    current["page_url"].encode("utf-8")
+                ).hexdigest(),
+            }
+            for current in (successful, terminal)
+        ],
+        SqliteJobStore(tmp_path / "page-jobs.sqlite3"),
+        transport,
+        FetchPolicy(
+            retries=0,
+            global_concurrency=1,
+            per_host_concurrency=1,
+            network_policy_fingerprint="page-v1",
+        ),
+    )
+
+    joined = list(
+        iter_entity_page_join(
+            [entity_path],
+            iter_page_fanout(
+                fetched.outcomes_path,
+                fetched.policy_fingerprint,
+            ),
+            join_path=tmp_path / "entity-page-join.sqlite3",
+            commit_every=1,
+        )
+    )
+
+    assert sorted(transport.calls) == sorted(
+        [successful["page_url"], terminal["page_url"]]
+    )
+    assert [record["entity_id"] for record, _page in joined] == [
+        "success",
+        "terminal",
+        "missing",
+    ]
+    assert joined[0][1]["status"] == "success"
+    assert joined[0][1]["text"] == "durable page"
+    assert joined[1][1]["status"] == "terminal"
+    assert joined[1][1]["error_class"] == "TimeoutError"
+    assert joined[2][1] is None
+    with sqlite3.connect(tmp_path / "entity-page-join.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM entity_pages"
+        ).fetchone() == (2,)
+
+
 def test_zero_attempt_and_zero_retained_budgets_are_independent() -> None:
     image_url = "https://i.test/a.jpg"
     assert (
@@ -501,6 +659,8 @@ def test_planning_persists_all_mappings_before_global_dedup_and_resumes(
         chunk_records=2,
     )
     assert completed.records == 8
+    assert completed.complete is True
+    assert completed.manifest_path.is_file()
     unique = read_jsonl([unique_path])
     assert len(
         {
@@ -508,6 +668,33 @@ def test_planning_persists_all_mappings_before_global_dedup_and_resumes(
             for record in unique
         }
     ) == 8
+
+    mtime = unique_path.stat().st_mtime_ns
+    resumed_unique = build_unique_image_jobs(
+        planned,
+        unique_path,
+        chunk_records=2,
+    )
+    assert resumed_unique == completed
+    assert unique_path.stat().st_mtime_ns == mtime
+
+
+def test_unique_image_job_stage_rejects_corruption_and_parameter_change(
+    tmp_path: Path,
+) -> None:
+    planned = persist_entity_asset_plans(
+        [(entity(image_urls=["https://i.test/a.jpg"]), page())],
+        output_root=tmp_path / "plans",
+        input_fingerprint="entities-v1",
+    )
+    unique_path = tmp_path / "unique" / "images.jsonl"
+    build_unique_image_jobs(planned, unique_path, chunk_records=2)
+    unique_path.write_text('{"corrupt":true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checksum"):
+        build_unique_image_jobs(planned, unique_path, chunk_records=2)
+    with pytest.raises(ValueError, match="fingerprint"):
+        build_unique_image_jobs(planned, unique_path, chunk_records=3)
 
 
 def test_plan_resume_rejects_a_corrupt_mapping_shard(
@@ -595,21 +782,18 @@ class FakeImageTransport:
         return success
 
 
-def write_unique_jobs(path: Path, urls: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(
-            json.dumps(
-                plan_entity_assets(
-                    entity(f"e{index}", image_urls=[url]),
-                    page(),
-                ).image_refs[0].as_record()
-            )
-            + "\n"
+def write_unique_jobs(path: Path, urls: list[str]):
+    planned = persist_entity_asset_plans(
+        [
+            (entity(f"e{index}", image_urls=[url]), page())
             for index, url in enumerate(urls)
-        ),
-        encoding="utf-8",
+        ],
+        output_root=path.parent / f"{path.stem}-plans",
+        input_fingerprint=hashlib.sha256(
+            "\n".join(urls).encode("utf-8")
+        ).hexdigest(),
     )
+    return build_unique_image_jobs(planned, path, chunk_records=17)
 
 
 def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
@@ -621,7 +805,10 @@ def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
         "https://i.test/other.jpg",
     ]
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, list(dict.fromkeys(urls)))
+    unique_jobs = write_unique_jobs(
+        unique_path,
+        list(dict.fromkeys(urls)),
+    )
     transport = FakeImageTransport(
         tmp_path,
         {
@@ -637,7 +824,7 @@ def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
     )
 
     result = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         transport,
         policy,
@@ -700,7 +887,7 @@ def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
 
     urls = ["https://i.test/a.png", "https://i.test/b.png"]
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, urls)
+    unique_jobs = write_unique_jobs(unique_path, urls)
     session = RasterSession()
     client = WdcWebClient(
         tmp_path / "web",
@@ -719,7 +906,7 @@ def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
     )
 
     fetched = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         client,
         policy,
@@ -749,7 +936,7 @@ def test_terminal_image_outcome_is_not_replayed_on_resume(
 ) -> None:
     image_url = "https://i.test/broken.jpg"
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, [image_url])
+    unique_jobs = write_unique_jobs(unique_path, [image_url])
     transport = FakeImageTransport(
         tmp_path,
         {image_url: TimeoutError()},
@@ -763,7 +950,7 @@ def test_terminal_image_outcome_is_not_replayed_on_resume(
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
 
     first = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         store,
         transport,
         policy,
@@ -771,7 +958,7 @@ def test_terminal_image_outcome_is_not_replayed_on_resume(
         image_dir=tmp_path / "content",
     )
     second = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         store,
         transport,
         policy,
@@ -788,7 +975,7 @@ def test_image_outcome_stream_detects_payload_checksum_corruption(
 ) -> None:
     image_url = "https://i.test/broken.jpg"
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, [image_url])
+    unique_jobs = write_unique_jobs(unique_path, [image_url])
     policy = FetchPolicy(
         network_policy_fingerprint="image-v1",
         policy_version="wdc200k-image-v1",
@@ -796,7 +983,7 @@ def test_image_outcome_stream_detects_payload_checksum_corruption(
         per_host_concurrency=1,
     )
     fetched = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         FakeImageTransport(tmp_path, {image_url: TimeoutError()}),
         policy,
@@ -825,7 +1012,7 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
 ) -> None:
     image_url = "https://i.test/durable.jpg"
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, [image_url])
+    unique_jobs = write_unique_jobs(unique_path, [image_url])
     transport = FakeImageTransport(tmp_path, {image_url: "unique"})
     policy = FetchPolicy(
         network_policy_fingerprint="image-v1",
@@ -837,7 +1024,7 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         fetch_unique_images(
-            [unique_path],
+            unique_jobs,
             store,
             transport,
             policy,
@@ -850,7 +1037,7 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
         )
 
     resumed = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         store,
         transport,
         policy,
@@ -859,6 +1046,173 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
     )
     assert resumed.success == 1
     assert transport.calls == [image_url]
+
+
+def test_live_foreign_lease_reports_incomplete_then_repairs_from_cache(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/leased.jpg"
+    unique_path = tmp_path / "unique.jsonl"
+    unique_jobs = write_unique_jobs(unique_path, [image_url])
+    transport = FakeImageTransport(tmp_path, {image_url: "unique"})
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        fetch_unique_images(
+            unique_jobs,
+            store,
+            transport,
+            policy,
+            outcomes_path=tmp_path / "outcomes.sqlite3",
+            image_dir=tmp_path / "content",
+            lease_seconds=60,
+            after_cache_write=lambda _outcome: (
+                _ for _ in ()
+            ).throw(RuntimeError("simulated crash")),
+        )
+
+    concurrent = fetch_unique_images(
+        unique_jobs,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+    assert concurrent.complete is False
+    assert concurrent.leased == 1
+    assert concurrent.remaining == 1
+    assert transport.calls == [image_url]
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET lease_expires = 0 WHERE kind = ?",
+            (concurrent.job_kind,),
+        )
+    repaired = fetch_unique_images(
+        unique_jobs,
+        store,
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+    assert repaired.complete is True
+    assert transport.calls == [image_url]
+
+
+class TrackingTerminalTransport:
+    network_policy_fingerprint = "image-v1"
+    max_retries = 0
+    max_response_seconds = 8.0
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active = 0
+        self.maximum_active = 0
+        self.active_by_host: dict[str, int] = {}
+        self.maximum_by_host: dict[str, int] = {}
+        self.calls = 0
+        self.cache: dict[str, dict] = {}
+
+    def cached_image_outcome(self, image_url: str) -> dict | None:
+        return self.cache.get(image_url)
+
+    def download_image(self, image_url: str, **_kwargs) -> None:
+        host = image_url.split("/", 3)[2]
+        with self.lock:
+            self.calls += 1
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            active = self.active_by_host.get(host, 0) + 1
+            self.active_by_host[host] = active
+            self.maximum_by_host[host] = max(
+                self.maximum_by_host.get(host, 0),
+                active,
+            )
+        time.sleep(0.002)
+        with self.lock:
+            self.active -= 1
+            self.active_by_host[host] -= 1
+            self.cache[image_url] = {
+                "status": "terminal",
+                "image_url": image_url,
+                "error_class": "not_an_image",
+                "policy_fingerprint": self.network_policy_fingerprint,
+            }
+        return None
+
+
+def test_image_scheduler_releases_host_state_for_many_unique_hosts(
+    tmp_path: Path,
+) -> None:
+    urls = [
+        f"https://h{index}.test/image.png"
+        for index in range(2_000)
+    ]
+    unique_path = tmp_path / "unique.jsonl"
+    unique_jobs = write_unique_jobs(unique_path, urls)
+    transport = TrackingTerminalTransport()
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=8,
+        per_host_concurrency=2,
+    )
+
+    fetched = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+        claim_buffer=32,
+    )
+
+    assert fetched.maximum_claimed <= 32
+    assert fetched.maximum_inflight <= 8
+    assert fetched.maximum_host_states <= 32
+    assert transport.calls == len(urls)
+
+
+def test_image_scheduler_enforces_global_and_per_host_limits(
+    tmp_path: Path,
+) -> None:
+    urls = [
+        f"https://h{index % 3}.test/{index}.png"
+        for index in range(90)
+    ]
+    unique_path = tmp_path / "unique.jsonl"
+    unique_jobs = write_unique_jobs(unique_path, urls)
+    transport = TrackingTerminalTransport()
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=6,
+        per_host_concurrency=2,
+    )
+
+    fetched = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+        claim_buffer=24,
+    )
+
+    assert transport.maximum_active == 6
+    assert max(transport.maximum_by_host.values()) == 2
+    assert fetched.maximum_inflight == 6
+    assert fetched.maximum_claimed <= 24
 
 
 def test_two_entity_fanout_keeps_two_links_after_one_shared_request(
@@ -870,7 +1224,7 @@ def test_two_entity_fanout_keeps_two_links_after_one_shared_request(
         entity("e2", image_urls=[shared]),
     ]
     unique_path = tmp_path / "unique.jsonl"
-    write_unique_jobs(unique_path, [shared])
+    unique_jobs = write_unique_jobs(unique_path, [shared])
     transport = FakeImageTransport(tmp_path, {shared: "shared"})
     policy = FetchPolicy(
         network_policy_fingerprint="image-v1",
@@ -879,7 +1233,7 @@ def test_two_entity_fanout_keeps_two_links_after_one_shared_request(
         per_host_concurrency=1,
     )
     fetched = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         transport,
         policy,
@@ -933,7 +1287,11 @@ def test_materialization_streams_canonical_shards_and_resumes(
         records_per_shard=1,
     )
     unique_path = tmp_path / "unique.jsonl"
-    build_unique_image_jobs(planned, unique_path, chunk_records=1)
+    unique_jobs = build_unique_image_jobs(
+        planned,
+        unique_path,
+        chunk_records=1,
+    )
     policy = FetchPolicy(
         network_policy_fingerprint="image-v1",
         policy_version="wdc200k-image-v1",
@@ -941,7 +1299,7 @@ def test_materialization_streams_canonical_shards_and_resumes(
         per_host_concurrency=1,
     )
     fetched = fetch_unique_images(
-        [unique_path],
+        unique_jobs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         FakeImageTransport(tmp_path, {shared: "shared"}),
         policy,
@@ -951,8 +1309,7 @@ def test_materialization_streams_canonical_shards_and_resumes(
 
     materialized = materialize_asset_shards(
         planned,
-        outcomes_path=fetched.outcomes_path,
-        policy_fingerprint=fetched.policy_fingerprint,
+        fetch_result=fetched,
         output_root=tmp_path / "materialized",
         input_fingerprint="assets-v1",
         records_per_shard=1,
@@ -984,11 +1341,71 @@ def test_materialization_streams_canonical_shards_and_resumes(
     }
     resumed = materialize_asset_shards(
         planned,
-        outcomes_path=fetched.outcomes_path,
-        policy_fingerprint=fetched.policy_fingerprint,
+        fetch_result=fetched,
         output_root=tmp_path / "materialized",
         input_fingerprint="assets-v1",
         records_per_shard=1,
     )
     assert resumed == materialized
     assert {path: path.stat().st_mtime_ns for path in mtimes} == mtimes
+
+    with pytest.raises(ValueError, match="complete"):
+        materialize_asset_shards(
+            planned,
+            fetch_result=replace(fetched, complete=False),
+            output_root=tmp_path / "materialized",
+            input_fingerprint="assets-v1",
+            records_per_shard=1,
+        )
+
+    forged_outcomes_path = tmp_path / "forged-outcomes.sqlite3"
+    with (
+        sqlite3.connect(fetched.outcomes_path) as source,
+        sqlite3.connect(forged_outcomes_path) as target,
+    ):
+        source.backup(target)
+    with pytest.raises(ValueError, match="outcome path"):
+        materialize_asset_shards(
+            planned,
+            fetch_result=replace(
+                fetched,
+                outcomes_path=forged_outcomes_path,
+            ),
+            output_root=tmp_path / "materialized",
+            input_fingerprint="assets-v1",
+            records_per_shard=1,
+        )
+
+    with sqlite3.connect(fetched.outcomes_path) as connection:
+        payload = json.dumps(
+            {
+                "status": "terminal",
+                "image_url": "https://i.test/unplanned.jpg",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            """
+            INSERT INTO image_outcomes (
+                policy_fingerprint, url_key, image_url, status,
+                outcome_json, payload_sha256, updated_at
+            ) VALUES (?, ?, ?, 'terminal', ?, ?, 0)
+            """,
+            (
+                fetched.policy_fingerprint,
+                "f" * 64,
+                "https://i.test/unplanned.jpg",
+                payload,
+                hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="outcome"):
+        materialize_asset_shards(
+            planned,
+            fetch_result=fetched,
+            output_root=tmp_path / "materialized",
+            input_fingerprint="assets-v1",
+            records_per_shard=1,
+        )

@@ -29,6 +29,8 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        StageFingerprint,
+        StageManifest,
         SqliteJobStore,
         external_unique_jsonl,
         validate_completed_shard,
@@ -59,6 +61,8 @@ except ModuleNotFoundError as error:
         io_helpers = importlib.import_module("wdc200k_io")
         AtomicJsonlShard = io_helpers.AtomicJsonlShard
         CompletedShard = io_helpers.CompletedShard
+        StageFingerprint = io_helpers.StageFingerprint
+        StageManifest = io_helpers.StageManifest
         SqliteJobStore = io_helpers.SqliteJobStore
         external_unique_jsonl = io_helpers.external_unique_jsonl
         validate_completed_shard = io_helpers.validate_completed_shard
@@ -67,6 +71,11 @@ except ModuleNotFoundError as error:
         )._normalize_http_url
     finally:
         sys.path.remove(scripts_directory)
+
+
+ASSET_PLANNING_SCHEMA_VERSION = "wdc200k-asset-planning-v1"
+UNIQUE_IMAGE_JOB_SCHEMA_VERSION = "wdc200k-unique-image-jobs-v1"
+ASSET_MATERIALIZATION_SCHEMA_VERSION = "wdc200k-asset-materialization-v1"
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,20 @@ class AssetPlanShards:
 
 
 @dataclass(frozen=True)
+class UniqueImageJobs:
+    output_path: Path
+    manifest_path: Path
+    completed_shard: CompletedShard
+    input_fingerprint: str
+    parameter_fingerprint: str
+    complete: bool = True
+
+    @property
+    def records(self) -> int:
+        return self.completed_shard.records
+
+
+@dataclass(frozen=True)
 class ImageFetchResult:
     unique: int
     success: int
@@ -141,6 +164,17 @@ class ImageFetchResult:
     policy_fingerprint: str
     maximum_inflight: int
     maximum_claimed: int
+    maximum_host_states: int
+    unique_jobs: UniqueImageJobs
+    job_store_path: Path
+    job_kind: str
+    fetch_manifest_path: Path
+    fetch_manifest_sha256: str
+    outcome_digest: str
+    outcomes_count: int
+    outcome_url_key_digest: str
+    leased: int
+    remaining: int
 
 
 @dataclass(frozen=True)
@@ -305,6 +339,46 @@ class ImageOutcomeStore:
             ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
 
+    def snapshot(self, policy_fingerprint: str) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        key_digest = hashlib.sha256()
+        success = 0
+        terminal = 0
+        count = 0
+        connection = self._connect()
+        try:
+            for row in connection.execute(
+                """
+                SELECT url_key, status, outcome_json, payload_sha256
+                FROM image_outcomes
+                WHERE policy_fingerprint = ?
+                ORDER BY url_key
+                """,
+                (policy_fingerprint,),
+            ):
+                self._decode(row)
+                url_key = str(row["url_key"])
+                payload_sha256 = str(row["payload_sha256"])
+                digest.update(url_key.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(payload_sha256.encode("ascii"))
+                digest.update(b"\n")
+                key_digest.update(url_key.encode("utf-8"))
+                key_digest.update(b"\n")
+                status = str(row["status"])
+                success += int(status == "success")
+                terminal += int(status == "terminal")
+                count += 1
+        finally:
+            connection.close()
+        return {
+            "count": count,
+            "success": success,
+            "terminal": terminal,
+            "digest": digest.hexdigest(),
+            "url_key_digest": key_digest.hexdigest(),
+        }
+
 
 class _BoundedShardWriter:
     def __init__(
@@ -368,6 +442,16 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _atomic_json_if_changed(path: Path, payload: dict[str, Any]) -> None:
+    if path.exists():
+        try:
+            if json.loads(path.read_text(encoding="utf-8")) == payload:
+                return
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    _atomic_json(path, payload)
 
 
 def _relative_completed(
@@ -459,6 +543,95 @@ def _successful_page(page: dict[str, Any] | None) -> dict[str, Any] | None:
     if status not in {None, "success"}:
         return None
     return page
+
+
+def iter_entity_page_join(
+    entity_paths: Iterable[Path],
+    page_fanout: Iterable[dict[str, Any]],
+    *,
+    join_path: Path,
+    commit_every: int = 10_000,
+) -> Iterator[tuple[dict[str, Any], dict[str, Any] | None]]:
+    """Stream Task 3 entities joined to Task 4 fanout via bounded disk state."""
+    if commit_every <= 0:
+        raise ValueError("commit_every must be positive")
+    join_path = Path(join_path)
+    join_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(join_path, timeout=30.0)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DROP TABLE IF EXISTS entity_pages")
+        connection.execute(
+            """
+            CREATE TABLE entity_pages (
+                entity_id TEXT PRIMARY KEY,
+                page_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+        pending = 0
+        for page in page_fanout:
+            if not isinstance(page, dict):
+                raise ValueError("page fanout record must be an object")
+            entity_id = clean_text(page.get("entity_id"))
+            if not entity_id:
+                raise ValueError("page fanout record has no entity_id")
+            encoded = json.dumps(
+                page,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            existing = connection.execute(
+                """
+                SELECT page_json
+                FROM entity_pages
+                WHERE entity_id = ?
+                """,
+                (entity_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != encoded:
+                    raise ValueError(
+                        "conflicting page outcomes for one entity"
+                    )
+                continue
+            connection.execute(
+                """
+                INSERT INTO entity_pages (entity_id, page_json)
+                VALUES (?, ?)
+                """,
+                (entity_id, encoded),
+            )
+            pending += 1
+            if pending >= commit_every:
+                connection.commit()
+                pending = 0
+        connection.commit()
+
+        for current_entity in _iter_jsonl(entity_paths):
+            if not isinstance(current_entity, dict):
+                raise ValueError("entity shard record must be an object")
+            entity_id = clean_text(current_entity.get("entity_id"))
+            if not entity_id:
+                raise ValueError("entity shard record has no entity_id")
+            row = connection.execute(
+                """
+                SELECT page_json
+                FROM entity_pages
+                WHERE entity_id = ?
+                """,
+                (entity_id,),
+            ).fetchone()
+            page = None if row is None else json.loads(str(row[0]))
+            if page is not None and not isinstance(page, dict):
+                raise ValueError("corrupt entity page join record")
+            yield current_entity, page
+    finally:
+        connection.close()
 
 
 def plan_entity_assets(
@@ -630,16 +803,80 @@ def build_unique_image_jobs(
     *,
     chunk_records: int = 100_000,
     merge_fan_in: int = 64,
-) -> CompletedShard:
+) -> UniqueImageJobs:
     """Publish one image job per globally unique normalized URL."""
     resumed = _validated_planning_result(planned)
-    return external_unique_jsonl(
-        resumed.image_mapping_paths,
-        Path(output_path),
-        key_fn=lambda record: record["url_key"],
-        chunk_records=chunk_records,
-        merge_fan_in=merge_fan_in,
+    output_path = Path(output_path)
+    planning_manifest_sha256 = _sha256_file(resumed.manifest_path)
+    input_fingerprint = stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        planning_manifest_sha256,
+        length=40,
     )
+    parameter_fingerprint = stable_hash(
+        UNIQUE_IMAGE_JOB_SCHEMA_VERSION,
+        "normalize-http-url-v1",
+        "url-key-sha256-v1",
+        "first-record-per-url-key",
+        chunk_records,
+        merge_fan_in,
+        length=40,
+    )
+    manifest_path = output_path.with_suffix(
+        output_path.suffix + ".manifest.json"
+    )
+    manifest = StageManifest(
+        manifest_path,
+        StageFingerprint(
+            stage=UNIQUE_IMAGE_JOB_SCHEMA_VERSION,
+            input_fingerprint=input_fingerprint,
+            parameter_fingerprint=parameter_fingerprint,
+        ),
+    )
+    if manifest.complete:
+        if len(manifest.completed_shards) != 1:
+            raise ValueError("unique image job manifest has invalid shards")
+        completed = manifest.completed_shards[0]
+        if not validate_completed_shard(completed, output_path.parent):
+            raise ValueError("unique image job shard checksum validation failed")
+    else:
+        completed = external_unique_jsonl(
+            resumed.image_mapping_paths,
+            output_path,
+            key_fn=lambda record: record["url_key"],
+            chunk_records=chunk_records,
+            merge_fan_in=merge_fan_in,
+        )
+        manifest.record_shard(completed)
+        manifest.mark_complete()
+    return UniqueImageJobs(
+        output_path=output_path,
+        manifest_path=manifest_path,
+        completed_shard=completed,
+        input_fingerprint=input_fingerprint,
+        parameter_fingerprint=parameter_fingerprint,
+    )
+
+
+def _validated_unique_image_jobs(
+    jobs: UniqueImageJobs,
+) -> UniqueImageJobs:
+    manifest = StageManifest(
+        jobs.manifest_path,
+        StageFingerprint(
+            stage=UNIQUE_IMAGE_JOB_SCHEMA_VERSION,
+            input_fingerprint=jobs.input_fingerprint,
+            parameter_fingerprint=jobs.parameter_fingerprint,
+        ),
+    )
+    if not manifest.complete or len(manifest.completed_shards) != 1:
+        raise ValueError("unique image job stage is incomplete")
+    completed = manifest.completed_shards[0]
+    if completed != jobs.completed_shard:
+        raise ValueError("unique image job result does not match manifest")
+    if not validate_completed_shard(completed, jobs.output_path.parent):
+        raise ValueError("unique image job shard checksum validation failed")
+    return jobs
 
 
 def _validated_planning_result(
@@ -685,8 +922,17 @@ def _image_policy_fingerprint(policy: FetchPolicy) -> str:
     )
 
 
-def _image_kind(policy_fingerprint: str) -> str:
-    return f"wdc200k-image:{policy_fingerprint}"
+def _image_kind(
+    policy_fingerprint: str,
+    unique_jobs: UniqueImageJobs,
+) -> str:
+    job_set_fingerprint = stable_hash(
+        unique_jobs.input_fingerprint,
+        unique_jobs.parameter_fingerprint,
+        unique_jobs.completed_shard.sha256,
+        length=40,
+    )
+    return f"wdc200k-image:{policy_fingerprint}:{job_set_fingerprint}"
 
 
 def _enqueue_unique_images(
@@ -751,6 +997,47 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
                 (kind,),
             ).fetchone()[0]
         )
+
+
+def _job_snapshot(store: SqliteJobStore, kind: str) -> dict[str, int]:
+    with store._connect() as connection:
+        rows = {
+            str(row["status"]): int(row["count"])
+            for row in connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM jobs
+                WHERE kind = ?
+                GROUP BY status
+                """,
+                (kind,),
+            )
+        }
+    return {
+        "total": sum(rows.values()),
+        "success": rows.get("success", 0),
+        "terminal": rows.get("terminal", 0),
+        "pending": rows.get("pending", 0),
+        "retryable": rows.get("retryable", 0),
+        "leased": rows.get("leased", 0),
+    }
+
+
+def _unique_job_url_key_digest(jobs: UniqueImageJobs) -> str:
+    digest = hashlib.sha256()
+    count = 0
+    previous: str | None = None
+    for record in _iter_jsonl([jobs.output_path]):
+        url_key = str(record.get("url_key") or "")
+        if not url_key or (previous is not None and url_key <= previous):
+            raise ValueError("unique image jobs are not strictly ordered")
+        digest.update(url_key.encode("utf-8"))
+        digest.update(b"\n")
+        previous = url_key
+        count += 1
+    if count != jobs.records:
+        raise ValueError("unique image job record count mismatch")
+    return digest.hexdigest()
 
 
 _CONTENT_LOCKS = tuple(threading.Lock() for _ in range(128))
@@ -933,7 +1220,7 @@ def _fetch_image_job(
 
 
 def fetch_unique_images(
-    image_job_paths: Iterable[Path],
+    unique_jobs: UniqueImageJobs,
     store: SqliteJobStore,
     transport: Any,
     policy: FetchPolicy = FetchPolicy(
@@ -947,6 +1234,7 @@ def fetch_unique_images(
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
 ) -> ImageFetchResult:
     """Fetch globally unique image URLs with bounded fair durable jobs."""
+    unique_jobs = _validated_unique_image_jobs(unique_jobs)
     if policy.retries != 0:
         raise ValueError("image fetching permits exactly zero retries")
     transport_policy = getattr(
@@ -974,7 +1262,7 @@ def fetch_unique_images(
             "image transport deadline does not match FetchPolicy"
         )
     fingerprint = _image_policy_fingerprint(policy)
-    kind = _image_kind(fingerprint)
+    kind = _image_kind(fingerprint, unique_jobs)
     outcomes_path = Path(
         outcomes_path
         or store.path.with_name(
@@ -983,7 +1271,7 @@ def fetch_unique_images(
     )
     outcome_store = ImageOutcomeStore(outcomes_path)
     _enqueue_unique_images(
-        image_job_paths,
+        [unique_jobs.output_path],
         store=store,
         kind=kind,
         policy_fingerprint=fingerprint,
@@ -1010,6 +1298,7 @@ def fetch_unique_images(
     claimed_buffered = 0
     maximum_claimed = 0
     maximum_inflight = 0
+    maximum_host_states = 0
 
     def add_ready(host: str) -> None:
         if host_queues.get(host) and host not in ready_set:
@@ -1029,7 +1318,7 @@ def fetch_unique_images(
         )
 
     def claim_more() -> int:
-        nonlocal claimed_buffered, maximum_claimed
+        nonlocal claimed_buffered, maximum_claimed, maximum_host_states
         need = buffer_limit - claimed_buffered - len(futures)
         if need <= 0:
             return 0
@@ -1051,6 +1340,10 @@ def fetch_unique_images(
             host_queues.setdefault(host, deque()).append(job)
             claimed_buffered += 1
             add_ready(host)
+        maximum_host_states = max(
+            maximum_host_states,
+            len(host_queues),
+        )
         maximum_claimed = max(
             maximum_claimed,
             claimed_buffered + len(futures),
@@ -1068,6 +1361,11 @@ def fetch_unique_images(
             host = ready_hosts.popleft()
             ready_set.discard(host)
             queue = host_queues[host]
+            if not queue:
+                if active_by_host.get(host, 0) == 0:
+                    host_queues.pop(host, None)
+                rotations -= 1
+                continue
             if (
                 active_by_host.get(host, 0)
                 >= policy.per_host_concurrency
@@ -1111,7 +1409,11 @@ def fetch_unique_images(
                 active_by_host[host] -= 1
                 if active_by_host[host] == 0:
                     del active_by_host[host]
-                add_ready(host)
+                if host_queues.get(host):
+                    add_ready(host)
+                else:
+                    host_queues.pop(host, None)
+                    ready_set.discard(host)
                 outcome = future.result()
                 persisted = outcome_store.put(
                     fingerprint,
@@ -1133,16 +1435,76 @@ def fetch_unique_images(
                 )
             submit_ready(pool)
 
-    success, terminal = outcome_store.counts(fingerprint)
+    outcome_snapshot = outcome_store.snapshot(fingerprint)
+    success = int(outcome_snapshot["success"])
+    terminal = int(outcome_snapshot["terminal"])
+    job_snapshot = _job_snapshot(store, kind)
+    unique_key_digest = _unique_job_url_key_digest(unique_jobs)
+    complete = (
+        success + terminal == unique
+        and int(outcome_snapshot["count"]) == unique
+        and job_snapshot["success"] == success
+        and job_snapshot["terminal"] == terminal
+        and job_snapshot["total"] == unique
+        and job_snapshot["pending"] == 0
+        and job_snapshot["retryable"] == 0
+        and job_snapshot["leased"] == 0
+        and outcome_snapshot["url_key_digest"] == unique_key_digest
+    )
+    fetch_manifest_path = outcomes_path.with_suffix(
+        outcomes_path.suffix + ".fetch-manifest.json"
+    )
+    fetch_manifest = {
+        "stage": "wdc200k-image-fetch-v1",
+        "complete": complete,
+        "policy_fingerprint": fingerprint,
+        "unique_jobs": {
+            "manifest_sha256": _sha256_file(unique_jobs.manifest_path),
+            "input_fingerprint": unique_jobs.input_fingerprint,
+            "parameter_fingerprint": unique_jobs.parameter_fingerprint,
+            "path": unique_jobs.completed_shard.path,
+            "records": unique_jobs.records,
+            "bytes": unique_jobs.completed_shard.bytes,
+            "sha256": unique_jobs.completed_shard.sha256,
+            "url_key_digest": unique_key_digest,
+        },
+        "job_store": {
+            "kind": kind,
+            **job_snapshot,
+        },
+        "outcomes": {
+            "path": str(outcomes_path),
+            **outcome_snapshot,
+        },
+    }
+    _atomic_json_if_changed(fetch_manifest_path, fetch_manifest)
+    fetch_manifest_sha256 = _sha256_file(fetch_manifest_path)
     return ImageFetchResult(
         unique=unique,
         success=success,
         terminal=terminal,
-        complete=success + terminal == unique,
+        complete=complete,
         outcomes_path=outcomes_path,
         policy_fingerprint=fingerprint,
         maximum_inflight=maximum_inflight,
         maximum_claimed=maximum_claimed,
+        maximum_host_states=maximum_host_states,
+        unique_jobs=unique_jobs,
+        job_store_path=store.path,
+        job_kind=kind,
+        fetch_manifest_path=fetch_manifest_path,
+        fetch_manifest_sha256=fetch_manifest_sha256,
+        outcome_digest=str(outcome_snapshot["digest"]),
+        outcomes_count=int(outcome_snapshot["count"]),
+        outcome_url_key_digest=str(
+            outcome_snapshot["url_key_digest"]
+        ),
+        leased=job_snapshot["leased"],
+        remaining=(
+            job_snapshot["pending"]
+            + job_snapshot["retryable"]
+            + job_snapshot["leased"]
+        ),
     )
 
 
@@ -1382,11 +1744,113 @@ def _load_materialized_assets(
     )
 
 
+def _validate_complete_image_fetch(
+    result: ImageFetchResult,
+) -> dict[str, Any]:
+    if not result.complete:
+        raise ValueError("image fetch result is not complete")
+    unique_jobs = _validated_unique_image_jobs(result.unique_jobs)
+    if not result.fetch_manifest_path.is_file():
+        raise ValueError("image fetch manifest is missing")
+    actual_manifest_sha256 = _sha256_file(result.fetch_manifest_path)
+    if actual_manifest_sha256 != result.fetch_manifest_sha256:
+        raise ValueError("image fetch manifest checksum mismatch")
+    manifest = json.loads(
+        result.fetch_manifest_path.read_text(encoding="utf-8")
+    )
+    if (
+        manifest.get("stage") != "wdc200k-image-fetch-v1"
+        or manifest.get("complete") is not True
+        or manifest.get("policy_fingerprint")
+        != result.policy_fingerprint
+    ):
+        raise ValueError("image fetch manifest is not complete")
+
+    unique_manifest = manifest.get("unique_jobs") or {}
+    expected_unique = {
+        "manifest_sha256": _sha256_file(unique_jobs.manifest_path),
+        "input_fingerprint": unique_jobs.input_fingerprint,
+        "parameter_fingerprint": unique_jobs.parameter_fingerprint,
+        "path": unique_jobs.completed_shard.path,
+        "records": unique_jobs.records,
+        "bytes": unique_jobs.completed_shard.bytes,
+        "sha256": unique_jobs.completed_shard.sha256,
+        "url_key_digest": _unique_job_url_key_digest(unique_jobs),
+    }
+    if unique_manifest != expected_unique:
+        raise ValueError("image fetch unique-job fingerprint mismatch")
+
+    expected_outcomes = manifest.get("outcomes") or {}
+    manifest_outcomes_path = Path(
+        str(expected_outcomes.get("path") or "")
+    )
+    if manifest_outcomes_path.resolve() != result.outcomes_path.resolve():
+        raise ValueError("image fetch outcome path mismatch")
+    if not result.outcomes_path.is_file():
+        raise ValueError("image fetch outcome store is missing")
+    outcome_store = ImageOutcomeStore(result.outcomes_path)
+    outcome_snapshot = outcome_store.snapshot(result.policy_fingerprint)
+    if (
+        int(outcome_snapshot["count"]) != result.outcomes_count
+        or str(outcome_snapshot["digest"]) != result.outcome_digest
+        or str(outcome_snapshot["url_key_digest"])
+        != result.outcome_url_key_digest
+        or int(outcome_snapshot["success"]) != result.success
+        or int(outcome_snapshot["terminal"]) != result.terminal
+        or {
+            key: expected_outcomes.get(key)
+            for key in (
+                "count",
+                "success",
+                "terminal",
+                "digest",
+                "url_key_digest",
+            )
+        }
+        != outcome_snapshot
+    ):
+        raise ValueError("image fetch outcome digest/count mismatch")
+    if (
+        outcome_snapshot["url_key_digest"]
+        != expected_unique["url_key_digest"]
+    ):
+        raise ValueError("image fetch outcome job set mismatch")
+
+    if not result.job_store_path.is_file():
+        raise ValueError("image fetch durable job store is missing")
+    job_snapshot = _job_snapshot(
+        SqliteJobStore(result.job_store_path),
+        result.job_kind,
+    )
+    expected_jobs = manifest.get("job_store") or {}
+    if (
+        result.job_kind != expected_jobs.get("kind")
+        or {
+            key: expected_jobs.get(key)
+            for key in job_snapshot
+        }
+        != job_snapshot
+        or job_snapshot["total"] != unique_jobs.records
+        or job_snapshot["success"] != result.success
+        or job_snapshot["terminal"] != result.terminal
+        or any(
+            job_snapshot[key]
+            for key in ("pending", "retryable", "leased")
+        )
+    ):
+        raise ValueError("image fetch durable job set is incomplete")
+    return {
+        "manifest_sha256": actual_manifest_sha256,
+        "unique_jobs": expected_unique,
+        "outcomes": outcome_snapshot,
+        "job_store": job_snapshot,
+    }
+
+
 def materialize_asset_shards(
     planned: AssetPlanShards,
     *,
-    outcomes_path: Path,
-    policy_fingerprint: str,
+    fetch_result: ImageFetchResult,
     output_root: Path,
     input_fingerprint: str,
     budget: ImageBudget = ImageBudget(),
@@ -1396,16 +1860,47 @@ def materialize_asset_shards(
     records_per_shard: int = 10_000,
 ) -> MaterializedAssetShards:
     """Stream canonical bridge assets and source-table links into shards."""
-    if not input_fingerprint or not policy_fingerprint:
+    if not input_fingerprint:
         raise ValueError("materialization fingerprints must not be empty")
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be positive")
     planned = _validated_planning_result(planned)
+    planning_manifest_sha256 = _sha256_file(planned.manifest_path)
+    expected_unique_input = stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        planning_manifest_sha256,
+        length=40,
+    )
+    if fetch_result.unique_jobs.input_fingerprint != expected_unique_input:
+        raise ValueError(
+            "image fetch jobs do not belong to this asset planning manifest"
+        )
+    fetch_snapshot = _validate_complete_image_fetch(fetch_result)
     output_root = Path(output_root)
     manifest_path = output_root / "asset-materialization-manifest.json"
     expected = {
         "input_fingerprint": input_fingerprint,
-        "image_policy_fingerprint": policy_fingerprint,
+        "schema_version": ASSET_MATERIALIZATION_SCHEMA_VERSION,
+        "planning_manifest_sha256": planning_manifest_sha256,
+        "unique_job_manifest_sha256": (
+            fetch_snapshot["unique_jobs"]["manifest_sha256"]
+        ),
+        "unique_job_sha256": (
+            fetch_snapshot["unique_jobs"]["sha256"]
+        ),
+        "image_fetch_manifest_sha256": (
+            fetch_snapshot["manifest_sha256"]
+        ),
+        "image_policy_fingerprint": fetch_result.policy_fingerprint,
+        "image_outcome_digest": (
+            fetch_snapshot["outcomes"]["digest"]
+        ),
+        "image_outcome_count": (
+            fetch_snapshot["outcomes"]["count"]
+        ),
+        "image_outcome_url_key_digest": (
+            fetch_snapshot["outcomes"]["url_key_digest"]
+        ),
         "attempts_per_entity": budget.attempts_per_entity,
         "retained_per_entity": budget.retained_per_entity,
         "text_asset_chunk_chars": int(text_asset_chunk_chars),
@@ -1425,7 +1920,7 @@ def materialize_asset_shards(
     if resumed is not None:
         return resumed
 
-    outcome_store = ImageOutcomeStore(Path(outcomes_path))
+    outcome_store = ImageOutcomeStore(fetch_result.outcomes_path)
     asset_writer = _BoundedShardWriter(
         output_root / "bridge_assets",
         records_per_shard,
@@ -1448,7 +1943,7 @@ def materialize_asset_shards(
                 for reference in entity_plan.image_refs
                 if (
                     outcome := outcome_store.get(
-                        policy_fingerprint,
+                        fetch_result.policy_fingerprint,
                         reference.url_key,
                     )
                 )

@@ -1319,6 +1319,176 @@ def test_concurrent_different_urls_with_same_content_share_one_file(
         ).fetchone() == (2,)
 
 
+def test_bad_alias_sha_does_not_remove_valid_shared_content_reference(
+    tmp_path,
+):
+    shared_body = png_bytes(color=(10, 20, 30))
+    replacement_body = png_bytes(color=(200, 30, 40))
+    first_url = "https://cdn.test/alias-a.png"
+    second_url = "https://cdn.test/alias-b.png"
+    for policy, image_url in (
+        ("image-v1", first_url),
+        ("image-v2", second_url),
+    ):
+        client = WdcWebClient(
+            tmp_path,
+            session=FakeSession(
+                [
+                    FakeResponse(
+                        shared_body,
+                        headers={"Content-Type": "image/png"},
+                    )
+                ]
+            ),
+            host_delay=0,
+            max_retries=0,
+            network_policy_version=policy,
+        )
+        assert client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=policy,
+        ) is not None
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        connection.execute(
+            """
+            UPDATE image_cache SET sha256 = ?
+            WHERE original_url = ? AND policy_fingerprint = 'image-v1'
+            """,
+            ("0" * 64, first_url),
+        )
+
+    repairing = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                )
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+        network_policy_version="image-v1",
+    )
+    repaired = repairing.download_image(
+        first_url,
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="repaired",
+    )
+    valid_alias = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        max_retries=0,
+        network_policy_version="image-v2",
+    ).cached_image_outcome(second_url)
+
+    assert repaired is not None
+    assert repaired["sha256"] == hashlib.sha256(
+        replacement_body
+    ).hexdigest()
+    assert valid_alias is not None
+    assert valid_alias["sha256"] == hashlib.sha256(shared_body).hexdigest()
+    assert Path(valid_alias["file_name"]).name != repaired["file_name"]
+    assert repairing._image_bytes_total == (
+        len(shared_body) + len(replacement_body)
+    )
+
+
+def test_corrupt_shared_file_invalidates_all_aliases_and_debits_once(
+    tmp_path,
+):
+    shared_body = png_bytes(color=(10, 20, 30))
+    unique_body = png_bytes(color=(40, 50, 60))
+    replacement_body = png_bytes(color=(70, 80, 90))
+    urls = [
+        "https://cdn.test/shared-a.png",
+        "https://cdn.test/shared-b.png",
+        "https://cdn.test/unique.png",
+    ]
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    shared_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    shared_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    unique_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+    )
+    records = [
+        client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=image_url,
+        )
+        for image_url in urls
+    ]
+    assert all(record is not None for record in records)
+    Path(records[0]["local_path"]).write_bytes(b"corrupt")
+
+    repairing = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+    )
+    first = repairing.download_image(
+        urls[0],
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="a",
+    )
+    second = repairing.download_image(
+        urls[1],
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="b",
+    )
+
+    assert first is not None and second is not None
+    assert first["local_path"] == second["local_path"]
+    assert repairing._image_bytes_total == (
+        len(unique_body) + len(replacement_body)
+    )
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT original_url, file_name
+            FROM image_cache ORDER BY original_url
+            """
+        ).fetchall()
+    assert len(rows) == 3
+    assert len({row[1] for row in rows}) == 2
+
+
 def test_download_image_same_url_singleflight_keeps_file_index_and_records_consistent(
     tmp_path,
     monkeypatch,
