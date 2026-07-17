@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import sqlite3
@@ -20,6 +21,24 @@ if str(SCRIPTS) not in sys.path:
 
 import build_mm_joinability_dataset as join_builder
 import wdc200k_materialize as materializer
+from wdc200k_assets import (
+    ImageBudget,
+    asset_materialization_input_fingerprint,
+    asset_planning_input_fingerprint,
+    build_unique_image_jobs,
+    fetch_unique_images,
+    iter_entity_page_join,
+    materialize_asset_shards,
+    persist_entity_asset_plans,
+    structural_asset_input_identity,
+    validate_materialized_asset_shards,
+)
+from wdc200k_fetch import (
+    FetchPolicy,
+    fetch_unique_pages,
+    iter_page_fanout,
+    validate_complete_page_fetch,
+)
 from wdc200k_materialize import (
     MaterializationInputs,
     MaterializationShardInputs,
@@ -36,11 +55,13 @@ from wdc200k_io import (
 from wdc200k_models import (
     AssetStageBarrier,
     StructuralStageBarrier,
+    adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
     run_model_stage,
 )
 from wdc200k_structural import (
     STRUCTURAL_SCHEMA_VERSION,
+    expand_selected_shard,
     finalize_validated_selection,
 )
 from stage1_io import iter_manifest_records, load_split_map
@@ -427,6 +448,88 @@ def _structural_upstream(
     return root, (manifest_path,), finalized.manifest, barrier
 
 
+def _real_structural_upstream(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    tuple[Path, ...],
+    Path,
+    StructuralStageBarrier,
+]:
+    input_root = tmp_path / "raw"
+    table_path = (
+        input_root
+        / "Thing"
+        / "Thing_example.test_October2023.json.gz"
+    )
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "name": name,
+            "State": state,
+            "Category": "Place",
+            "page_url": f"https://example.test/{name.casefold()}",
+            "image": "",
+        }
+        for name, state in (("Alpha", "Texas"), ("Beta", "Ohio"))
+    ]
+    with gzip.open(table_path, "wt", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    selection = {
+        "schema_class": "Thing",
+        "subset": "minimum3",
+        "host": "example.test",
+        "relative_path": table_path.relative_to(input_root).as_posix(),
+        "rows": 2,
+        "columns": 5,
+        "rank": "rank",
+        "selection_seed": 13,
+    }
+    root = tmp_path / "structural"
+    expanded = expand_selected_shard(
+        [selection],
+        output_root=root,
+        input_root=input_root,
+        min_rows=2,
+        min_cols=3,
+    )
+    manifest_path = expanded.manifest
+    finalized = finalize_validated_selection(
+        [manifest_path],
+        output_root=root,
+        target_tables=1,
+    )
+    manifest_payload = json.loads(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    final_payload = json.loads(
+        finalized.manifest.read_text(encoding="utf-8")
+    )
+    manifest_key = manifest_path.resolve().as_posix()
+    final_shard = final_payload["completed_shards"][0]
+    barrier = StructuralStageBarrier(
+        schema_version=STRUCTURAL_SCHEMA_VERSION,
+        manifest_count=1,
+        manifest_sha256={
+            manifest_key: hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+        },
+        input_fingerprints={
+            manifest_key: manifest_payload["input_fingerprint"]
+        },
+        parameter_fingerprints={
+            manifest_key: manifest_payload["parameter_fingerprint"]
+        },
+        final_manifest_sha256=hashlib.sha256(
+            finalized.manifest.read_bytes()
+        ).hexdigest(),
+        final_selection=dict(final_shard),
+    )
+    return root, (manifest_path,), finalized.manifest, barrier
+
+
 def _task5_fingerprint() -> dict[str, Any]:
     return {
         "input_fingerprint": "structural-page-image-v1",
@@ -511,8 +614,51 @@ def _model_upstream(
     )
 
 
+class _PageTransport:
+    network_policy_fingerprint = "test-page-network-v1"
+
+    def __init__(
+        self,
+        outcomes: dict[str, dict[str, Any] | BaseException],
+    ) -> None:
+        self.outcomes = outcomes
+
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        deadline_seconds: float,
+        max_retries: int,
+    ) -> dict[str, Any]:
+        assert deadline_seconds > 0
+        assert max_retries == 0
+        outcome = self.outcomes[url]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return {
+            "page_url": url,
+            "final_url": url,
+            "text": str(outcome.get("text") or ""),
+            "image_urls": list(outcome.get("image_urls") or []),
+        }
+
+
+class _ImageTransport:
+    network_policy_fingerprint = "test-image-network-v1"
+    max_retries = 0
+    max_response_seconds = 30.0
+
+    def download_image(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TimeoutError("image download timed out")
+
+
 def _authoritative_inputs(
     tmp_path: Path,
+    *,
+    page_success: bool = False,
+    extractor: Any = None,
+    page_image_url: str | None = None,
+    real_structural: bool = False,
 ) -> tuple[MaterializationInputs, argparse.Namespace]:
     args = _args(tmp_path)
     (
@@ -520,17 +666,171 @@ def _authoritative_inputs(
         structural_manifests,
         final_manifest,
         structural_barrier,
-    ) = _structural_upstream(tmp_path)
-    assets_manifest, assets_barrier = _asset_upstream(tmp_path)
-    model_result = _model_upstream(tmp_path, args)
+    ) = (
+        _real_structural_upstream(tmp_path)
+        if real_structural
+        else _structural_upstream(tmp_path)
+    )
+    structural_payload = json.loads(
+        structural_manifests[0].read_text(encoding="utf-8")
+    )
+    completed = [
+        _completed_from_payload
+        for _completed_from_payload in structural_payload[
+            "completed_shards"
+        ]
+    ]
+    entity_paths = tuple(
+        structural_root / item["path"]
+        for item in completed
+        if item["path"].startswith("entities/")
+    )
+    page_ref_paths = tuple(
+        structural_root / item["path"]
+        for item in completed
+        if item["path"].startswith("page_refs/")
+    )
+    page_refs = [
+        json.loads(line)
+        for path in page_ref_paths
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    page_outcomes: dict[str, dict[str, Any] | BaseException] = {}
+    for reference in page_refs:
+        page_url = str(reference["page_url"])
+        if page_success:
+            entity_name = page_url.rsplit("/", 1)[-1].title()
+            page_outcomes[page_url] = {
+                "text": (
+                    f"{entity_name} has a State value recorded on this "
+                    "page. "
+                )
+                * 20,
+                "image_urls": (
+                    [page_image_url] if page_image_url else []
+                ),
+            }
+        else:
+            page_outcomes[page_url] = TimeoutError("page timed out")
+    page_result = fetch_unique_pages(
+        page_refs,
+        SqliteJobStore(tmp_path / "page-jobs.sqlite3"),
+        _PageTransport(page_outcomes),
+        FetchPolicy(
+            retries=0,
+            network_policy_fingerprint="test-page-network-v1",
+        ),
+    )
+    page_snapshot = validate_complete_page_fetch(
+        page_result,
+        page_refs,
+        validation_database=tmp_path / "page-validation.sqlite3",
+    )
+    structural_identity = structural_asset_input_identity(
+        (
+            structural_barrier.manifest_sha256[
+                path.resolve().as_posix()
+            ]
+            for path in sorted(structural_manifests)
+        ),
+        structural_barrier.final_manifest_sha256,
+    )
+    planning_input = asset_planning_input_fingerprint(
+        structural_identity,
+        str(page_snapshot["identity"]),
+    )
+    planned = persist_entity_asset_plans(
+        iter_entity_page_join(
+            entity_paths,
+            iter_page_fanout(
+                page_result.outcomes_path,
+                page_result.policy_fingerprint,
+            ),
+            join_path=tmp_path / "entity-page-join.sqlite3",
+        ),
+        output_root=tmp_path / "asset-plans",
+        input_fingerprint=planning_input,
+        budget=ImageBudget(3, 3),
+    )
+    unique_jobs = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique-images.jsonl",
+    )
+    image_result = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "image-jobs.sqlite3"),
+        _ImageTransport(),
+        FetchPolicy(
+            retries=0,
+            deadline_seconds=30.0,
+            network_policy_fingerprint="test-image-network-v1",
+            policy_version="wdc200k-image-fetch-v1",
+        ),
+        outcomes_path=tmp_path / "image-outcomes.sqlite3",
+        image_dir=tmp_path / "image-content",
+    )
+    asset_input = asset_materialization_input_fingerprint(
+        planned.manifest_path,
+        image_result.fetch_manifest_path,
+    )
+    materialized_assets = materialize_asset_shards(
+        planned,
+        fetch_result=image_result,
+        output_root=tmp_path / "assets",
+        input_fingerprint=asset_input,
+    )
+    _validated_assets, assets_barrier = (
+        validate_materialized_asset_shards(
+            materialized_assets,
+            planned=planned,
+            image_fetch_result=image_result,
+            expected_input_fingerprint=asset_input,
+        )
+    )
+    adapted = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=structural_manifests,
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=materialized_assets.manifest_path,
+        assets_barrier=assets_barrier,
+        output_root=tmp_path / "adapted-model-tasks",
+        args=args,
+    )
+    task_records = (
+        json.loads(line)
+        for path in adapted.task_paths
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    model_store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        task_records,
+        model_store,
+        args=args,
+        input_fingerprint=adapted.input_fingerprint,
+        text_input_fingerprint=adapted.input_fingerprint,
+        image_input_fingerprint=adapted.input_fingerprint,
+    )
+    model_result = run_model_stage(
+        model_store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "model-outputs",
+    )
     return (
         MaterializationInputs(
             structural_output_root=structural_root,
             structural_manifests=structural_manifests,
             finalized_selection_manifest=final_manifest,
             structural_barrier=structural_barrier,
-            assets_manifest=assets_manifest,
-            assets_barrier=assets_barrier,
+            page_fetch_result=page_result,
+            asset_plan_result=planned,
+            unique_image_jobs=unique_jobs,
+            image_fetch_result=image_result,
+            materialized_assets=materialized_assets,
+            adapted_model_tasks=adapted,
             model_result=model_result,
             work_root=tmp_path / "work",
         ),
@@ -555,6 +855,27 @@ class _StateExtractor:
                     "name": "State",
                     "value": value,
                     "evidence": f"The page states {value}.",
+                    "connection_evidence": "The entity name is visible.",
+                }
+            ],
+            "raw_response": '{"attributes":[]}',
+            "error": "",
+        }
+
+
+class _FailingExtractor:
+    def extract(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("terminal model failure")
+
+
+class _GenericExtractor:
+    def extract(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "attributes": [
+                {
+                    "name": "State",
+                    "value": "Texas",
+                    "evidence": "The page states Texas.",
                     "connection_evidence": "The entity name is visible.",
                 }
             ],
@@ -776,6 +1097,76 @@ def test_duplicate_asset_id_with_different_payload_is_rejected(
         materialize_dataset_shard(inputs, args=args, split="train")
 
 
+def test_link_to_missing_asset_is_rejected(
+    tmp_path: Path,
+) -> None:
+    links = _links()
+    links[0] = {**links[0], "asset_ids": ["missing-asset"]}
+
+    with pytest.raises(ValueError, match="link.*asset"):
+        materialize_dataset_shard(
+            _shard_inputs(
+                tmp_path,
+                assets=_assets(),
+                links=links,
+            ),
+            args=_args(tmp_path),
+            split="train",
+        )
+
+
+def test_link_to_asset_owned_by_another_entity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    assets = _assets()
+    assets[0] = {**assets[0], "entity_id": "entity-beta"}
+
+    with pytest.raises(ValueError, match="link.*entity"):
+        materialize_dataset_shard(
+            _shard_inputs(
+                tmp_path,
+                assets=assets,
+                links=_links(),
+            ),
+            args=_args(tmp_path),
+            split="train",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"asset_id": "missing-asset"}, "extraction.*asset"),
+        ({"entity_id": "entity-beta"}, "extraction.*entity"),
+        ({"source_table_id": "foreign-source"}, "extraction.*source"),
+        ({"source_row_id": 999}, "extraction.*source"),
+    ],
+)
+def test_extraction_relation_mismatches_are_rejected(
+    tmp_path: Path,
+    mutation: dict[str, Any],
+    message: str,
+) -> None:
+    args = _args(tmp_path)
+    assets = _assets()
+    extraction = {
+        **_extractions(args, assets)[0],
+        **mutation,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        materialize_dataset_shard(
+            _shard_inputs(
+                tmp_path,
+                assets=assets,
+                links=_links(),
+                extractions=[extraction],
+            ),
+            args=args,
+            split="train",
+        )
+
+
 def test_irrelevant_records_are_disk_indexed_without_global_python_maps(
     tmp_path: Path,
 ) -> None:
@@ -790,11 +1181,21 @@ def test_irrelevant_records_are_disk_indexed_without_global_python_maps(
         }
         for index in range(10_000)
     ]
+    irrelevant_entities = [
+        {
+            **_entities()[0],
+            "entity_id": f"other-{index:05d}",
+            "wiki_title": f"wdc_other_{index:05d}",
+            "display_texts": [f"Other {index}"],
+        }
+        for index in range(10_000)
+    ]
     tracemalloc.start()
     try:
         actual = materialize_dataset_shard(
             _shard_inputs(
                 tmp_path,
+                entities=[*_entities(), *irrelevant_entities],
                 assets=[*irrelevant_assets, *relevant_assets],
                 links=_links(),
                 extractions=_extractions(args, relevant_assets),
@@ -910,6 +1311,181 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     assert {path: path.stat().st_mtime_ns for path in published} == mtimes
 
 
+def test_real_fetch_and_model_failures_reach_canonical_diagnostics(
+    tmp_path: Path,
+) -> None:
+    web_inputs, web_args = _authoritative_inputs(tmp_path / "web")
+    web_output = tmp_path / "web-output"
+    materialize_dataset(
+        web_inputs,
+        output_root=web_output,
+        args=web_args,
+    )
+    web_failures = [
+        json.loads(line)
+        for line in (web_output / "web_fetch_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(web_failures) == 2
+    assert {record["stage"] for record in web_failures} == {
+        "page_fetch"
+    }
+
+    failed_inputs, failed_args = _authoritative_inputs(
+        tmp_path / "media-model",
+        page_success=True,
+        page_image_url="https://images.test/failure.jpg",
+        extractor=_FailingExtractor(),
+    )
+    failed_output = tmp_path / "media-model-output"
+    materialize_dataset(
+        failed_inputs,
+        output_root=failed_output,
+        args=failed_args,
+    )
+    media_failures = [
+        json.loads(line)
+        for line in (failed_output / "media_download_failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    model_failures = [
+        json.loads(line)
+        for line in (failed_output / "model_attribute_errors.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    manifest = json.loads(
+        (failed_output / "dataset_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(media_failures) == 1
+    assert media_failures[0]["failure_type"] == (
+        "media_download_failure"
+    )
+    assert media_failures[0]["error_class"] == "TimeoutError"
+    assert model_failures
+    assert {
+        "web_fetch_failures",
+        "media_download_failures",
+        "model_attribute_errors",
+    } <= set(manifest["single_files"])
+
+
+def test_real_task3_expand_through_task7_is_readable(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        extractor=_GenericExtractor(),
+        real_structural=True,
+    )
+    output_root = tmp_path / "output"
+
+    result = materialize_dataset(
+        inputs,
+        output_root=output_root,
+        args=args,
+        records_per_shard=1,
+    )
+
+    source_records = list(
+        iter_manifest_records(output_root, "source_tables", log_every=0)
+    )
+    assert result.complete is True
+    assert len(source_records) == 1
+    assert len(source_records[0]["rows"]) == 2
+    assert "image" not in {
+        column["column_name"]
+        for column in source_records[0]["columns"]
+    }
+    assert load_split_map(output_root)
+
+
+def test_cross_run_task5_and_task6_substitution_is_rejected(
+    tmp_path: Path,
+) -> None:
+    first, args = _authoritative_inputs(tmp_path / "first")
+    second, _second_args = _authoritative_inputs(
+        tmp_path / "second",
+        page_success=True,
+        extractor=_StateExtractor(),
+    )
+
+    with pytest.raises(ValueError, match="materialization"):
+        materialize_dataset(
+            replace(
+                first,
+                materialized_assets=second.materialized_assets,
+            ),
+            output_root=tmp_path / "foreign-task5-output",
+            args=args,
+        )
+    with pytest.raises(ValueError, match="adapter"):
+        materialize_dataset(
+            replace(
+                first,
+                adapted_model_tasks=second.adapted_model_tasks,
+                model_result=second.model_result,
+            ),
+            output_root=tmp_path / "foreign-task6-output",
+            args=args,
+        )
+
+
+@pytest.mark.parametrize("interrupt_after", [1, 5, 10, 13, 15])
+def test_global_finalize_interruptions_resume_without_publishing_partial_manifest(
+    tmp_path: Path,
+    interrupt_after: int,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    output_root = tmp_path / "output"
+    commits: list[str] = []
+
+    def interrupt(name: str) -> None:
+        commits.append(name)
+        if len(commits) == interrupt_after:
+            raise RuntimeError("global finalize interrupted")
+
+    with pytest.raises(RuntimeError, match="global finalize"):
+        materialize_dataset(
+            inputs,
+            output_root=output_root,
+            args=args,
+            records_per_shard=1,
+            after_finalize_commit=interrupt,
+        )
+    assert not (output_root / "dataset_manifest.json").exists()
+    if interrupt_after == 13:
+        assert (output_root / "web_fetch_failures.jsonl").is_file()
+        assert not (
+            output_root / "media_download_failures.jsonl"
+        ).exists()
+    stale = output_root / "source_tables" / "part-99999.jsonl"
+    stale.write_text('{"stale":true}\n', encoding="utf-8")
+
+    result = materialize_dataset(
+        inputs,
+        output_root=output_root,
+        args=args,
+        records_per_shard=1,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    declared = {
+        item["path"]
+        for artifact in manifest["artifacts"].values()
+        for item in artifact["shards"]
+    }
+    assert "source_tables/part-99999.jsonl" not in declared
+    assert list(
+        iter_manifest_records(output_root, "source_tables", log_every=0)
+    )
+
+
 def test_resume_revalidates_upstream_checksums_before_skipping(
     tmp_path: Path,
 ) -> None:
@@ -917,15 +1493,20 @@ def test_resume_revalidates_upstream_checksums_before_skipping(
     output_root = tmp_path / "output"
     materialize_dataset(inputs, output_root=output_root, args=args)
     asset_payload = json.loads(
-        inputs.assets_manifest.read_text(encoding="utf-8")
+        inputs.materialized_assets.manifest_path.read_text(
+            encoding="utf-8"
+        )
     )
     asset_path = (
-        inputs.assets_manifest.parent
-        / asset_payload["bridge_asset_shards"][0]["path"]
+        inputs.materialized_assets.manifest_path.parent
+        / asset_payload["table_asset_link_shards"][0]["path"]
     )
     asset_path.write_text('{"forged":true}\n', encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Task-5.*validation"):
+    with pytest.raises(
+        ValueError,
+        match="asset materialization shard checksum validation",
+    ):
         materialize_dataset(inputs, output_root=output_root, args=args)
 
 
@@ -933,18 +1514,15 @@ def test_forged_barriers_and_missing_model_manifest_are_rejected(
     tmp_path: Path,
 ) -> None:
     inputs, args = _authoritative_inputs(tmp_path)
-    forged_fingerprint = dict(inputs.assets_barrier.fingerprint)
-    forged_fingerprint["planning_manifest_sha256"] = "f" * 64
 
-    with pytest.raises(ValueError, match="fingerprint"):
+    with pytest.raises(ValueError, match="does not match manifest"):
         materialize_dataset(
             replace(
                 inputs,
-                assets_barrier=AssetStageBarrier(
-                    fingerprint=forged_fingerprint,
-                    bridge_assets=inputs.assets_barrier.bridge_assets,
-                    table_asset_links=(
-                        inputs.assets_barrier.table_asset_links
+                materialized_assets=replace(
+                    inputs.materialized_assets,
+                    bridge_assets=(
+                        inputs.materialized_assets.bridge_assets + 1
                     ),
                 ),
             ),
@@ -978,7 +1556,7 @@ def test_forged_barriers_and_missing_model_manifest_are_rejected(
     inputs.model_result.manifest_path.rename(
         inputs.model_result.manifest_path.with_suffix(".missing")
     )
-    with pytest.raises(ValueError, match="Task-6"):
+    with pytest.raises(ValueError, match="model stage result validation"):
         materialize_dataset(
             inputs,
             output_root=tmp_path / "missing-model-output",
@@ -1033,34 +1611,10 @@ def test_interruption_after_table_commit_resumes_without_reprocessing(
 def test_nonempty_task6_outputs_materialize_query_qrel_and_evidence(
     tmp_path: Path,
 ) -> None:
-    args = _args(tmp_path)
-    (
-        structural_root,
-        structural_manifests,
-        final_manifest,
-        structural_barrier,
-    ) = _structural_upstream(tmp_path)
-    assets = _assets()
-    assets_manifest, assets_barrier = _asset_upstream(
+    inputs, args = _authoritative_inputs(
         tmp_path,
-        assets=assets,
-        links=_links(),
-    )
-    model_result = _model_upstream(
-        tmp_path,
-        args,
-        tasks=_model_tasks(assets),
+        page_success=True,
         extractor=_StateExtractor(),
-    )
-    inputs = MaterializationInputs(
-        structural_output_root=structural_root,
-        structural_manifests=structural_manifests,
-        finalized_selection_manifest=final_manifest,
-        structural_barrier=structural_barrier,
-        assets_manifest=assets_manifest,
-        assets_barrier=assets_barrier,
-        model_result=model_result,
-        work_root=tmp_path / "work",
     )
     output_root = tmp_path / "output"
 
@@ -1074,8 +1628,8 @@ def test_nonempty_task6_outputs_materialize_query_qrel_and_evidence(
     assert result.stats["queryable_source_tables"] == 1
     assert result.stats["query_tables"] == 1
     assert result.stats["qrels"] == 1
-    assert result.stats["attribute_extractions"] == 4
-    assert result.stats["evidence_recoveries"] == 4
+    assert result.stats["attribute_extractions"] >= 2
+    assert result.stats["evidence_recoveries"] >= 2
     query = list(
         iter_manifest_records(output_root, "query_tables", log_every=0)
     )

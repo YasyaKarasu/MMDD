@@ -2917,7 +2917,7 @@ def _strict_asset_manifest(
         _completed_from_payload(item)
         for item in payload.get("table_asset_link_shards", [])
     ]
-    if not asset_shards or not link_shards:
+    if not link_shards:
         raise ValueError("Task-5 manifest is missing required shards")
     if not all(
         validate_completed_shard(shard, root)
@@ -3096,12 +3096,10 @@ def adapt_model_tasks_from_manifests(
         Path(assets_manifest),
         barrier=assets_barrier,
     )
-    input_fingerprint = stable_hash(
-        MODEL_QUEUE_SCHEMA_VERSION,
-        *(digest for _path, digest in manifest_hashes),
-        _sha256_path(final_path),
-        _sha256_path(Path(assets_manifest)),
-        length=40,
+    input_fingerprint = model_adapter_input_fingerprint(
+        (digest for _path, digest in manifest_hashes),
+        finalized_selection_manifest=final_path,
+        assets_manifest=Path(assets_manifest),
     )
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -3288,6 +3286,156 @@ def adapt_model_tasks_from_manifests(
         tasks=task_count,
         errors=error_count,
     )
+
+
+def model_adapter_input_fingerprint(
+    structural_manifest_sha256: Iterable[str],
+    *,
+    finalized_selection_manifest: Path,
+    assets_manifest: Path,
+) -> str:
+    """Return the canonical Task-6 adapter identity formula."""
+    digests = tuple(str(value) for value in structural_manifest_sha256)
+    if not digests or any(
+        len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in digests
+    ):
+        raise ValueError("structural manifest digest set is invalid")
+    return stable_hash(
+        MODEL_QUEUE_SCHEMA_VERSION,
+        *digests,
+        _sha256_path(Path(finalized_selection_manifest)),
+        _sha256_path(Path(assets_manifest)),
+        length=40,
+    )
+
+
+def validate_adapted_model_tasks(
+    adapted: AdaptedModelTasks,
+    *,
+    expected_input_fingerprint: str,
+) -> AdaptedModelTasks:
+    """Validate the adapter manifest and every declared task/error shard."""
+    payload = _validated_complete_manifest(Path(adapted.manifest_path))
+    if (
+        payload.get("stage") != "wdc200k_model_task_adapter"
+        or payload.get("schema_version") != MODEL_QUEUE_SCHEMA_VERSION
+        or payload.get("input_fingerprint")
+        != expected_input_fingerprint
+    ):
+        raise ValueError("model adapter input identity mismatch")
+    try:
+        task_shards = tuple(
+            _completed_from_payload(item)
+            for item in payload.get("task_shards", [])
+        )
+        error_shards = tuple(
+            _completed_from_payload(item)
+            for item in payload.get("error_shards", [])
+        )
+        counts = payload["counts"]
+        expected_tasks = int(counts["tasks"])
+        expected_errors = int(counts["errors"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("model adapter manifest is invalid") from error
+    root = Path(adapted.output_root)
+    if (
+        expected_tasks < 0
+        or expected_errors < 0
+        or sum(item.records for item in task_shards) != expected_tasks
+        or sum(item.records for item in error_shards) != expected_errors
+        or not all(
+            validate_completed_shard(item, root)
+            for item in (*task_shards, *error_shards)
+        )
+    ):
+        raise ValueError("model adapter shard validation failed")
+    reconstructed = AdaptedModelTasks(
+        output_root=root,
+        task_paths=tuple(root / item.path for item in task_shards),
+        error_paths=tuple(root / item.path for item in error_shards),
+        manifest_path=Path(adapted.manifest_path),
+        input_fingerprint=expected_input_fingerprint,
+        tasks=expected_tasks,
+        errors=expected_errors,
+    )
+    if reconstructed != adapted:
+        raise ValueError("model adapter result does not match manifest")
+    return reconstructed
+
+
+def validate_model_stage_for_adapter(
+    result: ModelStageResult,
+    adapted: AdaptedModelTasks,
+    *,
+    args: argparse.Namespace,
+    validation_store_path: Path,
+) -> bool:
+    """Rebuild adapter membership and compare it to the durable model run."""
+    adapted = validate_adapted_model_tasks(
+        adapted,
+        expected_input_fingerprint=adapted.input_fingerprint,
+    )
+    if not validate_model_stage(result):
+        raise ValueError("model stage result validation failed")
+    expected = enqueue_model_tasks(
+        _iter_jsonl_paths(adapted.task_paths),
+        SqliteJobStore(Path(validation_store_path)),
+        args=args,
+        input_fingerprint=adapted.input_fingerprint,
+        text_input_fingerprint=adapted.input_fingerprint,
+        image_input_fingerprint=adapted.input_fingerprint,
+        prompt_version=result.jobset.prompt_version,
+    )
+    comparable_fields = (
+        "input_fingerprint",
+        "prompt_version",
+        "text_fingerprint",
+        "image_fingerprint",
+        "text_kind",
+        "image_kind",
+        "text_tasks",
+        "image_tasks",
+    )
+    if any(
+        getattr(expected, field) != getattr(result.jobset, field)
+        for field in comparable_fields
+    ):
+        raise ValueError("model stage does not belong to adapter task set")
+    for modality in ("text", "image"):
+        expected_fingerprint = expected.fingerprint_for(modality)
+        actual_fingerprint = result.jobset.fingerprint_for(modality)
+        with _connect(expected.database_path) as connection:
+            expected_row = connection.execute(
+                """
+                SELECT input_fingerprint, task_count, membership_digest,
+                       enqueue_complete
+                FROM model_jobsets WHERE fingerprint = ?
+                """,
+                (expected_fingerprint,),
+            ).fetchone()
+        with _connect(result.jobset.database_path) as connection:
+            actual_row = connection.execute(
+                """
+                SELECT input_fingerprint, task_count, membership_digest,
+                       enqueue_complete
+                FROM model_jobsets WHERE fingerprint = ?
+                """,
+                (actual_fingerprint,),
+            ).fetchone()
+        if (
+            expected_row is None
+            or actual_row is None
+            or str(expected_row["input_fingerprint"])
+            != adapted.input_fingerprint
+            or str(actual_row["input_fingerprint"])
+            != adapted.input_fingerprint
+            or tuple(expected_row) != tuple(actual_row)
+            or int(actual_row["enqueue_complete"]) != 1
+        ):
+            raise ValueError("model adapter membership digest mismatch")
+    return True
 
 
 def enqueue_model_tasks_from_manifest(

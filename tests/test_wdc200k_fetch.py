@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from wdc200k_fetch import (  # noqa: E402
     iter_finalized_page_refs,
     iter_page_fanout,
     iter_page_outcomes,
+    validate_complete_page_fetch,
 )
 from wdc200k_io import SqliteJobStore  # noqa: E402
 from wdc200k_io import AtomicJsonlShard  # noqa: E402
@@ -705,6 +706,75 @@ def test_failure_and_progress_snapshots_are_durable_and_sanitized(
     assert progress["terminal"] == 1
     assert progress["inflight"] == 0
     assert result.failure_path == tmp_path / "failures.jsonl"
+
+
+def test_complete_page_fetch_validator_binds_jobs_refs_and_snapshots(
+    tmp_path: Path,
+) -> None:
+    success_url = "https://e.test/success"
+    failure_url = "https://e.test/failure?secret=hidden"
+    refs = [
+        page_ref("e1", success_url),
+        page_ref("e2", failure_url),
+    ]
+    result = fetch_unique_pages(
+        refs,
+        SqliteJobStore(tmp_path / "pages.sqlite3"),
+        CountingTransport(
+            {
+                success_url: {
+                    "text": "page text",
+                    "image_urls": [],
+                },
+                failure_url: TimeoutError("private failure"),
+            }
+        ),
+        FetchPolicy(),
+    )
+
+    snapshot = validate_complete_page_fetch(
+        result,
+        refs,
+        validation_database=tmp_path / "validate.sqlite3",
+    )
+
+    assert snapshot["unique"] == 2
+    assert snapshot["success"] == 1
+    assert snapshot["terminal"] == 1
+    assert len(snapshot["identity"]) == 64
+    assert snapshot["failure_records"] == 1
+
+    with pytest.raises(ValueError, match="reference"):
+        validate_complete_page_fetch(
+            result,
+            refs[:1],
+            validation_database=tmp_path / "foreign.sqlite3",
+        )
+
+    with pytest.raises(ValueError, match="job store"):
+        validate_complete_page_fetch(
+            replace(
+                result,
+                job_store_path=tmp_path / "missing.sqlite3",
+            ),
+            refs,
+            validation_database=tmp_path / "missing-validate.sqlite3",
+        )
+
+    with sqlite3.connect(result.job_store_path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET payload_json = '{"forged":true}'
+            WHERE kind = ?
+            """,
+            (result.job_kind,),
+        )
+    with pytest.raises(ValueError, match="job store membership"):
+        validate_complete_page_fetch(
+            result,
+            refs,
+            validation_database=tmp_path / "forged-job.sqlite3",
+        )
 
 
 def test_wdc_client_exposes_read_only_cached_page_outcome(

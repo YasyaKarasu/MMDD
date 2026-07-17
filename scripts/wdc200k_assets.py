@@ -78,6 +78,55 @@ UNIQUE_IMAGE_JOB_SCHEMA_VERSION = "wdc200k-unique-image-jobs-v1"
 ASSET_MATERIALIZATION_SCHEMA_VERSION = "wdc200k-asset-materialization-v1"
 
 
+def structural_asset_input_identity(
+    structural_manifest_sha256: Iterable[str],
+    finalized_selection_manifest_sha256: str,
+) -> str:
+    """Collapse exact validated Task-3 artifacts into a Task-5 input ID."""
+    digests = tuple(str(value) for value in structural_manifest_sha256)
+    values = (*digests, str(finalized_selection_manifest_sha256))
+    if not digests or any(
+        len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in values
+    ):
+        raise ValueError("structural asset input digests are invalid")
+    return stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        *digests,
+        finalized_selection_manifest_sha256,
+        length=64,
+    )
+
+
+def asset_planning_input_fingerprint(
+    structural_identity: str,
+    page_fetch_identity: str,
+) -> str:
+    """Bind asset planning to exact validated Task-3 and Task-4 inputs."""
+    if not structural_identity or not page_fetch_identity:
+        raise ValueError("asset planning identities must not be empty")
+    return stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        structural_identity,
+        page_fetch_identity,
+        length=40,
+    )
+
+
+def asset_materialization_input_fingerprint(
+    planning_manifest_path: Path,
+    image_fetch_manifest_path: Path,
+) -> str:
+    """Bind final Task-5 shards to exact planning and image-fetch manifests."""
+    return stable_hash(
+        ASSET_MATERIALIZATION_SCHEMA_VERSION,
+        _sha256_file(Path(planning_manifest_path)),
+        _sha256_file(Path(image_fetch_manifest_path)),
+        length=40,
+    )
+
+
 @dataclass(frozen=True)
 class ImageBudget:
     """Independent attempted-candidate and retained-success limits."""
@@ -1328,6 +1377,40 @@ def _validated_planning_result(
     return resumed
 
 
+def validate_asset_plan_shards(
+    planned: AssetPlanShards,
+    *,
+    expected_input_fingerprint: str,
+) -> AssetPlanShards:
+    """Validate planning shards against an independently derived input."""
+    resumed = _validated_planning_result(planned)
+    payload = json.loads(
+        Path(planned.manifest_path).read_text(encoding="utf-8")
+    )
+    if payload.get("input_fingerprint") != expected_input_fingerprint:
+        raise ValueError("asset planning input fingerprint mismatch")
+    if resumed != planned:
+        raise ValueError("asset planning result does not match manifest")
+    return resumed
+
+
+def validate_unique_image_jobs(
+    jobs: UniqueImageJobs,
+    *,
+    planned: AssetPlanShards,
+) -> UniqueImageJobs:
+    """Validate unique image jobs against the exact planning manifest."""
+    planned = _validated_planning_result(planned)
+    expected_input = stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        _sha256_file(planned.manifest_path),
+        length=40,
+    )
+    if jobs.input_fingerprint != expected_input:
+        raise ValueError("unique image jobs planning fingerprint mismatch")
+    return _validated_unique_image_jobs(jobs)
+
+
 def _iter_jsonl(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
     for path in paths:
         with Path(path).open("r", encoding="utf-8") as handle:
@@ -2057,6 +2140,38 @@ def iter_image_outcomes(
     )
 
 
+def iter_image_failures(
+    result: ImageFetchResult,
+) -> Iterator[dict[str, Any]]:
+    """Stream terminal failures for exactly this fetch result's job set."""
+    validate_complete_image_fetch(
+        result,
+        unique_jobs=result.unique_jobs,
+    )
+    outcome_store = ImageOutcomeStore(result.outcomes_path)
+    for job in _iter_jsonl((result.unique_jobs.output_path,)):
+        url_key = clean_text(job.get("url_key"))
+        outcome = outcome_store.get(
+            result.policy_fingerprint,
+            url_key,
+        )
+        if outcome is None or outcome.get("status") != "terminal":
+            continue
+        yield {
+            "failure_type": "media_download_failure",
+            "stage": "image_fetch",
+            "status": "terminal",
+            "entity_id": clean_text(job.get("entity_id")),
+            "page_url": clean_text(job.get("page_url")),
+            "source": clean_text(job.get("source")),
+            "image_url": clean_text(outcome.get("image_url")),
+            "url_key": url_key,
+            "error_class": clean_text(outcome.get("error_class")),
+            "http_status": outcome.get("http_status"),
+            "policy_fingerprint": result.policy_fingerprint,
+        }
+
+
 def _table_asset_links(
     entity: dict[str, Any],
     asset_ids: list[str],
@@ -2403,6 +2518,124 @@ def _validate_complete_image_fetch(
         "outcomes": outcome_snapshot,
         "job_store": job_snapshot,
     }
+
+
+def validate_complete_image_fetch(
+    result: ImageFetchResult,
+    *,
+    unique_jobs: UniqueImageJobs,
+) -> dict[str, Any]:
+    """Validate image fetch state against independently supplied jobs."""
+    validated_jobs = _validated_unique_image_jobs(unique_jobs)
+    if result.unique_jobs != validated_jobs:
+        raise ValueError("image fetch unique-job result mismatch")
+    return _validate_complete_image_fetch(result)
+
+
+def validate_materialized_asset_shards(
+    materialized: MaterializedAssetShards,
+    *,
+    planned: AssetPlanShards,
+    image_fetch_result: ImageFetchResult,
+    expected_input_fingerprint: str,
+) -> tuple[MaterializedAssetShards, Any]:
+    """Reconstruct Task-5 fingerprint, shards, counts, and strict barrier."""
+    planned = _validated_planning_result(planned)
+    fetch_snapshot = validate_complete_image_fetch(
+        image_fetch_result,
+        unique_jobs=image_fetch_result.unique_jobs,
+    )
+    expected_unique_input = stable_hash(
+        ASSET_PLANNING_SCHEMA_VERSION,
+        _sha256_file(planned.manifest_path),
+        length=40,
+    )
+    if image_fetch_result.unique_jobs.input_fingerprint != expected_unique_input:
+        raise ValueError("image fetch does not belong to asset planning")
+    expected_stage_input = asset_materialization_input_fingerprint(
+        planned.manifest_path,
+        image_fetch_result.fetch_manifest_path,
+    )
+    if expected_input_fingerprint != expected_stage_input:
+        raise ValueError("asset materialization input fingerprint mismatch")
+    try:
+        payload = json.loads(
+            Path(materialized.manifest_path).read_text(encoding="utf-8")
+        )
+        fingerprint = payload["fingerprint"]
+        budget = ImageBudget(
+            attempts_per_entity=int(
+                fingerprint["attempts_per_entity"]
+            ),
+            retained_per_entity=int(
+                fingerprint["retained_per_entity"]
+            ),
+        )
+        expected = {
+            "input_fingerprint": expected_input_fingerprint,
+            "schema_version": ASSET_MATERIALIZATION_SCHEMA_VERSION,
+            "planning_manifest_sha256": _sha256_file(
+                planned.manifest_path
+            ),
+            "unique_job_manifest_sha256": (
+                fetch_snapshot["unique_jobs"]["manifest_sha256"]
+            ),
+            "unique_job_sha256": (
+                fetch_snapshot["unique_jobs"]["sha256"]
+            ),
+            "image_fetch_manifest_sha256": (
+                fetch_snapshot["manifest_sha256"]
+            ),
+            "image_policy_fingerprint": (
+                image_fetch_result.policy_fingerprint
+            ),
+            "image_outcome_digest": (
+                fetch_snapshot["outcomes"]["digest"]
+            ),
+            "image_outcome_count": (
+                fetch_snapshot["outcomes"]["count"]
+            ),
+            "image_outcome_url_key_digest": (
+                fetch_snapshot["outcomes"]["url_key_digest"]
+            ),
+            "attempts_per_entity": budget.attempts_per_entity,
+            "retained_per_entity": budget.retained_per_entity,
+            "text_asset_chunk_chars": int(
+                fingerprint["text_asset_chunk_chars"]
+            ),
+            "min_text_asset_chunk_chars": int(
+                fingerprint["min_text_asset_chunk_chars"]
+            ),
+            "max_text_asset_chunks_per_entity": int(
+                fingerprint["max_text_asset_chunks_per_entity"]
+            ),
+            "records_per_shard": int(
+                fingerprint["records_per_shard"]
+            ),
+        }
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            "asset materialization fingerprint is invalid"
+        ) from error
+    resumed = _load_materialized_assets(
+        output_root=materialized.output_root,
+        manifest_path=materialized.manifest_path,
+        expected=expected,
+    )
+    if resumed is None:
+        raise ValueError("asset materialization is incomplete")
+    if resumed != materialized:
+        raise ValueError(
+            "asset materialization result does not match manifest"
+        )
+    from wdc200k_models import AssetStageBarrier
+
+    barrier = AssetStageBarrier(
+        fingerprint=expected,
+        bridge_assets=resumed.bridge_assets,
+        table_asset_links=resumed.table_asset_links,
+    )
+    return resumed, barrier
 
 
 def materialize_asset_shards(

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from build_mm_joinability_dataset import ExtractionCache
-from wdc200k_io import SqliteJobStore
+from wdc200k_io import AtomicJsonlShard, SqliteJobStore
 import wdc200k_models as models
 from wdc200k_models import (
     AssetStageBarrier,
@@ -25,8 +25,11 @@ from wdc200k_models import (
     enqueue_model_tasks_from_manifest,
     iter_assets_from_materialization_manifest,
     marker_matches,
+    model_adapter_input_fingerprint,
     run_model_stage,
+    validate_adapted_model_tasks,
     validate_model_stage,
+    validate_model_stage_for_adapter,
     write_model_start_marker,
 )
 
@@ -295,6 +298,106 @@ class CountingExtractor:
             "raw_response": '{"attributes":[]}',
             "error": "",
         }
+
+
+def test_adapter_and_model_validators_bind_exact_task_membership(
+    tmp_path: Path,
+) -> None:
+    structural_manifest = tmp_path / "structural.json"
+    finalized_manifest = tmp_path / "final.json"
+    assets_manifest = tmp_path / "assets.json"
+    structural_manifest.write_text('{"complete":true}', encoding="utf-8")
+    finalized_manifest.write_text('{"complete":true}', encoding="utf-8")
+    assets_manifest.write_text('{"complete":true}', encoding="utf-8")
+    adapter_input = model_adapter_input_fingerprint(
+        [
+            hashlib.sha256(
+                structural_manifest.read_bytes()
+            ).hexdigest()
+        ],
+        finalized_selection_manifest=finalized_manifest,
+        assets_manifest=assets_manifest,
+    )
+    adapter_root = tmp_path / "adapter"
+    task_path = adapter_root / "tasks" / "part-00000.jsonl"
+    task_writer = AtomicJsonlShard(task_path)
+    task_writer.write(asset("adapter"))
+    task_shard = task_writer.commit()
+    relative_task_shard = {
+        "path": task_path.relative_to(adapter_root).as_posix(),
+        "records": task_shard.records,
+        "bytes": task_shard.bytes,
+        "sha256": task_shard.sha256,
+    }
+    adapter_manifest = (
+        adapter_root / "model-task-adapter-manifest.json"
+    )
+    adapter_manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_model_task_adapter",
+                "schema_version": models.MODEL_QUEUE_SCHEMA_VERSION,
+                "input_fingerprint": adapter_input,
+                "task_shards": [relative_task_shard],
+                "error_shards": [],
+                "counts": {"tasks": 1, "errors": 0},
+                "complete": True,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    adapted = models.AdaptedModelTasks(
+        output_root=adapter_root,
+        task_paths=(task_path,),
+        error_paths=(),
+        manifest_path=adapter_manifest,
+        input_fingerprint=adapter_input,
+        tasks=1,
+        errors=0,
+    )
+    validated = validate_adapted_model_tasks(
+        adapted,
+        expected_input_fingerprint=adapter_input,
+    )
+    args = model_args()
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("adapter")],
+        store,
+        args=args,
+        input_fingerprint=adapter_input,
+        text_input_fingerprint=adapter_input,
+        image_input_fingerprint=adapter_input,
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "model-output",
+    )
+
+    assert validated == adapted
+    assert validate_model_stage_for_adapter(
+        result,
+        adapted,
+        args=args,
+        validation_store_path=tmp_path / "validation-models.sqlite3",
+    )
+
+    foreign_adapter = models.AdaptedModelTasks(
+        **{
+            **adapted.__dict__,
+            "input_fingerprint": "foreign-adapter",
+        }
+    )
+    with pytest.raises(ValueError, match="adapter"):
+        validate_model_stage_for_adapter(
+            result,
+            foreign_adapter,
+            args=args,
+            validation_store_path=tmp_path / "foreign-models.sqlite3",
+        )
 
 
 def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:

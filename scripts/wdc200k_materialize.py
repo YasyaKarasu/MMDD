@@ -20,23 +20,44 @@ try:
     import wdc200k_structural as structural
     from build_mm_table_dataset import normalize_title
     from stage1_io import clean_text, stable_hash
+    from wdc200k_assets import (
+        AssetPlanShards,
+        ImageFetchResult,
+        MaterializedAssetShards,
+        UniqueImageJobs,
+        asset_materialization_input_fingerprint,
+        asset_planning_input_fingerprint,
+        iter_image_failures,
+        structural_asset_input_identity,
+        validate_asset_plan_shards,
+        validate_complete_image_fetch,
+        validate_materialized_asset_shards,
+        validate_unique_image_jobs,
+    )
+    from wdc200k_fetch import (
+        FetchResult,
+        validate_complete_page_fetch,
+    )
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
         validate_completed_shard,
     )
     from wdc200k_models import (
-        AssetStageBarrier,
+        AdaptedModelTasks,
         ModelStageResult,
         StructuralStageBarrier,
-        _strict_asset_manifest,
-        validate_model_stage,
+        model_adapter_input_fingerprint,
+        validate_adapted_model_tasks,
+        validate_model_stage_for_adapter,
     )
 except ModuleNotFoundError as error:
     if error.name not in {
         "build_mm_joinability_dataset",
         "build_mm_table_dataset",
         "stage1_io",
+        "wdc200k_assets",
+        "wdc200k_fetch",
         "wdc200k_io",
         "wdc200k_models",
         "wdc200k_structural",
@@ -49,17 +70,36 @@ except ModuleNotFoundError as error:
         import wdc200k_structural as structural
         from build_mm_table_dataset import normalize_title
         from stage1_io import clean_text, stable_hash
+        from wdc200k_assets import (
+            AssetPlanShards,
+            ImageFetchResult,
+            MaterializedAssetShards,
+            UniqueImageJobs,
+            asset_materialization_input_fingerprint,
+            asset_planning_input_fingerprint,
+            iter_image_failures,
+            structural_asset_input_identity,
+            validate_asset_plan_shards,
+            validate_complete_image_fetch,
+            validate_materialized_asset_shards,
+            validate_unique_image_jobs,
+        )
+        from wdc200k_fetch import (
+            FetchResult,
+            validate_complete_page_fetch,
+        )
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
             validate_completed_shard,
         )
         from wdc200k_models import (
-            AssetStageBarrier,
+            AdaptedModelTasks,
             ModelStageResult,
             StructuralStageBarrier,
-            _strict_asset_manifest,
-            validate_model_stage,
+            model_adapter_input_fingerprint,
+            validate_adapted_model_tasks,
+            validate_model_stage_for_adapter,
         )
     finally:
         sys.path.remove(scripts_directory)
@@ -102,8 +142,12 @@ class MaterializationInputs:
     structural_manifests: tuple[Path, ...]
     finalized_selection_manifest: Path
     structural_barrier: StructuralStageBarrier
-    assets_manifest: Path
-    assets_barrier: AssetStageBarrier
+    page_fetch_result: FetchResult
+    asset_plan_result: AssetPlanShards
+    unique_image_jobs: UniqueImageJobs
+    image_fetch_result: ImageFetchResult
+    materialized_assets: MaterializedAssetShards
+    adapted_model_tasks: AdaptedModelTasks
     model_result: ModelStageResult
     work_root: Path
 
@@ -136,11 +180,15 @@ class MaterializationResult:
 class _ValidatedUpstream:
     source_paths: tuple[Path, ...]
     entity_paths: tuple[Path, ...]
+    page_ref_paths: tuple[Path, ...]
     structural_failure_paths: tuple[Path, ...]
+    page_failure_path: Path
     asset_paths: tuple[Path, ...]
     link_paths: tuple[Path, ...]
     extraction_paths: tuple[Path, ...]
     model_error_paths: tuple[Path, ...]
+    adapter_error_paths: tuple[Path, ...]
+    image_fetch_result: ImageFetchResult
     expected_tables: int
     expected_entities: int
     expected_assets: int
@@ -216,6 +264,7 @@ def _structural_inputs(
     list[Path],
     list[Path],
     list[Path],
+    list[Path],
     int,
     int,
     list[tuple[Path, str]],
@@ -239,6 +288,7 @@ def _structural_inputs(
     source_paths: list[Path] = []
     entity_paths: list[Path] = []
     failure_paths: list[Path] = []
+    page_ref_paths: list[Path] = []
     validated_paths: list[Path] = []
     manifest_hashes: list[tuple[Path, str]] = []
     tables = 0
@@ -280,6 +330,8 @@ def _structural_inputs(
                 entities += shard.records
             elif shard.path.startswith("structural_failures/"):
                 failure_paths.append(path)
+            elif shard.path.startswith("page_refs/"):
+                page_ref_paths.append(path)
 
     final_path = Path(inputs.finalized_selection_manifest)
     final_payload = _manifest_payload(final_path)
@@ -338,6 +390,7 @@ def _structural_inputs(
     return (
         source_paths,
         entity_paths,
+        page_ref_paths,
         failure_paths,
         tables,
         entities,
@@ -347,19 +400,77 @@ def _structural_inputs(
 
 def _validate_upstream(
     inputs: MaterializationInputs,
+    *,
+    args: argparse.Namespace,
 ) -> _ValidatedUpstream:
     (
         source_paths,
         entity_paths,
+        page_ref_paths,
         failure_paths,
         tables,
         entities,
         structural_hashes,
     ) = _structural_inputs(inputs)
-    _assets_payload, asset_paths, link_paths = _strict_asset_manifest(
-        Path(inputs.assets_manifest),
-        barrier=inputs.assets_barrier,
+    validation_root = Path(inputs.work_root) / "upstream-validation"
+    page_snapshot = validate_complete_page_fetch(
+        inputs.page_fetch_result,
+        _iter_jsonl(page_ref_paths),
+        validation_database=validation_root / "page-fetch.sqlite3",
     )
+    structural_identity = structural_asset_input_identity(
+        (digest for _path, digest in structural_hashes),
+        inputs.structural_barrier.final_manifest_sha256,
+    )
+    expected_planning_input = asset_planning_input_fingerprint(
+        structural_identity,
+        str(page_snapshot["identity"]),
+    )
+    planned = validate_asset_plan_shards(
+        inputs.asset_plan_result,
+        expected_input_fingerprint=expected_planning_input,
+    )
+    unique_jobs = validate_unique_image_jobs(
+        inputs.unique_image_jobs,
+        planned=planned,
+    )
+    if inputs.image_fetch_result.unique_jobs != unique_jobs:
+        raise ValueError("Task-5 image fetch unique-job substitution")
+    validate_complete_image_fetch(
+        inputs.image_fetch_result,
+        unique_jobs=unique_jobs,
+    )
+    expected_asset_input = asset_materialization_input_fingerprint(
+        planned.manifest_path,
+        inputs.image_fetch_result.fetch_manifest_path,
+    )
+    materialized_assets, assets_barrier = (
+        validate_materialized_asset_shards(
+            inputs.materialized_assets,
+            planned=planned,
+            image_fetch_result=inputs.image_fetch_result,
+            expected_input_fingerprint=expected_asset_input,
+        )
+    )
+    expected_adapter_input = model_adapter_input_fingerprint(
+        (digest for _path, digest in structural_hashes),
+        finalized_selection_manifest=(
+            inputs.finalized_selection_manifest
+        ),
+        assets_manifest=materialized_assets.manifest_path,
+    )
+    adapted = validate_adapted_model_tasks(
+        inputs.adapted_model_tasks,
+        expected_input_fingerprint=expected_adapter_input,
+    )
+    validate_model_stage_for_adapter(
+        inputs.model_result,
+        adapted,
+        args=args,
+        validation_store_path=validation_root / "model-membership.sqlite3",
+    )
+    asset_paths = materialized_assets.bridge_asset_paths
+    link_paths = materialized_assets.table_asset_link_paths
     retained_link_count = sum(
         1
         for link in _iter_jsonl(link_paths)
@@ -368,8 +479,6 @@ def _validate_upstream(
             for asset_id in (link.get("asset_ids") or [])
         )
     )
-    if not validate_model_stage(inputs.model_result):
-        raise ValueError("Task-6 model result manifest validation failed")
     model_payload = _manifest_payload(inputs.model_result.manifest_path)
     model_root = inputs.model_result.manifest_path.parent
     model_extraction_shards = [
@@ -397,7 +506,9 @@ def _validate_upstream(
     model_manifest_sha256 = _sha256_path(
         inputs.model_result.manifest_path
     )
-    asset_manifest_sha256 = _sha256_path(inputs.assets_manifest)
+    asset_manifest_sha256 = _sha256_path(
+        materialized_assets.manifest_path
+    )
     provenance = {
         "structural_schema_version": (
             inputs.structural_barrier.schema_version
@@ -412,8 +523,22 @@ def _validate_upstream(
         "finalized_selection_manifest_sha256": (
             inputs.structural_barrier.final_manifest_sha256
         ),
+        "page_fetch_identity": page_snapshot["identity"],
+        "asset_planning_manifest_sha256": _sha256_path(
+            planned.manifest_path
+        ),
+        "unique_image_job_manifest_sha256": _sha256_path(
+            unique_jobs.manifest_path
+        ),
+        "image_fetch_manifest_sha256": _sha256_path(
+            inputs.image_fetch_result.fetch_manifest_path
+        ),
         "asset_manifest_sha256": asset_manifest_sha256,
-        "asset_fingerprint": inputs.assets_barrier.fingerprint,
+        "asset_fingerprint": assets_barrier.fingerprint,
+        "model_adapter_manifest_sha256": _sha256_path(
+            adapted.manifest_path
+        ),
+        "model_adapter_input_fingerprint": adapted.input_fingerprint,
         "model_manifest_sha256": model_manifest_sha256,
         "model_jobsets": {
             "text": inputs.model_result.jobset.text_fingerprint,
@@ -431,7 +556,9 @@ def _validate_upstream(
     return _ValidatedUpstream(
         source_paths=tuple(source_paths),
         entity_paths=tuple(entity_paths),
+        page_ref_paths=tuple(page_ref_paths),
         structural_failure_paths=tuple(failure_paths),
+        page_failure_path=Path(inputs.page_fetch_result.failure_path),
         asset_paths=tuple(asset_paths),
         link_paths=tuple(link_paths),
         extraction_paths=tuple(
@@ -440,9 +567,11 @@ def _validate_upstream(
         model_error_paths=tuple(
             model_root / shard.path for shard in model_error_shards
         ),
+        adapter_error_paths=adapted.error_paths,
+        image_fetch_result=inputs.image_fetch_result,
         expected_tables=tables,
         expected_entities=entities,
-        expected_assets=inputs.assets_barrier.bridge_assets,
+        expected_assets=assets_barrier.bridge_assets,
         expected_links=retained_link_count,
         expected_extractions=model_success + model_terminal,
         identity=identity,
@@ -490,6 +619,15 @@ def _initialize_index(path: Path) -> None:
             CREATE INDEX IF NOT EXISTS entities_source
                 ON entities(source_table_id, source_row_id, entity_id);
 
+            CREATE TABLE IF NOT EXISTS entity_sources (
+                entity_id TEXT NOT NULL,
+                source_table_id TEXT NOT NULL,
+                source_row_id INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, source_table_id, source_row_id)
+            );
+            CREATE INDEX IF NOT EXISTS entity_sources_source
+                ON entity_sources(source_table_id, source_row_id, entity_id);
+
             CREATE TABLE IF NOT EXISTS entity_aliases (
                 alias TEXT PRIMARY KEY,
                 entity_id TEXT NOT NULL
@@ -513,6 +651,14 @@ def _initialize_index(path: Path) -> None:
             CREATE INDEX IF NOT EXISTS links_source
                 ON links(source_table_id, source_row_id, link_id);
 
+            CREATE TABLE IF NOT EXISTS link_assets (
+                link_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                PRIMARY KEY (link_id, asset_id)
+            );
+            CREATE INDEX IF NOT EXISTS link_assets_asset
+                ON link_assets(asset_id, link_id);
+
             CREATE TABLE IF NOT EXISTS extractions (
                 cache_key TEXT PRIMARY KEY,
                 model_call_key TEXT NOT NULL,
@@ -520,6 +666,7 @@ def _initialize_index(path: Path) -> None:
                 entity_id TEXT NOT NULL,
                 asset_id TEXT NOT NULL,
                 source_table_id TEXT NOT NULL,
+                source_row_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 record_json TEXT NOT NULL
             );
@@ -530,6 +677,9 @@ def _initialize_index(path: Path) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS extractions_full_call
                 ON extractions(model_call_key)
                 WHERE model_call_key <> '';
+            CREATE UNIQUE INDEX IF NOT EXISTS extractions_job
+                ON extractions(job_id)
+                WHERE job_id <> '';
 
             CREATE TABLE IF NOT EXISTS evidence (
                 recovery_id TEXT PRIMARY KEY,
@@ -596,6 +746,19 @@ def _initialize_index(path: Path) -> None:
             );
             """
         )
+        extraction_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(extractions)"
+            )
+        }
+        if "source_row_id" not in extraction_columns:
+            connection.execute(
+                """
+                ALTER TABLE extractions
+                ADD COLUMN source_row_id INTEGER NOT NULL DEFAULT 0
+                """
+            )
 
 
 def _insert_identity_record(
@@ -684,6 +847,31 @@ def _index_entities(
             },
             kind="entity",
         )
+        appearances = record.get("appears_in")
+        if not isinstance(appearances, list) or not appearances:
+            raise ValueError("entity is missing source-table appearance")
+        for appearance in appearances:
+            if not isinstance(appearance, dict):
+                raise ValueError("entity appearance is not an object")
+            appearance_source = clean_text(
+                appearance.get("source_table_id")
+            )
+            if not appearance_source:
+                raise ValueError(
+                    "entity appearance is missing source_table_id"
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO entity_sources (
+                    entity_id, source_table_id, source_row_id
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    entity_id,
+                    appearance_source,
+                    int(appearance.get("row_id", 0)),
+                ),
+            )
         wiki_title = clean_text(record.get("wiki_title"))
         aliases = {
             wiki_title,
@@ -751,6 +939,20 @@ def _index_links(
             },
             kind="asset link",
         )
+        asset_ids = record.get("asset_ids") or []
+        if not isinstance(asset_ids, list):
+            raise ValueError("asset link asset_ids is not a list")
+        for asset_id_value in asset_ids:
+            asset_id = clean_text(asset_id_value)
+            if not asset_id:
+                raise ValueError("asset link contains an empty asset ID")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO link_assets (link_id, asset_id)
+                VALUES (?, ?)
+                """,
+                (link_id, asset_id),
+            )
         for alias in (
             clean_text(record.get("entity_wiki_title")),
             normalize_title(clean_text(record.get("entity_wiki_title"))),
@@ -782,14 +984,28 @@ def _index_extractions(
         cache_key, entity_id, asset_id = _extraction_identity(record)
         entity_row = connection.execute(
             """
-            SELECT source_table_id FROM entities WHERE entity_id = ?
+            SELECT source_table_id, source_row_id
+            FROM entities WHERE entity_id = ?
             """,
             (entity_id,),
         ).fetchone()
-        source_table_id = (
+        declared_source_table_id = clean_text(
+            record.get("source_table_id")
+        )
+        source_table_id = declared_source_table_id or (
             str(entity_row["source_table_id"])
             if entity_row is not None
-            else clean_text(record.get("source_table_id"))
+            else ""
+        )
+        declared_source_row_id = record.get("source_row_id")
+        source_row_id = (
+            int(declared_source_row_id)
+            if declared_source_row_id is not None
+            else (
+                int(entity_row["source_row_id"])
+                if entity_row is not None
+                else 0
+            )
         )
         if not source_table_id:
             raise ValueError(
@@ -808,6 +1024,7 @@ def _index_extractions(
                 "entity_id": entity_id,
                 "asset_id": asset_id,
                 "source_table_id": source_table_id,
+                "source_row_id": source_row_id,
                 "status": status,
                 "record": record,
             },
@@ -831,6 +1048,112 @@ def _index_extractions(
                 kind="model error",
             )
         _commit_index_batch(connection, count, commit_every)
+
+
+def _validate_relation_closure(
+    connection: sqlite3.Connection,
+) -> None:
+    missing_asset_entity = connection.execute(
+        """
+        SELECT assets.asset_id
+        FROM assets
+        LEFT JOIN entities USING (entity_id)
+        WHERE entities.entity_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_asset_entity is not None:
+        raise ValueError(
+            "asset entity relation is missing: "
+            f"{missing_asset_entity['asset_id']}"
+        )
+    missing_link_entity = connection.execute(
+        """
+        SELECT links.link_id
+        FROM links
+        LEFT JOIN entities
+          ON entities.entity_id = links.entity_id
+        LEFT JOIN entity_sources
+          ON entity_sources.entity_id = links.entity_id
+         AND entity_sources.source_table_id = links.source_table_id
+         AND entity_sources.source_row_id = links.source_row_id
+        WHERE entities.entity_id IS NULL
+           OR entity_sources.entity_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_link_entity is not None:
+        raise ValueError(
+            "link entity/source relation is missing: "
+            f"{missing_link_entity['link_id']}"
+        )
+    invalid_link_asset = connection.execute(
+        """
+        SELECT link_assets.link_id, link_assets.asset_id,
+               links.entity_id AS link_entity_id,
+               assets.entity_id AS asset_entity_id
+        FROM link_assets
+        JOIN links USING (link_id)
+        LEFT JOIN assets USING (asset_id)
+        WHERE assets.asset_id IS NULL
+           OR assets.entity_id <> links.entity_id
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_link_asset is not None:
+        if invalid_link_asset["asset_entity_id"] is None:
+            raise ValueError(
+                "link asset relation is missing: "
+                f"{invalid_link_asset['asset_id']}"
+            )
+        raise ValueError(
+            "link asset entity mismatch: "
+            f"{invalid_link_asset['link_id']}"
+        )
+    invalid_extraction = connection.execute(
+        """
+        SELECT extractions.cache_key,
+               extractions.entity_id,
+               extractions.asset_id,
+               extractions.source_table_id,
+               entities.entity_id AS found_entity_id,
+               assets.asset_id AS found_asset_id,
+               assets.entity_id AS asset_entity_id,
+               entity_sources.entity_id AS found_source_entity_id
+        FROM extractions
+        LEFT JOIN entities
+          ON entities.entity_id = extractions.entity_id
+        LEFT JOIN assets
+          ON assets.asset_id = extractions.asset_id
+        LEFT JOIN entity_sources
+          ON entity_sources.entity_id = extractions.entity_id
+         AND entity_sources.source_table_id =
+             extractions.source_table_id
+         AND entity_sources.source_row_id =
+             extractions.source_row_id
+        WHERE entities.entity_id IS NULL
+           OR assets.asset_id IS NULL
+           OR assets.entity_id <> extractions.entity_id
+           OR entity_sources.entity_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_extraction is not None:
+        if invalid_extraction["found_entity_id"] is None:
+            reason = "entity"
+        elif invalid_extraction["found_asset_id"] is None:
+            reason = "asset"
+        elif (
+            invalid_extraction["asset_entity_id"]
+            != invalid_extraction["entity_id"]
+        ):
+            reason = "entity"
+        else:
+            reason = "source"
+        raise ValueError(
+            f"extraction {reason} relation mismatch: "
+            f"{invalid_extraction['cache_key']}"
+        )
 
 
 def _commit_index_batch(
@@ -860,6 +1183,7 @@ def _build_index(inputs: MaterializationShardInputs) -> None:
             inputs.error_paths,
             status="terminal",
         )
+        _validate_relation_closure(connection)
         connection.commit()
 
 
@@ -905,6 +1229,7 @@ def _prepare_authoritative_index(
             status="terminal",
             commit_every=1_000,
         )
+        _validate_relation_closure(connection)
         connection.commit()
 
 
@@ -1900,6 +2225,49 @@ def _failure_records(
     yield from _iter_jsonl(paths)
 
 
+def _deduplicated_failures(
+    database_path: Path,
+    *,
+    kind: str,
+    records: Iterable[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    with _connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS diagnostic_seen (
+                kind TEXT NOT NULL,
+                record_sha256 TEXT NOT NULL,
+                PRIMARY KEY (kind, record_sha256)
+            )
+            """
+        )
+        connection.execute(
+            "DELETE FROM diagnostic_seen WHERE kind = ?",
+            (kind,),
+        )
+        for record in records:
+            encoded = _canonical_json(record)
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO diagnostic_seen (
+                    kind, record_sha256
+                ) VALUES (?, ?)
+                """,
+                (kind, digest),
+            )
+            if cursor.rowcount == 1:
+                yield record
+        connection.commit()
+
+
+def _combined_records(
+    *record_sets: Iterable[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    for records in record_sets:
+        yield from records
+
+
 def _stats_payload(
     database_path: Path,
     counts: dict[str, int],
@@ -2095,6 +2463,7 @@ def _finalize_dataset(
     args: argparse.Namespace,
     parameter_fingerprint: str,
     records_per_shard: int,
+    after_finalize_commit: Callable[[str], None] | None = None,
 ) -> MaterializationResult:
     counts = _validate_global_counts(database_path, upstream)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -2109,6 +2478,8 @@ def _finalize_dataset(
             for record in _iter_materialized(database_path, artifact):
                 writer.write(record)
             artifact_shards[artifact] = writer.close()
+            if after_finalize_commit is not None:
+                after_finalize_commit(f"artifact:{artifact}")
         except BaseException:
             writer.abort()
             raise
@@ -2117,33 +2488,69 @@ def _finalize_dataset(
         output_root / "qrels.jsonl",
         _iter_materialized(database_path, "qrels"),
     )
+    if after_finalize_commit is not None:
+        after_finalize_commit("single:qrels.jsonl")
     decisions = _atomic_jsonl_from_records(
         output_root / "table_queryability_decisions.jsonl",
         _iter_materialized(
             database_path, "table_queryability_decisions"
         ),
     )
+    if after_finalize_commit is not None:
+        after_finalize_commit(
+            "single:table_queryability_decisions.jsonl"
+        )
     splits = _write_splits(
         database_path,
         output_root / "splits.json",
         args,
     )
+    if after_finalize_commit is not None:
+        after_finalize_commit("single:splits.json")
     stats_payload = _stats_payload(database_path, counts, args)
     stats = _atomic_json(output_root / "stats.json", stats_payload)
-    diagnostics = {
-        "web_fetch_failures.jsonl": _atomic_jsonl_from_records(
-            output_root / "web_fetch_failures.jsonl",
-            _failure_records(upstream.structural_failure_paths),
+    if after_finalize_commit is not None:
+        after_finalize_commit("single:stats.json")
+    diagnostics: dict[str, CompletedShard] = {}
+    web_failure_name = "web_fetch_failures.jsonl"
+    diagnostics[web_failure_name] = _atomic_jsonl_from_records(
+        output_root / web_failure_name,
+        _deduplicated_failures(
+            database_path,
+            kind="web",
+            records=_combined_records(
+                _failure_records(upstream.structural_failure_paths),
+                _failure_records((upstream.page_failure_path,)),
+            ),
         ),
-        "media_download_failures.jsonl": _atomic_jsonl_from_records(
-            output_root / "media_download_failures.jsonl",
-            (),
+    )
+    if after_finalize_commit is not None:
+        after_finalize_commit(f"single:{web_failure_name}")
+    media_failure_name = "media_download_failures.jsonl"
+    diagnostics[media_failure_name] = _atomic_jsonl_from_records(
+        output_root / media_failure_name,
+        _deduplicated_failures(
+            database_path,
+            kind="media",
+            records=iter_image_failures(upstream.image_fetch_result),
         ),
-        "model_attribute_errors.jsonl": _atomic_jsonl_from_records(
-            output_root / "model_attribute_errors.jsonl",
-            _failure_records(upstream.model_error_paths),
+    )
+    if after_finalize_commit is not None:
+        after_finalize_commit(f"single:{media_failure_name}")
+    model_error_name = "model_attribute_errors.jsonl"
+    diagnostics[model_error_name] = _atomic_jsonl_from_records(
+        output_root / model_error_name,
+        _deduplicated_failures(
+            database_path,
+            kind="model",
+            records=_combined_records(
+                _failure_records(upstream.adapter_error_paths),
+                _failure_records(upstream.model_error_paths),
+            ),
         ),
-    }
+    )
+    if after_finalize_commit is not None:
+        after_finalize_commit(f"single:{model_error_name}")
     single_shards = {
         "qrels.jsonl": CompletedShard(
             path="qrels.jsonl",
@@ -2203,6 +2610,13 @@ def _finalize_dataset(
             "table_queryability_decisions": (
                 "table_queryability_decisions.jsonl"
             ),
+            "web_fetch_failures": "web_fetch_failures.jsonl",
+            "media_download_failures": (
+                "media_download_failures.jsonl"
+            ),
+            "model_attribute_errors": (
+                "model_attribute_errors.jsonl"
+            ),
         },
         "published_single_files": {
             name: {
@@ -2246,6 +2660,7 @@ def materialize_dataset(
     args: argparse.Namespace,
     records_per_shard: int = 50_000,
     after_table_commit: Callable[[str], None] | None = None,
+    after_finalize_commit: Callable[[str], None] | None = None,
 ) -> MaterializationResult:
     """Validate upstream barriers and stream the canonical final dataset."""
     if records_per_shard <= 0:
@@ -2258,7 +2673,7 @@ def materialize_dataset(
         or work_root.is_relative_to(output_root)
     ):
         raise ValueError("work_root and output_root must be separate")
-    upstream = _validate_upstream(inputs)
+    upstream = _validate_upstream(inputs, args=args)
     parameter_fingerprint = _parameter_fingerprint(args)
     resumed = _load_published_result(
         output_root,
@@ -2299,4 +2714,5 @@ def materialize_dataset(
         args=args,
         parameter_fingerprint=parameter_fingerprint,
         records_per_shard=records_per_shard,
+        after_finalize_commit=after_finalize_commit,
     )

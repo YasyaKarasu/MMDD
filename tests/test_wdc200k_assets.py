@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from wdc200k_assets import (  # noqa: E402
     ImageBudget,
     ImageOutcomeStore,
+    asset_materialization_input_fingerprint,
+    asset_planning_input_fingerprint,
     build_unique_image_jobs,
     fetch_unique_images,
     iter_entity_page_join,
@@ -27,6 +29,10 @@ from wdc200k_assets import (  # noqa: E402
     materialize_entity_assets,
     persist_entity_asset_plans,
     plan_entity_assets,
+    validate_asset_plan_shards,
+    validate_complete_image_fetch,
+    validate_materialized_asset_shards,
+    validate_unique_image_jobs,
 )
 from wdc200k_fetch import (  # noqa: E402
     FetchPolicy,
@@ -2190,3 +2196,85 @@ def test_materialization_streams_canonical_shards_and_resumes(
         records_per_shard=1,
     )
     assert resumed_after_unrelated_outcome == materialized
+
+
+def test_public_asset_validators_reconstruct_the_complete_producer_chain(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/asset.jpg"
+    structural_identity = hashlib.sha256(b"structural").hexdigest()
+    page_identity = hashlib.sha256(b"page-fetch").hexdigest()
+    planning_input = asset_planning_input_fingerprint(
+        structural_identity,
+        page_identity,
+    )
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity("e1", image_urls=[image_url]),
+                page(text="durable page text"),
+            )
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint=planning_input,
+    )
+    validated_plan = validate_asset_plan_shards(
+        planned,
+        expected_input_fingerprint=planning_input,
+    )
+    unique = build_unique_image_jobs(
+        validated_plan,
+        tmp_path / "unique.jsonl",
+    )
+    validate_unique_image_jobs(unique, planned=validated_plan)
+    fetched = fetch_unique_images(
+        unique,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        FakeImageTransport(tmp_path, {image_url: "asset"}),
+        FetchPolicy(
+            network_policy_fingerprint="image-v1",
+            policy_version="wdc200k-image-v1",
+        ),
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+    )
+    fetch_snapshot = validate_complete_image_fetch(
+        fetched,
+        unique_jobs=unique,
+    )
+    materialization_input = asset_materialization_input_fingerprint(
+        planned.manifest_path,
+        fetched.fetch_manifest_path,
+    )
+    materialized = materialize_asset_shards(
+        planned,
+        fetch_result=fetched,
+        output_root=tmp_path / "assets",
+        input_fingerprint=materialization_input,
+    )
+
+    validated, barrier = validate_materialized_asset_shards(
+        materialized,
+        planned=planned,
+        image_fetch_result=fetched,
+        expected_input_fingerprint=materialization_input,
+    )
+
+    assert validated == materialized
+    assert fetch_snapshot["outcomes"]["count"] == 1
+    assert barrier.bridge_assets == 2
+    assert barrier.table_asset_links == 1
+    assert barrier.fingerprint["input_fingerprint"] == materialization_input
+
+    with pytest.raises(ValueError, match="planning input"):
+        validate_asset_plan_shards(
+            planned,
+            expected_input_fingerprint="foreign-planning-run",
+        )
+    with pytest.raises(ValueError, match="materialization input"):
+        validate_materialized_asset_shards(
+            materialized,
+            planned=planned,
+            image_fetch_result=fetched,
+            expected_input_fingerprint="foreign-materialization-run",
+        )

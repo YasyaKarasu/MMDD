@@ -103,6 +103,8 @@ class FetchResult:
     failure_path: Path
     progress_path: Path
     policy_fingerprint: str
+    job_store_path: Path
+    job_kind: str
 
 
 class PageOutcomeStore:
@@ -1278,7 +1280,384 @@ def fetch_unique_pages(
         failure_path=failure_path,
         progress_path=progress_path,
         policy_fingerprint=fingerprint,
+        job_store_path=store.path,
+        job_kind=kind,
     )
+
+
+def validate_complete_page_fetch(
+    result: FetchResult,
+    page_refs: Iterable[dict[str, Any]],
+    *,
+    validation_database: Path,
+) -> dict[str, Any]:
+    """Re-derive a complete Task-4 identity from durable producer state."""
+    if (
+        not result.complete
+        or result.remaining != 0
+        or result.leased != 0
+        or result.inflight != 0
+    ):
+        raise ValueError("page fetch result is incomplete")
+    expected_kind = _job_kind(result.policy_fingerprint)
+    if result.job_kind != expected_kind:
+        raise ValueError("page fetch job store kind mismatch")
+    paths = (
+        Path(result.outcomes_path),
+        Path(result.failure_path),
+        Path(result.progress_path),
+        Path(result.job_store_path),
+    )
+    if not all(path.is_file() for path in paths):
+        raise ValueError("page fetch job store or snapshot is missing")
+
+    validation_database = Path(validation_database)
+    validation_database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(validation_database) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS expected_page_refs (
+                url_key TEXT NOT NULL,
+                reference_key TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                source_table_id TEXT NOT NULL,
+                row_id_json TEXT NOT NULL,
+                PRIMARY KEY (url_key, reference_key)
+            );
+            CREATE TABLE IF NOT EXISTS expected_page_urls (
+                url_key TEXT PRIMARY KEY,
+                page_url TEXT NOT NULL
+            );
+            DELETE FROM expected_page_refs;
+            DELETE FROM expected_page_urls;
+            """
+        )
+        for record in page_refs:
+            url_key, page_url, _host = _validated_ref(record)
+            reference_key = stable_hash(
+                record.get("entity_id", ""),
+                record.get("source_table_id", ""),
+                record.get("row_id", ""),
+                length=40,
+            )
+            reference_values = (
+                url_key,
+                reference_key,
+                str(record.get("entity_id") or ""),
+                str(record.get("source_table_id") or ""),
+                json.dumps(
+                    record.get("row_id"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            existing = connection.execute(
+                """
+                SELECT url_key, reference_key, entity_id,
+                       source_table_id, row_id_json
+                FROM expected_page_refs
+                WHERE url_key = ? AND reference_key = ?
+                """,
+                (url_key, reference_key),
+            ).fetchone()
+            if existing is not None and tuple(existing) != reference_values:
+                raise ValueError("conflicting expected page reference")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO expected_page_refs
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                reference_values,
+            )
+            url_row = connection.execute(
+                """
+                SELECT page_url FROM expected_page_urls
+                WHERE url_key = ?
+                """,
+                (url_key,),
+            ).fetchone()
+            if url_row is not None and str(url_row[0]) != page_url:
+                raise ValueError("conflicting expected page URL")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO expected_page_urls
+                VALUES (?, ?)
+                """,
+                (url_key, page_url),
+            )
+        connection.commit()
+        connection.execute(
+            "ATTACH DATABASE ? AS outcomes_db",
+            (str(Path(result.outcomes_path).resolve()),),
+        )
+        connection.execute(
+            "ATTACH DATABASE ? AS jobs_db",
+            (str(Path(result.job_store_path).resolve()),),
+        )
+        policy = result.policy_fingerprint
+        expected_ref_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM expected_page_refs"
+            ).fetchone()[0]
+        )
+        actual_ref_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM outcomes_db.page_references
+                WHERE policy_fingerprint = ?
+                """,
+                (policy,),
+            ).fetchone()[0]
+        )
+        missing_refs = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM expected_page_refs AS expected
+            LEFT JOIN outcomes_db.page_references AS actual
+              ON actual.policy_fingerprint = ?
+             AND actual.url_key = expected.url_key
+             AND actual.reference_key = expected.reference_key
+             AND actual.entity_id = expected.entity_id
+             AND actual.source_table_id = expected.source_table_id
+             AND actual.row_id_json = expected.row_id_json
+            WHERE actual.url_key IS NULL
+            """,
+            (policy,),
+        ).fetchone()[0]
+        if int(missing_refs) != 0 or actual_ref_count != expected_ref_count:
+            raise ValueError("page fetch reference set mismatch")
+        expected_url_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM expected_page_urls"
+            ).fetchone()[0]
+        )
+        actual_url_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM outcomes_db.page_outcomes
+                WHERE policy_fingerprint = ?
+                """,
+                (policy,),
+            ).fetchone()[0]
+        )
+        missing_urls = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM expected_page_urls AS expected
+            LEFT JOIN outcomes_db.page_outcomes AS actual
+              ON actual.policy_fingerprint = ?
+             AND actual.url_key = expected.url_key
+             AND actual.page_url = expected.page_url
+            WHERE actual.url_key IS NULL
+            """,
+            (policy,),
+        ).fetchone()[0]
+        if int(missing_urls) != 0 or actual_url_count != expected_url_count:
+            raise ValueError("page fetch outcome URL set mismatch")
+        job_rows = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)
+                    AS success,
+                SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END)
+                    AS terminal,
+                SUM(CASE WHEN status NOT IN ('success', 'terminal')
+                         THEN 1 ELSE 0 END) AS incomplete
+            FROM jobs_db.jobs WHERE kind = ?
+            """,
+            (expected_kind,),
+        ).fetchone()
+        expected_unique = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM expected_page_urls"
+            ).fetchone()[0]
+        )
+        outcome_rows = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)
+                    AS success,
+                SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END)
+                    AS terminal
+            FROM outcomes_db.page_outcomes
+            WHERE policy_fingerprint = ?
+            """,
+            (policy,),
+        ).fetchone()
+        counts = {
+            "unique": expected_unique,
+            "success": int(outcome_rows["success"] or 0),
+            "terminal": int(outcome_rows["terminal"] or 0),
+        }
+        if (
+            int(outcome_rows["total"] or 0) != expected_unique
+            or int(job_rows["total"] or 0) != expected_unique
+            or int(job_rows["success"] or 0) != counts["success"]
+            or int(job_rows["terminal"] or 0) != counts["terminal"]
+            or int(job_rows["incomplete"] or 0) != 0
+            or result.unique != counts["unique"]
+            or result.success != counts["success"]
+            or result.terminal != counts["terminal"]
+        ):
+            raise ValueError("page fetch job store counts mismatch")
+        for row in connection.execute(
+            """
+            SELECT expected.url_key, expected.page_url,
+                   jobs.job_id, jobs.payload_json, jobs.status,
+                   jobs.result_json, jobs.owner, jobs.lease_expires,
+                   jobs.lease_id, outcomes.status AS outcome_status
+            FROM expected_page_urls AS expected
+            LEFT JOIN jobs_db.jobs AS jobs
+              ON jobs.job_id = ? || ':' || expected.url_key
+             AND jobs.kind = ?
+            LEFT JOIN outcomes_db.page_outcomes AS outcomes
+              ON outcomes.policy_fingerprint = ?
+             AND outcomes.url_key = expected.url_key
+            ORDER BY expected.url_key
+            """,
+            (policy, expected_kind, policy),
+        ):
+            expected_payload = {
+                "url_key": str(row["url_key"]),
+                "page_url": str(row["page_url"]),
+                "host": _host_for_url(str(row["page_url"])),
+                "policy_fingerprint": policy,
+            }
+            expected_result = {
+                "url_key": str(row["url_key"]),
+                "policy_fingerprint": policy,
+            }
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                result_payload = json.loads(str(row["result_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "page fetch job store membership mismatch"
+                ) from error
+            if (
+                str(row["job_id"]) != f"{policy}:{row['url_key']}"
+                or payload != expected_payload
+                or result_payload != expected_result
+                or str(row["status"]) != str(row["outcome_status"])
+                or row["owner"] is not None
+                or row["lease_expires"] is not None
+                or row["lease_id"] is not None
+            ):
+                raise ValueError(
+                    "page fetch job store membership mismatch"
+                )
+
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {
+                    "schema_version": FETCH_SCHEMA_VERSION,
+                    "policy_fingerprint": policy,
+                    **counts,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for row in connection.execute(
+            """
+            SELECT url_key, page_url, status, payload_sha256
+            FROM outcomes_db.page_outcomes
+            WHERE policy_fingerprint = ?
+            ORDER BY url_key
+            """,
+            (policy,),
+        ):
+            digest.update(
+                json.dumps(
+                    list(row),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        for row in connection.execute(
+            """
+            SELECT url_key, reference_key, entity_id,
+                   source_table_id, row_id_json
+            FROM expected_page_refs
+            ORDER BY url_key, reference_key
+            """
+        ):
+            digest.update(
+                json.dumps(
+                    list(row),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+
+    for outcome in PageOutcomeStore(result.outcomes_path).iter(
+        result.policy_fingerprint
+    ):
+        canonical = {
+            "policy_fingerprint": outcome["policy_fingerprint"],
+            "url_key": outcome["url_key"],
+            "page_url": outcome["page_url"],
+            "status": outcome["status"],
+            "final_url": outcome["final_url"],
+            "text": outcome["text"],
+            "image_urls": outcome["image_urls"],
+            "error_class": outcome["error_class"],
+            "http_status": outcome["http_status"],
+        }
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != outcome[
+            "payload_sha256"
+        ]:
+            raise ValueError("page fetch outcome checksum mismatch")
+
+    progress = json.loads(
+        Path(result.progress_path).read_text(encoding="utf-8")
+    )
+    expected_progress = {
+        "policy_fingerprint": result.policy_fingerprint,
+        "unique": counts["unique"],
+        "success": counts["success"],
+        "terminal": counts["terminal"],
+        "pending": 0,
+        "leased": 0,
+        "remaining": 0,
+        "complete": True,
+        "inflight": 0,
+    }
+    if any(progress.get(key) != value for key, value in expected_progress.items()):
+        raise ValueError("page fetch progress snapshot mismatch")
+    expected_failures = [
+        _sanitized_failure(
+            outcome,
+            int(outcome["affected_reference_count"]),
+        )
+        for outcome in PageOutcomeStore(result.outcomes_path).iter(
+            result.policy_fingerprint
+        )
+        if outcome["status"] == "terminal"
+    ]
+    actual_failures = []
+    with Path(result.failure_path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                actual_failures.append(json.loads(line))
+    if actual_failures != expected_failures:
+        raise ValueError("page fetch failure snapshot mismatch")
+    return {
+        **counts,
+        "identity": digest.hexdigest(),
+        "failure_records": len(expected_failures),
+    }
 
 
 def iter_page_outcomes(
