@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from build_mm_joinability_dataset import ExtractionCache
 from wdc200k_io import SqliteJobStore
+import wdc200k_models as models
 from wdc200k_models import (
     AssetStageBarrier,
     MODEL_PARSER_SCHEMA_VERSION,
@@ -179,6 +180,93 @@ def write_strict_upstream_barriers(
     return network, assets
 
 
+def write_task5_image_manifest(
+    root: Path,
+    *,
+    content: bytes = b"FIRST",
+    declared_sha256: str | None = None,
+    create_file: bool = True,
+) -> tuple[Path, AssetStageBarrier, Path]:
+    from dataclasses import asdict
+    from wdc200k_io import AtomicJsonlShard
+
+    assets_root = root / "assets"
+    content_sha256 = hashlib.sha256(content).hexdigest()
+    image_path = (
+        assets_root / "images" / f"image_{content_sha256}.jpg"
+    )
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    if create_file:
+        image_path.write_bytes(content)
+    image_record = asset("verified-image", "image")
+    image_record.update(
+        {
+            "local_path": str(image_path),
+            "file_name": image_path.name,
+            "relative_path": f"images/{image_path.name}",
+            "sha256": declared_sha256 or content_sha256,
+        }
+    )
+    asset_writer = AtomicJsonlShard(
+        assets_root / "bridge_assets" / "part-00000.jsonl"
+    )
+    asset_writer.write(image_record)
+    asset_shard = asdict(asset_writer.commit())
+    asset_shard["path"] = "bridge_assets/part-00000.jsonl"
+    link_writer = AtomicJsonlShard(
+        assets_root / "table_asset_links" / "part-00000.jsonl"
+    )
+    link_writer.write(
+        {
+            "source_table_id": "table-1",
+            "row_id": 0,
+            "entity_id": "entity-verified-image",
+            "asset_ids": ["verified-image"],
+        }
+    )
+    link_shard = asdict(link_writer.commit())
+    link_shard["path"] = "table_asset_links/part-00000.jsonl"
+    manifest = assets_root / "asset-materialization-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_asset_materialization",
+                "fingerprint": task5_fingerprint(),
+                "bridge_asset_shards": [asset_shard],
+                "table_asset_link_shards": [link_shard],
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest, task5_barrier(), image_path
+
+
+def write_strict_ready_marker(
+    path: Path,
+    jobset,
+    *,
+    run_fingerprint: str,
+    start_fingerprint: str,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_model_ready",
+                "schema_version": "wdc200k-model-markers-v1",
+                "status": "vllm_servers_ready",
+                "run_fingerprint": run_fingerprint,
+                "text_jobset_fingerprint": jobset.text_fingerprint,
+                "image_jobset_fingerprint": jobset.image_fingerprint,
+                "text_task_count": jobset.text_tasks,
+                "image_task_count": jobset.image_tasks,
+                "start_fingerprint": start_fingerprint,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class CountingExtractor:
     def __init__(self, *, fail: bool = False, delay: float = 0.0) -> None:
         self.asset_ids: list[str] = []
@@ -216,6 +304,23 @@ def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:
     )
     text_done = tmp_path / "text-done.json"
     image_done = tmp_path / "image-done.json"
+    network, assets_manifest = write_strict_upstream_barriers(tmp_path)
+    start = tmp_path / "start.json"
+    ready = tmp_path / "ready.json"
+    start_fingerprint = write_model_start_marker(
+        start,
+        jobset,
+        network_manifests=[network],
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        run_fingerprint="run-v1",
+    )
+    write_strict_ready_marker(
+        ready,
+        jobset,
+        run_fingerprint="run-v1",
+        start_fingerprint=start_fingerprint,
+    )
 
     first = run_model_stage(
         store,
@@ -224,22 +329,41 @@ def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:
         output_root=tmp_path / "outputs",
         text_done_marker=text_done,
         image_done_marker=image_done,
+        start_marker=start,
+        ready_marker=ready,
+        network_manifests=[network],
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
         run_fingerprint="run-v1",
     )
     assert first.complete is False
     assert text_done.exists()
     assert not image_done.exists()
+    text_done_payload = json.loads(text_done.read_text(encoding="utf-8"))
+    assert text_done_payload["stage"] == "wdc200k_model_done"
+    assert text_done_payload["schema_version"] == (
+        "wdc200k-model-markers-v1"
+    )
+    assert text_done_payload["start_fingerprint"] == start_fingerprint
     second = run_model_stage(
         store,
         extractor,
         output_root=tmp_path / "outputs",
         text_done_marker=text_done,
         image_done_marker=image_done,
+        start_marker=start,
+        ready_marker=ready,
+        network_manifests=[network],
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
         run_fingerprint="run-v1",
     )
 
     assert second.complete is True
     assert image_done.exists()
+    assert json.loads(image_done.read_text(encoding="utf-8"))[
+        "start_fingerprint"
+    ] == start_fingerprint
     assert Counter(extractor.asset_ids) == {"a": 1, "b": 1}
     assert validate_model_stage(second)
     mtimes = {
@@ -322,6 +446,92 @@ def test_resume_manifest_rejects_record_provenance_even_with_new_checksum(
     shard["bytes"] = len(encoded)
     shard["sha256"] = hashlib.sha256(encoded).hexdigest()
     result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert validate_model_stage(result) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    [
+        ("model_call_key", "f" * 64),
+        ("cache_key", "forged-cache-key"),
+        ("asset_fingerprint", "e" * 64),
+        ("entity_prompt_fingerprint", "d" * 64),
+        ("candidate_attribute_names", ["Forged"]),
+    ],
+)
+def test_resume_manifest_rejects_exact_payload_field_forgery(
+    tmp_path: Path,
+    field: str,
+    forged_value: object,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    path = result.extraction_paths[0]
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["job_kind"] == jobset.text_kind
+    assert len(record["payload_sha256"]) == 64
+    record[field] = forged_value
+    encoded = (
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    path.write_bytes(encoded)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    shard = manifest["extraction_shards"][0]
+    shard["bytes"] = len(encoded)
+    shard["sha256"] = hashlib.sha256(encoded).hexdigest()
+    result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert validate_model_stage(result) is False
+
+
+def test_resume_manifest_rejects_tampered_durable_payload_hash(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    with sqlite3.connect(store.path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id = ?",
+                (jobset.jobs[0].job_id,),
+            ).fetchone()[0]
+        )
+        payload["entity"]["cell_text"] = "tampered after enqueue"
+        connection.execute(
+            "UPDATE jobs SET payload_json = ? WHERE job_id = ?",
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                jobset.jobs[0].job_id,
+            ),
+        )
 
     assert validate_model_stage(result) is False
 
@@ -1394,6 +1604,9 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
         run_fingerprint="run-v1",
     )
     payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["stage"] == "wdc200k_model_start"
+    assert payload["schema_version"] == "wdc200k-model-markers-v1"
+    assert len(payload["start_fingerprint"]) == 64
     assert payload["text_task_count"] == 1
     assert payload["image_task_count"] == 1
     assert payload["run_fingerprint"] == "run-v1"
@@ -1414,16 +1627,19 @@ def test_model_stage_owns_start_ready_marker_handshake(
         args=model_args(),
         input_fingerprint="assets-v1",
     )
-    ready.write_text(
-        json.dumps(
-            {
-                "status": "vllm_servers_ready",
-                "run_fingerprint": "run-v1",
-                "text_jobset_fingerprint": jobset.text_fingerprint,
-                "image_jobset_fingerprint": jobset.image_fingerprint,
-            }
-        ),
-        encoding="utf-8",
+    start_fingerprint = write_model_start_marker(
+        start,
+        jobset,
+        network_manifests=[network],
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        run_fingerprint="run-v1",
+    )
+    write_strict_ready_marker(
+        ready,
+        jobset,
+        run_fingerprint="run-v1",
+        start_fingerprint=start_fingerprint,
     )
 
     result = run_model_stage(
@@ -1437,6 +1653,7 @@ def test_model_stage_owns_start_ready_marker_handshake(
         assets_manifest=assets_manifest,
         assets_barrier=task5_barrier(),
         run_fingerprint="run-v1",
+        ready_timeout_seconds=1,
     )
 
     assert result.complete is True
@@ -1485,6 +1702,66 @@ def test_ready_marker_requires_exact_status_and_kind(tmp_path: Path) -> None:
         run_fingerprint="run-v1",
         text_jobset_fingerprint="text-v1",
         image_jobset_fingerprint="image-v1",
+    )
+
+
+def test_model_markers_require_schema_stage_and_start_identity(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    base = {
+        "status": "vllm_servers_ready",
+        "run_fingerprint": "run-v1",
+        "text_jobset_fingerprint": "text-v1",
+        "image_jobset_fingerprint": "image-v1",
+        "text_task_count": 2,
+        "image_task_count": 3,
+        "start_fingerprint": "a" * 64,
+    }
+    ready.write_text(json.dumps(base), encoding="utf-8")
+    assert not marker_matches(
+        ready,
+        expected_stage="wdc200k_model_ready",
+        expected_status="vllm_servers_ready",
+        run_fingerprint="run-v1",
+        text_jobset_fingerprint="text-v1",
+        image_jobset_fingerprint="image-v1",
+        text_task_count=2,
+        image_task_count=3,
+        start_fingerprint="a" * 64,
+    )
+
+    ready.write_text(
+        json.dumps(
+            {
+                **base,
+                "stage": "wdc200k_model_ready",
+                "schema_version": "wdc200k-model-markers-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert marker_matches(
+        ready,
+        expected_stage="wdc200k_model_ready",
+        expected_status="vllm_servers_ready",
+        run_fingerprint="run-v1",
+        text_jobset_fingerprint="text-v1",
+        image_jobset_fingerprint="image-v1",
+        text_task_count=2,
+        image_task_count=3,
+        start_fingerprint="a" * 64,
+    )
+    assert not marker_matches(
+        ready,
+        expected_stage="wdc200k_model_ready",
+        expected_status="vllm_servers_ready",
+        run_fingerprint="run-v1",
+        text_jobset_fingerprint="text-v1",
+        image_jobset_fingerprint="image-v1",
+        text_task_count=2,
+        image_task_count=3,
+        start_fingerprint="b" * 64,
     )
 
 
@@ -1711,6 +1988,96 @@ def test_enqueue_from_strict_task5_manifest_with_factory(
     assert jobset.image_tasks == 0
 
 
+@pytest.mark.parametrize(
+    ("declared_sha256", "create_file"),
+    [
+        ("f" * 64, True),
+        (None, False),
+    ],
+)
+def test_task5_image_enqueue_rejects_missing_or_mismatched_bytes(
+    tmp_path: Path,
+    declared_sha256: str | None,
+    create_file: bool,
+) -> None:
+    manifest, barrier, _image_path = write_task5_image_manifest(
+        tmp_path,
+        declared_sha256=declared_sha256,
+        create_file=create_file,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="image.*(missing|hash|content-addressed)",
+    ):
+        enqueue_model_tasks_from_manifest(
+            manifest,
+            SqliteJobStore(tmp_path / "models.sqlite3"),
+            args=model_args(),
+            assets_barrier=barrier,
+            input_fingerprint="task5-images",
+            task_factory=lambda current_asset: current_asset,
+        )
+
+
+def test_task5_image_bytes_are_fingerprinted_and_rechecked_before_model_call(
+    tmp_path: Path,
+) -> None:
+    manifest, barrier, image_path = write_task5_image_manifest(tmp_path)
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks_from_manifest(
+        manifest,
+        store,
+        args=model_args(),
+        assets_barrier=barrier,
+        input_fingerprint="task5-images",
+        task_factory=lambda current_asset: current_asset,
+    )
+    expected = hashlib.sha256(b"FIRST").hexdigest()
+    with sqlite3.connect(store.path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id = ?",
+                (jobset.jobs[0].job_id,),
+            ).fetchone()[0]
+        )
+    assert payload["asset"]["verified_content_sha256"] == expected
+    assert jobset.jobs[0].asset_fingerprint == hashlib.sha256(
+        json.dumps(
+            payload["asset"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    image_path.write_bytes(b"SECOND")
+    extractor = CountingExtractor()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert extractor.asset_ids == []
+    assert result.success == 0
+    assert result.terminal == 1
+    terminal = json.loads(
+        result.error_paths[0].read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert "image content hash changed" in terminal["error"]
+    with pytest.raises(ValueError, match="image.*hash"):
+        enqueue_model_tasks_from_manifest(
+            manifest,
+            SqliteJobStore(tmp_path / "second.sqlite3"),
+            args=model_args(),
+            assets_barrier=barrier,
+            input_fingerprint="same-json-second-bytes",
+            task_factory=lambda current_asset: current_asset,
+        )
+
+
 def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     tmp_path: Path,
 ) -> None:
@@ -1813,9 +2180,10 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     structural_manifest.parent.mkdir(parents=True, exist_ok=True)
     structural_manifest.write_text(
         json.dumps(
-            {
-                "stage": "wdc200k_structural",
-                "input_fingerprint": "selection-v1",
+                {
+                    "stage": "wdc200k_structural",
+                    "schema_version": "wdc200k-structural-v2",
+                    "input_fingerprint": "selection-v1",
                 "parameter_fingerprint": "structural-v2",
                 "completed_shards": completed,
                 "complete": True,
@@ -1845,9 +2213,10 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     ).hexdigest()
     final_manifest.write_text(
         json.dumps(
-            {
-                "stage": "wdc200k_validated_selection",
-                "input_fingerprint": stable_hash(
+                {
+                    "stage": "wdc200k_validated_selection",
+                    "schema_version": "wdc200k-structural-v2",
+                    "input_fingerprint": stable_hash(
                     "wdc200k-structural-v2",
                     (
                         f"{structural_manifest.resolve()}:"
@@ -1865,6 +2234,24 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
             }
         ),
         encoding="utf-8",
+    )
+    structural_key = structural_manifest.resolve().as_posix()
+    structural_barrier = models.StructuralStageBarrier(
+        schema_version="wdc200k-structural-v2",
+        manifest_count=1,
+        manifest_sha256={
+            structural_key: structural_manifest_sha,
+        },
+        input_fingerprints={
+            structural_key: "selection-v1",
+        },
+        parameter_fingerprints={
+            structural_key: "structural-v2",
+        },
+        final_manifest_sha256=hashlib.sha256(
+            final_manifest.read_bytes()
+        ).hexdigest(),
+        final_selection=final_completed,
     )
 
     assets_root = tmp_path / "assets"
@@ -1905,6 +2292,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         structural_output_root=structural_root,
         structural_manifests=[structural_manifest],
         finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
         assets_manifest=assets_manifest,
         assets_barrier=task5_barrier(),
         output_root=tmp_path / "adapted",
@@ -1924,14 +2312,32 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         == "entity-alpha"
     )
 
-    corrupted = json.loads(final_manifest.read_text(encoding="utf-8"))
-    corrupted["input_fingerprint"] = "foreign-structural-set"
-    final_manifest.write_text(json.dumps(corrupted), encoding="utf-8")
-    with pytest.raises(ValueError, match="fingerprint"):
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="structural.*schema"):
         adapt_model_tasks_from_manifests(
             structural_output_root=structural_root,
             structural_manifests=[structural_manifest],
             finalized_selection_manifest=final_manifest,
+            structural_barrier=replace(
+                structural_barrier,
+                schema_version="arbitrary-structural-v2",
+            ),
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=tmp_path / "bad-schema-adapted",
+            args=model_args(),
+        )
+
+    corrupted = json.loads(final_manifest.read_text(encoding="utf-8"))
+    corrupted["input_fingerprint"] = "foreign-structural-set"
+    final_manifest.write_text(json.dumps(corrupted), encoding="utf-8")
+    with pytest.raises(ValueError, match="(fingerprint|checksum)"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
             assets_manifest=assets_manifest,
             assets_barrier=task5_barrier(),
             output_root=tmp_path / "corrupt-adapted",

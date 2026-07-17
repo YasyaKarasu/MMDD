@@ -722,6 +722,7 @@ def _validated_shard_from_manifest(
         ) from error
     if (
         payload.get("stage") != "wdc200k_structural"
+        or payload.get("schema_version") != STRUCTURAL_SCHEMA_VERSION
         or payload.get("complete") is not True
     ):
         raise StructuralExpansionError(
@@ -902,6 +903,7 @@ def finalize_validated_selection(
             target_tables,
             length=40,
         ),
+        schema_version=STRUCTURAL_SCHEMA_VERSION,
     )
     final_manifest: StageManifest | None = None
     if manifest_path.exists():
@@ -1133,6 +1135,7 @@ def expand_selected_shard(
             CONTENT_HASH_SEMANTICS,
             length=40,
         ),
+        schema_version=STRUCTURAL_SCHEMA_VERSION,
     )
     try:
         manifest = StageManifest(paths.manifest, fingerprint)

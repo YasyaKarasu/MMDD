@@ -122,15 +122,18 @@ class StageFingerprint:
     stage: str
     input_fingerprint: str
     parameter_fingerprint: str
+    schema_version: str = ""
 
     @property
     def digest(self) -> str:
-        return stable_hash(
+        values = (
             self.stage,
             self.input_fingerprint,
             self.parameter_fingerprint,
-            length=40,
         )
+        if self.schema_version:
+            values = (*values, self.schema_version)
+        return stable_hash(*values, length=40)
 
 
 class StageManifest:
@@ -178,6 +181,7 @@ class StageManifest:
             stage=str(payload["stage"]),
             input_fingerprint=str(payload["input_fingerprint"]),
             parameter_fingerprint=str(payload["parameter_fingerprint"]),
+            schema_version=str(payload.get("schema_version", "")),
         )
         if stored_fingerprint != self.fingerprint:
             raise ValueError(
@@ -217,6 +221,8 @@ class StageManifest:
             },
             "complete": self.complete,
         }
+        if self.fingerprint.schema_version:
+            payload["schema_version"] = self.fingerprint.schema_version
         try:
             with temporary_path.open("w", encoding="utf-8") as handle:
                 json.dump(

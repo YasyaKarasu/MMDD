@@ -177,6 +177,9 @@ def test_structural_expansion_preserves_all_rows_and_removes_image(
         output_root=tmp_path / "structural",
         input_root=tmp_path,
     )
+    assert read_manifest(result.manifest)["schema_version"] == (
+        "wdc200k-structural-v2"
+    )
 
     source = read_records(result.source_tables)[0]
     assert len(source["rows"]) == 37
@@ -467,6 +470,9 @@ def test_global_finalize_is_exact_validated_and_idempotent(
         manifests,
         output_root=output_root,
         target_tables=2,
+    )
+    assert read_manifest(finalized.manifest)["schema_version"] == (
+        "wdc200k-structural-v2"
     )
     records = read_records(finalized.validated_selection)
     assert len(records) == 2

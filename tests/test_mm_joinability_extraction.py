@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import signal
 import subprocess
 import sys
@@ -43,6 +45,65 @@ from run_mm_joinability_dynamic_vllm import (
     wait_for_any_marker_or_builder_exit,
     wait_for_marker_or_builder_exit,
 )
+
+
+def strict_start_marker(
+    *,
+    run_fingerprint: str,
+    text_tasks: int,
+    image_tasks: int,
+    text_jobset: str = "text-v1",
+    image_jobset: str = "image-v1",
+) -> dict:
+    payload = {
+        "stage": "wdc200k_model_start",
+        "schema_version": "wdc200k-model-markers-v1",
+        "status": "model_cache_ready_to_start",
+        "run_fingerprint": run_fingerprint,
+        "text_jobset_fingerprint": text_jobset,
+        "image_jobset_fingerprint": image_jobset,
+        "text_task_count": text_tasks,
+        "image_task_count": image_tasks,
+        "upstream_manifests": [],
+    }
+    payload["start_fingerprint"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def strict_done_marker(
+    *,
+    model_kind: str,
+    run_fingerprint: str,
+    start_fingerprint: str,
+    text_tasks: int = 1,
+    image_tasks: int = 1,
+    text_jobset: str = "text-v1",
+    image_jobset: str = "image-v1",
+) -> dict:
+    task_count = text_tasks if model_kind == "text" else image_tasks
+    jobset = text_jobset if model_kind == "text" else image_jobset
+    return {
+        "stage": "wdc200k_model_done",
+        "schema_version": "wdc200k-model-markers-v1",
+        "status": f"{model_kind}_model_cache_precomputed",
+        "model_kind": model_kind,
+        "task_count": task_count,
+        f"{model_kind}_task_count": task_count,
+        "jobset_fingerprint": jobset,
+        "run_fingerprint": run_fingerprint,
+        "text_jobset_fingerprint": text_jobset,
+        "image_jobset_fingerprint": image_jobset,
+        "text_task_count": text_tasks,
+        "image_task_count": image_tasks,
+        "start_fingerprint": start_fingerprint,
+    }
 
 
 def test_prompt_version_invalidates_cache_after_image_prompt_changes():
@@ -850,7 +911,13 @@ def test_start_server_passes_vllm_output_through_to_tmux(monkeypatch):
 def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
     marker = tmp_path / "start.json"
     marker.write_text(
-        '{"status":"model_cache_ready_to_start","run_fingerprint":"stale","text_task_count":1,"image_task_count":1}',
+        json.dumps(
+            strict_start_marker(
+                run_fingerprint="stale",
+                text_tasks=1,
+                image_tasks=1,
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -862,7 +929,13 @@ def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"status":"model_cache_ready_to_start","run_fingerprint":"current","text_task_count":1,"image_task_count":1}',
+            json.dumps(
+                strict_start_marker(
+                    run_fingerprint="current",
+                    text_tasks=1,
+                    image_tasks=1,
+                )
+            ),
             encoding="utf-8",
         )
 
@@ -882,8 +955,15 @@ def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
 
 def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
     marker = tmp_path / "text-done.json"
+    start_fingerprint = "a" * 64
     marker.write_text(
-        '{"status":"text_model_cache_precomputed","run_fingerprint":"stale","model_kind":"text","task_count":1}',
+        json.dumps(
+            strict_done_marker(
+                model_kind="text",
+                run_fingerprint="stale",
+                start_fingerprint=start_fingerprint,
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -895,7 +975,13 @@ def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"status":"text_model_cache_precomputed","run_fingerprint":"current","model_kind":"text","task_count":1}',
+            json.dumps(
+                strict_done_marker(
+                    model_kind="text",
+                    run_fingerprint="current",
+                    start_fingerprint=start_fingerprint,
+                )
+            ),
             encoding="utf-8",
         )
 
@@ -915,8 +1001,16 @@ def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
 
 def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
     marker = tmp_path / "image-done.json"
+    start_fingerprint = "a" * 64
     marker.write_text(
-        '{"status":"image_model_cache_precomputed","run_fingerprint":"current","jobset_fingerprint":"old","model_kind":"image","task_count":1}',
+        json.dumps(
+            strict_done_marker(
+                model_kind="image",
+                run_fingerprint="current",
+                start_fingerprint=start_fingerprint,
+                image_jobset="old",
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -928,7 +1022,14 @@ def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"status":"image_model_cache_precomputed","run_fingerprint":"current","jobset_fingerprint":"image-v2","model_kind":"image","task_count":1}',
+            json.dumps(
+                strict_done_marker(
+                    model_kind="image",
+                    run_fingerprint="current",
+                    start_fingerprint=start_fingerprint,
+                    image_jobset="image-v2",
+                )
+            ),
             encoding="utf-8",
         )
 
@@ -966,6 +1067,50 @@ def test_dynamic_done_marker_requires_exact_status_kind_and_count(tmp_path):
     )
 
 
+def test_dynamic_markers_reject_legacy_and_ready_binds_start(
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "status": "text_model_cache_precomputed",
+                "model_kind": "text",
+                "task_count": 1,
+                "run_fingerprint": "run-v1",
+                "jobset_fingerprint": "text-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not marker_matches_run(
+        legacy,
+        "run-v1",
+        "text-v1",
+        expected_status="text_model_cache_precomputed",
+        expected_model_kind="text",
+        expected_task_count=1,
+    )
+
+    ready = tmp_path / "ready.json"
+    runner.write_ready_marker(
+        ready,
+        run_fingerprint="run-v1",
+        text_jobset_fingerprint="text-v1",
+        image_jobset_fingerprint="image-v1",
+        text_task_count=2,
+        image_task_count=3,
+        start_fingerprint="a" * 64,
+    )
+    payload = json.loads(ready.read_text(encoding="utf-8"))
+    assert payload["stage"] == "wdc200k_model_ready"
+    assert payload["schema_version"] == "wdc200k-model-markers-v1"
+    assert payload["start_fingerprint"] == "a" * 64
+    assert not ready.with_suffix(".json.tmp").exists()
+
+
 def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypatch, tmp_path):
     events = []
 
@@ -978,23 +1123,41 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
                 events.append("builder_started")
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
+                start_payload = strict_start_marker(
+                    run_fingerprint="",
+                    text_tasks=1,
+                    image_tasks=1,
+                )
                 marker.write_text(
-                    '{"status":"model_cache_ready_to_start",'
-                    '"text_task_count":1,"image_task_count":1}',
+                    json.dumps(start_payload),
                     encoding="utf-8",
                 )
                 Path(
                     command[command.index("--model_text_done_marker") + 1]
                 ).write_text(
-                    '{"status":"text_model_cache_precomputed",'
-                    '"model_kind":"text","task_count":1}',
+                    json.dumps(
+                        strict_done_marker(
+                            model_kind="text",
+                            run_fingerprint="",
+                            start_fingerprint=start_payload[
+                                "start_fingerprint"
+                            ],
+                        )
+                    ),
                     encoding="utf-8",
                 )
                 Path(
                     command[command.index("--model_image_done_marker") + 1]
                 ).write_text(
-                    '{"status":"image_model_cache_precomputed",'
-                    '"model_kind":"image","task_count":1}',
+                    json.dumps(
+                        strict_done_marker(
+                            model_kind="image",
+                            run_fingerprint="",
+                            start_fingerprint=start_payload[
+                                "start_fingerprint"
+                            ],
+                        )
+                    ),
                     encoding="utf-8",
                 )
             else:
@@ -1043,8 +1206,13 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"status":"model_cache_ready_to_start",'
-                    '"text_task_count": 0, "image_task_count": 0}',
+                    json.dumps(
+                        strict_start_marker(
+                            run_fingerprint="",
+                            text_tasks=0,
+                            image_tasks=0,
+                        )
+                    ),
                     encoding="utf-8",
                 )
             else:
@@ -1104,8 +1272,13 @@ def test_dynamic_vllm_signal_path_stops_builder_and_all_started_models(
                 )
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"status":"model_cache_ready_to_start",'
-                    '"text_task_count":1,"image_task_count":1}',
+                    json.dumps(
+                        strict_start_marker(
+                            run_fingerprint="",
+                            text_tasks=1,
+                            image_tasks=1,
+                        )
+                    ),
                     encoding="utf-8",
                 )
 
@@ -1182,8 +1355,13 @@ def test_dynamic_vllm_masks_signal_handlers_during_best_effort_cleanup(
                 )
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"status":"model_cache_ready_to_start",'
-                    '"text_task_count":1,"image_task_count":1}',
+                    json.dumps(
+                        strict_start_marker(
+                            run_fingerprint="",
+                            text_tasks=1,
+                            image_tasks=1,
+                        )
+                    ),
                     encoding="utf-8",
                 )
 

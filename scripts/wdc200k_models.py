@@ -70,6 +70,11 @@ MODEL_QUEUE_SCHEMA_VERSION = "wdc200k-model-queues-v1"
 MODEL_OUTPUT_SCHEMA_VERSION = "wdc200k-model-outputs-v1"
 MODEL_POLICY_VERSION = "existing-extraction-semantics-v1"
 MODEL_PARSER_SCHEMA_VERSION = "connection-evidence-parser-v1"
+MODEL_MARKER_SCHEMA_VERSION = "wdc200k-model-markers-v1"
+MODEL_START_STAGE = "wdc200k_model_start"
+MODEL_READY_STAGE = "wdc200k_model_ready"
+MODEL_DONE_STAGE = "wdc200k_model_done"
+STRUCTURAL_STAGE_SCHEMA_VERSION = "wdc200k-structural-v2"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
 
@@ -163,6 +168,74 @@ class AssetStageBarrier:
             raise ValueError("Task-5 barrier counts must be non-negative")
 
 
+@dataclass(frozen=True)
+class StructuralStageBarrier:
+    """Exact Task-3 manifest set and finalized-selection identity."""
+
+    schema_version: str
+    manifest_count: int
+    manifest_sha256: dict[str, str]
+    input_fingerprints: dict[str, str]
+    parameter_fingerprints: dict[str, str]
+    final_manifest_sha256: str
+    final_selection: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        mappings = (
+            self.manifest_sha256,
+            self.input_fingerprints,
+            self.parameter_fingerprints,
+        )
+        if not all(isinstance(value, dict) for value in mappings):
+            raise TypeError(
+                "structural barrier manifest identities must be objects"
+            )
+        normalized = tuple(
+            {
+                str(key): str(value)
+                for key, value in sorted(mapping.items())
+            }
+            for mapping in mappings
+        )
+        key_sets = tuple(set(mapping) for mapping in normalized)
+        if (
+            self.manifest_count <= 0
+            or len(normalized[0]) != self.manifest_count
+            or key_sets[0] != key_sets[1]
+            or key_sets[0] != key_sets[2]
+        ):
+            raise ValueError("structural barrier manifest set/count mismatch")
+        if any(
+            not value
+            for mapping in normalized[1:]
+            for value in mapping.values()
+        ):
+            raise ValueError("structural barrier fingerprint is empty")
+        if any(
+            not _is_sha256(value) for value in normalized[0].values()
+        ):
+            raise ValueError("structural barrier manifest checksum is invalid")
+        if not _is_sha256(self.final_manifest_sha256):
+            raise ValueError("structural barrier final checksum is invalid")
+        if not isinstance(self.final_selection, dict):
+            raise TypeError(
+                "structural barrier final selection must be an object"
+            )
+        final_selection = json.loads(_canonical_json(self.final_selection))
+        if (
+            set(final_selection) != {"path", "records", "bytes", "sha256"}
+            or not clean_text(final_selection.get("path"))
+            or int(final_selection.get("records", -1)) < 0
+            or int(final_selection.get("bytes", -1)) < 0
+            or not _is_sha256(str(final_selection.get("sha256", "")))
+        ):
+            raise ValueError("structural barrier final selection is invalid")
+        object.__setattr__(self, "manifest_sha256", normalized[0])
+        object.__setattr__(self, "input_fingerprints", normalized[1])
+        object.__setattr__(self, "parameter_fingerprints", normalized[2])
+        object.__setattr__(self, "final_selection", final_selection)
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30.0)
     connection.row_factory = sqlite3.Row
@@ -188,6 +261,49 @@ def _sha256_path(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value.lower()
+    )
+
+
+def _verify_task5_asset_bytes(record: dict[str, Any]) -> dict[str, Any]:
+    verified = dict(record)
+    if clean_text(verified.get("asset_type")) != "image":
+        return verified
+    local_path = Path(clean_text(verified.get("local_path")))
+    declared = clean_text(verified.get("sha256")).lower()
+    if not local_path.is_file():
+        raise ValueError("Task-5 image local_path is missing")
+    if not _is_sha256(declared):
+        raise ValueError("Task-5 image declared hash is invalid")
+    if (
+        local_path.name != clean_text(verified.get("file_name"))
+        or not local_path.name.startswith(f"image_{declared}.")
+    ):
+        raise ValueError("Task-5 image path is not content-addressed")
+    actual = _sha256_path(local_path)
+    if actual != declared:
+        raise ValueError("Task-5 image content hash mismatch")
+    verified["verified_content_sha256"] = actual
+    return verified
+
+
+def _image_evidence_error(payload: dict[str, Any]) -> str:
+    asset = payload.get("asset")
+    if not isinstance(asset, dict) or asset.get("asset_type") != "image":
+        return ""
+    verified = clean_text(asset.get("verified_content_sha256")).lower()
+    if not verified:
+        return ""
+    local_path = Path(clean_text(asset.get("local_path")))
+    if not local_path.is_file():
+        return "image content hash changed since enqueue: file is missing"
+    if _sha256_path(local_path) != verified:
+        return "image content hash changed since enqueue"
+    return ""
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1449,6 +1565,26 @@ def _process_claimed_group(
     ) as heartbeat:
         for job in claimed:
             payload = job.payload
+            evidence_error = _image_evidence_error(payload)
+            if evidence_error:
+                if _fenced_commit_model_record(
+                    store.path,
+                    job=job,
+                    expected_kind=job.kind,
+                    payload=payload,
+                    record={
+                        "attributes": [],
+                        "raw_response": "",
+                        "error": evidence_error,
+                        "error_class": "image_evidence_changed",
+                    },
+                    status="terminal",
+                    heartbeat=heartbeat,
+                    after_cache_write=after_cache_write,
+                    after_result_write=after_result_write,
+                ):
+                    handled += 1
+                continue
             cached = cache.get(payload)
             if cached is None:
                 model_jobs.append(job)
@@ -1851,11 +1987,13 @@ def _load_valid_manifest(
                         durable = connection.execute(
                             """
                             SELECT results.status,
+                                   results.record_json,
                                    results.record_sha256,
                                    results.jobset_fingerprint,
                                    results.modality,
                                    results.committed,
                                    jobs.kind,
+                                   jobs.payload_json,
                                    members.payload_sha256
                             FROM model_results AS results
                             JOIN jobs USING (job_id)
@@ -1867,21 +2005,58 @@ def _load_valid_manifest(
                             """,
                             (job_id,),
                         ).fetchone()
-                        record_digest = hashlib.sha256(
-                            _canonical_json(record).encode("utf-8")
-                        ).hexdigest()
                         modality = str(record["modality"])
+                        if durable is None:
+                            raise ValueError(
+                                "model output does not match its durable "
+                                "member/result"
+                            )
+                        payload_encoded = str(durable["payload_json"])
+                        payload_digest = hashlib.sha256(
+                            payload_encoded.encode("utf-8")
+                        ).hexdigest()
+                        try:
+                            task_payload = json.loads(payload_encoded)
+                            durable_record = _decode_checked(
+                                str(durable["record_json"]),
+                                str(durable["record_sha256"]),
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError) as error:
+                            raise ValueError(
+                                "durable model payload/result is invalid"
+                            ) from error
+                        if not isinstance(task_payload, dict):
+                            raise ValueError(
+                                "durable model payload is not an object"
+                            )
+                        expected_kind = jobset.kind_for(modality)
+                        expected_jobset = jobset.fingerprint_for(modality)
+                        expected_record = {
+                            **durable_record,
+                            "job_kind": expected_kind,
+                            "payload_sha256": payload_digest,
+                        }
                         if (
-                            durable is None
-                            or str(durable["status"]) != status
-                            or str(durable["record_sha256"])
-                            != record_digest
+                            str(durable["status"]) != status
                             or str(durable["jobset_fingerprint"])
-                            != jobset.fingerprint_for(modality)
+                            != expected_jobset
                             or str(durable["modality"]) != modality
                             or int(durable["committed"]) != 1
-                            or str(durable["kind"])
-                            != jobset.kind_for(modality)
+                            or str(durable["kind"]) != expected_kind
+                            or str(durable["payload_sha256"])
+                            != payload_digest
+                            or task_payload.get("job_id") != job_id
+                            or task_payload.get("jobset_fingerprint")
+                            != expected_jobset
+                            or task_payload.get("modality") != modality
+                            or record.get("job_kind") != expected_kind
+                            or record.get("payload_sha256")
+                            != payload_digest
+                            or not _record_matches_payload(
+                                record, task_payload
+                            )
+                            or _canonical_json(record)
+                            != _canonical_json(expected_record)
                         ):
                             raise ValueError(
                                 "model output does not match its durable "
@@ -2002,11 +2177,18 @@ def _publish_outputs(
                 for modality in ("text", "image"):
                     cursor = connection.execute(
                         """
-                        SELECT status, record_json, record_sha256
-                        FROM model_results
-                        WHERE jobset_fingerprint = ?
-                          AND committed = 1
-                        ORDER BY job_id
+                        SELECT results.status, results.record_json,
+                               results.record_sha256, jobs.kind,
+                               members.payload_sha256
+                        FROM model_results AS results
+                        JOIN jobs USING (job_id)
+                        JOIN model_job_members AS members
+                          ON members.job_id = results.job_id
+                         AND members.jobset_fingerprint =
+                             results.jobset_fingerprint
+                        WHERE results.jobset_fingerprint = ?
+                          AND results.committed = 1
+                        ORDER BY results.job_id
                         """,
                         (jobset.fingerprint_for(modality),),
                     )
@@ -2016,6 +2198,13 @@ def _publish_outputs(
                             str(row["record_json"]),
                             str(row["record_sha256"]),
                         )
+                        record = {
+                            **record,
+                            "job_kind": str(row["kind"]),
+                            "payload_sha256": str(
+                                row["payload_sha256"]
+                            ),
+                        }
                         if writers[status] is None:
                             root_name = (
                                 "attribute_extractions"
@@ -2134,6 +2323,15 @@ def run_model_stage(
     )
     owner = owner or f"model-worker-{os.getpid()}-{uuid.uuid4().hex}"
     _initialize_tables(store.path)
+    if (
+        ready_marker is not None
+        or text_done_marker is not None
+        or image_done_marker is not None
+    ) and start_marker is None:
+        raise ValueError(
+            "ready/done markers require an authoritative start marker"
+        )
+    start_fingerprint = ""
     if start_marker is not None:
         if assets_manifest is None:
             raise ValueError(
@@ -2141,7 +2339,7 @@ def run_model_stage(
             )
         if assets_barrier is None:
             raise ValueError("assets_barrier is required with start_marker")
-        write_model_start_marker(
+        start_fingerprint = write_model_start_marker(
             start_marker,
             jobset,
             network_manifests=network_manifests,
@@ -2155,6 +2353,9 @@ def run_model_stage(
                 run_fingerprint=run_fingerprint,
                 text_jobset_fingerprint=jobset.text_fingerprint,
                 image_jobset_fingerprint=jobset.image_fingerprint,
+                text_task_count=jobset.text_tasks,
+                image_task_count=jobset.image_tasks,
+                start_fingerprint=start_fingerprint,
                 timeout_seconds=ready_timeout_seconds,
             )
     persistent_cache = _PersistentCache(store.path, delegate=cache)
@@ -2214,6 +2415,11 @@ def run_model_stage(
                 ),
                 jobset_fingerprint=jobset.fingerprint_for(modality),
                 run_fingerprint=run_fingerprint,
+                text_jobset_fingerprint=jobset.text_fingerprint,
+                image_jobset_fingerprint=jobset.image_fingerprint,
+                text_task_count=jobset.text_tasks,
+                image_task_count=jobset.image_tasks,
+                start_fingerprint=start_fingerprint,
             )
     snapshot = _job_snapshot(store.path, jobset)
     complete = (
@@ -2367,7 +2573,7 @@ def write_model_start_marker(
     assets_manifest: Path,
     assets_barrier: AssetStageBarrier,
     run_fingerprint: str,
-) -> None:
+) -> str:
     """Publish exact staged counts only after upstream completion is proven."""
     if not run_fingerprint:
         raise ValueError("run_fingerprint must not be empty")
@@ -2392,19 +2598,27 @@ def write_model_start_marker(
             "sha256": _sha256_path(assets_path),
         }
     )
+    payload = {
+        "stage": MODEL_START_STAGE,
+        "schema_version": MODEL_MARKER_SCHEMA_VERSION,
+        "status": "model_cache_ready_to_start",
+        "run_fingerprint": run_fingerprint,
+        "text_jobset_fingerprint": jobset.text_fingerprint,
+        "image_jobset_fingerprint": jobset.image_fingerprint,
+        "text_task_count": jobset.text_tasks,
+        "image_task_count": jobset.image_tasks,
+        "upstream_manifests": upstream,
+    }
+    start_fingerprint = _digest_json(payload)
     _atomic_json(
         Path(path),
         {
-            "status": "model_cache_ready_to_start",
-            "run_fingerprint": run_fingerprint,
-            "text_jobset_fingerprint": jobset.text_fingerprint,
-            "image_jobset_fingerprint": jobset.image_fingerprint,
-            "text_task_count": jobset.text_tasks,
-            "image_task_count": jobset.image_tasks,
-            "upstream_manifests": upstream,
+            **payload,
+            "start_fingerprint": start_fingerprint,
             "timestamp": time.time(),
         },
     )
+    return start_fingerprint
 
 
 def write_model_done_marker(
@@ -2414,18 +2628,30 @@ def write_model_done_marker(
     task_count: int,
     jobset_fingerprint: str,
     run_fingerprint: str,
+    text_jobset_fingerprint: str,
+    image_jobset_fingerprint: str,
+    text_task_count: int,
+    image_task_count: int,
+    start_fingerprint: str,
 ) -> None:
     if model_kind not in {"text", "image"}:
         raise ValueError(f"unsupported model kind: {model_kind}")
     _atomic_json(
         Path(path),
         {
+            "stage": MODEL_DONE_STAGE,
+            "schema_version": MODEL_MARKER_SCHEMA_VERSION,
             "status": f"{model_kind}_model_cache_precomputed",
             "model_kind": model_kind,
             "task_count": task_count,
             f"{model_kind}_task_count": task_count,
             "jobset_fingerprint": jobset_fingerprint,
             "run_fingerprint": run_fingerprint,
+            "text_jobset_fingerprint": text_jobset_fingerprint,
+            "image_jobset_fingerprint": image_jobset_fingerprint,
+            "text_task_count": text_task_count,
+            "image_task_count": image_task_count,
+            "start_fingerprint": start_fingerprint,
             "timestamp": time.time(),
         },
     )
@@ -2434,6 +2660,7 @@ def write_model_done_marker(
 def marker_matches(
     path: Path,
     *,
+    expected_stage: str | None = None,
     expected_status: str | None = None,
     model_kind: str | None = None,
     task_count: int | None = None,
@@ -2441,6 +2668,9 @@ def marker_matches(
     jobset_fingerprint: str | None = None,
     text_jobset_fingerprint: str | None = None,
     image_jobset_fingerprint: str | None = None,
+    text_task_count: int | None = None,
+    image_task_count: int | None = None,
+    start_fingerprint: str | None = None,
 ) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2448,6 +2678,59 @@ def marker_matches(
         return False
     if not isinstance(payload, dict):
         return False
+    inferred_stage = expected_stage
+    if inferred_stage is None:
+        inferred_stage = {
+            "model_cache_ready_to_start": MODEL_START_STAGE,
+            "vllm_servers_ready": MODEL_READY_STAGE,
+            "text_model_cache_precomputed": MODEL_DONE_STAGE,
+            "image_model_cache_precomputed": MODEL_DONE_STAGE,
+        }.get(expected_status or "")
+    if (
+        payload.get("schema_version") != MODEL_MARKER_SCHEMA_VERSION
+        or inferred_stage is None
+        or payload.get("stage") != inferred_stage
+    ):
+        return False
+    if (
+        not isinstance(payload.get("run_fingerprint"), str)
+        or not all(
+            isinstance(payload.get(field), str) and bool(payload[field])
+            for field in (
+                "text_jobset_fingerprint",
+                "image_jobset_fingerprint",
+            )
+        )
+        or not all(
+            isinstance(payload.get(field), int)
+            and not isinstance(payload[field], bool)
+            and payload[field] >= 0
+            for field in ("text_task_count", "image_task_count")
+        )
+        or not isinstance(payload.get("start_fingerprint"), str)
+        or not _is_sha256(str(payload["start_fingerprint"]))
+    ):
+        return False
+    if inferred_stage == MODEL_START_STAGE:
+        identity = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"start_fingerprint", "timestamp"}
+        }
+        if payload["start_fingerprint"] != _digest_json(identity):
+            return False
+    if inferred_stage == MODEL_DONE_STAGE:
+        current_kind = payload.get("model_kind")
+        if (
+            current_kind not in {"text", "image"}
+            or payload.get("status")
+            != f"{current_kind}_model_cache_precomputed"
+            or payload.get("jobset_fingerprint")
+            != payload.get(f"{current_kind}_jobset_fingerprint")
+            or payload.get("task_count")
+            != payload.get(f"{current_kind}_task_count")
+        ):
+            return False
     if (
         expected_status is not None
         and payload.get("status") != expected_status
@@ -2476,6 +2759,21 @@ def marker_matches(
         != image_jobset_fingerprint
     ):
         return False
+    if (
+        text_task_count is not None
+        and payload.get("text_task_count") != text_task_count
+    ):
+        return False
+    if (
+        image_task_count is not None
+        and payload.get("image_task_count") != image_task_count
+    ):
+        return False
+    if (
+        start_fingerprint is not None
+        and payload.get("start_fingerprint") != start_fingerprint
+    ):
+        return False
     return True
 
 
@@ -2485,16 +2783,23 @@ def wait_for_model_ready_marker(
     run_fingerprint: str,
     text_jobset_fingerprint: str | None = None,
     image_jobset_fingerprint: str | None = None,
+    text_task_count: int,
+    image_task_count: int,
+    start_fingerprint: str,
     timeout_seconds: float | None = None,
     poll_seconds: float = 2.0,
 ) -> None:
     started = time.monotonic()
     while not marker_matches(
         Path(path),
+        expected_stage=MODEL_READY_STAGE,
         expected_status="vllm_servers_ready",
         run_fingerprint=run_fingerprint,
         text_jobset_fingerprint=text_jobset_fingerprint,
         image_jobset_fingerprint=image_jobset_fingerprint,
+        text_task_count=text_task_count,
+        image_task_count=image_task_count,
+        start_fingerprint=start_fingerprint,
     ):
         if (
             timeout_seconds is not None
@@ -2525,7 +2830,7 @@ def iter_assets_from_materialization_manifest(
                 if status and status != "success":
                     continue
                 if record.get("asset_type") in {"text", "image"}:
-                    yield record
+                    yield _verify_task5_asset_bytes(record)
 
 
 class _AdapterShardWriter:
@@ -2717,6 +3022,7 @@ def adapt_model_tasks_from_manifests(
     structural_output_root: Path,
     structural_manifests: Iterable[Path],
     finalized_selection_manifest: Path,
+    structural_barrier: StructuralStageBarrier,
     assets_manifest: Path,
     assets_barrier: AssetStageBarrier,
     output_root: Path,
@@ -2732,12 +3038,46 @@ def adapt_model_tasks_from_manifests(
     structural_paths = sorted(Path(path) for path in structural_manifests)
     if not structural_paths:
         raise ValueError("structural manifests are required")
+    if (
+        structural_barrier.schema_version
+        != structural.STRUCTURAL_SCHEMA_VERSION
+        or structural_barrier.schema_version
+        != STRUCTURAL_STAGE_SCHEMA_VERSION
+    ):
+        raise ValueError("structural barrier schema mismatch")
+    structural_keys = {
+        path.resolve().as_posix() for path in structural_paths
+    }
+    if (
+        len(structural_paths) != structural_barrier.manifest_count
+        or len(structural_keys) != len(structural_paths)
+        or structural_keys != set(structural_barrier.manifest_sha256)
+    ):
+        raise ValueError("structural barrier manifest set/count mismatch")
     source_paths: list[Path] = []
     entity_paths: list[Path] = []
     validated_selection_paths: list[Path] = []
     table_count = 0
     manifest_hashes: list[tuple[Path, str]] = []
     for manifest_path in structural_paths:
+        manifest_key = manifest_path.resolve().as_posix()
+        actual_manifest_sha256 = _sha256_path(manifest_path)
+        if (
+            actual_manifest_sha256
+            != structural_barrier.manifest_sha256[manifest_key]
+        ):
+            raise ValueError("structural barrier manifest checksum mismatch")
+        manifest_payload = _validated_complete_manifest(manifest_path)
+        if (
+            manifest_payload.get("stage") != "wdc200k_structural"
+            or manifest_payload.get("schema_version")
+            != structural_barrier.schema_version
+            or manifest_payload.get("input_fingerprint")
+            != structural_barrier.input_fingerprints[manifest_key]
+            or manifest_payload.get("parameter_fingerprint")
+            != structural_barrier.parameter_fingerprints[manifest_key]
+        ):
+            raise ValueError("structural barrier fingerprint mismatch")
         validated, records, manifest_hash = (
             structural._validated_shard_from_manifest(
                 manifest_path,
@@ -2749,7 +3089,7 @@ def adapt_model_tasks_from_manifests(
         manifest_hashes.append(
             (manifest_path.resolve(), manifest_hash)
         )
-        payload = _validated_complete_manifest(manifest_path)
+        payload = manifest_payload
         completed = [
             _completed_from_payload(item)
             for item in payload["completed_shards"]
@@ -2768,7 +3108,14 @@ def adapt_model_tasks_from_manifests(
     final_path = Path(finalized_selection_manifest)
     final_payload = _validated_complete_manifest(final_path)
     if (
+        _sha256_path(final_path)
+        != structural_barrier.final_manifest_sha256
+    ):
+        raise ValueError("structural final manifest checksum mismatch")
+    if (
         final_payload.get("stage") != "wdc200k_validated_selection"
+        or final_payload.get("schema_version")
+        != structural_barrier.schema_version
         or not clean_text(final_payload.get("input_fingerprint"))
         or not clean_text(final_payload.get("parameter_fingerprint"))
         or len(final_payload.get("completed_shards") or []) != 1
@@ -2777,6 +3124,8 @@ def adapt_model_tasks_from_manifests(
     final_shard = _completed_from_payload(
         final_payload["completed_shards"][0]
     )
+    if _shard_payload(final_shard) != structural_barrier.final_selection:
+        raise ValueError("structural final artifact identity mismatch")
     expected_final_input = stable_hash(
         structural.STRUCTURAL_SCHEMA_VERSION,
         *(
@@ -2858,6 +3207,7 @@ def adapt_model_tasks_from_manifests(
             "CREATE INDEX links_source ON links(source_table_id)"
         )
         for record in _iter_jsonl_paths(asset_paths):
+            record = _verify_task5_asset_bytes(record)
             connection.execute(
                 "INSERT OR REPLACE INTO assets VALUES (?, ?)",
                 (str(record["asset_id"]), _canonical_json(record)),
@@ -3059,6 +3409,7 @@ def enqueue_model_tasks_from_manifest(
                 continue
             if current_asset.get("asset_type") not in {"text", "image"}:
                 continue
+            current_asset = _verify_task5_asset_bytes(current_asset)
             produced = task_factory(current_asset)
             if isinstance(produced, dict):
                 yield produced
