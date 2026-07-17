@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
@@ -361,9 +362,13 @@ class SqliteJobStore:
         job_id: str,
         status: str,
         result: dict[str, Any] | None = None,
+        owner: str | None = None,
     ) -> None:
         if status not in {"success", "terminal", "retryable"}:
             raise ValueError(f"invalid finish status: {status}")
+        if not owner:
+            raise ValueError("owner is required to finish a leased job")
+        now = time.time()
         connection = self._connect()
         try:
             cursor = connection.execute(
@@ -372,16 +377,23 @@ class SqliteJobStore:
                 SET status = ?, result_json = ?, owner = NULL,
                     lease_expires = NULL, updated_at = ?
                 WHERE job_id = ?
+                  AND status = 'leased'
+                  AND owner = ?
+                  AND lease_expires > ?
                 """,
                 (
                     status,
                     None if result is None else json.dumps(result, ensure_ascii=False),
-                    time.time(),
+                    now,
                     job_id,
+                    owner,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
-                raise KeyError(job_id)
+                raise RuntimeError(
+                    f"job {job_id!r} has no active lease owned by {owner!r}"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -435,15 +447,66 @@ def _iter_sorted_run(handle: TextIO) -> Iterator[tuple[str, int, dict[str, Any]]
         yield str(key), int(ordinal), record
 
 
+def _iter_merged_runs(
+    run_paths: list[Path],
+) -> Iterator[tuple[str, int, dict[str, Any]]]:
+    with ExitStack() as stack:
+        handles = [
+            stack.enter_context(run_path.open("r", encoding="utf-8"))
+            for run_path in run_paths
+        ]
+        yield from heapq.merge(
+            *(_iter_sorted_run(handle) for handle in handles),
+            key=lambda item: (item[0], item[1]),
+        )
+
+
+def _merge_run_group(run_paths: list[Path], output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8") as handle:
+        for key, ordinal, record in _iter_merged_runs(run_paths):
+            write_jsonl_record(handle, [key, ordinal, record])
+
+
+def _reduce_sorted_runs(
+    run_paths: list[Path],
+    temporary_dir: Path,
+    merge_fan_in: int,
+) -> list[Path]:
+    merge_pass = 0
+    while len(run_paths) > merge_fan_in:
+        reduced_paths: list[Path] = []
+        for group_index, start in enumerate(
+            range(0, len(run_paths), merge_fan_in)
+        ):
+            group = run_paths[start : start + merge_fan_in]
+            if len(group) == 1:
+                reduced_paths.append(group[0])
+                continue
+            merged_path = (
+                temporary_dir
+                / f"merge-{merge_pass:04d}-{group_index:08d}.jsonl"
+            )
+            _merge_run_group(group, merged_path)
+            for run_path in group:
+                run_path.unlink()
+            reduced_paths.append(merged_path)
+        run_paths = reduced_paths
+        merge_pass += 1
+    return run_paths
+
+
 def external_unique_jsonl(
     input_paths: Iterable[Path],
     output_path: Path,
     key_fn: Callable[[dict[str, Any]], Any],
     chunk_records: int,
+    merge_fan_in: int = 64,
 ) -> CompletedShard:
     """Externally sort JSONL records and keep the first record for each key."""
     if chunk_records <= 0:
         raise ValueError("chunk_records must be positive")
+    if merge_fan_in < 2:
+        raise ValueError("merge_fan_in must be at least 2")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="wdc200k-unique-") as temporary:
         temporary_dir = Path(temporary)
@@ -462,21 +525,17 @@ def external_unique_jsonl(
             run_path = temporary_dir / f"run-{len(run_paths):08d}.jsonl"
             _write_sorted_run(chunk, run_path)
             run_paths.append(run_path)
+        run_paths = _reduce_sorted_runs(
+            run_paths,
+            temporary_dir,
+            merge_fan_in,
+        )
 
         output = AtomicJsonlShard(output_path)
-        handles: list[TextIO] = []
         try:
-            handles = [
-                run_path.open("r", encoding="utf-8")
-                for run_path in run_paths
-            ]
-            merged = heapq.merge(
-                *(_iter_sorted_run(handle) for handle in handles),
-                key=lambda item: (item[0], item[1]),
-            )
             previous_key: str | None = None
             has_previous_key = False
-            for key, _ordinal, record in merged:
+            for key, _ordinal, record in _iter_merged_runs(run_paths):
                 if has_previous_key and key == previous_key:
                     continue
                 output.write(record)
@@ -486,6 +545,3 @@ def external_unique_jsonl(
         except BaseException:
             output.abort()
             raise
-        finally:
-            for handle in handles:
-                handle.close()
