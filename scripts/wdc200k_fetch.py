@@ -13,15 +13,17 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
+import fcntl
+
 try:
     from stage1_io import stable_hash
     from wdc200k_io import (
-        AtomicJsonlShard,
         CompletedShard,
         Job,
         SqliteJobStore,
@@ -35,7 +37,6 @@ except ModuleNotFoundError as error:
     try:
         from stage1_io import stable_hash
         from wdc200k_io import (
-            AtomicJsonlShard,
             CompletedShard,
             Job,
             SqliteJobStore,
@@ -57,6 +58,7 @@ class FetchPolicy:
     global_concurrency: int = 128
     per_host_concurrency: int = 2
     policy_version: str = FETCH_SCHEMA_VERSION
+    network_policy_fingerprint: str = "wdc-web-v1"
 
     def __post_init__(self) -> None:
         if self.retries != 0:
@@ -69,11 +71,14 @@ class FetchPolicy:
             raise ValueError("per_host_concurrency must be positive")
         if not self.policy_version:
             raise ValueError("policy_version must not be empty")
+        if not self.network_policy_fingerprint:
+            raise ValueError("network_policy_fingerprint must not be empty")
 
     @property
     def fingerprint(self) -> str:
         return stable_hash(
             self.policy_version,
+            self.network_policy_fingerprint,
             self.retries,
             self.deadline_seconds,
             self.global_concurrency,
@@ -88,6 +93,9 @@ class FetchResult:
     success: int
     terminal: int
     inflight: int
+    leased: int
+    remaining: int
+    complete: bool
     maximum_inflight: int
     maximum_claimed: int
     maximum_host_limiters: int
@@ -105,6 +113,15 @@ class PageOutcomeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            counts_existed = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'policy_outcome_counts'
+                    """
+                ).fetchone()
+                is not None
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS page_outcomes (
@@ -129,12 +146,31 @@ class PageOutcomeStore:
                     policy_fingerprint TEXT NOT NULL,
                     url_key TEXT NOT NULL,
                     reference_key TEXT NOT NULL,
+                    entity_id TEXT NOT NULL DEFAULT '',
+                    source_table_id TEXT NOT NULL DEFAULT '',
+                    row_id_json TEXT NOT NULL DEFAULT 'null',
                     PRIMARY KEY (
                         policy_fingerprint, url_key, reference_key
                     )
                 )
                 """
             )
+            reference_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(page_references)"
+                )
+            }
+            for column, declaration in (
+                ("entity_id", "TEXT NOT NULL DEFAULT ''"),
+                ("source_table_id", "TEXT NOT NULL DEFAULT ''"),
+                ("row_id_json", "TEXT NOT NULL DEFAULT 'null'"),
+            ):
+                if column not in reference_columns:
+                    connection.execute(
+                        f"ALTER TABLE page_references "
+                        f"ADD COLUMN {column} {declaration}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS page_host_sequences (
@@ -145,6 +181,35 @@ class PageOutcomeStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS policy_outcome_counts (
+                    policy_fingerprint TEXT PRIMARY KEY,
+                    success INTEGER NOT NULL,
+                    terminal INTEGER NOT NULL,
+                    total INTEGER NOT NULL
+                )
+                """
+            )
+            if not counts_existed:
+                connection.execute(
+                    """
+                    INSERT INTO policy_outcome_counts (
+                        policy_fingerprint, success, terminal, total
+                    )
+                    SELECT
+                        policy_fingerprint,
+                        SUM(
+                            CASE WHEN status = 'success' THEN 1 ELSE 0 END
+                        ),
+                        SUM(
+                            CASE WHEN status = 'terminal' THEN 1 ELSE 0 END
+                        ),
+                        COUNT(*)
+                    FROM page_outcomes
+                    GROUP BY policy_fingerprint
+                    """
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -157,7 +222,20 @@ class PageOutcomeStore:
         url_key: str,
     ) -> dict[str, Any] | None:
         with self._connect() as connection:
-            row = connection.execute(
+            return self._get_with_connection(
+                connection,
+                policy_fingerprint,
+                url_key,
+            )
+
+    @classmethod
+    def _get_with_connection(
+        cls,
+        connection: sqlite3.Connection,
+        policy_fingerprint: str,
+        url_key: str,
+    ) -> dict[str, Any] | None:
+        row = connection.execute(
                 """
                 SELECT *
                 FROM page_outcomes
@@ -165,7 +243,7 @@ class PageOutcomeStore:
                 """,
                 (policy_fingerprint, url_key),
             ).fetchone()
-        return None if row is None else self._decode(row)
+        return None if row is None else cls._decode(row)
 
     def put(
         self,
@@ -218,6 +296,28 @@ class PageOutcomeStore:
         )
         payload_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT payload_sha256
+                FROM page_outcomes
+                WHERE policy_fingerprint = ? AND url_key = ?
+                """,
+                (policy_fingerprint, url_key),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_sha256"]) != payload_sha256:
+                    raise ValueError(
+                        "conflicting immutable page outcome"
+                    )
+                persisted = self._get_with_connection(
+                    connection,
+                    policy_fingerprint,
+                    url_key,
+                )
+                if persisted is None:
+                    raise RuntimeError("page outcome disappeared")
+                return persisted
             connection.execute(
                 """
                 INSERT INTO page_outcomes (
@@ -225,7 +325,6 @@ class PageOutcomeStore:
                     final_url, text, image_urls_json, error_class,
                     http_status, payload_sha256, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(policy_fingerprint, url_key) DO NOTHING
                 """,
                 (
                     policy_fingerprint,
@@ -239,6 +338,24 @@ class PageOutcomeStore:
                     canonical["http_status"],
                     payload_sha256,
                     time.time(),
+                ),
+            )
+            success_increment = 1 if status == "success" else 0
+            terminal_increment = 1 if status == "terminal" else 0
+            connection.execute(
+                """
+                INSERT INTO policy_outcome_counts (
+                    policy_fingerprint, success, terminal, total
+                ) VALUES (?, ?, ?, 1)
+                ON CONFLICT(policy_fingerprint) DO UPDATE SET
+                    success = success + excluded.success,
+                    terminal = terminal + excluded.terminal,
+                    total = total + 1
+                """,
+                (
+                    policy_fingerprint,
+                    success_increment,
+                    terminal_increment,
                 ),
             )
         persisted = self.get(policy_fingerprint, url_key)
@@ -289,17 +406,37 @@ class PageOutcomeStore:
 
     def counts(self, policy_fingerprint: str) -> tuple[int, int]:
         with self._connect() as connection:
-            rows = connection.execute(
+            row = connection.execute(
                 """
-                SELECT status, COUNT(*) AS count
-                FROM page_outcomes
+                SELECT success, terminal
+                FROM policy_outcome_counts
                 WHERE policy_fingerprint = ?
-                GROUP BY status
                 """,
                 (policy_fingerprint,),
-            ).fetchall()
-        counts = {str(row["status"]): int(row["count"]) for row in rows}
-        return counts.get("success", 0), counts.get("terminal", 0)
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["success"]), int(row["terminal"])
+
+    def rebuild_counts(self) -> None:
+        """Explicitly rebuild counters for migration or integrity recovery."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM policy_outcome_counts")
+            connection.execute(
+                """
+                INSERT INTO policy_outcome_counts (
+                    policy_fingerprint, success, terminal, total
+                )
+                SELECT
+                    policy_fingerprint,
+                    SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM page_outcomes
+                GROUP BY policy_fingerprint
+                """
+            )
 
     def reference_count(
         self,
@@ -404,6 +541,23 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
+def _job_status_counts(
+    store: SqliteJobStore,
+    kind: str,
+) -> dict[str, int]:
+    with store._connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            WHERE kind = ?
+            GROUP BY status
+            """,
+            (kind,),
+        ).fetchall()
+    return {str(row[0]): int(row[1]) for row in rows}
+
+
 def _safe_error_class(value: Any) -> str:
     candidate = str(value or "")
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", candidate):
@@ -423,7 +577,7 @@ def _transport_cached_outcome(
     if not isinstance(cached, dict):
         return None
     cached_policy = cached.get("policy_fingerprint")
-    if cached_policy not in {policy.policy_version, policy.fingerprint}:
+    if cached_policy != policy.network_policy_fingerprint:
         return None
     status = str(cached.get("status") or "")
     if status == "success":
@@ -494,11 +648,59 @@ def _fetch_one(
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
     try:
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _snapshot_guard(progress_path: Path) -> Iterator[None]:
+    lock_path = progress_path.with_name(
+        f".{progress_path.name}.snapshot.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_failure_snapshot(
+    path: Path,
+    records: Iterable[dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for record in records:
+                json.dump(
+                    record,
+                    handle,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
@@ -536,51 +738,74 @@ def _sanitized_failure(
 def _publish_snapshots(
     outcome_store: PageOutcomeStore,
     *,
+    store: SqliteJobStore,
+    kind: str,
     policy_fingerprint: str,
     unique: int,
     failure_path: Path,
     progress_path: Path,
     inflight: int,
 ) -> tuple[int, int]:
-    success, terminal = outcome_store.counts(policy_fingerprint)
-    writer = AtomicJsonlShard(failure_path)
-    try:
-        for outcome in outcome_store.iter(policy_fingerprint):
-            if outcome["status"] == "terminal":
-                writer.write(
-                    _sanitized_failure(
-                        outcome,
-                        int(outcome["affected_reference_count"]),
-                    )
+    with _snapshot_guard(progress_path):
+        _atomic_failure_snapshot(
+            failure_path,
+            (
+                _sanitized_failure(
+                    outcome,
+                    int(outcome["affected_reference_count"]),
                 )
-        writer.commit()
-    except BaseException:
-        writer.abort()
-        raise
-    _atomic_json(
-        progress_path,
-        {
-            "policy_fingerprint": policy_fingerprint,
-            "unique": unique,
-            "success": success,
-            "terminal": terminal,
-            "pending": max(0, unique - success - terminal - inflight),
-            "inflight": inflight,
-            "updated_at": time.time(),
-        },
-    )
-    return success, terminal
+                for outcome in outcome_store.iter(policy_fingerprint)
+                if outcome["status"] == "terminal"
+            ),
+        )
+        return _publish_progress_unlocked(
+            outcome_store,
+            store=store,
+            kind=kind,
+            policy_fingerprint=policy_fingerprint,
+            unique=unique,
+            progress_path=progress_path,
+            inflight=inflight,
+        )
 
 
 def _publish_progress(
     outcome_store: PageOutcomeStore,
     *,
+    store: SqliteJobStore,
+    kind: str,
+    policy_fingerprint: str,
+    unique: int,
+    progress_path: Path,
+    inflight: int,
+) -> tuple[int, int]:
+    with _snapshot_guard(progress_path):
+        return _publish_progress_unlocked(
+            outcome_store,
+            store=store,
+            kind=kind,
+            policy_fingerprint=policy_fingerprint,
+            unique=unique,
+            progress_path=progress_path,
+            inflight=inflight,
+        )
+
+
+def _publish_progress_unlocked(
+    outcome_store: PageOutcomeStore,
+    *,
+    store: SqliteJobStore,
+    kind: str,
     policy_fingerprint: str,
     unique: int,
     progress_path: Path,
     inflight: int,
 ) -> tuple[int, int]:
     success, terminal = outcome_store.counts(policy_fingerprint)
+    statuses = _job_status_counts(store, kind)
+    leased = statuses.get("leased", 0)
+    remaining = max(0, unique - success - terminal)
+    observed_inflight = max(inflight, leased)
     _atomic_json(
         progress_path,
         {
@@ -588,8 +813,12 @@ def _publish_progress(
             "unique": unique,
             "success": success,
             "terminal": terminal,
-            "pending": max(0, unique - success - terminal - inflight),
-            "inflight": inflight,
+            "pending": statuses.get("pending", 0)
+            + statuses.get("retryable", 0),
+            "leased": leased,
+            "remaining": remaining,
+            "complete": success + terminal == unique,
+            "inflight": observed_inflight,
             "updated_at": time.time(),
         },
     )
@@ -621,10 +850,28 @@ def _enqueue_page_refs(
             reference_connection.execute(
                 """
                 INSERT OR IGNORE INTO page_references (
+                    policy_fingerprint, url_key, reference_key,
+                    entity_id, source_table_id, row_id_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
                     policy_fingerprint, url_key, reference_key
-                ) VALUES (?, ?, ?)
+                ) DO UPDATE SET
+                    entity_id = excluded.entity_id,
+                    source_table_id = excluded.source_table_id,
+                    row_id_json = excluded.row_id_json
                 """,
-                (policy_fingerprint, url_key, reference_key),
+                (
+                    policy_fingerprint,
+                    url_key,
+                    reference_key,
+                    str(record.get("entity_id") or ""),
+                    str(record.get("source_table_id") or ""),
+                    json.dumps(
+                        record.get("row_id"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                ),
             )
             host_ordinal = int(
                 reference_connection.execute(
@@ -688,6 +935,8 @@ def fetch_unique_pages(
     claim_buffer: int | None = None,
     lease_seconds: float | None = None,
     progress_every: int = 1_000,
+    max_wait_seconds: float = 0.0,
+    poll_interval_seconds: float = 0.05,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
 ) -> FetchResult:
     """Fetch each Task-3 URL key once for this exact policy.
@@ -698,6 +947,15 @@ def fetch_unique_pages(
     """
     fingerprint = policy.fingerprint
     kind = _job_kind(fingerprint)
+    transport_policy = getattr(
+        transport,
+        "network_policy_fingerprint",
+        None,
+    )
+    if transport_policy != policy.network_policy_fingerprint:
+        raise ValueError(
+            "transport network policy fingerprint does not match FetchPolicy"
+        )
     outcomes_path = Path(
         outcomes_path
         or store.path.with_name(f"{store.path.stem}-page-outcomes.sqlite3")
@@ -730,6 +988,10 @@ def fetch_unique_pages(
         raise ValueError("claim_buffer must be at least global_concurrency")
     if progress_every <= 0:
         raise ValueError("progress_every must be positive")
+    if max_wait_seconds < 0:
+        raise ValueError("max_wait_seconds must be non-negative")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
     effective_lease_seconds = (
         float(lease_seconds)
         if lease_seconds is not None
@@ -752,8 +1014,11 @@ def fetch_unique_pages(
     maximum_inflight = 0
     maximum_host_limiters = 0
     completions_since_progress = 0
+    wait_started = time.monotonic()
     _publish_progress(
         outcome_store,
+        store=store,
+        kind=kind,
         policy_fingerprint=fingerprint,
         unique=unique,
         progress_path=progress_path,
@@ -801,6 +1066,8 @@ def fetch_unique_pages(
                 if completions_since_progress >= progress_every:
                     _publish_progress(
                         outcome_store,
+                        store=store,
+                        kind=kind,
                         policy_fingerprint=fingerprint,
                         unique=unique,
                         progress_path=progress_path,
@@ -876,6 +1143,37 @@ def fetch_unique_pages(
                     if claimed_count:
                         raise RuntimeError("page scheduler made no progress")
                     if claimed_now == 0:
+                        success_now, terminal_now = outcome_store.counts(
+                            fingerprint
+                        )
+                        statuses = _job_status_counts(store, kind)
+                        unresolved = unique - success_now - terminal_now
+                        active_leases = statuses.get("leased", 0)
+                        elapsed = time.monotonic() - wait_started
+                        if (
+                            active_leases
+                            and (
+                                unresolved > 0
+                                or elapsed < max_wait_seconds
+                            )
+                            and elapsed < max_wait_seconds
+                        ):
+                            _publish_progress(
+                                outcome_store,
+                                store=store,
+                                kind=kind,
+                                policy_fingerprint=fingerprint,
+                                unique=unique,
+                                progress_path=progress_path,
+                                inflight=0,
+                            )
+                            time.sleep(
+                                min(
+                                    poll_interval_seconds,
+                                    max_wait_seconds - elapsed,
+                                )
+                            )
+                            continue
                         break
                     continue
                 completed, _pending = wait(
@@ -915,6 +1213,8 @@ def fetch_unique_pages(
                     if completions_since_progress >= progress_every:
                         _publish_progress(
                             outcome_store,
+                            store=store,
+                            kind=kind,
                             policy_fingerprint=fingerprint,
                             unique=unique,
                             progress_path=progress_path,
@@ -925,6 +1225,8 @@ def fetch_unique_pages(
     except BaseException:
         _publish_snapshots(
             outcome_store,
+            store=store,
+            kind=kind,
             policy_fingerprint=fingerprint,
             unique=unique,
             failure_path=failure_path,
@@ -935,17 +1237,25 @@ def fetch_unique_pages(
 
     success, terminal = _publish_snapshots(
         outcome_store,
+        store=store,
+        kind=kind,
         policy_fingerprint=fingerprint,
         unique=unique,
         failure_path=failure_path,
         progress_path=progress_path,
         inflight=0,
     )
+    statuses = _job_status_counts(store, kind)
+    leased = statuses.get("leased", 0)
+    remaining = max(0, unique - success - terminal)
     return FetchResult(
         unique=unique,
         success=success,
         terminal=terminal,
-        inflight=0,
+        inflight=leased,
+        leased=leased,
+        remaining=remaining,
+        complete=success + terminal == unique,
         maximum_inflight=maximum_inflight,
         maximum_claimed=maximum_claimed,
         maximum_host_limiters=maximum_host_limiters,
@@ -962,6 +1272,73 @@ def iter_page_outcomes(
 ) -> Iterator[dict[str, Any]]:
     """Stream durable page outcomes without loading them into memory."""
     yield from PageOutcomeStore(Path(outcomes_path)).iter(policy_fingerprint)
+
+
+def iter_page_fanout(
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> Iterator[dict[str, Any]]:
+    """Stream the disk-backed entity-ref to unique-outcome join for Task 5."""
+    outcome_store = PageOutcomeStore(Path(outcomes_path))
+    connection = outcome_store._connect()
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                refs.entity_id,
+                refs.source_table_id,
+                refs.row_id_json,
+                outcomes.url_key,
+                outcomes.page_url,
+                outcomes.status,
+                outcomes.final_url,
+                outcomes.text,
+                outcomes.image_urls_json,
+                outcomes.error_class,
+                outcomes.http_status,
+                outcomes.payload_sha256
+            FROM page_references AS refs
+            JOIN page_outcomes AS outcomes
+              ON outcomes.policy_fingerprint = refs.policy_fingerprint
+             AND outcomes.url_key = refs.url_key
+            WHERE refs.policy_fingerprint = ?
+            ORDER BY refs.url_key, refs.reference_key
+            """,
+            (policy_fingerprint,),
+        )
+        for row in rows:
+            try:
+                row_id = json.loads(str(row["row_id_json"]))
+                image_urls = json.loads(row["image_urls_json"] or "[]")
+            except json.JSONDecodeError as error:
+                raise ValueError("corrupt page fanout record") from error
+            yield {
+                "entity_id": str(row["entity_id"]),
+                "source_table_id": str(row["source_table_id"]),
+                "row_id": row_id,
+                "url_key": str(row["url_key"]),
+                "page_url": str(row["page_url"]),
+                "status": str(row["status"]),
+                "final_url": (
+                    None
+                    if row["final_url"] is None
+                    else str(row["final_url"])
+                ),
+                "text": None if row["text"] is None else str(row["text"]),
+                "image_urls": (
+                    image_urls if isinstance(image_urls, list) else []
+                ),
+                "error_class": (
+                    None
+                    if row["error_class"] is None
+                    else str(row["error_class"])
+                ),
+                "http_status": _optional_int(row["http_status"]),
+                "payload_sha256": str(row["payload_sha256"]),
+                "policy_fingerprint": policy_fingerprint,
+            }
+    finally:
+        connection.close()
 
 
 def iter_finalized_page_refs(

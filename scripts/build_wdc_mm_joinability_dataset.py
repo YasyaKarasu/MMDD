@@ -392,6 +392,11 @@ class WdcWebClient:
     _RETRYABLE_HTTP_STATUSES = {408, 425, 429}
     _IMAGE_LOCK_STRIPES = 256
 
+    @property
+    def network_policy_fingerprint(self) -> str:
+        """Fingerprint of the network/cache namespace used by this client."""
+        return self.network_policy_version
+
     def __init__(
         self,
         cache_dir: Path,
@@ -474,38 +479,9 @@ class WdcWebClient:
 
     def _initialize_database(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS page_cache (
-                    page_url TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    final_url TEXT,
-                    text TEXT,
-                    image_urls_json TEXT,
-                    http_status INTEGER,
-                    error TEXT,
-                    body_bytes INTEGER NOT NULL DEFAULT 0,
-                    policy_fingerprint TEXT NOT NULL DEFAULT 'wdc-web-v1',
-                    updated_at REAL NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS image_cache (
-                    original_url TEXT PRIMARY KEY,
-                    final_url TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    sha256 TEXT NOT NULL UNIQUE,
-                    width INTEGER NOT NULL,
-                    height INTEGER NOT NULL,
-                    mime_type TEXT NOT NULL,
-                    bytes INTEGER NOT NULL DEFAULT 0,
-                    policy_fingerprint TEXT NOT NULL DEFAULT 'wdc-web-v1',
-                    updated_at REAL NOT NULL
-                )
-                """
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            self._migrate_page_cache(connection)
+            self._migrate_image_cache(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS image_failure_cache (
@@ -519,40 +495,11 @@ class WdcWebClient:
                 )
                 """
             )
-            columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(image_cache)")
-            }
-            if "bytes" not in columns:
-                connection.execute(
-                    "ALTER TABLE image_cache ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0"
-                )
-            if "policy_fingerprint" not in columns:
-                connection.execute(
-                    """
-                    ALTER TABLE image_cache
-                    ADD COLUMN policy_fingerprint TEXT NOT NULL
-                    DEFAULT 'wdc-web-v1'
-                    """
-                )
-            page_columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(page_cache)")
-            }
-            if "body_bytes" not in page_columns:
-                connection.execute(
-                    "ALTER TABLE page_cache ADD COLUMN body_bytes INTEGER NOT NULL DEFAULT 0"
-                )
-            if "policy_fingerprint" not in page_columns:
-                connection.execute(
-                    """
-                    ALTER TABLE page_cache
-                    ADD COLUMN policy_fingerprint TEXT NOT NULL
-                    DEFAULT 'wdc-web-v1'
-                    """
-                )
             for row in connection.execute(
-                "SELECT original_url, file_name FROM image_cache WHERE bytes <= 0"
+                """
+                SELECT original_url, policy_fingerprint, file_name
+                FROM image_cache WHERE bytes <= 0
+                """
             ):
                 path = self.image_dir / str(row["file_name"])
                 try:
@@ -560,12 +507,19 @@ class WdcWebClient:
                 except OSError:
                     actual_bytes = 0
                 connection.execute(
-                    "UPDATE image_cache SET bytes = ? WHERE original_url = ?",
-                    (actual_bytes, row["original_url"]),
+                    """
+                    UPDATE image_cache SET bytes = ?
+                    WHERE original_url = ? AND policy_fingerprint = ?
+                    """,
+                    (
+                        actual_bytes,
+                        row["original_url"],
+                        row["policy_fingerprint"],
+                    ),
                 )
             for row in connection.execute(
                 """
-                SELECT page_url, text, image_urls_json
+                SELECT page_url, policy_fingerprint, text, image_urls_json
                 FROM page_cache WHERE status = 'success' AND body_bytes <= 0
                 """
             ):
@@ -573,8 +527,15 @@ class WdcWebClient:
                     (row["image_urls_json"] or "").encode("utf-8")
                 )
                 connection.execute(
-                    "UPDATE page_cache SET body_bytes = ? WHERE page_url = ?",
-                    (estimated_bytes, row["page_url"]),
+                    """
+                    UPDATE page_cache SET body_bytes = ?
+                    WHERE page_url = ? AND policy_fingerprint = ?
+                    """,
+                    (
+                        estimated_bytes,
+                        row["page_url"],
+                        row["policy_fingerprint"],
+                    ),
                 )
             self._image_bytes_total = int(
                 connection.execute(
@@ -583,9 +544,143 @@ class WdcWebClient:
             )
             self._page_bytes_total = int(
                 connection.execute(
-                    "SELECT COALESCE(SUM(body_bytes), 0) FROM page_cache WHERE status = 'success'"
+                    """
+                    SELECT COALESCE(SUM(body_bytes), 0)
+                    FROM page_cache WHERE status = 'success'
+                    """
                 ).fetchone()[0]
             )
+
+    @staticmethod
+    def _table_columns(
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> dict[str, sqlite3.Row]:
+        return {
+            str(row["name"]): row
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+
+    @staticmethod
+    def _create_page_cache(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE page_cache (
+                page_url TEXT NOT NULL,
+                policy_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                final_url TEXT,
+                text TEXT,
+                image_urls_json TEXT,
+                http_status INTEGER,
+                error TEXT,
+                body_bytes INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (page_url, policy_fingerprint)
+            )
+            """
+        )
+
+    @classmethod
+    def _migrate_page_cache(cls, connection: sqlite3.Connection) -> None:
+        columns = cls._table_columns(connection, "page_cache")
+        if not columns:
+            cls._create_page_cache(connection)
+            return
+        primary_key = [
+            name
+            for name, row in sorted(
+                columns.items(),
+                key=lambda item: int(item[1]["pk"] or 0),
+            )
+            if int(row["pk"] or 0)
+        ]
+        if primary_key == ["page_url", "policy_fingerprint"]:
+            return
+        connection.execute("ALTER TABLE page_cache RENAME TO page_cache_legacy")
+        cls._create_page_cache(connection)
+        body_expression = "body_bytes" if "body_bytes" in columns else "0"
+        policy_expression = (
+            "policy_fingerprint"
+            if "policy_fingerprint" in columns
+            else "'wdc-web-v1'"
+        )
+        connection.execute(
+            f"""
+            INSERT INTO page_cache (
+                page_url, policy_fingerprint, status, final_url, text,
+                image_urls_json, http_status, error, body_bytes, updated_at
+            )
+            SELECT
+                page_url, {policy_expression}, status, final_url, text,
+                image_urls_json, http_status, error, {body_expression},
+                updated_at
+            FROM page_cache_legacy
+            """
+        )
+        connection.execute("DROP TABLE page_cache_legacy")
+
+    @staticmethod
+    def _create_image_cache(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE image_cache (
+                original_url TEXT NOT NULL,
+                policy_fingerprint TEXT NOT NULL,
+                final_url TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                mime_type TEXT NOT NULL,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (original_url, policy_fingerprint),
+                UNIQUE (sha256, policy_fingerprint)
+            )
+            """
+        )
+
+    @classmethod
+    def _migrate_image_cache(cls, connection: sqlite3.Connection) -> None:
+        columns = cls._table_columns(connection, "image_cache")
+        if not columns:
+            cls._create_image_cache(connection)
+            return
+        primary_key = [
+            name
+            for name, row in sorted(
+                columns.items(),
+                key=lambda item: int(item[1]["pk"] or 0),
+            )
+            if int(row["pk"] or 0)
+        ]
+        if primary_key == ["original_url", "policy_fingerprint"]:
+            return
+        connection.execute(
+            "ALTER TABLE image_cache RENAME TO image_cache_legacy"
+        )
+        cls._create_image_cache(connection)
+        bytes_expression = "bytes" if "bytes" in columns else "0"
+        policy_expression = (
+            "policy_fingerprint"
+            if "policy_fingerprint" in columns
+            else "'wdc-web-v1'"
+        )
+        connection.execute(
+            f"""
+            INSERT INTO image_cache (
+                original_url, policy_fingerprint, final_url, file_name,
+                sha256, width, height, mime_type, bytes, updated_at
+            )
+            SELECT
+                original_url, {policy_expression}, final_url, file_name,
+                sha256, width, height, mime_type, {bytes_expression},
+                updated_at
+            FROM image_cache_legacy
+            """
+        )
+        connection.execute("DROP TABLE image_cache_legacy")
 
     def _reserve_cache_bytes(self, amount: int, *, image: bool) -> bool:
         amount = max(0, int(amount))
@@ -713,7 +808,7 @@ class WdcWebClient:
             if float(self.monotonic_fn()) >= deadline:
                 raise TimeoutError("response deadline exceeded")
             current_url = current_target.url
-            self._wait_for_host(current_url)
+            self._wait_for_host(current_url, deadline=deadline)
             if float(self.monotonic_fn()) >= deadline:
                 raise TimeoutError("response deadline exceeded")
             response = self._session_get(
@@ -749,7 +844,12 @@ class WdcWebClient:
                 raise ValueError("too_many_redirects")
         raise ValueError("too_many_redirects")
 
-    def _wait_for_host(self, url: str) -> None:
+    def _wait_for_host(
+        self,
+        url: str,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         try:
             parsed = urlsplit(url)
             host = (parsed.hostname or parsed.netloc).casefold().rstrip(".")
@@ -763,7 +863,12 @@ class WdcWebClient:
             if last_request is not None:
                 wait_seconds = self.host_delay - (now - last_request)
                 if wait_seconds > 0:
-                    self.sleep_fn(wait_seconds)
+                    remaining = (
+                        wait_seconds
+                        if deadline is None
+                        else max(0.0, deadline - now)
+                    )
+                    self.sleep_fn(min(wait_seconds, remaining))
                     now = float(self.monotonic_fn())
             self._last_request_by_host[host] = now
 
@@ -872,6 +977,20 @@ class WdcWebClient:
                 (image_url, self.network_policy_version),
             ).fetchone()
         if success is not None:
+            candidate_path = (self.image_dir / str(success["file_name"])).resolve()
+            image_root = self.image_dir.resolve()
+            if not candidate_path.is_relative_to(image_root):
+                return None
+            raster = self._validated_raster(candidate_path)
+            if (
+                raster is None
+                or self._sha256_path(candidate_path) != str(success["sha256"])
+                or raster[0] != int(success["width"])
+                or raster[1] != int(success["height"])
+                or raster[2] != str(success["mime_type"])
+                or candidate_path.stat().st_size != int(success["bytes"])
+            ):
+                return None
             return {
                 "status": "success",
                 "image_url": image_url,
@@ -906,6 +1025,15 @@ class WdcWebClient:
         http_status: int | None = None,
     ) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                """
+                SELECT 1 FROM image_cache
+                WHERE original_url = ? AND policy_fingerprint = ?
+                """,
+                (image_url, self.network_policy_version),
+            ).fetchone() is not None:
+                return
             connection.execute(
                 """
                 INSERT INTO image_failure_cache (
@@ -936,7 +1064,7 @@ class WdcWebClient:
                     http_status, error, body_bytes, policy_fingerprint,
                     updated_at
                 ) VALUES (?, 'success', ?, ?, ?, ?, NULL, ?, ?, ?)
-                ON CONFLICT(page_url) DO UPDATE SET
+                ON CONFLICT(page_url, policy_fingerprint) DO UPDATE SET
                     status = excluded.status,
                     final_url = excluded.final_url,
                     text = excluded.text,
@@ -974,7 +1102,7 @@ class WdcWebClient:
                     page_url, status, final_url, text, image_urls_json,
                     http_status, error, policy_fingerprint, updated_at
                 ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
-                ON CONFLICT(page_url) DO UPDATE SET
+                ON CONFLICT(page_url, policy_fingerprint) DO UPDATE SET
                     status = excluded.status,
                     final_url = NULL,
                     text = NULL,
@@ -1344,26 +1472,29 @@ class WdcWebClient:
         entity_id: str,
     ) -> dict[str, Any] | None:
         self.image_dir.mkdir(parents=True, exist_ok=True)
-        image_key = stable_hash(image_url, length=24)
+        image_key = (
+            stable_hash(image_url, length=24)
+            if self.network_policy_version == "wdc-web-v1"
+            else stable_hash(
+                image_url,
+                self.network_policy_version,
+                length=24,
+            )
+        )
         attempt_key = uuid.uuid4().hex
         temporary_path = self.image_dir / f".{image_key}.{attempt_key}.download.tmp"
 
         with self._connect() as connection:
             cached_row = connection.execute(
-                "SELECT * FROM image_cache WHERE original_url = ?",
-                (image_url,),
+                """
+                SELECT * FROM image_cache
+                WHERE original_url = ? AND policy_fingerprint = ?
+                """,
+                (image_url, self.network_policy_version),
             ).fetchone()
         if cached_row is not None:
             cached_path = self.image_dir / cached_row["file_name"]
-            policy_matches = (
-                str(cached_row["policy_fingerprint"])
-                == self.network_policy_version
-            )
-            raster = (
-                self._validated_raster(cached_path)
-                if policy_matches
-                else None
-            )
+            raster = self._validated_raster(cached_path)
             sha_matches = (
                 raster is not None
                 and self._sha256_path(cached_path) == cached_row["sha256"]
@@ -1384,8 +1515,11 @@ class WdcWebClient:
                 )
             with self._connect() as connection:
                 connection.execute(
-                    "DELETE FROM image_cache WHERE original_url = ?",
-                    (image_url,),
+                    """
+                    DELETE FROM image_cache
+                    WHERE original_url = ? AND policy_fingerprint = ?
+                    """,
+                    (image_url, self.network_policy_version),
                 )
             with self._image_quota_lock:
                 self._image_bytes_total = max(
@@ -1528,8 +1662,11 @@ class WdcWebClient:
                 digest = self._sha256_path(raster_path)
                 with self._connect() as connection:
                     duplicate = connection.execute(
-                        "SELECT original_url FROM image_cache WHERE sha256 = ?",
-                        (digest,),
+                        """
+                        SELECT original_url FROM image_cache
+                        WHERE sha256 = ? AND policy_fingerprint = ?
+                        """,
+                        (digest, self.network_policy_version),
                     ).fetchone()
                 if duplicate is not None and duplicate["original_url"] != image_url:
                     return None
@@ -1642,7 +1779,10 @@ class WdcWebClient:
         height: int,
         mime_type: str,
     ) -> None:
+        digest = self._sha256_path(path)
+        size = path.stat().st_size
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 INSERT INTO image_cache (
@@ -1650,7 +1790,7 @@ class WdcWebClient:
                     width, height, mime_type, bytes, policy_fingerprint,
                     updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(original_url) DO UPDATE SET
+                ON CONFLICT(original_url, policy_fingerprint) DO UPDATE SET
                     final_url = excluded.final_url,
                     file_name = excluded.file_name,
                     sha256 = excluded.sha256,
@@ -1665,14 +1805,21 @@ class WdcWebClient:
                     original_url,
                     final_url,
                     path.name,
-                    self._sha256_path(path),
+                    digest,
                     width,
                     height,
                     mime_type,
-                    path.stat().st_size,
+                    size,
                     self.network_policy_version,
                     time.time(),
                 ),
+            )
+            connection.execute(
+                """
+                DELETE FROM image_failure_cache
+                WHERE original_url = ? AND policy_fingerprint = ?
+                """,
+                (original_url, self.network_policy_version),
             )
 
     def _image_record(

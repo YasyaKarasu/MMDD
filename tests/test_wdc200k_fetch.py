@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import socket
 import sqlite3
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,8 +23,10 @@ import build_wdc_mm_joinability_dataset as wdc_builder  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 from wdc200k_fetch import (  # noqa: E402
     FetchPolicy,
+    PageOutcomeStore,
     fetch_unique_pages,
     iter_finalized_page_refs,
+    iter_page_fanout,
     iter_page_outcomes,
 )
 from wdc200k_io import SqliteJobStore  # noqa: E402
@@ -38,12 +42,19 @@ def page_ref(entity_id: str, url: str) -> dict[str, str]:
     }
 
 
+def png_bytes(color: tuple[int, int, int] = (20, 40, 60)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 48), color=color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class CountingTransport:
     def __init__(
         self,
         outcomes: dict[str, dict[str, Any] | BaseException | None],
     ) -> None:
         self.outcomes = outcomes
+        self.network_policy_fingerprint = "wdc-web-v1"
         self.calls: list[str] = []
         self.cached: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
@@ -97,6 +108,46 @@ def test_duplicate_page_urls_make_one_physical_request(tmp_path: Path) -> None:
     assert result.unique == 1
     assert result.success == 1
     assert result.terminal == 0
+
+
+def test_page_outcome_fanout_streams_every_entity_reference(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/shared"
+    transport = CountingTransport({url: {"text": "shared"}})
+    result = fetch_unique_pages(
+        page_refs=[
+            {
+                **page_ref("e1", url),
+                "source_table_id": "t1",
+                "row_id": 1,
+            },
+            {
+                **page_ref("e2", url),
+                "source_table_id": "t2",
+                "row_id": 7,
+            },
+        ],
+        store=SqliteJobStore(tmp_path / "pages.sqlite3"),
+        transport=transport,
+        policy=FetchPolicy(),
+    )
+
+    fanout = list(
+        iter_page_fanout(
+            result.outcomes_path,
+            result.policy_fingerprint,
+        )
+    )
+    assert transport.calls == [url]
+    assert sorted(
+        (row["entity_id"], row["row_id"]) for row in fanout
+    ) == [
+        ("e1", 1),
+        ("e2", 7),
+    ]
+    assert len({row["payload_sha256"] for row in fanout}) == 1
+    assert all(row["status"] == "success" for row in fanout)
 
 
 def test_terminal_page_failure_is_not_replayed_on_resume(
@@ -166,6 +217,43 @@ def test_cache_write_before_job_finish_is_repaired_without_request(
         ).fetchone() == ("success",)
 
 
+def test_positive_ttl_crash_is_reclaimed_by_immediate_resume(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/positive-ttl"
+    transport = CountingTransport({url: {"text": "durable"}})
+    store = SqliteJobStore(tmp_path / "pages.sqlite3")
+
+    with pytest.raises(RuntimeError, match="crash after cache"):
+        fetch_unique_pages(
+            [page_ref("e1", url)],
+            store,
+            transport,
+            FetchPolicy(global_concurrency=1),
+            lease_seconds=0.05,
+            after_cache_write=lambda _outcome: (_ for _ in ()).throw(
+                RuntimeError("crash after cache")
+            ),
+        )
+
+    resumed = fetch_unique_pages(
+        [page_ref("e1", url)],
+        store,
+        transport,
+        FetchPolicy(global_concurrency=1),
+        max_wait_seconds=0.5,
+        poll_interval_seconds=0.01,
+    )
+
+    assert resumed.complete is True
+    assert resumed.leased == 0
+    assert transport.calls == [url]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT status FROM jobs"
+        ).fetchone() == ("success",)
+
+
 def test_expired_lease_cannot_finish_but_reclaim_repairs_from_cache(
     tmp_path: Path,
 ) -> None:
@@ -215,6 +303,72 @@ def test_policy_change_has_distinct_jobs_and_outcomes(tmp_path: Path) -> None:
     assert len(list(iter_page_outcomes(second.outcomes_path))) == 2
 
 
+def test_outcome_counts_are_transactional_idempotent_and_constant_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    policy = "p1"
+    key = "a" * 64
+    success = {
+        "status": "success",
+        "final_url": "https://e.test/a",
+        "text": "ok",
+        "image_urls": [],
+    }
+
+    store.put(policy, key, "https://e.test/a", success)
+    store.put(policy, key, "https://e.test/a", success)
+    assert store.counts(policy) == (1, 0)
+    with pytest.raises(ValueError, match="conflicting immutable"):
+        store.put(
+            policy,
+            key,
+            "https://e.test/a",
+            {"status": "terminal", "error_class": "TimeoutError"},
+        )
+    assert store.counts(policy) == (1, 0)
+
+    statements: list[str] = []
+    original_connect = store._connect
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    assert store.counts(policy) == (1, 0)
+    count_sql = " ".join(statements).casefold()
+    assert "policy_outcome_counts" in count_sql
+    assert "group by" not in count_sql
+
+
+def test_fetch_rejects_transport_network_policy_mismatch_before_work(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/policy"
+    session = _NoNetworkSession()
+    client = WdcWebClient(
+        tmp_path / "web",
+        session=session,
+        host_delay=0,
+        network_policy_version="stage-v1",
+    )
+
+    with pytest.raises(ValueError, match="network policy"):
+        fetch_unique_pages(
+            [page_ref("e1", url)],
+            SqliteJobStore(tmp_path / "pages.sqlite3"),
+            client,
+            FetchPolicy(network_policy_fingerprint="stage-v2"),
+        )
+
+    assert session.calls == 0
+    with sqlite3.connect(tmp_path / "pages.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
+
+
 class ConcurrencyTransport(CountingTransport):
     def __init__(self, delay: float = 0.02) -> None:
         super().__init__({})
@@ -256,6 +410,78 @@ class ConcurrencyTransport(CountingTransport):
         }
         self.cached[url] = result
         return result
+
+
+class BlockingTransport(CountingTransport):
+    def __init__(self, url: str) -> None:
+        super().__init__({url: {"text": "eventually"}})
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        deadline_seconds: float,
+        max_retries: int,
+    ) -> dict[str, Any] | None:
+        self.started.set()
+        assert self.release.wait(timeout=2)
+        return super().fetch_page(
+            url,
+            deadline_seconds=deadline_seconds,
+            max_retries=max_retries,
+        )
+
+
+def test_second_worker_reports_active_lease_as_incomplete(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/active"
+    transport = BlockingTransport(url)
+    store = SqliteJobStore(tmp_path / "pages.sqlite3")
+    first_results: list[Any] = []
+    first = threading.Thread(
+        target=lambda: first_results.append(
+            fetch_unique_pages(
+                [page_ref("e1", url)],
+                store,
+                transport,
+                FetchPolicy(global_concurrency=1),
+            )
+        )
+    )
+    first.start()
+    assert transport.started.wait(timeout=1)
+
+    concurrent = fetch_unique_pages(
+        [page_ref("e1", url)],
+        store,
+        transport,
+        FetchPolicy(global_concurrency=1),
+        max_wait_seconds=0,
+    )
+    progress = json.loads(concurrent.progress_path.read_text(encoding="utf-8"))
+
+    assert concurrent.complete is False
+    assert concurrent.remaining == 1
+    assert concurrent.leased == 1
+    assert concurrent.inflight == 1
+    assert progress["complete"] is False
+    assert progress["remaining"] == 1
+    assert progress["leased"] == 1
+    assert progress["inflight"] == 1
+
+    transport.release.set()
+    first.join(timeout=2)
+    assert not first.is_alive()
+    assert first_results[0].complete is True
+    final_progress = json.loads(
+        concurrent.progress_path.read_text(encoding="utf-8")
+    )
+    assert final_progress["complete"] is True
+    assert final_progress["remaining"] == 0
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_scheduler_enforces_host_and_global_limits_without_starvation(
@@ -381,6 +607,131 @@ def test_wdc_page_success_cache_is_scoped_to_network_policy(
     assert changed.cached_page_outcome(page_url) is None
 
 
+def test_wdc_page_cache_preserves_v1_v2_v1_results(
+    tmp_path: Path,
+) -> None:
+    page_url = "https://e.test/multi-policy"
+    v1 = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+        network_policy_version="page-v1",
+    )
+    v2 = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+        network_policy_version="page-v2",
+    )
+    v1._store_page(
+        {
+            "page_url": page_url,
+            "final_url": page_url,
+            "text": "v1",
+            "image_urls": [],
+        }
+    )
+    v2._store_page(
+        {
+            "page_url": page_url,
+            "final_url": page_url,
+            "text": "v2",
+            "image_urls": [],
+        }
+    )
+
+    assert v1.cached_page_outcome(page_url)["text"] == "v1"
+    assert v2.cached_page_outcome(page_url)["text"] == "v2"
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM page_cache WHERE page_url = ?",
+            (page_url,),
+        ).fetchone() == (2,)
+
+
+def test_legacy_single_key_page_cache_migrates_without_losing_row(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE page_cache (
+                page_url TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                final_url TEXT,
+                text TEXT,
+                image_urls_json TEXT,
+                http_status INTEGER,
+                error TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO page_cache VALUES (
+                'https://e.test/legacy', 'success',
+                'https://e.test/legacy', 'legacy', '[]', 200, NULL, 1.0
+            )
+            """
+        )
+
+    client = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+    )
+
+    assert client.cached_page_outcome("https://e.test/legacy")["text"] == "legacy"
+    with sqlite3.connect(database) as connection:
+        primary_key = [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(page_cache)")
+            if row[5]
+        ]
+    assert primary_key == ["page_url", "policy_fingerprint"]
+
+
+def test_concurrent_page_writes_in_different_policies_do_not_overwrite(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/concurrent-policy"
+    clients = [
+        WdcWebClient(
+            tmp_path,
+            session=_NoNetworkSession(),
+            host_delay=0,
+            network_policy_version=policy,
+        )
+        for policy in ("p1", "p2")
+    ]
+    barrier = threading.Barrier(2)
+
+    def write(client: WdcWebClient, text: str) -> None:
+        barrier.wait(timeout=1)
+        client._store_page(
+            {
+                "page_url": url,
+                "final_url": url,
+                "text": text,
+                "image_urls": [],
+            }
+        )
+
+    threads = [
+        threading.Thread(target=write, args=(clients[index], f"p{index + 1}"))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert clients[0].cached_page_outcome(url)["text"] == "p1"
+    assert clients[1].cached_page_outcome(url)["text"] == "p2"
+
+
 class _NoNetworkSession:
     def __init__(self) -> None:
         self.headers: dict[str, str] = {}
@@ -408,6 +759,39 @@ class _InvalidImageResponse:
         yield b"not a raster"
 
 
+class _PageResponse:
+    status_code = 200
+    encoding = "utf-8"
+    headers = {"Content-Type": "text/html"}
+
+    def __init__(self, url: str, text: str) -> None:
+        self.url = url
+        self.body = f"<p>{text}</p>".encode()
+
+    def __enter__(self) -> "_PageResponse":
+        return self
+
+    def __exit__(self, *_args: Any) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int) -> Any:
+        del chunk_size
+        yield self.body
+
+
+class _PageSession(_NoNetworkSession):
+    def __init__(self, response: _PageResponse) -> None:
+        super().__init__()
+        self.response = response
+
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.calls += 1
+        return self.response
+
+
 class _OneResponseSession(_NoNetworkSession):
     def __init__(self) -> None:
         super().__init__()
@@ -416,6 +800,104 @@ class _OneResponseSession(_NoNetworkSession):
     def get(self, *_args: Any, **_kwargs: Any) -> Any:
         self.calls += 1
         return self.response
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _RedirectResponse:
+    status_code = 302
+    url = "https://e.test/start"
+    headers = {"Location": "/next"}
+
+    def close(self) -> None:
+        return None
+
+
+class _RedirectSession(_NoNetworkSession):
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.calls += 1
+        return _RedirectResponse()
+
+
+def test_redirect_host_delay_is_truncated_by_absolute_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    session = _RedirectSession()
+    client = WdcWebClient(
+        tmp_path,
+        session=session,
+        host_delay=1.0,
+        sleep_fn=clock.sleep,
+        monotonic_fn=clock.monotonic,
+        max_retries=0,
+    )
+
+    assert client.fetch_page(
+        "https://e.test/start",
+        deadline_seconds=0.05,
+        max_retries=0,
+    ) is None
+    assert session.calls == 1
+    assert clock.sleeps == [pytest.approx(0.05)]
+
+
+def test_real_wdc_stage_cache_round_trip_v1_v2_v1(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/stage-policy"
+    store = SqliteJobStore(tmp_path / "pages.sqlite3")
+    sessions = {
+        "v1": _PageSession(_PageResponse(url, "version one")),
+        "v2": _PageSession(_PageResponse(url, "version two")),
+    }
+    results = {}
+    for version in ("v1", "v2"):
+        client = WdcWebClient(
+            tmp_path / "web",
+            session=sessions[version],
+            host_delay=0,
+            network_policy_version=version,
+        )
+        results[version] = fetch_unique_pages(
+            [page_ref("e1", url)],
+            store,
+            client,
+            FetchPolicy(network_policy_fingerprint=version),
+        )
+    offline = _NoNetworkSession()
+    v1_again = WdcWebClient(
+        tmp_path / "web",
+        session=offline,
+        host_delay=0,
+        network_policy_version="v1",
+    )
+    resumed = fetch_unique_pages(
+        [page_ref("e1", url)],
+        store,
+        v1_again,
+        FetchPolicy(network_policy_fingerprint="v1"),
+    )
+
+    assert sessions["v1"].calls == 1
+    assert sessions["v2"].calls == 1
+    assert offline.calls == 0
+    assert resumed.complete is True
+    assert {
+        outcome["text"]
+        for outcome in iter_page_outcomes(results["v1"].outcomes_path)
+    } == {"version one", "version two"}
 
 
 def test_invalid_image_is_negative_cached_for_policy(tmp_path: Path) -> None:
@@ -497,6 +979,169 @@ def test_failed_image_download_is_negative_cached_until_policy_changes(
         entity_id="e3",
     ) is None
     assert refreshed_session.calls == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "sha_mismatch", "invalid_raster"])
+def test_cached_image_success_validates_file_without_network_or_mutation(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    client = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+    )
+    client.image_dir.mkdir()
+    path = client.image_dir / "cached.png"
+    path.write_bytes(png_bytes())
+    image_url = "https://i.test/cached.png"
+    client._store_image_index(
+        original_url=image_url,
+        final_url=image_url,
+        path=path,
+        width=64,
+        height=48,
+        mime_type="image/png",
+    )
+    if damage == "missing":
+        path.unlink()
+    elif damage == "sha_mismatch":
+        path.write_bytes(png_bytes((200, 10, 10)))
+    else:
+        path.write_bytes(b"not a raster")
+
+    assert client.cached_image_outcome(image_url) is None
+    with sqlite3.connect(client.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache WHERE original_url = ?",
+            (image_url,),
+        ).fetchone() == (1,)
+
+
+def test_image_success_cache_keeps_independent_policy_rows(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/policy.png"
+    outcomes: dict[str, dict[str, Any] | None] = {}
+    for index, policy in enumerate(("image-v1", "image-v2")):
+        client = WdcWebClient(
+            tmp_path,
+            session=_NoNetworkSession(),
+            host_delay=0,
+            network_policy_version=policy,
+        )
+        client.image_dir.mkdir(exist_ok=True)
+        path = client.image_dir / f"{policy}.png"
+        path.write_bytes(png_bytes((20 + index, 40, 60)))
+        client._store_image_index(
+            original_url=image_url,
+            final_url=image_url,
+            path=path,
+            width=64,
+            height=48,
+            mime_type="image/png",
+        )
+        outcomes[policy] = client.cached_image_outcome(image_url)
+
+    assert outcomes["image-v1"]["file_name"] == "image-v1.png"
+    assert outcomes["image-v2"]["file_name"] == "image-v2.png"
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache WHERE original_url = ?",
+            (image_url,),
+        ).fetchone() == (2,)
+
+
+def test_legacy_single_key_image_cache_migrates_with_verified_asset(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "wdc_images"
+    image_dir.mkdir()
+    path = image_dir / "legacy.png"
+    body = png_bytes()
+    path.write_bytes(body)
+    database = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE image_cache (
+                original_url TEXT PRIMARY KEY,
+                final_url TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                sha256 TEXT NOT NULL UNIQUE,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                mime_type TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO image_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "https://i.test/legacy.png",
+                "https://i.test/legacy.png",
+                path.name,
+                hashlib.sha256(body).hexdigest(),
+                64,
+                48,
+                "image/png",
+                1.0,
+            ),
+        )
+
+    client = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+    )
+
+    assert client.cached_image_outcome(
+        "https://i.test/legacy.png"
+    )["status"] == "success"
+    with sqlite3.connect(database) as connection:
+        primary_key = [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(image_cache)")
+            if row[5]
+        ]
+    assert primary_key == ["original_url", "policy_fingerprint"]
+
+
+def test_image_success_and_negative_are_mutually_exclusive_per_policy(
+    tmp_path: Path,
+) -> None:
+    client = WdcWebClient(
+        tmp_path,
+        session=_NoNetworkSession(),
+        host_delay=0,
+        network_policy_version="image-policy",
+    )
+    client.image_dir.mkdir()
+    path = client.image_dir / "valid.png"
+    path.write_bytes(png_bytes())
+    image_url = "https://i.test/state.png"
+
+    client._store_image_failure(image_url, error_class="TimeoutError")
+    client._store_image_index(
+        original_url=image_url,
+        final_url=image_url,
+        path=path,
+        width=64,
+        height=48,
+        mime_type="image/png",
+    )
+    client._store_image_failure(image_url, error_class="late_failure")
+
+    assert client.cached_image_outcome(image_url)["status"] == "success"
+    with sqlite3.connect(client.database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM image_failure_cache
+            WHERE original_url = ? AND policy_fingerprint = ?
+            """,
+            (image_url, "image-policy"),
+        ).fetchone() == (0,)
 
 
 def test_finalized_page_refs_reject_incomplete_global_barrier(
