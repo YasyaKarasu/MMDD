@@ -1,4 +1,5 @@
 import argparse
+import signal
 import subprocess
 import sys
 import threading
@@ -36,6 +37,7 @@ from run_mm_joinability_dynamic_vllm import (
     build_builder_command,
     default_vllm_extra_args,
     main as dynamic_vllm_main,
+    marker_matches_run,
     parse_args as parse_dynamic_vllm_args,
     start_server,
     wait_for_any_marker_or_builder_exit,
@@ -848,7 +850,7 @@ def test_start_server_passes_vllm_output_through_to_tmux(monkeypatch):
 def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
     marker = tmp_path / "start.json"
     marker.write_text(
-        '{"run_fingerprint":"stale","text_task_count":1,"image_task_count":1}',
+        '{"status":"model_cache_ready_to_start","run_fingerprint":"stale","text_task_count":1,"image_task_count":1}',
         encoding="utf-8",
     )
 
@@ -860,7 +862,7 @@ def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"run_fingerprint":"current","text_task_count":1,"image_task_count":1}',
+            '{"status":"model_cache_ready_to_start","run_fingerprint":"current","text_task_count":1,"image_task_count":1}',
             encoding="utf-8",
         )
 
@@ -881,7 +883,7 @@ def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
 def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
     marker = tmp_path / "text-done.json"
     marker.write_text(
-        '{"run_fingerprint":"stale","model_kind":"text"}',
+        '{"status":"text_model_cache_precomputed","run_fingerprint":"stale","model_kind":"text","task_count":1}',
         encoding="utf-8",
     )
 
@@ -893,7 +895,7 @@ def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"run_fingerprint":"current","model_kind":"text"}',
+            '{"status":"text_model_cache_precomputed","run_fingerprint":"current","model_kind":"text","task_count":1}',
             encoding="utf-8",
         )
 
@@ -914,7 +916,7 @@ def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
 def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
     marker = tmp_path / "image-done.json"
     marker.write_text(
-        '{"run_fingerprint":"current","jobset_fingerprint":"old","model_kind":"image"}',
+        '{"status":"image_model_cache_precomputed","run_fingerprint":"current","jobset_fingerprint":"old","model_kind":"image","task_count":1}',
         encoding="utf-8",
     )
 
@@ -926,7 +928,7 @@ def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
     def publish_current():
         threading.Event().wait(0.05)
         marker.write_text(
-            '{"run_fingerprint":"current","jobset_fingerprint":"image-v2","model_kind":"image"}',
+            '{"status":"image_model_cache_precomputed","run_fingerprint":"current","jobset_fingerprint":"image-v2","model_kind":"image","task_count":1}',
             encoding="utf-8",
         )
 
@@ -945,6 +947,25 @@ def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
     assert completed == {"image"}
 
 
+def test_dynamic_done_marker_requires_exact_status_kind_and_count(tmp_path):
+    marker = tmp_path / "text-done.json"
+    marker.write_text(
+        '{"status":"image_model_cache_precomputed","model_kind":"image",'
+        '"task_count":2,"run_fingerprint":"run-v1",'
+        '"jobset_fingerprint":"text-v1"}',
+        encoding="utf-8",
+    )
+
+    assert not marker_matches_run(
+        marker,
+        "run-v1",
+        "text-v1",
+        expected_status="text_model_cache_precomputed",
+        expected_model_kind="text",
+        expected_task_count=1,
+    )
+
+
 def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypatch, tmp_path):
     events = []
 
@@ -957,9 +978,25 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
                 events.append("builder_started")
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text("{}", encoding="utf-8")
-                Path(command[command.index("--model_text_done_marker") + 1]).write_text("{}", encoding="utf-8")
-                Path(command[command.index("--model_image_done_marker") + 1]).write_text("{}", encoding="utf-8")
+                marker.write_text(
+                    '{"status":"model_cache_ready_to_start",'
+                    '"text_task_count":1,"image_task_count":1}',
+                    encoding="utf-8",
+                )
+                Path(
+                    command[command.index("--model_text_done_marker") + 1]
+                ).write_text(
+                    '{"status":"text_model_cache_precomputed",'
+                    '"model_kind":"text","task_count":1}',
+                    encoding="utf-8",
+                )
+                Path(
+                    command[command.index("--model_image_done_marker") + 1]
+                ).write_text(
+                    '{"status":"image_model_cache_precomputed",'
+                    '"model_kind":"image","task_count":1}',
+                    encoding="utf-8",
+                )
             else:
                 events.append(f"server_started:{command[command.index('--served-model-name') + 1]}")
 
@@ -1006,7 +1043,8 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"text_task_count": 0, "image_task_count": 0}',
+                    '{"status":"model_cache_ready_to_start",'
+                    '"text_task_count": 0, "image_task_count": 0}',
                     encoding="utf-8",
                 )
             else:
@@ -1066,7 +1104,8 @@ def test_dynamic_vllm_signal_path_stops_builder_and_all_started_models(
                 )
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"text_task_count":1,"image_task_count":1}',
+                    '{"status":"model_cache_ready_to_start",'
+                    '"text_task_count":1,"image_task_count":1}',
                     encoding="utf-8",
                 )
 
@@ -1113,6 +1152,108 @@ def test_dynamic_vllm_signal_path_stops_builder_and_all_started_models(
         "Qwen3.5-9B",
         "Qwen3-VL-8B-Thinking",
     }
+
+
+def test_dynamic_vllm_forwards_signal_to_every_live_process_group():
+    import run_mm_joinability_dynamic_vllm as runner
+
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(30)",
+            ],
+            start_new_session=True,
+        )
+        for _index in range(2)
+    ]
+    try:
+        runner.forward_signal_to_live_process_groups(signal.SIGTERM, processes)
+
+        assert [process.wait(timeout=3) for process in processes] == [
+            -signal.SIGTERM,
+            -signal.SIGTERM,
+        ]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+
+
+def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(
+    monkeypatch,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    registrations = []
+    forwarded = []
+
+    def fake_signal(signum, handler):
+        registrations.append((signum, handler))
+        return f"previous-{signum}"
+
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(
+        runner,
+        "forward_signal_to_live_process_groups",
+        lambda signum, processes: forwarded.append(
+            (signum, tuple(processes))
+        ),
+    )
+    live_processes = (object(), object())
+
+    previous = runner.install_process_group_signal_handlers(
+        lambda: live_processes
+    )
+    installed = {
+        signum: handler
+        for signum, handler in registrations
+    }
+
+    assert set(installed) == {
+        signal.SIGTERM,
+        signal.SIGHUP,
+        signal.SIGINT,
+    }
+    with pytest.raises(runner.ForwardedSignal) as raised:
+        installed[signal.SIGHUP](signal.SIGHUP, None)
+    assert raised.value.signum == signal.SIGHUP
+    assert forwarded == [(signal.SIGHUP, live_processes)]
+
+    runner.restore_signal_handlers(previous)
+
+    assert registrations[-3:] == [
+        (signum, f"previous-{signum}")
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    ]
+
+
+def test_dynamic_vllm_cleanup_continues_after_one_stop_failure(monkeypatch):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    attempted: list[int] = []
+
+    class FakeProcess:
+        def __init__(self, pid: int):
+            self.pid = pid
+
+    processes = [FakeProcess(101), FakeProcess(102), FakeProcess(103)]
+
+    def fake_stop(process):
+        attempted.append(process.pid)
+        if process.pid == 101:
+            raise RuntimeError("first process would not stop")
+
+    monkeypatch.setattr(runner, "stop_process", fake_stop)
+
+    errors = runner.stop_processes_best_effort(processes)
+
+    assert attempted == [101, 102, 103]
+    assert len(errors) == 1
+    assert errors[0][0] is processes[0]
+    assert str(errors[0][1]) == "first process would not stop"
 
 
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):

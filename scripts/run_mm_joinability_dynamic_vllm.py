@@ -20,7 +20,7 @@ import time
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 try:
     import requests
@@ -170,6 +170,60 @@ def stop_process(proc: subprocess.Popen[str] | None, *, timeout_seconds: float =
         proc.wait(timeout=timeout_seconds)
 
 
+def forward_signal_to_live_process_groups(
+    signum: int,
+    processes: Iterable[subprocess.Popen[str] | None],
+) -> None:
+    for process in processes:
+        if process is None or process.poll() is not None:
+            continue
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            continue
+
+
+class ForwardedSignal(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def install_process_group_signal_handlers(
+    processes: Callable[[], Iterable[subprocess.Popen[str] | None]],
+) -> dict[int, object]:
+    previous_handlers: dict[int, object] = {}
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        forward_signal_to_live_process_groups(signum, processes())
+        raise ForwardedSignal(signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous_handlers[signum] = signal.signal(signum, handle_signal)
+    return previous_handlers
+
+
+def restore_signal_handlers(previous_handlers: dict[int, object]) -> None:
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous = previous_handlers.get(signum)
+        if previous is not None:
+            signal.signal(signum, previous)
+
+
+def stop_processes_best_effort(
+    processes: Iterable[subprocess.Popen[str] | None],
+) -> list[tuple[subprocess.Popen[str], Exception]]:
+    errors: list[tuple[subprocess.Popen[str], Exception]] = []
+    for process in processes:
+        if process is None:
+            continue
+        try:
+            stop_process(process)
+        except Exception as exc:
+            errors.append((process, exc))
+    return errors
+
+
 def wait_for_server(base_url: str, *, timeout_seconds: float, poll_seconds: float = 2.0) -> None:
     if requests is None:
         raise RuntimeError("requests is required for vLLM health checks")
@@ -227,10 +281,14 @@ def read_pending_model_task_count(path: Path) -> int | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
-    if not isinstance(payload, dict) or not {
-        "text_task_count",
-        "image_task_count",
-    }.issubset(payload):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") != "model_cache_ready_to_start"
+        or not {
+            "text_task_count",
+            "image_task_count",
+        }.issubset(payload)
+    ):
         return None
     try:
         return max(0, int(payload["text_task_count"])) + max(0, int(payload["image_task_count"]))
@@ -242,16 +300,33 @@ def marker_matches_run(
     path: Path,
     expected_run_fingerprint: str | None,
     expected_jobset_fingerprint: str | None = None,
+    *,
+    expected_status: str | None = None,
+    expected_model_kind: str | None = None,
+    expected_task_count: int | None = None,
 ) -> bool:
     if not path.exists():
         return False
-    if not expected_run_fingerprint and not expected_jobset_fingerprint:
-        return True
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return False
     if not isinstance(payload, dict):
+        return False
+    if (
+        expected_status is not None
+        and payload.get("status") != expected_status
+    ):
+        return False
+    if (
+        expected_model_kind is not None
+        and payload.get("model_kind") != expected_model_kind
+    ):
+        return False
+    if (
+        expected_task_count is not None
+        and payload.get("task_count") != expected_task_count
+    ):
         return False
     if (
         expected_run_fingerprint
@@ -279,9 +354,14 @@ def wait_for_marker_or_builder_exit(
     timeout_seconds: float | None,
     poll_seconds: float = 2.0,
     expected_run_fingerprint: str | None = None,
+    expected_status: str = "model_cache_ready_to_start",
 ) -> None:
     started = time.time()
-    while not marker_matches_run(marker, expected_run_fingerprint):
+    while not marker_matches_run(
+        marker,
+        expected_run_fingerprint,
+        expected_status=expected_status,
+    ):
         code = builder.poll()
         if code is not None:
             raise RuntimeError(f"Builder exited with code {code} before marker was written: {marker}")
@@ -298,6 +378,7 @@ def wait_for_any_marker_or_builder_exit(
     poll_seconds: float = 2.0,
     expected_run_fingerprint: str | None = None,
     expected_jobset_fingerprints: dict[str, str] | None = None,
+    expected_task_counts: dict[str, int] | None = None,
 ) -> set[str]:
     started = time.time()
     while True:
@@ -308,6 +389,11 @@ def wait_for_any_marker_or_builder_exit(
                 marker,
                 expected_run_fingerprint,
                 (expected_jobset_fingerprints or {}).get(kind),
+                expected_status=f"{kind}_model_cache_precomputed",
+                expected_model_kind=kind,
+                expected_task_count=(
+                    expected_task_counts or {}
+                ).get(kind),
             )
         }
         if completed:
@@ -442,6 +528,15 @@ def main(argv: list[str] | None = None) -> int:
     secondary_text_proc: subprocess.Popen[str] | None = None
     secondary_image_proc: subprocess.Popen[str] | None = None
     builder_proc: subprocess.Popen[str] | None = None
+    previous_signal_handlers = install_process_group_signal_handlers(
+        lambda: (
+            builder_proc,
+            text_proc,
+            primary_image_proc,
+            secondary_text_proc,
+            secondary_image_proc,
+        )
+    )
     try:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         for marker in (model_start_marker, model_ready_marker, text_done_marker, image_done_marker):
@@ -505,6 +600,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if fingerprint
         }
+        expected_task_counts = {
+            kind: int(start_payload[f"{kind}_task_count"])
+            for kind in ("text", "image")
+        }
 
         if read_pending_model_task_count(model_start_marker) == 0:
             return int(builder_proc.wait())
@@ -526,12 +625,16 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=first_done_timeout,
             expected_run_fingerprint=args.run_fingerprint or None,
             expected_jobset_fingerprints=expected_jobsets,
+            expected_task_counts=expected_task_counts,
         )
 
         if completed == {"text"} and not marker_matches_run(
             image_done_marker,
             args.run_fingerprint or None,
             expected_jobsets.get("image"),
+            expected_status="image_model_cache_precomputed",
+            expected_model_kind="image",
+            expected_task_count=expected_task_counts["image"],
         ):
             stop_process(text_proc)
             text_proc = None
@@ -542,6 +645,9 @@ def main(argv: list[str] | None = None) -> int:
             text_done_marker,
             args.run_fingerprint or None,
             expected_jobsets.get("text"),
+            expected_status="text_model_cache_precomputed",
+            expected_model_kind="text",
+            expected_task_count=expected_task_counts["text"],
         ):
             stop_process(primary_image_proc)
             primary_image_proc = None
@@ -550,13 +656,24 @@ def main(argv: list[str] | None = None) -> int:
             write_endpoint_file(text_endpoints_file, [text_server.base_url, secondary_text_server.base_url])
 
         return int(builder_proc.wait())
+    except ForwardedSignal as exc:
+        return 128 + exc.signum
     finally:
-        if builder_proc is not None and builder_proc.poll() is None:
-            stop_process(builder_proc)
-        stop_process(text_proc)
-        stop_process(primary_image_proc)
-        stop_process(secondary_text_proc)
-        stop_process(secondary_image_proc)
+        cleanup_errors = stop_processes_best_effort(
+            (
+                builder_proc,
+                text_proc,
+                primary_image_proc,
+                secondary_text_proc,
+                secondary_image_proc,
+            )
+        )
+        restore_signal_handlers(previous_signal_handlers)
+        for process, error in cleanup_errors:
+            print(
+                f"warning: failed to stop process group {process.pid}: {error}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

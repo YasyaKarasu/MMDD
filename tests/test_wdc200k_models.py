@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -15,6 +17,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from build_mm_joinability_dataset import ExtractionCache
 from wdc200k_io import SqliteJobStore
 from wdc200k_models import (
+    MODEL_PARSER_SCHEMA_VERSION,
+    adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
     enqueue_model_tasks_from_manifest,
     iter_assets_from_materialization_manifest,
@@ -65,6 +69,78 @@ def asset(
             }
         )
     return record
+
+
+def write_strict_upstream_barriers(
+    root: Path,
+) -> tuple[Path, Path]:
+    from dataclasses import asdict
+    from wdc200k_io import AtomicJsonlShard
+
+    network_root = root / "network"
+    network_writer = AtomicJsonlShard(
+        network_root / "outcomes" / "part-00000.jsonl"
+    )
+    network_writer.write({"status": "success", "url": "https://example.test"})
+    network_shard = asdict(network_writer.commit())
+    network_shard["path"] = "outcomes/part-00000.jsonl"
+    network = network_root / "network-manifest.json"
+    network.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_network_fetch",
+                "schema_version": "wdc200k-network-fetch-v1",
+                "policy_fingerprint": "network-policy-v1",
+                "counts": {
+                    "unique": 1,
+                    "success": 1,
+                    "terminal": 0,
+                    "pending": 0,
+                    "leased": 0,
+                },
+                "completed_shards": [network_shard],
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assets_root = root / "assets"
+    asset_writer = AtomicJsonlShard(
+        assets_root / "bridge_assets" / "part-00000.jsonl"
+    )
+    asset_writer.write(asset("upstream"))
+    asset_shard = asdict(asset_writer.commit())
+    asset_shard["path"] = "bridge_assets/part-00000.jsonl"
+    link_writer = AtomicJsonlShard(
+        assets_root / "table_asset_links" / "part-00000.jsonl"
+    )
+    link_writer.write(
+        {
+            "source_table_id": "table-1",
+            "row_id": 0,
+            "entity_id": "entity-upstream",
+            "asset_ids": ["upstream"],
+        }
+    )
+    link_shard = asdict(link_writer.commit())
+    link_shard["path"] = "table_asset_links/part-00000.jsonl"
+    assets = assets_root / "asset-materialization-manifest.json"
+    assets.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_asset_materialization",
+                "fingerprint": {
+                    "schema_version": "wdc200k-asset-materialization-v1"
+                },
+                "bridge_asset_shards": [asset_shard],
+                "table_asset_link_shards": [link_shard],
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return network, assets
 
 
 class CountingExtractor:
@@ -150,6 +226,70 @@ def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:
     } == mtimes
 
 
+def test_resume_manifest_rejects_corrupt_counts(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest["counts"]["success"] += 1
+    result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert validate_model_stage(result) is False
+    with pytest.raises(ValueError, match="count"):
+        run_model_stage(
+            store,
+            CountingExtractor(),
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+
+
+def test_resume_manifest_rejects_record_provenance_even_with_new_checksum(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    path = result.extraction_paths[0]
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records[0]["jobset_fingerprint"] = "foreign-jobset"
+    encoded = "".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        for record in records
+    ).encode("utf-8")
+    path.write_bytes(encoded)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    shard = manifest["extraction_shards"][0]
+    shard["bytes"] = len(encoded)
+    shard["sha256"] = hashlib.sha256(encoded).hexdigest()
+    result.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert validate_model_stage(result) is False
+
+
 def test_result_written_before_finish_repairs_without_model_call(
     tmp_path: Path,
 ) -> None:
@@ -176,8 +316,11 @@ def test_result_written_before_finish_repairs_without_model_call(
             jobset=jobset,
             output_root=tmp_path / "outputs",
             after_result_write=crash_once,
+            lease_seconds=0.08,
+            heartbeat_seconds=0.02,
         )
 
+    time.sleep(0.1)
     resumed = run_model_stage(
         store,
         extractor,
@@ -210,8 +353,11 @@ def test_cache_written_before_result_repairs_without_model_call(
             jobset=jobset,
             output_root=tmp_path / "outputs",
             after_cache_write=crash_after_cache,
+            lease_seconds=0.08,
+            heartbeat_seconds=0.02,
         )
 
+    time.sleep(0.1)
     resumed = run_model_stage(
         store,
         extractor,
@@ -237,12 +383,18 @@ def test_existing_extraction_cache_repairs_job_without_model_call(
         jobset.jobs[0].cache_key,
         {
             "cache_key": jobset.jobs[0].cache_key,
+            "model_call_key": jobset.jobs[0].model_call_key,
             "prompt_version": jobset.prompt_version,
+            "model_identity": "text-v1",
+            "asset_fingerprint": jobset.jobs[0].asset_fingerprint,
             "entity_id": "entity-a",
             "entity_text": "Entity a",
             "entity_wiki_title": "Entity a",
             "asset_id": "a",
             "asset_type": "text",
+            "modality": "text",
+            "policy_fingerprint": "existing-extraction-semantics-v1",
+            "parser_schema_version": MODEL_PARSER_SCHEMA_VERSION,
             "candidate_attribute_names": ["State"],
             "attributes": [],
             "raw_response": '{"attributes":[]}',
@@ -360,6 +512,225 @@ def test_text_and_image_jobsets_change_independently(tmp_path: Path) -> None:
     assert first.image_kind != image_changed.image_kind
 
 
+def test_jobsets_v1_v2_v1_are_physically_isolated_in_one_store(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    extractor = CountingExtractor()
+    first = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    first_result = run_model_stage(
+        store,
+        extractor,
+        jobset=first,
+        output_root=tmp_path / "outputs",
+    )
+    second = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v2",
+    )
+    second_result = run_model_stage(
+        store,
+        extractor,
+        jobset=second,
+        output_root=tmp_path / "outputs",
+    )
+    resumed_first = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    resumed_result = run_model_stage(
+        store,
+        extractor,
+        jobset=resumed_first,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert first.text_kind != second.text_kind
+    assert first.jobs[0].job_id != second.jobs[0].job_id
+    assert resumed_first.text_kind == first.text_kind
+    assert extractor.asset_ids == ["a"]
+    assert first_result.manifest_path != second_result.manifest_path
+    assert resumed_result.manifest_path == first_result.manifest_path
+
+
+def test_expanded_shrunk_and_disjoint_jobsets_publish_exact_manifests(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    extractor = CountingExtractor()
+    variants = (
+        ("expanded", [asset("a"), asset("b"), asset("c")]),
+        ("shrunk", [asset("a")]),
+        ("disjoint", [asset("x"), asset("y", "image")]),
+    )
+    results = []
+    expected_tasks = []
+    for fingerprint, tasks in variants:
+        jobset = enqueue_model_tasks(
+            tasks,
+            store,
+            args=model_args(),
+            input_fingerprint=fingerprint,
+        )
+        expected_tasks.append(jobset.total_tasks)
+        results.append(
+            run_model_stage(
+                store,
+                extractor,
+                jobset=jobset,
+                output_root=tmp_path / "outputs",
+            )
+        )
+
+    assert expected_tasks == [3, 1, 2]
+    assert len({result.manifest_path for result in results}) == 3
+    assert all(validate_model_stage(result) for result in results)
+    assert [
+        result.success + result.terminal for result in results
+    ] == expected_tasks
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone()[0] == sum(expected_tasks)
+    assert Counter(extractor.asset_ids) == {
+        "a": 1,
+        "b": 1,
+        "c": 1,
+        "x": 1,
+        "y": 1,
+    }
+
+
+def test_model_call_cache_isolated_by_full_payload_provenance(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    extractor = CountingExtractor()
+    variants = [
+        (
+            asset("a", content="old bytes"),
+            model_args(),
+            "input-content-old",
+            "prompt-p1",
+            "policy-p1",
+        ),
+        (
+            asset("a", content="new bytes"),
+            model_args(),
+            "input-content-new",
+            "prompt-p1",
+            "policy-p1",
+        ),
+        (
+            asset("a", content="old bytes"),
+            model_args(),
+            "input-prompt-p2",
+            "prompt-p2",
+            "policy-p1",
+        ),
+        (
+            asset("a", content="old bytes"),
+            model_args(text_model_name="text-v2"),
+            "input-model-v2",
+            "prompt-p1",
+            "policy-p1",
+        ),
+        (
+            {**asset("a", content="old bytes"), "candidate_attribute_names": ["Year"]},
+            model_args(),
+            "input-candidates-year",
+            "prompt-p1",
+            "policy-p1",
+        ),
+        (
+            asset("a", content="old bytes"),
+            model_args(),
+            "input-policy-p2",
+            "prompt-p1",
+            "policy-p2",
+        ),
+    ]
+    records = []
+    for current, args, input_fp, prompt, policy in variants:
+        jobset = enqueue_model_tasks(
+            [current],
+            store,
+            args=args,
+            input_fingerprint=input_fp,
+            prompt_version=prompt,
+            policy_fingerprint=policy,
+        )
+        result = run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+        records.append(
+            json.loads(
+                result.extraction_paths[0].read_text(
+                    encoding="utf-8"
+                ).splitlines()[0]
+            )
+        )
+
+    assert len(extractor.asset_ids) == len(variants)
+    assert len({record["model_call_key"] for record in records}) == len(
+        variants
+    )
+    for record, (_asset, args, _input, prompt, policy) in zip(
+        records,
+        variants,
+    ):
+        assert record["prompt_version"] == prompt
+        assert record["model_identity"] == args.text_model_name
+        assert record["policy_fingerprint"] == policy
+        assert record["asset_fingerprint"]
+
+
+def test_legacy_cache_requires_complete_matching_provenance(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    incomplete = ExtractionCache(tmp_path / "legacy-cache.jsonl")
+    incomplete.put(
+        jobset.jobs[0].cache_key,
+        {
+            "cache_key": jobset.jobs[0].cache_key,
+            "asset_id": "a",
+            "entity_id": "entity-a",
+            "attributes": [],
+            "error": "",
+        },
+    )
+    extractor = CountingExtractor()
+
+    run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        cache=incomplete,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert extractor.asset_ids == ["a"]
+
+
 def test_duplicate_extraction_key_across_tables_enqueues_one_model_call(
     tmp_path: Path,
 ) -> None:
@@ -462,14 +833,117 @@ def test_heartbeat_prevents_second_worker_from_repeating_model_call(
     assert extractor.asset_ids == ["a"]
 
 
+def test_heartbeat_zero_row_discards_late_result_and_shared_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import wdc200k_models
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    monkeypatch.setattr(
+        wdc200k_models,
+        "_extend_leases",
+        lambda *_args, **_kwargs: 0,
+    )
+
+    result = run_model_stage(
+        store,
+        CountingExtractor(delay=0.12),
+        jobset=jobset,
+        lease_seconds=1,
+        heartbeat_seconds=0.02,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is False
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_call_cache"
+        ).fetchone()[0] == 0
+
+
+def test_stolen_lease_fences_old_worker_result_and_cache(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingExtractor(CountingExtractor):
+        def extract(self, current_asset, entity, candidates):
+            started.set()
+            release.wait(timeout=2)
+            return super().extract(current_asset, entity, candidates)
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    failures: list[BaseException] = []
+    results = []
+
+    def run_old() -> None:
+        try:
+            results.append(
+                run_model_stage(
+                    store,
+                    BlockingExtractor(),
+                    jobset=jobset,
+                    owner="old-owner",
+                    lease_seconds=5,
+                    heartbeat_seconds=1,
+                    output_root=tmp_path / "outputs",
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=run_old)
+    worker.start()
+    assert started.wait(timeout=1)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET owner = 'new-owner', lease_id = 'new-lease',
+                lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (time.time() + 5, jobset.jobs[0].job_id),
+        )
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not failures
+    assert results and results[0].complete is False
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_call_cache"
+        ).fetchone()[0] == 0
+
+
 def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
     tmp_path: Path,
 ) -> None:
-    network = tmp_path / "network.json"
-    assets = tmp_path / "assets.json"
+    network, assets = write_strict_upstream_barriers(tmp_path)
     marker = tmp_path / "start.json"
-    network.write_text('{"complete": true}', encoding="utf-8")
-    assets.write_text('{"complete": false}', encoding="utf-8")
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
         [asset("a"), asset("b", "image")],
@@ -478,17 +952,18 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
         input_fingerprint="assets-v1",
     )
 
-    with pytest.raises(ValueError, match="complete"):
+    faux_assets = tmp_path / "faux-assets.json"
+    faux_assets.write_text('{"complete": true}', encoding="utf-8")
+    with pytest.raises(ValueError, match="Task-5"):
         write_model_start_marker(
             marker,
             jobset,
             network_manifests=[network],
-            assets_manifest=assets,
+            assets_manifest=faux_assets,
             run_fingerprint="run-v1",
         )
     assert not marker.exists()
 
-    assets.write_text('{"complete": true}', encoding="utf-8")
     write_model_start_marker(
         marker,
         jobset,
@@ -507,12 +982,9 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
 def test_model_stage_owns_start_ready_marker_handshake(
     tmp_path: Path,
 ) -> None:
-    network = tmp_path / "network.json"
-    assets_manifest = tmp_path / "assets.json"
+    network, assets_manifest = write_strict_upstream_barriers(tmp_path)
     start = tmp_path / "start.json"
     ready = tmp_path / "ready.json"
-    network.write_text('{"complete": true}', encoding="utf-8")
-    assets_manifest.write_text('{"complete": true}', encoding="utf-8")
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
         [asset("a")],
@@ -573,6 +1045,43 @@ def test_ready_marker_rejects_stale_modality_jobsets(
     )
 
 
+def test_ready_marker_requires_exact_status_and_kind(tmp_path: Path) -> None:
+    ready = tmp_path / "ready.json"
+    payload = {
+        "status": "wrong_ready_state",
+        "model_kind": "text",
+        "run_fingerprint": "run-v1",
+        "text_jobset_fingerprint": "text-v1",
+        "image_jobset_fingerprint": "image-v1",
+    }
+    ready.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not marker_matches(
+        ready,
+        expected_status="vllm_servers_ready",
+        run_fingerprint="run-v1",
+        text_jobset_fingerprint="text-v1",
+        image_jobset_fingerprint="image-v1",
+    )
+
+
+def test_faux_complete_network_barrier_is_rejected(tmp_path: Path) -> None:
+    _, assets = write_strict_upstream_barriers(tmp_path)
+    network = tmp_path / "faux-network.json"
+    network.write_text('{"complete": true}', encoding="utf-8")
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks([asset("a")], store, args=model_args())
+
+    with pytest.raises(ValueError, match="network"):
+        write_model_start_marker(
+            tmp_path / "start.json",
+            jobset,
+            network_manifests=[network],
+            assets_manifest=assets,
+            run_fingerprint="run-v1",
+        )
+
+
 def test_task5_manifest_is_checksum_validated_before_streaming_assets(
     tmp_path: Path,
 ) -> None:
@@ -586,21 +1095,47 @@ def test_task5_manifest_is_checksum_validated_before_streaming_assets(
     relative_path = (
         root / "bridge_assets" / completed.path
     ).relative_to(root).as_posix()
+    link_writer = AtomicJsonlShard(
+        root / "table_asset_links" / "part-00000.jsonl"
+    )
+    link_writer.write(
+        {
+            "source_table_id": "table-1",
+            "row_id": 0,
+            "entity_id": "entity-a",
+            "asset_ids": ["a"],
+        }
+    )
+    link_completed = link_writer.commit()
+    link_relative = (
+        root / "table_asset_links" / link_completed.path
+    ).relative_to(root).as_posix()
     manifest = root / "asset-materialization-manifest.json"
     manifest.write_text(
         json.dumps(
-            {
-                "stage": "wdc200k_asset_materialization",
-                "complete": True,
-                "bridge_asset_shards": [
+                {
+                    "stage": "wdc200k_asset_materialization",
+                    "fingerprint": {
+                        "schema_version": "wdc200k-asset-materialization-v1"
+                    },
+                    "complete": True,
+                    "bridge_asset_shards": [
                     {
                         "path": relative_path,
                         "records": completed.records,
                         "bytes": completed.bytes,
-                        "sha256": completed.sha256,
-                    }
-                ],
-            }
+                            "sha256": completed.sha256,
+                        }
+                    ],
+                    "table_asset_link_shards": [
+                        {
+                            "path": link_relative,
+                            "records": link_completed.records,
+                            "bytes": link_completed.bytes,
+                            "sha256": link_completed.sha256,
+                        }
+                    ],
+                }
         ),
         encoding="utf-8",
     )
@@ -614,8 +1149,7 @@ def test_task5_manifest_is_checksum_validated_before_streaming_assets(
     with pytest.raises(ValueError, match="validation"):
         list(iter_assets_from_materialization_manifest(manifest))
 
-    network = tmp_path / "network.json"
-    network.write_text('{"complete": true}', encoding="utf-8")
+    network, _ = write_strict_upstream_barriers(tmp_path / "strict")
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
         [asset("a")],
@@ -675,3 +1209,203 @@ def test_enqueue_from_task5_manifest_filters_non_success_assets(
 
     assert jobset.text_tasks == 1
     assert jobset.image_tasks == 0
+
+
+def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import asdict
+    from wdc200k_io import AtomicJsonlShard
+
+    structural_root = tmp_path / "structural"
+    source = {
+        "source_table_id": "source-1",
+        "source_file": "Thing/Thing_test.json.gz",
+        "page_title": "Thing",
+        "caption": "",
+        "section_title": "",
+        "num_rows": 1,
+        "num_cols": 2,
+        "columns": [
+            {"column_index": 0, "column_name": "name"},
+            {"column_index": 1, "column_name": "State"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "name",
+                        "text": "Alpha",
+                        "wiki_title": "wdc_alpha",
+                    },
+                    {
+                        "column_index": 1,
+                        "column_name": "State",
+                        "text": "",
+                        "wiki_title": None,
+                    },
+                ],
+            }
+        ],
+        "provenance_builder": "build_wdc_mm_joinability_dataset.py",
+        "metadata": {
+            "candidate_entity_columns": [0],
+            "column_profiles": [
+                {
+                    "column_index": 0,
+                    "wiki_link_ratio": 1.0,
+                    "non_empty_ratio": 1.0,
+                },
+                {
+                    "column_index": 1,
+                    "wiki_link_ratio": 0.0,
+                    "non_empty_ratio": 1.0,
+                },
+            ],
+        },
+    }
+    entity_record = {
+        "entity_id": "entity-alpha",
+        "wiki_title": "wdc_alpha",
+        "display_texts": ["Alpha"],
+        "context_terms": ["State"],
+        "appears_in": [
+            {
+                "source_table_id": "source-1",
+                "query_view_id": None,
+                "row_id": 0,
+                "column_index": 0,
+                "column_name": "name",
+            }
+        ],
+        "page_url": "https://example.test/alpha",
+        "image_urls": [],
+    }
+    shard_records = {
+        "source_tables/part-00000.jsonl": [source],
+        "entities/part-00000.jsonl": [entity_record],
+        "page_refs/part-00000.jsonl": [
+            {
+                "entity_id": "entity-alpha",
+                "page_url": "https://example.test/alpha",
+            }
+        ],
+        "direct_image_refs/part-00000.jsonl": [],
+        "structural_failures/part-00000.jsonl": [],
+        "selection/validated-00000.jsonl": [
+            {"relative_path": "Thing/test.json.gz", "rows": 1}
+        ],
+    }
+    completed = []
+    for relative, records in shard_records.items():
+        writer = AtomicJsonlShard(structural_root / relative)
+        for record in records:
+            writer.write(record)
+        item = asdict(writer.commit())
+        item["path"] = relative
+        completed.append(item)
+    structural_manifest = (
+        structural_root / "stage_manifests" / "structural-00000.json"
+    )
+    structural_manifest.parent.mkdir(parents=True, exist_ok=True)
+    structural_manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_structural",
+                "input_fingerprint": "selection-v1",
+                "parameter_fingerprint": "structural-v2",
+                "completed_shards": completed,
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    final_writer = AtomicJsonlShard(
+        structural_root
+        / "selection"
+        / "validated-selected-tables.jsonl"
+    )
+    final_writer.write(
+        {"relative_path": "Thing/test.json.gz", "rows": 1}
+    )
+    final_completed = asdict(final_writer.commit())
+    final_completed["path"] = (
+        "selection/validated-selected-tables.jsonl"
+    )
+    final_manifest = (
+        structural_root
+        / "stage_manifests"
+        / "validated-selection-global.json"
+    )
+    final_manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_validated_selection",
+                "input_fingerprint": "structural-v2",
+                "parameter_fingerprint": "validated-selection-global-v1",
+                "completed_shards": [final_completed],
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assets_root = tmp_path / "assets"
+    asset_writer = AtomicJsonlShard(
+        assets_root / "bridge_assets" / "part-00000.jsonl"
+    )
+    asset_writer.write(asset("asset-alpha"))
+    asset_completed = asdict(asset_writer.commit())
+    asset_completed["path"] = "bridge_assets/part-00000.jsonl"
+    link_writer = AtomicJsonlShard(
+        assets_root / "table_asset_links" / "part-00000.jsonl"
+    )
+    link_writer.write(
+        {
+            "source_table_id": "source-1",
+            "row_id": 0,
+            "entity_id": "entity-alpha",
+            "asset_ids": ["asset-alpha"],
+        }
+    )
+    link_completed = asdict(link_writer.commit())
+    link_completed["path"] = "table_asset_links/part-00000.jsonl"
+    assets_manifest = assets_root / "asset-materialization-manifest.json"
+    assets_manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_asset_materialization",
+                "fingerprint": {
+                    "schema_version": "wdc200k-asset-materialization-v1"
+                },
+                "bridge_asset_shards": [asset_completed],
+                "table_asset_link_shards": [link_completed],
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    adapted = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        assets_manifest=assets_manifest,
+        output_root=tmp_path / "adapted",
+        args=model_args(),
+    )
+    records = [
+        json.loads(line)
+        for path in adapted.task_paths
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert adapted.tasks == 1
+    assert adapted.errors == 0
+    assert records[0]["extraction_task"]["candidate_attribute_names"] == ["State"]
+    assert (
+        records[0]["extraction_task"]["entity"]["entity_id"]
+        == "entity-alpha"
+    )

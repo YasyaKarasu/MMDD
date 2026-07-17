@@ -26,6 +26,7 @@ try:
     from build_mm_joinability_dataset import (
         PROMPT_VERSION,
         ExtractionTask,
+        collect_table_extraction_tasks,
         extraction_cache_key,
         run_extraction_task_group,
     )
@@ -49,6 +50,7 @@ except ModuleNotFoundError as error:
         from build_mm_joinability_dataset import (
             PROMPT_VERSION,
             ExtractionTask,
+            collect_table_extraction_tasks,
             extraction_cache_key,
             run_extraction_task_group,
         )
@@ -66,6 +68,7 @@ except ModuleNotFoundError as error:
 MODEL_QUEUE_SCHEMA_VERSION = "wdc200k-model-queues-v1"
 MODEL_OUTPUT_SCHEMA_VERSION = "wdc200k-model-outputs-v1"
 MODEL_POLICY_VERSION = "existing-extraction-semantics-v1"
+MODEL_PARSER_SCHEMA_VERSION = "connection-evidence-parser-v1"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
 
@@ -74,6 +77,7 @@ _ENQUEUE_BATCH_SIZE = 1_000
 class ModelJobInfo:
     job_id: str
     cache_key: str
+    model_call_key: str
     modality: str
     asset_fingerprint: str
 
@@ -124,6 +128,17 @@ class ModelStageResult:
     leased: int
     complete: bool
     jobset: ModelJobSet
+
+
+@dataclass(frozen=True)
+class AdaptedModelTasks:
+    output_root: Path
+    task_paths: tuple[Path, ...]
+    error_paths: tuple[Path, ...]
+    manifest_path: Path
+    input_fingerprint: str
+    tasks: int
+    errors: int
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -245,6 +260,10 @@ def _initialize_tables(path: Path) -> None:
                 status TEXT NOT NULL,
                 record_json TEXT NOT NULL,
                 record_sha256 TEXT NOT NULL,
+                commit_owner TEXT NOT NULL,
+                commit_lease_id TEXT NOT NULL,
+                commit_lease_expires REAL NOT NULL,
+                committed INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
             )
             """
@@ -255,10 +274,43 @@ def _initialize_tables(path: Path) -> None:
             ON model_results(jobset_fingerprint, status, job_id)
             """
         )
+        result_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(model_results)"
+            )
+        }
+        for name, definition in (
+            ("commit_owner", "TEXT NOT NULL DEFAULT ''"),
+            ("commit_lease_id", "TEXT NOT NULL DEFAULT ''"),
+            ("commit_lease_expires", "REAL NOT NULL DEFAULT 0"),
+            ("committed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in result_columns:
+                connection.execute(
+                    f"ALTER TABLE model_results ADD COLUMN {name} {definition}"
+                )
+        required_job_columns = {
+            "job_id",
+            "kind",
+            "payload_json",
+            "status",
+            "result_json",
+            "owner",
+            "lease_expires",
+            "lease_id",
+            "updated_at",
+        }
+        actual_job_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        if not required_job_columns <= actual_job_columns:
+            raise ValueError("Task-1 job schema is incompatible")
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS model_cache (
-                cache_key TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS model_call_cache (
+                model_call_key TEXT PRIMARY KEY,
                 record_json TEXT NOT NULL,
                 record_sha256 TEXT NOT NULL,
                 updated_at REAL NOT NULL
@@ -374,21 +426,27 @@ def _task_payload(
         args=args,
     )
     asset_fingerprint = _digest_json(asset)
+    model_call_key = stable_hash(
+        MODEL_QUEUE_SCHEMA_VERSION,
+        legacy_cache_key,
+        asset_fingerprint,
+        prompt_version,
+        model_identity,
+        modality,
+        policy_fingerprint,
+        MODEL_PARSER_SCHEMA_VERSION,
+        _canonical_json(candidates),
+        length=64,
+    )
     payload = {
-        "order": int(task_record.get("order", order)),
+        "order": 0,
         "cache_key": legacy_cache_key,
-        "source_table_id": clean_text(
-            task_record.get("source_table_id")
-        ),
-        "source_row_id": int(task_record.get("source_row_id") or 0),
-        "entity_column_index": int(
-            task_record.get("entity_column_index")
-            or entity.get("entity_column_index")
-            or 0
-        ),
-        "entity_column_name": (
-            clean_text(task_record.get("entity_column_name"))
-            or clean_text(entity.get("entity_column_name"))
+        "model_call_key": model_call_key,
+        "source_table_id": "",
+        "source_row_id": 0,
+        "entity_column_index": int(entity.get("entity_column_index") or 0),
+        "entity_column_name": clean_text(
+            entity.get("entity_column_name")
         ),
         "entity": entity,
         "asset": asset,
@@ -398,18 +456,10 @@ def _task_payload(
         "model_identity": model_identity,
         "modality": modality,
         "policy_fingerprint": policy_fingerprint,
+        "parser_schema_version": MODEL_PARSER_SCHEMA_VERSION,
         "jobset_fingerprint": jobset_fingerprint,
     }
-    job_id = stable_hash(
-        MODEL_QUEUE_SCHEMA_VERSION,
-        legacy_cache_key,
-        asset_fingerprint,
-        prompt_version,
-        model_identity,
-        modality,
-        policy_fingerprint,
-        length=40,
-    )
+    job_id = f"{jobset_fingerprint}:{model_call_key}"
     return job_id, asset_fingerprint, payload
 
 
@@ -496,6 +546,24 @@ def enqueue_model_tasks(
                 payload_digest,
                 encoded,
             ) in buffered:
+                existing_job = connection.execute(
+                    """
+                    SELECT kind, payload_json
+                    FROM jobs
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if existing_job is not None and (
+                    str(existing_job["kind"]) != kinds[modality]
+                    or _canonical_json(
+                        json.loads(str(existing_job["payload_json"]))
+                    )
+                    != encoded
+                ):
+                    raise ValueError(
+                        f"conflicting durable model job: {job_id}"
+                    )
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO jobs (
@@ -509,6 +577,25 @@ def enqueue_model_tasks(
                         committed_at,
                     ),
                 )
+                existing_member = connection.execute(
+                    """
+                    SELECT cache_key, asset_fingerprint, payload_sha256
+                    FROM model_job_members
+                    WHERE jobset_fingerprint = ? AND job_id = ?
+                    """,
+                    (fingerprints[modality], job_id),
+                ).fetchone()
+                if existing_member is not None and (
+                    str(existing_member["cache_key"])
+                    != str(payload["cache_key"])
+                    or str(existing_member["asset_fingerprint"])
+                    != asset_fingerprint
+                    or str(existing_member["payload_sha256"])
+                    != payload_digest
+                ):
+                    raise ValueError(
+                        f"conflicting model job member: {job_id}"
+                    )
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO model_job_members (
@@ -572,6 +659,7 @@ def enqueue_model_tasks(
                 ModelJobInfo(
                     job_id=job_id,
                     cache_key=str(payload["cache_key"]),
+                    model_call_key=str(payload["model_call_key"]),
                     modality=modality,
                     asset_fingerprint=asset_fingerprint,
                 )
@@ -644,7 +732,7 @@ def enqueue_model_tasks(
 def _payload_to_task(payload: dict[str, Any]) -> ExtractionTask:
     return ExtractionTask(
         order=int(payload["order"]),
-        cache_key=str(payload["cache_key"]),
+        cache_key=str(payload["model_call_key"]),
         source_table_id=str(payload["source_table_id"]),
         source_row_id=int(payload["source_row_id"]),
         entity_column_index=int(payload["entity_column_index"]),
@@ -673,91 +761,105 @@ class _PersistentCache:
         self.delegate = delegate
         self._lock = threading.Lock()
 
-    def get(self, cache_key: str) -> dict[str, Any] | None:
-        if self.delegate is not None:
-            record = self.delegate.get(cache_key)
-            if record is not None:
-                return record
+    def get(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        model_call_key = str(payload["model_call_key"])
         with _connect(self.database_path) as connection:
             row = connection.execute(
                 """
                 SELECT record_json, record_sha256
-                FROM model_cache
-                WHERE cache_key = ?
+                FROM model_call_cache
+                WHERE model_call_key = ?
                 """,
-                (cache_key,),
+                (model_call_key,),
             ).fetchone()
-        if row is None:
+        if row is not None:
+            record = _decode_checked(
+                str(row["record_json"]),
+                str(row["record_sha256"]),
+            )
+            if not _record_matches_payload(record, payload):
+                raise ValueError(
+                    "model-call cache provenance does not match its key"
+                )
+            return record
+        if self.delegate is None:
             return None
-        return _decode_checked(
-            str(row["record_json"]),
-            str(row["record_sha256"]),
-        )
+        legacy = self.delegate.get(str(payload["cache_key"]))
+        if legacy is None or not _record_matches_payload(legacy, payload):
+            return None
+        return dict(legacy)
 
-    def put(self, cache_key: str, record: dict[str, Any]) -> None:
+    def put(
+        self,
+        payload: dict[str, Any],
+        record: dict[str, Any],
+    ) -> None:
         encoded = _canonical_json(record)
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        with self._lock:
-            if self.delegate is not None:
-                self.delegate.put(cache_key, record)
-            with _connect(self.database_path) as connection:
-                connection.execute(
-                    """
-                    INSERT INTO model_cache (
-                        cache_key, record_json, record_sha256, updated_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(cache_key) DO UPDATE SET
-                        record_json = excluded.record_json,
-                        record_sha256 = excluded.record_sha256,
-                        updated_at = excluded.updated_at
-                    """,
-                    (cache_key, encoded, digest, time.time()),
-                )
+        with _connect(self.database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO model_call_cache (
+                    model_call_key, record_json, record_sha256, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(model_call_key) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    record_sha256 = excluded.record_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(payload["model_call_key"]),
+                    encoded,
+                    digest,
+                    time.time(),
+                ),
+            )
 
 
-def _put_result(
-    database_path: Path,
-    *,
-    job_id: str,
-    jobset_fingerprint: str,
-    modality: str,
-    status: str,
+def _record_matches_payload(
     record: dict[str, Any],
-) -> None:
-    encoded = _canonical_json(record)
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        existing = connection.execute(
-            """
-            SELECT record_sha256, status
-            FROM model_results
-            WHERE job_id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        if existing is not None and (
-            str(existing["record_sha256"]) != digest
-            or str(existing["status"]) != status
-        ):
-            raise ValueError(f"conflicting durable model result: {job_id}")
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO model_results (
-                job_id, jobset_fingerprint, modality, status,
-                record_json, record_sha256, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                jobset_fingerprint,
-                modality,
-                status,
-                encoded,
-                digest,
-                time.time(),
-            ),
-        )
+    payload: dict[str, Any],
+) -> bool:
+    expected = {
+        "cache_key": str(payload["cache_key"]),
+        "model_call_key": str(payload["model_call_key"]),
+        "prompt_version": str(payload["prompt_version"]),
+        "model_identity": str(payload["model_identity"]),
+        "asset_fingerprint": str(payload["asset_fingerprint"]),
+        "asset_type": str(payload["modality"]),
+        "modality": str(payload["modality"]),
+        "policy_fingerprint": str(payload["policy_fingerprint"]),
+        "parser_schema_version": str(payload["parser_schema_version"]),
+        "candidate_attribute_names": list(
+            payload["candidate_attribute_names"]
+        ),
+    }
+    return all(record.get(key) == value for key, value in expected.items())
+
+
+def _canonical_extraction_record(
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    canonical = {
+        **record,
+        "cache_key": str(payload["cache_key"]),
+        "model_call_key": str(payload["model_call_key"]),
+        "jobset_fingerprint": str(payload["jobset_fingerprint"]),
+        "prompt_version": str(payload["prompt_version"]),
+        "model_identity": str(payload["model_identity"]),
+        "asset_fingerprint": str(payload["asset_fingerprint"]),
+        "asset_type": str(payload["modality"]),
+        "modality": str(payload["modality"]),
+        "policy_fingerprint": str(payload["policy_fingerprint"]),
+        "parser_schema_version": str(payload["parser_schema_version"]),
+        "candidate_attribute_names": list(
+            payload["candidate_attribute_names"]
+        ),
+    }
+    if not _record_matches_payload(canonical, payload):
+        raise ValueError("canonical extraction provenance mismatch")
+    return canonical
 
 
 def _repair_durable_results(
@@ -768,69 +870,62 @@ def _repair_durable_results(
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         for modality in ("text", "image"):
-            cursor = connection.execute(
+            rows = connection.execute(
                 """
-                UPDATE jobs
-                SET status = (
-                        SELECT model_results.status
-                        FROM model_results
-                        WHERE model_results.job_id = jobs.job_id
-                    ),
-                    result_json = (
-                        SELECT model_results.record_json
-                        FROM model_results
-                        WHERE model_results.job_id = jobs.job_id
-                    ),
-                    owner = NULL, lease_expires = NULL, lease_id = NULL,
-                    updated_at = ?
-                WHERE kind = ?
-                  AND status NOT IN ('success', 'terminal')
-                  AND EXISTS (
-                        SELECT 1 FROM model_results
-                        WHERE model_results.job_id = jobs.job_id
-                    )
-                """,
-                (time.time(), jobset.kind_for(modality)),
-            )
-            repaired += max(0, int(cursor.rowcount))
-    return repaired
-
-
-def _repair_cached_leases(
-    database_path: Path,
-    jobset: ModelJobSet,
-    cache: _PersistentCache,
-) -> int:
-    repaired = 0
-    with _connect(database_path) as connection:
-        for modality in ("text", "image"):
-            cursor = connection.execute(
-                """
-                SELECT job_id, payload_json
+                SELECT jobs.job_id, jobs.owner, jobs.lease_id,
+                       model_results.status,
+                       model_results.record_json
                 FROM jobs
-                WHERE kind = ? AND status = 'leased'
-                ORDER BY job_id
+                JOIN model_results
+                  ON model_results.job_id = jobs.job_id
+                WHERE jobs.kind = ?
+                  AND jobs.status = 'leased'
+                  AND jobs.lease_expires <= ?
+                  AND model_results.committed = 0
+                  AND model_results.commit_owner = jobs.owner
+                  AND model_results.commit_lease_id = jobs.lease_id
                 """,
-                (jobset.kind_for(modality),),
-            )
-            for row in cursor:
-                payload = json.loads(str(row["payload_json"]))
-                cached = cache.get(str(payload["cache_key"]))
-                if cached is None:
-                    continue
-                _put_result(
-                    database_path,
-                    job_id=str(row["job_id"]),
-                    jobset_fingerprint=str(
-                        payload["jobset_fingerprint"]
+                (jobset.kind_for(modality), time.time()),
+            ).fetchall()
+            for row in rows:
+                now = time.time()
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, result_json = ?, owner = NULL,
+                        lease_expires = NULL, lease_id = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND status = 'leased'
+                      AND owner = ? AND lease_id = ?
+                      AND lease_expires <= ?
+                    """,
+                    (
+                        str(row["status"]),
+                        str(row["record_json"]),
+                        now,
+                        str(row["job_id"]),
+                        str(row["owner"]),
+                        str(row["lease_id"]),
+                        now,
                     ),
-                    modality=modality,
-                    status="success",
-                    record=cached,
+                )
+                if cursor.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE model_results
+                    SET committed = 1, updated_at = ?
+                    WHERE job_id = ? AND committed = 0
+                      AND commit_owner = ? AND commit_lease_id = ?
+                    """,
+                    (
+                        now,
+                        str(row["job_id"]),
+                        str(row["owner"]),
+                        str(row["lease_id"]),
+                    ),
                 )
                 repaired += 1
-    if repaired:
-        _repair_durable_results(database_path, jobset)
     return repaired
 
 
@@ -840,8 +935,8 @@ def _extend_leases(
     *,
     owner: str,
     lease_seconds: float,
-) -> int:
-    renewed = 0
+) -> set[str]:
+    renewed: set[str] = set()
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         now = time.time()
@@ -863,7 +958,8 @@ def _extend_leases(
                     now,
                 ),
             )
-            renewed += int(cursor.rowcount)
+            if cursor.rowcount == 1:
+                renewed.add(str(job.job_id))
     return renewed
 
 
@@ -885,19 +981,38 @@ class _LeaseHeartbeat:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: BaseException | None = None
+        self._lost: set[str] = set()
+        self._lock = threading.Lock()
+
+    def is_lost(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._lost
 
     def __enter__(self) -> "_LeaseHeartbeat":
         def heartbeat() -> None:
             while not self._stop.wait(self.interval):
                 try:
-                    _extend_leases(
+                    renewed = _extend_leases(
                         self.database_path,
                         self.jobs,
                         owner=self.owner,
                         lease_seconds=self.lease_seconds,
                     )
+                    expected = {str(job.job_id) for job in self.jobs}
+                    if isinstance(renewed, int):
+                        renewed_ids = expected if renewed == len(expected) else set()
+                    else:
+                        renewed_ids = set(renewed)
+                    missing = expected - renewed_ids
+                    if missing:
+                        with self._lock:
+                            self._lost.update(missing)
                 except BaseException as error:
                     self.error = error
+                    with self._lock:
+                        self._lost.update(
+                            str(job.job_id) for job in self.jobs
+                        )
                     self._stop.set()
 
         self._thread = threading.Thread(
@@ -912,33 +1027,167 @@ class _LeaseHeartbeat:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval * 2))
-        if self.error is not None and _exc[0] is None:
-            raise RuntimeError("model lease heartbeat failed") from self.error
 
 
-def _finish_safely(
-    store: SqliteJobStore,
-    job: Any,
+def _fenced_commit_model_record(
+    database_path: Path,
     *,
-    status: str,
+    job: Any,
+    expected_kind: str,
+    payload: dict[str, Any],
     record: dict[str, Any],
-) -> None:
-    try:
-        store.finish(
-            job.job_id,
-            status=status,
-            result=record,
-            owner=job.owner,
-            lease_id=job.lease_id,
+    status: str,
+    heartbeat: _LeaseHeartbeat,
+    after_cache_write: (
+        Callable[[str, dict[str, Any]], None] | None
+    ),
+    after_result_write: (
+        Callable[[str, dict[str, Any]], None] | None
+    ),
+) -> bool:
+    if heartbeat.is_lost(str(job.job_id)):
+        return False
+    canonical = _canonical_extraction_record(payload, record)
+    encoded = _canonical_json(canonical)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    now = time.time()
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT kind, payload_json, status, owner, lease_id,
+                   lease_expires
+            FROM jobs
+            WHERE job_id = ?
+            """,
+            (job.job_id,),
+        ).fetchone()
+        if (
+            row is None
+            or heartbeat.is_lost(str(job.job_id))
+            or str(row["kind"]) != expected_kind
+            or _canonical_json(json.loads(str(row["payload_json"])))
+            != _canonical_json(payload)
+            or str(row["status"]) != "leased"
+            or str(row["owner"]) != str(job.owner)
+            or str(row["lease_id"]) != str(job.lease_id)
+            or float(row["lease_expires"] or 0.0) <= now
+        ):
+            connection.rollback()
+            return False
+        if status == "success":
+            connection.execute(
+                """
+                INSERT INTO model_call_cache (
+                    model_call_key, record_json,
+                    record_sha256, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(model_call_key) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    record_sha256 = excluded.record_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(payload["model_call_key"]),
+                    encoded,
+                    digest,
+                    now,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO model_results (
+                job_id, jobset_fingerprint, modality, status,
+                record_json, record_sha256, commit_owner,
+                commit_lease_id, commit_lease_expires,
+                committed, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                jobset_fingerprint = excluded.jobset_fingerprint,
+                modality = excluded.modality,
+                status = excluded.status,
+                record_json = excluded.record_json,
+                record_sha256 = excluded.record_sha256,
+                commit_owner = excluded.commit_owner,
+                commit_lease_id = excluded.commit_lease_id,
+                commit_lease_expires = excluded.commit_lease_expires,
+                committed = 0,
+                updated_at = excluded.updated_at
+            """,
+            (
+                job.job_id,
+                str(payload["jobset_fingerprint"]),
+                str(payload["modality"]),
+                status,
+                encoded,
+                digest,
+                str(job.owner),
+                str(job.lease_id),
+                float(row["lease_expires"]),
+                now,
+            ),
         )
-    except RuntimeError:
-        with _connect(store.path) as connection:
-            row = connection.execute(
-                "SELECT status FROM jobs WHERE job_id = ?",
-                (job.job_id,),
-            ).fetchone()
-        if row is None or str(row["status"]) != status:
-            raise
+        connection.commit()
+        if status == "success" and after_cache_write is not None:
+            after_cache_write(str(job.job_id), canonical)
+        if after_result_write is not None:
+            after_result_write(str(job.job_id), canonical)
+    if heartbeat.is_lost(str(job.job_id)):
+        return False
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        finish_time = time.time()
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET status = ?, result_json = ?, owner = NULL,
+                lease_expires = NULL, lease_id = NULL, updated_at = ?
+            WHERE job_id = ? AND kind = ? AND status = 'leased'
+              AND owner = ? AND lease_id = ? AND lease_expires > ?
+              AND EXISTS (
+                    SELECT 1
+                    FROM model_results
+                    WHERE model_results.job_id = jobs.job_id
+                      AND model_results.commit_owner = ?
+                      AND model_results.commit_lease_id = ?
+                      AND model_results.record_sha256 = ?
+                      AND model_results.committed = 0
+              )
+            """,
+            (
+                status,
+                encoded,
+                finish_time,
+                job.job_id,
+                expected_kind,
+                job.owner,
+                job.lease_id,
+                finish_time,
+                job.owner,
+                job.lease_id,
+                digest,
+            ),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+        connection.execute(
+            """
+            UPDATE model_results
+            SET committed = 1, updated_at = ?
+            WHERE job_id = ? AND commit_owner = ?
+              AND commit_lease_id = ? AND record_sha256 = ?
+            """,
+            (
+                finish_time,
+                job.job_id,
+                job.owner,
+                job.lease_id,
+                digest,
+            ),
+        )
+        connection.commit()
+    return True
 
 
 def _process_claimed_group(
@@ -963,75 +1212,82 @@ def _process_claimed_group(
     task_by_key: dict[str, Any] = {}
     job_by_key: dict[str, Any] = {}
     handled = 0
-    for job in claimed:
-        payload = job.payload
-        cached = cache.get(str(payload["cache_key"]))
-        if cached is None:
-            model_jobs.append(job)
-            task = _payload_to_task(payload)
-            task_by_key[task.cache_key] = task
-            job_by_key[task.cache_key] = job
-            continue
-        _put_result(
-            store.path,
-            job_id=job.job_id,
-            jobset_fingerprint=str(payload["jobset_fingerprint"]),
-            modality=modality,
-            status="success",
-            record=cached,
-        )
-        if after_result_write is not None:
-            after_result_write(job.job_id, cached)
-        _finish_safely(store, job, status="success", record=cached)
-        handled += 1
-    if not model_jobs:
-        return handled
-    if extractor is None:
-        for job in model_jobs:
-            store.finish(
-                job.job_id,
-                status="retryable",
-                result={"reason": "model extractor is unavailable"},
-                owner=job.owner,
-                lease_id=job.lease_id,
-            )
-        raise RuntimeError(
-            "model analysis is required but no extractor was provided"
-        )
-
-    def commit_record(cache_key: str, record: dict[str, Any]) -> None:
-        nonlocal handled
-        job = job_by_key[cache_key]
-        payload = job.payload
-        error = clean_text(record.get("error"))
-        status = "terminal" if error else "success"
-        if status == "success":
-            cache.put(cache_key, record)
-            if after_cache_write is not None:
-                after_cache_write(job.job_id, record)
-        _put_result(
-            store.path,
-            job_id=job.job_id,
-            jobset_fingerprint=str(payload["jobset_fingerprint"]),
-            modality=modality,
-            status=status,
-            record=record,
-        )
-        if after_result_write is not None:
-            after_result_write(job.job_id, record)
-        _finish_safely(store, job, status=status, record=record)
-        handled += 1
-
     with _LeaseHeartbeat(
         store.path,
-        model_jobs,
+        claimed,
         owner=owner,
         lease_seconds=lease_seconds,
         interval=heartbeat_seconds,
-    ):
+    ) as heartbeat:
+        for job in claimed:
+            payload = job.payload
+            cached = cache.get(payload)
+            if cached is None:
+                model_jobs.append(job)
+                task = _payload_to_task(payload)
+                task_by_key[task.cache_key] = task
+                job_by_key[task.cache_key] = job
+                continue
+            if _fenced_commit_model_record(
+                store.path,
+                job=job,
+                expected_kind=job.kind,
+                payload=payload,
+                record=cached,
+                status="success",
+                heartbeat=heartbeat,
+                after_cache_write=after_cache_write,
+                after_result_write=after_result_write,
+            ):
+                handled += 1
+        if not model_jobs:
+            return handled
+        if extractor is None:
+            for job in model_jobs:
+                if heartbeat.is_lost(str(job.job_id)):
+                    continue
+                store.finish(
+                    job.job_id,
+                    status="retryable",
+                    result={"reason": "model extractor is unavailable"},
+                    owner=job.owner,
+                    lease_id=job.lease_id,
+                )
+            raise RuntimeError(
+                "model analysis is required but no extractor was provided"
+            )
+
+        def commit_record(
+            model_call_key: str,
+            record: dict[str, Any],
+        ) -> None:
+            nonlocal handled
+            job = job_by_key[model_call_key]
+            payload = job.payload
+            status = (
+                "terminal"
+                if clean_text(record.get("error"))
+                else "success"
+            )
+            if _fenced_commit_model_record(
+                store.path,
+                job=job,
+                expected_kind=job.kind,
+                payload=payload,
+                record=record,
+                status=status,
+                heartbeat=heartbeat,
+                after_cache_write=after_cache_write,
+                after_result_write=after_result_write,
+            ):
+                handled += 1
+
         run_extraction_task_group(
             extractor=extractor,
-            tasks=[task_by_key[job.payload["cache_key"]] for job in model_jobs],
+            tasks=[
+                task_by_key[job.payload["model_call_key"]]
+                for job in model_jobs
+            ],
             workers=workers,
             on_record=commit_record,
         )
@@ -1135,6 +1391,104 @@ def _latest_jobset(database_path: Path) -> ModelJobSet:
     )
 
 
+def _jobset_provenance(jobset: ModelJobSet) -> dict[str, Any]:
+    rows: dict[str, sqlite3.Row] = {}
+    with _connect(jobset.database_path) as connection:
+        for modality in ("text", "image"):
+            row = connection.execute(
+                """
+                SELECT *
+                FROM model_jobsets
+                WHERE fingerprint = ?
+                """,
+                (jobset.fingerprint_for(modality),),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"missing durable {modality} model jobset metadata"
+                )
+            rows[modality] = row
+    for modality, row in rows.items():
+        if (
+            str(row["modality"]) != modality
+            or str(row["job_kind"]) != jobset.kind_for(modality)
+            or int(row["task_count"]) != (
+                jobset.text_tasks
+                if modality == "text"
+                else jobset.image_tasks
+            )
+            or int(row["enqueue_complete"]) != 1
+            or str(row["prompt_version"]) != jobset.prompt_version
+        ):
+            raise ValueError(
+                f"durable {modality} model jobset metadata mismatch"
+            )
+    return {
+        "queue_schema_version": MODEL_QUEUE_SCHEMA_VERSION,
+        "parser_schema_version": MODEL_PARSER_SCHEMA_VERSION,
+        "prompt_version": jobset.prompt_version,
+        "input_fingerprints": {
+            modality: str(rows[modality]["input_fingerprint"])
+            for modality in ("text", "image")
+        },
+        "model_identities": {
+            modality: str(rows[modality]["model_identity"])
+            for modality in ("text", "image")
+        },
+        "policy_fingerprints": {
+            modality: str(rows[modality]["policy_fingerprint"])
+            for modality in ("text", "image")
+        },
+    }
+
+
+def _validate_output_record_provenance(
+    record: dict[str, Any],
+    *,
+    status: str,
+    jobset: ModelJobSet,
+    expected: dict[str, Any],
+) -> None:
+    modality = clean_text(record.get("modality"))
+    if modality not in {"text", "image"}:
+        raise ValueError("model output record modality is invalid")
+    expected_values = {
+        "jobset_fingerprint": jobset.fingerprint_for(modality),
+        "prompt_version": expected["prompt_version"],
+        "model_identity": expected["model_identities"][modality],
+        "policy_fingerprint": expected["policy_fingerprints"][modality],
+        "parser_schema_version": expected["parser_schema_version"],
+        "asset_type": modality,
+    }
+    if any(
+        record.get(field) != value
+        for field, value in expected_values.items()
+    ):
+        raise ValueError(
+            f"model output {status} record provenance mismatch"
+        )
+    if not all(
+        clean_text(record.get(field))
+        for field in (
+            "cache_key",
+            "model_call_key",
+            "asset_fingerprint",
+        )
+    ):
+        raise ValueError(
+            f"model output {status} record provenance is incomplete"
+        )
+    candidates = record.get("candidate_attribute_names")
+    if (
+        not isinstance(candidates, list)
+        or not candidates
+        or not all(clean_text(value) for value in candidates)
+    ):
+        raise ValueError(
+            f"model output {status} record candidates are invalid"
+        )
+
+
 def _load_valid_manifest(
     path: Path,
     *,
@@ -1144,10 +1498,24 @@ def _load_valid_manifest(
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        payload.get("stage") != "wdc200k_model_outputs"
+        or payload.get("schema_version") != MODEL_OUTPUT_SCHEMA_VERSION
+    ):
+        raise ValueError("model output manifest stage/schema mismatch")
     if payload.get("identity") != _manifest_identity(jobset):
         raise ValueError("model output manifest identity mismatch")
     if payload.get("complete") is not True:
         return None
+    expected_jobsets = {
+        "text": jobset.text_fingerprint,
+        "image": jobset.image_fingerprint,
+    }
+    if payload.get("jobsets") != expected_jobsets:
+        raise ValueError("model output manifest jobset mismatch")
+    expected_provenance = _jobset_provenance(jobset)
+    if payload.get("provenance") != expected_provenance:
+        raise ValueError("model output manifest provenance mismatch")
     extraction_shards = [
         _completed_from_payload(item)
         for item in payload.get("extraction_shards", [])
@@ -1161,7 +1529,68 @@ def _load_valid_manifest(
         for shard in (*extraction_shards, *error_shards)
     ):
         raise ValueError("model output shard checksum validation failed")
-    counts = payload["counts"]
+    counts_value = payload.get("counts")
+    if not isinstance(counts_value, dict):
+        raise ValueError("model output manifest count metadata is missing")
+    try:
+        counts = {
+            key: int(counts_value[key])
+            for key in (
+                "text_total",
+                "image_total",
+                "success",
+                "terminal",
+            )
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "model output manifest count metadata is invalid"
+        ) from error
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("model output manifest count is negative")
+    if (
+        counts["text_total"] != jobset.text_tasks
+        or counts["image_total"] != jobset.image_tasks
+        or counts["success"] + counts["terminal"] != jobset.total_tasks
+        or sum(shard.records for shard in extraction_shards)
+        != counts["success"]
+        or sum(shard.records for shard in error_shards)
+        != counts["terminal"]
+    ):
+        raise ValueError("model output manifest count mismatch")
+    snapshot = _job_snapshot(jobset.database_path, jobset)
+    if (
+        snapshot["total"] != jobset.total_tasks
+        or snapshot["success"] != counts["success"]
+        or snapshot["terminal"] != counts["terminal"]
+        or snapshot["pending"] + snapshot["retryable"] + snapshot["leased"]
+        != 0
+    ):
+        raise ValueError("model output manifest/store count mismatch")
+    for status, shards in (
+        ("success", extraction_shards),
+        ("terminal", error_shards),
+    ):
+        observed = 0
+        for shard in shards:
+            with (output_root / shard.path).open(
+                "r", encoding="utf-8"
+            ) as handle:
+                for line in handle:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            "model output shard record is not an object"
+                        )
+                    _validate_output_record_provenance(
+                        record,
+                        status=status,
+                        jobset=jobset,
+                        expected=expected_provenance,
+                    )
+                    observed += 1
+        if observed != counts[status]:
+            raise ValueError("model output shard record count mismatch")
     return ModelStageResult(
         output_root=output_root,
         manifest_path=path,
@@ -1171,10 +1600,10 @@ def _load_valid_manifest(
         error_paths=tuple(
             output_root / shard.path for shard in error_shards
         ),
-        text_total=int(counts["text_total"]),
-        image_total=int(counts["image_total"]),
-        success=int(counts["success"]),
-        terminal=int(counts["terminal"]),
+        text_total=counts["text_total"],
+        image_total=counts["image_total"],
+        success=counts["success"],
+        terminal=counts["terminal"],
         pending=0,
         leased=0,
         complete=True,
@@ -1249,6 +1678,7 @@ def _publish_outputs(
                         SELECT status, record_json, record_sha256
                         FROM model_results
                         WHERE jobset_fingerprint = ?
+                          AND committed = 1
                         ORDER BY job_id
                         """,
                         (jobset.fingerprint_for(modality),),
@@ -1295,6 +1725,7 @@ def _publish_outputs(
                 "text": jobset.text_fingerprint,
                 "image": jobset.image_fingerprint,
             },
+            "provenance": _jobset_provenance(jobset),
             "extraction_shards": [
                 _shard_payload(shard) for shard in extraction_shards
             ],
@@ -1397,7 +1828,6 @@ def run_model_stage(
             )
     persistent_cache = _PersistentCache(store.path, delegate=cache)
     _repair_durable_results(store.path, jobset)
-    _repair_cached_leases(store.path, jobset, persistent_cache)
     processed = 0
     for modality in ("text", "image"):
         while stop_after is None or processed < stop_after:
@@ -1546,6 +1976,58 @@ def _validate_declared_shards(
         raise ValueError(f"upstream manifest shard validation failed: {path}")
 
 
+def _validate_network_manifest(
+    path: Path,
+    payload: dict[str, Any],
+) -> None:
+    if (
+        payload.get("stage") != "wdc200k_network_fetch"
+        or payload.get("schema_version")
+        != "wdc200k-network-fetch-v1"
+        or not clean_text(payload.get("policy_fingerprint"))
+    ):
+        raise ValueError(f"invalid WDC network manifest: {path}")
+    declared = payload.get("completed_shards")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError(
+            f"WDC network manifest is missing required shards: {path}"
+        )
+    _validate_declared_shards(path, payload, field="completed_shards")
+    counts_value = payload.get("counts")
+    if not isinstance(counts_value, dict):
+        raise ValueError(f"WDC network manifest counts are missing: {path}")
+    try:
+        counts = {
+            key: int(counts_value[key])
+            for key in (
+                "unique",
+                "success",
+                "terminal",
+                "pending",
+                "leased",
+            )
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"WDC network manifest counts are invalid: {path}"
+        ) from error
+    if (
+        any(value < 0 for value in counts.values())
+        or counts["success"] + counts["terminal"] != counts["unique"]
+        or counts["pending"] != 0
+        or counts["leased"] != 0
+        or sum(
+            int(item["records"])
+            for item in declared
+            if isinstance(item, dict)
+        )
+        != counts["unique"]
+    ):
+        raise ValueError(
+            f"WDC network manifest counts are incomplete: {path}"
+        )
+
+
 def write_model_start_marker(
     path: Path,
     jobset: ModelJobSet,
@@ -1558,14 +2040,12 @@ def write_model_start_marker(
     if not run_fingerprint:
         raise ValueError("run_fingerprint must not be empty")
     network_paths = [Path(value) for value in network_manifests]
+    if not network_paths:
+        raise ValueError("at least one WDC network manifest is required")
     upstream = []
     for manifest_path in network_paths:
         payload = _validated_complete_manifest(manifest_path)
-        _validate_declared_shards(
-            manifest_path,
-            payload,
-            field="completed_shards",
-        )
+        _validate_network_manifest(manifest_path, payload)
         upstream.append(
             {
                 "path": str(manifest_path),
@@ -1573,18 +2053,7 @@ def write_model_start_marker(
             }
         )
     assets_path = Path(assets_manifest)
-    assets_payload = _validated_complete_manifest(assets_path)
-    if assets_payload.get("stage") == "wdc200k_asset_materialization":
-        _validate_declared_shards(
-            assets_path,
-            assets_payload,
-            field="bridge_asset_shards",
-        )
-        _validate_declared_shards(
-            assets_path,
-            assets_payload,
-            field="table_asset_link_shards",
-        )
+    _strict_asset_manifest(assets_path)
     upstream.append(
         {
             "path": str(assets_path),
@@ -1633,6 +2102,9 @@ def write_model_done_marker(
 def marker_matches(
     path: Path,
     *,
+    expected_status: str | None = None,
+    model_kind: str | None = None,
+    task_count: int | None = None,
     run_fingerprint: str,
     jobset_fingerprint: str | None = None,
     text_jobset_fingerprint: str | None = None,
@@ -1643,6 +2115,15 @@ def marker_matches(
     except (OSError, ValueError, TypeError):
         return False
     if not isinstance(payload, dict):
+        return False
+    if (
+        expected_status is not None
+        and payload.get("status") != expected_status
+    ):
+        return False
+    if model_kind is not None and payload.get("model_kind") != model_kind:
+        return False
+    if task_count is not None and payload.get("task_count") != task_count:
         return False
     if payload.get("run_fingerprint") != run_fingerprint:
         return False
@@ -1678,6 +2159,7 @@ def wait_for_model_ready_marker(
     started = time.monotonic()
     while not marker_matches(
         Path(path),
+        expected_status="vllm_servers_ready",
         run_fingerprint=run_fingerprint,
         text_jobset_fingerprint=text_jobset_fingerprint,
         image_jobset_fingerprint=image_jobset_fingerprint,
@@ -1717,6 +2199,363 @@ def iter_assets_from_materialization_manifest(
                     continue
                 if record.get("asset_type") in {"text", "image"}:
                     yield record
+
+
+class _AdapterShardWriter:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        records_per_shard: int,
+    ) -> None:
+        self.root = root
+        self.records_per_shard = records_per_shard
+        self.completed: list[CompletedShard] = []
+        self.writer: AtomicJsonlShard | None = None
+        self.current_records = 0
+
+    def write(self, record: dict[str, Any]) -> None:
+        if self.writer is None:
+            self.writer = AtomicJsonlShard(
+                self.root / f"part-{len(self.completed):05d}.jsonl"
+            )
+            self.current_records = 0
+        self.writer.write(record)
+        self.current_records += 1
+        if self.current_records >= self.records_per_shard:
+            self._commit()
+
+    def _commit(self) -> None:
+        if self.writer is None:
+            return
+        completed = self.writer.commit()
+        self.completed.append(
+            CompletedShard(
+                path=(self.root / completed.path).as_posix(),
+                records=completed.records,
+                bytes=completed.bytes,
+                sha256=completed.sha256,
+            )
+        )
+        self.writer = None
+
+    def close(self) -> list[CompletedShard]:
+        self._commit()
+        return self.completed
+
+    def abort(self) -> None:
+        if self.writer is not None:
+            self.writer.abort()
+
+
+def _iter_jsonl_paths(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
+    for path in paths:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError(f"non-object JSONL record: {path}")
+                yield record
+
+
+def _strict_asset_manifest(
+    manifest_path: Path,
+) -> tuple[dict[str, Any], list[Path], list[Path]]:
+    payload = _validated_complete_manifest(manifest_path)
+    if (
+        payload.get("stage") != "wdc200k_asset_materialization"
+        or not isinstance(payload.get("fingerprint"), dict)
+        or payload["fingerprint"].get("schema_version")
+        != "wdc200k-asset-materialization-v1"
+    ):
+        raise ValueError("invalid Task-5 asset materialization manifest")
+    root = manifest_path.parent
+    asset_shards = [
+        _completed_from_payload(item)
+        for item in payload.get("bridge_asset_shards", [])
+    ]
+    link_shards = [
+        _completed_from_payload(item)
+        for item in payload.get("table_asset_link_shards", [])
+    ]
+    if not asset_shards or not link_shards:
+        raise ValueError("Task-5 manifest is missing required shards")
+    if not all(
+        validate_completed_shard(shard, root)
+        for shard in (*asset_shards, *link_shards)
+    ):
+        raise ValueError("Task-5 manifest shard validation failed")
+    return (
+        payload,
+        [root / shard.path for shard in asset_shards],
+        [root / shard.path for shard in link_shards],
+    )
+
+
+def adapt_model_tasks_from_manifests(
+    *,
+    structural_output_root: Path,
+    structural_manifests: Iterable[Path],
+    finalized_selection_manifest: Path,
+    assets_manifest: Path,
+    output_root: Path,
+    args: argparse.Namespace,
+    records_per_shard: int = 10_000,
+) -> AdaptedModelTasks:
+    """Disk-index Task-3/Task-5 artifacts into authoritative model tasks."""
+    if records_per_shard <= 0:
+        raise ValueError("records_per_shard must be positive")
+    import wdc200k_structural as structural
+
+    structural_output_root = Path(structural_output_root)
+    structural_paths = sorted(Path(path) for path in structural_manifests)
+    if not structural_paths:
+        raise ValueError("structural manifests are required")
+    source_paths: list[Path] = []
+    entity_paths: list[Path] = []
+    table_count = 0
+    manifest_hashes: list[str] = []
+    for manifest_path in structural_paths:
+        _validated, records, manifest_hash = (
+            structural._validated_shard_from_manifest(
+                manifest_path,
+                output_root=structural_output_root,
+            )
+        )
+        table_count += records
+        manifest_hashes.append(manifest_hash)
+        payload = _validated_complete_manifest(manifest_path)
+        completed = [
+            _completed_from_payload(item)
+            for item in payload["completed_shards"]
+        ]
+        source_paths.extend(
+            structural_output_root / shard.path
+            for shard in completed
+            if shard.path.startswith("source_tables/")
+        )
+        entity_paths.extend(
+            structural_output_root / shard.path
+            for shard in completed
+            if shard.path.startswith("entities/")
+        )
+
+    final_path = Path(finalized_selection_manifest)
+    final_payload = _validated_complete_manifest(final_path)
+    if (
+        final_payload.get("stage") != "wdc200k_validated_selection"
+        or not clean_text(final_payload.get("input_fingerprint"))
+        or not clean_text(final_payload.get("parameter_fingerprint"))
+        or len(final_payload.get("completed_shards") or []) != 1
+    ):
+        raise ValueError("invalid Task-3 finalized-selection barrier")
+    final_shard = _completed_from_payload(
+        final_payload["completed_shards"][0]
+    )
+    if (
+        final_shard.records != table_count
+        or not validate_completed_shard(
+            final_shard,
+            structural_output_root,
+        )
+    ):
+        raise ValueError("Task-3 finalized-selection validation failed")
+    _, asset_paths, link_paths = _strict_asset_manifest(
+        Path(assets_manifest)
+    )
+    input_fingerprint = stable_hash(
+        MODEL_QUEUE_SCHEMA_VERSION,
+        *(manifest_hashes),
+        _sha256_path(final_path),
+        _sha256_path(Path(assets_manifest)),
+        length=40,
+    )
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    index_path = output_root / "model-task-adapter.sqlite3"
+    index_path.unlink(missing_ok=True)
+    with sqlite3.connect(index_path) as connection:
+        connection.execute(
+            "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE entities (entity_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE links (
+                source_table_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                PRIMARY KEY (source_table_id, entity_id, asset_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX links_source ON links(source_table_id)"
+        )
+        for record in _iter_jsonl_paths(asset_paths):
+            connection.execute(
+                "INSERT OR REPLACE INTO assets VALUES (?, ?)",
+                (str(record["asset_id"]), _canonical_json(record)),
+            )
+        for record in _iter_jsonl_paths(entity_paths):
+            connection.execute(
+                "INSERT OR REPLACE INTO entities VALUES (?, ?)",
+                (str(record["entity_id"]), _canonical_json(record)),
+            )
+        for record in _iter_jsonl_paths(link_paths):
+            for asset_id in record.get("asset_ids") or []:
+                connection.execute(
+                    "INSERT OR IGNORE INTO links VALUES (?, ?, ?)",
+                    (
+                        str(record["source_table_id"]),
+                        str(record["entity_id"]),
+                        str(asset_id),
+                    ),
+                )
+        connection.commit()
+
+    task_writer = _AdapterShardWriter(
+        output_root / "tasks",
+        records_per_shard=records_per_shard,
+    )
+    error_writer = _AdapterShardWriter(
+        output_root / "planning_errors",
+        records_per_shard=records_per_shard,
+    )
+    task_count = 0
+    error_count = 0
+    adapter_args = argparse.Namespace(**vars(args))
+    if not hasattr(adapter_args, "min_column_non_empty_ratio"):
+        adapter_args.min_column_non_empty_ratio = 0.5
+    try:
+        with sqlite3.connect(index_path) as connection:
+            connection.row_factory = sqlite3.Row
+            for source_table in _iter_jsonl_paths(source_paths):
+                source_table_id = str(source_table["source_table_id"])
+                link_rows = connection.execute(
+                    """
+                    SELECT entity_id, asset_id
+                    FROM links
+                    WHERE source_table_id = ?
+                    ORDER BY entity_id, asset_id
+                    """,
+                    (source_table_id,),
+                ).fetchall()
+                entity_to_assets: dict[str, list[str]] = {}
+                assets: dict[str, dict[str, Any]] = {}
+                wiki_to_entity_id: dict[str, str] = {}
+                for link in link_rows:
+                    entity_id = str(link["entity_id"])
+                    asset_id = str(link["asset_id"])
+                    entity_to_assets.setdefault(entity_id, []).append(
+                        asset_id
+                    )
+                    asset_row = connection.execute(
+                        "SELECT payload FROM assets WHERE asset_id = ?",
+                        (asset_id,),
+                    ).fetchone()
+                    entity_row = connection.execute(
+                        "SELECT payload FROM entities WHERE entity_id = ?",
+                        (entity_id,),
+                    ).fetchone()
+                    if asset_row is None or entity_row is None:
+                        continue
+                    assets[asset_id] = json.loads(str(asset_row["payload"]))
+                    entity = json.loads(str(entity_row["payload"]))
+                    wiki_to_entity_id[str(entity["wiki_title"])] = entity_id
+                tasks = collect_table_extraction_tasks(
+                    source_table=source_table,
+                    assets=assets,
+                    entity_to_assets=entity_to_assets,
+                    wiki_to_entity_id=wiki_to_entity_id,
+                    args=adapter_args,
+                )
+                if link_rows and not tasks:
+                    error_writer.write(
+                        {
+                            "status": "terminal",
+                            "error_class": "no_candidate_attributes",
+                            "source_table_id": source_table_id,
+                        }
+                    )
+                    error_count += 1
+                for task in tasks:
+                    if not task.candidate_attribute_names:
+                        raise ValueError(
+                            "adapter produced an empty candidate task"
+                        )
+                    task_writer.write(
+                        {
+                            "extraction_task": {
+                                "order": task.order,
+                                "cache_key": task.cache_key,
+                                "source_table_id": task.source_table_id,
+                                "source_row_id": task.source_row_id,
+                                "entity_column_index": (
+                                    task.entity_column_index
+                                ),
+                                "entity_column_name": (
+                                    task.entity_column_name
+                                ),
+                                "entity": task.entity,
+                                "asset": task.asset,
+                                "candidate_attribute_names": (
+                                    task.candidate_attribute_names
+                                ),
+                            }
+                        }
+                    )
+                    task_count += 1
+        task_shards = task_writer.close()
+        error_shards = error_writer.close()
+    except BaseException:
+        task_writer.abort()
+        error_writer.abort()
+        raise
+    task_shards = [
+        CompletedShard(
+            path=Path(shard.path).relative_to(output_root).as_posix(),
+            records=shard.records,
+            bytes=shard.bytes,
+            sha256=shard.sha256,
+        )
+        for shard in task_shards
+    ]
+    error_shards = [
+        CompletedShard(
+            path=Path(shard.path).relative_to(output_root).as_posix(),
+            records=shard.records,
+            bytes=shard.bytes,
+            sha256=shard.sha256,
+        )
+        for shard in error_shards
+    ]
+    manifest_path = output_root / "model-task-adapter-manifest.json"
+    _atomic_json(
+        manifest_path,
+        {
+            "stage": "wdc200k_model_task_adapter",
+            "schema_version": MODEL_QUEUE_SCHEMA_VERSION,
+            "input_fingerprint": input_fingerprint,
+            "task_shards": [_shard_payload(item) for item in task_shards],
+            "error_shards": [_shard_payload(item) for item in error_shards],
+            "counts": {"tasks": task_count, "errors": error_count},
+            "complete": True,
+        },
+    )
+    return AdaptedModelTasks(
+        output_root=output_root,
+        task_paths=tuple(output_root / item.path for item in task_shards),
+        error_paths=tuple(output_root / item.path for item in error_shards),
+        manifest_path=manifest_path,
+        input_fingerprint=input_fingerprint,
+        tasks=task_count,
+        errors=error_count,
+    )
 
 
 def enqueue_model_tasks_from_manifest(
