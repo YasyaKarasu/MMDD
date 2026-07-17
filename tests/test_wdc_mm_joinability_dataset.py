@@ -1120,7 +1120,7 @@ def test_download_image_retries_with_injected_sleep(tmp_path):
     assert clock.sleeps == [0.5]
 
 
-def test_download_image_rejects_duplicate_content_from_different_urls(tmp_path):
+def test_download_image_shares_duplicate_content_from_different_urls(tmp_path):
     body = png_bytes()
     client = WdcWebClient(
         tmp_path,
@@ -1148,8 +1148,28 @@ def test_download_image_rejects_duplicate_content_from_different_urls(tmp_path):
     )
 
     assert first is not None
-    assert duplicate is None
+    assert duplicate is not None
+    assert first["local_path"] == duplicate["local_path"]
+    assert first["sha256"] == duplicate["sha256"]
+    assert first["original_url"] == "https://cdn.test/first.png"
+    assert duplicate["original_url"] == "https://cdn.test/second.png"
+    assert duplicate["final_url"] == "https://example.test/final"
     assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT original_url, file_name, sha256
+            FROM image_cache
+            ORDER BY original_url
+            """
+        ).fetchall()
+        failures = connection.execute(
+            "SELECT COUNT(*) FROM image_failure_cache"
+        ).fetchone()[0]
+    assert len(rows) == 2
+    assert len({row[1] for row in rows}) == 1
+    assert len({row[2] for row in rows}) == 1
+    assert failures == 0
 
 
 def test_download_image_orphan_sha_conflict_is_cleaned_without_raising(tmp_path):
@@ -1185,14 +1205,118 @@ def test_download_image_orphan_sha_conflict_is_cleaned_without_raising(tmp_path)
         max_retries=0,
     )
 
-    assert recovering_client.download_image(
+    recovered = recovering_client.download_image(
         orphan_url,
         page_url="https://example.test/page",
         source="wdc_page_image",
         entity_id="ent_orphan",
-    ) is None
+    )
+    assert recovered is not None
+    assert recovered["original_url"] == orphan_url
+    assert recovered["local_path"] == str(
+        tmp_path
+        / "wdc_images"
+        / client.cached_image_outcome(first_url)["file_name"]
+    )
     assert not orphan_path.exists()
     assert offline_session.calls == []
+
+
+def test_duplicate_content_is_shared_across_policy_namespaces(tmp_path):
+    body = png_bytes()
+    records = []
+    for policy, image_url in (
+        ("image-v1", "https://cdn.test/one.png"),
+        ("image-v2", "https://cdn.test/two.png"),
+    ):
+        client = WdcWebClient(
+            tmp_path,
+            session=FakeSession(
+                [
+                    FakeResponse(
+                        body,
+                        headers={"Content-Type": "image/png"},
+                    )
+                ]
+            ),
+            host_delay=0,
+            max_retries=0,
+            network_policy_version=policy,
+        )
+        records.append(
+            client.download_image(
+                image_url,
+                page_url="https://example.test/page",
+                source="wdc_page_image",
+                entity_id=policy,
+            )
+        )
+
+    assert all(record is not None for record in records)
+    assert records[0]["local_path"] == records[1]["local_path"]
+    assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache"
+        ).fetchone() == (2,)
+
+
+def test_concurrent_different_urls_with_same_content_share_one_file(
+    tmp_path,
+):
+    body = png_bytes()
+    barrier = threading.Barrier(2)
+
+    class BarrierResponse(FakeResponse):
+        def iter_content(self, chunk_size: int):
+            barrier.wait(timeout=5)
+            yield from super().iter_content(chunk_size)
+
+    class ConcurrentSession(FakeSession):
+        def __init__(self):
+            super().__init__([])
+            self.lock = threading.Lock()
+
+        def get(self, url: str, **kwargs):
+            with self.lock:
+                self.calls.append((url, kwargs))
+            return BarrierResponse(
+                body,
+                url=url + "?final=1",
+                headers={"Content-Type": "image/png"},
+            )
+
+    client = WdcWebClient(
+        tmp_path,
+        session=ConcurrentSession(),
+        host_delay=0,
+        max_retries=0,
+    )
+    start = threading.Barrier(2)
+
+    def download(image_url: str):
+        start.wait(timeout=5)
+        return client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=image_url,
+        )
+
+    urls = [
+        "https://cdn.test/concurrent-a.png",
+        "https://cdn.test/concurrent-b.png",
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(download, urls))
+
+    assert all(record is not None for record in records)
+    assert records[0]["local_path"] == records[1]["local_path"]
+    assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache"
+        ).fetchone() == (2,)
 
 
 def test_download_image_same_url_singleflight_keeps_file_index_and_records_consistent(

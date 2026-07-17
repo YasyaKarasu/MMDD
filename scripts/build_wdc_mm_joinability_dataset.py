@@ -470,6 +470,9 @@ class WdcWebClient:
         self._image_locks = tuple(
             threading.Lock() for _ in range(self._IMAGE_LOCK_STRIPES)
         )
+        self._image_content_locks = tuple(
+            threading.Lock() for _ in range(self._IMAGE_LOCK_STRIPES)
+        )
         self._initialize_database()
 
     def _connect(self) -> sqlite3.Connection:
@@ -539,7 +542,14 @@ class WdcWebClient:
                 )
             self._image_bytes_total = int(
                 connection.execute(
-                    "SELECT COALESCE(SUM(bytes), 0) FROM image_cache"
+                    """
+                    SELECT COALESCE(SUM(bytes), 0)
+                    FROM (
+                        SELECT file_name, MAX(bytes) AS bytes
+                        FROM image_cache
+                        GROUP BY file_name
+                    )
+                    """
                 ).fetchone()[0]
             )
             self._page_bytes_total = int(
@@ -635,8 +645,7 @@ class WdcWebClient:
                 mime_type TEXT NOT NULL,
                 bytes INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL,
-                PRIMARY KEY (original_url, policy_fingerprint),
-                UNIQUE (sha256, policy_fingerprint)
+                PRIMARY KEY (original_url, policy_fingerprint)
             )
             """
         )
@@ -655,7 +664,23 @@ class WdcWebClient:
             )
             if int(row["pk"] or 0)
         ]
-        if primary_key == ["original_url", "policy_fingerprint"]:
+        unique_sha_indexes = []
+        for index in connection.execute("PRAGMA index_list(image_cache)"):
+            if not int(index["unique"] or 0):
+                continue
+            index_name = str(index["name"])
+            columns_in_index = [
+                str(row["name"])
+                for row in connection.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                )
+            ]
+            if "sha256" in columns_in_index:
+                unique_sha_indexes.append(index_name)
+        if (
+            primary_key == ["original_url", "policy_fingerprint"]
+            and not unique_sha_indexes
+        ):
             return
         connection.execute(
             "ALTER TABLE image_cache RENAME TO image_cache_legacy"
@@ -1547,7 +1572,50 @@ class WdcWebClient:
                 continue
             width, height, mime_type, _extension = raster
             existing_bytes = cached_path.stat().st_size
+            digest = self._sha256_path(cached_path)
             try:
+                with self._connect() as connection:
+                    duplicate = connection.execute(
+                        """
+                        SELECT final_url, file_name
+                        FROM image_cache
+                        WHERE sha256 = ?
+                        ORDER BY updated_at, original_url
+                        LIMIT 1
+                        """,
+                        (digest,),
+                    ).fetchone()
+                if duplicate is not None:
+                    shared_path = (
+                        self.image_dir / str(duplicate["file_name"])
+                    )
+                    shared_raster = self._validated_raster(shared_path)
+                    if (
+                        shared_raster is not None
+                        and self._sha256_path(shared_path) == digest
+                    ):
+                        cached_path.unlink(missing_ok=True)
+                        width, height, mime_type, _extension = shared_raster
+                        self._store_image_index(
+                            original_url=image_url,
+                            final_url=image_url,
+                            path=shared_path,
+                            width=width,
+                            height=height,
+                            mime_type=mime_type,
+                        )
+                        return self._image_record(
+                            shared_path,
+                            original_url=image_url,
+                            final_url=image_url,
+                            page_url=page_url,
+                            source=source,
+                            entity_id=entity_id,
+                            width=width,
+                            height=height,
+                            mime_type=mime_type,
+                            downloaded=False,
+                        )
                 with self._image_quota_lock:
                     if (
                         self._image_bytes_total + existing_bytes
@@ -1559,10 +1627,21 @@ class WdcWebClient:
                     ):
                         cached_path.unlink(missing_ok=True)
                         return None
+                    content_path = (
+                        self.image_dir
+                        / f"image_{digest}{_extension}"
+                    )
+                    if cached_path != content_path:
+                        try:
+                            os.link(cached_path, content_path)
+                        except FileExistsError:
+                            if self._sha256_path(content_path) != digest:
+                                return None
+                        cached_path.unlink(missing_ok=True)
                     self._store_image_index(
                         original_url=image_url,
                         final_url=image_url,
-                        path=cached_path,
+                        path=content_path,
                         width=width,
                         height=height,
                         mime_type=mime_type,
@@ -1575,7 +1654,7 @@ class WdcWebClient:
                     pass
                 return None
             return self._image_record(
-                cached_path,
+                content_path,
                 original_url=image_url,
                 final_url=image_url,
                 page_url=page_url,
@@ -1667,19 +1746,28 @@ class WdcWebClient:
                     return None
                 width, height, mime_type, extension = raster
                 digest = self._sha256_path(raster_path)
-                with self._connect() as connection:
-                    duplicate = connection.execute(
-                        """
-                        SELECT original_url FROM image_cache
-                        WHERE sha256 = ? AND policy_fingerprint = ?
-                        """,
-                        (digest, self.network_policy_version),
-                    ).fetchone()
-                if duplicate is not None and duplicate["original_url"] != image_url:
-                    return None
-                image_path = self.image_dir / f"image_{image_key}{extension}"
-                raster_path.replace(image_path)
-                try:
+                image_path = self.image_dir / f"image_{digest}{extension}"
+                content_lock = self._image_content_locks[
+                    int(digest[:8], 16) % len(self._image_content_locks)
+                ]
+                with content_lock:
+                    created = False
+                    if image_path.exists():
+                        if (
+                            self._validated_raster(image_path) is None
+                            or self._sha256_path(image_path) != digest
+                        ):
+                            return None
+                    else:
+                        try:
+                            os.link(raster_path, image_path)
+                            created = True
+                        except FileExistsError:
+                            if (
+                                self._validated_raster(image_path) is None
+                                or self._sha256_path(image_path) != digest
+                            ):
+                                return None
                     self._store_image_index(
                         original_url=image_url,
                         final_url=final_url,
@@ -1688,11 +1776,11 @@ class WdcWebClient:
                         height=height,
                         mime_type=mime_type,
                     )
-                except sqlite3.IntegrityError:
-                    image_path.unlink(missing_ok=True)
-                    return None
-                with self._image_quota_lock:
-                    self._image_bytes_total += image_path.stat().st_size
+                    if created:
+                        with self._image_quota_lock:
+                            self._image_bytes_total += (
+                                image_path.stat().st_size
+                            )
                 return self._image_record(
                     image_path,
                     original_url=image_url,
