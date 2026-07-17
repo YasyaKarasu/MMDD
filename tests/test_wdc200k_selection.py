@@ -87,6 +87,7 @@ def test_statistics_catalog_keeps_missing_gzip_as_provisional(
     assert [record.relative_path for record in records] == [
         "Product/Product_missing.test_October2023.json.gz"
     ]
+    assert "exists" not in (read_statistics_catalog.__doc__ or "")
 
 
 def test_selection_module_imports_through_scripts_package() -> None:
@@ -378,6 +379,8 @@ def test_replacement_prefers_same_stratum_then_global_reserve(
     first = replace_invalid_selection(
         invalid,
         first_manager,
+        operation_key="replace-bad",
+        reason="malformed gzip",
         is_invalid=lambda item: item.host == "also-bad.test",
     )
     second_manager = ReserveManager.create(
@@ -389,6 +392,8 @@ def test_replacement_prefers_same_stratum_then_global_reserve(
     second = replace_invalid_selection(
         invalid,
         second_manager,
+        operation_key="replace-bad-global",
+        reason="malformed gzip",
         is_invalid=lambda _item: False,
     )
 
@@ -442,7 +447,12 @@ def test_replacement_global_fallback_skips_class_at_cap(
         policy=policy,
     )
 
-    replacement = replace_invalid_selection(invalid, manager)
+    replacement = replace_invalid_selection(
+        invalid,
+        manager,
+        operation_key="replace-event",
+        reason="unreadable gzip",
+    )
 
     assert replacement == feasible_event
     assert manager.class_counts() == {"Event": 1, "Product": 2}
@@ -487,7 +497,12 @@ def test_replacement_raises_when_no_candidate_fits_class_cap(
         ReserveExhaustedError,
         match="no reserve candidate can replace",
     ):
-        replace_invalid_selection(invalid, manager)
+        replace_invalid_selection(
+            invalid,
+            manager,
+            operation_key="replace-exhausted",
+            reason="unreadable gzip",
+        )
 
     assert manager.class_counts() == {"Event": 0, "Product": 1}
 
@@ -543,10 +558,25 @@ def test_reserve_manager_consumes_consecutively_and_resumes(
         policy=policy,
     )
 
-    first = replace_invalid_selection(invalid_product, manager)
-    second = replace_invalid_selection(invalid_event, manager)
+    first = replace_invalid_selection(
+        invalid_product,
+        manager,
+        operation_key="replace-product-1",
+        reason="invalid table",
+    )
+    second = replace_invalid_selection(
+        invalid_event,
+        manager,
+        operation_key="replace-event-1",
+        reason="invalid table",
+    )
     resumed = ReserveManager.open(database, policy)
-    third = replace_invalid_selection(first, resumed)
+    third = replace_invalid_selection(
+        first,
+        resumed,
+        operation_key="replace-product-2",
+        reason="invalid replacement",
+    )
 
     assert first == product_reserves[0]
     assert second == event_reserve
@@ -612,7 +642,209 @@ def test_reserve_manager_streams_selection_jsonl_from_cli_schema(
         policy=policy,
     )
 
-    assert replace_invalid_selection(invalid, manager) == replacement
+    assert (
+        replace_invalid_selection(
+            invalid,
+            manager,
+            operation_key="replace-jsonl",
+            reason="invalid table",
+        )
+        == replacement
+    )
+
+
+def test_reserve_manager_create_does_not_reuse_fixed_temporary_path(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "reserve.sqlite"
+    legacy_temporary = database.with_suffix(database.suffix + ".tmp")
+    legacy_temporary.write_text("owned by another creator", encoding="utf-8")
+    selected = TableCandidate(
+        "Product",
+        "minimum3",
+        "selected.test",
+        "Product/Product_selected.test_October2023.json.gz",
+        1,
+        3,
+    )
+    policy = SelectionPolicy(target_tables=1)
+
+    ReserveManager.create(
+        database,
+        reserve=[],
+        selected=[selected],
+        policy=policy,
+    )
+
+    assert legacy_temporary.read_text(encoding="utf-8") == (
+        "owned by another creator"
+    )
+
+
+def test_reserve_manager_open_missing_does_not_create_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "missing.sqlite"
+
+    with pytest.raises(FileNotFoundError):
+        ReserveManager.open(
+            database,
+            SelectionPolicy(target_tables=1),
+        )
+
+    assert not database.exists()
+
+
+def test_replacement_claim_survives_crash_and_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    reserves = [
+        TableCandidate(
+            "Product",
+            "minimum3",
+            f"reserve-{index}.test",
+            f"Product/Product_reserve-{index}.test_October2023.json.gz",
+            2,
+            4,
+        )
+        for index in range(2)
+    ]
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=reserves,
+        selected=[invalid],
+        policy=policy,
+    )
+
+    committed = manager.claim_replacement(
+        operation_key="structural-shard-7-row-3",
+        invalid_candidate=invalid,
+        reason="gzip JSON decode failed",
+    )
+    counts_after_commit = manager.class_counts()
+    used_after_commit = manager.used_paths()
+
+    resumed = ReserveManager.open(database, policy)
+    pending = resumed.pending_claims()
+    replay_by_key = resumed.claim_replacement(
+        operation_key="structural-shard-7-row-3",
+        invalid_candidate=invalid,
+        reason="gzip JSON decode failed",
+    )
+    replay_by_invalid = resumed.claim_replacement(
+        operation_key="retry-with-new-process-key",
+        invalid_candidate=invalid,
+        reason="process restarted",
+    )
+
+    assert committed.status == "pending"
+    assert committed.operation_key == "structural-shard-7-row-3"
+    assert committed.invalid_path == invalid.relative_path
+    assert committed.replacement == reserves[0]
+    assert committed.reason == "gzip JSON decode failed"
+    assert committed.created_at > 0
+    assert committed.acknowledged_at is None
+    assert pending == [committed]
+    assert replay_by_key == committed
+    assert replay_by_invalid == committed
+    assert resumed.class_counts() == counts_after_commit
+    assert resumed.used_paths() == used_after_commit
+    assert reserves[1].relative_path not in resumed.used_paths()
+
+
+def test_acknowledge_is_persistent_idempotent_and_validated(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    replacement = TableCandidate(
+        "Product",
+        "minimum3",
+        "replacement.test",
+        "Product/Product_replacement.test_October2023.json.gz",
+        2,
+        4,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=[replacement],
+        selected=[invalid],
+        policy=policy,
+    )
+    pending = manager.claim_replacement(
+        operation_key="operation-1",
+        invalid_candidate=invalid,
+        reason="invalid table",
+    )
+
+    with pytest.raises(KeyError, match="unknown replacement operation"):
+        manager.acknowledge(
+            operation_key="missing-operation",
+            replacement_path=replacement.relative_path,
+        )
+    with pytest.raises(ValueError, match="replacement path does not match"):
+        manager.acknowledge(
+            operation_key=pending.operation_key,
+            replacement_path="Product/wrong.json.gz",
+        )
+    with pytest.raises(ValueError, match="operation key belongs"):
+        manager.claim_replacement(
+            operation_key=pending.operation_key,
+            invalid_candidate=replacement,
+            reason="different invalid path",
+        )
+    conflicting_invalid = TableCandidate(
+        "Event",
+        invalid.subset,
+        invalid.host,
+        invalid.relative_path,
+        invalid.rows,
+        invalid.columns,
+    )
+    with pytest.raises(ValueError, match="invalid candidate metadata"):
+        manager.claim_replacement(
+            operation_key="operation-with-conflicting-metadata",
+            invalid_candidate=conflicting_invalid,
+            reason="invalid table",
+        )
+
+    acknowledged = manager.acknowledge(
+        operation_key=pending.operation_key,
+        replacement_path=replacement.relative_path,
+    )
+    replayed_ack = manager.acknowledge(
+        operation_key=pending.operation_key,
+        replacement_path=replacement.relative_path,
+    )
+    resumed = ReserveManager.open(database, policy)
+
+    assert acknowledged.status == "acked"
+    assert acknowledged.acknowledged_at is not None
+    assert replayed_ack == acknowledged
+    assert resumed.pending_claims() == []
+    assert resumed.claim_replacement(
+        operation_key=pending.operation_key,
+        invalid_candidate=invalid,
+        reason="invalid table",
+    ) == acknowledged
 
 
 def test_selection_cli_writes_exact_stable_provisional_and_reserve(

@@ -9,6 +9,8 @@ import json
 import math
 import os
 import sqlite3
+import time
+import uuid
 import zipfile
 from collections import defaultdict
 from collections.abc import Callable
@@ -84,7 +86,7 @@ class SelectionResult:
 
 
 def read_statistics_catalog(archive: Path) -> Iterator[TableCandidate]:
-    """Yield candidates whose sibling extracted data file exists."""
+    """Yield provisional candidates declared by a statistics archive."""
     schema_class = archive.stem.removesuffix("_statistics")
     with zipfile.ZipFile(archive) as zipped:
         members = set(zipped.namelist())
@@ -462,6 +464,41 @@ class ReserveExhaustedError(RuntimeError):
     """Raised when no unused reserve can preserve the selection constraints."""
 
 
+@dataclass(frozen=True)
+class ReplacementClaim:
+    operation_key: str
+    invalid_path: str
+    replacement: TableCandidate
+    reason: str
+    status: str
+    created_at: float
+    acknowledged_at: float | None
+
+    @property
+    def replacement_path(self) -> str:
+        return self.replacement.relative_path
+
+
+_CLAIM_SELECT = """
+    SELECT
+        operations.operation_key,
+        operations.invalid_path,
+        operations.replacement_path,
+        operations.reason,
+        operations.status,
+        operations.created_at,
+        operations.acknowledged_at,
+        candidates.schema_class AS replacement_schema_class,
+        candidates.subset_name AS replacement_subset,
+        candidates.host AS replacement_host,
+        candidates.rows_count AS replacement_rows,
+        candidates.columns_count AS replacement_columns
+    FROM replacement_operations AS operations
+    JOIN candidates
+      ON candidates.relative_path = operations.replacement_path
+"""
+
+
 class ReserveManager:
     """Persist reserve cursors, used paths, and active class counts in SQLite."""
 
@@ -482,10 +519,9 @@ class ReserveManager:
         if database_path.exists():
             raise FileExistsError(database_path)
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = database_path.with_suffix(
-            database_path.suffix + ".tmp"
+        temporary_path = database_path.parent / (
+            f".{database_path.name}.{uuid.uuid4().hex}.tmp"
         )
-        temporary_path.unlink(missing_ok=True)
         connection = sqlite3.connect(temporary_path)
         try:
             connection.execute("PRAGMA synchronous=FULL")
@@ -516,12 +552,33 @@ class ReserveManager:
                     schema_class TEXT PRIMARY KEY,
                     active_count INTEGER NOT NULL
                 );
+                CREATE TABLE replacement_operations (
+                    operation_key TEXT PRIMARY KEY,
+                    invalid_path TEXT NOT NULL UNIQUE,
+                    invalid_schema_class TEXT NOT NULL,
+                    invalid_subset TEXT NOT NULL,
+                    invalid_host TEXT NOT NULL,
+                    invalid_rows INTEGER NOT NULL,
+                    invalid_columns INTEGER NOT NULL,
+                    replacement_path TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending', 'acked')),
+                    created_at REAL NOT NULL,
+                    acknowledged_at REAL,
+                    FOREIGN KEY(replacement_path)
+                        REFERENCES candidates(relative_path)
+                );
                 CREATE INDEX candidates_same_stratum
                 ON candidates (
                     schema_class, subset_name, used, ordinal
                 );
                 CREATE INDEX candidates_class_order
                 ON candidates (schema_class, used, ordinal);
+                CREATE INDEX replacement_operations_pending
+                ON replacement_operations (
+                    status, created_at, operation_key
+                );
                 """
             )
             connection.execute(
@@ -634,7 +691,15 @@ class ReserveManager:
             raise
         else:
             connection.close()
-        temporary_path.replace(database_path)
+        try:
+            os.link(temporary_path, database_path)
+        except FileExistsError:
+            raise FileExistsError(
+                f"reserve database was concurrently published: "
+                f"{database_path}"
+            ) from None
+        finally:
+            temporary_path.unlink(missing_ok=True)
         _fsync_parent(database_path.parent)
         return cls.open(database_path, policy)
 
@@ -662,7 +727,9 @@ class ReserveManager:
         policy: SelectionPolicy,
     ) -> ReserveManager:
         """Open existing reserve state and verify its selection policy."""
-        connection = sqlite3.connect(database_path)
+        if not database_path.is_file():
+            raise FileNotFoundError(database_path)
+        connection = _connect_sqlite_read_write(database_path)
         try:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'policy'"
@@ -705,13 +772,74 @@ class ReserveManager:
     def replace(
         self,
         invalid_candidate: TableCandidate,
+        *,
+        operation_key: str,
+        reason: str,
         is_invalid: Callable[[TableCandidate], bool] | None = None,
     ) -> TableCandidate:
-        """Transactionally consume the next feasible deterministic reserve."""
+        """Compatibility helper returning the claimed replacement candidate."""
+        return self.claim_replacement(
+            operation_key=operation_key,
+            invalid_candidate=invalid_candidate,
+            reason=reason,
+            is_invalid=is_invalid,
+        ).replacement
+
+    def claim_replacement(
+        self,
+        *,
+        operation_key: str,
+        invalid_candidate: TableCandidate,
+        reason: str,
+        is_invalid: Callable[[TableCandidate], bool] | None = None,
+    ) -> ReplacementClaim:
+        """Persist and return an idempotent pending replacement operation."""
+        if not operation_key:
+            raise ValueError("operation_key must be non-empty")
+        if not reason:
+            raise ValueError("replacement reason must be non-empty")
         invalid_test = is_invalid or (lambda _candidate: False)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            existing_operation = self._claim_by_operation(
+                connection,
+                operation_key,
+            )
+            if existing_operation is not None:
+                if (
+                    existing_operation.invalid_path
+                    != invalid_candidate.relative_path
+                ):
+                    raise ValueError(
+                        f"operation key belongs to invalid path "
+                        f"{existing_operation.invalid_path}"
+                    )
+                self._validate_invalid_metadata(
+                    connection,
+                    existing_operation.operation_key,
+                    invalid_candidate,
+                )
+                if existing_operation.reason != reason:
+                    raise ValueError(
+                        "operation key replacement reason does not match"
+                    )
+                connection.commit()
+                return existing_operation
+
+            existing_invalid = self._claim_by_invalid(
+                connection,
+                invalid_candidate.relative_path,
+            )
+            if existing_invalid is not None:
+                self._validate_invalid_metadata(
+                    connection,
+                    existing_invalid.operation_key,
+                    invalid_candidate,
+                )
+                connection.commit()
+                return existing_invalid
+
             active = connection.execute(
                 """
                 SELECT schema_class
@@ -782,14 +910,157 @@ class ReserveManager:
                 """,
                 (replacement.schema_class,),
             )
+            connection.execute(
+                """
+                INSERT INTO replacement_operations (
+                    operation_key, invalid_path,
+                    invalid_schema_class, invalid_subset,
+                    invalid_host, invalid_rows, invalid_columns,
+                    replacement_path, reason, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    operation_key,
+                    invalid_candidate.relative_path,
+                    invalid_candidate.schema_class,
+                    invalid_candidate.subset,
+                    invalid_candidate.host,
+                    invalid_candidate.rows,
+                    invalid_candidate.columns,
+                    replacement.relative_path,
+                    reason,
+                    time.time(),
+                ),
+            )
+            claim = self._claim_by_operation(connection, operation_key)
+            if claim is None:
+                raise RuntimeError("replacement journal insert was not visible")
             connection.commit()
-            return replacement
+            return claim
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
             raise
         finally:
             connection.close()
+
+    def pending_claims(self) -> list[ReplacementClaim]:
+        """Return committed operations awaiting durable-output acknowledgment."""
+        connection = self._connect()
+        try:
+            return [
+                _replacement_claim_from_row(row)
+                for row in connection.execute(
+                    _CLAIM_SELECT
+                    + """
+                    WHERE operations.status = 'pending'
+                    ORDER BY operations.created_at, operations.operation_key
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+
+    def acknowledge(
+        self,
+        *,
+        operation_key: str,
+        replacement_path: str,
+    ) -> ReplacementClaim:
+        """Mark a claim acked after Task 3 durably commits replacement output."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = self._claim_by_operation(connection, operation_key)
+            if claim is None:
+                raise KeyError(
+                    f"unknown replacement operation: {operation_key}"
+                )
+            if claim.replacement_path != replacement_path:
+                raise ValueError(
+                    "replacement path does not match operation "
+                    f"{operation_key}"
+                )
+            if claim.status == "pending":
+                connection.execute(
+                    """
+                    UPDATE replacement_operations
+                    SET status = 'acked', acknowledged_at = ?
+                    WHERE operation_key = ? AND status = 'pending'
+                    """,
+                    (time.time(), operation_key),
+                )
+                claim = self._claim_by_operation(connection, operation_key)
+                if claim is None:
+                    raise RuntimeError(
+                        "acknowledged replacement operation disappeared"
+                    )
+            connection.commit()
+            return claim
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _claim_by_operation(
+        connection: sqlite3.Connection,
+        operation_key: str,
+    ) -> ReplacementClaim | None:
+        row = connection.execute(
+            _CLAIM_SELECT + "WHERE operations.operation_key = ?",
+            (operation_key,),
+        ).fetchone()
+        return None if row is None else _replacement_claim_from_row(row)
+
+    @staticmethod
+    def _claim_by_invalid(
+        connection: sqlite3.Connection,
+        invalid_path: str,
+    ) -> ReplacementClaim | None:
+        row = connection.execute(
+            _CLAIM_SELECT + "WHERE operations.invalid_path = ?",
+            (invalid_path,),
+        ).fetchone()
+        return None if row is None else _replacement_claim_from_row(row)
+
+    @staticmethod
+    def _validate_invalid_metadata(
+        connection: sqlite3.Connection,
+        operation_key: str,
+        candidate: TableCandidate,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT
+                invalid_schema_class, invalid_subset, invalid_host,
+                invalid_rows, invalid_columns
+            FROM replacement_operations
+            WHERE operation_key = ?
+            """,
+            (operation_key,),
+        ).fetchone()
+        stored = (
+            str(row["invalid_schema_class"]),
+            str(row["invalid_subset"]),
+            str(row["invalid_host"]),
+            int(row["invalid_rows"]),
+            int(row["invalid_columns"]),
+        )
+        requested = (
+            candidate.schema_class,
+            candidate.subset,
+            candidate.host,
+            candidate.rows,
+            candidate.columns,
+        )
+        if stored != requested:
+            raise ValueError(
+                "invalid candidate metadata does not match "
+                f"operation {operation_key}"
+            )
 
     def _consume_same_stratum(
         self,
@@ -879,7 +1150,10 @@ class ReserveManager:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection = _connect_sqlite_read_write(
+            self.database_path,
+            timeout=30.0,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -897,6 +1171,29 @@ def _candidate_from_sqlite(row: sqlite3.Row) -> TableCandidate:
         relative_path=str(row["relative_path"]),
         rows=int(row["rows_count"]),
         columns=int(row["columns_count"]),
+    )
+
+
+def _replacement_claim_from_row(row: sqlite3.Row) -> ReplacementClaim:
+    return ReplacementClaim(
+        operation_key=str(row["operation_key"]),
+        invalid_path=str(row["invalid_path"]),
+        replacement=TableCandidate(
+            schema_class=str(row["replacement_schema_class"]),
+            subset=str(row["replacement_subset"]),
+            host=str(row["replacement_host"]),
+            relative_path=str(row["replacement_path"]),
+            rows=int(row["replacement_rows"]),
+            columns=int(row["replacement_columns"]),
+        ),
+        reason=str(row["reason"]),
+        status=str(row["status"]),
+        created_at=float(row["created_at"]),
+        acknowledged_at=(
+            None
+            if row["acknowledged_at"] is None
+            else float(row["acknowledged_at"])
+        ),
     )
 
 
@@ -924,15 +1221,37 @@ def _fsync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
+def _connect_sqlite_read_write(
+    path: Path,
+    *,
+    timeout: float = 5.0,
+) -> sqlite3.Connection:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return sqlite3.connect(
+        path.resolve().as_uri() + "?mode=rw",
+        uri=True,
+        timeout=timeout,
+    )
+
+
 def replace_invalid_selection(
     invalid_candidate: TableCandidate,
     reserve: ReserveManager,
+    *,
+    operation_key: str,
+    reason: str,
     is_invalid: Callable[[TableCandidate], bool] | None = None,
 ) -> TableCandidate:
     """Replace an invalid active candidate through persistent reserve state."""
     if not isinstance(reserve, ReserveManager):
         raise TypeError("reserve must be a ReserveManager")
-    return reserve.replace(invalid_candidate, is_invalid)
+    return reserve.replace(
+        invalid_candidate,
+        operation_key=operation_key,
+        reason=reason,
+        is_invalid=is_invalid,
+    )
 
 
 def _candidate_record(
