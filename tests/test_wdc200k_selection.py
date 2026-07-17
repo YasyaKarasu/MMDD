@@ -847,6 +847,185 @@ def test_acknowledge_is_persistent_idempotent_and_validated(
     ) == acknowledged
 
 
+def test_replacement_chain_supersedes_predecessor_across_restart(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    reserves = [
+        TableCandidate(
+            "Product",
+            "minimum3",
+            f"reserve-{index}.test",
+            f"Product/Product_reserve-{index}.test_October2023.json.gz",
+            2,
+            4,
+        )
+        for index in range(2)
+    ]
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=reserves,
+        selected=[invalid],
+        policy=policy,
+    )
+    predecessor = manager.claim_replacement(
+        operation_key="operation-0",
+        invalid_candidate=invalid,
+        reason="invalid selected table",
+    )
+
+    resumed = ReserveManager.open(database, policy)
+    successor = resumed.claim_replacement(
+        operation_key="operation-1",
+        invalid_candidate=predecessor.replacement,
+        reason="invalid replacement table",
+    )
+    reopened = ReserveManager.open(database, policy)
+    replayed_predecessor = reopened.claim_replacement(
+        operation_key="operation-0",
+        invalid_candidate=invalid,
+        reason="invalid selected table",
+    )
+
+    assert successor.status == "pending"
+    assert successor.replacement == reserves[1]
+    assert reopened.pending_claims() == [successor]
+    assert replayed_predecessor.status == "superseded"
+    assert replayed_predecessor.successor_operation_key == "operation-1"
+    assert reopened.class_counts() == {"Product": 1}
+    with pytest.raises(ValueError, match="cannot acknowledge superseded"):
+        reopened.acknowledge(
+            operation_key="operation-0",
+            replacement_path=reserves[0].relative_path,
+        )
+    with pytest.raises(RuntimeError, match="superseded"):
+        replace_invalid_selection(
+            invalid,
+            reopened,
+            operation_key="operation-0",
+            reason="invalid selected table",
+        )
+
+
+def test_exhausted_operation_is_terminal_and_replays_after_restart(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=[],
+        selected=[invalid],
+        policy=policy,
+    )
+
+    with pytest.raises(ReserveExhaustedError) as first:
+        manager.claim_replacement(
+            operation_key="operation-exhausted",
+            invalid_candidate=invalid,
+            reason="unreadable gzip",
+        )
+
+    resumed = ReserveManager.open(database, policy)
+    with pytest.raises(ReserveExhaustedError) as replayed:
+        resumed.claim_replacement(
+            operation_key="operation-exhausted",
+            invalid_candidate=invalid,
+            reason="unreadable gzip",
+        )
+    with pytest.raises(ReserveExhaustedError) as aliased:
+        resumed.claim_replacement(
+            operation_key="retry-after-restart",
+            invalid_candidate=invalid,
+            reason="worker restarted",
+        )
+
+    terminal = resumed.terminal_claims()
+    assert str(first.value) == str(replayed.value) == str(aliased.value)
+    assert first.value.claim == terminal[0]
+    assert terminal[0].status == "exhausted"
+    assert terminal[0].replacement is None
+    assert resumed.pending_claims() == []
+    assert resumed.class_counts() == {"Product": 0}
+    with pytest.raises(ValueError, match="cannot acknowledge exhausted"):
+        resumed.acknowledge(
+            operation_key="operation-exhausted",
+            replacement_path="Product/no-replacement.json.gz",
+        )
+
+
+def test_first_claim_requires_full_active_candidate_metadata(
+    tmp_path: Path,
+) -> None:
+    active = TableCandidate(
+        "Product",
+        "minimum3",
+        "active.test",
+        "Product/Product_active.test_October2023.json.gz",
+        7,
+        4,
+    )
+    reserve = TableCandidate(
+        "Product",
+        "rest",
+        "reserve.test",
+        "Product/Product_reserve.test_October2023.json.gz",
+        2,
+        3,
+    )
+    forged = TableCandidate(
+        active.schema_class,
+        "rest",
+        active.host,
+        active.relative_path,
+        active.rows,
+        active.columns,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=[reserve],
+        selected=[active],
+        policy=policy,
+    )
+
+    with pytest.raises(ValueError, match="active candidate metadata"):
+        manager.claim_replacement(
+            operation_key="forged-operation",
+            invalid_candidate=forged,
+            reason="forged subset",
+        )
+
+    reopened = ReserveManager.open(database, policy)
+    with pytest.raises(ValueError, match="active candidate metadata"):
+        reopened.claim_replacement(
+            operation_key="forged-operation",
+            invalid_candidate=forged,
+            reason="forged subset",
+        )
+    assert reopened.class_counts() == {"Product": 1}
+    assert reopened.used_paths() == {active.relative_path}
+    assert reopened.pending_claims() == []
+
+
 def test_selection_cli_writes_exact_stable_provisional_and_reserve(
     tmp_path: Path,
 ) -> None:

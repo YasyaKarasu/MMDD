@@ -463,20 +463,37 @@ def select_tables(
 class ReserveExhaustedError(RuntimeError):
     """Raised when no unused reserve can preserve the selection constraints."""
 
+    def __init__(self, claim: ReplacementClaim) -> None:
+        self.claim = claim
+        super().__init__(
+            f"no reserve candidate can replace {claim.invalid_path}; "
+            f"operation {claim.operation_key} exhausted: {claim.reason}"
+        )
+
+
+class ReplacementOperationStateError(RuntimeError):
+    """Raised when a terminal operation cannot yield expansion work."""
+
 
 @dataclass(frozen=True)
 class ReplacementClaim:
     operation_key: str
     invalid_path: str
-    replacement: TableCandidate
+    replacement: TableCandidate | None
     reason: str
     status: str
     created_at: float
     acknowledged_at: float | None
+    terminal_at: float | None
+    successor_operation_key: str | None
 
     @property
-    def replacement_path(self) -> str:
-        return self.replacement.relative_path
+    def replacement_path(self) -> str | None:
+        return (
+            None
+            if self.replacement is None
+            else self.replacement.relative_path
+        )
 
 
 _CLAIM_SELECT = """
@@ -488,13 +505,15 @@ _CLAIM_SELECT = """
         operations.status,
         operations.created_at,
         operations.acknowledged_at,
+        operations.terminal_at,
+        operations.successor_operation_key,
         candidates.schema_class AS replacement_schema_class,
         candidates.subset_name AS replacement_subset,
         candidates.host AS replacement_host,
         candidates.rows_count AS replacement_rows,
         candidates.columns_count AS replacement_columns
     FROM replacement_operations AS operations
-    JOIN candidates
+    LEFT JOIN candidates
       ON candidates.relative_path = operations.replacement_path
 """
 
@@ -543,7 +562,11 @@ class ReserveManager:
                 );
                 CREATE TABLE active_selections (
                     relative_path TEXT PRIMARY KEY,
-                    schema_class TEXT NOT NULL
+                    schema_class TEXT NOT NULL,
+                    subset_name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    rows_count INTEGER NOT NULL,
+                    columns_count INTEGER NOT NULL
                 );
                 CREATE TABLE used_paths (
                     relative_path TEXT PRIMARY KEY
@@ -560,14 +583,21 @@ class ReserveManager:
                     invalid_host TEXT NOT NULL,
                     invalid_rows INTEGER NOT NULL,
                     invalid_columns INTEGER NOT NULL,
-                    replacement_path TEXT NOT NULL,
+                    replacement_path TEXT UNIQUE,
                     reason TEXT NOT NULL,
                     status TEXT NOT NULL
-                        CHECK(status IN ('pending', 'acked')),
+                        CHECK(status IN (
+                            'pending', 'acked',
+                            'superseded', 'exhausted'
+                        )),
                     created_at REAL NOT NULL,
                     acknowledged_at REAL,
+                    terminal_at REAL,
+                    successor_operation_key TEXT,
                     FOREIGN KEY(replacement_path)
-                        REFERENCES candidates(relative_path)
+                        REFERENCES candidates(relative_path),
+                    FOREIGN KEY(successor_operation_key)
+                        REFERENCES replacement_operations(operation_key)
                 );
                 CREATE INDEX candidates_same_stratum
                 ON candidates (
@@ -626,10 +656,18 @@ class ReserveManager:
                     connection.execute(
                         """
                         INSERT INTO active_selections (
-                            relative_path, schema_class
-                        ) VALUES (?, ?)
+                            relative_path, schema_class, subset_name,
+                            host, rows_count, columns_count
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (candidate.relative_path, candidate.schema_class),
+                        (
+                            candidate.relative_path,
+                            candidate.schema_class,
+                            candidate.subset,
+                            candidate.host,
+                            candidate.rows,
+                            candidate.columns,
+                        ),
                     )
                 except sqlite3.IntegrityError as error:
                     raise ValueError(
@@ -778,12 +816,18 @@ class ReserveManager:
         is_invalid: Callable[[TableCandidate], bool] | None = None,
     ) -> TableCandidate:
         """Compatibility helper returning the claimed replacement candidate."""
-        return self.claim_replacement(
+        claim = self.claim_replacement(
             operation_key=operation_key,
             invalid_candidate=invalid_candidate,
             reason=reason,
             is_invalid=is_invalid,
-        ).replacement
+        )
+        if claim.status != "pending" or claim.replacement is None:
+            raise ReplacementOperationStateError(
+                f"replacement operation {claim.operation_key} is "
+                f"{claim.status}; no expansion work may be replayed"
+            )
+        return claim.replacement
 
     def claim_replacement(
         self,
@@ -825,6 +869,8 @@ class ReserveManager:
                         "operation key replacement reason does not match"
                     )
                 connection.commit()
+                if existing_operation.status == "exhausted":
+                    raise ReserveExhaustedError(existing_operation)
                 return existing_operation
 
             existing_invalid = self._claim_by_invalid(
@@ -838,11 +884,13 @@ class ReserveManager:
                     invalid_candidate,
                 )
                 connection.commit()
+                if existing_invalid.status == "exhausted":
+                    raise ReserveExhaustedError(existing_invalid)
                 return existing_invalid
 
             active = connection.execute(
                 """
-                SELECT schema_class
+                SELECT *
                 FROM active_selections
                 WHERE relative_path = ?
                 """,
@@ -853,11 +901,15 @@ class ReserveManager:
                     "invalid candidate is not an active selection: "
                     f"{invalid_candidate.relative_path}"
                 )
-            stored_class = str(active["schema_class"])
-            if stored_class != invalid_candidate.schema_class:
+            stored_candidate = _candidate_from_active_sqlite(active)
+            if stored_candidate != invalid_candidate:
                 raise ValueError(
-                    "invalid candidate class does not match active state"
+                    "active candidate metadata does not match persisted state"
                 )
+            predecessor = self._claim_by_replacement(
+                connection,
+                invalid_candidate.relative_path,
+            )
             connection.execute(
                 """
                 DELETE FROM active_selections
@@ -885,21 +937,60 @@ class ReserveManager:
                     invalid_test,
                 )
             if replacement is None:
-                connection.commit()
-                raise ReserveExhaustedError(
-                    "no reserve candidate can replace "
-                    f"{invalid_candidate.relative_path} without "
-                    "exceeding the class cap"
+                now = time.time()
+                connection.execute(
+                    """
+                    INSERT INTO replacement_operations (
+                        operation_key, invalid_path,
+                        invalid_schema_class, invalid_subset,
+                        invalid_host, invalid_rows, invalid_columns,
+                        replacement_path, reason, status,
+                        created_at, terminal_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?,
+                        NULL, ?, 'exhausted', ?, ?
+                    )
+                    """,
+                    (
+                        operation_key,
+                        invalid_candidate.relative_path,
+                        invalid_candidate.schema_class,
+                        invalid_candidate.subset,
+                        invalid_candidate.host,
+                        invalid_candidate.rows,
+                        invalid_candidate.columns,
+                        reason,
+                        now,
+                        now,
+                    ),
                 )
+                self._supersede_pending_predecessor(
+                    connection,
+                    predecessor,
+                    operation_key,
+                    now,
+                )
+                claim = self._claim_by_operation(connection, operation_key)
+                if claim is None:
+                    raise RuntimeError(
+                        "exhausted replacement operation was not visible"
+                    )
+                connection.commit()
+                raise ReserveExhaustedError(claim)
             connection.execute(
                 """
                 INSERT INTO active_selections (
-                    relative_path, schema_class
-                ) VALUES (?, ?)
+                    relative_path, schema_class, subset_name,
+                    host, rows_count, columns_count
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     replacement.relative_path,
                     replacement.schema_class,
+                    replacement.subset,
+                    replacement.host,
+                    replacement.rows,
+                    replacement.columns,
                 ),
             )
             connection.execute(
@@ -932,6 +1023,12 @@ class ReserveManager:
                     time.time(),
                 ),
             )
+            self._supersede_pending_predecessor(
+                connection,
+                predecessor,
+                operation_key,
+                time.time(),
+            )
             claim = self._claim_by_operation(connection, operation_key)
             if claim is None:
                 raise RuntimeError("replacement journal insert was not visible")
@@ -961,6 +1058,23 @@ class ReserveManager:
         finally:
             connection.close()
 
+    def terminal_claims(self) -> list[ReplacementClaim]:
+        """Return acked, superseded, and exhausted operation history."""
+        connection = self._connect()
+        try:
+            return [
+                _replacement_claim_from_row(row)
+                for row in connection.execute(
+                    _CLAIM_SELECT
+                    + """
+                    WHERE operations.status != 'pending'
+                    ORDER BY operations.created_at, operations.operation_key
+                    """
+                )
+            ]
+        finally:
+            connection.close()
+
     def acknowledge(
         self,
         *,
@@ -975,6 +1089,11 @@ class ReserveManager:
             if claim is None:
                 raise KeyError(
                     f"unknown replacement operation: {operation_key}"
+                )
+            if claim.status in {"superseded", "exhausted"}:
+                raise ValueError(
+                    f"cannot acknowledge {claim.status} replacement "
+                    f"operation {operation_key}"
                 )
             if claim.replacement_path != replacement_path:
                 raise ValueError(
@@ -1025,6 +1144,45 @@ class ReserveManager:
             (invalid_path,),
         ).fetchone()
         return None if row is None else _replacement_claim_from_row(row)
+
+    @staticmethod
+    def _claim_by_replacement(
+        connection: sqlite3.Connection,
+        replacement_path: str,
+    ) -> ReplacementClaim | None:
+        row = connection.execute(
+            _CLAIM_SELECT + "WHERE operations.replacement_path = ?",
+            (replacement_path,),
+        ).fetchone()
+        return None if row is None else _replacement_claim_from_row(row)
+
+    @staticmethod
+    def _supersede_pending_predecessor(
+        connection: sqlite3.Connection,
+        predecessor: ReplacementClaim | None,
+        successor_operation_key: str,
+        terminal_at: float,
+    ) -> None:
+        if predecessor is None or predecessor.status != "pending":
+            return
+        cursor = connection.execute(
+            """
+            UPDATE replacement_operations
+            SET status = 'superseded',
+                successor_operation_key = ?,
+                terminal_at = ?
+            WHERE operation_key = ? AND status = 'pending'
+            """,
+            (
+                successor_operation_key,
+                terminal_at,
+                predecessor.operation_key,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "pending predecessor changed during replacement transaction"
+            )
 
     @staticmethod
     def _validate_invalid_metadata(
@@ -1174,18 +1332,34 @@ def _candidate_from_sqlite(row: sqlite3.Row) -> TableCandidate:
     )
 
 
+def _candidate_from_active_sqlite(row: sqlite3.Row) -> TableCandidate:
+    return TableCandidate(
+        schema_class=str(row["schema_class"]),
+        subset=str(row["subset_name"]),
+        host=str(row["host"]),
+        relative_path=str(row["relative_path"]),
+        rows=int(row["rows_count"]),
+        columns=int(row["columns_count"]),
+    )
+
+
 def _replacement_claim_from_row(row: sqlite3.Row) -> ReplacementClaim:
-    return ReplacementClaim(
-        operation_key=str(row["operation_key"]),
-        invalid_path=str(row["invalid_path"]),
-        replacement=TableCandidate(
+    replacement = (
+        None
+        if row["replacement_path"] is None
+        else TableCandidate(
             schema_class=str(row["replacement_schema_class"]),
             subset=str(row["replacement_subset"]),
             host=str(row["replacement_host"]),
             relative_path=str(row["replacement_path"]),
             rows=int(row["replacement_rows"]),
             columns=int(row["replacement_columns"]),
-        ),
+        )
+    )
+    return ReplacementClaim(
+        operation_key=str(row["operation_key"]),
+        invalid_path=str(row["invalid_path"]),
+        replacement=replacement,
         reason=str(row["reason"]),
         status=str(row["status"]),
         created_at=float(row["created_at"]),
@@ -1193,6 +1367,16 @@ def _replacement_claim_from_row(row: sqlite3.Row) -> ReplacementClaim:
             None
             if row["acknowledged_at"] is None
             else float(row["acknowledged_at"])
+        ),
+        terminal_at=(
+            None
+            if row["terminal_at"] is None
+            else float(row["terminal_at"])
+        ),
+        successor_operation_key=(
+            None
+            if row["successor_operation_key"] is None
+            else str(row["successor_operation_key"])
         ),
     )
 
