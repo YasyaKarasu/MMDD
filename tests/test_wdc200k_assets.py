@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -40,7 +40,7 @@ from wdc200k_fetch import (  # noqa: E402
     fetch_unique_pages,
     iter_page_fanout,
 )
-from wdc200k_io import SqliteJobStore  # noqa: E402
+from wdc200k_io import AtomicJsonlShard, SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
 
@@ -2227,7 +2227,11 @@ def test_public_asset_validators_reconstruct_the_complete_producer_chain(
         validated_plan,
         tmp_path / "unique.jsonl",
     )
-    validate_unique_image_jobs(unique, planned=validated_plan)
+    validate_unique_image_jobs(
+        unique,
+        planned=validated_plan,
+        validation_database=tmp_path / "validate-unique.sqlite3",
+    )
     fetched = fetch_unique_images(
         unique,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
@@ -2367,3 +2371,60 @@ def test_image_failures_fan_out_reference_counts_for_current_jobset(
     assert expected[0]["affected_reference_count"] == 1
     assert expected[0]["entity_id"] == "e3"
     assert resumed == expected
+
+
+@pytest.mark.parametrize("mutation", ["delete", "add", "replace"])
+def test_unique_image_validator_rejects_rechecksummed_membership_changes(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    shared = "https://i.test/shared.jpg"
+    planned = persist_entity_asset_plans(
+        [
+            (entity("e1", image_urls=[shared]), page()),
+            (entity("e2", image_urls=[shared]), page()),
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint="planning-v1",
+    )
+    unique = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique.jsonl",
+    )
+    records = read_jsonl((unique.output_path,))
+    if mutation == "delete":
+        forged_records: list[dict] = []
+    elif mutation == "add":
+        extra_url = "https://i.test/extra.jpg"
+        forged_records = [
+            *records,
+            {
+                **records[0],
+                "image_url": extra_url,
+                "url_key": hashlib.sha256(
+                    extra_url.encode("utf-8")
+                ).hexdigest(),
+            },
+        ]
+    else:
+        forged_records = [{**records[0], "entity_id": "substituted"}]
+    writer = AtomicJsonlShard(unique.output_path)
+    for record in forged_records:
+        writer.write(record)
+    completed = writer.commit()
+    manifest = json.loads(
+        unique.manifest_path.read_text(encoding="utf-8")
+    )
+    manifest["completed_shards"] = [asdict(completed)]
+    unique.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+    forged = replace(unique, completed_shard=completed)
+
+    with pytest.raises(ValueError, match="unique image.*membership"):
+        validate_unique_image_jobs(
+            forged,
+            planned=planned,
+            validation_database=tmp_path / "validate-unique.sqlite3",
+        )

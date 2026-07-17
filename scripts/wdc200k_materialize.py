@@ -438,6 +438,9 @@ def _validate_upstream(
     unique_jobs = validate_unique_image_jobs(
         inputs.unique_image_jobs,
         planned=planned,
+        validation_database=(
+            validation_root / "unique-image-membership.sqlite3"
+        ),
     )
     if inputs.image_fetch_result.unique_jobs != unique_jobs:
         raise ValueError("Task-5 image fetch unique-job substitution")
@@ -1167,6 +1170,73 @@ def _validate_relation_closure(
         )
 
 
+def _validate_source_catalog_closure(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.executescript(
+        """
+        DROP TABLE IF EXISTS temp.valid_source_rows;
+        CREATE TEMP TABLE valid_source_rows (
+            source_table_id TEXT NOT NULL,
+            source_row_id INTEGER NOT NULL
+        );
+        INSERT INTO valid_source_rows (source_table_id, source_row_id)
+        SELECT source_catalog.source_table_id,
+               CAST(json_extract(source_row.value, '$.row_id') AS INTEGER)
+        FROM source_catalog
+        JOIN json_each(source_catalog.record_json, '$.rows') AS source_row
+        WHERE json_type(source_row.value, '$.row_id') IN ('integer', 'text');
+        CREATE INDEX valid_source_rows_identity
+            ON valid_source_rows(source_table_id, source_row_id);
+        """
+    )
+    relations = (
+        (
+            "entity",
+            "entity_sources",
+            "entity_id",
+        ),
+        (
+            "link",
+            "links",
+            "link_id",
+        ),
+        (
+            "extraction",
+            "extractions",
+            "cache_key",
+        ),
+    )
+    for kind, table, identity_column in relations:
+        missing = connection.execute(
+            f"""
+            SELECT relation.{identity_column} AS identity,
+                   relation.source_table_id,
+                   relation.source_row_id
+            FROM {table} AS relation
+            LEFT JOIN source_catalog
+              ON source_catalog.source_table_id =
+                 relation.source_table_id
+            LEFT JOIN valid_source_rows
+              ON valid_source_rows.source_table_id =
+                 relation.source_table_id
+             AND valid_source_rows.source_row_id =
+                 relation.source_row_id
+            WHERE source_catalog.source_table_id IS NULL
+               OR valid_source_rows.source_table_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if missing is not None:
+            raise ValueError(
+                f"{kind} source catalog relation is missing: "
+                f"{missing['identity']} "
+                f"({missing['source_table_id']}, "
+                f"{missing['source_row_id']})"
+            )
+    connection.execute("DROP TABLE temp.valid_source_rows")
+
+
 def _commit_index_batch(
     connection: sqlite3.Connection,
     count: int,
@@ -1298,9 +1368,9 @@ def _split_group(
     return source_table_id
 
 
-def _catalog_sources(
+def _catalog_source_records(
     database_path: Path,
-    source_paths: Iterable[Path],
+    source_tables: Iterable[dict[str, Any]],
     *,
     args: argparse.Namespace,
     expected_tables: int,
@@ -1308,7 +1378,7 @@ def _catalog_sources(
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         observed_stream = 0
-        for ordinal, source_table in enumerate(_iter_jsonl(source_paths)):
+        for ordinal, source_table in enumerate(source_tables):
             observed_stream += 1
             source_table_id = clean_text(
                 source_table.get("source_table_id")
@@ -1376,6 +1446,21 @@ def _catalog_sources(
                 f"not match expected {expected_tables}"
             )
         connection.commit()
+
+
+def _catalog_sources(
+    database_path: Path,
+    source_paths: Iterable[Path],
+    *,
+    args: argparse.Namespace,
+    expected_tables: int,
+) -> None:
+    _catalog_source_records(
+        database_path,
+        _iter_jsonl(source_paths),
+        args=args,
+        expected_tables=expected_tables,
+    )
 
 
 def _assign_splits(
@@ -1663,6 +1748,14 @@ def materialize_dataset_shard(
     if split not in {"train", "dev", "test"}:
         raise ValueError(f"invalid split: {split}")
     _build_index(inputs)
+    _catalog_source_records(
+        inputs.lookup_database,
+        [inputs.source_table],
+        args=args,
+        expected_tables=1,
+    )
+    with _connect(inputs.lookup_database) as connection:
+        _validate_source_catalog_closure(connection)
     return _materialize_from_index(
         inputs.source_table,
         inputs.lookup_database,
@@ -2717,6 +2810,8 @@ def materialize_dataset(
         args=args,
         expected_tables=upstream.expected_tables,
     )
+    with _connect(database_path) as connection:
+        _validate_source_catalog_closure(connection)
     _assign_splits(database_path, args)
     _materialize_all_tables(
         database_path,

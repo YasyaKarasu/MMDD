@@ -165,21 +165,25 @@ class ModelStageAuthority:
             raise ValueError("model stage authority parser schema mismatch")
 
     @classmethod
-    def from_args(
+    def current(
         cls,
         args: argparse.Namespace,
-        *,
-        prompt_version: str = PROMPT_VERSION,
-        policy_fingerprint: str = MODEL_POLICY_VERSION,
-        parser_schema_version: str = MODEL_PARSER_SCHEMA_VERSION,
     ) -> ModelStageAuthority:
         return cls(
             text_model_identity=_model_identity(args, "text"),
             image_model_identity=_model_identity(args, "image"),
-            prompt_version=prompt_version,
-            policy_fingerprint=policy_fingerprint,
-            parser_schema_version=parser_schema_version,
+            prompt_version=PROMPT_VERSION,
+            policy_fingerprint=MODEL_POLICY_VERSION,
+            parser_schema_version=MODEL_PARSER_SCHEMA_VERSION,
         )
+
+    @classmethod
+    def from_args(
+        cls,
+        args: argparse.Namespace,
+    ) -> ModelStageAuthority:
+        """Compatibility alias; production orchestration should use current."""
+        return cls.current(args)
 
 
 @dataclass(frozen=True)
@@ -3423,6 +3427,8 @@ def validate_model_stage_for_adapter(
     )
     if authority.parser_schema_version != MODEL_PARSER_SCHEMA_VERSION:
         raise ValueError("model stage authority parser schema mismatch")
+    if authority.policy_fingerprint != MODEL_POLICY_VERSION:
+        raise ValueError("model stage authority policy mismatch")
     authority_identities = {
         "text": authority.text_model_identity,
         "image": authority.image_model_identity,

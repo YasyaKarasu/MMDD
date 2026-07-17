@@ -833,7 +833,7 @@ def _authoritative_inputs(
             materialized_assets=materialized_assets,
             adapted_model_tasks=adapted,
             model_result=model_result,
-            model_authority=ModelStageAuthority.from_args(args),
+            model_authority=ModelStageAuthority.current(args),
             work_root=tmp_path / "work",
         ),
         args,
@@ -1165,6 +1165,38 @@ def test_extraction_relation_mismatches_are_rejected(
                 extractions=[extraction],
             ),
             args=args,
+            split="train",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing-source", "missing-row"])
+def test_relations_must_close_over_the_source_catalog(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    entities = _entities()
+    links = _links()
+    if mutation == "missing-source":
+        for entity in entities:
+            entity["appears_in"][0]["source_table_id"] = "foreign-source"
+        links = [
+            {**link, "source_table_id": "foreign-source"}
+            for link in links
+        ]
+    else:
+        for entity in entities:
+            entity["appears_in"][0]["row_id"] = 999
+        links = [{**link, "row_id": 999} for link in links]
+
+    with pytest.raises(ValueError, match="source catalog"):
+        materialize_dataset_shard(
+            _shard_inputs(
+                tmp_path,
+                entities=entities,
+                assets=_assets(),
+                links=links,
+            ),
+            args=_args(tmp_path),
             split="train",
         )
 

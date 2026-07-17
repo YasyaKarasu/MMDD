@@ -362,7 +362,7 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
         expected_input_fingerprint=adapter_input,
     )
     args = model_args()
-    authority = ModelStageAuthority.from_args(args)
+    authority = ModelStageAuthority.current(args)
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
         [asset("adapter")],
@@ -450,6 +450,22 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
                     tmp_path / f"foreign-validation-{index}.sqlite3"
                 ),
             )
+
+    foreign_policy_authority = ModelStageAuthority(
+        text_model_identity=authority.text_model_identity,
+        image_model_identity=authority.image_model_identity,
+        policy_fingerprint="foreign-model-policy-v0",
+    )
+    with pytest.raises(ValueError, match="model stage authority policy"):
+        validate_model_stage_for_adapter(
+            foreign_result,
+            adapted,
+            args=args,
+            authority=foreign_policy_authority,
+            validation_store_path=(
+                tmp_path / "foreign-policy-authority.sqlite3"
+            ),
+        )
 
 
 def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:

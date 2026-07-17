@@ -1398,8 +1398,9 @@ def validate_unique_image_jobs(
     jobs: UniqueImageJobs,
     *,
     planned: AssetPlanShards,
+    validation_database: Path,
 ) -> UniqueImageJobs:
-    """Validate unique image jobs against the exact planning manifest."""
+    """Replay exact first-per-URL membership from planning mappings."""
     planned = _validated_planning_result(planned)
     expected_input = stable_hash(
         ASSET_PLANNING_SCHEMA_VERSION,
@@ -1408,7 +1409,142 @@ def validate_unique_image_jobs(
     )
     if jobs.input_fingerprint != expected_input:
         raise ValueError("unique image jobs planning fingerprint mismatch")
-    return _validated_unique_image_jobs(jobs)
+    jobs = _validated_unique_image_jobs(jobs)
+    if (
+        jobs.output_path.resolve()
+        != (jobs.output_path.parent / jobs.completed_shard.path).resolve()
+    ):
+        raise ValueError("unique image job output path mismatch")
+    validation_database = Path(validation_database)
+    validation_database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(validation_database) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS expected_unique_images (
+                url_key TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS actual_unique_images (
+                url_key TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
+            DELETE FROM expected_unique_images;
+            DELETE FROM actual_unique_images;
+            """
+        )
+
+        def validated_record(
+            record: dict[str, Any],
+        ) -> tuple[str, str]:
+            image_url = clean_text(record.get("image_url"))
+            normalized = _normalize_http_url(image_url)
+            url_key = clean_text(record.get("url_key"))
+            if (
+                normalized is None
+                or normalized != image_url
+                or url_key
+                != hashlib.sha256(
+                    normalized.encode("utf-8")
+                ).hexdigest()
+            ):
+                raise ValueError(
+                    "unique image membership URL normalization mismatch"
+                )
+            return (
+                url_key,
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+
+        for mapping in _iter_jsonl(planned.image_mapping_paths):
+            url_key, encoded = validated_record(mapping)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO expected_unique_images (
+                    url_key, record_json
+                ) VALUES (?, ?)
+                """,
+                (url_key, encoded),
+            )
+        previous_url_key = ""
+        try:
+            for record in _iter_jsonl((jobs.output_path,)):
+                url_key, encoded = validated_record(record)
+                if previous_url_key and url_key <= previous_url_key:
+                    raise ValueError(
+                        "unique image membership order mismatch"
+                    )
+                previous_url_key = url_key
+                connection.execute(
+                    """
+                    INSERT INTO actual_unique_images (
+                        url_key, record_json
+                    ) VALUES (?, ?)
+                    """,
+                    (url_key, encoded),
+                )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(
+                "unique image membership has duplicate URL keys"
+            ) from error
+        counts = {
+            table: int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+            for table in (
+                "expected_unique_images",
+                "actual_unique_images",
+            )
+        }
+        missing_or_replaced = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM expected_unique_images AS expected
+                LEFT JOIN actual_unique_images AS actual
+                  ON actual.url_key = expected.url_key
+                 AND actual.record_json = expected.record_json
+                WHERE actual.url_key IS NULL
+                """
+            ).fetchone()[0]
+        )
+
+        def membership_digest(table: str) -> str:
+            digest = hashlib.sha256()
+            for row in connection.execute(
+                f"""
+                SELECT url_key, record_json FROM {table}
+                ORDER BY url_key
+                """
+            ):
+                digest.update(
+                    json.dumps(
+                        [str(row["url_key"]), str(row["record_json"])],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                digest.update(b"\n")
+            return digest.hexdigest()
+
+        if (
+            counts["expected_unique_images"]
+            != counts["actual_unique_images"]
+            or counts["actual_unique_images"] != jobs.records
+            or missing_or_replaced
+            or membership_digest("expected_unique_images")
+            != membership_digest("actual_unique_images")
+        ):
+            raise ValueError("unique image exact membership mismatch")
+        connection.commit()
+    return jobs
 
 
 def _iter_jsonl(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
@@ -2148,7 +2284,11 @@ def iter_image_failures(
 ) -> Iterator[dict[str, Any]]:
     """Aggregate current-jobset failure fanout without loading mappings."""
     planned = _validated_planning_result(planned)
-    validate_unique_image_jobs(result.unique_jobs, planned=planned)
+    validate_unique_image_jobs(
+        result.unique_jobs,
+        planned=planned,
+        validation_database=aggregation_database,
+    )
     validate_complete_image_fetch(
         result,
         unique_jobs=result.unique_jobs,
