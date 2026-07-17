@@ -7,11 +7,15 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from wdc200k_selection import (  # noqa: E402
+    ReserveExhaustedError,
+    ReserveManager,
     SelectionPolicy,
     TableCandidate,
     allocate_strata,
@@ -63,6 +67,25 @@ def test_statistics_zip_restores_subset_and_filename(tmp_path: Path) -> None:
             rows=10,
             columns=4,
         )
+    ]
+
+
+def test_statistics_catalog_keeps_missing_gzip_as_provisional(
+    tmp_path: Path,
+) -> None:
+    archive = make_statistics_zip(
+        tmp_path,
+        schema_class="Product",
+        subsets={"top100": [("missing.test", 10, 4)]},
+    )
+    (
+        archive.parent / "Product_missing.test_October2023.json.gz"
+    ).unlink()
+
+    records = list(read_statistics_catalog(archive))
+
+    assert [record.relative_path for record in records] == [
+        "Product/Product_missing.test_October2023.json.gz"
     ]
 
 
@@ -146,6 +169,94 @@ def test_allocate_strata_spills_shortfall_and_obeys_class_cap() -> None:
     ) == 4
 
 
+def test_allocate_strata_applies_exact_split_and_per_class_bases() -> None:
+    catalog = synthetic_catalog(
+        classes=3,
+        top100_per_class=0,
+        minimum3_per_class=2_000,
+        rest_per_class=2_000,
+    )
+    quotas = allocate_strata(
+        catalog,
+        SelectionPolicy(target_tables=2_000),
+    )
+
+    assert sum(
+        quota for (_schema_class, subset), quota in quotas.items()
+        if subset == "minimum3"
+    ) == 1_800
+    assert sum(
+        quota for (_schema_class, subset), quota in quotas.items()
+        if subset == "rest"
+    ) == 200
+    assert all(
+        quotas[(f"Class{index:02d}", "minimum3")] >= 250
+        for index in range(3)
+    )
+    assert all(
+        quotas[(f"Class{index:02d}", "rest")] >= 50
+        for index in range(3)
+    )
+
+
+def test_allocate_strata_spills_unfilled_rest_to_minimum3_first() -> None:
+    catalog = [
+        *synthetic_catalog(
+            classes=1,
+            top100_per_class=0,
+            minimum3_per_class=20,
+            rest_per_class=1,
+        )
+    ]
+    quotas = allocate_strata(
+        catalog,
+        SelectionPolicy(
+            target_tables=10,
+            minimum3_fraction=0.50,
+            minimum3_base_per_class=0,
+            rest_base_per_class=0,
+        ),
+    )
+
+    assert quotas[("Class00", "minimum3")] == 9
+    assert quotas[("Class00", "rest")] == 1
+
+
+def test_allocate_strata_rejects_insufficient_capacity() -> None:
+    catalog = synthetic_catalog(
+        classes=1,
+        top100_per_class=1,
+        minimum3_per_class=1,
+        rest_per_class=1,
+    )
+
+    with pytest.raises(ValueError, match="only 3 feasible"):
+        allocate_strata(
+            catalog,
+            SelectionPolicy(target_tables=4),
+        )
+
+
+def test_allocate_strata_rejects_top100_above_target_or_cap() -> None:
+    catalog = synthetic_catalog(
+        classes=1,
+        top100_per_class=3,
+        minimum3_per_class=0,
+        rest_per_class=0,
+    )
+
+    with pytest.raises(ValueError, match="exceed target_tables"):
+        allocate_strata(
+            catalog,
+            SelectionPolicy(target_tables=2),
+        )
+    with pytest.raises(ValueError, match="exceed class cap"):
+        allocate_strata(
+            catalog,
+            SelectionPolicy(target_tables=3, class_cap=2),
+        )
+
+
 def test_mixed_allocation_is_exact_capped_and_reproducible() -> None:
     catalog = synthetic_catalog(
         classes=42,
@@ -179,7 +290,50 @@ def test_mixed_allocation_is_exact_capped_and_reproducible() -> None:
     )
 
 
-def test_replacement_prefers_same_stratum_then_global_reserve() -> None:
+def test_conflicting_duplicate_path_is_canonical_across_input_order() -> None:
+    first_record = TableCandidate(
+        schema_class="Product",
+        subset="minimum3",
+        host="duplicate.test",
+        relative_path="Product/Product_duplicate.test_October2023.json.gz",
+        rows=2,
+        columns=4,
+    )
+    canonical_record = TableCandidate(
+        schema_class="Product",
+        subset="minimum3",
+        host="duplicate.test",
+        relative_path="Product/Product_duplicate.test_October2023.json.gz",
+        rows=10,
+        columns=5,
+    )
+    other = TableCandidate(
+        schema_class="Product",
+        subset="rest",
+        host="other.test",
+        relative_path="Product/Product_other.test_October2023.json.gz",
+        rows=3,
+        columns=2,
+    )
+    policy = SelectionPolicy(target_tables=2)
+
+    forward = select_tables(
+        [first_record, canonical_record, other],
+        policy,
+    )
+    backward = select_tables(
+        [other, canonical_record, first_record],
+        policy,
+    )
+
+    assert forward == backward
+    assert first_record in forward.selected
+    assert canonical_record not in forward.selected
+
+
+def test_replacement_prefers_same_stratum_then_global_reserve(
+    tmp_path: Path,
+) -> None:
     invalid = TableCandidate(
         schema_class="Product",
         subset="minimum3",
@@ -214,21 +368,251 @@ def test_replacement_prefers_same_stratum_then_global_reserve() -> None:
         rows=2,
         columns=3,
     )
-    reserve = [earlier_global, invalid_same, valid_same]
-
+    policy = SelectionPolicy(target_tables=1)
+    first_manager = ReserveManager.create(
+        tmp_path / "first.sqlite",
+        reserve=[earlier_global, invalid_same, valid_same],
+        selected=[invalid],
+        policy=policy,
+    )
     first = replace_invalid_selection(
         invalid,
-        reserve,
+        first_manager,
         is_invalid=lambda item: item.host == "also-bad.test",
+    )
+    second_manager = ReserveManager.create(
+        tmp_path / "second.sqlite",
+        reserve=[earlier_global],
+        selected=[invalid],
+        policy=policy,
     )
     second = replace_invalid_selection(
         invalid,
-        reserve[:1],
+        second_manager,
         is_invalid=lambda _item: False,
     )
 
     assert first == valid_same
     assert second == earlier_global
+
+
+def test_replacement_global_fallback_skips_class_at_cap(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Event",
+        "minimum3",
+        "invalid.test",
+        "Event/Event_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    selected_products = [
+        TableCandidate(
+            "Product",
+            "minimum3",
+            f"selected-{index}.test",
+            f"Product/Product_selected-{index}.test_October2023.json.gz",
+            1,
+            3,
+        )
+        for index in range(2)
+    ]
+    capped_product = TableCandidate(
+        "Product",
+        "rest",
+        "reserve.test",
+        "Product/Product_reserve.test_October2023.json.gz",
+        1,
+        3,
+    )
+    feasible_event = TableCandidate(
+        "Event",
+        "rest",
+        "reserve.test",
+        "Event/Event_reserve.test_October2023.json.gz",
+        1,
+        3,
+    )
+    policy = SelectionPolicy(target_tables=3, class_cap=2)
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite",
+        reserve=[capped_product, feasible_event],
+        selected=[*selected_products, invalid],
+        policy=policy,
+    )
+
+    replacement = replace_invalid_selection(invalid, manager)
+
+    assert replacement == feasible_event
+    assert manager.class_counts() == {"Event": 1, "Product": 2}
+
+
+def test_replacement_raises_when_no_candidate_fits_class_cap(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Event",
+        "minimum3",
+        "invalid.test",
+        "Event/Event_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    selected_product = TableCandidate(
+        "Product",
+        "minimum3",
+        "selected.test",
+        "Product/Product_selected.test_October2023.json.gz",
+        1,
+        3,
+    )
+    reserve_product = TableCandidate(
+        "Product",
+        "rest",
+        "reserve.test",
+        "Product/Product_reserve.test_October2023.json.gz",
+        1,
+        3,
+    )
+    policy = SelectionPolicy(target_tables=2, class_cap=1)
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite",
+        reserve=[reserve_product],
+        selected=[selected_product, invalid],
+        policy=policy,
+    )
+
+    with pytest.raises(
+        ReserveExhaustedError,
+        match="no reserve candidate can replace",
+    ):
+        replace_invalid_selection(invalid, manager)
+
+    assert manager.class_counts() == {"Event": 0, "Product": 1}
+
+
+def test_reserve_manager_consumes_consecutively_and_resumes(
+    tmp_path: Path,
+) -> None:
+    invalid_product = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid-product.test",
+        "Product/Product_invalid-product.test_October2023.json.gz",
+        1,
+        3,
+    )
+    invalid_event = TableCandidate(
+        "Event",
+        "minimum3",
+        "invalid-event.test",
+        "Event/Event_invalid-event.test_October2023.json.gz",
+        1,
+        3,
+    )
+    product_reserves = [
+        TableCandidate(
+            "Product",
+            "minimum3",
+            f"reserve-{index}.test",
+            f"Product/Product_reserve-{index}.test_October2023.json.gz",
+            1,
+            3,
+        )
+        for index in range(2)
+    ]
+    event_reserve = TableCandidate(
+        "Event",
+        "minimum3",
+        "reserve.test",
+        "Event/Event_reserve.test_October2023.json.gz",
+        1,
+        3,
+    )
+    policy = SelectionPolicy(target_tables=2, class_cap=4)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=[
+            product_reserves[0],
+            event_reserve,
+            product_reserves[1],
+        ],
+        selected=[invalid_product, invalid_event],
+        policy=policy,
+    )
+
+    first = replace_invalid_selection(invalid_product, manager)
+    second = replace_invalid_selection(invalid_event, manager)
+    resumed = ReserveManager.open(database, policy)
+    third = replace_invalid_selection(first, resumed)
+
+    assert first == product_reserves[0]
+    assert second == event_reserve
+    assert third == product_reserves[1]
+    assert resumed.used_paths() == {
+        invalid_product.relative_path,
+        invalid_event.relative_path,
+        product_reserves[0].relative_path,
+        product_reserves[1].relative_path,
+        event_reserve.relative_path,
+    }
+
+
+def test_reserve_manager_streams_selection_jsonl_from_cli_schema(
+    tmp_path: Path,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    replacement = TableCandidate(
+        "Product",
+        "minimum3",
+        "replacement.test",
+        "Product/Product_replacement.test_October2023.json.gz",
+        2,
+        4,
+    )
+    selected_path = tmp_path / "selected_tables.jsonl"
+    reserve_path = tmp_path / "reserve_tables.jsonl"
+    selected_path.write_text(
+        json.dumps(
+            {
+                **invalid.__dict__,
+                "rank": "001",
+                "selection_seed": 13,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reserve_path.write_text(
+        json.dumps(
+            {
+                **replacement.__dict__,
+                "rank": "002",
+                "selection_seed": 13,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    policy = SelectionPolicy(target_tables=1)
+
+    manager = ReserveManager.create_from_jsonl(
+        tmp_path / "reserve.sqlite",
+        reserve_path=reserve_path,
+        selected_path=selected_path,
+        policy=policy,
+    )
+
+    assert replace_invalid_selection(invalid, manager) == replacement
 
 
 def test_selection_cli_writes_exact_stable_provisional_and_reserve(
@@ -288,7 +672,7 @@ def test_selection_cli_writes_exact_stable_provisional_and_reserve(
     )
 
 
-def test_selection_cli_deduplicates_paths_before_allocating(
+def test_selection_cli_does_not_complete_when_capacity_is_insufficient(
     tmp_path: Path,
 ) -> None:
     input_dir = tmp_path / "input"
@@ -296,17 +680,13 @@ def test_selection_cli_deduplicates_paths_before_allocating(
         input_dir,
         schema_class="Product",
         subsets={
-            "top100": [("duplicate.test", 10, 4)],
-            "minimum3": [
-                ("duplicate.test", 10, 4),
-                ("minimum.test", 8, 4),
-            ],
-            "rest": [("rest.test", 6, 4)],
+            "top100": [("top.test", 10, 4)],
+            "minimum3": [("minimum.test", 8, 4)],
         },
     )
     work_dir = tmp_path / "work"
 
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             str(SCRIPTS_DIR / "wdc200k_selection.py"),
@@ -317,16 +697,74 @@ def test_selection_cli_deduplicates_paths_before_allocating(
             "--target_tables",
             "3",
         ],
-        check=True,
         capture_output=True,
         text=True,
     )
 
-    selected = [
-        json.loads(line)
-        for line in (
-            work_dir / "selection" / "selected_tables.jsonl"
-        ).read_text(encoding="utf-8").splitlines()
+    manifest = json.loads(
+        (work_dir / "selection" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.returncode != 0
+    assert "only 2 feasible" in result.stderr
+    assert manifest["complete"] is False
+    assert not (
+        work_dir / "selection" / "selected_tables.jsonl"
+    ).exists()
+
+
+def test_selection_cli_deduplicates_paths_before_allocating(
+    tmp_path: Path,
+) -> None:
+    duplicate_rows = [
+        ("duplicate.test", 2, 4),
+        ("duplicate.test", 10, 5),
+        ("minimum.test", 8, 4),
     ]
-    assert len(selected) == 3
-    assert len({item["relative_path"] for item in selected}) == 3
+    outputs = []
+    for name, rows in (
+        ("forward", duplicate_rows),
+        ("backward", list(reversed(duplicate_rows))),
+    ):
+        input_dir = tmp_path / name / "input"
+        make_statistics_zip(
+            input_dir,
+            schema_class="Product",
+            subsets={
+                "top100": [("top.test", 10, 4)],
+                "minimum3": rows,
+                "rest": [("rest.test", 6, 4)],
+            },
+        )
+        work_dir = tmp_path / name / "work"
+        subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "wdc200k_selection.py"),
+                "--input_dir",
+                str(input_dir),
+                "--work_dir",
+                str(work_dir),
+                "--target_tables",
+                "4",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(
+            (
+                work_dir / "selection" / "selected_tables.jsonl"
+            ).read_text(encoding="utf-8")
+        )
+
+    selected = [json.loads(line) for line in outputs[0].splitlines()]
+    assert outputs[0] == outputs[1]
+    assert len(selected) == 4
+    assert len({item["relative_path"] for item in selected}) == 4
+    duplicate = next(
+        item for item in selected
+        if item["relative_path"].endswith("duplicate.test_October2023.json.gz")
+    )
+    assert (duplicate["rows"], duplicate["columns"]) == (2, 4)

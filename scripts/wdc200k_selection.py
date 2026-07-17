@@ -7,10 +7,12 @@ import csv
 import io
 import json
 import math
+import os
+import sqlite3
 import zipfile
 from collections import defaultdict
-from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -100,8 +102,6 @@ def read_statistics_catalog(archive: Path) -> Iterator[TableCandidate]:
                     filename = (
                         f"{schema_class}_{host}_October2023.json.gz"
                     )
-                    if not (archive.parent / filename).is_file():
-                        continue
                     yield TableCandidate(
                         schema_class=schema_class,
                         subset=subset,
@@ -120,17 +120,45 @@ def _canonical_catalog(
         if candidate.subset not in _SUBSET_PRIORITY:
             raise ValueError(f"unknown WDC subset: {candidate.subset}")
         existing = by_path.get(candidate.relative_path)
-        if existing is None or (
-            _SUBSET_PRIORITY[candidate.subset],
-            candidate.schema_class,
-            candidate.host,
-        ) < (
-            _SUBSET_PRIORITY[existing.subset],
-            existing.schema_class,
-            existing.host,
-        ):
+        if existing is None or _candidate_canonical_key(
+            candidate
+        ) < _candidate_canonical_key(existing):
             by_path[candidate.relative_path] = candidate
     return tuple(by_path.values())
+
+
+def _candidate_canonical_key(
+    candidate: TableCandidate,
+) -> tuple[int, str, str, str, int, int]:
+    return (
+        _SUBSET_PRIORITY[candidate.subset],
+        candidate.schema_class,
+        candidate.subset,
+        candidate.host,
+        candidate.rows,
+        candidate.columns,
+    )
+
+
+def _record_canonical_key(record: dict[str, object]) -> list[object]:
+    subset = str(record["subset"])
+    return [
+        record["relative_path"],
+        _SUBSET_PRIORITY[subset],
+        record["schema_class"],
+        subset,
+        record["host"],
+        _nonnegative_integer_sort_key(record["rows"]),
+        _nonnegative_integer_sort_key(record["columns"]),
+    ]
+
+
+def _nonnegative_integer_sort_key(value: object) -> str:
+    number = int(value)
+    if number < 0:
+        raise ValueError("row and column counts must be non-negative")
+    text = str(number)
+    return f"{len(text):08d}:{text}"
 
 
 def _largest_remainder(
@@ -340,7 +368,12 @@ def _allocate_from_availability(
         )
         for schema_class in classes
     )
-    target = min(policy.target_tables, feasible_total)
+    if feasible_total < policy.target_tables:
+        raise ValueError(
+            f"requested {policy.target_tables} tables but only "
+            f"{feasible_total} feasible under the class cap"
+        )
+    target = policy.target_tables
     remaining = target - mandatory
     minimum3_goal = round(policy.minimum3_fraction * remaining)
     rest_goal = remaining - minimum3_goal
@@ -425,31 +458,481 @@ def select_tables(
     )
 
 
+class ReserveExhaustedError(RuntimeError):
+    """Raised when no unused reserve can preserve the selection constraints."""
+
+
+class ReserveManager:
+    """Persist reserve cursors, used paths, and active class counts in SQLite."""
+
+    def __init__(self, database_path: Path, policy: SelectionPolicy) -> None:
+        self.database_path = database_path
+        self.policy = policy
+
+    @classmethod
+    def create(
+        cls,
+        database_path: Path,
+        *,
+        reserve: Iterable[TableCandidate],
+        selected: Iterable[TableCandidate],
+        policy: SelectionPolicy,
+    ) -> ReserveManager:
+        """Atomically build indexed reserve state without materializing input."""
+        if database_path.exists():
+            raise FileExistsError(database_path)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = database_path.with_suffix(
+            database_path.suffix + ".tmp"
+        )
+        temporary_path.unlink(missing_ok=True)
+        connection = sqlite3.connect(temporary_path)
+        try:
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.executescript(
+                """
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE candidates (
+                    ordinal INTEGER PRIMARY KEY,
+                    relative_path TEXT NOT NULL UNIQUE,
+                    schema_class TEXT NOT NULL,
+                    subset_name TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    rows_count INTEGER NOT NULL,
+                    columns_count INTEGER NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE active_selections (
+                    relative_path TEXT PRIMARY KEY,
+                    schema_class TEXT NOT NULL
+                );
+                CREATE TABLE used_paths (
+                    relative_path TEXT PRIMARY KEY
+                );
+                CREATE TABLE class_counts (
+                    schema_class TEXT PRIMARY KEY,
+                    active_count INTEGER NOT NULL
+                );
+                CREATE INDEX candidates_same_stratum
+                ON candidates (
+                    schema_class, subset_name, used, ordinal
+                );
+                CREATE INDEX candidates_class_order
+                ON candidates (schema_class, used, ordinal);
+                """
+            )
+            connection.execute(
+                "INSERT INTO metadata (key, value) VALUES ('policy', ?)",
+                (json.dumps(asdict(policy), sort_keys=True),),
+            )
+            for ordinal, candidate in enumerate(reserve):
+                _validate_candidate_subset(candidate)
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO candidates (
+                            ordinal, relative_path, schema_class,
+                            subset_name, host, rows_count, columns_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ordinal,
+                            candidate.relative_path,
+                            candidate.schema_class,
+                            candidate.subset,
+                            candidate.host,
+                            candidate.rows,
+                            candidate.columns,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(
+                        "reserve contains a duplicate relative_path: "
+                        f"{candidate.relative_path}"
+                    ) from error
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO class_counts (
+                        schema_class, active_count
+                    ) VALUES (?, 0)
+                    """,
+                    (candidate.schema_class,),
+                )
+
+            selected_count = 0
+            for candidate in selected:
+                _validate_candidate_subset(candidate)
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO active_selections (
+                            relative_path, schema_class
+                        ) VALUES (?, ?)
+                        """,
+                        (candidate.relative_path, candidate.schema_class),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(
+                        "selected candidates contain a duplicate "
+                        f"relative_path: {candidate.relative_path}"
+                    ) from error
+                selected_count += 1
+                connection.execute(
+                    """
+                    INSERT INTO used_paths (relative_path)
+                    VALUES (?)
+                    ON CONFLICT(relative_path) DO NOTHING
+                    """,
+                    (candidate.relative_path,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO class_counts (
+                        schema_class, active_count
+                    ) VALUES (?, 1)
+                    ON CONFLICT(schema_class) DO UPDATE SET
+                        active_count = active_count + 1
+                    """,
+                    (candidate.schema_class,),
+                )
+                connection.execute(
+                    """
+                    UPDATE candidates SET used = 1
+                    WHERE relative_path = ?
+                    """,
+                    (candidate.relative_path,),
+                )
+
+            if selected_count != policy.target_tables:
+                raise ValueError(
+                    f"selected count {selected_count} does not match "
+                    f"target_tables {policy.target_tables}"
+                )
+            over_cap = connection.execute(
+                """
+                SELECT schema_class, active_count
+                FROM class_counts
+                WHERE active_count > ?
+                ORDER BY schema_class
+                LIMIT 1
+                """,
+                (policy.class_cap,),
+            ).fetchone()
+            if over_cap is not None:
+                raise ValueError(
+                    f"selected class {over_cap[0]} has {over_cap[1]} "
+                    f"tables above class cap {policy.class_cap}"
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            temporary_path.unlink(missing_ok=True)
+            raise
+        else:
+            connection.close()
+        temporary_path.replace(database_path)
+        _fsync_parent(database_path.parent)
+        return cls.open(database_path, policy)
+
+    @classmethod
+    def create_from_jsonl(
+        cls,
+        database_path: Path,
+        *,
+        reserve_path: Path,
+        selected_path: Path,
+        policy: SelectionPolicy,
+    ) -> ReserveManager:
+        """Build persistent reserve state by streaming CLI selection JSONL."""
+        return cls.create(
+            database_path,
+            reserve=_iter_candidate_jsonl(reserve_path),
+            selected=_iter_candidate_jsonl(selected_path),
+            policy=policy,
+        )
+
+    @classmethod
+    def open(
+        cls,
+        database_path: Path,
+        policy: SelectionPolicy,
+    ) -> ReserveManager:
+        """Open existing reserve state and verify its selection policy."""
+        connection = sqlite3.connect(database_path)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'policy'"
+            ).fetchone()
+        finally:
+            connection.close()
+        expected = json.dumps(asdict(policy), sort_keys=True)
+        if row is None or str(row[0]) != expected:
+            raise ValueError("reserve database policy does not match")
+        return cls(database_path, policy)
+
+    def class_counts(self) -> dict[str, int]:
+        connection = self._connect()
+        try:
+            return {
+                str(row["schema_class"]): int(row["active_count"])
+                for row in connection.execute(
+                    """
+                    SELECT schema_class, active_count
+                    FROM class_counts
+                    ORDER BY schema_class
+                    """
+                )
+            }
+        finally:
+            connection.close()
+
+    def used_paths(self) -> set[str]:
+        connection = self._connect()
+        try:
+            return {
+                str(row["relative_path"])
+                for row in connection.execute(
+                    "SELECT relative_path FROM used_paths"
+                )
+            }
+        finally:
+            connection.close()
+
+    def replace(
+        self,
+        invalid_candidate: TableCandidate,
+        is_invalid: Callable[[TableCandidate], bool] | None = None,
+    ) -> TableCandidate:
+        """Transactionally consume the next feasible deterministic reserve."""
+        invalid_test = is_invalid or (lambda _candidate: False)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT schema_class
+                FROM active_selections
+                WHERE relative_path = ?
+                """,
+                (invalid_candidate.relative_path,),
+            ).fetchone()
+            if active is None:
+                raise ValueError(
+                    "invalid candidate is not an active selection: "
+                    f"{invalid_candidate.relative_path}"
+                )
+            stored_class = str(active["schema_class"])
+            if stored_class != invalid_candidate.schema_class:
+                raise ValueError(
+                    "invalid candidate class does not match active state"
+                )
+            connection.execute(
+                """
+                DELETE FROM active_selections
+                WHERE relative_path = ?
+                """,
+                (invalid_candidate.relative_path,),
+            )
+            connection.execute(
+                """
+                UPDATE class_counts
+                SET active_count = active_count - 1
+                WHERE schema_class = ?
+                """,
+                (invalid_candidate.schema_class,),
+            )
+
+            replacement = self._consume_same_stratum(
+                connection,
+                invalid_candidate,
+                invalid_test,
+            )
+            if replacement is None:
+                replacement = self._consume_global(
+                    connection,
+                    invalid_test,
+                )
+            if replacement is None:
+                connection.commit()
+                raise ReserveExhaustedError(
+                    "no reserve candidate can replace "
+                    f"{invalid_candidate.relative_path} without "
+                    "exceeding the class cap"
+                )
+            connection.execute(
+                """
+                INSERT INTO active_selections (
+                    relative_path, schema_class
+                ) VALUES (?, ?)
+                """,
+                (
+                    replacement.relative_path,
+                    replacement.schema_class,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE class_counts
+                SET active_count = active_count + 1
+                WHERE schema_class = ?
+                """,
+                (replacement.schema_class,),
+            )
+            connection.commit()
+            return replacement
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _consume_same_stratum(
+        self,
+        connection: sqlite3.Connection,
+        invalid_candidate: TableCandidate,
+        is_invalid: Callable[[TableCandidate], bool],
+    ) -> TableCandidate | None:
+        while True:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM candidates
+                WHERE schema_class = ?
+                  AND subset_name = ?
+                  AND used = 0
+                ORDER BY ordinal
+                LIMIT 1
+                """,
+                (
+                    invalid_candidate.schema_class,
+                    invalid_candidate.subset,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            candidate = _candidate_from_sqlite(row)
+            self._mark_consumed(connection, candidate.relative_path)
+            if not is_invalid(candidate):
+                return candidate
+
+    def _consume_global(
+        self,
+        connection: sqlite3.Connection,
+        is_invalid: Callable[[TableCandidate], bool],
+    ) -> TableCandidate | None:
+        while True:
+            feasible_classes = [
+                str(row["schema_class"])
+                for row in connection.execute(
+                    """
+                    SELECT schema_class
+                    FROM class_counts
+                    WHERE active_count < ?
+                    ORDER BY schema_class
+                    """,
+                    (self.policy.class_cap,),
+                )
+            ]
+            heads = []
+            for schema_class in feasible_classes:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM candidates
+                    WHERE schema_class = ? AND used = 0
+                    ORDER BY ordinal
+                    LIMIT 1
+                    """,
+                    (schema_class,),
+                ).fetchone()
+                if row is not None:
+                    heads.append(row)
+            if not heads:
+                return None
+            row = min(heads, key=lambda item: int(item["ordinal"]))
+            candidate = _candidate_from_sqlite(row)
+            self._mark_consumed(connection, candidate.relative_path)
+            if not is_invalid(candidate):
+                return candidate
+
+    @staticmethod
+    def _mark_consumed(
+        connection: sqlite3.Connection,
+        relative_path: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE candidates SET used = 1 WHERE relative_path = ?",
+            (relative_path,),
+        )
+        connection.execute(
+            """
+            INSERT INTO used_paths (relative_path)
+            VALUES (?)
+            ON CONFLICT(relative_path) DO NOTHING
+            """,
+            (relative_path,),
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+
+def _validate_candidate_subset(candidate: TableCandidate) -> None:
+    if candidate.subset not in _SUBSET_PRIORITY:
+        raise ValueError(f"unknown WDC subset: {candidate.subset}")
+
+
+def _candidate_from_sqlite(row: sqlite3.Row) -> TableCandidate:
+    return TableCandidate(
+        schema_class=str(row["schema_class"]),
+        subset=str(row["subset_name"]),
+        host=str(row["host"]),
+        relative_path=str(row["relative_path"]),
+        rows=int(row["rows_count"]),
+        columns=int(row["columns_count"]),
+    )
+
+
+def _iter_candidate_jsonl(path: Path) -> Iterator[TableCandidate]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            yield TableCandidate(
+                schema_class=str(record["schema_class"]),
+                subset=str(record["subset"]),
+                host=str(record["host"]),
+                relative_path=str(record["relative_path"]),
+                rows=int(record["rows"]),
+                columns=int(record["columns"]),
+            )
+
+
+def _fsync_parent(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def replace_invalid_selection(
     invalid_candidate: TableCandidate,
-    reserve: Iterable[TableCandidate],
+    reserve: ReserveManager,
     is_invalid: Callable[[TableCandidate], bool] | None = None,
-    *,
-    used_paths: Collection[str] = (),
-) -> TableCandidate | None:
-    """Choose a valid same-stratum reserve before the global reserve."""
-    invalid_test = is_invalid or (lambda _candidate: False)
-    global_fallback: TableCandidate | None = None
-    for candidate in reserve:
-        if (
-            candidate.relative_path in used_paths
-            or candidate.relative_path == invalid_candidate.relative_path
-            or invalid_test(candidate)
-        ):
-            continue
-        if global_fallback is None:
-            global_fallback = candidate
-        if (
-            candidate.schema_class == invalid_candidate.schema_class
-            and candidate.subset == invalid_candidate.subset
-        ):
-            return candidate
-    return global_fallback
+) -> TableCandidate:
+    """Replace an invalid active candidate through persistent reserve state."""
+    if not isinstance(reserve, ReserveManager):
+        raise TypeError("reserve must be a ReserveManager")
+    return reserve.replace(invalid_candidate, is_invalid)
 
 
 def _candidate_record(
@@ -491,6 +974,7 @@ def _write_selection_outputs(
     sort_chunk_records: int,
 ) -> tuple[CompletedShard, CompletedShard]:
     unsorted_path = selection_dir / "catalog-unsorted.jsonl"
+    canonical_path = selection_dir / "catalog-canonical.jsonl"
     unique_path = selection_dir / "catalog-unique.jsonl"
     sorted_path = selection_dir / "catalog-ranked.jsonl"
     unsorted = AtomicJsonlShard(unsorted_path)
@@ -502,10 +986,25 @@ def _write_selection_outputs(
         unsorted.commit()
         external_unique_jsonl(
             [unsorted_path],
-            unique_path,
-            key_fn=lambda record: record["relative_path"],
+            canonical_path,
+            key_fn=_record_canonical_key,
             chunk_records=sort_chunk_records,
         )
+        unique = AtomicJsonlShard(unique_path)
+        try:
+            previous_path: str | None = None
+            with canonical_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    record = json.loads(line)
+                    relative_path = str(record["relative_path"])
+                    if relative_path == previous_path:
+                        continue
+                    unique.write(record)
+                    previous_path = relative_path
+            unique.commit()
+        except BaseException:
+            unique.abort()
+            raise
         availability: dict[tuple[str, str], int] = defaultdict(int)
         with unique_path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -556,6 +1055,7 @@ def _write_selection_outputs(
         raise
     finally:
         unsorted_path.unlink(missing_ok=True)
+        canonical_path.unlink(missing_ok=True)
         unique_path.unlink(missing_ok=True)
         sorted_path.unlink(missing_ok=True)
     return selected_completed, reserve_completed
