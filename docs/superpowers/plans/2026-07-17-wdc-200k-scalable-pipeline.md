@@ -219,7 +219,12 @@ def test_statistics_zip_restores_subset_and_filename(tmp_path: Path) -> None:
 
 
 def test_mixed_allocation_is_exact_capped_and_reproducible() -> None:
-    catalog = synthetic_catalog(classes=42, per_subset=10_000)
+    catalog = synthetic_catalog(
+        classes=42,
+        top100_per_class=100,
+        minimum3_per_class=10_000,
+        rest_per_class=10_000,
+    )
     first = select_tables(catalog, SelectionPolicy(target_tables=200_000, seed=13))
     second = select_tables(reversed(catalog), SelectionPolicy(target_tables=200_000, seed=13))
     assert [item.relative_path for item in first.selected] == [
@@ -275,8 +280,13 @@ class cap enforcement, cross-subset spill, and deterministic ordering by
 - [ ] **Step 5: Implement reserve replacement**
 
 `replace_invalid_selection(...)` must first consume the same class/subset
-reserve, then use the deterministic global reserve. Record `replaces_path` and
-`replacement_reason` in the manifest.
+reserve, then use the deterministic global reserve. The selector writes a
+provisional selection plus its ordered reserve. During Task 3 structural
+expansion, each selected gzip is read once; an unreadable candidate is replaced
+immediately and the replacement is expanded in the same pass. After 200,000
+tables have expanded successfully, Task 3 atomically publishes the immutable
+final selection manifest with `replaces_path`, `replacement_reason`, row count,
+column count, and content hash. This avoids reading every selected table twice.
 
 - [ ] **Step 6: Add a selection-only CLI smoke test**
 
@@ -290,7 +300,9 @@ conda run -n MMDD python scripts/wdc200k_selection.py \
   --seed 13
 ```
 
-Assert the manifest has exactly 20 valid records and stable hashes on rerun.
+Assert the provisional selection has exactly 20 records, the reserve order is
+stable on rerun, and a supplied invalid-path callback selects the same
+replacement deterministically.
 
 - [ ] **Step 7: Run focused tests**
 
@@ -320,7 +332,9 @@ git commit -m "Add stratified WDC table selection"
 
 **Interfaces:**
 - Consumes: selection records from Task 2 and `read_wdc_table(...)` semantics from the current WDC builder.
-- Produces: `expand_selected_shard(...)`, canonical source/entity shards, `page_refs` shards, and `direct_image_refs` shards.
+- Produces: `expand_selected_shard(...)`, the immutable validated selection
+  manifest, canonical source/entity shards, `page_refs` shards, and
+  `direct_image_refs` shards.
 
 - [ ] **Step 1: Write failing full-row and image-removal tests**
 
@@ -379,6 +393,12 @@ Process one selected table at a time. Derive the same source table IDs, entity
 IDs, cells, row IDs, context terms, and provenance used by the current WDC
 adapter. Store direct image URLs only on entity/reference records; remove the
 column before building the source table.
+
+If a selected gzip is unreadable or malformed, consume the next deterministic
+reserve candidate supplied by Task 2 and expand it immediately. Publish the
+final selection manifest only after exactly the requested number of candidates
+have expanded successfully. Compute the content hash while reading the gzip so
+validation and structural expansion do not duplicate I/O.
 
 - [ ] **Step 5: Emit every entity page reference**
 
