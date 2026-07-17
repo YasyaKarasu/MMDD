@@ -1075,6 +1075,28 @@ class ReserveManager:
         finally:
             connection.close()
 
+    def get_claim_by_operation(
+        self,
+        operation_key: str,
+    ) -> ReplacementClaim | None:
+        """Read one replacement claim without scanning the journal."""
+        connection = self._connect()
+        try:
+            return self._claim_by_operation(connection, operation_key)
+        finally:
+            connection.close()
+
+    def get_claim_by_invalid_path(
+        self,
+        invalid_path: str,
+    ) -> ReplacementClaim | None:
+        """Read one replacement claim by its invalid candidate path."""
+        connection = self._connect()
+        try:
+            return self._claim_by_invalid(connection, invalid_path)
+        finally:
+            connection.close()
+
     def acknowledge(
         self,
         *,

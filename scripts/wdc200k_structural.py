@@ -6,7 +6,10 @@ import gzip
 import hashlib
 import importlib
 import json
+import os
+import sqlite3
 import sys
+import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -60,7 +63,7 @@ except ModuleNotFoundError as error:
 
 
 CONTENT_HASH_SEMANTICS = "sha256-uncompressed-jsonl-bytes"
-STRUCTURAL_SCHEMA_VERSION = "wdc200k-structural-v1"
+STRUCTURAL_SCHEMA_VERSION = "wdc200k-structural-v2"
 
 
 class StructuralExpansionError(RuntimeError):
@@ -83,10 +86,81 @@ class StructuralExpansionResult:
 
 
 @dataclass(frozen=True)
+class FinalizedSelectionResult:
+    """The only validated-selection artifact downstream stages may consume."""
+
+    validated_selection: Path
+    manifest: Path
+    tables: int
+
+
+@dataclass(frozen=True)
 class _ExpandedTable:
     source_table: dict[str, Any]
-    entities: list[dict[str, Any]]
+    raw_rows_path: Path
     content_hash: str
+
+
+class _AtomicSourceTableShard(AtomicJsonlShard):
+    """Task-1-compatible atomic shard with streamed source-table rows."""
+
+    _encoder = json.JSONEncoder(ensure_ascii=False)
+
+    def _write_value(self, value: Any) -> None:
+        for chunk in self._encoder.iterencode(value):
+            self._handle.write(chunk)
+
+    def write_source_table(
+        self,
+        source_table: dict[str, Any],
+        rows: Iterable[dict[str, Any]],
+    ) -> None:
+        if self._handle.closed:
+            raise RuntimeError("cannot write to a closed shard")
+        prefix_fields = (
+            "source_table_id",
+            "source_file",
+            "page_title",
+            "caption",
+            "section_title",
+            "num_rows",
+            "num_cols",
+            "columns",
+        )
+        suffix_fields = ("provenance_builder", "metadata")
+        self._handle.write("{")
+        first_field = True
+        for field in prefix_fields:
+            if not first_field:
+                self._handle.write(", ")
+            self._write_value(field)
+            self._handle.write(": ")
+            self._write_value(source_table[field])
+            first_field = False
+        self._handle.write(", ")
+        self._write_value("rows")
+        self._handle.write(": [")
+        first_row = True
+        row_count = 0
+        for row in rows:
+            if not first_row:
+                self._handle.write(", ")
+            self._write_value(row)
+            first_row = False
+            row_count += 1
+        if row_count != int(source_table["num_rows"]):
+            raise StructuralExpansionError(
+                f"streamed {row_count} rows but source table expected "
+                f"{source_table['num_rows']}"
+            )
+        self._handle.write("]")
+        for field in suffix_fields:
+            self._handle.write(", ")
+            self._write_value(field)
+            self._handle.write(": ")
+            self._write_value(source_table[field])
+        self._handle.write("}\n")
+        self._records += 1
 
 
 def _candidate_from_record(
@@ -106,6 +180,11 @@ def _candidate_from_record(
 
 def _record_for_fingerprint(record: TableCandidate | dict[str, Any]) -> str:
     candidate = _candidate_from_record(record)
+    selection_seed = (
+        int(record.get("selection_seed", 13))
+        if isinstance(record, dict)
+        else 13
+    )
     return json.dumps(
         {
             "schema_class": candidate.schema_class,
@@ -114,6 +193,7 @@ def _record_for_fingerprint(record: TableCandidate | dict[str, Any]) -> str:
             "relative_path": candidate.relative_path,
             "rows": candidate.rows,
             "columns": candidate.columns,
+            "selection_seed": selection_seed,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -126,19 +206,27 @@ def _selection_fingerprint(
     shard_id: str,
     explicit: str | None,
 ) -> str:
+    if isinstance(records, Sequence):
+        records_fingerprint = stable_hash(
+            STRUCTURAL_SCHEMA_VERSION,
+            shard_id,
+            *(_record_for_fingerprint(record) for record in records),
+            length=40,
+        )
+        if explicit:
+            return stable_hash(
+                explicit,
+                records_fingerprint,
+                length=40,
+            )
+        return records_fingerprint
     if explicit:
         return explicit
-    if not isinstance(records, Sequence):
+    else:
         raise ValueError(
             "input_fingerprint is required when selection_records is "
             "a streamed iterable"
         )
-    return stable_hash(
-        STRUCTURAL_SCHEMA_VERSION,
-        shard_id,
-        *(_record_for_fingerprint(record) for record in records),
-        length=40,
-    )
 
 
 def _paths(output_root: Path, shard_id: str) -> StructuralExpansionResult:
@@ -212,35 +300,242 @@ def _read_table_once(
     input_root: Path,
     min_rows: int,
     min_cols: int,
+    spool_root: Path,
 ) -> _ExpandedTable:
     digest = hashlib.sha256()
-    rows: list[dict[str, Any]] = []
-    with gzip.open(path, "rb") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            digest.update(raw_line)
-            if not raw_line.strip():
-                continue
-            text = raw_line.decode("utf-8")
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"non-object JSON row at line {line_number}"
+    spool_root.mkdir(parents=True, exist_ok=True)
+    raw_descriptor, raw_name = tempfile.mkstemp(
+        prefix="raw-table-",
+        suffix=".jsonl",
+        dir=spool_root,
+    )
+    os.close(raw_descriptor)
+    profile_descriptor, profile_name = tempfile.mkstemp(
+        prefix="profiles-",
+        suffix=".sqlite3",
+        dir=spool_root,
+    )
+    os.close(profile_descriptor)
+    raw_rows_path = Path(raw_name)
+    profile_path = Path(profile_name)
+    connection = sqlite3.connect(profile_path)
+    column_names: list[str] = []
+    seen_columns: set[str] = set()
+    non_empty_counts: dict[str, int] = {}
+    numeric_counts: dict[str, int] = {}
+    examples: dict[str, list[str]] = {}
+    row_count = 0
+    try:
+        connection.execute(
+            """
+            CREATE TABLE distinct_values (
+                column_name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (column_name, value)
+            ) WITHOUT ROWID
+            """
+        )
+        with raw_rows_path.open("w", encoding="utf-8") as raw_spool:
+            with gzip.open(path, "rb") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    digest.update(raw_line)
+                    if not raw_line.strip():
+                        continue
+                    text = raw_line.decode("utf-8")
+                    payload = json.loads(text)
+                    if not isinstance(payload, dict):
+                        raise ValueError(
+                            f"non-object JSON row at line {line_number}"
+                        )
+                    row_count += 1
+                    for column_name, raw_value in payload.items():
+                        if column_name in wdc_adapter.EXCLUDED_COLUMNS:
+                            continue
+                        if column_name not in seen_columns:
+                            seen_columns.add(column_name)
+                            column_names.append(column_name)
+                            non_empty_counts[column_name] = 0
+                            numeric_counts[column_name] = 0
+                            examples[column_name] = []
+                        value = clean_text(
+                            wdc_adapter._cell_text(raw_value)
+                        )
+                        if not value:
+                            continue
+                        non_empty_counts[column_name] += 1
+                        if wdc_adapter.is_numeric_text(value):
+                            numeric_counts[column_name] += 1
+                        inserted = connection.execute(
+                            """
+                            INSERT OR IGNORE INTO distinct_values (
+                                column_name, value
+                            ) VALUES (?, ?)
+                            """,
+                            (column_name, value),
+                        ).rowcount
+                        if inserted and len(examples[column_name]) < 8:
+                            examples[column_name].append(value)
+                    json.dump(payload, raw_spool, ensure_ascii=False)
+                    raw_spool.write("\n")
+        if row_count < min_rows:
+            raise ValueError("too_few_rows")
+        if len(column_names) < min_cols:
+            raise ValueError("too_few_columns")
+        entity_column = wdc_adapter._entity_column(column_names)
+        if entity_column is None:
+            raise ValueError("missing_entity_column")
+
+        distinct_counts = {
+            str(column_name): int(count)
+            for column_name, count in connection.execute(
+                """
+                SELECT column_name, COUNT(*)
+                FROM distinct_values
+                GROUP BY column_name
+                """
+            )
+        }
+        relative_source = wdc_adapter._relative_source(path, input_root)
+        schema_class = wdc_adapter._schema_class(relative_source)
+        source_table_id = (
+            "st_wdc_"
+            + stable_hash(schema_class, relative_source, length=16)
+        )
+        columns: list[dict[str, Any]] = []
+        profiles: list[dict[str, Any]] = []
+        for column_index, column_name in enumerate(column_names):
+            non_empty = non_empty_counts[column_name]
+            distinct = distinct_counts.get(column_name, 0)
+            profile = {
+                "non_empty_ratio": non_empty / max(1, row_count),
+                "unique_ratio": distinct / max(1, non_empty),
+                "numeric_ratio": (
+                    numeric_counts[column_name] / max(1, non_empty)
+                ),
+                "distinct_count": distinct,
+                "examples": examples[column_name],
+            }
+            columns.append(
+                {
+                    "column_index": column_index,
+                    "column_name": column_name,
+                    "is_numeric_column": (
+                        float(profile["numeric_ratio"]) >= 0.8
+                    ),
+                }
+            )
+            profiles.append(
+                {
+                    "column_index": column_index,
+                    "column_name": column_name,
+                    **profile,
+                }
+            )
+        source_table: dict[str, Any] = {
+            "source_table_id": source_table_id,
+            "source_file": relative_source,
+            "page_title": schema_class,
+            "caption": "",
+            "section_title": "",
+            "num_rows": row_count,
+            "num_cols": len(columns),
+            "columns": columns,
+            "provenance_builder": "build_wdc_mm_joinability_dataset.py",
+            "metadata": {
+                "candidate_entity_columns": [entity_column],
+                "column_profiles": profiles,
+            },
+        }
+        connection.commit()
+        return _ExpandedTable(
+            source_table=source_table,
+            raw_rows_path=raw_rows_path,
+            content_hash=digest.hexdigest(),
+        )
+    except BaseException:
+        raw_rows_path.unlink(missing_ok=True)
+        raise
+    finally:
+        connection.close()
+        profile_path.unlink(missing_ok=True)
+
+
+def _iter_canonical_rows(
+    expanded: _ExpandedTable,
+) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
+    source = expanded.source_table
+    columns = source["columns"]
+    column_names = [str(column["column_name"]) for column in columns]
+    entity_column = int(
+        source["metadata"]["candidate_entity_columns"][0]
+    )
+    schema_class = str(source["page_title"])
+    relative_source = str(source["source_file"])
+    source_table_id = str(source["source_table_id"])
+    with expanded.raw_rows_path.open("r", encoding="utf-8") as handle:
+        for fallback, line in enumerate(handle):
+            raw_row = json.loads(line)
+            source_row_id = wdc_adapter._source_row_id(
+                raw_row,
+                fallback,
+            )
+            display_text = wdc_adapter._cell_text(
+                raw_row.get(column_names[entity_column])
+            )
+            page_url = clean_text(raw_row.get("page_url"))
+            entity_key = (
+                "wdc_"
+                + stable_hash(
+                    schema_class,
+                    relative_source,
+                    source_row_id,
+                    page_url,
+                    display_text,
+                    length=20,
                 )
-            rows.append(payload)
-    adapted = wdc_adapter._adapt_wdc_rows(
-        rows,
-        path,
-        input_root,
-        min_rows,
-        min_cols,
-    )
-    if adapted.source_table is None:
-        raise ValueError(adapted.skip_reason or "invalid_wdc_table")
-    return _ExpandedTable(
-        source_table=adapted.source_table,
-        entities=adapted.entities,
-        content_hash=digest.hexdigest(),
-    )
+            )
+            entity_id = f"ent_{stable_hash(entity_key, length=16)}"
+            image_urls = wdc_adapter.extract_image_urls(
+                raw_row.get("image"),
+                page_url,
+            )
+            cells: list[dict[str, Any]] = []
+            for column_index, column_name in enumerate(column_names):
+                raw_value = raw_row.get(column_name)
+                is_entity = column_index == entity_column
+                cells.append(
+                    {
+                        "column_index": column_index,
+                        "column_name": column_name,
+                        "raw": raw_value,
+                        "text": wdc_adapter._cell_text(raw_value),
+                        "wiki_title": entity_key if is_entity else None,
+                        "has_wiki_link": is_entity,
+                    }
+                )
+            appears_in = {
+                "source_table_id": source_table_id,
+                "query_view_id": None,
+                "row_id": source_row_id,
+                "column_index": entity_column,
+                "column_name": column_names[entity_column],
+            }
+            entity = {
+                "entity_id": entity_id,
+                "wiki_title": entity_key,
+                "display_texts": [display_text] if display_text else [],
+                "context_terms": wdc_adapter._context_terms(
+                    cells,
+                    entity_column,
+                ),
+                "appears_in": [appears_in],
+                "page_url": page_url,
+                "image_urls": image_urls,
+            }
+            yield (
+                {"row_id": source_row_id, "cells": cells},
+                entity,
+            )
 
 
 def _failure_reason(error: Exception) -> str:
@@ -256,23 +551,10 @@ def _operation_key(shard_id: str, invalid: TableCandidate) -> str:
     )
 
 
-def _claim_index(
-    reserve_manager: ReserveManager,
-) -> dict[str, ReplacementClaim]:
-    return {
-        claim.operation_key: claim
-        for claim in [
-            *reserve_manager.pending_claims(),
-            *reserve_manager.terminal_claims(),
-        ]
-    }
-
-
 def _claim_chain(
     reserve_manager: ReserveManager,
     claim: ReplacementClaim,
 ) -> list[ReplacementClaim]:
-    claims = _claim_index(reserve_manager)
     seen: set[str] = set()
     current = claim
     chain = [current]
@@ -280,13 +562,19 @@ def _claim_chain(
         if (
             current.operation_key in seen
             or not current.successor_operation_key
-            or current.successor_operation_key not in claims
         ):
             raise StructuralExpansionError(
                 "replacement journal contains a broken successor chain"
             )
         seen.add(current.operation_key)
-        current = claims[current.successor_operation_key]
+        successor = reserve_manager.get_claim_by_operation(
+            current.successor_operation_key
+        )
+        if successor is None:
+            raise StructuralExpansionError(
+                "replacement journal contains a broken successor chain"
+            )
+        current = successor
         chain.append(current)
     return chain
 
@@ -312,12 +600,288 @@ def _validated_record(
         "columns": int(source["num_cols"]),
         "content_hash": expanded.content_hash,
         "content_hash_semantics": CONTENT_HASH_SEMANTICS,
+        "source_table_id": str(source["source_table_id"]),
         "replaces_path": lineage[0] if lineage else None,
         "replacement_reason": reasons[0] if reasons else None,
         "replacement_chain": lineage,
         "replacement_reasons": reasons,
         "replacement_operation_key": operation_key,
     }
+
+
+def _completed_shard_from_payload(payload: dict[str, Any]) -> CompletedShard:
+    return CompletedShard(
+        path=str(payload["path"]),
+        records=int(payload["records"]),
+        bytes=int(payload["bytes"]),
+        sha256=str(payload["sha256"]),
+    )
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validated_shard_from_manifest(
+    manifest_path: Path,
+    *,
+    output_root: Path,
+) -> tuple[Path, int, str]:
+    if not manifest_path.is_file():
+        raise StructuralExpansionError(
+            f"missing structural manifest: {manifest_path}"
+        )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        completed = [
+            _completed_shard_from_payload(record)
+            for record in payload["completed_shards"]
+        ]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StructuralExpansionError(
+            f"invalid structural manifest: {manifest_path}"
+        ) from error
+    if (
+        payload.get("stage") != "wdc200k_structural"
+        or payload.get("complete") is not True
+    ):
+        raise StructuralExpansionError(
+            f"incomplete structural manifest: {manifest_path}"
+        )
+    if not completed:
+        raise StructuralExpansionError(
+            f"structural manifest has no shards: {manifest_path}"
+        )
+    for shard in completed:
+        if not validate_completed_shard(shard, output_root):
+            raise StructuralExpansionError(
+                "structural shard checksum validation failed: "
+                f"{shard.path}"
+            )
+    validated = [
+        shard
+        for shard in completed
+        if shard.path.startswith("selection/validated-")
+        and shard.path.endswith(".jsonl")
+    ]
+    sources = [
+        shard
+        for shard in completed
+        if shard.path.startswith("source_tables/")
+        and shard.path.endswith(".jsonl")
+    ]
+    if len(validated) != 1 or len(sources) != 1:
+        raise StructuralExpansionError(
+            "structural manifest must contain exactly one validated "
+            "selection shard and one source-table shard"
+        )
+    if validated[0].records != sources[0].records:
+        raise StructuralExpansionError(
+            "structural source and validated-selection counts differ"
+        )
+    return (
+        output_root / validated[0].path,
+        validated[0].records,
+        _sha256_path(manifest_path),
+    )
+
+
+def finalize_validated_selection(
+    structural_manifest_paths: Iterable[Path],
+    *,
+    output_root: Path,
+    target_tables: int,
+) -> FinalizedSelectionResult:
+    """Atomically publish the global selection after every structural shard.
+
+    Tasks 4 and later must consume only ``validated_selection`` returned by
+    this function, never provisional per-shard selection records.
+    """
+    if target_tables <= 0:
+        raise ValueError("target_tables must be positive")
+    output_root = Path(output_root)
+    manifests = [Path(path) for path in structural_manifest_paths]
+    if not manifests:
+        raise StructuralExpansionError("missing structural manifests")
+    canonical_manifests = [path.resolve() for path in manifests]
+    if len(canonical_manifests) != len(set(canonical_manifests)):
+        raise StructuralExpansionError("duplicate structural manifest")
+
+    validated_shards: list[tuple[Path, int]] = []
+    manifest_hashes: list[tuple[str, str]] = []
+    manifest_record_total = 0
+    for manifest_path in sorted(canonical_manifests):
+        validated_path, records, manifest_hash = (
+            _validated_shard_from_manifest(
+                manifest_path,
+                output_root=output_root,
+            )
+        )
+        validated_shards.append((validated_path, records))
+        manifest_record_total += records
+        manifest_hashes.append((manifest_path.as_posix(), manifest_hash))
+    if manifest_record_total != target_tables:
+        raise StructuralExpansionError(
+            f"structural manifest target is {manifest_record_total}, "
+            f"expected target {target_tables}"
+        )
+
+    final_path = (
+        output_root / "selection" / "validated-selected-tables.jsonl"
+    )
+    manifest_path = (
+        output_root
+        / "stage_manifests"
+        / "validated-selection-global.json"
+    )
+    fingerprint = StageFingerprint(
+        stage="wdc200k_validated_selection",
+        input_fingerprint=stable_hash(
+            STRUCTURAL_SCHEMA_VERSION,
+            *(
+                f"{path}:{digest}"
+                for path, digest in manifest_hashes
+            ),
+            length=40,
+        ),
+        parameter_fingerprint=stable_hash(
+            "validated-selection-global-v1",
+            target_tables,
+            length=40,
+        ),
+    )
+    final_manifest: StageManifest | None = None
+    if manifest_path.exists():
+        final_manifest = StageManifest(manifest_path, fingerprint)
+        if final_manifest.complete:
+            expected_final_path = final_path.relative_to(
+                output_root
+            ).as_posix()
+            if (
+                len(final_manifest.completed_shards) != 1
+                or final_manifest.completed_shards[0].path
+                != expected_final_path
+                or final_manifest.completed_shards[0].records
+                != target_tables
+                or not validate_completed_shard(
+                    final_manifest.completed_shards[0],
+                    output_root,
+                )
+            ):
+                raise StructuralExpansionError(
+                    "completed global validated selection failed validation"
+                )
+            return FinalizedSelectionResult(
+                validated_selection=final_path,
+                manifest=manifest_path,
+                tables=target_tables,
+            )
+
+    spool_root = output_root / ".structural_spool" / "global-finalize"
+    spool_root.mkdir(parents=True, exist_ok=True)
+    for stale_spool_file in spool_root.iterdir():
+        if stale_spool_file.is_file():
+            stale_spool_file.unlink()
+    descriptor, database_name = tempfile.mkstemp(
+        prefix="validated-selection-",
+        suffix=".sqlite3",
+        dir=spool_root,
+    )
+    os.close(descriptor)
+    database_path = Path(database_name)
+    writer = AtomicJsonlShard(final_path)
+    connection = sqlite3.connect(database_path)
+    record_count = 0
+    required_fields = {
+        "source_table_id",
+        "relative_path",
+        "rows",
+        "columns",
+        "content_hash",
+        "replacement_chain",
+        "replacement_reasons",
+        "replaces_path",
+        "replacement_reason",
+    }
+    try:
+        connection.execute(
+            """
+            CREATE TABLE seen (
+                relative_path TEXT PRIMARY KEY,
+                source_table_id TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        for validated_path, expected_records in validated_shards:
+            shard_records = 0
+            with validated_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    if (
+                        not isinstance(record, dict)
+                        or not required_fields.issubset(record)
+                    ):
+                        raise StructuralExpansionError(
+                            "validated selection record is incomplete"
+                        )
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO seen (
+                                relative_path, source_table_id
+                            ) VALUES (?, ?)
+                            """,
+                            (
+                                str(record["relative_path"]),
+                                str(record["source_table_id"]),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        raise StructuralExpansionError(
+                            "duplicate relative path or source table ID "
+                            "in validated selection"
+                        ) from error
+                    writer.write(record)
+                    shard_records += 1
+                    record_count += 1
+            if shard_records != expected_records:
+                raise StructuralExpansionError(
+                    "validated selection shard record count changed"
+                )
+        if record_count != target_tables:
+            raise StructuralExpansionError(
+                f"validated selection target is {record_count}, "
+                f"expected target {target_tables}"
+            )
+        connection.commit()
+        completed = writer.commit()
+        completed = _relative_completed(
+            completed,
+            final_path,
+            output_root,
+        )
+        if final_manifest is None:
+            final_manifest = StageManifest(manifest_path, fingerprint)
+        final_manifest.record_shard(completed)
+        final_manifest.mark_complete()
+    except BaseException:
+        writer.abort()
+        raise
+    finally:
+        connection.close()
+        database_path.unlink(missing_ok=True)
+
+    return FinalizedSelectionResult(
+        validated_selection=final_path,
+        manifest=manifest_path,
+        tables=record_count,
+    )
 
 
 def _acknowledge_validated_replacements(
@@ -425,8 +989,13 @@ def expand_selected_shard(
         )
         return _completed_result(paths)
 
+    spool_root = output_root / ".structural_spool" / shard_id
+    spool_root.mkdir(parents=True, exist_ok=True)
+    for stale_spool_file in spool_root.iterdir():
+        if stale_spool_file.is_file():
+            stale_spool_file.unlink()
     writers = {
-        "source_tables": AtomicJsonlShard(paths.source_tables),
+        "source_tables": _AtomicSourceTableShard(paths.source_tables),
         "entities": AtomicJsonlShard(paths.entities),
         "page_refs": AtomicJsonlShard(paths.page_refs),
         "direct_image_refs": AtomicJsonlShard(paths.direct_image_refs),
@@ -462,6 +1031,7 @@ def expand_selected_shard(
                         input_root=input_root,
                         min_rows=min_rows,
                         min_cols=min_cols,
+                        spool_root=spool_root,
                     )
                     break
                 except Exception as error:
@@ -493,71 +1063,93 @@ def expand_selected_shard(
                     final_operation_key = claim.operation_key
 
             source = expanded.source_table
-            writers["source_tables"].write(source)
-            successful_tables += 1
-            for entity in expanded.entities:
-                writers["entities"].write(entity)
-                entities_count += 1
-                appearance = entity["appears_in"][0]
-                normalized_page = _normalize_http_url(
-                    entity.get("page_url")
+            try:
+                def emitted_rows() -> Iterable[dict[str, Any]]:
+                    nonlocal entities_count
+                    nonlocal page_references
+                    nonlocal direct_image_references
+                    for row, entity in _iter_canonical_rows(expanded):
+                        writers["entities"].write(entity)
+                        entities_count += 1
+                        appearance = entity["appears_in"][0]
+                        normalized_page = _normalize_http_url(
+                            entity.get("page_url")
+                        )
+                        if normalized_page is None:
+                            raw_page = clean_text(entity.get("page_url"))
+                            writers["structural_failures"].write(
+                                {
+                                    "failure_type": (
+                                        "structural_page_url_failure"
+                                    ),
+                                    "stage": "structural",
+                                    "status": "terminal",
+                                    "error_class": (
+                                        "missing_page_url"
+                                        if not raw_page
+                                        else "invalid_page_url"
+                                    ),
+                                    "entity_id": entity["entity_id"],
+                                    "source_table_id": (
+                                        source["source_table_id"]
+                                    ),
+                                    "row_id": appearance["row_id"],
+                                    "page_url": raw_page,
+                                }
+                            )
+                        else:
+                            writers["page_refs"].write(
+                                {
+                                    "url_key": _url_key(normalized_page),
+                                    "page_url": normalized_page,
+                                    "entity_id": entity["entity_id"],
+                                    "source_table_id": (
+                                        source["source_table_id"]
+                                    ),
+                                    "row_id": appearance["row_id"],
+                                }
+                            )
+                            page_references += 1
+                        for ordinal, image_url in enumerate(
+                            entity.get("image_urls") or []
+                        ):
+                            normalized_image = _normalize_http_url(
+                                image_url
+                            )
+                            if normalized_image is None:
+                                continue
+                            writers["direct_image_refs"].write(
+                                {
+                                    "url_key": _url_key(normalized_image),
+                                    "image_url": image_url,
+                                    "entity_id": entity["entity_id"],
+                                    "source_table_id": (
+                                        source["source_table_id"]
+                                    ),
+                                    "row_id": appearance["row_id"],
+                                    "ordinal": ordinal,
+                                }
+                            )
+                            direct_image_references += 1
+                        yield row
+
+                writers["source_tables"].write_source_table(
+                    source,
+                    emitted_rows(),
                 )
-                if normalized_page is None:
-                    raw_page = clean_text(entity.get("page_url"))
-                    writers["structural_failures"].write(
-                        {
-                            "failure_type": "structural_page_url_failure",
-                            "stage": "structural",
-                            "status": "terminal",
-                            "error_class": (
-                                "missing_page_url"
-                                if not raw_page
-                                else "invalid_page_url"
-                            ),
-                            "entity_id": entity["entity_id"],
-                            "source_table_id": source["source_table_id"],
-                            "row_id": appearance["row_id"],
-                            "page_url": raw_page,
-                        }
+                successful_tables += 1
+                writers["validated_selection"].write(
+                    _validated_record(
+                        current,
+                        expanded,
+                        selection_seed=selection_seed,
+                        lineage=lineage,
+                        reasons=reasons,
+                        operation_key=final_operation_key,
                     )
-                else:
-                    writers["page_refs"].write(
-                        {
-                            "url_key": _url_key(normalized_page),
-                            "page_url": normalized_page,
-                            "entity_id": entity["entity_id"],
-                            "source_table_id": source["source_table_id"],
-                            "row_id": appearance["row_id"],
-                        }
-                    )
-                    page_references += 1
-                for ordinal, image_url in enumerate(
-                    entity.get("image_urls") or []
-                ):
-                    normalized_image = _normalize_http_url(image_url)
-                    if normalized_image is None:
-                        continue
-                    writers["direct_image_refs"].write(
-                        {
-                            "url_key": _url_key(normalized_image),
-                            "image_url": image_url,
-                            "entity_id": entity["entity_id"],
-                            "source_table_id": source["source_table_id"],
-                            "row_id": appearance["row_id"],
-                            "ordinal": ordinal,
-                        }
-                    )
-                    direct_image_references += 1
-            writers["validated_selection"].write(
-                _validated_record(
-                    current,
-                    expanded,
-                    selection_seed=selection_seed,
-                    lineage=lineage,
-                    reasons=reasons,
-                    operation_key=final_operation_key,
                 )
-            )
+            finally:
+                expanded.raw_rows_path.unlink(missing_ok=True)
 
         expected_tables = selected_count
         if successful_tables != expected_tables:

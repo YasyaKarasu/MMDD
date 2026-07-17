@@ -1179,3 +1179,43 @@ def test_selection_cli_deduplicates_paths_before_allocating(
         if item["relative_path"].endswith("duplicate.test_October2023.json.gz")
     )
     assert (duplicate["rows"], duplicate["columns"]) == (2, 4)
+
+
+def test_reserve_manager_reads_one_claim_by_operation_or_invalid_path(
+    tmp_path: Path,
+) -> None:
+    selected = TableCandidate(
+        schema_class="Product",
+        subset="minimum3",
+        host="bad.test",
+        relative_path="Product/Product_bad.test_October2023.json.gz",
+        rows=3,
+        columns=2,
+    )
+    reserve = TableCandidate(
+        schema_class="Product",
+        subset="minimum3",
+        host="good.test",
+        relative_path="Product/Product_good.test_October2023.json.gz",
+        rows=3,
+        columns=2,
+    )
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite3",
+        reserve=[reserve],
+        selected=[selected],
+        policy=SelectionPolicy(target_tables=1),
+    )
+    claim = manager.claim_replacement(
+        operation_key="replace-bad",
+        invalid_candidate=selected,
+        reason="broken",
+    )
+
+    assert manager.get_claim_by_operation("replace-bad") == claim
+    assert (
+        manager.get_claim_by_invalid_path(selected.relative_path)
+        == claim
+    )
+    assert manager.get_claim_by_operation("missing") is None
+    assert manager.get_claim_by_invalid_path("missing") is None

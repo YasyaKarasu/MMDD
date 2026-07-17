@@ -14,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import wdc200k_io as wdc200k_io_module  # noqa: E402
 from build_wdc_mm_joinability_dataset import (  # noqa: E402
     iter_wdc_rows,
     read_wdc_table,
@@ -27,6 +28,7 @@ from wdc200k_selection import (  # noqa: E402
 from wdc200k_structural import (  # noqa: E402
     StructuralExpansionError,
     expand_selected_shard,
+    finalize_validated_selection,
 )
 
 
@@ -198,6 +200,32 @@ def test_streamed_selection_requires_an_explicit_resume_fingerprint(
         )
 
 
+def test_selection_seed_changes_structural_resume_fingerprint(
+    tmp_path: Path,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    record = selection_record(path, tmp_path, rows=1, columns=2)
+    output_root = tmp_path / "structural"
+    expand_selected_shard(
+        [record],
+        output_root=output_root,
+        input_root=tmp_path,
+        input_fingerprint="same-upstream-fingerprint",
+    )
+
+    changed = {**record, "selection_seed": 99}
+    with pytest.raises(ValueError, match="fingerprint"):
+        expand_selected_shard(
+            [changed],
+            output_root=output_root,
+            input_root=tmp_path,
+            input_fingerprint="same-upstream-fingerprint",
+        )
+
+
 def test_structural_module_imports_through_scripts_package() -> None:
     result = subprocess.run(
         [
@@ -322,6 +350,174 @@ def test_content_hash_is_uncompressed_jsonl_bytes_from_the_expansion_pass(
     )
     assert validated["rows"] == 2
     assert validated["columns"] == 2
+
+
+def test_global_finalize_is_exact_validated_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    manifests: list[Path] = []
+    for shard_index in range(2):
+        path = write_wdc_gzip(
+            tmp_path,
+            host=f"shop-{shard_index}.test",
+            rows=[
+                {
+                    "name": f"item-{shard_index}",
+                    "page_url": f"https://example.test/{shard_index}",
+                }
+            ],
+        )
+        result = expand_selected_shard(
+            [selection_record(path, tmp_path, rows=1, columns=2)],
+            output_root=output_root,
+            input_root=tmp_path,
+            shard_id=f"{shard_index:05d}",
+        )
+        manifests.append(result.manifest)
+
+    finalized = finalize_validated_selection(
+        manifests,
+        output_root=output_root,
+        target_tables=2,
+    )
+    records = read_records(finalized.validated_selection)
+    assert len(records) == 2
+    assert len({record["relative_path"] for record in records}) == 2
+    assert len({record["source_table_id"] for record in records}) == 2
+    checksum = hashlib.sha256(
+        finalized.validated_selection.read_bytes()
+    ).hexdigest()
+    mtime = finalized.validated_selection.stat().st_mtime_ns
+
+    resumed = finalize_validated_selection(
+        manifests,
+        output_root=output_root,
+        target_tables=2,
+    )
+
+    assert resumed.tables == 2
+    assert (
+        hashlib.sha256(resumed.validated_selection.read_bytes()).hexdigest()
+        == checksum
+    )
+    assert resumed.validated_selection.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("target_tables", [1, 3])
+def test_global_finalize_rejects_non_exact_target(
+    tmp_path: Path,
+    target_tables: int,
+) -> None:
+    output_root = tmp_path / "structural"
+    first = write_wdc_gzip(
+        tmp_path,
+        host="first.test",
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    second = write_wdc_gzip(
+        tmp_path,
+        host="second.test",
+        rows=[{"name": "B", "page_url": "https://example.test/b"}],
+    )
+    result = expand_selected_shard(
+        [
+            selection_record(first, tmp_path, rows=1, columns=2),
+            selection_record(second, tmp_path, rows=1, columns=2),
+        ],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    with pytest.raises(StructuralExpansionError, match="target"):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=target_tables,
+        )
+
+    assert not (
+        output_root / "selection" / "validated-selected-tables.jsonl"
+    ).exists()
+
+
+def test_global_finalize_rejects_duplicate_structural_manifest(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=2)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    with pytest.raises(StructuralExpansionError, match="duplicate"):
+        finalize_validated_selection(
+            [result.manifest, result.manifest],
+            output_root=output_root,
+            target_tables=2,
+        )
+
+
+def test_global_finalize_rejects_duplicate_validated_records(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    manifests = [
+        expand_selected_shard(
+            [selection_record(path, tmp_path, rows=1, columns=2)],
+            output_root=output_root,
+            input_root=tmp_path,
+            shard_id=f"{index:05d}",
+        ).manifest
+        for index in range(2)
+    ]
+
+    with pytest.raises(StructuralExpansionError, match="duplicate"):
+        finalize_validated_selection(
+            manifests,
+            output_root=output_root,
+            target_tables=2,
+        )
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_global_finalize_rejects_missing_or_corrupt_structural_shard(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    output_root = tmp_path / "structural"
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=1, columns=2)],
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    if damage == "missing":
+        result.entities.unlink()
+    else:
+        result.entities.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        StructuralExpansionError,
+        match="checksum|missing",
+    ):
+        finalize_validated_selection(
+            [result.manifest],
+            output_root=output_root,
+            target_tables=1,
+        )
 
 
 def test_each_selection_shard_requires_its_own_exact_success_count(
@@ -505,6 +701,109 @@ def test_pending_replacement_chain_is_reconstructed_after_restart(
     ]
 
 
+def test_replacement_recovery_reads_only_the_current_successor_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write_wdc_gzip(tmp_path, host="first.test", rows=["{bad"])
+    second = write_wdc_gzip(tmp_path, host="second.test", rows=["[bad"])
+    good = write_wdc_gzip(
+        tmp_path,
+        host="third.test",
+        rows=[{"name": "ok", "page_url": "https://example.test/ok"}],
+    )
+    main_selected = candidate(first, tmp_path, rows=1)
+    unrelated_selected = [
+        TableCandidate(
+            schema_class="Product",
+            subset="minimum3",
+            host=f"unrelated-{index}.test",
+            relative_path=(
+                "Product/"
+                f"Product_unrelated-{index}.test_October2023.json.gz"
+            ),
+            rows=1,
+            columns=2,
+        )
+        for index in range(30)
+    ]
+    unrelated_reserve = [
+        TableCandidate(
+            schema_class="Product",
+            subset="minimum3",
+            host=f"reserve-{index}.test",
+            relative_path=(
+                "Product/"
+                f"Product_reserve-{index}.test_October2023.json.gz"
+            ),
+            rows=1,
+            columns=2,
+        )
+        for index in range(30)
+    ]
+    chain_reserve = [
+        candidate(second, tmp_path, rows=1),
+        candidate(good, tmp_path, rows=1),
+    ]
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite3",
+        reserve=[*chain_reserve, *unrelated_reserve],
+        selected=[main_selected, *unrelated_selected],
+        policy=SelectionPolicy(target_tables=31),
+    )
+    first_claim = manager.claim_replacement(
+        operation_key=stable_operation_key(
+            "00000", main_selected.relative_path
+        ),
+        invalid_candidate=main_selected,
+        reason=invalid_json_reason("{bad"),
+    )
+    manager.claim_replacement(
+        operation_key=stable_operation_key(
+            "00000", chain_reserve[0].relative_path
+        ),
+        invalid_candidate=chain_reserve[0],
+        reason=invalid_json_reason("[bad"),
+    )
+    assert first_claim.status == "pending"
+    for index, selected in enumerate(unrelated_selected):
+        claim = manager.claim_replacement(
+            operation_key=f"unrelated-{index}",
+            invalid_candidate=selected,
+            reason="unrelated",
+        )
+        manager.acknowledge(
+            operation_key=claim.operation_key,
+            replacement_path=str(claim.replacement_path),
+        )
+
+    def forbid_global_history_scan() -> Any:
+        raise AssertionError("global replacement history was loaded")
+
+    monkeypatch.setattr(manager, "pending_claims", forbid_global_history_scan)
+    monkeypatch.setattr(manager, "terminal_claims", forbid_global_history_scan)
+    original_get = manager.get_claim_by_operation
+    queried: list[str] = []
+
+    def tracked_get(operation_key: str) -> Any:
+        queried.append(operation_key)
+        return original_get(operation_key)
+
+    monkeypatch.setattr(manager, "get_claim_by_operation", tracked_get)
+
+    result = expand_selected_shard(
+        [selection_record(first, tmp_path, rows=1, columns=2)],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+        reserve_manager=manager,
+    )
+
+    assert result.tables == 1
+    assert queried == [
+        stable_operation_key("00000", chain_reserve[0].relative_path)
+    ]
+
+
 def test_durable_output_before_ack_recovers_pending_claim_without_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -581,6 +880,85 @@ def test_malformed_gzip_does_not_publish_partial_structural_shards(
     assert not list(output_root.rglob("*.tmp"))
 
 
+def test_invalid_utf8_and_corrupt_gzip_do_not_publish(
+    tmp_path: Path,
+) -> None:
+    invalid_utf8 = (
+        tmp_path / "Product" / "Product_utf8.test_October2023.json.gz"
+    )
+    invalid_utf8.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(invalid_utf8, "wb") as handle:
+        handle.write(b'{"name":"ok","page_url":"https://e.test"}\n')
+        handle.write(b"\xff\n")
+    corrupt = (
+        tmp_path / "Product" / "Product_corrupt.test_October2023.json.gz"
+    )
+    corrupt.write_bytes(b"not-a-gzip-stream")
+
+    for shard_id, path in (("utf8", invalid_utf8), ("gzip", corrupt)):
+        output_root = tmp_path / f"structural-{shard_id}"
+        with pytest.raises(StructuralExpansionError):
+            expand_selected_shard(
+                [selection_record(path, tmp_path, rows=2, columns=2)],
+                output_root=output_root,
+                input_root=tmp_path,
+                shard_id=shard_id,
+            )
+        assert not list((output_root / "source_tables").glob("*.jsonl"))
+        assert not list(output_root.rglob("*.tmp"))
+
+
+def test_resume_after_mid_commit_failure_rewrites_a_complete_artifact_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    records = [selection_record(path, tmp_path, rows=1, columns=2)]
+    output_root = tmp_path / "structural"
+    original_commit = wdc200k_io_module.AtomicJsonlShard.commit
+    calls = 0
+
+    def fail_third_commit(self: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("simulated commit failure")
+        return original_commit(self)
+
+    monkeypatch.setattr(
+        wdc200k_io_module.AtomicJsonlShard,
+        "commit",
+        fail_third_commit,
+    )
+    with pytest.raises(OSError, match="simulated commit failure"):
+        expand_selected_shard(
+            records,
+            output_root=output_root,
+            input_root=tmp_path,
+        )
+
+    monkeypatch.setattr(
+        wdc200k_io_module.AtomicJsonlShard,
+        "commit",
+        original_commit,
+    )
+    resumed = expand_selected_shard(
+        records,
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    assert resumed.tables == 1
+    assert len(read_records(resumed.source_tables)) == 1
+    assert len(read_records(resumed.validated_selection)) == 1
+    assert json.loads(resumed.manifest.read_text(encoding="utf-8"))[
+        "complete"
+    ]
+
+
 def test_non_object_json_row_is_malformed_and_does_not_drop_a_row(
     tmp_path: Path,
 ) -> None:
@@ -605,3 +983,88 @@ def test_non_object_json_row_is_malformed_and_does_not_drop_a_row(
 
     assert not list((output_root / "source_tables").glob("*.jsonl"))
     assert not list(output_root.rglob("*.tmp"))
+
+
+def test_large_source_table_bypasses_whole_record_jsonl_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[
+            {
+                "row_id": index,
+                "name": f"item-{index}",
+                "page_url": f"https://example.test/{index}",
+                "value": str(index),
+            }
+            for index in range(2_000)
+        ],
+    )
+    original_write = wdc200k_io_module.write_jsonl_record
+
+    def reject_whole_source(handle: Any, record: dict[str, Any]) -> None:
+        if (
+            "source_table_id" in record
+            and isinstance(record.get("rows"), list)
+        ):
+            raise AssertionError("whole source table reached json.dumps")
+        original_write(handle, record)
+
+    monkeypatch.setattr(
+        wdc200k_io_module,
+        "write_jsonl_record",
+        reject_whole_source,
+    )
+
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=2_000, columns=3)],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+    )
+
+    source = read_records(result.source_tables)[0]
+    assert source["num_rows"] == 2_000
+    assert len(source["rows"]) == 2_000
+
+
+def test_streamed_source_matches_adapter_with_sparse_late_columns(
+    tmp_path: Path,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[
+            {
+                "name": "first",
+                "page_url": "https://example.test/first",
+                "score": "1",
+            },
+            {
+                "name": "second",
+                "page_url": "https://example.test/second",
+                "late": {"nested": "value"},
+            },
+            {
+                "name": "",
+                "page_url": "https://example.test/third",
+                "score": "not numeric",
+                "late": ["a", "b"],
+            },
+        ],
+    )
+    baseline = read_wdc_table(
+        path,
+        tmp_path,
+        min_rows=1,
+        min_cols=1,
+        max_rows=0,
+    )
+
+    result = expand_selected_shard(
+        [selection_record(path, tmp_path, rows=3, columns=4)],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+    )
+
+    assert read_records(result.source_tables)[0] == baseline.source_table
+    assert read_records(result.entities) == baseline.entities
