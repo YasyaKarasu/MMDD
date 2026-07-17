@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import wdc200k_io as wdc200k_io_module  # noqa: E402
 from wdc200k_io import (  # noqa: E402
     AtomicJsonlShard,
     StageFingerprint,
@@ -56,6 +57,7 @@ def test_job_store_does_not_reclaim_terminal_outcomes(tmp_path: Path) -> None:
         status="terminal",
         result={"error": "timeout"},
         owner="worker-1",
+        lease_id=claimed[0].lease_id,
     )
     assert store.claim("page", limit=1, owner="worker-2") == []
 
@@ -63,11 +65,21 @@ def test_job_store_does_not_reclaim_terminal_outcomes(tmp_path: Path) -> None:
 def test_job_store_does_not_change_success_to_retryable(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
     store.enqueue("page", "url-1", {"url": "https://example.test/a"})
-    store.claim("page", limit=1, owner="worker-1")
-    store.finish("url-1", status="success", owner="worker-1")
+    claimed = store.claim("page", limit=1, owner="worker-1")
+    store.finish(
+        "url-1",
+        status="success",
+        owner="worker-1",
+        lease_id=claimed[0].lease_id,
+    )
 
     with pytest.raises(RuntimeError, match="active lease"):
-        store.finish("url-1", status="retryable", owner="worker-1")
+        store.finish(
+            "url-1",
+            status="retryable",
+            owner="worker-1",
+            lease_id=claimed[0].lease_id,
+        )
 
     assert store.claim("page", limit=1, owner="worker-2") == []
 
@@ -75,11 +87,21 @@ def test_job_store_does_not_change_success_to_retryable(tmp_path: Path) -> None:
 def test_job_store_does_not_change_terminal_to_retryable(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
     store.enqueue("page", "url-1", {"url": "https://example.test/a"})
-    store.claim("page", limit=1, owner="worker-1")
-    store.finish("url-1", status="terminal", owner="worker-1")
+    claimed = store.claim("page", limit=1, owner="worker-1")
+    store.finish(
+        "url-1",
+        status="terminal",
+        owner="worker-1",
+        lease_id=claimed[0].lease_id,
+    )
 
     with pytest.raises(RuntimeError, match="active lease"):
-        store.finish("url-1", status="retryable", owner="worker-1")
+        store.finish(
+            "url-1",
+            status="retryable",
+            owner="worker-1",
+            lease_id=claimed[0].lease_id,
+        )
 
     assert store.claim("page", limit=1, owner="worker-2") == []
 
@@ -87,15 +109,58 @@ def test_job_store_does_not_change_terminal_to_retryable(tmp_path: Path) -> None
 def test_job_store_rejects_a_stale_worker_after_reclaim(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
     store.enqueue("page", "url-1", {"url": "https://example.test/a"})
-    store.claim("page", limit=1, owner="worker-1", lease_seconds=-1.0)
+    original = store.claim(
+        "page",
+        limit=1,
+        owner="worker-1",
+        lease_seconds=-1.0,
+    )
     reclaimed = store.claim("page", limit=1, owner="worker-2")
     assert [job.job_id for job in reclaimed] == ["url-1"]
 
     with pytest.raises(RuntimeError, match="active lease"):
-        store.finish("url-1", status="success", owner="worker-1")
+        store.finish(
+            "url-1",
+            status="success",
+            owner="worker-1",
+            lease_id=original[0].lease_id,
+        )
 
-    store.finish("url-1", status="success", owner="worker-2")
+    store.finish(
+        "url-1",
+        status="success",
+        owner="worker-2",
+        lease_id=reclaimed[0].lease_id,
+    )
     assert store.claim("page", limit=1, owner="worker-3") == []
+
+
+def test_job_store_fences_same_owner_lease_generations(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    store.enqueue("page", "url-1", {"url": "https://example.test/a"})
+    original = store.claim(
+        "page",
+        limit=1,
+        owner="worker-1",
+        lease_seconds=-1.0,
+    )[0]
+    reclaimed = store.claim("page", limit=1, owner="worker-1")[0]
+
+    assert original.lease_id != reclaimed.lease_id
+    with pytest.raises(RuntimeError, match="active lease"):
+        store.finish(
+            "url-1",
+            status="success",
+            owner="worker-1",
+            lease_id=original.lease_id,
+        )
+
+    store.finish(
+        "url-1",
+        status="success",
+        owner="worker-1",
+        lease_id=reclaimed.lease_id,
+    )
 
 
 def test_completed_shard_validation_detects_content_changes(tmp_path: Path) -> None:
@@ -206,15 +271,13 @@ def test_job_store_reclaims_expired_and_retryable_jobs(tmp_path: Path) -> None:
     store.enqueue("expiring-page", "expired", {"attempt": 1})
     store.enqueue("page", "retry", {"attempt": 1})
 
-    assert [
-        job.job_id
-        for job in store.claim(
-            "expiring-page",
-            limit=1,
-            owner="worker-1",
-            lease_seconds=-1.0,
-        )
-    ] == ["expired"]
+    original = store.claim(
+        "expiring-page",
+        limit=1,
+        owner="worker-1",
+        lease_seconds=-1.0,
+    )
+    assert [job.job_id for job in original] == ["expired"]
     retry_job = store.claim("expiring-page", limit=1, owner="worker-1")[0]
     assert retry_job.job_id == "expired"
     store.finish(
@@ -222,6 +285,7 @@ def test_job_store_reclaims_expired_and_retryable_jobs(tmp_path: Path) -> None:
         status="success",
         result={"ok": True},
         owner="worker-1",
+        lease_id=retry_job.lease_id,
     )
     claimed_retry = store.claim("page", limit=1, owner="worker-1")
     assert [job.job_id for job in claimed_retry] == ["retry"]
@@ -230,6 +294,7 @@ def test_job_store_reclaims_expired_and_retryable_jobs(tmp_path: Path) -> None:
         status="retryable",
         result={"error": "busy"},
         owner="worker-1",
+        lease_id=claimed_retry[0].lease_id,
     )
 
     assert [
@@ -241,12 +306,13 @@ def test_job_store_reclaims_expired_and_retryable_jobs(tmp_path: Path) -> None:
 def test_enqueue_does_not_reset_a_successful_job(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
     store.enqueue("page", "url-1", {"version": 1})
-    store.claim("page", limit=1, owner="worker-1")
+    claimed = store.claim("page", limit=1, owner="worker-1")
     store.finish(
         "url-1",
         status="success",
         result={"ok": True},
         owner="worker-1",
+        lease_id=claimed[0].lease_id,
     )
 
     store.enqueue("page", "url-1", {"version": 2})
@@ -388,3 +454,47 @@ def test_external_unique_jsonl_bounds_open_runs_by_merge_fan_in(
     ]
     assert maximum_run_handles <= 3
     assert active_run_handles == 0
+
+
+def test_external_unique_jsonl_bounds_pending_run_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        "".join(
+            json.dumps({"id": f"id-{index:03d}"}) + "\n"
+            for index in range(243)
+        ),
+        encoding="utf-8",
+    )
+    maximum_pending_paths = 0
+    original_add = wdc200k_io_module._RunAccumulator.add
+
+    def tracked_add(
+        accumulator: Any,
+        run_path: Path,
+    ) -> None:
+        nonlocal maximum_pending_paths
+        original_add(accumulator, run_path)
+        maximum_pending_paths = max(
+            maximum_pending_paths,
+            accumulator.pending_path_count,
+        )
+
+    monkeypatch.setattr(
+        wdc200k_io_module._RunAccumulator,
+        "add",
+        tracked_add,
+    )
+
+    completed = external_unique_jsonl(
+        [input_path],
+        tmp_path / "unique.jsonl",
+        key_fn=lambda record: record["id"],
+        chunk_records=1,
+        merge_fan_in=3,
+    )
+
+    assert completed.records == 243
+    assert maximum_pending_paths <= 12

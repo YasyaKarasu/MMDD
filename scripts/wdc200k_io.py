@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,6 +245,7 @@ class Job:
     result: dict[str, Any] | None
     owner: str | None
     lease_expires: float | None
+    lease_id: str | None
 
 
 class SqliteJobStore:
@@ -265,10 +267,17 @@ class SqliteJobStore:
                     result_json TEXT,
                     owner TEXT,
                     lease_expires REAL,
+                    lease_id TEXT,
                     updated_at REAL NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            if "lease_id" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN lease_id TEXT")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS jobs_kind_status
@@ -329,15 +338,16 @@ class SqliteJobStore:
             job_ids = [str(row["job_id"]) for row in rows]
             if job_ids:
                 placeholders = ",".join("?" for _ in job_ids)
-                connection.execute(
-                    f"""
+                for job_id in job_ids:
+                    connection.execute(
+                        """
                     UPDATE jobs
                     SET status = 'leased', owner = ?, lease_expires = ?,
-                        updated_at = ?
-                    WHERE job_id IN ({placeholders})
+                        lease_id = ?, updated_at = ?
+                    WHERE job_id = ?
                     """,
-                    (owner, lease_expires, now, *job_ids),
-                )
+                        (owner, lease_expires, uuid.uuid4().hex, now, job_id),
+                    )
                 claimed = connection.execute(
                     f"""
                     SELECT *
@@ -363,11 +373,14 @@ class SqliteJobStore:
         status: str,
         result: dict[str, Any] | None = None,
         owner: str | None = None,
+        lease_id: str | None = None,
     ) -> None:
         if status not in {"success", "terminal", "retryable"}:
             raise ValueError(f"invalid finish status: {status}")
         if not owner:
             raise ValueError("owner is required to finish a leased job")
+        if not lease_id:
+            raise ValueError("lease_id is required to finish a leased job")
         now = time.time()
         connection = self._connect()
         try:
@@ -375,10 +388,11 @@ class SqliteJobStore:
                 """
                 UPDATE jobs
                 SET status = ?, result_json = ?, owner = NULL,
-                    lease_expires = NULL, updated_at = ?
+                    lease_expires = NULL, lease_id = NULL, updated_at = ?
                 WHERE job_id = ?
                   AND status = 'leased'
                   AND owner = ?
+                  AND lease_id = ?
                   AND lease_expires > ?
                 """,
                 (
@@ -387,6 +401,7 @@ class SqliteJobStore:
                     now,
                     job_id,
                     owner,
+                    lease_id,
                     now,
                 ),
             )
@@ -415,6 +430,9 @@ class SqliteJobStore:
                 None
                 if row["lease_expires"] is None
                 else float(row["lease_expires"])
+            ),
+            lease_id=(
+                None if row["lease_id"] is None else str(row["lease_id"])
             ),
         )
 
@@ -467,6 +485,50 @@ def _merge_run_group(run_paths: list[Path], output_path: Path) -> None:
             write_jsonl_record(handle, [key, ordinal, record])
 
 
+class _RunAccumulator:
+    """Incrementally compact sorted runs with bounded per-level metadata."""
+
+    def __init__(self, temporary_dir: Path, merge_fan_in: int) -> None:
+        self.temporary_dir = temporary_dir
+        self.merge_fan_in = merge_fan_in
+        self._levels: list[list[Path]] = []
+        self._merge_index = 0
+
+    @property
+    def pending_path_count(self) -> int:
+        return sum(len(level) for level in self._levels)
+
+    def add(self, run_path: Path) -> None:
+        self._add_at_level(run_path, level_index=0)
+
+    def pending_paths(self) -> list[Path]:
+        return [
+            run_path
+            for level in self._levels
+            for run_path in level
+        ]
+
+    def _add_at_level(self, run_path: Path, level_index: int) -> None:
+        while len(self._levels) <= level_index:
+            self._levels.append([])
+        level = self._levels[level_index]
+        level.append(run_path)
+        if len(level) < self.merge_fan_in:
+            return
+
+        group = list(level)
+        level.clear()
+        merged_path = (
+            self.temporary_dir
+            / f"merge-online-{self._merge_index:08d}.jsonl"
+        )
+        self._merge_index += 1
+        _merge_run_group(group, merged_path)
+        for grouped_path in group:
+            grouped_path.unlink()
+        self._add_at_level(merged_path, level_index + 1)
+
+
 def _reduce_sorted_runs(
     run_paths: list[Path],
     temporary_dir: Path,
@@ -510,23 +572,25 @@ def external_unique_jsonl(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="wdc200k-unique-") as temporary:
         temporary_dir = Path(temporary)
-        run_paths: list[Path] = []
+        run_accumulator = _RunAccumulator(temporary_dir, merge_fan_in)
+        run_index = 0
         chunk: list[tuple[str, int, dict[str, Any]]] = []
         ordinal = 0
         for record in iter_jsonl_records(input_paths):
             chunk.append((_external_key(key_fn(record)), ordinal, record))
             ordinal += 1
             if len(chunk) >= chunk_records:
-                run_path = temporary_dir / f"run-{len(run_paths):08d}.jsonl"
+                run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
+                run_index += 1
                 _write_sorted_run(chunk, run_path)
-                run_paths.append(run_path)
+                run_accumulator.add(run_path)
                 chunk = []
         if chunk:
-            run_path = temporary_dir / f"run-{len(run_paths):08d}.jsonl"
+            run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
             _write_sorted_run(chunk, run_path)
-            run_paths.append(run_path)
+            run_accumulator.add(run_path)
         run_paths = _reduce_sorted_runs(
-            run_paths,
+            run_accumulator.pending_paths(),
             temporary_dir,
             merge_fan_in,
         )
