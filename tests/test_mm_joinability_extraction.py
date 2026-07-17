@@ -38,6 +38,8 @@ from run_mm_joinability_dynamic_vllm import (
     main as dynamic_vllm_main,
     parse_args as parse_dynamic_vllm_args,
     start_server,
+    wait_for_any_marker_or_builder_exit,
+    wait_for_marker_or_builder_exit,
 )
 
 
@@ -793,7 +795,27 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     assert args.model_start_timeout_seconds is None
 
 
-def test_start_server_discards_vllm_output_by_default(monkeypatch):
+def test_dynamic_vllm_accepts_staged_run_fingerprint():
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--run_fingerprint",
+            "wdc-run-v1",
+        ]
+    )
+
+    assert args.run_fingerprint == "wdc-run-v1"
+    assert "--run_fingerprint" not in passthrough
+
+
+def test_start_server_passes_vllm_output_through_to_tmux(monkeypatch):
     captured = {}
 
     class FakePopen:
@@ -817,10 +839,110 @@ def test_start_server_discards_vllm_output_by_default(monkeypatch):
     start_server(spec)
 
     assert captured["command"] == spec.command()
-    assert captured["stdout"] == subprocess.DEVNULL
-    assert captured["stderr"] == subprocess.DEVNULL
+    assert captured["stdout"] is None
+    assert captured["stderr"] is None
     assert captured["text"] is True
     assert captured["start_new_session"] is True
+
+
+def test_dynamic_marker_wait_ignores_stale_run_fingerprint(tmp_path):
+    marker = tmp_path / "start.json"
+    marker.write_text(
+        '{"run_fingerprint":"stale","text_task_count":1,"image_task_count":1}',
+        encoding="utf-8",
+    )
+
+    class RunningBuilder:
+        @staticmethod
+        def poll():
+            return None
+
+    def publish_current():
+        threading.Event().wait(0.05)
+        marker.write_text(
+            '{"run_fingerprint":"current","text_task_count":1,"image_task_count":1}',
+            encoding="utf-8",
+        )
+
+    publisher = threading.Thread(target=publish_current)
+    publisher.start()
+    wait_for_marker_or_builder_exit(
+        marker=marker,
+        builder=RunningBuilder(),
+        timeout_seconds=1,
+        poll_seconds=0.01,
+        expected_run_fingerprint="current",
+    )
+    publisher.join(timeout=1)
+
+    assert not publisher.is_alive()
+
+
+def test_dynamic_done_wait_ignores_stale_marker(tmp_path):
+    marker = tmp_path / "text-done.json"
+    marker.write_text(
+        '{"run_fingerprint":"stale","model_kind":"text"}',
+        encoding="utf-8",
+    )
+
+    class RunningBuilder:
+        @staticmethod
+        def poll():
+            return None
+
+    def publish_current():
+        threading.Event().wait(0.05)
+        marker.write_text(
+            '{"run_fingerprint":"current","model_kind":"text"}',
+            encoding="utf-8",
+        )
+
+    publisher = threading.Thread(target=publish_current)
+    publisher.start()
+    completed = wait_for_any_marker_or_builder_exit(
+        markers={"text": marker},
+        builder=RunningBuilder(),
+        timeout_seconds=1,
+        poll_seconds=0.01,
+        expected_run_fingerprint="current",
+    )
+    publisher.join(timeout=1)
+
+    assert completed == {"text"}
+
+
+def test_dynamic_done_wait_ignores_stale_jobset_fingerprint(tmp_path):
+    marker = tmp_path / "image-done.json"
+    marker.write_text(
+        '{"run_fingerprint":"current","jobset_fingerprint":"old","model_kind":"image"}',
+        encoding="utf-8",
+    )
+
+    class RunningBuilder:
+        @staticmethod
+        def poll():
+            return None
+
+    def publish_current():
+        threading.Event().wait(0.05)
+        marker.write_text(
+            '{"run_fingerprint":"current","jobset_fingerprint":"image-v2","model_kind":"image"}',
+            encoding="utf-8",
+        )
+
+    publisher = threading.Thread(target=publish_current)
+    publisher.start()
+    completed = wait_for_any_marker_or_builder_exit(
+        markers={"image": marker},
+        builder=RunningBuilder(),
+        timeout_seconds=1,
+        poll_seconds=0.01,
+        expected_run_fingerprint="current",
+        expected_jobset_fingerprints={"image": "image-v2"},
+    )
+    publisher.join(timeout=1)
+
+    assert completed == {"image"}
 
 
 def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypatch, tmp_path):
@@ -916,6 +1038,81 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
 
     assert code == 0
     assert events == ["builder_started"]
+
+
+def test_dynamic_vllm_signal_path_stops_builder_and_all_started_models(
+    monkeypatch,
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    started = []
+    stopped = []
+
+    class FakePopen:
+        def __init__(self, command, **_kwargs):
+            self.command = command
+            self.pid = 12345 + len(started)
+            self._poll = None
+            self.role = (
+                "builder"
+                if command[0] == "/usr/bin/python"
+                else command[command.index("--served-model-name") + 1]
+            )
+            started.append(self)
+            if self.role == "builder":
+                marker = Path(
+                    command[command.index("--model_start_marker") + 1]
+                )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    '{"text_task_count":1,"image_task_count":1}',
+                    encoding="utf-8",
+                )
+
+        def poll(self):
+            return self._poll
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_server",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_any_marker_or_builder_exit",
+        lambda **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        runner,
+        "stop_process",
+        lambda proc, **_kwargs: (
+            stopped.append(proc.role) if proc is not None else None
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        dynamic_vllm_main(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/vl",
+                "--python_executable",
+                "/usr/bin/python",
+            ]
+        )
+
+    assert set(stopped) == {
+        "builder",
+        "Qwen3.5-9B",
+        "Qwen3-VL-8B-Thinking",
+    }
 
 
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):

@@ -147,8 +147,8 @@ def start_server(spec: VllmServerSpec) -> subprocess.Popen[str]:
         env=process_env(spec.gpu),
         text=True,
         start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=None,
+        stderr=None,
     )
 
 
@@ -198,10 +198,26 @@ def write_endpoint_file(path: Path, urls: Iterable[str]) -> None:
     path.write_text("\n".join(deduped) + "\n", encoding="utf-8")
 
 
-def write_ready_marker(path: Path) -> None:
+def write_ready_marker(
+    path: Path,
+    *,
+    run_fingerprint: str = "",
+    text_jobset_fingerprint: str = "",
+    image_jobset_fingerprint: str = "",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": "vllm_servers_ready",
+        "timestamp": time.time(),
+    }
+    if run_fingerprint:
+        payload["run_fingerprint"] = run_fingerprint
+    if text_jobset_fingerprint:
+        payload["text_jobset_fingerprint"] = text_jobset_fingerprint
+    if image_jobset_fingerprint:
+        payload["image_jobset_fingerprint"] = image_jobset_fingerprint
     path.write_text(
-        json.dumps({"status": "vllm_servers_ready", "timestamp": time.time()}, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -222,15 +238,50 @@ def read_pending_model_task_count(path: Path) -> int | None:
         return None
 
 
+def marker_matches_run(
+    path: Path,
+    expected_run_fingerprint: str | None,
+    expected_jobset_fingerprint: str | None = None,
+) -> bool:
+    if not path.exists():
+        return False
+    if not expected_run_fingerprint and not expected_jobset_fingerprint:
+        return True
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if (
+        expected_run_fingerprint
+        and payload.get("run_fingerprint") != expected_run_fingerprint
+    ):
+        return False
+    return not expected_jobset_fingerprint or (
+        payload.get("jobset_fingerprint")
+        == expected_jobset_fingerprint
+    )
+
+
+def read_marker_payload(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def wait_for_marker_or_builder_exit(
     *,
     marker: Path,
     builder: subprocess.Popen[str],
     timeout_seconds: float | None,
     poll_seconds: float = 2.0,
+    expected_run_fingerprint: str | None = None,
 ) -> None:
     started = time.time()
-    while not marker.exists():
+    while not marker_matches_run(marker, expected_run_fingerprint):
         code = builder.poll()
         if code is not None:
             raise RuntimeError(f"Builder exited with code {code} before marker was written: {marker}")
@@ -245,10 +296,20 @@ def wait_for_any_marker_or_builder_exit(
     builder: subprocess.Popen[str],
     timeout_seconds: float | None,
     poll_seconds: float = 2.0,
+    expected_run_fingerprint: str | None = None,
+    expected_jobset_fingerprints: dict[str, str] | None = None,
 ) -> set[str]:
     started = time.time()
     while True:
-        completed = {kind for kind, marker in markers.items() if marker.exists()}
+        completed = {
+            kind
+            for kind, marker in markers.items()
+            if marker_matches_run(
+                marker,
+                expected_run_fingerprint,
+                (expected_jobset_fingerprints or {}).get(kind),
+            )
+        }
         if completed:
             return completed
         code = builder.poll()
@@ -296,6 +357,8 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--vllm_bin", default="vllm")
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
+    parser.add_argument("--run_fingerprint", default="", help="Optional staged-run identity used to fence stale model markers.")
+    parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Defaults to OUTPUT_DIR/_dynamic_vllm for compatibility.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
@@ -317,7 +380,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 def main(argv: list[str] | None = None) -> int:
     args, passthrough_args = parse_args(argv)
     output_dir = Path(args.output_dir)
-    runtime_dir = output_dir / "_dynamic_vllm"
+    runtime_dir = (
+        Path(args.runtime_dir)
+        if args.runtime_dir
+        else output_dir / "_dynamic_vllm"
+    )
     text_endpoints_file = runtime_dir / "text_endpoints.txt"
     image_endpoints_file = runtime_dir / "image_endpoints.txt"
     model_start_marker = runtime_dir / "model_start.json"
@@ -384,6 +451,13 @@ def main(argv: list[str] | None = None) -> int:
         write_endpoint_file(image_endpoints_file, [primary_image_server.base_url])
 
         builder_passthrough_args = with_default_model_workers(passthrough_args, args.dynamic_model_workers)
+        if args.run_fingerprint and not passthrough_has_arg(
+            builder_passthrough_args,
+            "--run_fingerprint",
+        ):
+            builder_passthrough_args.extend(
+                ["--run_fingerprint", args.run_fingerprint]
+            )
         builder_command = build_builder_command(
             python_executable=args.python_executable,
             builder_script=Path(args.builder_script),
@@ -404,7 +478,33 @@ def main(argv: list[str] | None = None) -> int:
             marker=model_start_marker,
             builder=builder_proc,
             timeout_seconds=args.model_start_timeout_seconds,
+            expected_run_fingerprint=args.run_fingerprint or None,
         )
+        start_payload = read_marker_payload(model_start_marker)
+        expected_jobsets = {
+            kind: fingerprint
+            for kind, fingerprint in (
+                (
+                    "text",
+                    str(
+                        start_payload.get(
+                            "text_jobset_fingerprint"
+                        )
+                        or ""
+                    ),
+                ),
+                (
+                    "image",
+                    str(
+                        start_payload.get(
+                            "image_jobset_fingerprint"
+                        )
+                        or ""
+                    ),
+                ),
+            )
+            if fingerprint
+        }
 
         if read_pending_model_task_count(model_start_marker) == 0:
             return int(builder_proc.wait())
@@ -413,21 +513,36 @@ def main(argv: list[str] | None = None) -> int:
         primary_image_proc = start_server(primary_image_server)
         wait_for_server(text_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
         wait_for_server(primary_image_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
-        write_ready_marker(model_ready_marker)
+        write_ready_marker(
+            model_ready_marker,
+            run_fingerprint=args.run_fingerprint,
+            text_jobset_fingerprint=expected_jobsets.get("text", ""),
+            image_jobset_fingerprint=expected_jobsets.get("image", ""),
+        )
 
         completed = wait_for_any_marker_or_builder_exit(
             markers={"text": text_done_marker, "image": image_done_marker},
             builder=builder_proc,
             timeout_seconds=first_done_timeout,
+            expected_run_fingerprint=args.run_fingerprint or None,
+            expected_jobset_fingerprints=expected_jobsets,
         )
 
-        if completed == {"text"} and not image_done_marker.exists():
+        if completed == {"text"} and not marker_matches_run(
+            image_done_marker,
+            args.run_fingerprint or None,
+            expected_jobsets.get("image"),
+        ):
             stop_process(text_proc)
             text_proc = None
             secondary_image_proc = start_server(secondary_image_server)
             wait_for_server(secondary_image_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
             write_endpoint_file(image_endpoints_file, [primary_image_server.base_url, secondary_image_server.base_url])
-        elif completed == {"image"} and not text_done_marker.exists():
+        elif completed == {"image"} and not marker_matches_run(
+            text_done_marker,
+            args.run_fingerprint or None,
+            expected_jobsets.get("text"),
+        ):
             stop_process(primary_image_proc)
             primary_image_proc = None
             secondary_text_proc = start_server(secondary_text_server)
