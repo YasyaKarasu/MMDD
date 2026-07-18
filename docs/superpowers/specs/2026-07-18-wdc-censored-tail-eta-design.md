@@ -24,40 +24,85 @@ therefore rejected: either is gate-specific and can degrade images.
 ## Callback contract
 
 The fetchers replace the `(completed, total)` callback payload with an
-immutable `UrlProgressSnapshot`. One snapshot contains:
+immutable `UrlProgressSnapshot`. The reporter owns the logical-clock
+`timestamp` and derives it from the epoch's reporter baseline plus the
+snapshot's monotonic elapsed time; the fetcher does not manufacture a wall or
+logical timestamp. One snapshot contains:
 
-- `timestamp`: reporter logical-clock seconds;
 - `completed_durable`, `total`;
-- `pending_not_started`, `in_flight`, `finished_not_durable`;
+- `local_buffered_not_started`, `in_flight_jobs`,
+  `finished_not_durable`;
+- `physical_in_flight`, a diagnostic subset of `in_flight_jobs` used by the
+  censor histogram and not added separately to the topology equality;
+- `unobserved_nonlocal`, the residual jobs that are pending, unclaimed, or
+  leased by another execution;
 - `deadline_seconds`, `effective_concurrency`;
-- `transport_events[64]`: completed physical-transport durations;
-- `active_censors[64]`: current ages of active transports;
-- `commit_events[32]`: finish-to-durable-callback durations;
+- `execution_epoch`, `baseline_completed`, and `epoch_elapsed_seconds`;
+- `transport_event_histogram[64]`: completed physical-transport durations;
+- `active_censor_histogram[64]`: current ages of local active transports;
+- `commit_event_histogram[32]`: finish-to-durable-callback durations;
 - `transport_overflow_events`, `active_overflow_censors`, and
   `commit_overflow_events`.
 
-All counts are non-negative integers. The following equality is mandatory at
-every callback:
+All counts are integers in `[0, 2**64-1]`. The following equality is mandatory
+at every callback:
 
 ```text
-completed_durable + pending_not_started + in_flight
-    + finished_not_durable == total
+completed_durable + local_buffered_not_started + in_flight_jobs
+    + finished_not_durable + unobserved_nonlocal == total
 ```
 
-Suppressed durable replays are already durable and belong only in
-`completed_durable`. A physical attempt becomes `in_flight` after its durable
-start fence, moves to `finished_not_durable` after its finish fence, and moves
-to `completed_durable` after outcome and job completion commit. Exceptions use
-the same transitions.
+`physical_in_flight <= in_flight_jobs`, and the active-censor histogram sums
+exactly to `physical_in_flight`. Overflow counters cannot exceed their
+corresponding histogram totals.
 
-The scheduler maintains these aggregates in memory under its existing state
-lock. The callback must not scan SQLite. Resume initializes the aggregates
-from one bounded grouped query per store before scheduling begins.
+`completed_durable` means both the outcome and current job completion are
+durable. A scheduled worker job belongs to `in_flight_jobs` whether it makes a
+physical request, waits for another image URL claimant, or finds a final-check
+cache/suppressed outcome. A real physical attempt also increments
+`physical_in_flight` after its durable start fence and leaves it after its
+finish fence. When any worker future returns, its job moves from
+`in_flight_jobs` to `finished_not_durable`; only the serial outcome/job commit
+moves it to `completed_durable`. A cache hit reconciled synchronously during
+claiming commits the current job before the next snapshot and moves directly
+from local buffered state to completed. Thus no-transport paths obey the same
+job topology without fabricating a latency event.
+
+The scheduler maintains local aggregates in a thread-safe, bounded tracker.
+Immediately before each bounded callback (at most 256 per stage), it performs
+one indexed, read-only aggregate refresh of exact durable job/outcome counts;
+this occurs outside the callback and returns only scalar counts. It then
+obtains `unobserved_nonlocal` by subtraction, so completions made by another
+live execution are visible and concurrent leases cannot break the topology
+equality. Small start/finish hooks sit immediately
+inside the existing durable physical-attempt fence and use `time.monotonic()`
+for ages and durations. The callback never scans SQLite and never retains a
+URL. A batch returned by `wait(FIRST_COMPLETED)` enters
+`finished_not_durable` before its serial outcome/job commits, then leaves that
+state one result at a time.
+
+At the start of an epoch, the tracker records `epoch_started_monotonic`; every
+snapshot captures topology, histograms, and `captured_monotonic` under the same
+tracker lock and carries
+`epoch_elapsed_seconds = captured_monotonic - epoch_started_monotonic`.
+The reporter assigns the epoch's first logical timestamp as
+`baseline_timestamp`, then maps every sample in that epoch to
+`baseline_timestamp + epoch_elapsed_seconds`. This binds the histogram capture
+instant to the logical timeline without mixing wall and monotonic clocks.
+
+Each process execution has a new `execution_epoch`. On resume, the indexed
+durable refresh establishes `baseline_completed`; current transport, active,
+and commit histograms start empty because a dead prior process has no live
+transport. Previously published samples remain immutable under their prior
+epoch. Work held by another live execution remains in
+`unobserved_nonlocal`. This avoids treating stale unfinished-attempt rows as
+active work or loading per-attempt history.
 
 ## Fixed histograms
 
 Transport horizon `H` equals the configured request deadline. Transport bin
-edges are linear and closed on the right:
+edges are linear and left-closed/right-open, except that the last bin also
+contains the capped horizon:
 
 ```text
 T[j] = j * H / 64, j = 0..64
@@ -68,6 +113,9 @@ Durations and active ages `>= H` increment the corresponding overflow counter
 and bin 63. Overflow values are not assigned a fabricated duration beyond the
 policy deadline.
 
+Exact-edge tests require `T[j]` for `0 <= j < 64` to enter bin `j`, and `H`
+to enter bin 63 with overflow set.
+
 Commit horizon `C` is `min(2.0, H)` seconds, with 32 linear bins
 `C[j] = j*C/32`. Commit durations `>= C` increment `commit_overflow_events`
 and bin 31. These constants are schema fields and may change only with a new
@@ -75,8 +123,9 @@ telemetry schema version.
 
 ## Deterministic Kaplan-Meier estimate
 
-For transport bin `j`, let `d[j]` be completed transport events and `c[j]` be
-active right-censors. Compute the risk set from high to low:
+For transport bin `j`, let `d[j]` be completed transport events in the current
+execution epoch and `c[j]` be its currently active right-censors. Compute the
+risk set from high to low:
 
 ```text
 n[j] = sum(d[k] + c[k] for k in j..63)
@@ -97,13 +146,23 @@ Clamp `R(a)` to `[0, H-T[a]]`. Active overflow censors have `R=0`; their
 uncertain beyond-deadline residual is handled by the fallback below rather
 than inventing an uncapped tail.
 
-The in-flight component is the expected drain of the current active cohort:
+Raw RMST for a newly started final request overpredicted the recorded image
+tail by more than 30 times. Censor correction therefore activates only after
+the oldest local active request has survived one third of the configured
+deadline. This maturity fraction is a schema constant, applies identically to
+pages and images, and changes only with a telemetry schema version. Let
+`a_oldest` be the oldest occupied active bin:
 
 ```text
-inflight_eta = max(R(j) for every occupied active-censor bin j)
+if H/3 <= T[a_oldest] < H:
+    inflight_eta = R(a_oldest)
+else:
+    inflight_eta = unavailable
 ```
 
-Using occupied bins, not individual attempts, keeps the operation bounded.
+Using the oldest occupied bin, not individual attempts, corrects a mature
+right-censored drain without allowing a young request's unconditional RMST to
+override an already accurate observed completion rate.
 
 ## Queue and commit drain
 
@@ -111,16 +170,24 @@ The existing durable completion rate remains:
 
 ```text
 durable_rate = (completed_durable - baseline_completed)
-               / (timestamp - baseline_timestamp)
+               / epoch_elapsed_seconds
 ```
 
 When the denominator or numerator is zero, the rate is unavailable.
+`baseline_timestamp` remains the persisted logical-time authority for sample
+ordering and completion-factor evaluation; monotonic epoch elapsed time is the
+rate denominator.
 
-Queue drain is:
+The queue diagnostic is:
 
 ```text
-queue_eta = pending_not_started / durable_rate
+queue_eta = (local_buffered_not_started + unobserved_nonlocal)
+            / durable_rate
 ```
+
+It is persisted for observability. It is not added to `inflight_eta` because
+`rate_eta` below already covers every non-durable job; adding both double-
+counts the queued portion.
 
 Commit latency uses the deterministic midpoint mean of the 32-bin completed
 commit histogram, capped at `C`. For bin `j`, its representative duration is
@@ -128,16 +195,18 @@ commit histogram, capped at `C`. For bin `j`, its representative duration is
 representatives. With no commit events it falls back to `C/32`.
 
 ```text
-commit_mean = histogram_RMST(commit_events, horizon=C)
+commit_mean = histogram_midpoint_mean(commit_event_histogram, horizon=C)
 commit_eta = finished_not_durable * commit_mean
-             / max(1, effective_concurrency)
 ```
+
+Durable commits happen serially in the scheduler thread, so this component is
+not divided by transport concurrency.
 
 The prediction is:
 
 ```text
 rate_eta = (total - completed_durable) / durable_rate
-eta = max(rate_eta, queue_eta + inflight_eta, commit_eta)
+eta = max(rate_eta, inflight_eta, commit_eta, overflow_eta)
 ```
 
 Unavailable components are omitted, not replaced with infinity.
@@ -147,12 +216,13 @@ Unavailable components are omitted, not replaced with infinity.
 Fallback order is deterministic:
 
 1. If no durable rate and no completed transport events exist, ETA is null.
-2. If the KM risk set is empty but active requests exist, use
-   `inflight_eta = max(0, H - oldest_active_age_capped_to_H)`.
-3. If any active overflow censor exists, add one commit horizon to the current
-   `rate_eta`: `overflow_eta = rate_eta + C`; include it in the final maximum.
-   This covers the observed beyond-deadline final-request/commit window while
-   remaining bounded.
+2. If the KM risk set is empty, or the oldest active request is younger than
+   `H/3`, `inflight_eta` is unavailable and `rate_eta` remains authoritative.
+3. If any active overflow censor exists and durable rate is available, use a
+   two-completion continuity correction: `overflow_eta = 2 / durable_rate`.
+   It represents two observed durable inter-arrival intervals and does not
+   invent an uncapped request duration. Without a durable rate, overflow ETA
+   is unavailable.
 4. When `completed_durable == total`, emit the normal zero-remaining sample and
    complete the stage exactly as today.
 
@@ -161,18 +231,35 @@ recomputes the same summary and tampering fails closed.
 
 ## Progress schema and bounds
 
-Each sample adds only scalar topology fields, the chosen ETA components,
-overflow counters, and the final prediction. Histogram arrays belong to the
-reporter's current-stage accumulator and are not copied into every sample.
-Completed-stage telemetry persists one final 64-bin transport histogram and
-one 32-bin commit histogram. With two URL stages and at most 256 samples per
-stage, `progress.json` remains below its existing 4 MiB limit.
+Each sample contains scalar topology fields, the chosen ETA components,
+overflow counters, the final prediction, and fixed 64-bin transport/current-
+censor plus 32-bin commit histograms. For JSON persistence, the 160 counters
+are concatenated in that order as unsigned little-endian `uint64` and base64
+encoded in one `histogram_blob`; values outside `[0, 2**64-1]` fail closed.
+The decoder requires exactly 1,280 bytes. This preserves exact counters while
+avoiding pretty-printed per-element overhead. A serializer test constructs
+both stages at 256 samples with every counter and scalar at its maximum width;
+the resulting actual schema must be below 3 MiB, leaving at least 1 MiB below
+the existing 4 MiB restore limit.
 
 Snapshots must be monotonic in timestamp and durable completion. `total` and
-the deadline cannot change within a stage. Histogram counts cannot decrease
-except `active_censors`, which is a current-state histogram. Resume restores
-completed-event histograms and reconstructs the current active histogram from
-durable unfinished attempt rows.
+the deadline cannot change within a stage. Within one `execution_epoch`, event
+histograms cannot decrease; `active_censor_histogram` is current state and may
+change. Resume validates prior epochs, then starts a new epoch with empty
+histograms and a fresh durable baseline.
+
+Epoch authority is append-only and fail-closed:
+
+- an epoch identifier is non-empty, unique within the stage, and occupies one
+  contiguous sample range; a later sample cannot return to an older epoch;
+- the first sample has `epoch_elapsed_seconds=0`, empty histograms,
+  `completed_durable=baseline_completed`, and `baseline_completed` equal to
+  the exact indexed durable refresh used to start that epoch;
+- `baseline_timestamp` is finite, not earlier than the prior sample, and is
+  identical on every sample of the epoch;
+- elapsed time and durable completion are monotonic inside the epoch;
+- a new epoch's baseline completion is at least the prior sample's completion,
+  while the stage total/deadline/rate basis remain identical.
 
 ## Validation and compatibility
 
@@ -180,13 +267,24 @@ durable unfinished attempt rows.
 - Additive fields receive a new `wdc200k-url-telemetry-v2` schema version.
 - A v1 completed stage remains readable and retains its recorded ETA; it is
   not retroactively re-estimated.
-- A resumed incomplete v1 URL stage upgrades only after reconstructing v2
-  scheduler state from durable jobs and attempts.
+- A resumed incomplete v1 URL stage starts a v2 execution epoch from its exact
+  durable completion baseline; it does not reinterpret historical v1 samples.
 - Dry-run and structural-only runs create no transport telemetry.
-- All grouped initialization queries are read-only and disk bounded; all new
-  persistence uses the existing atomic, guarded progress write.
+- All new persistence uses the existing atomic, guarded progress write; no
+  estimator callback performs a database query.
 
 ## Tests
+
+### Approved formula replay
+
+Read-only prefix replay was performed during design against the recorded
+gate-100 page and image attempt/durable timestamps. The rejected raw design
+produced factors `9.156` for pages and `33.507` for images. Applying the
+one-third maturity rule, oldest-bin RMST, no queue double-counting, and the
+two-interval overflow correction produced `1.8978047370910645` for pages and
+left images at `1.8537476708755196`. These are design evidence only; the first
+implementation step must encode the same aggregate event streams as RED
+regression fixtures before production code changes.
 
 Unit tests use a fake logical clock and deterministic snapshots:
 
@@ -194,17 +292,27 @@ Unit tests use a fake logical clock and deterministic snapshots:
 2. queue-only, in-flight-only, commit-only, and mixed drain equations;
 3. topology equality, monotonicity, finite-number, bin-length, and deadline
    validation failures;
-4. at most 64/32 histogram bins and 256 samples regardless of URL count;
-5. resume reconstructs identical aggregates and does not replay attempts;
-6. v1 completed telemetry remains readable; incomplete v1 upgrades to v2;
-7. disk-guard failure leaves the prior atomic progress snapshot intact;
-8. dry-run/structural runs create no v2 telemetry.
+4. exact-edge binning, `uint64` blob length/range/tamper validation, at most
+   256 samples regardless of URL count, and the worst-width file below 3 MiB;
+5. resume preserves prior samples, starts an empty-histogram epoch from the
+   durable baseline, and does not replay attempts;
+6. epoch identifiers are unique/contiguous, baselines bind to the durable
+   refresh, and rollback-safe logical timestamps map exact monotonic elapsed;
+7. cache hits, suppressed final checks, and other-claim outcomes follow the
+   no-physical job transitions without violating topology;
+8. a concurrent execution's durable completion is observed by the next
+   indexed refresh without loading rows;
+9. v1 completed telemetry remains readable; incomplete v1 upgrades to v2;
+10. disk-guard failure leaves the prior atomic progress snapshot intact;
+11. dry-run/structural runs create no v2 telemetry.
 
-Regression fixtures replay the exact gate-100 page and image online event
-streams using only each event prefix. Both must retain every eligible
-final-half sample. Required results are:
+Before any production implementation, aggregate regression fixtures are
+created from the exact gate-100 page and image attempt start/finish timestamps
+and durable callback timestamps. They contain no URL or payload. Tests replay
+the online event streams using only each event prefix. Both must retain every
+eligible final-half sample. Required results are:
 
-- page maximum symmetric factor `<= 2.0`;
+- page maximum symmetric factor `1.8978047370910645` (`<= 2.0`);
 - image maximum symmetric factor `<= 1.8537476708755196` (no degradation from
   the accepted observed image gate);
 - predicted values at every sample are reproducible after interruption and
