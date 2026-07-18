@@ -122,6 +122,182 @@ def test_duplicate_page_urls_make_one_physical_request(tmp_path: Path) -> None:
     assert result.unique == 1
     assert result.success == 1
     assert result.terminal == 0
+    assert result.transport_attempt_summary["transport_attempts"] == 1
+    assert (
+        result.transport_attempt_summary["duplicate_physical_requests"] == 0
+    )
+    assert result.transport_attempt_summary["terminal_replays"] == 0
+    assert (
+        result.transport_attempt_summary["unfinished_transport_attempts"] == 0
+    )
+    assert result.transport_attempt_summary["blocked_durable_replays"] == 0
+
+
+def test_page_transport_attempts_survive_resume_without_replay(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/resume"
+    transport = CountingTransport({url: {"text": "hello"}})
+    jobs = SqliteJobStore(tmp_path / "pages.sqlite3")
+    policy = FetchPolicy()
+
+    first = fetch_unique_pages(
+        [page_ref("e1", url)],
+        jobs,
+        transport,
+        policy,
+    )
+    second = fetch_unique_pages(
+        [page_ref("e1", url)],
+        jobs,
+        transport,
+        policy,
+    )
+
+    assert transport.calls == [url]
+    assert second.transport_attempt_summary == first.transport_attempt_summary
+    assert second.transport_attempt_summary["records"] == 1
+    assert len(second.transport_attempt_summary["digest"]) == 64
+
+
+def test_page_transport_summary_is_scoped_to_current_job_store(
+    tmp_path: Path,
+) -> None:
+    first_url = "https://e.test/first"
+    unrelated_url = "https://other.test/unrelated"
+    outcomes_path = tmp_path / "shared-outcomes.sqlite3"
+    policy = FetchPolicy()
+    transport = CountingTransport(
+        {
+            first_url: {"text": "first"},
+            unrelated_url: {"text": "unrelated"},
+        }
+    )
+
+    first = fetch_unique_pages(
+        [page_ref("e1", first_url)],
+        SqliteJobStore(tmp_path / "first-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    fetch_unique_pages(
+        [page_ref("e2", unrelated_url)],
+        SqliteJobStore(tmp_path / "other-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    resumed = fetch_unique_pages(
+        [page_ref("e1", first_url)],
+        SqliteJobStore(tmp_path / "first-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+
+    assert resumed.transport_attempt_summary == (
+        first.transport_attempt_summary
+    )
+    assert resumed.transport_attempt_summary["transport_attempts"] == 1
+
+
+def test_page_transport_attempt_summary_counts_anomalies(
+    tmp_path: Path,
+) -> None:
+    store = PageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    policy = "policy"
+    url = "https://e.test/anomaly"
+    url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    first = store.begin_transport_attempt(
+        execution_id="execution-one",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=url,
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=1.0,
+    )
+    store.finish_transport_attempt(first, final_status="success", now=2.0)
+    store.put(
+        policy,
+        url_key,
+        url,
+        {"status": "terminal", "error_class": "prior_terminal"},
+    )
+    second = store.begin_transport_attempt(
+        execution_id="execution-two",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=url,
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=time.time() + 1.0,
+    )
+    store.finish_transport_attempt(
+        second,
+        final_status="terminal",
+        now=time.time() + 2.0,
+    )
+    store.begin_transport_attempt(
+        execution_id="execution-three",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=url,
+        baseline_outcome_status="terminal",
+        suppressed=True,
+        now=5.0,
+    )
+    store.begin_transport_attempt(
+        execution_id="execution-four",
+        policy_fingerprint=policy,
+        url_key=hashlib.sha256(b"https://e.test/crash").hexdigest(),
+        url="https://e.test/crash",
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=6.0,
+    )
+
+    summary = store.transport_attempt_summary(policy)
+    assert summary["records"] == 4
+    assert summary["transport_attempts"] == 3
+    assert summary["duplicate_physical_requests"] == 1
+    assert summary["terminal_replays"] == 1
+    assert summary["unfinished_transport_attempts"] == 1
+    assert summary["blocked_durable_replays"] == 1
+
+
+def test_page_transport_attempt_start_is_disk_guarded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    PageOutcomeStore(path)
+
+    def reject(_path: Path, estimated_bytes: int = 0) -> None:
+        if estimated_bytes:
+            raise OSError("transport reserve exhausted")
+
+    guarded = PageOutcomeStore(
+        path,
+        write_tracker=fetch_module.GuardedWriteTracker(
+            path,
+            reject,
+            interval_bytes=1,
+        ),
+    )
+    with pytest.raises(OSError, match="transport reserve"):
+        guarded.begin_transport_attempt(
+            execution_id="execution",
+            policy_fingerprint="policy",
+            url_key="a" * 64,
+            url="https://e.test/guard",
+            baseline_outcome_status=None,
+            suppressed=False,
+        )
+    assert PageOutcomeStore(path).transport_attempt_summary("policy")[
+        "records"
+    ] == 0
 
 
 def test_page_outcome_fanout_streams_every_entity_reference(

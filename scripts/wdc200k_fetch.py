@@ -111,10 +111,352 @@ class FetchResult:
     policy_fingerprint: str
     job_store_path: Path
     job_kind: str
+    transport_attempt_summary: dict[str, Any]
 
 
-class PageOutcomeStore:
+class TransportAttemptStoreMixin:
+    """Guarded transport-start ledger shared by page and image stores."""
+
+    _transport_stage: str
+    _transport_outcome_table: str
+    path: Path
+    _write_tracker: GuardedWriteTracker
+
+    @staticmethod
+    def _create_transport_attempt_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transport_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                policy_fingerprint TEXT NOT NULL,
+                url_key TEXT NOT NULL,
+                url TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                finished_at REAL,
+                final_status TEXT,
+                baseline_outcome_status TEXT,
+                suppressed INTEGER NOT NULL
+                    CHECK (suppressed IN (0, 1)),
+                CHECK (
+                    baseline_outcome_status IS NULL
+                    OR baseline_outcome_status IN ('success', 'terminal')
+                ),
+                CHECK (
+                    (finished_at IS NULL AND final_status IS NULL)
+                    OR (finished_at IS NOT NULL AND final_status IS NOT NULL)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS transport_attempts_policy_url
+            ON transport_attempts (
+                stage, policy_fingerprint, url_key, started_at, attempt_id
+            )
+            """
+        )
+
+    def begin_transport_attempt(
+        self,
+        *,
+        execution_id: str,
+        policy_fingerprint: str,
+        url_key: str,
+        url: str,
+        baseline_outcome_status: str | None,
+        suppressed: bool,
+        now: float | None = None,
+    ) -> str:
+        """Commit an immutable transport start before external I/O."""
+        if not execution_id or not policy_fingerprint or not url_key or not url:
+            raise ValueError("transport attempt identity must not be empty")
+        if baseline_outcome_status not in {None, "success", "terminal"}:
+            raise ValueError("invalid transport attempt baseline status")
+        if suppressed and baseline_outcome_status is None:
+            raise ValueError(
+                "suppressed transport attempt requires a durable baseline"
+            )
+        attempt_id = uuid.uuid4().hex
+        started_at = time.time() if now is None else float(now)
+        finished_at = started_at if suppressed else None
+        final_status = "suppressed" if suppressed else None
+        estimated_bytes = 4096 + 2 * sum(
+            len(value.encode("utf-8"))
+            for value in (
+                attempt_id,
+                execution_id,
+                self._transport_stage,
+                policy_fingerprint,
+                url_key,
+                url,
+                baseline_outcome_status or "",
+            )
+        )
+        self._write_tracker.before_write(estimated_bytes)
+        connection = self._connect()
+        try:
+            # WAL+NORMAL keeps committed rows process-crash durable without
+            # forcing one full device flush per concurrent URL start.
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO transport_attempts (
+                    attempt_id, execution_id, stage, policy_fingerprint,
+                    url_key, url, started_at, finished_at, final_status,
+                    baseline_outcome_status, suppressed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    execution_id,
+                    self._transport_stage,
+                    policy_fingerprint,
+                    url_key,
+                    url,
+                    started_at,
+                    finished_at,
+                    final_status,
+                    baseline_outcome_status,
+                    int(suppressed),
+                ),
+            )
+            self._write_tracker.before_commit(0)
+            connection.commit()
+            return attempt_id
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_transport_attempt(
+        self,
+        attempt_id: str,
+        *,
+        final_status: str,
+        now: float | None = None,
+    ) -> None:
+        """Fence one unfinished attempt without rewriting completed rows."""
+        if final_status not in {"success", "terminal", "exception"}:
+            raise ValueError("invalid transport attempt final status")
+        finished_at = time.time() if now is None else float(now)
+        self._write_tracker.before_write(4096)
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT stage, finished_at, final_status, suppressed
+                FROM transport_attempts
+                WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if row is None or str(row["stage"]) != self._transport_stage:
+                raise ValueError("transport attempt does not exist")
+            if int(row["suppressed"]):
+                raise ValueError("suppressed transport attempt is already final")
+            if row["finished_at"] is not None:
+                if str(row["final_status"]) != final_status:
+                    raise ValueError("conflicting transport attempt completion")
+                connection.commit()
+                return
+            connection.execute(
+                """
+                UPDATE transport_attempts
+                SET finished_at = ?, final_status = ?
+                WHERE attempt_id = ? AND finished_at IS NULL
+                """,
+                (finished_at, final_status, attempt_id),
+            )
+            self._write_tracker.before_commit(0)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def transport_attempt_summary(
+        self,
+        policy_fingerprint: str,
+        *,
+        job_store_path: Path | None = None,
+        job_kind: str | None = None,
+        job_id_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and logically fingerprint the policy-scoped ledger."""
+        if (job_store_path is None) != (job_kind is None):
+            raise ValueError(
+                "job_store_path and job_kind must be provided together"
+            )
+        if job_store_path is None and job_id_prefix is not None:
+            raise ValueError("job_id_prefix requires a job store scope")
+        effective_job_id_prefix = job_id_prefix or job_kind
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {
+                    "schema_version": "wdc200k-transport-attempt-v1",
+                    "stage": self._transport_stage,
+                    "policy_fingerprint": policy_fingerprint,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        records = 0
+        physical = 0
+        terminal_replays = 0
+        unfinished = 0
+        blocked = 0
+        duplicates = 0
+        previous_physical_url: str | None = None
+        previous_physical_count = 0
+        with self._connect() as connection:
+            if job_store_path is None:
+                rows = connection.execute(
+                    f"""
+                SELECT attempt.attempt_id, attempt.execution_id,
+                       attempt.stage, attempt.policy_fingerprint,
+                       attempt.url_key, attempt.url, attempt.started_at,
+                       attempt.finished_at, attempt.final_status,
+                       attempt.baseline_outcome_status, attempt.suppressed,
+                       baseline.status AS durable_baseline_outcome_status
+                FROM transport_attempts AS attempt
+                LEFT JOIN {self._transport_outcome_table} AS baseline
+                  ON baseline.policy_fingerprint = attempt.policy_fingerprint
+                 AND baseline.url_key = attempt.url_key
+                 AND baseline.updated_at <= attempt.started_at
+                WHERE attempt.stage = ?
+                  AND attempt.policy_fingerprint = ?
+                ORDER BY attempt.url_key, attempt.started_at,
+                         attempt.attempt_id
+                    """,
+                    (self._transport_stage, policy_fingerprint),
+                )
+            else:
+                connection.execute(
+                    "ATTACH DATABASE ? AS transport_attempt_jobs",
+                    (str(Path(job_store_path)),),
+                )
+                rows = connection.execute(
+                    f"""
+                SELECT attempt.attempt_id, attempt.execution_id,
+                       attempt.stage, attempt.policy_fingerprint,
+                       attempt.url_key, attempt.url, attempt.started_at,
+                       attempt.finished_at, attempt.final_status,
+                       attempt.baseline_outcome_status, attempt.suppressed,
+                       baseline.status AS durable_baseline_outcome_status
+                FROM transport_attempts AS attempt
+                LEFT JOIN {self._transport_outcome_table} AS baseline
+                  ON baseline.policy_fingerprint = attempt.policy_fingerprint
+                 AND baseline.url_key = attempt.url_key
+                 AND baseline.updated_at <= attempt.started_at
+                WHERE attempt.stage = ?
+                  AND attempt.policy_fingerprint = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM transport_attempt_jobs.jobs AS job
+                      WHERE job.kind = ?
+                        AND job.job_id = ? || ':' || attempt.url_key
+                  )
+                ORDER BY attempt.url_key, started_at, attempt_id
+                    """,
+                    (
+                        self._transport_stage,
+                        policy_fingerprint,
+                        job_kind,
+                        effective_job_id_prefix,
+                    ),
+                )
+            for row in rows:
+                values = list(row)
+                recorded_baseline = row["baseline_outcome_status"]
+                durable_baseline = row["durable_baseline_outcome_status"]
+                baseline = recorded_baseline or durable_baseline
+                suppressed = bool(row["suppressed"])
+                finished = row["finished_at"] is not None
+                final_status = row["final_status"]
+                if (
+                    str(row["stage"]) != self._transport_stage
+                    or str(row["policy_fingerprint"]) != policy_fingerprint
+                    or recorded_baseline not in {
+                        None,
+                        "success",
+                        "terminal",
+                    }
+                    or durable_baseline not in {
+                        None,
+                        "success",
+                        "terminal",
+                    }
+                    or (
+                        recorded_baseline is not None
+                        and durable_baseline is not None
+                        and recorded_baseline != durable_baseline
+                    )
+                    or (finished != (final_status is not None))
+                    or (suppressed and final_status != "suppressed")
+                    or (
+                        not suppressed
+                        and final_status not in {
+                            None,
+                            "success",
+                            "terminal",
+                            "exception",
+                        }
+                    )
+                ):
+                    raise ValueError("invalid transport attempt ledger row")
+                records += 1
+                if suppressed:
+                    blocked += 1
+                else:
+                    physical += 1
+                    url_key = str(row["url_key"])
+                    if url_key != previous_physical_url:
+                        duplicates += max(0, previous_physical_count - 1)
+                        previous_physical_url = url_key
+                        previous_physical_count = 1
+                    else:
+                        previous_physical_count += 1
+                    terminal_replays += int(baseline == "terminal")
+                    unfinished += int(not finished)
+                digest.update(
+                    json.dumps(
+                        values,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+        duplicates += max(0, previous_physical_count - 1)
+        return {
+            "stage": self._transport_stage,
+            "policy_fingerprint": policy_fingerprint,
+            "database_path": str(self.path.resolve()),
+            "records": records,
+            "digest": digest.hexdigest(),
+            "transport_attempts": physical,
+            "duplicate_physical_requests": duplicates,
+            "terminal_replays": terminal_replays,
+            "unfinished_transport_attempts": unfinished,
+            "blocked_durable_replays": blocked,
+        }
+
+
+class PageOutcomeStore(TransportAttemptStoreMixin):
     """Disk-backed outcome and reference mappings keyed by policy and URL."""
+
+    _transport_stage = "pages"
+    _transport_outcome_table = "page_outcomes"
 
     def __init__(
         self,
@@ -221,6 +563,7 @@ class PageOutcomeStore:
                 )
                 """
             )
+            self._create_transport_attempt_schema(connection)
             if not counts_existed:
                 counts: dict[str, list[int]] = {}
                 cursor = connection.execute(
@@ -661,6 +1004,8 @@ def _fetch_one(
     *,
     transport: Any,
     policy: FetchPolicy,
+    outcome_store: PageOutcomeStore,
+    execution_id: str,
     pre_write_guard: PreWriteGuard | None = None,
     target_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -673,42 +1018,82 @@ def _fetch_one(
             target_path or Path("."),
             int(getattr(transport, "max_page_bytes", 0) or 0),
         )
-    try:
-        payload = transport.fetch_page(
-            page_url,
-            deadline_seconds=policy.deadline_seconds,
-            max_retries=policy.retries,
+    url_key = str(job.payload["url_key"])
+    durable = outcome_store.get(policy.fingerprint, url_key)
+    if durable is not None:
+        outcome_store.begin_transport_attempt(
+            execution_id=execution_id,
+            policy_fingerprint=policy.fingerprint,
+            url_key=url_key,
+            url=page_url,
+            baseline_outcome_status=str(durable["status"]),
+            suppressed=True,
         )
-    except Exception as error:
-        return {
-            "status": "terminal",
-            "error_class": type(error).__name__,
-            "http_status": _optional_int(getattr(error, "status_code", None)),
-        }
-    if isinstance(payload, dict):
-        return {
-            "status": "success",
-            "final_url": payload.get("final_url") or page_url,
-            "text": payload.get("text") or "",
-            "image_urls": payload.get("image_urls") or [],
-        }
-    cached = getattr(transport, "cached_page_outcome", lambda _url: None)(
-        page_url
+        return durable
+    attempt_id = outcome_store.begin_transport_attempt(
+        execution_id=execution_id,
+        policy_fingerprint=policy.fingerprint,
+        url_key=url_key,
+        url=page_url,
+        baseline_outcome_status=None,
+        suppressed=False,
     )
-    return {
-        "status": "terminal",
-        "error_class": _safe_error_class(
-            (
-                cached.get("error_class")
-                if isinstance(cached, dict)
-                else None
+    outcome: dict[str, Any] | None = None
+    try:
+        try:
+            payload = transport.fetch_page(
+                page_url,
+                deadline_seconds=policy.deadline_seconds,
+                max_retries=policy.retries,
             )
-            or "fetch_failed"
-        ),
-        "http_status": (
-            cached.get("http_status") if isinstance(cached, dict) else None
-        ),
-    }
+        except Exception as error:
+            outcome = {
+                "status": "terminal",
+                "error_class": type(error).__name__,
+                "http_status": _optional_int(
+                    getattr(error, "status_code", None)
+                ),
+            }
+        else:
+            if isinstance(payload, dict):
+                outcome = {
+                    "status": "success",
+                    "final_url": payload.get("final_url") or page_url,
+                    "text": payload.get("text") or "",
+                    "image_urls": payload.get("image_urls") or [],
+                }
+            else:
+                cached = getattr(
+                    transport,
+                    "cached_page_outcome",
+                    lambda _url: None,
+                )(page_url)
+                outcome = {
+                    "status": "terminal",
+                    "error_class": _safe_error_class(
+                        (
+                            cached.get("error_class")
+                            if isinstance(cached, dict)
+                            else None
+                        )
+                        or "fetch_failed"
+                    ),
+                    "http_status": (
+                        cached.get("http_status")
+                        if isinstance(cached, dict)
+                        else None
+                    ),
+                }
+        return outcome
+    finally:
+        outcome_store.finish_transport_attempt(
+            attempt_id,
+            final_status=(
+                str(outcome["status"])
+                if outcome is not None
+                else "exception"
+            ),
+        )
 
 
 def _atomic_json(
@@ -1085,6 +1470,7 @@ def fetch_unique_pages(
 
     unique = _job_count(store, kind)
     owner = f"fetch-{os.getpid()}-{uuid.uuid4().hex}"
+    execution_id = f"page-execution-{os.getpid()}-{uuid.uuid4().hex}"
     buffer_limit = (
         max(policy.global_concurrency, policy.global_concurrency * 4)
         if claim_buffer is None
@@ -1233,6 +1619,8 @@ def fetch_unique_pages(
                 job,
                 transport=transport,
                 policy=policy,
+                outcome_store=outcome_store,
+                execution_id=execution_id,
                 pre_write_guard=pre_write_guard,
                 target_path=outcomes_path,
             )
@@ -1368,6 +1756,12 @@ def fetch_unique_pages(
     )
     leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
+    transport_attempt_summary = outcome_store.transport_attempt_summary(
+        fingerprint,
+        job_store_path=store.path,
+        job_kind=kind,
+        job_id_prefix=fingerprint,
+    )
     return FetchResult(
         unique=unique,
         success=success,
@@ -1385,6 +1779,7 @@ def fetch_unique_pages(
         policy_fingerprint=fingerprint,
         job_store_path=store.path,
         job_kind=kind,
+        transport_attempt_summary=transport_attempt_summary,
     )
 
 

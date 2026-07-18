@@ -1069,6 +1069,17 @@ def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
     assert result.success == 2
     assert len({outcome["local_path"] for outcome in outcomes}) == 1
     assert len(list((tmp_path / "content").iterdir())) == 1
+    assert result.transport_attempt_summary["transport_attempts"] == 2
+    assert (
+        result.transport_attempt_summary["duplicate_physical_requests"] == 0
+    )
+    assert (
+        result.transport_attempt_summary["unfinished_transport_attempts"] == 0
+    )
+    manifest = json.loads(
+        result.fetch_manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest["transport_attempts"] == result.transport_attempt_summary
 
 
 def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
@@ -1876,6 +1887,110 @@ def test_image_outcome_put_commit_guard_rolls_back_and_resumes(
         {"status": "terminal", "error_class": "TimeoutError"},
     )
     assert resumed.get("policy", url_key)["status"] == "terminal"
+
+
+def test_image_transport_attempt_summary_counts_resume_anomalies(
+    tmp_path: Path,
+) -> None:
+    store = ImageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    policy = "policy"
+    image_url = "https://i.test/anomaly.jpg"
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+
+    first = store.begin_transport_attempt(
+        execution_id="execution-one",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=image_url,
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=1.0,
+    )
+    store.finish_transport_attempt(first, final_status="success", now=2.0)
+    store.put(
+        policy,
+        url_key,
+        image_url,
+        {
+            "status": "terminal",
+            "image_url": image_url,
+            "error_class": "prior_terminal",
+        },
+    )
+    second = store.begin_transport_attempt(
+        execution_id="execution-two",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=image_url,
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=time.time() + 1.0,
+    )
+    store.finish_transport_attempt(
+        second,
+        final_status="terminal",
+        now=time.time() + 2.0,
+    )
+    store.begin_transport_attempt(
+        execution_id="execution-three",
+        policy_fingerprint=policy,
+        url_key=url_key,
+        url=image_url,
+        baseline_outcome_status="terminal",
+        suppressed=True,
+        now=5.0,
+    )
+    store.begin_transport_attempt(
+        execution_id="execution-four",
+        policy_fingerprint=policy,
+        url_key="b" * 64,
+        url="https://i.test/crash.jpg",
+        baseline_outcome_status=None,
+        suppressed=False,
+        now=6.0,
+    )
+
+    summary = ImageOutcomeStore(
+        tmp_path / "outcomes.sqlite3"
+    ).transport_attempt_summary(policy)
+    assert summary["records"] == 4
+    assert summary["transport_attempts"] == 3
+    assert summary["duplicate_physical_requests"] == 1
+    assert summary["terminal_replays"] == 1
+    assert summary["unfinished_transport_attempts"] == 1
+    assert summary["blocked_durable_replays"] == 1
+
+
+def test_image_transport_attempt_start_is_disk_guarded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(path)
+
+    def reject(_path: Path, estimated_bytes: int = 0) -> None:
+        if estimated_bytes:
+            raise OSError("image transport reserve exhausted")
+
+    guarded = ImageOutcomeStore(
+        path,
+        write_tracker=assets_module.GuardedWriteTracker(
+            path,
+            reject,
+            interval_bytes=1,
+        ),
+    )
+    with pytest.raises(OSError, match="image transport reserve"):
+        guarded.begin_transport_attempt(
+            execution_id="execution",
+            policy_fingerprint="policy",
+            url_key="a" * 64,
+            url="https://i.test/guard.jpg",
+            baseline_outcome_status=None,
+            suppressed=False,
+        )
+    assert ImageOutcomeStore(path).transport_attempt_summary("policy")[
+        "records"
+    ] == 0
 
 
 def test_image_outcome_initialization_commit_uses_live_guard(

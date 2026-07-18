@@ -26,7 +26,7 @@ try:
         split_text_asset_content,
     )
     from stage1_io import clean_text, stable_hash
-    from wdc200k_fetch import FetchPolicy
+    from wdc200k_fetch import FetchPolicy, TransportAttemptStoreMixin
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
@@ -61,7 +61,11 @@ except ModuleNotFoundError as error:
         stage1_io = importlib.import_module("stage1_io")
         clean_text = stage1_io.clean_text
         stable_hash = stage1_io.stable_hash
-        FetchPolicy = importlib.import_module("wdc200k_fetch").FetchPolicy
+        fetch_helpers = importlib.import_module("wdc200k_fetch")
+        FetchPolicy = fetch_helpers.FetchPolicy
+        TransportAttemptStoreMixin = (
+            fetch_helpers.TransportAttemptStoreMixin
+        )
         io_helpers = importlib.import_module("wdc200k_io")
         AtomicJsonlShard = io_helpers.AtomicJsonlShard
         CompletedShard = io_helpers.CompletedShard
@@ -231,6 +235,7 @@ class ImageFetchResult:
     outcome_url_key_digest: str
     leased: int
     remaining: int
+    transport_attempt_summary: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -263,8 +268,11 @@ class ImageJobExecution:
     lease: ImageUrlLease | None
 
 
-class ImageOutcomeStore:
+class ImageOutcomeStore(TransportAttemptStoreMixin):
     """Durable policy-scoped terminal outcomes for unique image URLs."""
+
+    _transport_stage = "images"
+    _transport_outcome_table = "image_outcomes"
 
     def __init__(
         self,
@@ -340,6 +348,7 @@ class ImageOutcomeStore:
             }
             if not required_claim_columns <= claim_columns:
                 raise ValueError("image URL claim schema is incompatible")
+            self._create_transport_attempt_schema(connection)
             self._write_tracker.before_commit(0)
             connection.commit()
         except BaseException:
@@ -1944,6 +1953,9 @@ def _fetch_image_job(
     *,
     transport: Any,
     image_dir: Path,
+    outcome_store: ImageOutcomeStore,
+    policy_fingerprint: str,
+    execution_id: str,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     image_url = str(payload["image_url"])
@@ -1952,48 +1964,78 @@ def _fetch_image_job(
         if cached["status"] == "success":
             return _content_address_outcome(cached, image_dir)
         return cached
+    url_key = str(payload["url_key"])
+    durable = outcome_store.get(policy_fingerprint, url_key)
+    if durable is not None:
+        outcome_store.begin_transport_attempt(
+            execution_id=execution_id,
+            policy_fingerprint=policy_fingerprint,
+            url_key=url_key,
+            url=image_url,
+            baseline_outcome_status=str(durable["status"]),
+            suppressed=True,
+        )
+        return durable
     if pre_write_guard is not None:
         pre_write_guard(
             image_dir,
             int(getattr(transport, "max_image_bytes", 0) or 0),
         )
+    attempt_id = outcome_store.begin_transport_attempt(
+        execution_id=execution_id,
+        policy_fingerprint=policy_fingerprint,
+        url_key=url_key,
+        url=image_url,
+        baseline_outcome_status=None,
+        suppressed=False,
+    )
+    outcome: dict[str, Any] | None = None
     try:
-        downloaded = transport.download_image(
-            image_url,
-            page_url=str(payload["page_url"]),
-            source=str(payload["source"]),
-            entity_id=str(payload["entity_id"]),
+        try:
+            downloaded = transport.download_image(
+                image_url,
+                page_url=str(payload["page_url"]),
+                source=str(payload["source"]),
+                entity_id=str(payload["entity_id"]),
+            )
+        except Exception as error:
+            cached = _transport_image_outcome(transport, image_url)
+            outcome = cached or {
+                "status": "terminal",
+                "image_url": image_url,
+                "original_url": image_url,
+                "error_class": type(error).__name__,
+            }
+        else:
+            if isinstance(downloaded, dict):
+                outcome = _content_address_outcome(
+                    {
+                        **downloaded,
+                        "status": "success",
+                        "original_url": (
+                            downloaded.get("original_url") or image_url
+                        ),
+                    },
+                    image_dir,
+                )
+            else:
+                cached = _transport_image_outcome(transport, image_url)
+                outcome = cached or {
+                    "status": "terminal",
+                    "image_url": image_url,
+                    "original_url": image_url,
+                    "error_class": "download_or_validation_failed",
+                }
+        return outcome
+    finally:
+        outcome_store.finish_transport_attempt(
+            attempt_id,
+            final_status=(
+                str(outcome["status"])
+                if outcome is not None
+                else "exception"
+            ),
         )
-    except Exception as error:
-        cached = _transport_image_outcome(transport, image_url)
-        if cached is not None:
-            return cached
-        return {
-            "status": "terminal",
-            "image_url": image_url,
-            "original_url": image_url,
-            "error_class": type(error).__name__,
-        }
-    if isinstance(downloaded, dict):
-        return _content_address_outcome(
-            {
-                **downloaded,
-                "status": "success",
-                "original_url": (
-                    downloaded.get("original_url") or image_url
-                ),
-            },
-            image_dir,
-        )
-    cached = _transport_image_outcome(transport, image_url)
-    if cached is not None:
-        return cached
-    return {
-        "status": "terminal",
-        "image_url": image_url,
-        "original_url": image_url,
-        "error_class": "download_or_validation_failed",
-    }
 
 
 def _execute_image_job(
@@ -2003,6 +2045,7 @@ def _execute_image_job(
     image_dir: Path,
     outcome_store: ImageOutcomeStore,
     policy_fingerprint: str,
+    execution_id: str,
     claim_owner: str,
     claim_lease_seconds: float,
     claim_poll_seconds: float,
@@ -2033,6 +2076,9 @@ def _execute_image_job(
                     payload,
                     transport=transport,
                     image_dir=image_dir,
+                    outcome_store=outcome_store,
+                    policy_fingerprint=policy_fingerprint,
+                    execution_id=execution_id,
                     pre_write_guard=pre_write_guard,
                 ),
                 lease=decision.lease,
@@ -2123,6 +2169,7 @@ def fetch_unique_images(
     if enqueued != unique:
         raise ValueError("image job set was not enqueued completely")
     owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
+    execution_id = f"image-execution-{os.getpid()}-{uuid.uuid4().hex}"
     buffer_limit = (
         policy.global_concurrency * 4
         if claim_buffer is None
@@ -2241,6 +2288,7 @@ def fetch_unique_images(
                 image_dir=Path(image_dir),
                 outcome_store=outcome_store,
                 policy_fingerprint=fingerprint,
+                execution_id=execution_id,
                 claim_owner=(
                     f"{owner}:{job.job_id}:{job.lease_id}"
                 ),
@@ -2341,6 +2389,11 @@ def fetch_unique_images(
     success = int(outcome_snapshot["success"])
     terminal = int(outcome_snapshot["terminal"])
     job_snapshot = _job_snapshot(store, kind)
+    transport_attempt_summary = outcome_store.transport_attempt_summary(
+        fingerprint,
+        job_store_path=store.path,
+        job_kind=kind,
+    )
     unique_key_digest = _unique_job_url_key_digest(unique_jobs)
     complete = (
         success + terminal == unique
@@ -2380,6 +2433,7 @@ def fetch_unique_images(
             "path": str(outcomes_path),
             **outcome_snapshot,
         },
+        "transport_attempts": transport_attempt_summary,
     }
     _atomic_json_if_changed(
         fetch_manifest_path,
@@ -2416,6 +2470,7 @@ def fetch_unique_images(
             ),
             unique - success - terminal,
         ),
+        transport_attempt_summary=transport_attempt_summary,
     )
 
 
