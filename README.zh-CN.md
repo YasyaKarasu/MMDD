@@ -444,11 +444,11 @@ production parser 可读的过滤版 statistics ZIP 与指向绝对源文件的 
 不会复制、删除、抓取或修改 corpus。目标必须不存在或严格为空，解析后的 realpath
 必须位于 corpus 树外（两者都不能包含对方）。`scale_gate_manifest.jsonl` 记录绝对
 source、相对 target 与源 gzip SHA-256，`scale_gate_checksums.json` 覆盖 manifest
-和过滤 ZIP。所有内容先在同父唯一 staging 目录内构建并验证，再一次性原子发布；
-malformed 或 duplicate catalog path 会 fail closed，不留下 partial target。这些
-目录是运维规模门禁子语料，不是正式 200K 抽样结果。分别用它们作为
-`--input_dir`，配套 `--max_source_tables 100/1000` 和全新的 output/work/cache
-根目录运行。10K structural gate 直接使用完整 corpus。
+和过滤 ZIP。所有内容先在同父唯一 staging 目录内构建并验证，再进行原子
+no-clobber 发布；malformed 或 duplicate catalog path 会 fail closed，不留下
+partial target。这些目录是运维规模门禁子语料，不是正式 200K 抽样结果。分别用
+它们作为 `--input_dir`，配套 `--max_source_tables 100/1000` 和全新的
+output/work/cache 根目录运行。10K structural gate 直接使用完整 corpus。
 
 ### Direct endpoints、动态 vLLM 与 tmux
 

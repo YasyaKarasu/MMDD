@@ -484,31 +484,131 @@ def test_scale_gate_input_manifest_failure_leaves_no_partial_target(
     assert _tree_snapshot(source) == source_before
 
 
+def _pool_candidate(
+    schema_class: str,
+    row_count: int,
+) -> gate_module._RankedCandidate:
+    relative_path = (
+        f"{schema_class}/{schema_class}_host-{row_count}.test"
+        "_October2023.json.gz"
+    )
+    candidate = gate_module.TableCandidate(
+        schema_class=schema_class,
+        subset="top100",
+        host=f"host-{row_count}.test",
+        relative_path=relative_path,
+        rows=row_count,
+        columns=3,
+    )
+    return gate_module._RankedCandidate(
+        key=(row_count, relative_path, relative_path),
+        candidate=candidate,
+        source_path=Path("/") / relative_path,
+    )
+
+
+def test_candidate_pool_round_robins_two_buckets_for_three_tables() -> None:
+    pool = gate_module._RoundRobinCandidatePool(
+        table_count=3,
+        bucket_count=2,
+    )
+    for schema_class, row_count in (
+        ("A", 100),
+        ("B", 200),
+        ("A", 1),
+        ("B", 2),
+    ):
+        pool.add(_pool_candidate(schema_class, row_count))
+
+    assert [
+        (ranked.candidate.schema_class, ranked.candidate.rows)
+        for ranked in pool.selected()
+    ] == [("A", 1), ("B", 2), ("A", 100)]
+
+
+def test_candidate_pool_keeps_round_robin_order_after_first_round() -> None:
+    pool = gate_module._RoundRobinCandidatePool(
+        table_count=4,
+        bucket_count=2,
+    )
+    for schema_class, row_count in (
+        ("A", 100),
+        ("B", 3),
+        ("B", 200),
+        ("A", 1),
+        ("B", 2),
+    ):
+        pool.add(_pool_candidate(schema_class, row_count))
+
+    assert [
+        (ranked.candidate.schema_class, ranked.candidate.rows)
+        for ranked in pool.selected()
+    ] == [("A", 1), ("B", 2), ("A", 100), ("B", 3)]
+
+
 def test_candidate_pool_retention_is_global_table_count_plus_buckets() -> None:
-    pool = gate_module._BoundedCandidatePool(table_count=7)
     bucket_count = 80
+    pool = gate_module._RoundRobinCandidatePool(
+        table_count=7,
+        bucket_count=bucket_count,
+    )
     for bucket_index in range(bucket_count):
         schema_class = f"Class{bucket_index:03d}"
         for row_index in range(100):
-            relative_path = (
-                f"{schema_class}/{schema_class}_host-{row_index}.test"
-                "_October2023.json.gz"
-            )
-            candidate = gate_module.TableCandidate(
-                schema_class=schema_class,
-                subset="top100",
-                host=f"host-{row_index}.test",
-                relative_path=relative_path,
-                rows=row_index,
-                columns=3,
-            )
-            pool.add(
-                gate_module._RankedCandidate(
-                    key=(row_index, relative_path, relative_path),
-                    candidate=candidate,
-                    source_path=Path("/") / relative_path,
-                )
-            )
+            pool.add(_pool_candidate(schema_class, row_index))
 
     assert pool.bucket_count == bucket_count
     assert pool.retained_count <= 7 + bucket_count
+
+
+def test_publish_noreplace_preserves_empty_directory_created_in_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = tmp_path / "gate"
+    _make_real_input(source)
+    real_rename = gate_module._rename_noreplace
+
+    def create_racing_target(staging: Path, destination: Path) -> None:
+        destination.mkdir()
+        real_rename(staging, destination)
+
+    monkeypatch.setattr(
+        gate_module,
+        "_rename_noreplace",
+        create_racing_target,
+    )
+
+    with pytest.raises(ValueError, match="appeared"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=target,
+            table_count=3,
+        )
+
+    assert target.is_dir()
+    assert not list(target.iterdir())
+    assert not list(tmp_path.glob(".gate.*.tmp"))
+
+
+def test_publish_does_not_fallback_to_os_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = tmp_path / "gate"
+    _make_real_input(source)
+
+    def reject_replace(*args: object, **kwargs: object) -> None:
+        raise AssertionError("os.replace must not publish gate input")
+
+    monkeypatch.setattr(gate_module.os, "replace", reject_replace)
+
+    result = create_scale_gate_input(
+        source_dir=source,
+        target_dir=target,
+        table_count=3,
+    )
+
+    assert result.manifest_path.is_file()

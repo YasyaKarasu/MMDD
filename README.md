@@ -301,11 +301,11 @@ root may contain the other). `scale_gate_manifest.jsonl` records absolute
 sources, relative targets, and source gzip hashes;
 `scale_gate_checksums.json` covers the manifest and filtered ZIPs. These are
 all built and verified in a unique sibling staging directory before one atomic
-publish; malformed or duplicate catalog paths fail closed without a partial
-target. These are operational scale-gate subcorpora, not the formal 200K
-sampling result. Use each gate input with the matching `--max_source_tables`
-and fresh output/work/cache roots. The 10K structural gate uses the full corpus
-directly.
+no-clobber publish; malformed or duplicate catalog paths fail closed without a
+partial target. These are operational scale-gate subcorpora, not the formal
+200K sampling result. Use each gate input with the matching
+`--max_source_tables` and fresh output/work/cache roots. The 10K structural
+gate uses the full corpus directly.
 
 ### Direct endpoints, dynamic vLLM, and tmux
 

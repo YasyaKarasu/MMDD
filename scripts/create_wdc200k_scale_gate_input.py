@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
+import errno
 import heapq
 import hashlib
 import io
@@ -48,65 +50,74 @@ class _RankedCandidate:
         return self.key > other.key
 
 
-class _BoundedCandidatePool:
-    """Keep one best record per bucket plus N globally best records."""
+class _RoundRobinCandidatePool:
+    """Keep a bounded low-row heap per bucket for round-robin output."""
 
-    def __init__(self, table_count: int) -> None:
+    def __init__(self, table_count: int, bucket_count: int) -> None:
+        if bucket_count <= 0:
+            raise ValueError("bucket_count must be positive")
         self.table_count = table_count
-        self._best_by_bucket: dict[
-            tuple[str, str], _RankedCandidate
+        self.expected_bucket_count = bucket_count
+        self.per_bucket_cap = (
+            table_count + bucket_count - 1
+        ) // bucket_count
+        self._buckets: dict[
+            tuple[str, str], list[_RankedCandidate]
         ] = {}
-        self._global_best: list[_RankedCandidate] = []
 
     @property
     def bucket_count(self) -> int:
-        return len(self._best_by_bucket)
+        return len(self._buckets)
 
     @property
     def retained_count(self) -> int:
-        return len(self._best_by_bucket) + len(self._global_best)
+        return sum(len(bucket) for bucket in self._buckets.values())
 
     def add(self, ranked: _RankedCandidate) -> None:
         candidate = ranked.candidate
-        bucket = (candidate.schema_class, candidate.subset)
-        current = self._best_by_bucket.get(bucket)
-        if current is None or ranked.key < current.key:
-            self._best_by_bucket[bucket] = ranked
-        if len(self._global_best) < self.table_count:
-            heapq.heappush(self._global_best, ranked)
-        elif ranked.key < self._global_best[0].key:
-            heapq.heapreplace(self._global_best, ranked)
+        bucket_key = (candidate.schema_class, candidate.subset)
+        bucket = self._buckets.get(bucket_key)
+        if bucket is None:
+            if len(self._buckets) >= self.expected_bucket_count:
+                raise ValueError("candidate introduced an unexpected bucket")
+            bucket = []
+            self._buckets[bucket_key] = bucket
+        if len(bucket) < self.per_bucket_cap:
+            heapq.heappush(bucket, ranked)
+        elif ranked.key < bucket[0].key:
+            heapq.heapreplace(bucket, ranked)
 
     def selected(self) -> list[_RankedCandidate]:
         classes = sorted(
             schema_class
-            for schema_class, _subset in self._best_by_bucket
+            for schema_class, _subset in self._buckets
         )
         classes = list(dict.fromkeys(classes))
         bucket_order = [
             (schema_class, subset)
             for subset in SUBSETS
             for schema_class in classes
-            if (schema_class, subset) in self._best_by_bucket
+            if (schema_class, subset) in self._buckets
         ]
+        ordered_buckets = {
+            key: sorted(self._buckets[key], key=lambda ranked: ranked.key)
+            for key in bucket_order
+        }
+        offsets = {key: 0 for key in bucket_order}
         selected: list[_RankedCandidate] = []
-        selected_paths: set[str] = set()
-        for bucket in bucket_order:
-            ranked = self._best_by_bucket[bucket]
-            selected.append(ranked)
-            selected_paths.add(ranked.candidate.relative_path)
-            if len(selected) == self.table_count:
-                return selected
-        for ranked in sorted(
-            self._global_best,
-            key=lambda item: item.key,
-        ):
-            relative_path = ranked.candidate.relative_path
-            if relative_path in selected_paths:
-                continue
-            selected.append(ranked)
-            selected_paths.add(relative_path)
-            if len(selected) == self.table_count:
+        while len(selected) < self.table_count:
+            added = False
+            for key in bucket_order:
+                offset = offsets[key]
+                bucket = ordered_buckets[key]
+                if offset >= len(bucket):
+                    continue
+                selected.append(bucket[offset])
+                offsets[key] = offset + 1
+                added = True
+                if len(selected) == self.table_count:
+                    break
+            if not added:
                 break
         return selected
 
@@ -208,9 +219,9 @@ def _select_candidates(
     table_count: int,
     seed: int,
 ) -> list[_RankedCandidate]:
-    pool = _BoundedCandidatePool(table_count)
     index_path = staging_dir / ".candidate-index.sqlite3"
     connection = sqlite3.connect(index_path)
+    nonempty_buckets: set[tuple[str, str]] = set()
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA temp_store=MEMORY")
@@ -237,6 +248,24 @@ def _select_candidates(
                 # provisional and are skipped; malformed rows fail above.
                 if not source_path.is_file():
                     continue
+                nonempty_buckets.add(
+                    (candidate.schema_class, candidate.subset)
+                )
+        connection.commit()
+        if not nonempty_buckets:
+            raise ValueError("no existing candidate tables were found")
+        pool = _RoundRobinCandidatePool(
+            table_count,
+            len(nonempty_buckets),
+        )
+        for archive in _statistics_archives(source_dir):
+            for candidate in read_statistics_catalog(archive):
+                source_path = _validated_source_path(
+                    source_dir,
+                    candidate,
+                )
+                if not source_path.is_file():
+                    continue
                 pool.add(
                     _RankedCandidate(
                         key=(
@@ -248,7 +277,6 @@ def _select_candidates(
                         source_path=source_path,
                     )
                 )
-        connection.commit()
     finally:
         connection.close()
     index_path.unlink()
@@ -450,6 +478,48 @@ def _target_identity(path: Path) -> tuple[int, int] | None:
     return stat.st_dev, stat.st_ino
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish without replacing any concurrently created path."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            "atomic no-clobber publish is unavailable: libc renameat2 missing"
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ValueError(
+            f"target appeared during atomic publish: {destination}"
+        )
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise RuntimeError(
+            "atomic no-clobber publish is unavailable: "
+            f"renameat2 failed with errno {error_number}"
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        str(destination),
+    )
+
+
 def _publish_staging(
     staging_dir: Path,
     target_dir: Path,
@@ -472,7 +542,7 @@ def _publish_staging(
         target_dir.rmdir()
     if os.path.lexists(target_dir):
         raise ValueError(f"target appeared during publish: {target_dir}")
-    os.replace(staging_dir, target_dir)
+    _rename_noreplace(staging_dir, target_dir)
     _fsync_directory(target_dir.parent)
 
 
