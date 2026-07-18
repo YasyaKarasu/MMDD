@@ -16,7 +16,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import create_wdc200k_scale_gate_input as gate_module  # noqa: E402
 from create_wdc200k_scale_gate_input import create_scale_gate_input  # noqa: E402
-from wdc200k_selection import read_statistics_catalog  # noqa: E402
+from wdc200k_selection import read_statistics_catalog, stable_hash  # noqa: E402
+
+
+SELECTION_MODES = ("round_robin", "global_lowest")
 
 
 def _make_real_input(
@@ -141,6 +144,154 @@ def test_scale_gate_input_round_robins_lowest_row_from_each_bucket(
     assert not (target / ".candidate-index.sqlite3").exists()
     checksums = json.loads(result.checksums_path.read_text(encoding="utf-8"))
     assert ".candidate-index.sqlite3" not in checksums["files"]
+
+
+def test_selection_modes_are_stable() -> None:
+    assert gate_module.SELECTION_MODES == SELECTION_MODES
+
+
+def test_scale_gate_input_default_matches_explicit_round_robin(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    _make_real_input(source)
+
+    implicit = create_scale_gate_input(
+        source_dir=source,
+        target_dir=tmp_path / "implicit",
+        table_count=7,
+        seed=29,
+    )
+    explicit = create_scale_gate_input(
+        source_dir=source,
+        target_dir=tmp_path / "explicit",
+        table_count=7,
+        seed=29,
+        selection_mode="round_robin",
+    )
+
+    assert _tree_snapshot(implicit.target_dir) == _tree_snapshot(
+        explicit.target_dir
+    )
+    assert implicit.selection_mode == explicit.selection_mode == "round_robin"
+
+
+def test_scale_gate_input_global_lowest_matches_full_reference_sort(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    _make_real_input(source)
+    table_count = 7
+    seed = 31
+    all_candidates = []
+    for schema_class in ("Event", "Product"):
+        all_candidates.extend(
+            read_statistics_catalog(
+                source
+                / schema_class
+                / f"{schema_class}_statistics.zip"
+            )
+        )
+    expected = [
+        candidate.relative_path
+        for candidate in sorted(
+            all_candidates,
+            key=lambda candidate: (
+                candidate.rows,
+                stable_hash(seed, candidate.relative_path),
+                candidate.relative_path,
+            ),
+        )[:table_count]
+    ]
+
+    first = create_scale_gate_input(
+        source_dir=source,
+        target_dir=tmp_path / "gate-a",
+        table_count=table_count,
+        seed=seed,
+        selection_mode="global_lowest",
+    )
+    second = create_scale_gate_input(
+        source_dir=source,
+        target_dir=tmp_path / "gate-b",
+        table_count=table_count,
+        seed=seed,
+        selection_mode="global_lowest",
+    )
+
+    first_records = _read_manifest(first.manifest_path)
+    second_records = _read_manifest(second.manifest_path)
+    assert len(first_records) == table_count
+    assert [record["target"] for record in first_records] == expected
+    assert first_records == second_records
+    assert _tree_snapshot(first.target_dir) == _tree_snapshot(
+        second.target_dir
+    )
+
+
+@pytest.mark.parametrize("selection_mode", SELECTION_MODES)
+def test_scale_gate_input_publication_integrity_for_each_selection_mode(
+    tmp_path: Path,
+    selection_mode: str,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = tmp_path / "gate"
+    _make_real_input(source)
+
+    result = create_scale_gate_input(
+        source_dir=source,
+        target_dir=target,
+        table_count=5,
+        seed=17,
+        selection_mode=selection_mode,
+    )
+
+    records = _read_manifest(result.manifest_path)
+    manifest_targets = {str(record["target"]) for record in records}
+    assert len(records) == 5
+    assert result.selection_mode == selection_mode
+    for record in records:
+        link = target / str(record["target"])
+        assert link.is_symlink()
+        assert link.resolve(strict=True) == Path(str(record["source"]))
+    archived_targets = set()
+    for schema_class in ("Event", "Product"):
+        archive = (
+            target
+            / schema_class
+            / f"{schema_class}_statistics.zip"
+        )
+        if archive.is_file():
+            archived_targets.update(
+                candidate.relative_path
+                for candidate in read_statistics_catalog(archive)
+            )
+    assert archived_targets == manifest_targets
+    checksums = json.loads(result.checksums_path.read_text(encoding="utf-8"))
+    assert checksums["selection_mode"] == selection_mode
+    assert checksums["table_count"] == len(records)
+    for relative_path, expected_sha256 in checksums["files"].items():
+        assert _sha256(target / relative_path) == expected_sha256
+
+
+def test_scale_gate_input_rejects_unknown_selection_mode_before_writing(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = tmp_path / "missing-parent" / "gate"
+    _make_real_input(source)
+    source_before = _tree_snapshot(source)
+
+    with pytest.raises(ValueError, match="selection_mode"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=target,
+            table_count=1,
+            selection_mode="unknown",
+        )
+
+    assert not target.parent.exists()
+    assert _tree_snapshot(source) == source_before
 
 
 def test_scale_gate_input_rejects_broken_symlink_target(
@@ -276,10 +427,53 @@ def test_scale_gate_input_cli_help_is_read_only_by_default() -> None:
     assert "--source_dir" in completed.stdout
     assert "--target_dir" in completed.stdout
     assert "--table_count" in completed.stdout
+    assert "--selection_mode" in completed.stdout
 
 
+@pytest.mark.parametrize(
+    ("selection_args", "expected_mode"),
+    [
+        ([], "round_robin"),
+        (["--selection_mode", "global_lowest"], "global_lowest"),
+    ],
+)
+def test_scale_gate_input_cli_prints_selection_mode(
+    tmp_path: Path,
+    selection_args: list[str],
+    expected_mode: str,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = tmp_path / "gate"
+    _make_real_input(source)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "create_wdc200k_scale_gate_input.py"),
+            "--source_dir",
+            str(source),
+            "--target_dir",
+            str(target),
+            "--table_count",
+            "3",
+            *selection_args,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["selection_mode"] == expected_mode
+    checksums = json.loads(
+        (target / "scale_gate_checksums.json").read_text(encoding="utf-8")
+    )
+    assert checksums["selection_mode"] == expected_mode
+
+
+@pytest.mark.parametrize("selection_mode", SELECTION_MODES)
 def test_scale_gate_input_rejects_traversal_statistics_before_publish(
     tmp_path: Path,
+    selection_mode: str,
 ) -> None:
     source = tmp_path / "source-root" / "real-wdc"
     target = tmp_path / "target-root" / "gate"
@@ -302,6 +496,7 @@ def test_scale_gate_input_rejects_traversal_statistics_before_publish(
             source_dir=source,
             target_dir=target,
             table_count=1,
+            selection_mode=selection_mode,
         )
 
     assert not target.exists()
@@ -309,8 +504,10 @@ def test_scale_gate_input_rejects_traversal_statistics_before_publish(
     assert _tree_snapshot(source) == source_before
 
 
+@pytest.mark.parametrize("selection_mode", SELECTION_MODES)
 def test_scale_gate_input_rejects_duplicate_candidate_path_atomically(
     tmp_path: Path,
+    selection_mode: str,
 ) -> None:
     source = tmp_path / "real-wdc"
     target = tmp_path / "gate"
@@ -330,15 +527,18 @@ def test_scale_gate_input_rejects_duplicate_candidate_path_atomically(
             source_dir=source,
             target_dir=target,
             table_count=1,
+            selection_mode=selection_mode,
         )
 
     assert not target.exists()
     assert _tree_snapshot(source) == source_before
 
 
+@pytest.mark.parametrize("selection_mode", SELECTION_MODES)
 def test_scale_gate_input_link_failure_leaves_no_partial_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selection_mode: str,
 ) -> None:
     source = tmp_path / "real-wdc"
     target = tmp_path / "gate"
@@ -361,6 +561,7 @@ def test_scale_gate_input_link_failure_leaves_no_partial_target(
             source_dir=source,
             target_dir=target,
             table_count=3,
+            selection_mode=selection_mode,
         )
 
     assert not target.exists()
@@ -529,6 +730,14 @@ def test_global_lowest_candidate_pool_returns_lowest_keys_in_order() -> None:
     assert [ranked.key for ranked in pool.selected()] == sorted(keys)[:3]
 
 
+@pytest.mark.parametrize("table_count", [0, -1])
+def test_global_lowest_candidate_pool_rejects_nonpositive_table_count(
+    table_count: int,
+) -> None:
+    with pytest.raises(ValueError, match="table_count"):
+        gate_module._GlobalLowestCandidatePool(table_count=table_count)
+
+
 def test_global_lowest_candidate_pool_retains_at_most_table_count() -> None:
     table_count = 7
     pool = gate_module._GlobalLowestCandidatePool(table_count)
@@ -693,9 +902,11 @@ def test_candidate_pool_retention_is_global_table_count_plus_buckets() -> None:
     assert pool.retained_count + pool.bucket_count <= 7 + bucket_count
 
 
+@pytest.mark.parametrize("selection_mode", SELECTION_MODES)
 def test_publish_noreplace_preserves_empty_directory_created_in_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selection_mode: str,
 ) -> None:
     source = tmp_path / "real-wdc"
     target = tmp_path / "gate"
@@ -717,6 +928,7 @@ def test_publish_noreplace_preserves_empty_directory_created_in_window(
             source_dir=source,
             target_dir=target,
             table_count=3,
+            selection_mode=selection_mode,
         )
 
     assert target.is_dir()

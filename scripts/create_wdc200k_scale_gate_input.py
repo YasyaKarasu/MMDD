@@ -38,6 +38,9 @@ except ModuleNotFoundError as error:
     )
 
 
+SELECTION_MODES = ("round_robin", "global_lowest")
+
+
 @dataclass(frozen=True)
 class _RankedCandidate:
     key: tuple[int, str, str]
@@ -54,6 +57,8 @@ class _GlobalLowestCandidatePool:
     """Keep a bounded heap containing the globally lowest-ranked candidates."""
 
     def __init__(self, table_count: int) -> None:
+        if table_count <= 0:
+            raise ValueError("table_count must be positive")
         self.table_count = table_count
         self._heap: list[_RankedCandidate] = []
 
@@ -181,6 +186,7 @@ class ScaleGateInput:
     manifest_path: Path
     checksums_path: Path
     table_count: int
+    selection_mode: str
 
 
 def _sha256_path(path: Path) -> str:
@@ -271,6 +277,7 @@ def _select_candidates(
     *,
     table_count: int,
     seed: int,
+    selection_mode: str,
 ) -> list[_RankedCandidate]:
     index_path = staging_dir / ".candidate-index.sqlite3"
     connection = sqlite3.connect(index_path)
@@ -307,11 +314,20 @@ def _select_candidates(
         connection.commit()
         if not capacities:
             raise ValueError("no existing candidate tables were found")
-        quotas = _allocate_round_robin_quotas(
-            dict(capacities),
-            table_count=table_count,
-        )
-        pool = _RoundRobinCandidatePool(quotas)
+        if sum(capacities.values()) < table_count:
+            raise ValueError(
+                f"requested {table_count} existing tables but found "
+                f"only {sum(capacities.values())}"
+            )
+        pool: _RoundRobinCandidatePool | _GlobalLowestCandidatePool
+        if selection_mode == "round_robin":
+            quotas = _allocate_round_robin_quotas(
+                dict(capacities),
+                table_count=table_count,
+            )
+            pool = _RoundRobinCandidatePool(quotas)
+        else:
+            pool = _GlobalLowestCandidatePool(table_count)
         for archive in _statistics_archives(source_dir):
             for candidate in read_statistics_catalog(archive):
                 source_path = _validated_source_path(
@@ -606,8 +622,14 @@ def create_scale_gate_input(
     target_dir: Path,
     table_count: int,
     seed: int = 13,
+    selection_mode: str = "round_robin",
 ) -> ScaleGateInput:
     """Build an exact-size real-table subcorpus without copying source data."""
+    if selection_mode not in SELECTION_MODES:
+        raise ValueError(
+            f"selection_mode must be one of {SELECTION_MODES}: "
+            f"{selection_mode!r}"
+        )
     source_dir = source_dir.absolute().resolve()
     target_input = target_dir.absolute()
     if target_input.is_symlink():
@@ -649,6 +671,7 @@ def create_scale_gate_input(
             staging_dir,
             table_count=table_count,
             seed=seed,
+            selection_mode=selection_mode,
         )
         manifest_records = []
         for ranked in selected:
@@ -699,6 +722,7 @@ def create_scale_gate_input(
             "source_dir": str(source_dir),
             "table_count": table_count,
             "seed": seed,
+            "selection_mode": selection_mode,
             "files": {
                 str(path.relative_to(staging_dir)): _sha256_path(path)
                 for path in [manifest_path, *archive_paths]
@@ -726,6 +750,7 @@ def create_scale_gate_input(
         manifest_path=target_dir / "scale_gate_manifest.jsonl",
         checksums_path=target_dir / "scale_gate_checksums.json",
         table_count=table_count,
+        selection_mode=selection_mode,
     )
 
 
@@ -740,6 +765,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target_dir", type=Path, required=True)
     parser.add_argument("--table_count", type=int, required=True)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument(
+        "--selection_mode",
+        choices=SELECTION_MODES,
+        default="round_robin",
+    )
     return parser.parse_args(argv)
 
 
@@ -750,6 +780,7 @@ def main(argv: list[str] | None = None) -> int:
         target_dir=args.target_dir,
         table_count=args.table_count,
         seed=args.seed,
+        selection_mode=args.selection_mode,
     )
     print(
         json.dumps(
@@ -758,6 +789,7 @@ def main(argv: list[str] | None = None) -> int:
                 "manifest": str(result.manifest_path),
                 "checksums": str(result.checksums_path),
                 "table_count": result.table_count,
+                "selection_mode": result.selection_mode,
             },
             sort_keys=True,
         )
