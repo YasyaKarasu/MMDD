@@ -25,6 +25,7 @@ from wdc200k_assets import (
     AssetPlanShards,
     ImageBudget,
     ImageFetchResult,
+    ImageOutcomeStore,
     MaterializedAssetShards,
     UniqueImageJobs,
     asset_materialization_input_fingerprint,
@@ -45,6 +46,7 @@ from wdc200k_archive import ArchiveResult, archive_pipeline_state
 from wdc200k_fetch import (
     FetchPolicy,
     FetchResult,
+    PageOutcomeStore,
     fetch_unique_pages,
     iter_finalized_page_refs,
     iter_page_fanout,
@@ -940,6 +942,38 @@ class ProgressReporter:
                 },
             }
 
+    def stage_completion_summary(self, stage: str) -> dict[str, Any]:
+        """Return the bounded, completed URL-unit authority for one stage."""
+        with self._lock:
+            telemetry = self._stage_telemetry.get(stage)
+            if telemetry is None or telemetry.get("completed_at") is None:
+                raise ValueError(
+                    f"URL telemetry is incomplete for stage: {stage}"
+                )
+            summary = {
+                key: telemetry[key]
+                for key in (
+                    "rate_basis",
+                    "completed_units",
+                    "total_units",
+                    "completed_at",
+                    "eligible_final_half_samples",
+                    "excluded_final_half_samples",
+                    "max_symmetric_eta_factor",
+                )
+            }
+        expected_basis = {"pages": "page_urls", "images": "image_urls"}.get(
+            stage
+        )
+        if (
+            summary["rate_basis"] != expected_basis
+            or int(summary["completed_units"]) != int(summary["total_units"])
+        ):
+            raise ValueError(
+                f"URL telemetry identity mismatch for stage: {stage}"
+            )
+        return summary
+
     def publish(self) -> None:
         with self._publish_lock:
             snapshot = self._snapshot()
@@ -1153,7 +1187,136 @@ def _load_stage_registry(path: Path) -> StageRegistry:
     )
 
 
+_ATTEMPT_COUNTER_FIELDS = (
+    "transport_attempts",
+    "duplicate_physical_requests",
+    "terminal_replays",
+    "unfinished_transport_attempts",
+    "blocked_durable_replays",
+)
+
+
+def _network_telemetry_counters(
+    stage: str,
+    attempts: dict[str, Any],
+    completion: dict[str, Any],
+) -> dict[str, int]:
+    prefix = {"pages": "page", "images": "image"}.get(stage)
+    if prefix is None:
+        raise ValueError(f"unsupported network telemetry stage: {stage}")
+    counters = {
+        f"{prefix}_{field}": int(attempts[field])
+        for field in _ATTEMPT_COUNTER_FIELDS
+    }
+    counters.update(
+        {
+            f"{prefix}_url_completed": int(completion["completed_units"]),
+            f"{prefix}_url_total": int(completion["total_units"]),
+            f"{prefix}_eta_eligible_final_half_samples": int(
+                completion["eligible_final_half_samples"]
+            ),
+            f"{prefix}_eta_excluded_final_half_samples": int(
+                completion["excluded_final_half_samples"]
+            ),
+        }
+    )
+    if any(value < 0 for value in counters.values()):
+        raise ValueError("network telemetry counters must be non-negative")
+    return counters
+
+
+def _validate_network_telemetry(
+    config: PipelineConfig,
+    registry_stage: str,
+    payload: dict[str, Any],
+    path: Path,
+) -> None:
+    attempts = payload.get("transport_attempts")
+    completion = payload.get("url_completion")
+    authority = payload.get("transport_attempt_authority")
+    if not all(
+        isinstance(value, dict)
+        for value in (attempts, completion, authority)
+    ):
+        raise ValueError(f"network telemetry is missing: {path}")
+    policy = str(payload.get("policy_fingerprint") or "")
+    if attempts.get("policy_fingerprint") != policy:
+        raise ValueError("transport attempt policy mismatch")
+    if attempts.get("stage") != registry_stage:
+        raise ValueError("transport attempt stage mismatch")
+    expected_paths = {
+        "pages": (
+            config.cache_dir / "page_cache" / "outcomes.sqlite3",
+            config.work_dir / "page_jobs" / "jobs.sqlite3",
+        ),
+        "images": (
+            config.cache_dir / "image_cache" / "outcomes.sqlite3",
+            config.work_dir / "image_jobs" / "jobs.sqlite3",
+        ),
+    }
+    try:
+        expected_database, expected_jobs = expected_paths[registry_stage]
+    except KeyError as error:
+        raise ValueError(
+            "network manifest belongs to a non-network stage"
+        ) from error
+    database_path = Path(str(authority.get("database_path") or "")).resolve()
+    job_store_path = Path(str(authority.get("job_store_path") or "")).resolve()
+    job_kind = str(authority.get("job_kind") or "")
+    job_id_prefix = str(authority.get("job_id_prefix") or "")
+    if (
+        database_path != expected_database.resolve()
+        or job_store_path != expected_jobs.resolve()
+        or str(attempts.get("database_path") or "") != str(database_path)
+        or not job_kind
+        or not job_id_prefix
+        or not database_path.is_file()
+        or not job_store_path.is_file()
+    ):
+        raise ValueError("transport attempt authority identity mismatch")
+    store = (
+        PageOutcomeStore(database_path)
+        if registry_stage == "pages"
+        else ImageOutcomeStore(database_path)
+    )
+    actual = store.transport_attempt_summary(
+        policy,
+        job_store_path=job_store_path,
+        job_kind=job_kind,
+        job_id_prefix=job_id_prefix,
+    )
+    if actual != attempts:
+        raise ValueError("transport attempt authority mismatch")
+    counts = payload.get("counts") or {}
+    expected_basis = {"pages": "page_urls", "images": "image_urls"}[
+        registry_stage
+    ]
+    try:
+        completed = int(completion["completed_units"])
+        total = int(completion["total_units"])
+        completed_at = float(completion["completed_at"])
+        eligible = int(completion["eligible_final_half_samples"])
+        excluded = int(completion["excluded_final_half_samples"])
+        factor_raw = completion["max_symmetric_eta_factor"]
+        factor = None if factor_raw is None else float(factor_raw)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("URL completion summary is invalid") from error
+    if (
+        completion.get("rate_basis") != expected_basis
+        or completed != total
+        or total != int(counts.get("unique", -1))
+        or not math.isfinite(completed_at)
+        or completed_at < 0
+        or eligible < 0
+        or excluded < 0
+        or (factor is not None and (not math.isfinite(factor) or factor < 1.0))
+    ):
+        raise ValueError("URL completion summary identity mismatch")
+    _network_telemetry_counters(registry_stage, attempts, completion)
+
+
 def _validate_producer_manifest(
+    config: PipelineConfig,
     stage: str,
     path: Path,
     *,
@@ -1181,6 +1344,8 @@ def _validate_producer_manifest(
         raise ValueError(
             f"unexpected {stage} producer type {producer_stage!r}: {path}"
         )
+    if producer_stage == "wdc200k_network_fetch":
+        _validate_network_telemetry(config, stage, payload, path)
     root = (
         path.parent.parent
         if producer_stage in {"wdc200k_structural", "wdc200k_validated_selection"}
@@ -1246,6 +1411,7 @@ def _validate_stage_registry(
         or not registry.producer_manifests
     ):
         raise ValueError(f"pipeline registry identity mismatch: {path}")
+    expected_telemetry_counters: dict[str, int] = {}
     for reference in registry.producer_manifests:
         if not reference.path.is_file():
             raise ValueError(f"producer manifest is missing: {reference.path}")
@@ -1254,10 +1420,27 @@ def _validate_stage_registry(
                 f"producer manifest checksum mismatch: {reference.path}"
             )
         _validate_producer_manifest(
+            config,
             stage,
             reference.path,
             allow_network_shard_repair=allow_network_shard_repair,
         )
+        producer_payload = json.loads(
+            reference.path.read_text(encoding="utf-8")
+        )
+        if producer_payload.get("stage") == "wdc200k_network_fetch":
+            expected_telemetry_counters.update(
+                _network_telemetry_counters(
+                    stage,
+                    producer_payload["transport_attempts"],
+                    producer_payload["url_completion"],
+                )
+            )
+    if any(
+        registry.counters.get(key) != value
+        for key, value in expected_telemetry_counters.items()
+    ):
+        raise ValueError("pipeline registry telemetry counters mismatch")
     return registry
 
 
@@ -1695,6 +1878,9 @@ def _publish_network_manifest(
     pending: int,
     leased: int,
     records_per_shard: int,
+    transport_attempts: dict[str, Any] | None = None,
+    transport_attempt_authority: dict[str, Any] | None = None,
+    url_completion: dict[str, Any] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> Path:
     if records_per_shard <= 0:
@@ -1718,6 +1904,10 @@ def _publish_network_manifest(
             and int(payload.get("records_per_shard", -1))
             == records_per_shard
             and declared == counts
+            and payload.get("transport_attempts") == transport_attempts
+            and payload.get("transport_attempt_authority")
+            == transport_attempt_authority
+            and payload.get("url_completion") == url_completion
         ):
             raise ValueError(
                 f"network manifest conflicts with durable state: {manifest_path}"
@@ -1774,19 +1964,26 @@ def _publish_network_manifest(
         publish_chunk(len(completed_shards), chunk)
     if sum(shard.records for shard in completed_shards) != unique:
         raise ValueError("network outcome count does not match durable jobs")
+    manifest_payload = {
+        "stage": "wdc200k_network_fetch",
+        "schema_version": "wdc200k-network-fetch-v1",
+        "policy_fingerprint": policy_fingerprint,
+        "records_per_shard": records_per_shard,
+        "counts": counts,
+        "completed_shards": [asdict(shard) for shard in completed_shards],
+        "complete": True,
+    }
+    if transport_attempts is not None:
+        manifest_payload.update(
+            {
+                "transport_attempts": transport_attempts,
+                "transport_attempt_authority": transport_attempt_authority,
+                "url_completion": url_completion,
+            }
+        )
     _atomic_json(
         manifest_path,
-        {
-            "stage": "wdc200k_network_fetch",
-            "schema_version": "wdc200k-network-fetch-v1",
-            "policy_fingerprint": policy_fingerprint,
-            "records_per_shard": records_per_shard,
-            "counts": counts,
-            "completed_shards": [
-                asdict(shard) for shard in completed_shards
-            ],
-            "complete": True,
-        },
+        manifest_payload,
         pre_write_guard=pre_write_guard,
     )
     return manifest_path
@@ -2192,6 +2389,13 @@ def _run_pages(
         validation_database=page_validation_database,
         pre_write_guard=pre_write_guard,
     )
+    url_completion = reporter.stage_completion_summary("pages")
+    transport_authority = {
+        "database_path": str(result.outcomes_path.resolve()),
+        "job_store_path": str(result.job_store_path.resolve()),
+        "job_kind": result.job_kind,
+        "job_id_prefix": result.policy_fingerprint,
+    }
     network_manifest = _publish_network_manifest(
         root / "network",
         iter_page_outcomes(result.outcomes_path, result.policy_fingerprint),
@@ -2202,6 +2406,9 @@ def _run_pages(
         pending=result.remaining,
         leased=result.leased,
         records_per_shard=config.records_per_shard,
+        transport_attempts=result.transport_attempt_summary,
+        transport_attempt_authority=transport_authority,
+        url_completion=url_completion,
         pre_write_guard=pre_write_guard,
     )
     counters = {
@@ -2209,6 +2416,11 @@ def _run_pages(
         "page_success": result.success,
         "page_terminal": result.terminal,
         "page_remaining": result.remaining,
+        **_network_telemetry_counters(
+            "pages",
+            result.transport_attempt_summary,
+            url_completion,
+        ),
     }
     _write_stage_registry(
         config,
@@ -2401,6 +2613,13 @@ def _run_images(
         expected_input_fingerprint=asset_input,
         pre_write_guard=pre_write_guard,
     )
+    url_completion = reporter.stage_completion_summary("images")
+    transport_authority = {
+        "database_path": str(image_result.outcomes_path.resolve()),
+        "job_store_path": str(image_result.job_store_path.resolve()),
+        "job_kind": image_result.job_kind,
+        "job_id_prefix": image_result.job_kind,
+    }
     network_manifest = _publish_network_manifest(
         root / "network",
         iter_image_outcomes(
@@ -2414,6 +2633,9 @@ def _run_images(
         pending=image_result.remaining,
         leased=image_result.leased,
         records_per_shard=config.records_per_shard,
+        transport_attempts=image_result.transport_attempt_summary,
+        transport_attempt_authority=transport_authority,
+        url_completion=url_completion,
         pre_write_guard=pre_write_guard,
     )
     counters = {
@@ -2423,6 +2645,11 @@ def _run_images(
         "bridge_assets": materialized.bridge_assets,
         "table_asset_links": materialized.table_asset_links,
         "image_outcomes": image_result.outcomes_count,
+        **_network_telemetry_counters(
+            "images",
+            image_result.transport_attempt_summary,
+            url_completion,
+        ),
     }
     _write_stage_registry(
         config,
@@ -2713,6 +2940,11 @@ def run_pipeline(
                 "unique_page_jobs": page_result.unique,
                 "page_success": page_result.success,
                 "page_terminal": page_result.terminal,
+                **_network_telemetry_counters(
+                    "pages",
+                    page_result.transport_attempt_summary,
+                    reporter.stage_completion_summary("pages"),
+                ),
             }
         )
         if config.stop_after == "pages":
@@ -2770,6 +3002,11 @@ def run_pipeline(
                 "image_terminal": image_result.terminal,
                 "bridge_assets": materialized_assets.bridge_assets,
                 "table_asset_links": materialized_assets.table_asset_links,
+                **_network_telemetry_counters(
+                    "images",
+                    image_result.transport_attempt_summary,
+                    reporter.stage_completion_summary("images"),
+                ),
             }
         )
         if config.stop_after == "images":

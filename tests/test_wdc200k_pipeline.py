@@ -4,6 +4,7 @@ import json
 import gzip
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -345,6 +346,9 @@ def test_dry_run_validates_without_writes_or_network(
     assert not output_dir.exists()
     assert not work_dir.exists()
     assert not cache_dir.exists()
+    assert not (work_dir / "progress.json").exists()
+    assert not (work_dir / "page_jobs/network/network-manifest.json").exists()
+    assert not (work_dir / "image_jobs/network/network-manifest.json").exists()
 
 
 def test_cli_help_and_absolute_script_smoke() -> None:
@@ -427,6 +431,7 @@ def test_stop_after_structural_emits_exact_counts_without_network(
     )
     assert progress["stage"] == "structural"
     assert progress["counters"]["entities"] == 2
+    assert progress["stage_telemetry"] == {}
     assert progress["disk"]["free_bytes"] >= 0
     stdout = capsys.readouterr().out
     assert "[wdc200k]" in stdout
@@ -435,6 +440,12 @@ def test_stop_after_structural_emits_exact_counts_without_network(
     assert "free_output=" in stdout and "reserve=" in stdout
     assert not config.cache_dir.exists()
     assert not config.output_dir.exists()
+    assert not (
+        config.work_dir / "page_jobs/network/network-manifest.json"
+    ).exists()
+    assert not (
+        config.work_dir / "image_jobs/network/network-manifest.json"
+    ).exists()
 
 
 def test_from_stage_moves_named_and_downstream_without_deleting(
@@ -655,6 +666,53 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         assert telemetry["samples"][-1]["completed_units"] == total
         assert telemetry["completed_at"] is not None
 
+    first_network_telemetry = {}
+    for stage, expected_attempts, basis in (
+        ("pages", 1, "page_urls"),
+        ("images", 3, "image_urls"),
+    ):
+        registry_path = (
+            config.work_dir / "stage_manifests" / f"pipeline-{stage}.json"
+        )
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        network_ref = next(
+            item
+            for item in registry["producer_manifests"]
+            if json.loads(Path(item["path"]).read_text(encoding="utf-8"))[
+                "stage"
+            ]
+            == "wdc200k_network_fetch"
+        )
+        network = json.loads(
+            Path(network_ref["path"]).read_text(encoding="utf-8")
+        )
+        attempts = network["transport_attempts"]
+        completion = network["url_completion"]
+        assert attempts["stage"] == stage
+        assert attempts["policy_fingerprint"] == network["policy_fingerprint"]
+        assert attempts["transport_attempts"] == expected_attempts
+        assert attempts["duplicate_physical_requests"] == 0
+        assert attempts["terminal_replays"] == 0
+        assert attempts["unfinished_transport_attempts"] == 0
+        assert completion["rate_basis"] == basis
+        assert completion["completed_units"] == network["counts"]["unique"]
+        assert completion["total_units"] == network["counts"]["unique"]
+        assert completion["completed_at"] is not None
+        assert registry["counters"][f"{stage[:-1]}_transport_attempts"] == (
+            expected_attempts
+        )
+        assert registry["counters"][
+            f"{stage[:-1]}_duplicate_physical_requests"
+        ] == 0
+        assert registry["counters"][
+            f"{stage[:-1]}_eta_eligible_final_half_samples"
+        ] == completion["eligible_final_half_samples"]
+        first_network_telemetry[stage] = {
+            "transport_attempts": attempts,
+            "url_completion": completion,
+            "registry_counters": registry["counters"],
+        }
+
     resumed = run_pipeline(
         config,
         page_transport=page_transport,
@@ -681,6 +739,99 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         assert registry["stage"] == stage
         assert registry["complete"] is True
         assert registry["producer_type"]
+        if stage in first_network_telemetry:
+            network_ref = next(
+                item
+                for item in registry["producer_manifests"]
+                if json.loads(Path(item["path"]).read_text(encoding="utf-8"))[
+                    "stage"
+                ]
+                == "wdc200k_network_fetch"
+            )
+            network = json.loads(
+                Path(network_ref["path"]).read_text(encoding="utf-8")
+            )
+            assert {
+                "transport_attempts": network["transport_attempts"],
+                "url_completion": network["url_completion"],
+                "registry_counters": registry["counters"],
+            } == first_network_telemetry[stage]
+
+
+def test_resume_rejects_tampered_page_attempt_authority(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    outcomes = config.cache_dir / "page_cache/outcomes.sqlite3"
+    with sqlite3.connect(outcomes) as connection:
+        connection.execute(
+            "UPDATE transport_attempts SET final_status = 'exception'"
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="transport attempt authority mismatch",
+    ):
+        run_pipeline(config, page_transport=_PipelinePageTransport())
+
+
+def test_resume_rejects_tampered_attempt_registry_counter(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    registry_path = config.work_dir / "stage_manifests/pipeline-pages.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["counters"]["page_transport_attempts"] += 1
+    registry_path.write_text(
+        json.dumps(registry, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="telemetry counters mismatch"):
+        run_pipeline(config, page_transport=_PipelinePageTransport())
+
+
+def test_resume_rejects_stale_image_attempt_policy_even_with_updated_checksum(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="images")
+    run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+    )
+    registry_path = config.work_dir / "stage_manifests/pipeline-images.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    network_ref = next(
+        item
+        for item in registry["producer_manifests"]
+        if json.loads(Path(item["path"]).read_text(encoding="utf-8"))[
+            "stage"
+        ]
+        == "wdc200k_network_fetch"
+    )
+    network_path = Path(network_ref["path"])
+    network = json.loads(network_path.read_text(encoding="utf-8"))
+    network["transport_attempts"]["policy_fingerprint"] = "stale-policy"
+    network_path.write_text(
+        json.dumps(network, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    network_ref["sha256"] = pipeline_module._sha256_path(network_path)
+    registry_path.write_text(
+        json.dumps(registry, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="transport attempt policy mismatch"):
+        run_pipeline(
+            config,
+            page_transport=_PipelinePageTransport(),
+            image_transport=_PipelineImageTransport(),
+        )
 
 
 def test_resume_repairs_corrupt_network_snapshot_from_authoritative_store(
