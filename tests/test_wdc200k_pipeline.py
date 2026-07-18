@@ -1171,6 +1171,27 @@ def test_stop_after_selection_does_not_expand_structural_tables(
     assert not (config.work_dir / "structural").exists()
 
 
+def test_fresh_no_resume_page_telemetry_validates_from_progress_state(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _full_pipeline_config(tmp_path),
+        resume=False,
+        stop_after="pages",
+    )
+
+    result = run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+    )
+
+    assert result.status == "stopped"
+    assert result.stage == "pages"
+    assert result.counters["page_url_completed"] == (
+        result.counters["page_url_total"]
+    )
+
+
 def test_progress_stdout_is_bounded_between_periodic_snapshots(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -1558,7 +1558,9 @@ def _validate_network_telemetry(
     ):
         raise ValueError("URL completion summary identity mismatch")
     try:
-        progress_reporter = ProgressReporter(replace(config, from_stage=None))
+        progress_reporter = ProgressReporter(
+            replace(config, resume=True, from_stage=None)
+        )
         progress_completion = progress_reporter.stage_completion_summary(
             registry_stage
         )
