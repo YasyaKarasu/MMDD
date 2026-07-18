@@ -890,6 +890,112 @@ def test_dynamic_vllm_accepts_staged_run_fingerprint():
     assert "--run_fingerprint" not in passthrough
 
 
+def _capture_dynamic_builder_launch(
+    monkeypatch,
+    *,
+    tmp_path: Path,
+    runtime_dir: Path | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    captured: dict[str, object] = {}
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.pid = 12345
+            self._poll = None
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            marker = Path(command[command.index("--model_start_marker") + 1])
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                json.dumps(
+                    strict_start_marker(
+                        run_fingerprint="",
+                        text_tasks=0,
+                        image_tasks=0,
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.subprocess.Popen",
+        FakePopen,
+    )
+    argv = [
+        "--input_dir",
+        str(tmp_path / "input"),
+        "--output_dir",
+        str(tmp_path / "output"),
+        "--text_model_path",
+        "/models/text",
+        "--image_model_path",
+        "/models/vl",
+        "--python_executable",
+        "/usr/bin/python",
+        "--builder_script",
+        "/repo/scripts/build_wdc200k_mm_joinability_dataset.py",
+    ]
+    if runtime_dir is not None:
+        argv.extend(["--runtime_dir", str(runtime_dir)])
+
+    assert dynamic_vllm_main(argv) == 0
+    return captured["command"], captured["kwargs"]
+
+
+def test_dynamic_vllm_default_runtime_is_outside_task8_output(
+    monkeypatch,
+    tmp_path,
+):
+    command, popen_kwargs = _capture_dynamic_builder_launch(
+        monkeypatch,
+        tmp_path=tmp_path,
+    )
+    output_dir = tmp_path / "output"
+    runtime_dir = tmp_path / ".output.wdc200k-runtime"
+    runtime_options = {
+        "--text_model_base_urls_file": "text_endpoints.txt",
+        "--image_model_base_urls_file": "image_endpoints.txt",
+        "--model_start_marker": "model_start.json",
+        "--model_ready_marker": "model_ready.json",
+        "--model_text_done_marker": "text_done.json",
+        "--model_image_done_marker": "image_done.json",
+    }
+
+    assert command[1] == "/repo/scripts/build_wdc200k_mm_joinability_dataset.py"
+    for option, filename in runtime_options.items():
+        path = Path(command[command.index(option) + 1])
+        assert path == runtime_dir / filename
+        assert not path.is_relative_to(output_dir)
+    assert popen_kwargs.get("stdout") is None
+    assert popen_kwargs["start_new_session"] is True
+
+
+def test_dynamic_vllm_preserves_explicit_runtime_dir(monkeypatch, tmp_path):
+    explicit_runtime = tmp_path / "explicit-runtime"
+    command, _popen_kwargs = _capture_dynamic_builder_launch(
+        monkeypatch,
+        tmp_path=tmp_path,
+        runtime_dir=explicit_runtime,
+    )
+
+    for option in (
+        "--text_model_base_urls_file",
+        "--image_model_base_urls_file",
+        "--model_start_marker",
+        "--model_ready_marker",
+        "--model_text_done_marker",
+        "--model_image_done_marker",
+    ):
+        assert Path(command[command.index(option) + 1]).parent == explicit_runtime
+
+
 def test_real_builder_and_default_runner_share_strict_marker_contract(
     tmp_path,
 ):

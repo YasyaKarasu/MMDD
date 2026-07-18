@@ -467,7 +467,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--run_fingerprint", default="", help="Optional staged-run identity used to fence stale model markers.")
-    parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Defaults to OUTPUT_DIR/_dynamic_vllm for compatibility.")
+    parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Defaults to a hidden sibling of OUTPUT_DIR.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
@@ -492,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime_dir = (
         Path(args.runtime_dir)
         if args.runtime_dir
-        else output_dir / "_dynamic_vllm"
+        else output_dir.parent / f".{output_dir.name}.wdc200k-runtime"
     )
     text_endpoints_file = runtime_dir / "text_endpoints.txt"
     image_endpoints_file = runtime_dir / "image_endpoints.txt"
