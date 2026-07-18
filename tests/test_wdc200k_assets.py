@@ -2499,9 +2499,13 @@ def test_public_asset_validators_reconstruct_the_complete_producer_chain(
         outcomes_path=tmp_path / "outcomes.sqlite3",
         image_dir=tmp_path / "content",
     )
+    guarded_paths: list[Path] = []
     fetch_snapshot = validate_complete_image_fetch(
         fetched,
         unique_jobs=unique,
+        pre_write_guard=lambda path, _size=0: guarded_paths.append(
+            Path(path)
+        ),
     )
     materialization_input = asset_materialization_input_fingerprint(
         planned.manifest_path,
@@ -2523,6 +2527,12 @@ def test_public_asset_validators_reconstruct_the_complete_producer_chain(
 
     assert validated == materialized
     assert fetch_snapshot["outcomes"]["count"] == 1
+    assert fetched.outcomes_path in guarded_paths
+    assert fetched.job_store_path in guarded_paths
+    assert any(
+        path.name.startswith(".image-membership-")
+        for path in guarded_paths
+    )
     assert barrier.bridge_assets == 2
     assert barrier.table_asset_links == 1
     assert barrier.fingerprint["input_fingerprint"] == materialization_input

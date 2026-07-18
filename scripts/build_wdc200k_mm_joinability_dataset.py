@@ -1875,6 +1875,7 @@ def _run_images(
     validate_complete_image_fetch(
         image_result,
         unique_jobs=unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(completed_shards=2, total_shards=3)
     asset_input = asset_materialization_input_fingerprint(

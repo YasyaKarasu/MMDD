@@ -1427,6 +1427,7 @@ def validate_complete_page_fetch(
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(
             """
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS expected_page_refs (
                 url_key TEXT NOT NULL,
                 reference_key TEXT NOT NULL,
@@ -1709,7 +1710,14 @@ def validate_complete_page_fetch(
                 ).encode("utf-8")
             )
 
-    for outcome in PageOutcomeStore(result.outcomes_path).iter(
+    outcome_store = PageOutcomeStore(
+        result.outcomes_path,
+        write_tracker=GuardedWriteTracker(
+            result.outcomes_path,
+            pre_write_guard,
+        ),
+    )
+    for outcome in outcome_store.iter(
         result.policy_fingerprint
     ):
         canonical = {
@@ -1755,7 +1763,7 @@ def validate_complete_page_fetch(
             outcome,
             int(outcome["affected_reference_count"]),
         )
-        for outcome in PageOutcomeStore(result.outcomes_path).iter(
+        for outcome in outcome_store.iter(
             result.policy_fingerprint
         )
         if outcome["status"] == "terminal"

@@ -828,6 +828,7 @@ class ImageOutcomeStore:
                 "ATTACH DATABASE ? AS outcomes_db",
                 (str(self.path),),
             )
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE current_image_job_keys (
@@ -2448,7 +2449,13 @@ def iter_image_failures(
         unique_jobs=result.unique_jobs,
         pre_write_guard=pre_write_guard,
     )
-    outcome_store = ImageOutcomeStore(result.outcomes_path)
+    outcome_store = ImageOutcomeStore(
+        result.outcomes_path,
+        write_tracker=GuardedWriteTracker(
+            result.outcomes_path,
+            pre_write_guard,
+        ),
+    )
     aggregation_database = Path(aggregation_database)
     write_tracker = GuardedWriteTracker(
         aggregation_database,
@@ -2460,6 +2467,7 @@ def iter_image_failures(
         connection.row_factory = sqlite3.Row
         connection.executescript(
             """
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS current_image_failure_jobs (
                 url_key TEXT PRIMARY KEY,
                 entity_id TEXT NOT NULL,
@@ -2859,7 +2867,13 @@ def _validate_complete_image_fetch(
         raise ValueError("image fetch outcome path mismatch")
     if not result.outcomes_path.is_file():
         raise ValueError("image fetch outcome store is missing")
-    outcome_store = ImageOutcomeStore(result.outcomes_path)
+    outcome_store = ImageOutcomeStore(
+        result.outcomes_path,
+        write_tracker=GuardedWriteTracker(
+            result.outcomes_path,
+            pre_write_guard,
+        ),
+    )
     outcome_snapshot = outcome_store.snapshot_for_jobs(
         result.policy_fingerprint,
         unique_jobs,
@@ -2896,7 +2910,10 @@ def _validate_complete_image_fetch(
     if not result.job_store_path.is_file():
         raise ValueError("image fetch durable job store is missing")
     job_snapshot = _job_snapshot(
-        SqliteJobStore(result.job_store_path),
+        SqliteJobStore(
+            result.job_store_path,
+            pre_write_guard=pre_write_guard,
+        ),
         result.job_kind,
     )
     expected_jobs = manifest.get("job_store") or {}
@@ -3125,7 +3142,13 @@ def materialize_asset_shards(
     if resumed is not None:
         return resumed
 
-    outcome_store = ImageOutcomeStore(fetch_result.outcomes_path)
+    outcome_store = ImageOutcomeStore(
+        fetch_result.outcomes_path,
+        write_tracker=GuardedWriteTracker(
+            fetch_result.outcomes_path,
+            pre_write_guard,
+        ),
+    )
     asset_writer = _BoundedShardWriter(
         output_root / "bridge_assets",
         records_per_shard,

@@ -791,10 +791,14 @@ def test_complete_page_fetch_validator_binds_jobs_refs_and_snapshots(
         FetchPolicy(),
     )
 
+    guarded_paths: list[Path] = []
     snapshot = validate_complete_page_fetch(
         result,
         refs,
         validation_database=tmp_path / "validate.sqlite3",
+        pre_write_guard=lambda path, _size=0: guarded_paths.append(
+            Path(path)
+        ),
     )
 
     assert snapshot["unique"] == 2
@@ -802,6 +806,8 @@ def test_complete_page_fetch_validator_binds_jobs_refs_and_snapshots(
     assert snapshot["terminal"] == 1
     assert len(snapshot["identity"]) == 64
     assert snapshot["failure_records"] == 1
+    assert result.outcomes_path in guarded_paths
+    assert tmp_path / "validate.sqlite3" in guarded_paths
 
     with pytest.raises(ValueError, match="reference"):
         validate_complete_page_fetch(
