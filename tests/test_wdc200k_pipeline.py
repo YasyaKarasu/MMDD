@@ -1005,6 +1005,85 @@ def test_progress_restores_bounded_samples_across_process_resume(
     ] == [0, 2]
 
 
+def test_progress_resume_survives_wall_clock_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        completed_units=0,
+        total_units=4,
+        rate_basis="page_urls",
+    )
+    clock[0] = 110.0
+    first.update(completed_units=2)
+    first.publish()
+
+    clock[0] = 50.0
+    resumed = ProgressReporter(config)
+    resumed.update(
+        stage="pages",
+        completed_units=3,
+        total_units=4,
+        rate_basis="page_urls",
+    )
+    clock[0] = 51.0
+    resumed.update(completed_units=4)
+    resumed.publish()
+    payload = json.loads(resumed.path.read_text(encoding="utf-8"))
+    samples = payload["stage_telemetry"]["pages"]["samples"]
+
+    assert [sample["timestamp"] for sample in samples] == sorted(
+        sample["timestamp"] for sample in samples
+    )
+    assert payload["stage_telemetry"]["pages"]["completed_at"] >= (
+        samples[-1]["timestamp"]
+    )
+    ProgressReporter(config)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda telemetry: telemetry["samples"][0].__setitem__(
+            "timestamp", float("nan")
+        ),
+        lambda telemetry: telemetry.__setitem__("completed_units", 999),
+        lambda telemetry: telemetry.__setitem__(
+            "eligible_final_half_samples", -1
+        ),
+    ],
+)
+def test_progress_restore_rejects_tampered_unit_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: Any,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        completed_units=0,
+        total_units=2,
+        rate_basis="page_urls",
+    )
+    clock[0] = 1.0
+    reporter.update(completed_units=1)
+    reporter.publish()
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    tamper(payload["stage_telemetry"]["pages"])
+    reporter.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="progress"):
+        ProgressReporter(config)
+
+
 def test_tree_bytes_tolerates_files_removed_during_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

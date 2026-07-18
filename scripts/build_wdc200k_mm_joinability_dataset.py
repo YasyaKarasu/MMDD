@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -368,12 +369,44 @@ class ProgressReporter:
         self._state = _ProgressState()
         self._rolling_samples: deque[tuple[float, int]] = deque()
         self._stage_telemetry: dict[str, dict[str, Any]] = {}
+        self._logical_clock_offset = 0.0
+        self._logical_time_floor = float("-inf")
         self._restore_stage_telemetry()
         self._pre_write_guard = pre_write_guard
         self._lock = threading.Lock()
         self._publish_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _eta_completion_summary(
+        samples: Sequence[dict[str, Any]],
+        *,
+        total: int,
+        completed_at: float,
+    ) -> dict[str, Any]:
+        eligible = 0
+        excluded = 0
+        factors: list[float] = []
+        for sample in samples:
+            completed = int(sample["completed_units"])
+            if total > 0 and completed * 2 < total:
+                continue
+            predicted = sample["predicted_remaining_seconds"]
+            actual = completed_at - float(sample["timestamp"])
+            if predicted is None or float(predicted) <= 0 or actual <= 0:
+                excluded += 1
+                continue
+            eligible += 1
+            predicted_value = float(predicted)
+            factors.append(
+                max(predicted_value / actual, actual / predicted_value)
+            )
+        return {
+            "eligible_final_half_samples": eligible,
+            "excluded_final_half_samples": excluded,
+            "max_symmetric_eta_factor": max(factors) if factors else None,
+        }
 
     def _restore_stage_telemetry(self) -> None:
         """Restore only bounded URL telemetry from an atomic prior snapshot."""
@@ -398,11 +431,18 @@ class ProgressReporter:
             samples = raw.get("samples")
             if not isinstance(rate_basis, str) or not rate_basis:
                 raise ValueError("progress rate_basis is invalid")
+            expected_basis = {
+                "pages": "page_urls",
+                "images": "image_urls",
+            }.get(stage)
+            if rate_basis != expected_basis:
+                raise ValueError("progress rate_basis does not match stage")
             if not isinstance(samples, list) or len(samples) > self._MAX_STAGE_SAMPLES:
                 raise ValueError("progress stage samples are not bounded")
             restored_samples: list[dict[str, Any]] = []
             previous_completed = -1
             previous_timestamp = float("-inf")
+            previous_total = -1
             for sample in samples:
                 if not isinstance(sample, dict):
                     raise ValueError("progress stage sample is invalid")
@@ -416,8 +456,21 @@ class ProgressReporter:
                     None if predicted_raw is None else float(predicted_raw)
                 )
                 if (
-                    timestamp < previous_timestamp
+                    not all(
+                        math.isfinite(value)
+                        for value in (
+                            timestamp,
+                            rate,
+                            rolling_rate,
+                        )
+                    )
+                    or (
+                        predicted is not None
+                        and not math.isfinite(predicted)
+                    )
+                    or timestamp < previous_timestamp
                     or completed < previous_completed
+                    or total < previous_total
                     or completed < 0
                     or total < completed
                     or rate < 0
@@ -425,6 +478,21 @@ class ProgressReporter:
                     or (predicted is not None and predicted < 0)
                 ):
                     raise ValueError("progress stage samples are not monotonic")
+                remaining = total - completed
+                expected_predicted = remaining / rate if rate > 0 else None
+                if (
+                    (expected_predicted is None) != (predicted is None)
+                    or (
+                        expected_predicted is not None
+                        and not math.isclose(
+                            float(predicted),
+                            expected_predicted,
+                            rel_tol=1e-12,
+                            abs_tol=1e-12,
+                        )
+                    )
+                ):
+                    raise ValueError("progress ETA sample is inconsistent")
                 restored_samples.append(
                     {
                         "timestamp": timestamp,
@@ -437,40 +505,124 @@ class ProgressReporter:
                 )
                 previous_completed = completed
                 previous_timestamp = timestamp
+                previous_total = total
+                self._logical_time_floor = max(
+                    self._logical_time_floor,
+                    timestamp,
+                )
             completed_at_raw = raw.get("completed_at")
             last_sample = restored_samples[-1] if restored_samples else None
+            if last_sample is None:
+                raise ValueError("progress stage telemetry has no samples")
+            restored_completed = int(raw.get("completed_units", -1))
+            restored_total = int(raw.get("total_units", -1))
+            if (
+                restored_completed < 0
+                or restored_total < restored_completed
+                or restored_completed != int(last_sample["completed_units"])
+                or restored_total != int(last_sample["total_units"])
+            ):
+                raise ValueError("progress stage summary is inconsistent")
+            completed_at = (
+                None
+                if completed_at_raw is None
+                else float(completed_at_raw)
+            )
+            if completed_at is not None and (
+                not math.isfinite(completed_at)
+                or completed_at < float(last_sample["timestamp"])
+                or restored_completed != restored_total
+            ):
+                raise ValueError("progress completed_at is inconsistent")
+            if completed_at is None and restored_completed == restored_total:
+                raise ValueError("progress completed stage lacks completed_at")
+            persisted_eligible = int(
+                raw.get("eligible_final_half_samples", -1)
+            )
+            persisted_excluded = int(
+                raw.get("excluded_final_half_samples", -1)
+            )
+            persisted_factor_raw = raw.get("max_symmetric_eta_factor")
+            persisted_factor = (
+                None
+                if persisted_factor_raw is None
+                else float(persisted_factor_raw)
+            )
+            if (
+                persisted_eligible < 0
+                or persisted_excluded < 0
+                or (
+                    persisted_factor is not None
+                    and (
+                        not math.isfinite(persisted_factor)
+                        or persisted_factor < 1.0
+                    )
+                )
+            ):
+                raise ValueError("progress ETA summary is invalid")
+            expected_summary = (
+                {
+                    "eligible_final_half_samples": 0,
+                    "excluded_final_half_samples": 0,
+                    "max_symmetric_eta_factor": None,
+                }
+                if completed_at is None
+                else self._eta_completion_summary(
+                    restored_samples,
+                    total=restored_total,
+                    completed_at=completed_at,
+                )
+            )
+            expected_factor = expected_summary["max_symmetric_eta_factor"]
+            if (
+                persisted_eligible
+                != expected_summary["eligible_final_half_samples"]
+                or persisted_excluded
+                != expected_summary["excluded_final_half_samples"]
+                or (expected_factor is None) != (persisted_factor is None)
+                or (
+                    expected_factor is not None
+                    and not math.isclose(
+                        float(persisted_factor),
+                        float(expected_factor),
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                )
+            ):
+                raise ValueError("progress ETA summary is inconsistent")
             self._stage_telemetry[stage] = {
                 "rate_basis": rate_basis,
                 "samples": restored_samples,
-                "completed_units": int(
-                    raw.get(
-                        "completed_units",
-                        0 if last_sample is None else last_sample["completed_units"],
-                    )
-                ),
-                "total_units": int(
-                    raw.get(
-                        "total_units",
-                        0 if last_sample is None else last_sample["total_units"],
-                    )
-                ),
-                "completed_at": (
-                    None
-                    if completed_at_raw is None
-                    else float(completed_at_raw)
-                ),
-                "eligible_final_half_samples": int(
-                    raw.get("eligible_final_half_samples", 0)
-                ),
-                "excluded_final_half_samples": int(
-                    raw.get("excluded_final_half_samples", 0)
-                ),
-                "max_symmetric_eta_factor": (
-                    None
-                    if raw.get("max_symmetric_eta_factor") is None
-                    else float(raw["max_symmetric_eta_factor"])
-                ),
+                "completed_units": restored_completed,
+                "total_units": restored_total,
+                "completed_at": completed_at,
+                **expected_summary,
             }
+            if completed_at is not None:
+                self._logical_time_floor = max(
+                    self._logical_time_floor,
+                    completed_at,
+                )
+        if math.isfinite(self._logical_time_floor):
+            wall_now = time.time()
+            if not math.isfinite(wall_now):
+                raise ValueError("progress wall clock is invalid")
+            self._logical_clock_offset = max(
+                0.0,
+                self._logical_time_floor - wall_now,
+            )
+
+    def _progress_now_locked(self) -> float:
+        wall_now = time.time()
+        if not math.isfinite(wall_now):
+            raise ValueError("progress wall clock is invalid")
+        candidate = wall_now + self._logical_clock_offset
+        if candidate < self._logical_time_floor:
+            self._logical_clock_offset += self._logical_time_floor - candidate
+            candidate = self._logical_time_floor
+        self._logical_time_floor = candidate
+        return candidate
 
     def start(self) -> None:
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -588,7 +740,7 @@ class ProgressReporter:
                 raise ValueError("completed_units exceeds total_units")
             changed = monotonic_completed != self._state.completed_units
             self._state.completed_units = monotonic_completed
-        now = time.time()
+        now = self._progress_now_locked()
         if self._state.unit_baseline_at is None:
             self._state.unit_baseline_at = now
             self._state.unit_baseline_completed = self._state.completed_units
@@ -694,37 +846,23 @@ class ProgressReporter:
         telemetry = self._stage_telemetry.get(self._state.stage)
         if telemetry is None or telemetry["completed_at"] is not None:
             return
-        completed_at = time.time()
-        eligible = 0
-        excluded = 0
-        factors: list[float] = []
+        completed_at = self._progress_now_locked()
         total = self._state.total_units
-        for sample in telemetry["samples"]:
-            completed = int(sample["completed_units"])
-            if total > 0 and completed * 2 < total:
-                continue
-            predicted = sample["predicted_remaining_seconds"]
-            actual = completed_at - float(sample["timestamp"])
-            if predicted is None or float(predicted) <= 0 or actual <= 0:
-                excluded += 1
-                continue
-            eligible += 1
-            predicted_value = float(predicted)
-            factors.append(
-                max(predicted_value / actual, actual / predicted_value)
-            )
         telemetry.update(
             {
                 "completed_at": completed_at,
-                "eligible_final_half_samples": eligible,
-                "excluded_final_half_samples": excluded,
-                "max_symmetric_eta_factor": max(factors) if factors else None,
+                **self._eta_completion_summary(
+                    telemetry["samples"],
+                    total=total,
+                    completed_at=completed_at,
+                ),
             }
         )
 
     def _snapshot(self) -> dict[str, Any]:
         with self._lock:
             now = time.time()
+            unit_now = self._progress_now_locked()
             elapsed = max(0.0, now - self._state.stage_started_at)
             complete = self._state.completed_shards
             total = self._state.total_shards
@@ -747,7 +885,7 @@ class ProgressReporter:
                     )
             remaining = max(0, total - complete)
             shard_eta = remaining / rate if rate > 0 else None
-            unit_rate, unit_rolling_rate = self._unit_rates_locked(now)
+            unit_rate, unit_rolling_rate = self._unit_rates_locked(unit_now)
             unit_remaining = max(
                 0,
                 self._state.total_units - self._state.completed_units,
