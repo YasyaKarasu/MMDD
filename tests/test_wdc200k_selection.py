@@ -13,6 +13,7 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import wdc200k_selection as selection_module  # noqa: E402
 from wdc200k_selection import (  # noqa: E402
     ReserveExhaustedError,
     ReserveManager,
@@ -21,6 +22,7 @@ from wdc200k_selection import (  # noqa: E402
     allocate_strata,
     read_statistics_catalog,
     replace_invalid_selection,
+    run_selection,
     select_tables,
 )
 
@@ -651,6 +653,85 @@ def test_reserve_manager_streams_selection_jsonl_from_cli_schema(
         )
         == replacement
     )
+
+
+def test_reserve_database_guard_failure_preserves_selection_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    work_dir = tmp_path / "work"
+    make_statistics_zip(
+        input_dir,
+        schema_class="Product",
+        subsets={
+            "minimum3": [
+                (f"host-{index}.test", index + 1, 3)
+                for index in range(8)
+            ]
+        },
+    )
+    policy = SelectionPolicy(target_tables=2)
+    run_selection(
+        input_dir,
+        work_dir,
+        policy,
+        sort_chunk_records=2,
+    )
+    selection_dir = work_dir / "selection"
+    checkpoint_paths = [
+        selection_dir / "manifest.json",
+        selection_dir / "selected_tables.jsonl",
+        selection_dir / "reserve_tables.jsonl",
+    ]
+    checkpoint_bytes = {
+        path: path.read_bytes() for path in checkpoint_paths
+    }
+    monkeypatch.setattr(
+        selection_module,
+        "_RESERVE_CREATE_BATCH_RECORDS",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        selection_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        16 * 1024,
+    )
+    calls: list[tuple[Path, int]] = []
+    commit_checks = 0
+
+    def guard(path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal commit_checks
+        calls.append((path, estimated_bytes))
+        if estimated_bytes == 0:
+            commit_checks += 1
+            if commit_checks == 3:
+                raise OSError("reserve exhausted mid-batch")
+
+    database_path = selection_dir / "reserve.sqlite3"
+    with pytest.raises(OSError, match="reserve exhausted mid-batch"):
+        ReserveManager.create_from_jsonl(
+            database_path,
+            reserve_path=selection_dir / "reserve_tables.jsonl",
+            selected_path=selection_dir / "selected_tables.jsonl",
+            policy=policy,
+            pre_write_guard=guard,
+        )
+
+    assert not database_path.exists()
+    assert {
+        path: path.read_bytes() for path in checkpoint_paths
+    } == checkpoint_bytes
+    assert not list(selection_dir.glob(".reserve.sqlite3.*.tmp"))
+    guarded_paths = {path for path, _estimated in calls}
+    assert len(guarded_paths) == 1
+    guarded_path = guarded_paths.pop()
+    assert guarded_path.parent == selection_dir
+    assert guarded_path.name.startswith(".reserve.sqlite3.")
+    assert guarded_path.name.endswith(".tmp")
+    positive_checks = [size for _path, size in calls if size > 0]
+    assert 0 < len(positive_checks) < 4
 
 
 def test_reserve_manager_create_does_not_reuse_fixed_temporary_path(

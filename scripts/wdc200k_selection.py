@@ -22,6 +22,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedWriteTracker,
         PreWriteGuard,
         StageFingerprint,
         StageManifest,
@@ -35,6 +36,7 @@ except ModuleNotFoundError as error:
     from scripts.wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedWriteTracker,
         PreWriteGuard,
         StageFingerprint,
         StageManifest,
@@ -46,6 +48,7 @@ except ModuleNotFoundError as error:
 
 SUBSETS = ("top100", "minimum3", "rest")
 _SUBSET_PRIORITY = {subset: index for index, subset in enumerate(SUBSETS)}
+_RESERVE_CREATE_BATCH_RECORDS = 1_000
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,23 @@ class TableCandidate:
     relative_path: str
     rows: int
     columns: int
+
+
+def _candidate_sqlite_payload_bytes(
+    candidate: TableCandidate,
+    *,
+    selected: bool,
+) -> int:
+    payload_bytes = len(
+        json.dumps(
+            asdict(candidate),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    index_copies = 8 if selected else 5
+    return 4096 + index_copies * payload_bytes
 
 
 @dataclass(frozen=True)
@@ -535,14 +555,20 @@ class ReserveManager:
         reserve: Iterable[TableCandidate],
         selected: Iterable[TableCandidate],
         policy: SelectionPolicy,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> ReserveManager:
         """Atomically build indexed reserve state without materializing input."""
         if database_path.exists():
             raise FileExistsError(database_path)
-        database_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = database_path.parent / (
             f".{database_path.name}.{uuid.uuid4().hex}.tmp"
         )
+        write_tracker = GuardedWriteTracker(
+            temporary_path,
+            pre_write_guard,
+        )
+        write_tracker.before_write(64 * 1024)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(temporary_path)
         try:
             connection.execute("PRAGMA synchronous=FULL")
@@ -617,8 +643,15 @@ class ReserveManager:
                 "INSERT INTO metadata (key, value) VALUES ('policy', ?)",
                 (json.dumps(asdict(policy), sort_keys=True),),
             )
+            pending_batch_records = 0
             for ordinal, candidate in enumerate(reserve):
                 _validate_candidate_subset(candidate)
+                write_tracker.before_write(
+                    _candidate_sqlite_payload_bytes(
+                        candidate,
+                        selected=False,
+                    )
+                )
                 try:
                     connection.execute(
                         """
@@ -650,10 +683,21 @@ class ReserveManager:
                     """,
                     (candidate.schema_class,),
                 )
+                pending_batch_records += 1
+                if pending_batch_records >= _RESERVE_CREATE_BATCH_RECORDS:
+                    write_tracker.before_commit(0)
+                    connection.commit()
+                    pending_batch_records = 0
 
             selected_count = 0
             for candidate in selected:
                 _validate_candidate_subset(candidate)
+                write_tracker.before_write(
+                    _candidate_sqlite_payload_bytes(
+                        candidate,
+                        selected=True,
+                    )
+                )
                 try:
                     connection.execute(
                         """
@@ -702,6 +746,11 @@ class ReserveManager:
                     """,
                     (candidate.relative_path,),
                 )
+                pending_batch_records += 1
+                if pending_batch_records >= _RESERVE_CREATE_BATCH_RECORDS:
+                    write_tracker.before_commit(0)
+                    connection.commit()
+                    pending_batch_records = 0
 
             if selected_count != policy.target_tables:
                 raise ValueError(
@@ -723,6 +772,7 @@ class ReserveManager:
                     f"selected class {over_cap[0]} has {over_cap[1]} "
                     f"tables above class cap {policy.class_cap}"
                 )
+            write_tracker.before_commit(0)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -751,6 +801,7 @@ class ReserveManager:
         reserve_path: Path,
         selected_path: Path,
         policy: SelectionPolicy,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> ReserveManager:
         """Build persistent reserve state by streaming CLI selection JSONL."""
         return cls.create(
@@ -758,6 +809,7 @@ class ReserveManager:
             reserve=_iter_candidate_jsonl(reserve_path),
             selected=_iter_candidate_jsonl(selected_path),
             policy=policy,
+            pre_write_guard=pre_write_guard,
         )
 
     @classmethod
