@@ -1561,6 +1561,72 @@ def test_progress_restore_rejects_files_above_four_mibibytes(
         ProgressReporter(config)
 
 
+@pytest.mark.parametrize("from_stage", [None, "pages"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(
+            lambda payload: payload.pop("disk"),
+            id="missing-disk",
+        ),
+        pytest.param(
+            lambda payload: payload["disk"].pop("roots"),
+            id="missing-roots",
+        ),
+        pytest.param(
+            lambda payload: payload["disk"]["roots"].pop("cache"),
+            id="missing-one-root",
+        ),
+    ],
+)
+def test_progress_v2_restore_requires_complete_disk_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: Any,
+    from_stage: str | None,
+) -> None:
+    config, path = _published_v2_progress(tmp_path, monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tamper(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="disk roots"):
+        ProgressReporter(replace(config, from_stage=from_stage))
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(
+            lambda root: root.pop("peak_bytes"),
+            id="missing-extremum",
+        ),
+        pytest.param(
+            lambda root: root.__setitem__("min_free_bytes", -1),
+            id="negative-extremum",
+        ),
+        pytest.param(
+            lambda root: root.__setitem__(
+                "current_bytes", root["peak_bytes"] + 1
+            ),
+            id="inconsistent-extrema",
+        ),
+    ],
+)
+def test_progress_v2_restore_requires_valid_disk_extrema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: Any,
+) -> None:
+    config, path = _published_v2_progress(tmp_path, monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tamper(payload["disk"]["roots"]["work"])
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="progress disk"):
+        ProgressReporter(config)
+
+
 def _published_v2_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

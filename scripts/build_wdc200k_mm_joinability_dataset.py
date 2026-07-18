@@ -586,6 +586,22 @@ class ProgressReporter:
         raw_stages = payload.get("stage_telemetry", {})
         if not isinstance(raw_stages, dict):
             raise ValueError("progress stage_telemetry must be an object")
+        has_v2_telemetry = any(
+            isinstance(raw, dict)
+            and isinstance(raw.get("samples"), list)
+            and any(
+                isinstance(sample, dict)
+                and "telemetry_schema_version" in sample
+                for sample in raw["samples"]
+            )
+            for raw in raw_stages.values()
+        )
+        if has_v2_telemetry and set(self._disk_roots) != {
+            "work",
+            "cache",
+            "output",
+        }:
+            raise ValueError("progress v2 disk roots are incomplete")
         invalidated: set[str] = set()
         if self.config.from_stage is not None:
             invalidated = set(STAGES[STAGES.index(self.config.from_stage) :])
