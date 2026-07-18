@@ -959,11 +959,23 @@ def _refresh_page_url_counts(
     policy_fingerprint: str,
 ) -> DurableUrlCounts:
     """Refresh indexed durable page-job counts without materializing URLs."""
-    with store._connect() as connection:
+    connection = store._connect()
+    transaction_started = False
+    try:
         connection.execute(
             "ATTACH DATABASE ? AS page_progress_outcomes",
             (str(outcomes_path),),
         )
+        connection.execute("BEGIN")
+        transaction_started = True
+        connection.execute(
+            """
+            SELECT 1
+            FROM page_progress_outcomes.page_outcomes
+            WHERE policy_fingerprint = ? AND url_key = ''
+            """,
+            (policy_fingerprint,),
+        ).fetchone()
         status_counts = {
             str(row["status"]): int(row["count"])
             for row in connection.execute(
@@ -993,6 +1005,14 @@ def _refresh_page_url_counts(
                 (policy_fingerprint, kind),
             ).fetchone()[0]
         )
+        connection.commit()
+        transaction_started = False
+    except BaseException:
+        if transaction_started:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
     return DurableUrlCounts(
         completed=completed,
         pending=(

@@ -1302,6 +1302,107 @@ def test_image_url_refresh_uses_kind_status_and_outcome_key_indexes(
     )
 
 
+def test_image_url_refresh_uses_one_snapshot_during_external_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    outcomes = ImageOutcomeStore(outcomes_path)
+    kind = "wdc200k-image:policy:set"
+    policy = "policy"
+    image_url = "https://i.test/concurrent.jpg"
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    jobs.enqueue(kind, "job", {"url_key": url_key})
+    claimed = jobs.claim(kind, 1, "other", lease_seconds=60)[0]
+    status_query_started = threading.Event()
+    writer_committed = threading.Event()
+    refresh_closed = threading.Event()
+    writer_errors: list[BaseException] = []
+    original_connect = jobs._connect
+
+    class BarrierConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def execute(self, sql: str, parameters=()):
+            cursor = self.connection.execute(sql, parameters)
+            normalized = " ".join(sql.casefold().split())
+            if normalized.startswith("select status, count(*) as count"):
+                status_query_started.set()
+                assert writer_committed.wait(timeout=5)
+            return cursor
+
+        def close(self) -> None:
+            refresh_closed.set()
+            self.connection.close()
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+        def __enter__(self):
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.connection.__exit__(*args)
+
+    monkeypatch.setattr(
+        jobs,
+        "_connect",
+        lambda: BarrierConnection(original_connect()),
+    )
+
+    def finish_elsewhere() -> None:
+        try:
+            assert status_query_started.wait(timeout=5)
+            outcomes.put(
+                policy,
+                url_key,
+                image_url,
+                {
+                    "status": "terminal",
+                    "image_url": image_url,
+                    "original_url": image_url,
+                    "error_class": "done",
+                },
+            )
+            with original_connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'terminal', owner = NULL,
+                        lease_expires = NULL, lease_id = NULL
+                    WHERE job_id = ? AND lease_id = ?
+                    """,
+                    (claimed.job_id, claimed.lease_id),
+                )
+                connection.commit()
+        except BaseException as error:
+            writer_errors.append(error)
+        finally:
+            writer_committed.set()
+
+    writer = threading.Thread(target=finish_elsewhere)
+    writer.start()
+    try:
+        counts = assets_module._refresh_image_url_counts(
+            jobs, kind, outcomes_path, policy
+        )
+    finally:
+        writer.join(timeout=5)
+
+    assert not writer_errors
+    assert not writer.is_alive()
+    assert refresh_closed.is_set()
+    assert (counts.completed, counts.pending, counts.leased, counts.total) == (
+        0,
+        0,
+        1,
+        1,
+    )
+
+
 def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
     tmp_path: Path,
 ) -> None:
