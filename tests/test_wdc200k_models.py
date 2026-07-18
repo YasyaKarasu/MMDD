@@ -47,6 +47,63 @@ def model_args(
     )
 
 
+def test_model_schema_initialization_commit_uses_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.sqlite3"
+    SqliteJobStore(path)
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("model schema reserve exhausted")
+
+    with pytest.raises(OSError, match="model schema reserve"):
+        models._initialize_tables(
+            path,
+            pre_write_guard=reject_commit,
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'model_jobsets'"
+        ).fetchone() == (0,)
+
+
+def test_model_jobset_initial_commit_uses_store_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.sqlite3"
+    zero_checks = 0
+
+    def reject_jobset_commit(
+        _path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 5:
+                raise OSError("model jobset reserve exhausted")
+
+    store = SqliteJobStore(path, pre_write_guard=reject_jobset_commit)
+    with pytest.raises(OSError, match="model jobset reserve"):
+        enqueue_model_tasks(
+            [asset("guarded")],
+            store,
+            args=model_args(),
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_jobsets"
+        ).fetchone() == (0,)
+
+
 def asset(
     asset_id: str,
     asset_type: str = "text",
@@ -327,7 +384,7 @@ def test_enqueue_staging_database_uses_guarded_controlled_directory(
     assert jobset.total_tasks == 2
     assert any(size > 0 for _path, size in staging_calls)
     assert any(size == 0 for _path, size in staging_calls)
-    assert list(staging_dir.iterdir()) == []
+    assert not staging_dir.exists() or list(staging_dir.iterdir()) == []
 
 
 def test_enqueue_staging_database_is_cleaned_when_initial_guard_fails(
@@ -348,7 +405,7 @@ def test_enqueue_staging_database_is_cleaned_when_initial_guard_fails(
             pre_write_guard=reject_staging,
         )
 
-    assert list(staging_dir.iterdir()) == []
+    assert not staging_dir.exists() or list(staging_dir.iterdir()) == []
 
 
 def test_model_result_writes_are_amortized_but_commits_recheck_live_disk(
@@ -925,18 +982,18 @@ def test_first_model_result_commit_guard_rolls_back_prepared_record(
         "DEFAULT_INTERVAL_BYTES",
         1,
     )
-    armed = False
+    zero_checks = 0
 
     def reject_first_commit(
         path: Path,
         estimated_bytes: int = 0,
     ) -> None:
-        nonlocal armed
+        nonlocal zero_checks
         if Path(path) != store.path:
             return
-        if estimated_bytes > 0:
-            armed = True
-        elif armed:
+        if estimated_bytes == 0:
+            zero_checks += 1
+        if zero_checks == 5:
             raise OSError("prepared result commit reserve exhausted")
 
     with pytest.raises(OSError, match="prepared result commit reserve"):

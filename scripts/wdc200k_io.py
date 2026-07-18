@@ -399,6 +399,7 @@ class SqliteJobStore:
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -426,7 +427,11 @@ class SqliteJobStore:
                 ON jobs(kind, status, updated_at)
                 """
             )
+            self._write_tracker.before_commit(0)
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

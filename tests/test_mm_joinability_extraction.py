@@ -987,6 +987,26 @@ def test_dynamic_vllm_default_runtime_is_work_runtime(
     assert popen_kwargs["start_new_session"] is True
 
 
+def test_dynamic_vllm_default_builder_is_wdc200k() -> None:
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+        ]
+    )
+
+    assert Path(args.builder_script).name == (
+        "build_wdc200k_mm_joinability_dataset.py"
+    )
+    assert passthrough == []
+
+
 def test_dynamic_vllm_preserves_required_explicit_runtime_dir(
     monkeypatch,
     tmp_path,
@@ -1042,7 +1062,12 @@ def test_dynamic_vllm_rejects_runtime_outside_work_before_any_write(
     "option",
     [
         "--runtime_dir=escape",
+        "--text_model_base_url=http://escape/v1",
         "--text_model_base_urls_file=escape",
+        "--text_model_name=escape",
+        "--image_model_base_url=http://escape/v1",
+        "--image_model_name=escape",
+        "--run_fingerprint=escape",
         "--model_start_marker=escape",
     ],
 )

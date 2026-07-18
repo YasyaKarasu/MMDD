@@ -273,7 +273,10 @@ class ImageOutcomeStore:
         write_tracker: GuardedWriteTracker | None = None,
     ) -> None:
         self.path = Path(path)
-        self._write_tracker = write_tracker
+        self._write_tracker = write_tracker or GuardedWriteTracker(
+            self.path,
+            None,
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
@@ -337,6 +340,7 @@ class ImageOutcomeStore:
             }
             if not required_claim_columns <= claim_columns:
                 raise ValueError("image URL claim schema is incompatible")
+            self._write_tracker.before_commit(0)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -1116,6 +1120,7 @@ def iter_entity_page_join(
             )
             """
         )
+        write_tracker.before_commit(0)
         connection.commit()
 
         pending = 0

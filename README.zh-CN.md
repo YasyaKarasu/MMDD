@@ -380,23 +380,21 @@ WDC `image` 属性里的直接图片已经下载成功，也不会跳过网页�
 
 ```bash
 conda run -n MMDD python scripts/run_mm_joinability_dynamic_vllm.py \
-  --builder_script scripts/build_wdc_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_mm_joinability_run_001 \
+  --work_dir work_wdc_mm_joinability_run_001 \
   --text_model_path /path/to/text-model \
   --image_model_path /path/to/vision-model \
   --cache_dir cache/wdc_mm_joinability_run_001 \
   --max_source_tables 100 \
-  --max_scanned_files 1000 \
-  --max_rows_per_source_table 100 \
-  --max_images_per_entity 2 \
-  --web_workers 4
+  --max_image_attempts_per_entity 3 \
+  --max_images_per_entity 3 \
+  --web_global_concurrency 16
 ```
 
 runner 会自动传入 `--precompute_model_cache`、两个模态的 endpoint files，
-以及 model start/ready/done markers。若手工管理 endpoint 池，可使用
-`--text_model_base_urls_file` 和 `--image_model_base_urls_file`；builder 会在请求前
-重新读取文件。
+以及 model start/ready/done markers。runner 对 endpoint、模型 identity 和 marker
+参数拥有唯一控制权；如果要手工管理 endpoint 池，请直接运行 builder。
 
 ## Stage-1 逻辑连通性 Pipeline
 

@@ -400,9 +400,17 @@ def _atomic_json(
         raise
 
 
-def _initialize_tables(path: Path) -> None:
-    with _connect(path) as connection:
+def _initialize_tables(
+    path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    tracker = GuardedWriteTracker(path, pre_write_guard)
+    tracker.before_write(64 * 1024)
+    connection = _connect(path)
+    try:
         connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS model_jobsets (
@@ -533,6 +541,13 @@ def _initialize_tables(path: Path) -> None:
             )
             """
         )
+        tracker.before_commit(0)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _model_identity(args: argparse.Namespace, modality: str) -> str:
@@ -710,7 +725,12 @@ def enqueue_model_tasks(
         image_model_name="image",
     )
     store.reserve_write(64 * 1024)
-    _initialize_tables(store.path)
+    effective_guard = (
+        pre_write_guard
+        if pre_write_guard is not None
+        else getattr(store._write_tracker, "guard", None)
+    )
+    _initialize_tables(store.path, pre_write_guard=effective_guard)
     input_by_kind = {
         "text": text_input_fingerprint or input_fingerprint,
         "image": image_input_fingerprint or input_fingerprint,
@@ -756,6 +776,7 @@ def enqueue_model_tasks(
                     now,
                 ),
             )
+        store.guard_commit()
     previews: list[ModelJobInfo] = []
     staging_dir = Path(
         staging_dir or store.path.parent / ".model-enqueue-staging"
@@ -1856,8 +1877,15 @@ def _manifest_identity(jobset: ModelJobSet) -> str:
     )
 
 
-def _latest_jobset(database_path: Path) -> ModelJobSet:
-    _initialize_tables(database_path)
+def _latest_jobset(
+    database_path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> ModelJobSet:
+    _initialize_tables(
+        database_path,
+        pre_write_guard=pre_write_guard,
+    )
     with _connect(database_path) as connection:
         row = connection.execute(
             """
@@ -2475,7 +2503,10 @@ def run_model_stage(
     pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelStageResult:
     """Run bounded claims, durably committing each result before job finish."""
-    jobset = jobset or _latest_jobset(store.path)
+    jobset = jobset or _latest_jobset(
+        store.path,
+        pre_write_guard=pre_write_guard,
+    )
     if jobset.database_path.resolve() != store.path.resolve():
         raise ValueError("model job set belongs to a different job store")
     if group_size <= 0:
@@ -2502,7 +2533,10 @@ def run_model_stage(
         pre_write_guard(store.path, 0)
         pre_write_guard(output_root, 0)
     owner = owner or f"model-worker-{os.getpid()}-{uuid.uuid4().hex}"
-    _initialize_tables(store.path)
+    _initialize_tables(
+        store.path,
+        pre_write_guard=pre_write_guard,
+    )
     if (
         ready_marker is not None
         or text_done_marker is not None

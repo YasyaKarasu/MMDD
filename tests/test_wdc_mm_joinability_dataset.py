@@ -636,7 +636,7 @@ def test_web_client_page_commit_guard_rolls_back_with_window_remaining(
         nonlocal zero_checks
         if estimated_bytes == 0:
             zero_checks += 1
-            if zero_checks == 3:
+            if zero_checks == 4:
                 raise OSError("page cache commit reserve exhausted")
 
     client = WdcWebClient(
@@ -660,6 +660,42 @@ def test_web_client_page_commit_guard_rolls_back_with_window_remaining(
         assert connection.execute(
             "SELECT COUNT(*) FROM page_cache"
         ).fetchone() == (0,)
+
+
+def test_web_client_image_writes_use_actual_target_trackers(tmp_path):
+    guarded_paths: list[Path] = []
+    body = png_bytes()
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    body,
+                    headers={"Content-Type": "image/png"},
+                )
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+        pre_write_guard=lambda path, _size=0: guarded_paths.append(
+            Path(path)
+        ),
+    )
+
+    record = client.download_image(
+        "https://cdn.test/guarded.png",
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="entity-guarded",
+    )
+
+    assert record is not None
+    assert any(path.name.endswith(".download.tmp") for path in guarded_paths)
+    assert any(
+        path.name.startswith("image_") and path.suffix == ".png"
+        for path in guarded_paths
+    )
+    assert any(path == client.image_dir for path in guarded_paths)
 
 
 def test_web_client_requests_identity_content_encoding(tmp_path):

@@ -98,6 +98,28 @@ def test_atomic_shard_guard_failure_before_commit_preserves_checkpoint(
     assert not target.exists()
 
 
+def test_job_store_initialization_commit_uses_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("job init reserve exhausted")
+
+    with pytest.raises(OSError, match="job init reserve"):
+        SqliteJobStore(path, pre_write_guard=reject_commit)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'jobs'"
+        ).fetchone() == (0,)
+
+
 def test_atomic_shard_amortizes_guard_checks_by_byte_window(
     tmp_path: Path,
 ) -> None:
@@ -144,7 +166,7 @@ def test_sqlite_enqueue_commit_rechecks_with_window_remaining(
         nonlocal zero_checks
         if estimated == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("live commit reserve exhausted")
 
     path = tmp_path / "jobs.sqlite3"
@@ -267,7 +289,7 @@ def test_sqlite_job_store_claim_commit_guard_rolls_back_lease(
         nonlocal zero_checks
         if estimated == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("claim commit reserve exhausted")
 
     guarded = SqliteJobStore(
@@ -300,7 +322,7 @@ def test_sqlite_job_store_finish_commit_guard_preserves_lease(
         nonlocal zero_checks
         if estimated == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("finish commit reserve exhausted")
 
     guarded = SqliteJobStore(

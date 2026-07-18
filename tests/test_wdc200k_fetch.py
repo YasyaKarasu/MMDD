@@ -369,7 +369,7 @@ def test_page_outcome_commit_guard_rolls_back_and_resumes(
         nonlocal zero_checks
         if estimated_bytes == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("page outcome commit reserve exhausted")
 
     tracker = fetch_module.GuardedWriteTracker(
@@ -391,6 +391,30 @@ def test_page_outcome_commit_guard_rolls_back_and_resumes(
     assert resumed.counts("policy") == (0, 0)
     resumed.put("policy", "a" * 64, "https://e.test/a", outcome)
     assert resumed.counts("policy") == (1, 0)
+
+
+def test_page_outcome_initialization_commit_uses_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("page init reserve exhausted")
+
+    tracker = fetch_module.GuardedWriteTracker(path, reject_commit)
+    with pytest.raises(OSError, match="page init reserve"):
+        PageOutcomeStore(path, write_tracker=tracker)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'page_outcomes'"
+        ).fetchone() == (0,)
 
 
 def test_legacy_outcome_schema_migrates_once_across_processes(

@@ -631,12 +631,20 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _initialize_index(path: Path) -> None:
+def _initialize_index(
+    path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    tracker = GuardedWriteTracker(path, pre_write_guard)
+    tracker.before_write(64 * 1024)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _connect(path) as connection:
+    connection = _connect(path)
+    try:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(
             """
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
                 source_table_id TEXT NOT NULL,
@@ -786,6 +794,13 @@ def _initialize_index(path: Path) -> None:
                 ADD COLUMN source_row_id INTEGER NOT NULL DEFAULT 0
                 """
             )
+        tracker.before_commit(0)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _insert_identity_record(
@@ -1409,7 +1424,10 @@ def _build_index(
         pre_write_guard,
     )
     write_tracker.before_write(64 * 1024)
-    _initialize_index(inputs.lookup_database)
+    _initialize_index(
+        inputs.lookup_database,
+        pre_write_guard=pre_write_guard,
+    )
     with _connect(inputs.lookup_database) as connection:
         connection.execute("BEGIN IMMEDIATE")
         _index_entities(
@@ -1452,7 +1470,10 @@ def _prepare_authoritative_index(
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     write_tracker.before_write(64 * 1024)
-    _initialize_index(database_path)
+    _initialize_index(
+        database_path,
+        pre_write_guard=pre_write_guard,
+    )
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         stored = connection.execute(

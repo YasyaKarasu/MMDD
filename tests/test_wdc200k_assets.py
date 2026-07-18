@@ -1848,7 +1848,7 @@ def test_image_outcome_put_commit_guard_rolls_back_and_resumes(
         nonlocal zero_checks
         if estimated_bytes == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("image outcome commit reserve exhausted")
 
     tracker = assets_module.GuardedWriteTracker(
@@ -1878,6 +1878,60 @@ def test_image_outcome_put_commit_guard_rolls_back_and_resumes(
     assert resumed.get("policy", url_key)["status"] == "terminal"
 
 
+def test_image_outcome_initialization_commit_uses_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("image init reserve exhausted")
+
+    tracker = assets_module.GuardedWriteTracker(path, reject_commit)
+    with pytest.raises(OSError, match="image init reserve"):
+        ImageOutcomeStore(path, write_tracker=tracker)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'image_outcomes'"
+        ).fetchone() == (0,)
+
+
+def test_entity_page_join_ddl_commit_uses_live_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "join.sqlite3"
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("join init reserve exhausted")
+
+    with pytest.raises(OSError, match="join init reserve"):
+        list(
+            iter_entity_page_join(
+                [],
+                [],
+                join_path=path,
+                pre_write_guard=reject_commit,
+            )
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'entity_pages'"
+        ).fetchone() == (0,)
+
+
 def test_image_url_claim_commit_guard_rolls_back_lease(
     tmp_path: Path,
 ) -> None:
@@ -1889,7 +1943,7 @@ def test_image_url_claim_commit_guard_rolls_back_lease(
         nonlocal zero_checks
         if estimated_bytes == 0:
             zero_checks += 1
-            if zero_checks == 2:
+            if zero_checks == 3:
                 raise OSError("image claim commit reserve exhausted")
 
     tracker = assets_module.GuardedWriteTracker(

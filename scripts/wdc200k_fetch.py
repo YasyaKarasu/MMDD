@@ -123,7 +123,10 @@ class PageOutcomeStore:
         write_tracker: GuardedWriteTracker | None = None,
     ) -> None:
         self.path = Path(path)
-        self._write_tracker = write_tracker
+        self._write_tracker = write_tracker or GuardedWriteTracker(
+            self.path,
+            None,
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
@@ -219,24 +222,43 @@ class PageOutcomeStore:
                 """
             )
             if not counts_existed:
-                connection.execute(
+                counts: dict[str, list[int]] = {}
+                cursor = connection.execute(
+                    """
+                    SELECT policy_fingerprint, status
+                    FROM page_outcomes
+                    ORDER BY policy_fingerprint, url_key
+                    """
+                )
+                while True:
+                    rows = cursor.fetchmany(10_000)
+                    if not rows:
+                        break
+                    self._write_tracker.before_commit(0)
+                    for row in rows:
+                        values = counts.setdefault(
+                            str(row["policy_fingerprint"]),
+                            [0, 0, 0],
+                        )
+                        status = str(row["status"])
+                        values[0] += int(status == "success")
+                        values[1] += int(status == "terminal")
+                        values[2] += 1
+                self._write_tracker.before_write(
+                    max(4 * 1024, len(counts) * 256)
+                )
+                connection.executemany(
                     """
                     INSERT INTO policy_outcome_counts (
                         policy_fingerprint, success, terminal, total
-                    )
-                    SELECT
-                        policy_fingerprint,
-                        SUM(
-                            CASE WHEN status = 'success' THEN 1 ELSE 0 END
-                        ),
-                        SUM(
-                            CASE WHEN status = 'terminal' THEN 1 ELSE 0 END
-                        ),
-                        COUNT(*)
-                    FROM page_outcomes
-                    GROUP BY policy_fingerprint
-                    """
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        (policy, values[0], values[1], values[2])
+                        for policy, values in sorted(counts.items())
+                    ),
                 )
+            self._write_tracker.before_commit(0)
             connection.commit()
         except BaseException:
             connection.rollback()

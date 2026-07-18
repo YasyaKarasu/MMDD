@@ -494,8 +494,13 @@ _RESERVED_BUILDER_OPTIONS = (
     "--input_dir",
     "--output_dir",
     "--runtime_dir",
+    "--text_model_base_url",
     "--text_model_base_urls_file",
+    "--text_model_name",
+    "--image_model_base_url",
     "--image_model_base_urls_file",
+    "--image_model_name",
+    "--run_fingerprint",
     "--model_start_marker",
     "--model_ready_marker",
     "--model_text_done_marker",
@@ -555,7 +560,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
-    parser.add_argument("--builder_script", default=str(Path(__file__).with_name("build_mm_joinability_dataset.py")))
+    parser.add_argument("--builder_script", default=str(Path(__file__).with_name("build_wdc200k_mm_joinability_dataset.py")))
     parser.add_argument("--python_executable", default=sys.executable)
     parser.add_argument("--vllm_dtype", default="bfloat16")
     parser.add_argument("--vllm_max_model_len", type=int, default=8192)

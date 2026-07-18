@@ -462,9 +462,19 @@ class WdcWebClient:
                 "web cache write tracker targets a different database"
             )
         self._write_tracker = write_tracker
+        self._tracker_type = type(write_tracker)
+        self._pre_write_guard = (
+            pre_write_guard
+            if pre_write_guard is not None
+            else getattr(write_tracker, "guard", None)
+        )
         self._write_tracker.before_write(64 * 1024)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.image_dir = self.cache_dir / "wdc_images"
+        self._image_dir_tracker = self._tracker_type(
+            self.image_dir,
+            self._pre_write_guard,
+        )
         self.session = session
         self._session_injected = session is not None
         self._session_headers = {
@@ -513,6 +523,9 @@ class WdcWebClient:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _image_write_tracker(self, path: Path) -> Any:
+        return self._tracker_type(Path(path), self._pre_write_guard)
 
     def _initialize_database(self) -> None:
         existing_bytes = (
@@ -1567,7 +1580,7 @@ class WdcWebClient:
         source: str,
         entity_id: str,
     ) -> dict[str, Any] | None:
-        self._write_tracker.before_commit(0)
+        self._image_dir_tracker.before_commit(0)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         image_key = (
             stable_hash(image_url, length=24)
@@ -1580,6 +1593,7 @@ class WdcWebClient:
         )
         attempt_key = uuid.uuid4().hex
         temporary_path = self.image_dir / f".{image_key}.{attempt_key}.download.tmp"
+        temporary_tracker = self._image_write_tracker(temporary_path)
 
         with self._connect() as connection:
             cached_row = connection.execute(
@@ -1687,7 +1701,9 @@ class WdcWebClient:
                     )
                     if cached_path != content_path:
                         try:
-                            self._write_tracker.before_commit(0)
+                            self._image_write_tracker(
+                                content_path
+                            ).before_commit(0)
                             os.link(cached_path, content_path)
                         except FileExistsError:
                             if self._sha256_path(content_path) != digest:
@@ -1784,7 +1800,7 @@ class WdcWebClient:
                             if not self._reserve_cache_bytes(len(chunk), image=True):
                                 return None
                             reserved_bytes += len(chunk)
-                            self._write_tracker.before_write(len(chunk))
+                            temporary_tracker.before_write(len(chunk))
                             handle.write(chunk)
 
                 source_mime_type = content_type.split(";", 1)[0]
@@ -1816,7 +1832,9 @@ class WdcWebClient:
                             return None
                     else:
                         try:
-                            self._write_tracker.before_commit(0)
+                            self._image_write_tracker(
+                                image_path
+                            ).before_commit(0)
                             os.link(raster_path, image_path)
                             created = True
                         except FileExistsError:
