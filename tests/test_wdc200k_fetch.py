@@ -160,6 +160,42 @@ def test_page_transport_attempts_survive_resume_without_replay(
     assert len(second.transport_attempt_summary["digest"]) == 64
 
 
+def test_page_progress_callback_starts_from_durable_baseline_and_is_bounded(
+    tmp_path: Path,
+) -> None:
+    urls = [f"https://e.test/progress-{index}" for index in range(5)]
+    transport = CountingTransport(
+        {url: {"text": str(index)} for index, url in enumerate(urls)}
+    )
+    jobs = SqliteJobStore(tmp_path / "pages.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    policy = FetchPolicy(global_concurrency=1, per_host_concurrency=1)
+
+    fetch_unique_pages(
+        [page_ref("e0", urls[0])],
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    updates: list[tuple[int, int]] = []
+    result = fetch_unique_pages(
+        [page_ref(f"e{index}", url) for index, url in enumerate(urls)],
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        progress_callback=lambda completed, total: updates.append(
+            (completed, total)
+        ),
+        progress_callback_every=2,
+    )
+
+    assert result.complete
+    assert updates == [(1, 5), (3, 5), (5, 5)]
+    assert updates == sorted(updates)
+
+
 def test_page_transport_summary_is_scoped_to_current_job_store(
     tmp_path: Path,
 ) -> None:

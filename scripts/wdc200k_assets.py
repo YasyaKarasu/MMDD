@@ -1779,6 +1779,36 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
+def _durable_image_completions(
+    store: SqliteJobStore,
+    kind: str,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> int:
+    """Count terminal outcomes for exactly this durable image job set."""
+    with store._connect() as connection:
+        connection.execute(
+            "ATTACH DATABASE ? AS image_progress_outcomes",
+            (str(outcomes_path),),
+        )
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs AS job
+                JOIN image_progress_outcomes.image_outcomes AS outcome
+                  ON outcome.policy_fingerprint = ?
+                 AND outcome.url_key = json_extract(
+                        job.payload_json, '$.url_key'
+                    )
+                WHERE job.kind = ?
+                  AND outcome.status IN ('success', 'terminal')
+                """,
+                (policy_fingerprint, kind),
+            ).fetchone()[0]
+        )
+
+
 def _job_snapshot(store: SqliteJobStore, kind: str) -> dict[str, int]:
     with store._connect() as connection:
         rows = {
@@ -2108,6 +2138,8 @@ def fetch_unique_images(
     url_claim_poll_seconds: float = 0.05,
     after_url_claim: Callable[[ImageUrlLease], None] | None = None,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback_every: int | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> ImageFetchResult:
     """Fetch globally unique image URLs with bounded fair durable jobs."""
@@ -2168,6 +2200,36 @@ def fetch_unique_images(
     enqueued = _job_count(store, kind)
     if enqueued != unique:
         raise ValueError("image job set was not enqueued completely")
+    if progress_callback_every is not None and progress_callback_every <= 0:
+        raise ValueError("progress_callback_every must be positive")
+    callback_interval = (
+        max(1, (unique + 255) // 256)
+        if progress_callback_every is None
+        else int(progress_callback_every)
+    )
+    callback_completed = _durable_image_completions(
+        store,
+        kind,
+        outcomes_path,
+        fingerprint,
+    )
+    callback_last_published = callback_completed
+    if progress_callback is not None:
+        progress_callback(callback_completed, unique)
+
+    def publish_url_progress(*, force: bool = False) -> None:
+        nonlocal callback_last_published
+        if progress_callback is None:
+            return
+        if (
+            force
+            or callback_completed - callback_last_published
+            >= callback_interval
+        ):
+            if callback_completed != callback_last_published:
+                progress_callback(callback_completed, unique)
+                callback_last_published = callback_completed
+
     owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
     execution_id = f"image-execution-{os.getpid()}-{uuid.uuid4().hex}"
     buffer_limit = (
@@ -2379,6 +2441,8 @@ def fetch_unique_images(
                     owner=owner,
                     lease_id=job.lease_id,
                 )
+                callback_completed += 1
+                publish_url_progress()
             submit_ready(pool)
 
     outcome_snapshot = outcome_store.snapshot_for_jobs(
@@ -2407,6 +2471,8 @@ def fetch_unique_images(
         and int(outcome_snapshot["missing"]) == 0
         and outcome_snapshot["url_key_digest"] == unique_key_digest
     )
+    callback_completed = min(unique, success + terminal)
+    publish_url_progress(force=True)
     fetch_manifest_path = _image_fetch_manifest_path(
         outcomes_path,
         kind,

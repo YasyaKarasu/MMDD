@@ -344,12 +344,18 @@ class _ProgressState:
     known_work_bytes: int = 0
     known_cache_bytes: int = 0
     known_output_bytes: int = 0
+    completed_units: int = 0
+    total_units: int = 0
+    rate_basis: str | None = None
+    unit_baseline_completed: int = 0
+    unit_baseline_at: float | None = None
 
 
 class ProgressReporter:
     """Publish bounded-cost progress to JSON and direct stdout."""
 
     _ROLLING_WINDOW_SECONDS = 60.0
+    _MAX_STAGE_SAMPLES = 256
 
     def __init__(
         self,
@@ -361,11 +367,110 @@ class ProgressReporter:
         self.path = config.work_dir / "progress.json"
         self._state = _ProgressState()
         self._rolling_samples: deque[tuple[float, int]] = deque()
+        self._stage_telemetry: dict[str, dict[str, Any]] = {}
+        self._restore_stage_telemetry()
         self._pre_write_guard = pre_write_guard
         self._lock = threading.Lock()
         self._publish_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _restore_stage_telemetry(self) -> None:
+        """Restore only bounded URL telemetry from an atomic prior snapshot."""
+        if not self.config.resume or not self.path.is_file():
+            return
+        if self.path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError("progress telemetry exceeds bounded state size")
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        raw_stages = payload.get("stage_telemetry", {})
+        if not isinstance(raw_stages, dict):
+            raise ValueError("progress stage_telemetry must be an object")
+        invalidated = set()
+        if self.config.from_stage is not None:
+            from_index = STAGES.index(self.config.from_stage)
+            invalidated = set(STAGES[from_index:])
+        for stage, raw in raw_stages.items():
+            if stage not in STAGES or stage in invalidated:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError("progress stage telemetry must be an object")
+            rate_basis = raw.get("rate_basis")
+            samples = raw.get("samples")
+            if not isinstance(rate_basis, str) or not rate_basis:
+                raise ValueError("progress rate_basis is invalid")
+            if not isinstance(samples, list) or len(samples) > self._MAX_STAGE_SAMPLES:
+                raise ValueError("progress stage samples are not bounded")
+            restored_samples: list[dict[str, Any]] = []
+            previous_completed = -1
+            previous_timestamp = float("-inf")
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    raise ValueError("progress stage sample is invalid")
+                timestamp = float(sample["timestamp"])
+                completed = int(sample["completed_units"])
+                total = int(sample["total_units"])
+                rate = float(sample["rate"])
+                rolling_rate = float(sample["rolling_rate"])
+                predicted_raw = sample.get("predicted_remaining_seconds")
+                predicted = (
+                    None if predicted_raw is None else float(predicted_raw)
+                )
+                if (
+                    timestamp < previous_timestamp
+                    or completed < previous_completed
+                    or completed < 0
+                    or total < completed
+                    or rate < 0
+                    or rolling_rate < 0
+                    or (predicted is not None and predicted < 0)
+                ):
+                    raise ValueError("progress stage samples are not monotonic")
+                restored_samples.append(
+                    {
+                        "timestamp": timestamp,
+                        "completed_units": completed,
+                        "total_units": total,
+                        "rate": rate,
+                        "rolling_rate": rolling_rate,
+                        "predicted_remaining_seconds": predicted,
+                    }
+                )
+                previous_completed = completed
+                previous_timestamp = timestamp
+            completed_at_raw = raw.get("completed_at")
+            last_sample = restored_samples[-1] if restored_samples else None
+            self._stage_telemetry[stage] = {
+                "rate_basis": rate_basis,
+                "samples": restored_samples,
+                "completed_units": int(
+                    raw.get(
+                        "completed_units",
+                        0 if last_sample is None else last_sample["completed_units"],
+                    )
+                ),
+                "total_units": int(
+                    raw.get(
+                        "total_units",
+                        0 if last_sample is None else last_sample["total_units"],
+                    )
+                ),
+                "completed_at": (
+                    None
+                    if completed_at_raw is None
+                    else float(completed_at_raw)
+                ),
+                "eligible_final_half_samples": int(
+                    raw.get("eligible_final_half_samples", 0)
+                ),
+                "excluded_final_half_samples": int(
+                    raw.get("excluded_final_half_samples", 0)
+                ),
+                "max_symmetric_eta_factor": (
+                    None
+                    if raw.get("max_symmetric_eta_factor") is None
+                    else float(raw["max_symmetric_eta_factor"])
+                ),
+            }
 
     def start(self) -> None:
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -391,12 +496,21 @@ class ProgressReporter:
         known_work_bytes: int | None = None,
         known_cache_bytes: int | None = None,
         known_output_bytes: int | None = None,
+        completed_units: int | None = None,
+        total_units: int | None = None,
+        rate_basis: str | None = None,
     ) -> None:
         with self._lock:
             if stage is not None and stage != self._state.stage:
+                self._complete_unit_stage_locked()
                 self._state.stage = stage
                 self._state.stage_started_at = time.time()
                 self._rolling_samples.clear()
+                self._state.completed_units = 0
+                self._state.total_units = 0
+                self._state.rate_basis = None
+                self._state.unit_baseline_completed = 0
+                self._state.unit_baseline_at = None
             if completed_shards is not None:
                 self._state.completed_shards = completed_shards
             if total_shards is not None:
@@ -411,6 +525,202 @@ class ProgressReporter:
                 self._state.known_cache_bytes = int(known_cache_bytes)
             if known_output_bytes is not None:
                 self._state.known_output_bytes = int(known_output_bytes)
+            self._update_units_locked(
+                completed_units=completed_units,
+                total_units=total_units,
+                rate_basis=rate_basis,
+            )
+
+    def _update_units_locked(
+        self,
+        *,
+        completed_units: int | None,
+        total_units: int | None,
+        rate_basis: str | None,
+    ) -> None:
+        if (
+            completed_units is None
+            and total_units is None
+            and rate_basis is None
+        ):
+            return
+        if rate_basis is not None:
+            normalized_basis = str(rate_basis).strip()
+            if not normalized_basis:
+                raise ValueError("rate_basis must not be empty")
+            if (
+                self._state.rate_basis is not None
+                and self._state.rate_basis != normalized_basis
+            ):
+                raise ValueError("rate_basis cannot change within a stage")
+            self._state.rate_basis = normalized_basis
+        if self._state.rate_basis is None:
+            raise ValueError("rate_basis is required for URL-unit progress")
+        existing_samples = self._current_stage_samples_locked()
+        if existing_samples:
+            last_sample = existing_samples[-1]
+            self._state.total_units = max(
+                self._state.total_units,
+                int(last_sample["total_units"]),
+            )
+            self._state.completed_units = max(
+                self._state.completed_units,
+                int(last_sample["completed_units"]),
+            )
+        if total_units is not None:
+            candidate_total = int(total_units)
+            if candidate_total < 0:
+                raise ValueError("total_units must be non-negative")
+            self._state.total_units = max(
+                self._state.total_units,
+                candidate_total,
+            )
+        changed = False
+        if completed_units is not None:
+            candidate_completed = int(completed_units)
+            if candidate_completed < 0:
+                raise ValueError("completed_units must be non-negative")
+            monotonic_completed = max(
+                self._state.completed_units,
+                candidate_completed,
+            )
+            if monotonic_completed > self._state.total_units:
+                raise ValueError("completed_units exceeds total_units")
+            changed = monotonic_completed != self._state.completed_units
+            self._state.completed_units = monotonic_completed
+        now = time.time()
+        if self._state.unit_baseline_at is None:
+            self._state.unit_baseline_at = now
+            self._state.unit_baseline_completed = self._state.completed_units
+            changed = True
+        samples = self._current_stage_samples_locked()
+        duplicate_last = bool(samples) and (
+            int(samples[-1]["completed_units"])
+            == self._state.completed_units
+            and int(samples[-1]["total_units"]) == self._state.total_units
+        )
+        if (changed and not duplicate_last) or not samples:
+            self._record_unit_sample_locked(now)
+        self._complete_unit_stage_locked()
+
+    def _current_stage_samples_locked(self) -> list[dict[str, Any]]:
+        telemetry = self._stage_telemetry.get(self._state.stage)
+        if telemetry is None:
+            return []
+        return telemetry["samples"]
+
+    def _unit_rates_locked(self, now: float) -> tuple[float, float]:
+        baseline_at = self._state.unit_baseline_at
+        if baseline_at is None:
+            return 0.0, 0.0
+        elapsed = now - baseline_at
+        rate = (
+            max(
+                0.0,
+                (
+                    self._state.completed_units
+                    - self._state.unit_baseline_completed
+                )
+                / elapsed,
+            )
+            if elapsed > 0
+            else 0.0
+        )
+        rolling_rate = 0.0
+        samples = self._current_stage_samples_locked()
+        cutoff = now - self._ROLLING_WINDOW_SECONDS
+        first = next(
+            (
+                sample
+                for sample in samples
+                if float(sample["timestamp"]) >= cutoff
+            ),
+            None,
+        )
+        if first is not None:
+            rolling_elapsed = now - float(first["timestamp"])
+            if rolling_elapsed > 0:
+                rolling_rate = max(
+                    0.0,
+                    (
+                        self._state.completed_units
+                        - int(first["completed_units"])
+                    )
+                    / rolling_elapsed,
+                )
+        return rate, rolling_rate
+
+    def _record_unit_sample_locked(self, now: float) -> None:
+        rate, rolling_rate = self._unit_rates_locked(now)
+        remaining = max(
+            0,
+            self._state.total_units - self._state.completed_units,
+        )
+        predicted = remaining / rate if rate > 0 else None
+        telemetry = self._stage_telemetry.setdefault(
+            self._state.stage,
+            {
+                "rate_basis": self._state.rate_basis,
+                "samples": [],
+                "completed_units": 0,
+                "total_units": self._state.total_units,
+                "completed_at": None,
+                "eligible_final_half_samples": 0,
+                "excluded_final_half_samples": 0,
+                "max_symmetric_eta_factor": None,
+            },
+        )
+        samples = telemetry["samples"]
+        telemetry["completed_units"] = self._state.completed_units
+        telemetry["total_units"] = self._state.total_units
+        samples.append(
+            {
+                "timestamp": now,
+                "completed_units": self._state.completed_units,
+                "total_units": self._state.total_units,
+                "rate": rate,
+                "rolling_rate": rolling_rate,
+                "predicted_remaining_seconds": predicted,
+            }
+        )
+        if len(samples) > self._MAX_STAGE_SAMPLES:
+            del samples[: len(samples) - self._MAX_STAGE_SAMPLES]
+
+    def _complete_unit_stage_locked(self) -> None:
+        if self._state.rate_basis is None:
+            return
+        if self._state.completed_units != self._state.total_units:
+            return
+        telemetry = self._stage_telemetry.get(self._state.stage)
+        if telemetry is None or telemetry["completed_at"] is not None:
+            return
+        completed_at = time.time()
+        eligible = 0
+        excluded = 0
+        factors: list[float] = []
+        total = self._state.total_units
+        for sample in telemetry["samples"]:
+            completed = int(sample["completed_units"])
+            if total > 0 and completed * 2 < total:
+                continue
+            predicted = sample["predicted_remaining_seconds"]
+            actual = completed_at - float(sample["timestamp"])
+            if predicted is None or float(predicted) <= 0 or actual <= 0:
+                excluded += 1
+                continue
+            eligible += 1
+            predicted_value = float(predicted)
+            factors.append(
+                max(predicted_value / actual, actual / predicted_value)
+            )
+        telemetry.update(
+            {
+                "completed_at": completed_at,
+                "eligible_final_half_samples": eligible,
+                "excluded_final_half_samples": excluded,
+                "max_symmetric_eta_factor": max(factors) if factors else None,
+            }
+        )
 
     def _snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -436,7 +746,16 @@ class ProgressReporter:
                         (complete - first_complete) / rolling_elapsed,
                     )
             remaining = max(0, total - complete)
-            eta = remaining / rate if rate > 0 else None
+            shard_eta = remaining / rate if rate > 0 else None
+            unit_rate, unit_rolling_rate = self._unit_rates_locked(now)
+            unit_remaining = max(
+                0,
+                self._state.total_units - self._state.completed_units,
+            )
+            unit_eta = (
+                unit_remaining / unit_rate if unit_rate > 0 else None
+            )
+            eta = unit_eta if self._state.rate_basis is not None else shard_eta
             free_by_root = {
                 name: int(
                     shutil.disk_usage(DiskGuard._existing_ancestor(path)).free
@@ -451,12 +770,26 @@ class ProgressReporter:
                 "stage": self._state.stage,
                 "completed_shards": complete,
                 "total_shards": total,
+                "completed_units": self._state.completed_units,
+                "total_units": self._state.total_units,
+                "rate_basis": self._state.rate_basis,
                 "counters": dict(sorted(self._state.counters.items())),
                 "rates": {
                     "shards_per_second": rate,
                     "rolling_shards_per_second": rolling_rate,
+                    "units_per_second": unit_rate,
+                    "rolling_units_per_second": unit_rolling_rate,
                 },
                 "eta_seconds": eta,
+                "stage_telemetry": {
+                    stage: {
+                        **telemetry,
+                        "samples": [dict(sample) for sample in telemetry["samples"]],
+                    }
+                    for stage, telemetry in sorted(
+                        self._stage_telemetry.items()
+                    )
+                },
                 "elapsed_seconds": max(0.0, now - self._state.started_at),
                 "updated_at": now,
                 "disk": {
@@ -482,9 +815,16 @@ class ProgressReporter:
                 f"stage={snapshot['stage']} "
                 f"shards={snapshot['completed_shards']}/"
                 f"{snapshot['total_shards']} "
+                f"units={snapshot['completed_units']}/"
+                f"{snapshot['total_units']} "
+                f"rate_basis={snapshot['rate_basis']} "
                 f"rate={snapshot['rates']['shards_per_second']:.3f}/s "
                 "rolling="
                 f"{snapshot['rates']['rolling_shards_per_second']:.3f}/s "
+                "unit_rate="
+                f"{snapshot['rates']['units_per_second']:.3f}/s "
+                "unit_rolling="
+                f"{snapshot['rates']['rolling_units_per_second']:.3f}/s "
                 f"eta={snapshot['eta_seconds']} "
                 f"work={snapshot['disk']['work_bytes']} "
                 f"cache={snapshot['disk']['cache_bytes']} "
@@ -1686,6 +2026,13 @@ def _run_pages(
         if after_cache_write is not None:
             after_cache_write(record)
 
+    def page_url_progress(completed: int, total: int) -> None:
+        reporter.update(
+            completed_units=completed,
+            total_units=total,
+            rate_basis="page_urls",
+        )
+
     result = fetch_unique_pages(
         _page_refs(config.work_dir / "structural", structural, finalized),
         SqliteJobStore(jobs_path, pre_write_guard=pre_write_guard),
@@ -1695,6 +2042,7 @@ def _run_pages(
         failure_path=root / "page-failures.jsonl",
         progress_path=root / "page-progress.json",
         after_cache_write=after_page_outcome,
+        progress_callback=page_url_progress,
         pre_write_guard=pre_write_guard,
     )
     page_validation_database = root / "validation.sqlite3"
@@ -1857,6 +2205,13 @@ def _run_images(
         image_completed += 1
         reporter.update(counters={"image_completed_live": image_completed})
 
+    def image_url_progress(completed: int, total: int) -> None:
+        reporter.update(
+            completed_units=completed,
+            total_units=total,
+            rate_basis="image_urls",
+        )
+
     if pre_write_guard is not None:
         pre_write_guard(root / "jobs.sqlite3", 0)
     image_result = fetch_unique_images(
@@ -1870,6 +2225,7 @@ def _run_images(
         outcomes_path=config.cache_dir / "image_cache" / "outcomes.sqlite3",
         image_dir=config.cache_dir / "images",
         after_cache_write=after_image_outcome,
+        progress_callback=image_url_progress,
         pre_write_guard=pre_write_guard,
     )
     validate_complete_image_fetch(

@@ -643,6 +643,17 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
     assert page_transport.calls == 1
     assert image_transport.calls == 3
     first_calls = (page_transport.calls, image_transport.calls)
+    first_progress = json.loads(
+        (config.work_dir / "progress.json").read_text(encoding="utf-8")
+    )
+    for stage, basis, total in (
+        ("pages", "page_urls", 1),
+        ("images", "image_urls", 3),
+    ):
+        telemetry = first_progress["stage_telemetry"][stage]
+        assert telemetry["rate_basis"] == basis
+        assert telemetry["samples"][-1]["completed_units"] == total
+        assert telemetry["completed_at"] is not None
 
     resumed = run_pipeline(
         config,
@@ -653,6 +664,12 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
 
     assert resumed.status == "complete"
     assert (page_transport.calls, image_transport.calls) == first_calls
+    resumed_progress = json.loads(
+        (config.work_dir / "progress.json").read_text(encoding="utf-8")
+    )
+    assert resumed_progress["stage_telemetry"] == first_progress[
+        "stage_telemetry"
+    ]
     for stage in STAGES:
         registry = json.loads(
             (
@@ -855,6 +872,137 @@ def test_progress_rolling_rate_uses_a_fixed_time_window(
     assert snapshot["rates"]["shards_per_second"] == pytest.approx(100 / 70)
     assert snapshot["rates"]["rolling_shards_per_second"] == pytest.approx(10 / 60)
     assert snapshot["rates"]["rolling_shards_per_second"] != snapshot["rates"]["shards_per_second"]
+
+
+def test_progress_url_units_use_resume_baseline_and_remain_monotonic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    reporter = ProgressReporter(config)
+
+    reporter.update(
+        stage="pages",
+        completed_units=5,
+        total_units=10,
+        rate_basis="page_urls",
+    )
+    clock[0] = 2.0
+    reporter.update(completed_units=7)
+    snapshot = reporter._snapshot()
+    reporter.update(completed_units=6)
+    monotonic = reporter._snapshot()
+
+    assert snapshot["completed_units"] == 7
+    assert snapshot["total_units"] == 10
+    assert snapshot["rate_basis"] == "page_urls"
+    assert snapshot["rates"]["units_per_second"] == pytest.approx(1.0)
+    assert snapshot["eta_seconds"] == pytest.approx(3.0)
+    assert monotonic["completed_units"] == 7
+
+
+def test_progress_keeps_bounded_stage_samples_and_final_half_eta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        completed_units=0,
+        total_units=300,
+        rate_basis="page_urls",
+    )
+    for completed in range(1, 301):
+        clock[0] = float(completed)
+        reporter.update(completed_units=completed)
+    reporter.update(stage="images")
+    snapshot = reporter._snapshot()
+    pages = snapshot["stage_telemetry"]["pages"]
+
+    assert len(pages["samples"]) == 256
+    assert pages["completed_units"] == 300
+    assert pages["total_units"] == 300
+    assert pages["completed_at"] == 300.0
+    assert pages["eligible_final_half_samples"] > 0
+    assert pages["excluded_final_half_samples"] == 1
+    assert pages["max_symmetric_eta_factor"] == pytest.approx(1.0)
+    assert snapshot["stage"] == "images"
+    assert snapshot["completed_units"] == 0
+    assert snapshot["total_units"] == 0
+    assert snapshot["rate_basis"] is None
+
+
+def test_progress_atomically_publishes_guarded_url_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    guarded: list[tuple[Path, int]] = []
+
+    def guard(path: Path, estimated_bytes: int = 0) -> None:
+        guarded.append((Path(path), estimated_bytes))
+
+    reporter = ProgressReporter(
+        config,
+        pre_write_guard=guard,
+    )
+    reporter.update(
+        stage="pages",
+        completed_units=0,
+        total_units=2,
+        rate_basis="page_urls",
+    )
+    clock[0] = 1.0
+    reporter.update(completed_units=1)
+    reporter.publish()
+
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    assert payload["stage_telemetry"]["pages"]["samples"][-1][
+        "completed_units"
+    ] == 1
+    assert guarded
+    assert not list(reporter.path.parent.glob(f".{reporter.path.name}.*.tmp"))
+
+
+def test_progress_restores_bounded_samples_across_process_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        completed_units=0,
+        total_units=4,
+        rate_basis="page_urls",
+    )
+    clock[0] = 2.0
+    first.update(completed_units=2)
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    resumed.update(
+        stage="pages",
+        completed_units=1,
+        total_units=4,
+        rate_basis="page_urls",
+    )
+    snapshot = resumed._snapshot()
+
+    assert snapshot["completed_units"] == 2
+    assert [
+        sample["completed_units"]
+        for sample in snapshot["stage_telemetry"]["pages"]["samples"]
+    ] == [0, 2]
 
 
 def test_tree_bytes_tolerates_files_removed_during_scan(

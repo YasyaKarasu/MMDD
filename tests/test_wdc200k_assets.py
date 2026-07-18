@@ -1082,6 +1082,50 @@ def test_unique_image_fetch_requests_each_url_once_and_content_addresses(
     assert manifest["transport_attempts"] == result.transport_attempt_summary
 
 
+def test_image_progress_callback_starts_from_durable_baseline_and_is_bounded(
+    tmp_path: Path,
+) -> None:
+    urls = [f"https://i.test/progress-{index}.jpg" for index in range(5)]
+    transport = FakeImageTransport(
+        tmp_path,
+        {url: f"unique-{index}" for index, url in enumerate(urls)},
+    )
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+
+    fetch_unique_images(
+        write_unique_jobs(tmp_path / "first.jsonl", urls[:1]),
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    updates: list[tuple[int, int]] = []
+    result = fetch_unique_images(
+        write_unique_jobs(tmp_path / "all.jsonl", urls),
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        progress_callback=lambda completed, total: updates.append(
+            (completed, total)
+        ),
+        progress_callback_every=2,
+    )
+
+    assert result.complete
+    assert updates == [(1, 5), (3, 5), (5, 5)]
+    assert updates == sorted(updates)
+
+
 def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
     tmp_path: Path,
 ) -> None:

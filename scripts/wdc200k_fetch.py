@@ -942,6 +942,36 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
+def _durable_page_completions(
+    store: SqliteJobStore,
+    kind: str,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> int:
+    """Count terminal outcomes for exactly this durable page job set."""
+    with store._connect() as connection:
+        connection.execute(
+            "ATTACH DATABASE ? AS page_progress_outcomes",
+            (str(outcomes_path),),
+        )
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM jobs AS job
+                JOIN page_progress_outcomes.page_outcomes AS outcome
+                  ON outcome.policy_fingerprint = ?
+                 AND outcome.url_key = json_extract(
+                        job.payload_json, '$.url_key'
+                    )
+                WHERE job.kind = ?
+                  AND outcome.status IN ('success', 'terminal')
+                """,
+                (policy_fingerprint, kind),
+            ).fetchone()[0]
+        )
+
+
 def _leased_count(
     store: SqliteJobStore,
     kind: str,
@@ -1416,6 +1446,8 @@ def fetch_unique_pages(
     max_wait_seconds: float = 0.0,
     poll_interval_seconds: float = 0.05,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback_every: int | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> FetchResult:
     """Fetch each Task-3 URL key once for this exact policy.
@@ -1469,6 +1501,36 @@ def fetch_unique_pages(
     )
 
     unique = _job_count(store, kind)
+    if progress_callback_every is not None and progress_callback_every <= 0:
+        raise ValueError("progress_callback_every must be positive")
+    callback_interval = (
+        max(1, (unique + 255) // 256)
+        if progress_callback_every is None
+        else int(progress_callback_every)
+    )
+    callback_completed = _durable_page_completions(
+        store,
+        kind,
+        outcomes_path,
+        fingerprint,
+    )
+    callback_last_published = callback_completed
+    if progress_callback is not None:
+        progress_callback(callback_completed, unique)
+
+    def publish_url_progress(*, force: bool = False) -> None:
+        nonlocal callback_last_published
+        if progress_callback is None:
+            return
+        if (
+            force
+            or callback_completed - callback_last_published
+            >= callback_interval
+        ):
+            if callback_completed != callback_last_published:
+                progress_callback(callback_completed, unique)
+                callback_last_published = callback_completed
+
     owner = f"fetch-{os.getpid()}-{uuid.uuid4().hex}"
     execution_id = f"page-execution-{os.getpid()}-{uuid.uuid4().hex}"
     buffer_limit = (
@@ -1716,6 +1778,8 @@ def fetch_unique_pages(
                         owner=owner,
                         lease_id=job.lease_id,
                     )
+                    callback_completed += 1
+                    publish_url_progress()
                     if completions_since_progress >= progress_every:
                         _publish_progress(
                             outcome_store,
@@ -1756,6 +1820,13 @@ def fetch_unique_pages(
     )
     leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
+    callback_completed = _durable_page_completions(
+        store,
+        kind,
+        outcomes_path,
+        fingerprint,
+    )
+    publish_url_progress(force=True)
     transport_attempt_summary = outcome_store.transport_attempt_summary(
         fingerprint,
         job_store_path=store.path,
