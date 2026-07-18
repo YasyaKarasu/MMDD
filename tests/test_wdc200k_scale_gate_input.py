@@ -120,6 +120,79 @@ def test_scale_gate_input_rejects_broken_symlink_target(
     assert target.is_symlink()
 
 
+def test_scale_gate_input_rejects_target_inside_source_before_writing(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    target = source / "gate"
+    _make_real_input(source)
+    before = sorted(
+        path.relative_to(source)
+        for path in source.rglob("*")
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=target,
+            table_count=1,
+        )
+
+    assert not target.exists()
+    assert sorted(
+        path.relative_to(source)
+        for path in source.rglob("*")
+    ) == before
+
+
+def test_scale_gate_input_rejects_source_inside_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outer"
+    source = target / "real-wdc"
+    _make_real_input(source)
+
+    with pytest.raises(ValueError, match="overlap"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=target,
+            table_count=1,
+        )
+
+
+def test_scale_gate_input_rejects_target_equal_to_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    _make_real_input(source)
+
+    with pytest.raises(ValueError, match="overlap"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=source,
+            table_count=1,
+        )
+
+
+def test_scale_gate_input_resolves_symlink_ancestor_before_overlap_check(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "real-wdc"
+    _make_real_input(source)
+    source_alias = tmp_path / "source-alias"
+    source_alias.symlink_to(source, target_is_directory=True)
+    target = source_alias / "gate"
+
+    with pytest.raises(ValueError, match="overlap"):
+        create_scale_gate_input(
+            source_dir=source,
+            target_dir=target,
+            table_count=1,
+        )
+
+    assert not (source / "gate").exists()
+
+
 def test_scale_gate_input_checksums_are_reproducible(
     tmp_path: Path,
 ) -> None:

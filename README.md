@@ -296,12 +296,13 @@ The helper round-robins class/subset buckets and chooses low-row tables by
 `(rows, stable_hash(seed, relative_path), relative_path)`. It creates filtered
 production-format statistics ZIPs plus absolute source-data symlinks; it does
 not copy, delete, fetch, or modify corpus data. The target must be absent or
-strictly empty. `scale_gate_manifest.jsonl` records absolute sources, relative
-targets, and source gzip hashes; `scale_gate_checksums.json` covers the
-manifest and filtered ZIPs. These are operational scale-gate subcorpora, not
-the formal 200K sampling result. Use each gate input with the matching
-`--max_source_tables` and fresh output/work/cache roots. The 10K structural
-gate uses the full corpus directly.
+strictly empty, and its resolved path must be outside the corpus tree (neither
+root may contain the other). `scale_gate_manifest.jsonl` records absolute
+sources, relative targets, and source gzip hashes;
+`scale_gate_checksums.json` covers the manifest and filtered ZIPs. These are
+operational scale-gate subcorpora, not the formal 200K sampling result. Use
+each gate input with the matching `--max_source_tables` and fresh
+output/work/cache roots. The 10K structural gate uses the full corpus directly.
 
 ### Direct endpoints, dynamic vLLM, and tmux
 

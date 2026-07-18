@@ -192,14 +192,24 @@ def create_scale_gate_input(
     seed: int = 13,
 ) -> ScaleGateInput:
     """Build an exact-size real-table subcorpus without copying source data."""
-    source_dir = source_dir.resolve()
-    target_dir = target_dir.absolute()
+    source_dir = source_dir.absolute().resolve()
+    target_input = target_dir.absolute()
+    if target_input.is_symlink():
+        raise ValueError(f"target must not be a symlink: {target_input}")
+    target_dir = target_input.resolve(strict=False)
     if table_count <= 0:
         raise ValueError("table_count must be positive")
     if not source_dir.is_dir():
         raise ValueError(f"source directory does not exist: {source_dir}")
-    if target_dir.is_symlink():
-        raise ValueError(f"target must not be a symlink: {target_dir}")
+    if (
+        target_dir == source_dir
+        or target_dir.is_relative_to(source_dir)
+        or source_dir.is_relative_to(target_dir)
+    ):
+        raise ValueError(
+            "source and target directories must not overlap: "
+            f"{source_dir} and {target_dir}"
+        )
     if target_dir.exists():
         if not target_dir.is_dir():
             raise ValueError(f"target must be a directory: {target_dir}")
