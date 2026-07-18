@@ -68,20 +68,26 @@ conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
   --source_dir wdc_schemaorg_2023 \
   --target_dir gate_inputs/wdc_100 \
   --table_count 100 \
+  --selection_mode global_lowest \
   --seed 13
 
 conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
   --source_dir wdc_schemaorg_2023 \
   --target_dir gate_inputs/wdc_1000 \
   --table_count 1000 \
+  --selection_mode global_lowest \
   --seed 13
 ```
 
-The helper selects low-row candidates while round-robining class/subset
-buckets, writes filtered production-format statistics ZIPs, symlinks gzip
-tables to absolute source paths, and records both source gzip hashes and
-generated-file checksums. The target must be absent or strictly empty. These
-gate inputs are not the formal 200K selection.
+These quick gates globally minimize source row counts by
+`(rows, stable_hash(seed, relative_path), relative_path)`. They validate
+pipeline plumbing, interruption/resume, request deduplication, checksums,
+resource bounds, and canonical output. They are not representative samples of
+WDC category balance, table quality, or row-count distribution, and they do
+not change the formal stratified 200K selection. The helper writes filtered
+production-format statistics ZIPs, symlinks gzip tables to absolute source
+paths, and records both source gzip hashes and generated-file checksums. The
+target must be absent or strictly empty.
 
 ### Fresh roots and interruption
 
@@ -120,6 +126,20 @@ stage boundaries, interruption, peak, and completion.
 - **ETA factor:** during the final half of a stage, for each sample with a
   non-null ETA compute `predicted_remaining_seconds / actual_remaining_seconds`.
   Report the maximum of that ratio and its reciprocal. Passing is at most 2.0.
+
+## Broad round-robin diagnostic (partial, not acceptance)
+
+A separate 100-table `round_robin` diagnostic reached structural expansion
+before an intentional interruption. It observed 55,839 entities, 52,880
+unique pages, and 322,324,462 structural bytes. The interrupted initial
+process peaked at 293,064 KiB RSS. The resume ran for 7:14.51 and peaked at
+359,208 KiB RSS. The digest of the 391 outcomes durable before interruption
+was unchanged after resume; the final total was 4,906 outcomes, of which 4,515
+were live resume outcomes.
+
+This run was interrupted and did not complete all required acceptance
+measurements or canonical artifact validation. It is broad diagnostic evidence
+only and does not count as the 100-table acceptance gate below.
 
 ## 100-table acceptance gate
 

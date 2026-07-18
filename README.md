@@ -283,17 +283,23 @@ conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
   --source_dir wdc_schemaorg_2023 \
   --target_dir gate_inputs/wdc_100 \
   --table_count 100 \
+  --selection_mode global_lowest \
   --seed 13
 
 conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
   --source_dir wdc_schemaorg_2023 \
   --target_dir gate_inputs/wdc_1000 \
   --table_count 1000 \
+  --selection_mode global_lowest \
   --seed 13
 ```
 
-The helper round-robins class/subset buckets and chooses low-row tables by
-`(rows, stable_hash(seed, relative_path), relative_path)`. It creates filtered
+These quick gates globally minimize source row counts by
+`(rows, stable_hash(seed, relative_path), relative_path)`. They validate
+pipeline plumbing, interruption/resume, request deduplication, checksums,
+resource bounds, and canonical output. They are not representative samples of
+WDC category balance, table quality, or row-count distribution, and they do
+not change the formal stratified 200K selection. The helper creates filtered
 production-format statistics ZIPs plus absolute source-data symlinks; it does
 not copy, delete, fetch, or modify corpus data. The target must be absent or
 strictly empty, and its resolved path must be outside the corpus tree (neither
