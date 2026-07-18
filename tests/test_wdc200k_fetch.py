@@ -307,14 +307,14 @@ def test_page_first_completed_batch_moves_all_futures_before_serial_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(6)
 
     class BatchTransport(CountingTransport):
         def fetch_page(self, url: str, **kwargs: Any) -> dict[str, Any]:
             barrier.wait(timeout=5)
             return super().fetch_page(url, **kwargs)
 
-    urls = ["https://a.test/batch", "https://b.test/batch"]
+    urls = [f"https://host-{index}.test/batch" for index in range(6)]
     real_wait = fetch_module.wait
 
     def wait_for_whole_batch(fs, *, return_when):
@@ -328,17 +328,18 @@ def test_page_first_completed_batch_moves_all_futures_before_serial_commits(
         [page_ref(str(index), url) for index, url in enumerate(urls)],
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
         BatchTransport({url: {"text": url} for url in urls}),
-        FetchPolicy(global_concurrency=2, per_host_concurrency=1),
+        FetchPolicy(global_concurrency=6, per_host_concurrency=1),
         progress_callback=snapshots.append,
-        progress_callback_every=1,
+        progress_callback_every=2,
     )
 
     assert result.complete
-    first_durable = next(
-        snapshot for snapshot in snapshots if snapshot.completed_durable == 1
-    )
-    assert first_durable.in_flight_jobs == 0
-    assert first_durable.finished_not_durable == 1
+    assert [snapshot.completed_durable for snapshot in snapshots] == [0, 6]
+    final = snapshots[-1]
+    assert final.in_flight_jobs == 0
+    assert final.finished_not_durable == 0
+    assert sum(final.transport_event_histogram) == 6
+    assert sum(final.commit_event_histogram) == 6
 
 
 def test_page_external_execution_completion_is_visible_in_final_snapshot(
@@ -395,6 +396,63 @@ def test_page_external_execution_completion_is_visible_in_final_snapshot(
     assert snapshots[0].unobserved_nonlocal == 1
     assert snapshots[-1].unobserved_nonlocal == 0
     assert sum(snapshots[-1].transport_event_histogram) == 0
+
+
+def test_page_incomplete_forced_refresh_keeps_off_milestone_for_next_epoch(
+    tmp_path: Path,
+) -> None:
+    urls = [f"https://foreign-{index}.test/page" for index in range(448)]
+    refs = [page_ref(str(index), url) for index, url in enumerate(urls)]
+    policy = FetchPolicy(global_concurrency=8, per_host_concurrency=1)
+    kind = fetch_module._job_kind(policy.fingerprint)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    all_epochs: list[list[UrlProgressSnapshot]] = []
+    foreign_completed = False
+
+    for _execution in range(32):
+        snapshots: list[UrlProgressSnapshot] = []
+
+        def callback(snapshot: UrlProgressSnapshot) -> None:
+            nonlocal foreign_completed
+            snapshots.append(snapshot)
+            if not foreign_completed:
+                leased = jobs.claim(kind, 448, "foreign", lease_seconds=3600)
+                assert len(leased) == 448
+                first = leased[0]
+                PageOutcomeStore(outcomes_path).put(
+                    policy.fingerprint,
+                    str(first.payload["url_key"]),
+                    str(first.payload["page_url"]),
+                    {"status": "terminal", "error_class": "foreign"},
+                )
+                jobs.finish(
+                    first.job_id,
+                    "terminal",
+                    {"url_key": first.payload["url_key"]},
+                    owner="foreign",
+                    lease_id=first.lease_id,
+                )
+                foreign_completed = True
+
+        result = fetch_unique_pages(
+            refs,
+            jobs,
+            CountingTransport({}),
+            policy,
+            outcomes_path=outcomes_path,
+            max_wait_seconds=0.0,
+            progress_callback=callback,
+            progress_callback_every=2,
+        )
+        assert not result.complete
+        all_epochs.append(snapshots)
+
+    assert [len(epoch) for epoch in all_epochs] == [1] * 32
+    assert [epoch[0].completed_durable for epoch in all_epochs] == [0] + [1] * 31
+    assert sum(len(epoch) - 1 for epoch in all_epochs) <= 224
+    assert len(all_epochs) <= 32
+    assert sum(map(len, all_epochs)) <= 256
 
 
 def test_page_url_refresh_uses_kind_status_and_outcome_key_indexes(
@@ -810,6 +868,80 @@ def test_page_finish_fence_failure_preserves_root_error_and_resumes(
     )
     assert resumed.complete
     assert resumed_transport.calls == [url]
+
+
+def test_page_mixed_completed_batch_commits_success_before_root_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    success_url = "https://success.test/mixed"
+    failed_url = "https://failed.test/mixed"
+    refs = [page_ref("success", success_url), page_ref("failed", failed_url)]
+    barrier = threading.Barrier(2)
+
+    class MixedTransport(CountingTransport):
+        def fetch_page(self, url: str, **kwargs: Any) -> dict[str, Any]:
+            barrier.wait(timeout=5)
+            return super().fetch_page(url, **kwargs)
+
+    original_finish = PageOutcomeStore.finish_transport_attempt
+
+    def fail_selected(self, attempt_id: str, **kwargs: Any) -> None:
+        with sqlite3.connect(self.path) as connection:
+            url = connection.execute(
+                "SELECT url FROM transport_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+        if url == failed_url:
+            raise OSError("mixed page finish sentinel")
+        original_finish(self, attempt_id, **kwargs)
+
+    real_wait = fetch_module.wait
+
+    def failed_first(fs, *, return_when):
+        done, pending = real_wait(fs)
+        return sorted(done, key=lambda future: future.exception() is None), pending
+
+    monkeypatch.setattr(PageOutcomeStore, "finish_transport_attempt", fail_selected)
+    monkeypatch.setattr(fetch_module, "wait", failed_first)
+    policy = FetchPolicy(global_concurrency=2, per_host_concurrency=1)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    snapshots: list[UrlProgressSnapshot] = []
+    with pytest.raises(OSError, match="mixed page finish sentinel"):
+        fetch_unique_pages(
+            refs,
+            jobs,
+            MixedTransport(
+                {success_url: {"text": "ok"}, failed_url: {"text": "bad"}}
+            ),
+            policy,
+            outcomes_path=outcomes_path,
+            lease_seconds=60.0,
+            progress_callback=snapshots.append,
+        )
+
+    store = PageOutcomeStore(outcomes_path)
+    assert store.get(policy.fingerprint, refs[0]["url_key"])["status"] == "success"
+    assert store.get(policy.fingerprint, refs[1]["url_key"]) is None
+    assert [snapshot.completed_durable for snapshot in snapshots] == [0, 1]
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status"
+        ).fetchall() == [("leased", 1), ("success", 1)]
+        connection.execute("UPDATE jobs SET lease_expires = 0 WHERE status='leased'")
+
+    monkeypatch.setattr(PageOutcomeStore, "finish_transport_attempt", original_finish)
+    resumed_transport = CountingTransport({failed_url: {"text": "retry"}})
+    resumed = fetch_unique_pages(
+        refs,
+        jobs,
+        resumed_transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    assert resumed.complete
+    assert resumed_transport.calls == [failed_url]
 
 
 def test_page_outcome_fanout_streams_every_entity_reference(

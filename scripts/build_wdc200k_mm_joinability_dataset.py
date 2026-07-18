@@ -61,6 +61,7 @@ from wdc200k_io import (
     validate_completed_shard,
 )
 from wdc200k_eta import (
+    MAX_URL_COMPLETION_PUBLICATIONS,
     MAX_URL_EXECUTION_EPOCHS,
     MAX_URL_STAGE_SAMPLES,
     URL_TELEMETRY_SCHEMA_VERSION,
@@ -368,6 +369,9 @@ class ProgressReporter:
 
     _ROLLING_WINDOW_SECONDS = 60.0
     _MAX_STAGE_SAMPLES = MAX_URL_STAGE_SAMPLES
+    _MAX_LEGACY_STAGE_SAMPLES = 256
+    _MAX_MIXED_STAGE_SAMPLES = _MAX_LEGACY_STAGE_SAMPLES + _MAX_STAGE_SAMPLES
+    _MAX_COMPLETION_PUBLICATIONS = MAX_URL_COMPLETION_PUBLICATIONS
     _MAX_EXECUTION_EPOCHS = MAX_URL_EXECUTION_EPOCHS
 
     def __init__(
@@ -637,7 +641,7 @@ class ProgressReporter:
             if (
                 not isinstance(samples, list)
                 or not samples
-                or len(samples) > self._MAX_STAGE_SAMPLES
+                or len(samples) > self._MAX_MIXED_STAGE_SAMPLES
             ):
                 raise ValueError("progress stage samples are not bounded")
 
@@ -657,6 +661,9 @@ class ProgressReporter:
             prior_transport_overflow: int | None = None
             prior_commit_overflow: int | None = None
             v2_started = False
+            legacy_sample_count = 0
+            v2_sample_count = 0
+            completion_publication_count = 0
 
             for sample_raw in samples:
                 if not isinstance(sample_raw, dict):
@@ -665,12 +672,18 @@ class ProgressReporter:
                 if not is_v2:
                     if v2_started:
                         raise ValueError("progress v1 sample follows v2 telemetry")
+                    legacy_sample_count += 1
+                    if legacy_sample_count > self._MAX_LEGACY_STAGE_SAMPLES:
+                        raise ValueError("progress legacy samples exceed 256")
                     sample = self._restore_v1_sample(sample_raw)
                     completed = int(sample["completed_units"])
                     total = int(sample["total_units"])
                     timestamp = float(sample["timestamp"])
                 else:
                     v2_started = True
+                    v2_sample_count += 1
+                    if v2_sample_count > self._MAX_STAGE_SAMPLES:
+                        raise ValueError("progress v2 samples exceed 256")
                     sample, snapshot = self._restore_v2_sample(sample_raw)
                     completed = snapshot.completed_durable
                     total = snapshot.total
@@ -713,6 +726,14 @@ class ProgressReporter:
                         ):
                             raise ValueError("progress v2 epoch baseline is invalid")
                     else:
+                        completion_publication_count += 1
+                        if (
+                            completion_publication_count
+                            > self._MAX_COMPLETION_PUBLICATIONS
+                        ):
+                            raise ValueError(
+                                "progress completion publications exceed 224"
+                            )
                         if (
                             snapshot.transport_overflow_events
                             < (prior_transport_overflow or 0)
@@ -1009,15 +1030,25 @@ class ProgressReporter:
             self._state.rate_basis = rate_basis
             return
         samples = [] if telemetry is None else telemetry["samples"]
-        if len(samples) >= self._MAX_STAGE_SAMPLES:
-            raise ValueError("progress URL stage exceeds 256 samples")
+        v2_samples = [
+            sample
+            for sample in samples
+            if "telemetry_schema_version" in sample
+        ]
+        if len(v2_samples) >= self._MAX_STAGE_SAMPLES:
+            raise ValueError("progress URL v2 suffix exceeds 256 samples")
+        existing_epochs = {
+            sample["execution_epoch"] for sample in v2_samples
+        }
+        completion_publications = len(v2_samples) - len(existing_epochs)
         active = self._active_epochs.get(stage)
+        if (
+            active is not None
+            and completion_publications >= self._MAX_COMPLETION_PUBLICATIONS
+        ):
+            raise ValueError("progress completion publications exceed 224")
         if active is None:
-            prior_epochs = {
-                sample.get("execution_epoch")
-                for sample in samples
-                if "execution_epoch" in sample
-            }
+            prior_epochs = existing_epochs
             if snapshot.execution_epoch in prior_epochs:
                 raise ValueError("progress execution epoch must be unique")
             if len(prior_epochs) >= self._MAX_EXECUTION_EPOCHS:

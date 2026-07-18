@@ -2319,14 +2319,19 @@ def fetch_unique_images(
                 outcomes_path,
                 fingerprint,
             )
-            if refresh.completed != callback_last_published:
+            crossed_milestone = refresh.completed >= callback_next_milestone
+            stage_complete = refresh.completed == refresh.total
+            if (
+                refresh.completed != callback_last_published
+                and (crossed_milestone or stage_complete)
+            ):
                 snapshot = progress_tracker.snapshot(refresh)
                 progress_callback(snapshot)
                 callback_last_published = refresh.completed
-            callback_next_milestone = next_completion_milestone(
-                refresh.completed,
-                callback_interval,
-            )
+                callback_next_milestone = next_completion_milestone(
+                    refresh.completed,
+                    callback_interval,
+                )
     buffer_limit = (
         policy.global_concurrency * 4
         if claim_buffer is None
@@ -2489,9 +2494,17 @@ def fetch_unique_images(
             completed_items = [
                 (future, *futures[future]) for future in completed
             ]
-            for future, job, _host in completed_items:
-                if not future.cancelled() and future.exception() is None:
-                    progress_tracker.future_finished(job.job_id)
+            successful_items = [
+                item
+                for item in completed_items
+                if not item[0].cancelled()
+                and item[0].exception() is None
+            ]
+            failed_items = [
+                item for item in completed_items if item not in successful_items
+            ]
+            for _future, job, _host in successful_items:
+                progress_tracker.future_finished(job.job_id)
             for future, job, host in completed_items:
                 futures.pop(future)
                 active_by_host[host] -= 1
@@ -2502,7 +2515,7 @@ def fetch_unique_images(
                 else:
                     host_queues.pop(host, None)
                     ready_set.discard(host)
-            for future, job, _host in completed_items:
+            for future, job, _host in successful_items:
                 execution = future.result()
                 if execution.lease is None:
                     persisted = execution.outcome
@@ -2566,7 +2579,10 @@ def fetch_unique_images(
                 )
                 progress_tracker.durable_completed(job.job_id)
                 local_durable_completed += 1
+            if successful_items:
                 publish_url_progress()
+            for future, _job, _host in failed_items:
+                future.result()
             submit_ready(pool)
 
     outcome_snapshot = outcome_store.snapshot_for_jobs(

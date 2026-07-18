@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 from bisect import bisect_right
+from functools import lru_cache
 import math
 import struct
 import threading
@@ -419,12 +420,14 @@ def fixed_bin(
     overflow = numeric_value >= numeric_horizon
     if overflow:
         return bin_count - 1, True
-    edges = tuple(
-        index * numeric_horizon / bin_count
-        for index in range(bin_count + 1)
-    )
+    edges = _fixed_bin_edges(numeric_horizon, bin_count)
     index = bisect_right(edges, max(0.0, numeric_value)) - 1
     return min(bin_count - 1, index), False
+
+
+@lru_cache(maxsize=128)
+def _fixed_bin_edges(horizon: float, bin_count: int) -> tuple[float, ...]:
+    return tuple(index * horizon / bin_count for index in range(bin_count + 1))
 
 
 def completion_publication_interval(

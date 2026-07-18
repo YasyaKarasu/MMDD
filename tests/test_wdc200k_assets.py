@@ -1141,6 +1141,122 @@ def test_image_progress_callback_starts_from_durable_baseline_and_is_bounded(
     assert len({snapshot.execution_epoch for snapshot in updates}) == 1
 
 
+def test_image_first_completed_batch_coalesces_url_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls = [f"https://host-{index}.test/batch.jpg" for index in range(6)]
+    barrier = threading.Barrier(6)
+
+    class BatchImageTransport(FakeImageTransport):
+        def download_image(self, image_url: str, **kwargs):
+            barrier.wait(timeout=5)
+            return super().download_image(image_url, **kwargs)
+
+    real_wait = assets_module.wait
+
+    def wait_for_whole_batch(fs, *, return_when):
+        assert return_when is assets_module.FIRST_COMPLETED
+        done, pending = real_wait(fs)
+        return done, pending
+
+    monkeypatch.setattr(assets_module, "wait", wait_for_whole_batch)
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_images(
+        write_unique_jobs(tmp_path / "unique.jsonl", urls),
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        BatchImageTransport(
+            tmp_path,
+            {url: f"unique-{index}" for index, url in enumerate(urls)},
+        ),
+        FetchPolicy(
+            network_policy_fingerprint="image-v1",
+            policy_version="wdc200k-image-v1",
+            global_concurrency=6,
+            per_host_concurrency=1,
+        ),
+        outcomes_path=tmp_path / "outcomes.sqlite3",
+        image_dir=tmp_path / "content",
+        progress_callback=snapshots.append,
+        progress_callback_every=2,
+    )
+
+    assert result.complete
+    assert [snapshot.completed_durable for snapshot in snapshots] == [0, 6]
+    final = snapshots[-1]
+    assert final.in_flight_jobs == 0
+    assert final.finished_not_durable == 0
+    assert sum(final.transport_event_histogram) == 6
+    assert sum(final.commit_event_histogram) == 6
+
+
+def test_image_incomplete_forced_refresh_keeps_off_milestone_for_next_epoch(
+    tmp_path: Path,
+) -> None:
+    urls = [f"https://foreign-{index}.test/image.jpg" for index in range(448)]
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", urls)
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=8,
+        per_host_concurrency=1,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    kind = assets_module._image_kind(fingerprint, unique_jobs)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    all_epochs: list[list[UrlProgressSnapshot]] = []
+    foreign_completed = False
+
+    for _execution in range(32):
+        snapshots: list[UrlProgressSnapshot] = []
+
+        def callback(snapshot: UrlProgressSnapshot) -> None:
+            nonlocal foreign_completed
+            snapshots.append(snapshot)
+            if not foreign_completed:
+                leased = jobs.claim(kind, 448, "foreign", lease_seconds=3600)
+                assert len(leased) == 448
+                first = leased[0]
+                ImageOutcomeStore(outcomes_path).put(
+                    fingerprint,
+                    str(first.payload["url_key"]),
+                    str(first.payload["image_url"]),
+                    {
+                        "status": "terminal",
+                        "image_url": first.payload["image_url"],
+                        "error_class": "foreign",
+                    },
+                )
+                jobs.finish(
+                    first.job_id,
+                    "terminal",
+                    {"url_key": first.payload["url_key"]},
+                    owner="foreign",
+                    lease_id=first.lease_id,
+                )
+                foreign_completed = True
+
+        result = fetch_unique_images(
+            unique_jobs,
+            jobs,
+            FakeImageTransport(tmp_path, {}),
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            progress_callback=callback,
+            progress_callback_every=2,
+        )
+        assert not result.complete
+        all_epochs.append(snapshots)
+
+    assert [len(epoch) for epoch in all_epochs] == [1] * 32
+    assert [epoch[0].completed_durable for epoch in all_epochs] == [0] + [1] * 31
+    assert sum(len(epoch) - 1 for epoch in all_epochs) <= 224
+    assert len(all_epochs) <= 32
+    assert sum(map(len, all_epochs)) <= 256
+
+
 def test_image_tracker_distinguishes_physical_and_synchronous_cache_paths(
     tmp_path: Path,
 ) -> None:
@@ -2417,6 +2533,93 @@ def test_image_finish_fence_failure_preserves_root_error_and_resumes(
     )
     assert resumed.complete
     assert resumed_transport.calls == [image_url]
+
+
+def test_image_mixed_completed_batch_commits_success_before_root_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    success_url = "https://success.test/mixed.jpg"
+    failed_url = "https://failed.test/mixed.jpg"
+    unique_jobs = write_unique_jobs(
+        tmp_path / "unique.jsonl", [success_url, failed_url]
+    )
+    barrier = threading.Barrier(2)
+
+    class MixedTransport(FakeImageTransport):
+        def download_image(self, image_url: str, **kwargs):
+            barrier.wait(timeout=5)
+            return super().download_image(image_url, **kwargs)
+
+    original_finish = ImageOutcomeStore.finish_transport_attempt
+
+    def fail_selected(self, attempt_id: str, **kwargs) -> None:
+        with sqlite3.connect(self.path) as connection:
+            url = connection.execute(
+                "SELECT url FROM transport_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+        if url == failed_url:
+            raise OSError("mixed image finish sentinel")
+        original_finish(self, attempt_id, **kwargs)
+
+    real_wait = assets_module.wait
+
+    def failed_first(fs, *, return_when):
+        done, pending = real_wait(fs)
+        return sorted(done, key=lambda future: future.exception() is None), pending
+
+    monkeypatch.setattr(ImageOutcomeStore, "finish_transport_attempt", fail_selected)
+    monkeypatch.setattr(assets_module, "wait", failed_first)
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=2,
+        per_host_concurrency=1,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    snapshots: list[UrlProgressSnapshot] = []
+    with pytest.raises(OSError, match="mixed image finish sentinel"):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            MixedTransport(
+                tmp_path,
+                {success_url: "success", failed_url: "failed"},
+            ),
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            lease_seconds=60.0,
+            progress_callback=snapshots.append,
+        )
+
+    store = ImageOutcomeStore(outcomes_path)
+    success_key = hashlib.sha256(success_url.encode("utf-8")).hexdigest()
+    failed_key = hashlib.sha256(failed_url.encode("utf-8")).hexdigest()
+    assert store.get(fingerprint, success_key)["status"] == "success"
+    assert store.get(fingerprint, failed_key) is None
+    assert [snapshot.completed_durable for snapshot in snapshots] == [0, 1]
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status"
+        ).fetchall() == [("leased", 1), ("success", 1)]
+        connection.execute("UPDATE jobs SET lease_expires = 0 WHERE status='leased'")
+
+    monkeypatch.setattr(ImageOutcomeStore, "finish_transport_attempt", original_finish)
+    resumed_transport = FakeImageTransport(tmp_path, {failed_url: "retry"})
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        resumed_transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    assert resumed.complete
+    assert resumed_transport.calls == [failed_url]
 
 
 def test_image_outcome_initialization_commit_uses_live_guard(

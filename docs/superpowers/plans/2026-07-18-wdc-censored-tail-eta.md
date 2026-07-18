@@ -133,6 +133,9 @@ def encode_histogram_blob(snapshot: UrlProgressSnapshot) -> str:
 
 `decode_histogram_blob` must require canonical base64 and exactly 1,280 decoded bytes. Keep estimation pure: it receives one prefix snapshot and cannot receive `completed_at`.
 
+Generate exact fixed-bin edges from the declared formula and reuse them through
+a bounded 128-entry `(finite horizon, bin_count)` LRU cache.
+
 - [ ] **Step 5: Run GREEN and regression tests**
 
 Run:
@@ -188,7 +191,9 @@ Add symmetric page/image guard and SQLite finish-fence failures. Assert the
 original exception type and message, unfinished attempt ledger, no false
 durable completion, physical-active tracker state, and successful retry after
 resume. In a completed batch, mark only successful futures finished, release
-scheduler resources, and propagate failed `future.result()` unchanged.
+scheduler resources, durable-commit every successful result, publish URL
+progress once for the whole batch, and then propagate failed `future.result()`
+unchanged. Add mixed successful/failed batch and resume coverage symmetrically.
 
 - [ ] **Step 3: Run RED tests**
 
@@ -208,7 +213,7 @@ Add/verify indexes supporting `jobs(kind, status)` and outcome `(policy_fingerpr
 
 - [ ] **Step 6: Integrate page and image schedulers**
 
-Place tracker hooks immediately after the existing durable attempt start/finish fences and around future/durable commits. Before each bounded absolute-completion milestone, run one external refresh, pass it into `tracker.snapshot`, then invoke the callback. Preserve one mandatory initial durable-baseline callback per epoch. Coalesce the forced final callback with an already published completion and count it within the 224 completion budget. Cover multiple resumes, external jumps, and completed batches.
+Place tracker hooks immediately after the existing durable attempt start/finish fences and around future/durable commits. Before each bounded absolute-completion milestone, run one external refresh, pass it into `tracker.snapshot`, then invoke the callback. Preserve one mandatory initial durable-baseline callback per epoch. A forced incomplete refresh publishes only after crossing the next absolute milestone; otherwise the next epoch baseline carries it. A completed stage may force its final publication. Coalesce completed batches and forced final callbacks, and count them within the 224 completion budget. Cover multiple resumes, foreign completions, external jumps, and completed batches for both page and image schedulers.
 
 - [ ] **Step 7: Run GREEN, focused regressions, and disk checks**
 
@@ -249,7 +254,7 @@ Add a fake disk-usage sequence for all three roots. Assert start is captured onc
 
 - [ ] **Step 2: Write failing codec/size/tamper tests**
 
-Construct two stages with 256 maximum-width samples. Assert decoded blob length 1,280, canonical base64 round-trip, output `< 3 * 1024 * 1024`, and restore rejects truncated/extra/noncanonical blobs, counter overflow, decreasing event histograms, topology mismatch, duplicate/noncontiguous epochs, changed deadline/total, and forged ETA components. The 257th sample and 33rd unique epoch must fail before replacing the previously published progress bytes.
+Construct two stages with a 256-sample incomplete-v1 prefix plus a 256-sample v2 suffix. Assert decoded blob length 1,280, canonical base64 round-trip, output `< 3 * 1024 * 1024`, and restore rejects truncated/extra/noncanonical blobs, counter overflow, decreasing event histograms, topology mismatch, duplicate/noncontiguous epochs, changed deadline/total, forged ETA components, 257 legacy samples, and more than 224 v2 completion publications. The 257th v2 suffix sample and 33rd unique v2 epoch must fail before replacing the previously published progress bytes.
 
 - [ ] **Step 3: Write failing pipeline authority/compatibility tests**
 
@@ -265,13 +270,13 @@ Expected: v2 persistence/restore tests fail because the reporter still accepts s
 
 - [ ] **Step 5: Implement v2 reporter epochs**
 
-On the first snapshot of an epoch, allocate a rollback-safe logical baseline and require elapsed zero. For later snapshots, derive timestamp only from the persisted baseline plus monotonic elapsed. Call `estimate_url_eta`, serialize the exact histograms, append at most 256 samples, and recompute final-half summaries from restored sample predictions. Never trim an accepted sample or epoch to recover capacity; fail closed before append instead.
+On the first snapshot of an epoch, allocate a rollback-safe logical baseline and require elapsed zero. For later snapshots, derive timestamp only from the persisted baseline plus monotonic elapsed. Call `estimate_url_eta`, serialize the exact histograms, append at most 256 v2 samples, and recompute final-half summaries from all restored v1 and v2 sample predictions. Count every epoch's first v2 sample as a baseline and every other v2 sample as a completion publication, independent of its completed value. Never trim an accepted sample or epoch to recover capacity; fail closed before append instead.
 
 During the same atomic snapshot, update output/work/cache current bytes, peak bytes, and per-root minimum free bytes. Initialize start bytes/free bytes only when absent. Restore and merge extrema before the first resume publication so a restarted process cannot erase a prior peak or raise a prior minimum-free value.
 
 - [ ] **Step 6: Implement strict restore and v1 compatibility**
 
-Validate every epoch and estimator component by decoding and recomputing, never trusting persisted ETA scalars. Preserve completed v1 summaries. For incomplete v1, retain historical v1 samples and append a new v2 epoch whose baseline is the exact durable refresh; never reinterpret v1 histograms.
+Validate every epoch and estimator component by decoding and recomputing, never trusting persisted ETA scalars. Preserve completed v1 summaries. For incomplete v1, accept at most 256 contiguous leading v1 samples and independently accept at most 256 following v2 samples (32 baselines plus 224 completions), for at most 512 mixed samples per stage. Append a new v2 epoch whose baseline is the exact durable refresh; never reinterpret v1 histograms or allow v1 after v2.
 
 - [ ] **Step 7: Bind v2 completion authority into manifests**
 

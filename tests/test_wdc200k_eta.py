@@ -406,6 +406,21 @@ def test_fixed_bin_all_nonbinary_exact_edges(
     assert fixed_bin(horizon, horizon, bin_count) == (bin_count - 1, True)
 
 
+def test_fixed_bin_edge_cache_reuses_entries_and_stays_bounded() -> None:
+    eta_module._fixed_bin_edges.cache_clear()
+    for _ in range(5):
+        fixed_bin(0.05, 0.1, 64)
+    reused = eta_module._fixed_bin_edges.cache_info()
+    assert reused.misses == 1
+    assert reused.hits == 4
+
+    for index in range(200):
+        fixed_bin(0.0, float(index + 1), 32)
+    bounded = eta_module._fixed_bin_edges.cache_info()
+    assert bounded.maxsize == 128
+    assert bounded.currsize <= 128
+
+
 def test_absolute_completion_milestones_span_resumes_jumps_and_batches() -> None:
     interval = completion_publication_interval(256, requested_interval=1)
     assert interval == 2

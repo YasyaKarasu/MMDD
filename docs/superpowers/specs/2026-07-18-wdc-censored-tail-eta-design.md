@@ -78,9 +78,12 @@ at the first milestone strictly above the indexed durable baseline, so it
 neither resets nor repeats old milestones. A user `progress_callback_every`
 can only increase the effective interval. A refresh that crosses several
 milestones, including an external durable-completion jump or a completed
-future batch, emits one current snapshot. The forced final publication counts
-toward the 224 budget and is coalesced when the same durable completion was
-already published.
+future batch, emits one current snapshot. A forced refresh publishes only if
+the refreshed durable completion crossed the next absolute milestone or the
+stage is complete. An incomplete off-milestone completion is carried into the
+next epoch's mandatory baseline. A forced final publication counts toward the
+224 budget and is coalesced when the same durable completion was already
+published.
 
 Immediately before each bounded callback, the scheduler performs one indexed,
 read-only aggregate refresh of exact durable job/outcome counts;
@@ -92,7 +95,10 @@ inside the existing durable physical-attempt fence and use `time.monotonic()`
 for ages and durations. The callback never scans SQLite and never retains a
 URL. A batch returned by `wait(FIRST_COMPLETED)` enters
 `finished_not_durable` before its serial outcome/job commits, then leaves that
-state one result at a time.
+state one result at a time. All successful futures in the batch cross the
+finish fence first; their serial durable commits complete before one coalesced
+URL publication. Synchronous cache reconciliation remains independently
+publishable because it does not belong to a completed future batch.
 
 The durable finish fence is also the tracker transition fence. If the attempt
 finish guard or SQLite transaction fails, the worker future fails and the
@@ -138,6 +144,9 @@ The `x >= H` overflow check occurs before the bisection. Exact-edge tests use
 the same generated edges and require `T[j]` for `0 <= j < 64` to enter bin
 `j`, and `H` to enter bin 63 with overflow set. This definition also applies
 to non-binary horizons such as `0.1` and `1.3`.
+The generated edge tuple is cached by finite `(horizon, bin_count)` with a
+bounded 128-entry LRU. The API continues to accept any positive integer bin
+count without allowing configuration diversity to create unbounded state.
 
 Commit horizon `C` is `min(2.0, H)` seconds, with 32 linear bins
 `C[j] = j*C/32`. Commit durations `>= C` increment `commit_overflow_events`
@@ -260,10 +269,14 @@ censor plus 32-bin commit histograms. For JSON persistence, the 160 counters
 are concatenated in that order as unsigned little-endian `uint64` and base64
 encoded in one `histogram_blob`; values outside `[0, 2**64-1]` fail closed.
 The decoder requires exactly 1,280 bytes. This preserves exact counters while
-avoiding pretty-printed per-element overhead. A serializer test constructs
-both stages at 256 samples with every counter and scalar at its maximum width;
-the resulting actual schema must be below 3 MiB, leaving at least 1 MiB below
-the existing 4 MiB restore limit.
+avoiding pretty-printed per-element overhead. Native v2 telemetry permits 256
+samples per stage: at most 32 epoch baselines and 224 completion publications.
+For incomplete-v1 migration only, an independently bounded legacy prefix of
+at most 256 v1 samples may precede the independently bounded v2 suffix, so one
+mixed stage may contain at most 512 samples. V1 may never follow v2. A
+serializer test constructs both stages at the mixed 256+256 maximum; the
+resulting actual schema must be below 3 MiB. Restore still rejects the file
+before parsing if it exceeds the existing 4 MiB cap.
 
 Snapshots must be monotonic in timestamp and durable completion. `total` and
 the deadline cannot change within a stage. Within one `execution_epoch`, event
@@ -283,7 +296,8 @@ Epoch and sample authority is append-only and fail-closed:
 - elapsed time and durable completion are monotonic inside the epoch;
 - a new epoch's baseline completion is at least the prior sample's completion,
   while the stage total/deadline/rate basis remain identical.
-- the 33rd unique execution epoch or 257th sample is rejected before telemetry
+- the 33rd unique v2 execution epoch, 225th v2 completion publication, 257th
+  v2 suffix sample, or 257th legacy prefix sample is rejected before telemetry
   append or `progress.json` replacement; previously published bytes and sample
   objects remain unchanged;
 - no accepted sample or epoch is trimmed, compacted, or excluded to recover
@@ -296,7 +310,9 @@ Epoch and sample authority is append-only and fail-closed:
 - A v1 completed stage remains readable and retains its recorded ETA; it is
   not retroactively re-estimated.
 - A resumed incomplete v1 URL stage starts a v2 execution epoch from its exact
-  durable completion baseline; it does not reinterpret historical v1 samples.
+  durable completion baseline; it does not reinterpret or delete any of the
+  at most 256 historical v1 samples. Completion authority includes every
+  eligible retained v1 and v2 sample.
 - Dry-run and structural-only runs create no transport telemetry.
 - All new persistence uses the existing atomic, guarded progress write; no
   estimator callback performs a database query.
