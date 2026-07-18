@@ -60,7 +60,15 @@ from wdc200k_io import (
     SqliteJobStore,
     validate_completed_shard,
 )
-from wdc200k_eta import UrlProgressSnapshot
+from wdc200k_eta import (
+    URL_TELEMETRY_SCHEMA_VERSION,
+    UrlEtaEstimate,
+    UrlProgressSnapshot,
+    decode_histogram_blob,
+    encode_histogram_blob,
+    estimate_url_eta,
+    url_estimator_metadata,
+)
 from wdc200k_materialize import (
     MaterializationInputs,
     MaterializationResult,
@@ -370,6 +378,8 @@ class ProgressReporter:
         self._state = _ProgressState()
         self._rolling_samples: deque[tuple[float, int]] = deque()
         self._stage_telemetry: dict[str, dict[str, Any]] = {}
+        self._disk_roots: dict[str, dict[str, int]] = {}
+        self._active_epochs: dict[str, tuple[str, float]] = {}
         self._logical_clock_offset = 0.0
         self._logical_time_floor = float("-inf")
         self._restore_stage_telemetry()
@@ -409,190 +419,342 @@ class ProgressReporter:
             "max_symmetric_eta_factor": max(factors) if factors else None,
         }
 
+    @staticmethod
+    def _uint(value: Any, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"progress {name} is not a non-negative integer")
+        return value
+
+    @staticmethod
+    def _finite(value: Any, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"progress {name} is not finite")
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"progress {name} is not finite")
+        return result
+
+    @staticmethod
+    def _estimate_fields(estimate: UrlEtaEstimate) -> dict[str, Any]:
+        return {
+            "durable_rate": estimate.durable_rate,
+            "rate_eta": estimate.rate_eta,
+            "queue_eta": estimate.queue_eta,
+            "inflight_eta": estimate.inflight_eta,
+            "commit_eta": estimate.commit_eta,
+            "overflow_eta": estimate.overflow_eta,
+            "predicted_remaining_seconds": (
+                estimate.predicted_remaining_seconds
+            ),
+            "fallback": estimate.fallback,
+        }
+
+    @classmethod
+    def _restore_v1_sample(cls, raw: dict[str, Any]) -> dict[str, Any]:
+        try:
+            timestamp = cls._finite(raw["timestamp"], "v1 timestamp")
+            completed = cls._uint(raw["completed_units"], "v1 completed")
+            total = cls._uint(raw["total_units"], "v1 total")
+            rate = cls._finite(raw["rate"], "v1 rate")
+            rolling = cls._finite(raw["rolling_rate"], "v1 rolling rate")
+            predicted_raw = raw.get("predicted_remaining_seconds")
+            predicted = (
+                None
+                if predicted_raw is None
+                else cls._finite(predicted_raw, "v1 ETA")
+            )
+        except KeyError as error:
+            raise ValueError("progress v1 sample is incomplete") from error
+        if (
+            total < completed
+            or rate < 0.0
+            or rolling < 0.0
+            or (predicted is not None and predicted < 0.0)
+        ):
+            raise ValueError("progress v1 sample is invalid")
+        expected = (total - completed) / rate if rate > 0.0 else None
+        if expected != predicted:
+            raise ValueError("progress v1 ETA sample is inconsistent")
+        return {
+            "timestamp": timestamp,
+            "completed_units": completed,
+            "total_units": total,
+            "rate": rate,
+            "rolling_rate": rolling,
+            "predicted_remaining_seconds": predicted,
+        }
+
+    @classmethod
+    def _restore_v2_sample(cls, raw: dict[str, Any]) -> tuple[
+        dict[str, Any], UrlProgressSnapshot
+    ]:
+        if raw.get("telemetry_schema_version") != URL_TELEMETRY_SCHEMA_VERSION:
+            raise ValueError("progress URL telemetry schema is invalid")
+        try:
+            transport, active, commit = decode_histogram_blob(
+                raw["histogram_blob"]
+            )
+            snapshot = UrlProgressSnapshot(
+                execution_epoch=raw["execution_epoch"],
+                baseline_completed=raw["baseline_completed"],
+                completed_durable=raw["completed_units"],
+                total=raw["total_units"],
+                local_buffered_not_started=raw[
+                    "local_buffered_not_started"
+                ],
+                in_flight_jobs=raw["in_flight_jobs"],
+                physical_in_flight=raw["physical_in_flight"],
+                finished_not_durable=raw["finished_not_durable"],
+                unobserved_nonlocal=raw["unobserved_nonlocal"],
+                deadline_seconds=raw["deadline_seconds"],
+                effective_concurrency=raw["effective_concurrency"],
+                epoch_elapsed_seconds=raw["epoch_elapsed_seconds"],
+                transport_event_histogram=transport,
+                active_censor_histogram=active,
+                commit_event_histogram=commit,
+                transport_overflow_events=raw["transport_overflow_events"],
+                active_overflow_censors=raw["active_overflow_censors"],
+                commit_overflow_events=raw["commit_overflow_events"],
+            )
+            baseline_timestamp = cls._finite(
+                raw["baseline_timestamp"], "baseline timestamp"
+            )
+            timestamp = cls._finite(raw["timestamp"], "sample timestamp")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("progress v2 sample is invalid") from error
+        if timestamp != baseline_timestamp + snapshot.epoch_elapsed_seconds:
+            raise ValueError("progress v2 logical timestamp is inconsistent")
+        estimate = estimate_url_eta(snapshot)
+        expected_fields = cls._estimate_fields(estimate)
+        for name, expected in expected_fields.items():
+            if name not in raw or raw[name] != expected:
+                raise ValueError(f"progress v2 {name} is inconsistent")
+        restored = dict(raw)
+        restored.update(
+            {
+                "timestamp": timestamp,
+                "baseline_timestamp": baseline_timestamp,
+                **expected_fields,
+            }
+        )
+        return restored, snapshot
+
+    def _restore_disk(self, payload: dict[str, Any]) -> None:
+        disk = payload.get("disk")
+        if disk is None:
+            return
+        if not isinstance(disk, dict):
+            raise ValueError("progress disk state is invalid")
+        roots = disk.get("roots")
+        if roots is None:
+            return
+        if not isinstance(roots, dict):
+            raise ValueError("progress disk roots are invalid")
+        if set(roots) != {"work", "cache", "output"}:
+            raise ValueError("progress disk roots are incomplete")
+        for name, raw in roots.items():
+            if not isinstance(raw, dict):
+                raise ValueError("progress disk root state is invalid")
+            restored = {
+                field: self._uint(raw.get(field), f"disk {name} {field}")
+                for field in (
+                    "start_bytes",
+                    "peak_bytes",
+                    "current_bytes",
+                    "start_free_bytes",
+                    "min_free_bytes",
+                )
+            }
+            if (
+                restored["peak_bytes"] < restored["start_bytes"]
+                or restored["peak_bytes"] < restored["current_bytes"]
+                or restored["min_free_bytes"] > restored["start_free_bytes"]
+            ):
+                raise ValueError("progress disk extrema are inconsistent")
+            self._disk_roots[name] = restored
+
     def _restore_stage_telemetry(self) -> None:
-        """Restore only bounded URL telemetry from an atomic prior snapshot."""
+        """Restore bounded URL telemetry and recompute every v2 estimate."""
         if not self.config.resume or not self.path.is_file():
             return
         if self.path.stat().st_size > 4 * 1024 * 1024:
             raise ValueError("progress telemetry exceeds bounded state size")
         payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("progress snapshot must be an object")
+        self._restore_disk(payload)
         raw_stages = payload.get("stage_telemetry", {})
         if not isinstance(raw_stages, dict):
             raise ValueError("progress stage_telemetry must be an object")
-        invalidated = set()
+        invalidated: set[str] = set()
         if self.config.from_stage is not None:
-            from_index = STAGES.index(self.config.from_stage)
-            invalidated = set(STAGES[from_index:])
+            invalidated = set(STAGES[STAGES.index(self.config.from_stage) :])
         for stage, raw in raw_stages.items():
             if stage not in STAGES or stage in invalidated:
                 continue
             if not isinstance(raw, dict):
                 raise ValueError("progress stage telemetry must be an object")
+            expected_basis = {"pages": "page_urls", "images": "image_urls"}.get(
+                stage
+            )
             rate_basis = raw.get("rate_basis")
             samples = raw.get("samples")
-            if not isinstance(rate_basis, str) or not rate_basis:
-                raise ValueError("progress rate_basis is invalid")
-            expected_basis = {
-                "pages": "page_urls",
-                "images": "image_urls",
-            }.get(stage)
             if rate_basis != expected_basis:
                 raise ValueError("progress rate_basis does not match stage")
-            if not isinstance(samples, list) or len(samples) > self._MAX_STAGE_SAMPLES:
+            if (
+                not isinstance(samples, list)
+                or not samples
+                or len(samples) > self._MAX_STAGE_SAMPLES
+            ):
                 raise ValueError("progress stage samples are not bounded")
+
             restored_samples: list[dict[str, Any]] = []
             previous_completed = -1
             previous_timestamp = float("-inf")
-            previous_total = -1
-            for sample in samples:
-                if not isinstance(sample, dict):
+            stage_total: int | None = None
+            stage_deadline: float | None = None
+            current_epoch: str | None = None
+            seen_epochs: set[str] = set()
+            epoch_baseline = -1
+            epoch_baseline_timestamp = float("-inf")
+            epoch_elapsed = -1.0
+            epoch_concurrency = -1
+            prior_transport: tuple[int, ...] | None = None
+            prior_commit: tuple[int, ...] | None = None
+            v2_started = False
+
+            for sample_raw in samples:
+                if not isinstance(sample_raw, dict):
                     raise ValueError("progress stage sample is invalid")
-                timestamp = float(sample["timestamp"])
-                completed = int(sample["completed_units"])
-                total = int(sample["total_units"])
-                rate = float(sample["rate"])
-                rolling_rate = float(sample["rolling_rate"])
-                predicted_raw = sample.get("predicted_remaining_seconds")
-                predicted = (
-                    None if predicted_raw is None else float(predicted_raw)
-                )
-                if (
-                    not all(
-                        math.isfinite(value)
-                        for value in (
-                            timestamp,
-                            rate,
-                            rolling_rate,
+                is_v2 = "telemetry_schema_version" in sample_raw
+                if not is_v2:
+                    if v2_started:
+                        raise ValueError("progress v1 sample follows v2 telemetry")
+                    sample = self._restore_v1_sample(sample_raw)
+                    completed = int(sample["completed_units"])
+                    total = int(sample["total_units"])
+                    timestamp = float(sample["timestamp"])
+                else:
+                    v2_started = True
+                    sample, snapshot = self._restore_v2_sample(sample_raw)
+                    completed = snapshot.completed_durable
+                    total = snapshot.total
+                    timestamp = float(sample["timestamp"])
+                    if stage_deadline is None:
+                        stage_deadline = snapshot.deadline_seconds
+                    elif snapshot.deadline_seconds != stage_deadline:
+                        raise ValueError("progress v2 deadline changed")
+                    epoch = snapshot.execution_epoch
+                    if epoch != current_epoch:
+                        if epoch in seen_epochs:
+                            raise ValueError("progress v2 epoch is noncontiguous")
+                        seen_epochs.add(epoch)
+                        current_epoch = epoch
+                        epoch_baseline = snapshot.baseline_completed
+                        epoch_baseline_timestamp = float(
+                            sample["baseline_timestamp"]
                         )
-                    )
-                    or (
-                        predicted is not None
-                        and not math.isfinite(predicted)
-                    )
-                    or timestamp < previous_timestamp
+                        epoch_elapsed = snapshot.epoch_elapsed_seconds
+                        epoch_concurrency = snapshot.effective_concurrency
+                        prior_transport = snapshot.transport_event_histogram
+                        prior_commit = snapshot.commit_event_histogram
+                        if (
+                            snapshot.epoch_elapsed_seconds != 0.0
+                            or snapshot.completed_durable
+                            != snapshot.baseline_completed
+                            or any(snapshot.transport_event_histogram)
+                            or any(snapshot.active_censor_histogram)
+                            or any(snapshot.commit_event_histogram)
+                            or snapshot.baseline_completed < previous_completed
+                            or epoch_baseline_timestamp < previous_timestamp
+                        ):
+                            raise ValueError("progress v2 epoch baseline is invalid")
+                    else:
+                        if (
+                            snapshot.baseline_completed != epoch_baseline
+                            or float(sample["baseline_timestamp"])
+                            != epoch_baseline_timestamp
+                            or snapshot.epoch_elapsed_seconds < epoch_elapsed
+                            or snapshot.effective_concurrency != epoch_concurrency
+                            or any(
+                                after < before
+                                for before, after in zip(
+                                    prior_transport or (),
+                                    snapshot.transport_event_histogram,
+                                )
+                            )
+                            or any(
+                                after < before
+                                for before, after in zip(
+                                    prior_commit or (),
+                                    snapshot.commit_event_histogram,
+                                )
+                            )
+                        ):
+                            raise ValueError("progress v2 epoch history is invalid")
+                        epoch_elapsed = snapshot.epoch_elapsed_seconds
+                        prior_transport = snapshot.transport_event_histogram
+                        prior_commit = snapshot.commit_event_histogram
+
+                if stage_total is None:
+                    stage_total = total
+                if (
+                    total != stage_total
                     or completed < previous_completed
-                    or total < previous_total
-                    or completed < 0
-                    or total < completed
-                    or rate < 0
-                    or rolling_rate < 0
-                    or (predicted is not None and predicted < 0)
+                    or timestamp < previous_timestamp
                 ):
                     raise ValueError("progress stage samples are not monotonic")
-                remaining = total - completed
-                expected_predicted = remaining / rate if rate > 0 else None
-                if (
-                    (expected_predicted is None) != (predicted is None)
-                    or (
-                        expected_predicted is not None
-                        and not math.isclose(
-                            float(predicted),
-                            expected_predicted,
-                            rel_tol=1e-12,
-                            abs_tol=1e-12,
-                        )
-                    )
-                ):
-                    raise ValueError("progress ETA sample is inconsistent")
-                restored_samples.append(
-                    {
-                        "timestamp": timestamp,
-                        "completed_units": completed,
-                        "total_units": total,
-                        "rate": rate,
-                        "rolling_rate": rolling_rate,
-                        "predicted_remaining_seconds": predicted,
-                    }
-                )
+                restored_samples.append(sample)
                 previous_completed = completed
                 previous_timestamp = timestamp
-                previous_total = total
                 self._logical_time_floor = max(
-                    self._logical_time_floor,
-                    timestamp,
+                    self._logical_time_floor, timestamp
                 )
-            completed_at_raw = raw.get("completed_at")
-            last_sample = restored_samples[-1] if restored_samples else None
-            if last_sample is None:
-                raise ValueError("progress stage telemetry has no samples")
-            restored_completed = int(raw.get("completed_units", -1))
-            restored_total = int(raw.get("total_units", -1))
+
+            last_sample = restored_samples[-1]
+            restored_completed = self._uint(
+                raw.get("completed_units"), "stage completed"
+            )
+            restored_total = self._uint(raw.get("total_units"), "stage total")
             if (
-                restored_completed < 0
-                or restored_total < restored_completed
-                or restored_completed != int(last_sample["completed_units"])
+                restored_completed != int(last_sample["completed_units"])
                 or restored_total != int(last_sample["total_units"])
             ):
                 raise ValueError("progress stage summary is inconsistent")
+            completed_at_raw = raw.get("completed_at")
             completed_at = (
                 None
                 if completed_at_raw is None
-                else float(completed_at_raw)
+                else self._finite(completed_at_raw, "completed_at")
             )
-            if completed_at is not None and (
-                not math.isfinite(completed_at)
-                or completed_at < float(last_sample["timestamp"])
-                or restored_completed != restored_total
-            ):
-                raise ValueError("progress completed_at is inconsistent")
-            if completed_at is None and restored_completed == restored_total:
-                raise ValueError("progress completed stage lacks completed_at")
-            persisted_eligible = int(
-                raw.get("eligible_final_half_samples", -1)
-            )
-            persisted_excluded = int(
-                raw.get("excluded_final_half_samples", -1)
-            )
-            persisted_factor_raw = raw.get("max_symmetric_eta_factor")
-            persisted_factor = (
-                None
-                if persisted_factor_raw is None
-                else float(persisted_factor_raw)
-            )
-            if (
-                persisted_eligible < 0
-                or persisted_excluded < 0
-                or (
-                    persisted_factor is not None
-                    and (
-                        not math.isfinite(persisted_factor)
-                        or persisted_factor < 1.0
-                    )
-                )
-            ):
-                raise ValueError("progress ETA summary is invalid")
-            expected_summary = (
-                {
+            if completed_at is None:
+                if restored_completed == restored_total:
+                    raise ValueError("progress completed stage lacks completed_at")
+                expected_summary = {
                     "eligible_final_half_samples": 0,
                     "excluded_final_half_samples": 0,
                     "max_symmetric_eta_factor": None,
                 }
-                if completed_at is None
-                else self._eta_completion_summary(
+            else:
+                if (
+                    restored_completed != restored_total
+                    or completed_at < float(last_sample["timestamp"])
+                    or (
+                        v2_started
+                        and completed_at != float(last_sample["timestamp"])
+                    )
+                ):
+                    raise ValueError("progress completed_at is inconsistent")
+                expected_summary = self._eta_completion_summary(
                     restored_samples,
                     total=restored_total,
                     completed_at=completed_at,
                 )
-            )
-            expected_factor = expected_summary["max_symmetric_eta_factor"]
-            if (
-                persisted_eligible
-                != expected_summary["eligible_final_half_samples"]
-                or persisted_excluded
-                != expected_summary["excluded_final_half_samples"]
-                or (expected_factor is None) != (persisted_factor is None)
-                or (
-                    expected_factor is not None
-                    and not math.isclose(
-                        float(persisted_factor),
-                        float(expected_factor),
-                        rel_tol=1e-12,
-                        abs_tol=1e-12,
-                    )
-                )
-            ):
-                raise ValueError("progress ETA summary is inconsistent")
-            self._stage_telemetry[stage] = {
+            for key, expected in expected_summary.items():
+                if raw.get(key) != expected:
+                    raise ValueError("progress ETA summary is inconsistent")
+
+            telemetry: dict[str, Any] = {
                 "rate_basis": rate_basis,
                 "samples": restored_samples,
                 "completed_units": restored_completed,
@@ -600,18 +762,29 @@ class ProgressReporter:
                 "completed_at": completed_at,
                 **expected_summary,
             }
+            if v2_started:
+                if raw.get("telemetry_schema_version") != (
+                    URL_TELEMETRY_SCHEMA_VERSION
+                ):
+                    raise ValueError("progress stage schema is inconsistent")
+                expected_estimator = url_estimator_metadata(stage_deadline)
+                if raw.get("estimator") != expected_estimator:
+                    raise ValueError("progress estimator metadata is inconsistent")
+                telemetry.update(
+                    telemetry_schema_version=URL_TELEMETRY_SCHEMA_VERSION,
+                    estimator=expected_estimator,
+                )
+            self._stage_telemetry[stage] = telemetry
             if completed_at is not None:
                 self._logical_time_floor = max(
-                    self._logical_time_floor,
-                    completed_at,
+                    self._logical_time_floor, completed_at
                 )
         if math.isfinite(self._logical_time_floor):
             wall_now = time.time()
             if not math.isfinite(wall_now):
                 raise ValueError("progress wall clock is invalid")
             self._logical_clock_offset = max(
-                0.0,
-                self._logical_time_floor - wall_now,
+                0.0, self._logical_time_floor - wall_now
             )
 
     def _progress_now_locked(self) -> float:
@@ -649,9 +822,7 @@ class ProgressReporter:
         known_work_bytes: int | None = None,
         known_cache_bytes: int | None = None,
         known_output_bytes: int | None = None,
-        completed_units: int | None = None,
-        total_units: int | None = None,
-        rate_basis: str | None = None,
+        url_snapshot: UrlProgressSnapshot | None = None,
     ) -> None:
         with self._lock:
             if stage is not None and stage != self._state.stage:
@@ -662,8 +833,6 @@ class ProgressReporter:
                 self._state.completed_units = 0
                 self._state.total_units = 0
                 self._state.rate_basis = None
-                self._state.unit_baseline_completed = 0
-                self._state.unit_baseline_at = None
             if completed_shards is not None:
                 self._state.completed_shards = completed_shards
             if total_shards is not None:
@@ -678,83 +847,8 @@ class ProgressReporter:
                 self._state.known_cache_bytes = int(known_cache_bytes)
             if known_output_bytes is not None:
                 self._state.known_output_bytes = int(known_output_bytes)
-            self._update_units_locked(
-                completed_units=completed_units,
-                total_units=total_units,
-                rate_basis=rate_basis,
-            )
-
-    def _update_units_locked(
-        self,
-        *,
-        completed_units: int | None,
-        total_units: int | None,
-        rate_basis: str | None,
-    ) -> None:
-        if (
-            completed_units is None
-            and total_units is None
-            and rate_basis is None
-        ):
-            return
-        if rate_basis is not None:
-            normalized_basis = str(rate_basis).strip()
-            if not normalized_basis:
-                raise ValueError("rate_basis must not be empty")
-            if (
-                self._state.rate_basis is not None
-                and self._state.rate_basis != normalized_basis
-            ):
-                raise ValueError("rate_basis cannot change within a stage")
-            self._state.rate_basis = normalized_basis
-        if self._state.rate_basis is None:
-            raise ValueError("rate_basis is required for URL-unit progress")
-        existing_samples = self._current_stage_samples_locked()
-        if existing_samples:
-            last_sample = existing_samples[-1]
-            self._state.total_units = max(
-                self._state.total_units,
-                int(last_sample["total_units"]),
-            )
-            self._state.completed_units = max(
-                self._state.completed_units,
-                int(last_sample["completed_units"]),
-            )
-        if total_units is not None:
-            candidate_total = int(total_units)
-            if candidate_total < 0:
-                raise ValueError("total_units must be non-negative")
-            self._state.total_units = max(
-                self._state.total_units,
-                candidate_total,
-            )
-        changed = False
-        if completed_units is not None:
-            candidate_completed = int(completed_units)
-            if candidate_completed < 0:
-                raise ValueError("completed_units must be non-negative")
-            monotonic_completed = max(
-                self._state.completed_units,
-                candidate_completed,
-            )
-            if monotonic_completed > self._state.total_units:
-                raise ValueError("completed_units exceeds total_units")
-            changed = monotonic_completed != self._state.completed_units
-            self._state.completed_units = monotonic_completed
-        now = self._progress_now_locked()
-        if self._state.unit_baseline_at is None:
-            self._state.unit_baseline_at = now
-            self._state.unit_baseline_completed = self._state.completed_units
-            changed = True
-        samples = self._current_stage_samples_locked()
-        duplicate_last = bool(samples) and (
-            int(samples[-1]["completed_units"])
-            == self._state.completed_units
-            and int(samples[-1]["total_units"]) == self._state.total_units
-        )
-        if (changed and not duplicate_last) or not samples:
-            self._record_unit_sample_locked(now)
-        self._complete_unit_stage_locked()
+            if url_snapshot is not None:
+                self._update_url_locked(url_snapshot)
 
     def _current_stage_samples_locked(self) -> list[dict[str, Any]]:
         telemetry = self._stage_telemetry.get(self._state.stage)
@@ -763,81 +857,233 @@ class ProgressReporter:
         return telemetry["samples"]
 
     def _unit_rates_locked(self, now: float) -> tuple[float, float]:
-        baseline_at = self._state.unit_baseline_at
-        if baseline_at is None:
-            return 0.0, 0.0
-        elapsed = now - baseline_at
-        rate = (
-            max(
-                0.0,
-                (
-                    self._state.completed_units
-                    - self._state.unit_baseline_completed
-                )
-                / elapsed,
-            )
-            if elapsed > 0
-            else 0.0
-        )
-        rolling_rate = 0.0
+        del now
         samples = self._current_stage_samples_locked()
-        cutoff = now - self._ROLLING_WINDOW_SECONDS
-        first = next(
-            (
-                sample
-                for sample in samples
-                if float(sample["timestamp"]) >= cutoff
-            ),
-            None,
-        )
-        if first is not None:
-            rolling_elapsed = now - float(first["timestamp"])
-            if rolling_elapsed > 0:
-                rolling_rate = max(
-                    0.0,
-                    (
-                        self._state.completed_units
-                        - int(first["completed_units"])
-                    )
-                    / rolling_elapsed,
-                )
-        return rate, rolling_rate
+        if not samples:
+            return 0.0, 0.0
+        rate = samples[-1].get("durable_rate")
+        if rate is None:
+            rate = samples[-1].get("rate", 0.0)
+        return float(rate or 0.0), float(rate or 0.0)
 
-    def _record_unit_sample_locked(self, now: float) -> None:
-        rate, rolling_rate = self._unit_rates_locked(now)
-        remaining = max(
-            0,
-            self._state.total_units - self._state.completed_units,
-        )
-        predicted = remaining / rate if rate > 0 else None
-        telemetry = self._stage_telemetry.setdefault(
-            self._state.stage,
-            {
-                "rate_basis": self._state.rate_basis,
-                "samples": [],
-                "completed_units": 0,
-                "total_units": self._state.total_units,
-                "completed_at": None,
-                "eligible_final_half_samples": 0,
-                "excluded_final_half_samples": 0,
-                "max_symmetric_eta_factor": None,
-            },
-        )
-        samples = telemetry["samples"]
-        telemetry["completed_units"] = self._state.completed_units
-        telemetry["total_units"] = self._state.total_units
-        samples.append(
-            {
-                "timestamp": now,
-                "completed_units": self._state.completed_units,
-                "total_units": self._state.total_units,
-                "rate": rate,
-                "rolling_rate": rolling_rate,
-                "predicted_remaining_seconds": predicted,
+    @staticmethod
+    def _v2_sample(
+        snapshot: UrlProgressSnapshot,
+        *,
+        baseline_timestamp: float,
+    ) -> dict[str, Any]:
+        estimate = estimate_url_eta(snapshot)
+        return {
+            "telemetry_schema_version": URL_TELEMETRY_SCHEMA_VERSION,
+            "timestamp": baseline_timestamp + snapshot.epoch_elapsed_seconds,
+            "execution_epoch": snapshot.execution_epoch,
+            "baseline_completed": snapshot.baseline_completed,
+            "baseline_timestamp": baseline_timestamp,
+            "epoch_elapsed_seconds": snapshot.epoch_elapsed_seconds,
+            "completed_units": snapshot.completed_durable,
+            "total_units": snapshot.total,
+            "local_buffered_not_started": snapshot.local_buffered_not_started,
+            "in_flight_jobs": snapshot.in_flight_jobs,
+            "physical_in_flight": snapshot.physical_in_flight,
+            "finished_not_durable": snapshot.finished_not_durable,
+            "unobserved_nonlocal": snapshot.unobserved_nonlocal,
+            "deadline_seconds": snapshot.deadline_seconds,
+            "effective_concurrency": snapshot.effective_concurrency,
+            "transport_overflow_events": snapshot.transport_overflow_events,
+            "active_overflow_censors": snapshot.active_overflow_censors,
+            "commit_overflow_events": snapshot.commit_overflow_events,
+            "histogram_blob": encode_histogram_blob(snapshot),
+            **ProgressReporter._estimate_fields(estimate),
+        }
+
+    @classmethod
+    def _trim_samples(cls, samples: list[dict[str, Any]]) -> None:
+        while len(samples) > cls._MAX_STAGE_SAMPLES:
+            first = samples[0]
+            if "execution_epoch" not in first:
+                del samples[0]
+                continue
+            epoch = first["execution_epoch"]
+            next_epoch = next(
+                (
+                    index
+                    for index, sample in enumerate(samples[1:], start=1)
+                    if sample.get("execution_epoch") != epoch
+                ),
+                len(samples),
+            )
+            if next_epoch < len(samples):
+                del samples[:next_epoch]
+            else:
+                del samples[1]
+
+    def _update_url_locked(self, snapshot: UrlProgressSnapshot) -> None:
+        if not isinstance(snapshot, UrlProgressSnapshot):
+            raise ValueError("url_snapshot must be UrlProgressSnapshot")
+        stage = self._state.stage
+        rate_basis = {"pages": "page_urls", "images": "image_urls"}.get(stage)
+        if rate_basis is None:
+            raise ValueError("URL progress belongs to pages or images")
+        telemetry = self._stage_telemetry.get(stage)
+        if telemetry is not None and telemetry.get("completed_at") is not None:
+            if not (
+                snapshot.epoch_elapsed_seconds == 0.0
+                and snapshot.baseline_completed
+                == snapshot.completed_durable
+                == snapshot.total
+                == int(telemetry["total_units"])
+                and not any(snapshot.transport_event_histogram)
+                and not any(snapshot.active_censor_histogram)
+                and not any(snapshot.commit_event_histogram)
+            ):
+                raise ValueError("progress URL stage is already complete")
+            self._state.completed_units = snapshot.completed_durable
+            self._state.total_units = snapshot.total
+            self._state.rate_basis = rate_basis
+            return
+        samples = [] if telemetry is None else telemetry["samples"]
+        active = self._active_epochs.get(stage)
+        if active is None:
+            prior_epochs = {
+                sample.get("execution_epoch")
+                for sample in samples
+                if "execution_epoch" in sample
             }
+            if snapshot.execution_epoch in prior_epochs:
+                raise ValueError("progress execution epoch must be unique")
+            if (
+                snapshot.epoch_elapsed_seconds != 0.0
+                or snapshot.completed_durable != snapshot.baseline_completed
+                or any(snapshot.transport_event_histogram)
+                or any(snapshot.active_censor_histogram)
+                or any(snapshot.commit_event_histogram)
+            ):
+                raise ValueError("progress first epoch snapshot is invalid")
+            if samples:
+                prior = samples[-1]
+                if (
+                    snapshot.baseline_completed < int(prior["completed_units"])
+                    or snapshot.total != int(prior["total_units"])
+                ):
+                    raise ValueError("progress epoch baseline is not durable")
+            baseline_timestamp = self._progress_now_locked()
+            self._active_epochs[stage] = (
+                snapshot.execution_epoch,
+                baseline_timestamp,
+            )
+        else:
+            active_epoch, baseline_timestamp = active
+            if snapshot.execution_epoch != active_epoch:
+                raise ValueError("progress execution epoch changed in process")
+        sample = self._v2_sample(
+            snapshot, baseline_timestamp=baseline_timestamp
         )
-        if len(samples) > self._MAX_STAGE_SAMPLES:
-            del samples[: len(samples) - self._MAX_STAGE_SAMPLES]
+        trial = [*samples, sample]
+        trial_raw = {
+            "rate_basis": rate_basis,
+            "samples": trial,
+            "completed_units": snapshot.completed_durable,
+            "total_units": snapshot.total,
+            "completed_at": None,
+            "eligible_final_half_samples": 0,
+            "excluded_final_half_samples": 0,
+            "max_symmetric_eta_factor": None,
+            "telemetry_schema_version": URL_TELEMETRY_SCHEMA_VERSION,
+            "estimator": url_estimator_metadata(snapshot.deadline_seconds),
+        }
+        # Reuse the strict decoder for append validation without trusting the
+        # freshly serialized scalar components.
+        previous_completed = -1
+        previous_timestamp = float("-inf")
+        previous_deadline: float | None = None
+        previous_total: int | None = None
+        current_epoch: str | None = None
+        seen_epochs: set[str] = set()
+        epoch_baseline = -1
+        epoch_baseline_timestamp = float("-inf")
+        epoch_concurrency = -1
+        epoch_elapsed = -1.0
+        prior_transport: tuple[int, ...] | None = None
+        prior_commit: tuple[int, ...] | None = None
+        for candidate in trial:
+            if "telemetry_schema_version" not in candidate:
+                previous_completed = int(candidate["completed_units"])
+                previous_timestamp = float(candidate["timestamp"])
+                previous_total = int(candidate["total_units"])
+                continue
+            restored, decoded = self._restore_v2_sample(candidate)
+            if previous_total is not None and decoded.total != previous_total:
+                raise ValueError("progress total changed within stage")
+            if previous_deadline is None:
+                previous_deadline = decoded.deadline_seconds
+            elif decoded.deadline_seconds != previous_deadline:
+                raise ValueError("progress deadline changed within stage")
+            if decoded.execution_epoch != current_epoch:
+                if decoded.execution_epoch in seen_epochs:
+                    raise ValueError("progress epoch is noncontiguous")
+                seen_epochs.add(decoded.execution_epoch)
+                current_epoch = decoded.execution_epoch
+                epoch_baseline = decoded.baseline_completed
+                epoch_baseline_timestamp = float(
+                    restored["baseline_timestamp"]
+                )
+                epoch_concurrency = decoded.effective_concurrency
+                if (
+                    decoded.epoch_elapsed_seconds != 0.0
+                    or decoded.completed_durable != decoded.baseline_completed
+                    or decoded.baseline_completed < previous_completed
+                    or float(restored["baseline_timestamp"])
+                    < previous_timestamp
+                    or any(decoded.transport_event_histogram)
+                    or any(decoded.active_censor_histogram)
+                    or any(decoded.commit_event_histogram)
+                ):
+                    raise ValueError("progress epoch baseline is invalid")
+            else:
+                if (
+                    decoded.baseline_completed != epoch_baseline
+                    or float(restored["baseline_timestamp"])
+                    != epoch_baseline_timestamp
+                    or decoded.effective_concurrency != epoch_concurrency
+                    or decoded.epoch_elapsed_seconds < epoch_elapsed
+                    or any(
+                        after < before
+                        for before, after in zip(
+                            prior_transport or (),
+                            decoded.transport_event_histogram,
+                        )
+                    )
+                    or any(
+                        after < before
+                        for before, after in zip(
+                            prior_commit or (), decoded.commit_event_histogram
+                        )
+                    )
+                ):
+                    raise ValueError("progress epoch samples are not monotonic")
+            if (
+                decoded.completed_durable < previous_completed
+                or float(restored["timestamp"]) < previous_timestamp
+            ):
+                raise ValueError("progress samples are not monotonic")
+            previous_completed = decoded.completed_durable
+            previous_timestamp = float(restored["timestamp"])
+            previous_total = decoded.total
+            epoch_elapsed = decoded.epoch_elapsed_seconds
+            prior_transport = decoded.transport_event_histogram
+            prior_commit = decoded.commit_event_histogram
+
+        self._trim_samples(trial)
+        telemetry = trial_raw
+        telemetry["samples"] = trial
+        self._stage_telemetry[stage] = telemetry
+        self._state.completed_units = snapshot.completed_durable
+        self._state.total_units = snapshot.total
+        self._state.rate_basis = rate_basis
+        self._logical_time_floor = max(
+            self._logical_time_floor, float(sample["timestamp"])
+        )
+        self._complete_unit_stage_locked()
 
     def _complete_unit_stage_locked(self) -> None:
         if self._state.rate_basis is None:
@@ -847,7 +1093,7 @@ class ProgressReporter:
         telemetry = self._stage_telemetry.get(self._state.stage)
         if telemetry is None or telemetry["completed_at"] is not None:
             return
-        completed_at = self._progress_now_locked()
+        completed_at = float(telemetry["samples"][-1]["timestamp"])
         total = self._state.total_units
         telemetry.update(
             {
@@ -887,12 +1133,11 @@ class ProgressReporter:
             remaining = max(0, total - complete)
             shard_eta = remaining / rate if rate > 0 else None
             unit_rate, unit_rolling_rate = self._unit_rates_locked(unit_now)
-            unit_remaining = max(
-                0,
-                self._state.total_units - self._state.completed_units,
-            )
+            unit_samples = self._current_stage_samples_locked()
             unit_eta = (
-                unit_remaining / unit_rate if unit_rate > 0 else None
+                unit_samples[-1].get("predicted_remaining_seconds")
+                if unit_samples
+                else None
             )
             eta = unit_eta if self._state.rate_basis is not None else shard_eta
             free_by_root = {
@@ -905,6 +1150,39 @@ class ProgressReporter:
                     ("output", self.config.output_dir),
                 )
             }
+            current_by_root = {
+                "work": self._uint(
+                    self._state.known_work_bytes, "work current bytes"
+                ),
+                "cache": self._uint(
+                    self._state.known_cache_bytes, "cache current bytes"
+                ),
+                "output": self._uint(
+                    self._state.known_output_bytes, "output current bytes"
+                ),
+            }
+            for name in ("work", "cache", "output"):
+                current_bytes = current_by_root[name]
+                free_bytes = self._uint(
+                    free_by_root[name], f"{name} current free bytes"
+                )
+                prior = self._disk_roots.get(name)
+                if prior is None:
+                    self._disk_roots[name] = {
+                        "start_bytes": current_bytes,
+                        "peak_bytes": current_bytes,
+                        "current_bytes": current_bytes,
+                        "start_free_bytes": free_bytes,
+                        "min_free_bytes": free_bytes,
+                    }
+                else:
+                    prior["peak_bytes"] = max(
+                        prior["peak_bytes"], current_bytes
+                    )
+                    prior["current_bytes"] = current_bytes
+                    prior["min_free_bytes"] = min(
+                        prior["min_free_bytes"], free_bytes
+                    )
             return {
                 "stage": self._state.stage,
                 "completed_shards": complete,
@@ -937,6 +1215,10 @@ class ProgressReporter:
                     "output_bytes": self._state.known_output_bytes,
                     "free_bytes": free_by_root["work"],
                     "free_bytes_by_root": free_by_root,
+                    "roots": {
+                        name: dict(values)
+                        for name, values in sorted(self._disk_roots.items())
+                    },
                     "reserve_bytes": self.config.min_free_disk_bytes,
                 },
             }
@@ -961,6 +1243,13 @@ class ProgressReporter:
                     "max_symmetric_eta_factor",
                 )
             }
+            if telemetry.get("telemetry_schema_version") is not None:
+                summary.update(
+                    telemetry_schema_version=telemetry[
+                        "telemetry_schema_version"
+                    ],
+                    estimator=dict(telemetry["estimator"]),
+                )
         expected_basis = {"pages": "page_urls", "images": "image_urls"}.get(
             stage
         )
@@ -1547,8 +1836,23 @@ def _validate_network_telemetry(
         factor = None if factor_raw is None else float(factor_raw)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("URL completion summary is invalid") from error
+    schema = completion.get("telemetry_schema_version")
+    estimator = completion.get("estimator")
+    if schema is None:
+        estimator_is_valid = "estimator" not in completion
+    else:
+        try:
+            deadline = float(estimator["deadline_seconds"])
+            estimator_is_valid = (
+                schema == URL_TELEMETRY_SCHEMA_VERSION
+                and isinstance(estimator, dict)
+                and estimator == url_estimator_metadata(deadline)
+            )
+        except (KeyError, TypeError, ValueError):
+            estimator_is_valid = False
     if (
-        completion.get("rate_basis") != expected_basis
+        not estimator_is_valid
+        or completion.get("rate_basis") != expected_basis
         or completed != total
         or total != int(counts.get("unique", -1))
         or not math.isfinite(completed_at)
@@ -1566,6 +1870,8 @@ def _validate_network_telemetry(
             registry_stage
         )
     except ValueError as error:
+        if "completed_at" in str(error):
+            raise ValueError("progress URL completion mismatch") from error
         raise ValueError("progress ETA summary mismatch") from error
     if progress_completion != completion:
         raise ValueError("progress URL completion mismatch")
@@ -2620,12 +2926,14 @@ def _run_pages(
         if after_cache_write is not None:
             after_cache_write(record)
 
+    page_epoch_started = False
+
     def page_url_progress(snapshot: UrlProgressSnapshot) -> None:
-        reporter.update(
-            completed_units=snapshot.completed_durable,
-            total_units=snapshot.total,
-            rate_basis="page_urls",
-        )
+        nonlocal page_epoch_started
+        if not page_epoch_started:
+            snapshot = replace(snapshot, epoch_elapsed_seconds=0.0)
+            page_epoch_started = True
+        reporter.update(url_snapshot=snapshot)
 
     result = fetch_unique_pages(
         _page_refs(config.work_dir / "structural", structural, finalized),
@@ -2819,12 +3127,14 @@ def _run_images(
         image_completed += 1
         reporter.update(counters={"image_completed_live": image_completed})
 
+    image_epoch_started = False
+
     def image_url_progress(snapshot: UrlProgressSnapshot) -> None:
-        reporter.update(
-            completed_units=snapshot.completed_durable,
-            total_units=snapshot.total,
-            rate_basis="image_urls",
-        )
+        nonlocal image_epoch_started
+        if not image_epoch_started:
+            snapshot = replace(snapshot, epoch_elapsed_seconds=0.0)
+            image_epoch_started = True
+        reporter.update(url_snapshot=snapshot)
 
     if pre_write_guard is not None:
         pre_write_guard(root / "jobs.sqlite3", 0)

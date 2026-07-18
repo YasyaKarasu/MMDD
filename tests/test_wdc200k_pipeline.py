@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import gzip
 import os
+import base64
 import shutil
 import sqlite3
 import subprocess
@@ -35,6 +36,15 @@ from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
 import build_wdc200k_mm_joinability_dataset as pipeline_module  # noqa: E402
 from wdc200k_assets import ImageOutcomeStore  # noqa: E402
 from wdc200k_fetch import PageOutcomeStore  # noqa: E402
+from wdc200k_eta import (  # noqa: E402
+    UrlProgressSnapshot,
+    decode_histogram_blob,
+    encode_histogram_blob,
+)
+
+
+URL_TELEMETRY_V2 = "wdc200k-url-telemetry-v2"
+UINT64_MAX = 2**64 - 1
 
 
 def _statistics_archive(input_dir: Path) -> Path:
@@ -635,6 +645,44 @@ def _full_pipeline_config(tmp_path: Path) -> PipelineConfig:
     )
 
 
+def _url_snapshot(
+    *,
+    epoch: str,
+    baseline: int,
+    completed: int,
+    total: int,
+    elapsed: float,
+    deadline: float = 8.0,
+    effective_concurrency: int = 128,
+) -> UrlProgressSnapshot:
+    completed_in_epoch = completed - baseline
+    transport = [0] * 64
+    commit = [0] * 32
+    if completed_in_epoch:
+        transport[0] = completed_in_epoch
+        commit[0] = completed_in_epoch
+    return UrlProgressSnapshot(
+        execution_epoch=epoch,
+        baseline_completed=baseline,
+        completed_durable=completed,
+        total=total,
+        local_buffered_not_started=0,
+        in_flight_jobs=0,
+        physical_in_flight=0,
+        finished_not_durable=0,
+        unobserved_nonlocal=total - completed,
+        deadline_seconds=deadline,
+        effective_concurrency=effective_concurrency,
+        epoch_elapsed_seconds=elapsed,
+        transport_event_histogram=tuple(transport),
+        active_censor_histogram=(0,) * 64,
+        commit_event_histogram=tuple(commit),
+        transport_overflow_events=0,
+        active_overflow_censors=0,
+        commit_overflow_events=0,
+    )
+
+
 def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
     tmp_path: Path,
 ) -> None:
@@ -666,6 +714,11 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         telemetry = first_progress["stage_telemetry"][stage]
         assert telemetry["rate_basis"] == basis
         assert telemetry["samples"][-1]["completed_units"] == total
+        assert telemetry["telemetry_schema_version"] == URL_TELEMETRY_V2
+        assert all(
+            sample["telemetry_schema_version"] == URL_TELEMETRY_V2
+            for sample in telemetry["samples"]
+        )
         assert telemetry["completed_at"] is not None
 
     first_network_telemetry = {}
@@ -700,6 +753,15 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         assert completion["completed_units"] == network["counts"]["unique"]
         assert completion["total_units"] == network["counts"]["unique"]
         assert completion["completed_at"] is not None
+        assert completion["telemetry_schema_version"] == URL_TELEMETRY_V2
+        assert completion["estimator"] == {
+            "transport_bins": 64,
+            "active_censor_bins": 64,
+            "commit_bins": 32,
+            "maturity_numerator": 1,
+            "maturity_denominator": 3,
+            "deadline_seconds": 8.0,
+        }
         assert registry["counters"][f"{stage[:-1]}_transport_attempts"] == (
             expected_attempts
         )
@@ -713,6 +775,8 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
             "transport_attempts": attempts,
             "url_completion": completion,
             "registry_counters": registry["counters"],
+            "network_bytes": Path(network_ref["path"]).read_bytes(),
+            "registry_bytes": registry_path.read_bytes(),
         }
 
     resumed = run_pipeline(
@@ -731,12 +795,11 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         "stage_telemetry"
     ]
     for stage in STAGES:
+        registry_path = (
+            config.work_dir / "stage_manifests" / f"pipeline-{stage}.json"
+        )
         registry = json.loads(
-            (
-                config.work_dir
-                / "stage_manifests"
-                / f"pipeline-{stage}.json"
-            ).read_text(encoding="utf-8")
+            registry_path.read_text(encoding="utf-8")
         )
         assert registry["stage"] == stage
         assert registry["complete"] is True
@@ -753,11 +816,24 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
             network = json.loads(
                 Path(network_ref["path"]).read_text(encoding="utf-8")
             )
+            assert Path(network_ref["path"]).read_bytes() == (
+                first_network_telemetry[stage]["network_bytes"]
+            )
+            assert registry_path.read_bytes() == first_network_telemetry[stage][
+                "registry_bytes"
+            ]
             assert {
                 "transport_attempts": network["transport_attempts"],
                 "url_completion": network["url_completion"],
                 "registry_counters": registry["counters"],
-            } == first_network_telemetry[stage]
+            } == {
+                key: first_network_telemetry[stage][key]
+                for key in (
+                    "transport_attempts",
+                    "url_completion",
+                    "registry_counters",
+                )
+            }
 
 
 def test_resume_rejects_tampered_page_attempt_authority(
@@ -933,6 +1009,66 @@ def test_registry_binds_url_completion_to_progress_state(
 
     with pytest.raises(ValueError, match="progress URL completion mismatch"):
         _validate_existing_network_registry(config, "pages")
+
+
+def test_registry_accepts_completed_v1_progress_and_manifest_authority(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    progress_path = config.work_dir / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    legacy = {
+        "rate_basis": "page_urls",
+        "completed_units": 1,
+        "total_units": 1,
+        "completed_at": 11.0,
+        "eligible_final_half_samples": 0,
+        "excluded_final_half_samples": 1,
+        "max_symmetric_eta_factor": None,
+        "samples": [
+            {
+                "timestamp": 10.0,
+                "completed_units": 0,
+                "total_units": 1,
+                "rate": 0.0,
+                "rolling_rate": 0.0,
+                "predicted_remaining_seconds": None,
+            },
+            {
+                "timestamp": 11.0,
+                "completed_units": 1,
+                "total_units": 1,
+                "rate": 1.0,
+                "rolling_rate": 1.0,
+                "predicted_remaining_seconds": 0.0,
+            },
+        ],
+    }
+    progress["stage_telemetry"]["pages"] = legacy
+    progress_path.write_text(
+        json.dumps(progress, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    def downgrade(network: dict[str, Any], registry: dict[str, Any]) -> None:
+        network["url_completion"] = {
+            key: legacy[key]
+            for key in (
+                "rate_basis",
+                "completed_units",
+                "total_units",
+                "completed_at",
+                "eligible_final_half_samples",
+                "excluded_final_half_samples",
+                "max_symmetric_eta_factor",
+            )
+        }
+        registry["counters"]["page_eta_eligible_final_half_samples"] = 0
+        registry["counters"]["page_eta_excluded_final_half_samples"] = 1
+
+    _rewrite_network_registry(config, "pages", downgrade)
+    _validate_existing_network_registry(config, "pages")
 
 
 def test_registry_recomputes_eta_summary_before_accepting_factor(
@@ -1237,138 +1373,7 @@ def test_progress_rolling_rate_uses_a_fixed_time_window(
     assert snapshot["rates"]["rolling_shards_per_second"] != snapshot["rates"]["shards_per_second"]
 
 
-def test_progress_url_units_use_resume_baseline_and_remain_monotonic(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _full_pipeline_config(tmp_path)
-    clock = [0.0]
-    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
-    reporter = ProgressReporter(config)
-
-    reporter.update(
-        stage="pages",
-        completed_units=5,
-        total_units=10,
-        rate_basis="page_urls",
-    )
-    clock[0] = 2.0
-    reporter.update(completed_units=7)
-    snapshot = reporter._snapshot()
-    reporter.update(completed_units=6)
-    monotonic = reporter._snapshot()
-
-    assert snapshot["completed_units"] == 7
-    assert snapshot["total_units"] == 10
-    assert snapshot["rate_basis"] == "page_urls"
-    assert snapshot["rates"]["units_per_second"] == pytest.approx(1.0)
-    assert snapshot["eta_seconds"] == pytest.approx(3.0)
-    assert monotonic["completed_units"] == 7
-
-
-def test_progress_keeps_bounded_stage_samples_and_final_half_eta(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _full_pipeline_config(tmp_path)
-    clock = [0.0]
-    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
-    reporter = ProgressReporter(config)
-    reporter.update(
-        stage="pages",
-        completed_units=0,
-        total_units=300,
-        rate_basis="page_urls",
-    )
-    for completed in range(1, 301):
-        clock[0] = float(completed)
-        reporter.update(completed_units=completed)
-    reporter.update(stage="images")
-    snapshot = reporter._snapshot()
-    pages = snapshot["stage_telemetry"]["pages"]
-
-    assert len(pages["samples"]) == 256
-    assert pages["completed_units"] == 300
-    assert pages["total_units"] == 300
-    assert pages["completed_at"] == 300.0
-    assert pages["eligible_final_half_samples"] > 0
-    assert pages["excluded_final_half_samples"] == 1
-    assert pages["max_symmetric_eta_factor"] == pytest.approx(1.0)
-    assert snapshot["stage"] == "images"
-    assert snapshot["completed_units"] == 0
-    assert snapshot["total_units"] == 0
-    assert snapshot["rate_basis"] is None
-
-
-def test_progress_atomically_publishes_guarded_url_telemetry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _full_pipeline_config(tmp_path)
-    clock = [0.0]
-    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
-    guarded: list[tuple[Path, int]] = []
-
-    def guard(path: Path, estimated_bytes: int = 0) -> None:
-        guarded.append((Path(path), estimated_bytes))
-
-    reporter = ProgressReporter(
-        config,
-        pre_write_guard=guard,
-    )
-    reporter.update(
-        stage="pages",
-        completed_units=0,
-        total_units=2,
-        rate_basis="page_urls",
-    )
-    clock[0] = 1.0
-    reporter.update(completed_units=1)
-    reporter.publish()
-
-    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
-    assert payload["stage_telemetry"]["pages"]["samples"][-1][
-        "completed_units"
-    ] == 1
-    assert guarded
-    assert not list(reporter.path.parent.glob(f".{reporter.path.name}.*.tmp"))
-
-
-def test_progress_restores_bounded_samples_across_process_resume(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _full_pipeline_config(tmp_path)
-    clock = [0.0]
-    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
-    first = ProgressReporter(config)
-    first.update(
-        stage="pages",
-        completed_units=0,
-        total_units=4,
-        rate_basis="page_urls",
-    )
-    clock[0] = 2.0
-    first.update(completed_units=2)
-    first.publish()
-
-    resumed = ProgressReporter(config)
-    resumed.update(
-        stage="pages",
-        completed_units=1,
-        total_units=4,
-        rate_basis="page_urls",
-    )
-    snapshot = resumed._snapshot()
-
-    assert snapshot["completed_units"] == 2
-    assert [
-        sample["completed_units"]
-        for sample in snapshot["stage_telemetry"]["pages"]["samples"]
-    ] == [0, 2]
-
-
-def test_progress_resume_survives_wall_clock_rollback(
+def test_progress_v2_maps_two_epochs_to_rollback_safe_logical_time(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1378,73 +1383,439 @@ def test_progress_resume_survives_wall_clock_rollback(
     first = ProgressReporter(config)
     first.update(
         stage="pages",
-        completed_units=0,
-        total_units=4,
-        rate_basis="page_urls",
+        url_snapshot=_url_snapshot(
+            epoch="epoch-1", baseline=5, completed=5, total=10, elapsed=0.0
+        ),
     )
-    clock[0] = 110.0
-    first.update(completed_units=2)
+    first.update(
+        url_snapshot=_url_snapshot(
+            epoch="epoch-1", baseline=5, completed=7, total=10, elapsed=2.0
+        )
+    )
     first.publish()
+    original_samples = json.loads(first.path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ]["pages"]["samples"]
 
     clock[0] = 50.0
     resumed = ProgressReporter(config)
     resumed.update(
         stage="pages",
-        completed_units=3,
-        total_units=4,
-        rate_basis="page_urls",
+        url_snapshot=_url_snapshot(
+            epoch="epoch-2", baseline=7, completed=7, total=10, elapsed=0.0
+        ),
     )
-    clock[0] = 51.0
-    resumed.update(completed_units=4)
+    clock[0] = 10.0
+    resumed.update(
+        url_snapshot=_url_snapshot(
+            epoch="epoch-2", baseline=7, completed=10, total=10, elapsed=3.0
+        )
+    )
     resumed.publish()
     payload = json.loads(resumed.path.read_text(encoding="utf-8"))
     samples = payload["stage_telemetry"]["pages"]["samples"]
 
-    assert [sample["timestamp"] for sample in samples] == sorted(
-        sample["timestamp"] for sample in samples
-    )
-    assert payload["stage_telemetry"]["pages"]["completed_at"] >= (
-        samples[-1]["timestamp"]
-    )
+    assert samples[:2] == original_samples
+    assert [sample["execution_epoch"] for sample in samples] == [
+        "epoch-1",
+        "epoch-1",
+        "epoch-2",
+        "epoch-2",
+    ]
+    assert samples[0]["epoch_elapsed_seconds"] == 0.0
+    assert samples[2]["epoch_elapsed_seconds"] == 0.0
+    assert samples[0]["timestamp"] == samples[0]["baseline_timestamp"]
+    assert samples[1]["timestamp"] == samples[0]["baseline_timestamp"] + 2.0
+    assert samples[2]["baseline_timestamp"] >= samples[1]["timestamp"]
+    assert samples[3]["timestamp"] == samples[2]["baseline_timestamp"] + 3.0
+    assert payload["stage_telemetry"]["pages"]["completed_at"] == samples[-1][
+        "timestamp"
+    ]
     ProgressReporter(config)
+
+
+def test_progress_v2_tracks_all_disk_root_extrema_across_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    for root in (config.work_dir, config.cache_dir, config.output_dir):
+        root.mkdir(parents=True, exist_ok=True)
+    free = {
+        config.work_dir.resolve(): iter((900, 700, 800)),
+        config.cache_dir.resolve(): iter((800, 600, 750)),
+        config.output_dir.resolve(): iter((700, 500, 650)),
+    }
+    monkeypatch.setattr(
+        pipeline_module.shutil,
+        "disk_usage",
+        lambda path: shutil._ntuple_diskusage(
+            1_000, 1_000 - (value := next(free[Path(path).resolve()])), value
+        ),
+    )
+    reporter = ProgressReporter(config)
+    reporter.update(
+        known_work_bytes=10, known_cache_bytes=20, known_output_bytes=30
+    )
+    reporter.publish()
+    reporter.update(
+        known_work_bytes=40, known_cache_bytes=15, known_output_bytes=35
+    )
+    reporter.publish()
+
+    resumed = ProgressReporter(config)
+    resumed.update(
+        known_work_bytes=5, known_cache_bytes=25, known_output_bytes=32
+    )
+    resumed.publish()
+    roots = json.loads(resumed.path.read_text(encoding="utf-8"))["disk"][
+        "roots"
+    ]
+
+    assert roots == {
+        "work": {
+            "start_bytes": 10,
+            "peak_bytes": 40,
+            "current_bytes": 5,
+            "start_free_bytes": 900,
+            "min_free_bytes": 700,
+        },
+        "cache": {
+            "start_bytes": 20,
+            "peak_bytes": 25,
+            "current_bytes": 25,
+            "start_free_bytes": 800,
+            "min_free_bytes": 600,
+        },
+        "output": {
+            "start_bytes": 30,
+            "peak_bytes": 35,
+            "current_bytes": 32,
+            "start_free_bytes": 700,
+            "min_free_bytes": 500,
+        },
+    }
+
+
+def test_progress_v2_is_bounded_canonical_and_strictly_restorable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 1e300)
+    reporter = ProgressReporter(config)
+    baseline = UINT64_MAX - 256
+    for stage, epoch in (("pages", "wide-pages"), ("images", "wide-images")):
+        for offset in range(257):
+            reporter.update(
+                stage=stage if offset == 0 else None,
+                url_snapshot=_url_snapshot(
+                    epoch=epoch,
+                    baseline=baseline,
+                    completed=baseline + offset,
+                    total=UINT64_MAX,
+                    elapsed=float(offset),
+                    deadline=1e300,
+                    effective_concurrency=UINT64_MAX,
+                ),
+            )
+    reporter.publish()
+
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    assert reporter.path.stat().st_size < 3 * 1024 * 1024
+    for stage in ("pages", "images"):
+        samples = payload["stage_telemetry"][stage]["samples"]
+        assert len(samples) == 256
+        for sample in samples:
+            decoded = base64.b64decode(sample["histogram_blob"])
+            assert len(decoded) == 1_280
+            transport, active, commit = decode_histogram_blob(
+                sample["histogram_blob"]
+            )
+            rebuilt = _url_snapshot(
+                epoch=sample["execution_epoch"],
+                baseline=sample["baseline_completed"],
+                completed=sample["completed_units"],
+                total=sample["total_units"],
+                elapsed=sample["epoch_elapsed_seconds"],
+                deadline=sample["deadline_seconds"],
+                effective_concurrency=sample["effective_concurrency"],
+            )
+            assert transport == rebuilt.transport_event_histogram
+            assert active == rebuilt.active_censor_histogram
+            assert commit == rebuilt.commit_event_histogram
+            assert encode_histogram_blob(rebuilt) == sample["histogram_blob"]
+    ProgressReporter(config)
+
+
+def test_progress_restore_rejects_files_above_four_mibibytes(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    (config.work_dir / "progress.json").write_bytes(
+        b" " * (4 * 1024 * 1024 + 1)
+    )
+
+    with pytest.raises(ValueError, match="bounded state size"):
+        ProgressReporter(config)
+
+
+def _published_v2_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[PipelineConfig, Path]:
+    monkeypatch.setattr(
+        pipeline_module.time, "time", lambda: 1_700_000_000.0
+    )
+    config = _full_pipeline_config(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="tamper-1", baseline=0, completed=0, total=3, elapsed=0.0
+        ),
+    )
+    reporter.update(
+        url_snapshot=_url_snapshot(
+            epoch="tamper-1", baseline=0, completed=1, total=3, elapsed=1.0
+        )
+    )
+    reporter.update(
+        url_snapshot=_url_snapshot(
+            epoch="tamper-1", baseline=0, completed=2, total=3, elapsed=2.0
+        )
+    )
+    reporter.publish()
+    return config, reporter.path
 
 
 @pytest.mark.parametrize(
     "tamper",
     [
-        lambda telemetry: telemetry["samples"][0].__setitem__(
-            "timestamp", float("nan")
+        lambda samples: samples[-1].__setitem__(
+            "histogram_blob", samples[-1]["histogram_blob"][:-4]
         ),
-        lambda telemetry: telemetry.__setitem__("completed_units", 999),
-        lambda telemetry: telemetry.__setitem__(
-            "eligible_final_half_samples", -1
+        lambda samples: samples[-1].__setitem__(
+            "histogram_blob",
+            base64.b64encode(base64.b64decode(samples[-1]["histogram_blob"]) + b"x").decode("ascii"),
         ),
+        lambda samples: samples[-1].__setitem__(
+            "histogram_blob", samples[-1]["histogram_blob"] + "\n"
+        ),
+        lambda samples: samples[-1].__setitem__(
+            "baseline_completed", 2**64
+        ),
+        lambda samples: samples[-1].__setitem__(
+            "unobserved_nonlocal", samples[-1]["unobserved_nonlocal"] + 1
+        ),
+        lambda samples: samples[-1].__setitem__("deadline_seconds", 9.0),
+        lambda samples: samples[-1].__setitem__("total_units", 4),
+        lambda samples: samples[-1].__setitem__(
+            "predicted_remaining_seconds",
+            samples[-1]["predicted_remaining_seconds"] + 1.0,
+        ),
+        lambda samples: samples[-1].pop("overflow_eta"),
     ],
 )
-def test_progress_restore_rejects_tampered_unit_telemetry(
+def test_progress_v2_restore_rejects_blob_counter_topology_and_eta_tamper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tamper: Any,
 ) -> None:
-    config = _full_pipeline_config(tmp_path)
-    clock = [0.0]
-    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
-    reporter = ProgressReporter(config)
-    reporter.update(
-        stage="pages",
-        completed_units=0,
-        total_units=2,
-        rate_basis="page_urls",
-    )
-    clock[0] = 1.0
-    reporter.update(completed_units=1)
-    reporter.publish()
-    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
-    tamper(payload["stage_telemetry"]["pages"])
-    reporter.path.write_text(json.dumps(payload), encoding="utf-8")
+    config, path = _published_v2_progress(tmp_path, monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tamper(payload["stage_telemetry"]["pages"]["samples"])
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="progress"):
         ProgressReporter(config)
+
+
+def test_progress_v2_restore_rejects_decreasing_events_and_reused_epochs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, path = _published_v2_progress(tmp_path, monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    samples = payload["stage_telemetry"]["pages"]["samples"]
+    transport, active, commit = decode_histogram_blob(samples[-1]["histogram_blob"])
+    forged = _url_snapshot(
+        epoch="tamper-1",
+        baseline=0,
+        completed=2,
+        total=3,
+        elapsed=2.0,
+    )
+    forged = replace(
+        forged,
+        transport_event_histogram=(0,) * 64,
+        commit_event_histogram=commit,
+    )
+    samples[-1]["histogram_blob"] = encode_histogram_blob(forged)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="progress"):
+        ProgressReporter(config)
+
+    config, path = _published_v2_progress(tmp_path / "epochs", monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    samples = payload["stage_telemetry"]["pages"]["samples"]
+    samples[1]["execution_epoch"] = "epoch-2"
+    samples[2]["execution_epoch"] = "tamper-1"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="progress"):
+        ProgressReporter(config)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        _url_snapshot(
+            epoch="same-epoch",
+            baseline=1,
+            completed=1,
+            total=3,
+            elapsed=1.0,
+        ),
+        _url_snapshot(
+            epoch="same-epoch",
+            baseline=0,
+            completed=1,
+            total=3,
+            elapsed=1.0,
+            effective_concurrency=64,
+        ),
+    ],
+)
+def test_progress_v2_rejects_changed_epoch_baseline_or_concurrency_before_write(
+    tmp_path: Path,
+    changed: UrlProgressSnapshot,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="same-epoch",
+            baseline=0,
+            completed=0,
+            total=3,
+            elapsed=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="progress"):
+        reporter.update(url_snapshot=changed)
+
+
+def test_progress_completed_v1_compatibility_and_incomplete_v1_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    completed_summary = {
+        "rate_basis": "page_urls",
+        "completed_units": 2,
+        "total_units": 2,
+        "completed_at": 12.0,
+        "eligible_final_half_samples": 1,
+        "excluded_final_half_samples": 1,
+        "max_symmetric_eta_factor": 2.0,
+        "samples": [
+            {
+                "timestamp": 10.0,
+                "completed_units": 1,
+                "total_units": 2,
+                "rate": 1.0,
+                "rolling_rate": 1.0,
+                "predicted_remaining_seconds": 1.0,
+            },
+            {
+                "timestamp": 12.0,
+                "completed_units": 2,
+                "total_units": 2,
+                "rate": 1.0,
+                "rolling_rate": 1.0,
+                "predicted_remaining_seconds": 0.0,
+            },
+        ],
+    }
+    progress_path = config.work_dir / "progress.json"
+    progress_path.write_text(
+        json.dumps({"stage_telemetry": {"pages": completed_summary}}),
+        encoding="utf-8",
+    )
+    restored = ProgressReporter(config)
+    assert restored.stage_completion_summary("pages") == {
+        key: completed_summary[key]
+        for key in (
+            "rate_basis",
+            "completed_units",
+            "total_units",
+            "completed_at",
+            "eligible_final_half_samples",
+            "excluded_final_half_samples",
+            "max_symmetric_eta_factor",
+        )
+    }
+
+    incomplete_sample = dict(completed_summary["samples"][0])
+    incomplete_sample.update(
+        total_units=3,
+        predicted_remaining_seconds=2.0,
+    )
+    incomplete = dict(completed_summary)
+    incomplete.update(
+        completed_units=1,
+        total_units=3,
+        completed_at=None,
+        eligible_final_half_samples=0,
+        excluded_final_half_samples=0,
+        max_symmetric_eta_factor=None,
+        samples=[incomplete_sample],
+    )
+    progress_path.write_text(
+        json.dumps({"stage_telemetry": {"pages": incomplete}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 5.0)
+    upgraded = ProgressReporter(config)
+    upgraded.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="v2-upgrade", baseline=1, completed=1, total=3, elapsed=0.0
+        ),
+    )
+    upgraded.publish()
+    samples = json.loads(progress_path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ]["pages"]["samples"]
+    assert samples[0] == incomplete["samples"][0]
+    assert samples[1]["telemetry_schema_version"] == URL_TELEMETRY_V2
+    assert samples[1]["baseline_completed"] == 1
+    assert samples[1]["epoch_elapsed_seconds"] == 0.0
+
+
+def test_progress_guard_failure_preserves_previous_bytes(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    reporter = ProgressReporter(config)
+    reporter.publish()
+    previous = reporter.path.read_bytes()
+
+    def fail_guard(_path: Path, _estimated_bytes: int = 0) -> None:
+        raise DiskSpaceInsufficientError("synthetic progress reserve exhausted")
+
+    reporter._pre_write_guard = fail_guard
+    reporter.update(counters={"after_failure": 1})
+    with pytest.raises(DiskSpaceInsufficientError, match="progress reserve"):
+        reporter.publish()
+    assert reporter.path.read_bytes() == previous
+    assert not list(reporter.path.parent.glob(f".{reporter.path.name}.*.tmp"))
 
 
 def test_tree_bytes_tolerates_files_removed_during_scan(

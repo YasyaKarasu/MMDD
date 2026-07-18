@@ -13,6 +13,7 @@ UINT64_MAX = 2**64 - 1
 TRANSPORT_BIN_COUNT = 64
 COMMIT_BIN_COUNT = 32
 MATURITY_FRACTION = 1.0 / 3.0
+URL_TELEMETRY_SCHEMA_VERSION = "wdc200k-url-telemetry-v2"
 _HISTOGRAM_STRUCT = struct.Struct("<" + "Q" * 160)
 
 
@@ -42,6 +43,21 @@ def _validate_histogram(
         raise ValueError(f"{name} must contain exactly {expected_length} bins")
     for index, value in enumerate(histogram):
         _require_uint64(value, f"{name}[{index}]")
+
+
+def url_estimator_metadata(deadline_seconds: float) -> dict[str, int | float]:
+    """Return deterministic manifest metadata for the fixed v2 estimator."""
+    deadline = _require_finite(
+        deadline_seconds, "deadline_seconds", positive=True
+    )
+    return {
+        "transport_bins": TRANSPORT_BIN_COUNT,
+        "active_censor_bins": TRANSPORT_BIN_COUNT,
+        "commit_bins": COMMIT_BIN_COUNT,
+        "maturity_numerator": 1,
+        "maturity_denominator": 3,
+        "deadline_seconds": deadline,
+    }
 
 
 @dataclass(frozen=True)

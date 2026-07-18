@@ -28,6 +28,7 @@ from wdc200k_eta import (  # noqa: E402
     estimate_url_eta,
     fixed_bin,
 )
+import wdc200k_eta as eta_module  # noqa: E402
 
 
 PAGE_FIXTURE = ROOT / "tests/fixtures/wdc_gate100_page_eta_events.json"
@@ -572,6 +573,22 @@ def test_histogram_codec_is_canonical_fixed_width_uint64() -> None:
     assert active == _histogram(64)
     assert commit == (UINT64_MAX,) * 32
     assert encode_histogram_blob(snapshot) == blob
+
+
+def test_v2_estimator_metadata_is_integer_rational_and_deadline_bound() -> None:
+    assert eta_module.URL_TELEMETRY_SCHEMA_VERSION == (
+        "wdc200k-url-telemetry-v2"
+    )
+    assert eta_module.url_estimator_metadata(8.0) == {
+        "transport_bins": 64,
+        "active_censor_bins": 64,
+        "commit_bins": 32,
+        "maturity_numerator": 1,
+        "maturity_denominator": 3,
+        "deadline_seconds": 8.0,
+    }
+    with pytest.raises(ValueError):
+        eta_module.url_estimator_metadata(float("nan"))
 
 
 @pytest.mark.parametrize("value", [-1, 2**64])
