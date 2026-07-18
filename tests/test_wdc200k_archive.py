@@ -255,3 +255,105 @@ def test_archive_stops_on_source_destination_conflict(
 
     assert calls == 1
     assert source.read_text(encoding="utf-8") == "source"
+
+
+def test_archive_move_commit_guard_failure_leaves_source_recoverable(
+    tmp_path: Path,
+) -> None:
+    arguments = _archive_arguments(tmp_path)
+    work_dir = arguments["work_dir"]
+    assert isinstance(work_dir, Path)
+    source = work_dir / "page_jobs/state"
+    _write(source, "page")
+
+    guarded_paths: list[tuple[Path, int]] = []
+    stale_zero_checks = 0
+
+    def fail_move_commit(path: Path, estimated_bytes: int) -> None:
+        nonlocal stale_zero_checks
+        guarded_paths.append((path, estimated_bytes))
+        if ".work.wdc200k-stale" in str(path) and estimated_bytes == 0:
+            stale_zero_checks += 1
+            if stale_zero_checks == 2:
+                raise OSError("injected move commit guard failure")
+
+    with pytest.raises(OSError, match="move commit guard failure"):
+        archive_pipeline_state(
+            **arguments,
+            pre_write_guard=fail_move_commit,
+        )
+
+    journal_path = next((work_dir / ".archive-transactions").glob("*.json"))
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    move = next(
+        item for item in payload["moves"] if Path(item["source"]) == source.parent
+    )
+    assert Path(move["source"]).is_dir()
+    assert not Path(move["destination"]).exists()
+    assert move["status"] == "pending"
+    assert not tuple(journal_path.parent.glob("*.tmp"))
+    assert any(
+        ".work.wdc200k-stale" in str(path) and estimated_bytes > 0
+        for path, estimated_bytes in guarded_paths
+    )
+
+    result = archive_pipeline_state(**arguments)
+
+    assert result.recovered is True
+    assert result.journal_path == journal_path
+    archived = next(
+        item.destination
+        for item in result.moves
+        if item.source == source.parent
+    )
+    assert (archived / "state").read_text(encoding="utf-8") == "page"
+
+
+def test_archive_journal_commit_guard_failure_preserves_old_journal_and_recovers(
+    tmp_path: Path,
+) -> None:
+    arguments = _archive_arguments(tmp_path)
+    work_dir = arguments["work_dir"]
+    assert isinstance(work_dir, Path)
+    source = work_dir / "page_jobs/state"
+    _write(source, "page")
+
+    journal_zero_checks = 0
+    guarded_paths: list[tuple[Path, int]] = []
+
+    def fail_second_journal_commit(path: Path, estimated_bytes: int) -> None:
+        nonlocal journal_zero_checks
+        guarded_paths.append((path, estimated_bytes))
+        if ".archive-transactions" in path.parts and estimated_bytes == 0:
+            journal_zero_checks += 1
+            # GuardedWriteTracker performs one zero-byte check when it is
+            # constructed, followed by one forced check for every commit.
+            if journal_zero_checks == 3:
+                raise OSError("injected journal commit guard failure")
+
+    with pytest.raises(OSError, match="journal commit guard failure"):
+        archive_pipeline_state(
+            **arguments,
+            pre_write_guard=fail_second_journal_commit,
+        )
+
+    journal_path = next((work_dir / ".archive-transactions").glob("*.json"))
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    move = next(
+        item for item in payload["moves"] if Path(item["source"]) == source.parent
+    )
+    assert not Path(move["source"]).exists()
+    assert (Path(move["destination"]) / "state").read_text(encoding="utf-8") == "page"
+    assert move["status"] == "pending"
+    assert payload["complete"] is False
+    assert not tuple(journal_path.parent.glob("*.tmp"))
+    assert any(
+        ".archive-transactions" in path.parts and estimated_bytes > 0
+        for path, estimated_bytes in guarded_paths
+    )
+
+    result = archive_pipeline_state(**arguments)
+
+    assert result.recovered is True
+    assert result.journal_path == journal_path
+    assert result.complete is True

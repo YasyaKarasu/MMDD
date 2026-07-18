@@ -12,10 +12,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+try:
+    from wdc200k_io import GuardedWriteTracker, PreWriteGuard
+except ModuleNotFoundError as error:
+    if error.name != "wdc200k_io":
+        raise
+    import sys
+
+    scripts_directory = str(Path(__file__).resolve().parent)
+    sys.path.insert(0, scripts_directory)
+    try:
+        from wdc200k_io import GuardedWriteTracker, PreWriteGuard
+    finally:
+        sys.path.remove(scripts_directory)
+
 
 JOURNAL_SCHEMA_VERSION = "wdc200k-archive-transaction-v1"
 DEFAULT_PAGE_CACHE_PATHS = ("page_cache", "page_transport")
 DEFAULT_IMAGE_CACHE_PATHS = ("image_cache", "images", "image_transport")
+DIRECTORY_ENTRY_RESERVE_BYTES = 4096
 
 
 class ArchiveError(RuntimeError):
@@ -73,19 +88,32 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _fsync_directory(path.parent.parent)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+def _atomic_json(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    write_tracker: GuardedWriteTracker,
+) -> None:
     encoded = (
         json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    with temporary.open("xb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
+    write_tracker.before_write(len(encoded) + DIRECTORY_ENTRY_RESERVE_BYTES)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _fsync_directory(path.parent.parent)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    committed = False
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        write_tracker.before_commit(0)
+        os.replace(temporary, path)
+        committed = True
+        _fsync_directory(path.parent)
+    finally:
+        if not committed:
+            temporary.unlink(missing_ok=True)
 
 
 def _device_id(path: Path) -> int:
@@ -451,6 +479,7 @@ def archive_pipeline_state(
     page_cache_paths: Sequence[str | Path] = DEFAULT_PAGE_CACHE_PATHS,
     image_cache_paths: Sequence[str | Path] = DEFAULT_IMAGE_CACHE_PATHS,
     move_path: MovePath = _replace_path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ArchiveResult:
     """Archive named and downstream pipeline state with durable recovery.
 
@@ -517,29 +546,55 @@ def archive_pipeline_state(
             "moves": moves,
             "complete": False,
         }
-        _atomic_json(journal_path, payload)
+    journal_tracker = GuardedWriteTracker(journal_path, pre_write_guard)
+    if recoverable is None:
+        _atomic_json(
+            journal_path,
+            payload,
+            write_tracker=journal_tracker,
+        )
 
     if _preflight_moves(payload, journal_path=journal_path):
-        _atomic_json(journal_path, payload)
+        _atomic_json(
+            journal_path,
+            payload,
+            write_tracker=journal_tracker,
+        )
 
     raw_moves = payload["moves"]
     assert isinstance(raw_moves, list)
+    move_trackers: dict[str, GuardedWriteTracker] = {}
     for raw_item in raw_moves:
         item = _validate_move_payload(raw_item, journal_path=journal_path)
         if item["status"] != "pending":
             continue
         source = Path(item["source"])
         destination = Path(item["destination"])
+        root_kind = item["root_kind"]
+        tracker = move_trackers.get(root_kind)
+        if tracker is None:
+            tracker = GuardedWriteTracker(destination, pre_write_guard)
+            move_trackers[root_kind] = tracker
+        tracker.before_write(DIRECTORY_ENTRY_RESERVE_BYTES)
         destination.parent.mkdir(parents=True, exist_ok=True)
         _fsync_directory(destination.parent.parent)
+        tracker.before_commit(0)
         move_path(source, destination)
         _fsync_directory(source.parent)
         _fsync_directory(destination.parent)
         item["status"] = "complete"
-        _atomic_json(journal_path, payload)
+        _atomic_json(
+            journal_path,
+            payload,
+            write_tracker=journal_tracker,
+        )
 
     payload["complete"] = True
-    _atomic_json(journal_path, payload)
+    _atomic_json(
+        journal_path,
+        payload,
+        write_tracker=journal_tracker,
+    )
     return _result(payload, journal_path=journal_path, recovered=recovered)
 
 

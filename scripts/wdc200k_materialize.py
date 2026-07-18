@@ -2182,7 +2182,7 @@ def _store_table_unit(
             ),
         )
         if write_tracker is not None:
-            write_tracker.before_commit(0, force=False)
+            write_tracker.before_commit(0)
         connection.commit()
     return True
 

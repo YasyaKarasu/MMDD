@@ -151,7 +151,32 @@ def test_runtime_state_must_stay_outside_input_cache_and_output(
         )
     )
 
-    with pytest.raises(ValueError, match="outside output"):
+    with pytest.raises(ValueError, match="equal work_dir/runtime"):
+        run_pipeline(config)
+
+
+def test_runtime_root_must_equal_work_runtime(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    _statistics_archive(input_dir)
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(input_dir),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--cache_dir",
+                str(tmp_path / "cache"),
+                "--runtime_dir",
+                str(tmp_path / "other-runtime"),
+                "--dry_run",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="equal work_dir/runtime"):
         run_pipeline(config)
 
 
@@ -986,7 +1011,7 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = _full_pipeline_config(tmp_path)
-    runtime = tmp_path / "runtime"
+    runtime = base.work_dir / "runtime"
     config = replace(
         base,
         runtime_dir=runtime,
@@ -1024,6 +1049,7 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
     assert captured["text_done_marker"] == config.model_text_done_marker
     assert captured["image_done_marker"] == config.model_image_done_marker
     assert captured["run_fingerprint"] == "dynamic-run-v1"
+    assert callable(captured["pre_write_guard"])
     assert len(tuple(captured["network_manifests"])) == 2
     assert captured["assets_manifest"].is_file()
 

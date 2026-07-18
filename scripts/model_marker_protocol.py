@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from wdc200k_io import GuardedWriteTracker, PreWriteGuard
+
 
 MODEL_MARKER_SCHEMA_VERSION = "wdc200k-model-markers-v1"
 MODEL_START_STAGE = "wdc200k_model_start"
@@ -49,22 +51,32 @@ def is_timestamp(value: object) -> bool:
     )
 
 
-def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+def atomic_write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
     path = Path(path)
+    tracker = GuardedWriteTracker(path, pre_write_guard)
+    encoded = (
+        json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    tracker.before_write(len(encoded.encode("utf-8")))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(
-                dict(payload),
-                handle,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            handle.write("\n")
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:

@@ -75,6 +75,7 @@ from wdc200k_models import (
     run_model_stage,
     validate_model_stage_for_adapter,
 )
+from wdc200k_runtime import resolve_work_dir
 from wdc200k_selection import (
     ReserveManager,
     SelectionPolicy,
@@ -208,11 +209,7 @@ class PipelineConfig:
     def from_args(cls, args: argparse.Namespace) -> "PipelineConfig":
         input_dir = Path(args.input_dir).resolve()
         output_dir = Path(args.output_dir).resolve()
-        work_dir = (
-            Path(args.work_dir).resolve()
-            if args.work_dir
-            else output_dir.parent / "work_wdc_200k"
-        )
+        work_dir = resolve_work_dir(output_dir, args.work_dir)
         cache_dir = (
             Path(args.cache_dir).resolve()
             if args.cache_dir
@@ -837,6 +834,8 @@ _STAGE_WORK_PATHS: dict[str, tuple[str, ...]] = {
 def invalidate_from_stage(
     config: PipelineConfig,
     stage: str,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ArchiveResult:
     """Recoverably archive the named and downstream state without deletion."""
     if stage not in STAGES:
@@ -855,6 +854,7 @@ def invalidate_from_stage(
         runtime_dir=config.runtime_dir,
         refresh_page_cache=config.refresh_page_cache,
         refresh_image_cache=config.refresh_image_cache,
+        pre_write_guard=pre_write_guard,
     )
 
 
@@ -876,7 +876,14 @@ def _statistics_archives(input_dir: Path) -> tuple[Path, ...]:
 def _validate_runtime_paths(config: PipelineConfig) -> None:
     if config.runtime_dir is None:
         raise ValueError("runtime_dir must be configured")
-    candidates: list[tuple[str, Path]] = [("runtime_dir", config.runtime_dir)]
+    runtime_dir = config.runtime_dir.resolve()
+    required_runtime = (config.work_dir.resolve() / "runtime").resolve()
+    if runtime_dir != required_runtime:
+        raise ValueError(
+            "runtime_dir must equal work_dir/runtime: "
+            f"{runtime_dir} != {required_runtime}"
+        )
+    candidates: list[tuple[str, Path]] = [("runtime_dir", runtime_dir)]
     for name, value in (
         ("text_model_base_urls_file", config.text_model_base_urls_file),
         ("image_model_base_urls_file", config.image_model_base_urls_file),
@@ -907,7 +914,7 @@ def _validate_runtime_paths(config: PipelineConfig) -> None:
             )
         seen[path] = name
         if name != "runtime_dir" and not path.is_relative_to(
-            config.runtime_dir
+            runtime_dir
         ):
             raise ValueError(
                 f"{name} must be inside runtime_dir: {path}"
@@ -955,6 +962,7 @@ def _preflight(
     guard = disk_guard or DiskGuard(config.min_free_disk_bytes)
     for root in (config.work_dir, config.cache_dir, config.output_dir):
         guard(root, 0)
+    guard(config.runtime_dir, 0)
     return archives
 
 
@@ -1601,7 +1609,12 @@ def _reconcile_page_jobs_from_outcomes(
         connection.commit()
 
 
-def _new_web_transport(config: PipelineConfig, namespace: str) -> Any:
+def _new_web_transport(
+    config: PipelineConfig,
+    namespace: str,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> Any:
     return legacy_wdc_builder.WdcWebClient(
         config.cache_dir / f"{namespace}_transport",
         max_retries=0,
@@ -1610,6 +1623,7 @@ def _new_web_transport(config: PipelineConfig, namespace: str) -> Any:
         min_free_disk_bytes=config.min_free_disk_bytes,
         max_response_seconds=config.web_max_response_seconds,
         host_delay=0.0,
+        pre_write_guard=pre_write_guard,
     )
 
 
@@ -2140,7 +2154,11 @@ def run_pipeline(
         )
     if config.from_stage:
         _validate_upstream_for_refresh(config, config.from_stage, archives)
-        invalidate_from_stage(config, config.from_stage)
+        invalidate_from_stage(
+            config,
+            config.from_stage,
+            pre_write_guard=disk_guard,
+        )
     elif config.resume:
         _validate_existing_registry_chain(config, archives)
     elif any(_producer_registry_path(config, stage).exists() for stage in STAGES):
@@ -2180,7 +2198,11 @@ def run_pipeline(
             )
         structural_barrier = _structural_barrier(structural, finalized)
         if page_transport is None:
-            page_transport = _new_web_transport(config, "page")
+            page_transport = _new_web_transport(
+                config,
+                "page",
+                pre_write_guard=disk_guard,
+            )
         page_result, page_snapshot, page_network_manifest = _run_pages(
             config,
             reporter,
@@ -2227,7 +2249,11 @@ def run_pipeline(
                 counters=counters,
             )
         if image_transport is None:
-            image_transport = _new_web_transport(config, "image")
+            image_transport = _new_web_transport(
+                config,
+                "image",
+                pre_write_guard=disk_guard,
+            )
         (
             unique_jobs,
             image_result,

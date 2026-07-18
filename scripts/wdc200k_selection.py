@@ -1060,7 +1060,7 @@ class ReserveManager:
                     raise RuntimeError(
                         "exhausted replacement operation was not visible"
                     )
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
                 connection.commit()
                 raise ReserveExhaustedError(claim)
             connection.execute(
@@ -1118,7 +1118,7 @@ class ReserveManager:
             claim = self._claim_by_operation(connection, operation_key)
             if claim is None:
                 raise RuntimeError("replacement journal insert was not visible")
-            self._write_tracker.before_commit(0, force=False)
+            self._write_tracker.before_commit(0)
             connection.commit()
             return claim
         except BaseException:
@@ -1230,7 +1230,7 @@ class ReserveManager:
                     raise RuntimeError(
                         "acknowledged replacement operation disappeared"
                     )
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
             return claim
         except BaseException:

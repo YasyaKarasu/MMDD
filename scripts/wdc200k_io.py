@@ -459,7 +459,7 @@ class SqliteJobStore:
                 """,
                 (job_id, kind, encoded_payload, now),
             )
-            self._write_tracker.before_commit(0, force=False)
+            self._write_tracker.before_commit(0)
             connection.commit()
         finally:
             connection.close()
@@ -518,7 +518,7 @@ class SqliteJobStore:
             else:
                 claimed = []
             if job_ids:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -582,7 +582,7 @@ class SqliteJobStore:
                 raise RuntimeError(
                     f"job {job_id!r} has no active lease owned by {owner!r}"
                 )
-            self._write_tracker.before_commit(0, force=False)
+            self._write_tracker.before_commit(0)
             connection.commit()
         finally:
             connection.close()

@@ -1568,7 +1568,7 @@ def _fenced_commit_model_record(
             ),
         )
         if write_tracker is not None:
-            write_tracker.before_commit(0, force=False)
+            write_tracker.before_commit(0)
         connection.commit()
         if status == "success" and after_cache_write is not None:
             after_cache_write(str(job.job_id), canonical)
@@ -1648,7 +1648,7 @@ def _fenced_commit_model_record(
             ),
         )
         if write_tracker is not None:
-            write_tracker.before_commit(0, force=False)
+            write_tracker.before_commit(0)
         connection.commit()
     return True
 
@@ -2526,6 +2526,7 @@ def run_model_stage(
             assets_manifest=assets_manifest,
             assets_barrier=assets_barrier,
             run_fingerprint=run_fingerprint,
+            pre_write_guard=pre_write_guard,
         )
         if jobset.total_tasks and ready_marker is not None:
             wait_for_model_ready_marker(
@@ -2609,6 +2610,7 @@ def run_model_stage(
                 text_task_count=jobset.text_tasks,
                 image_task_count=jobset.image_tasks,
                 start_fingerprint=start_fingerprint,
+                pre_write_guard=pre_write_guard,
             )
     snapshot = _job_snapshot(store.path, jobset)
     complete = (
@@ -2764,6 +2766,7 @@ def write_model_start_marker(
     assets_manifest: Path,
     assets_barrier: AssetStageBarrier,
     run_fingerprint: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> str:
     """Publish exact staged counts only after upstream completion is proven."""
     if not run_fingerprint:
@@ -2803,6 +2806,7 @@ def write_model_start_marker(
             context,
             timestamp=time.time(),
         ),
+        pre_write_guard=pre_write_guard,
     )
     return context.start_fingerprint
 
@@ -2819,6 +2823,7 @@ def write_model_done_marker(
     text_task_count: int,
     image_task_count: int,
     start_fingerprint: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
     if model_kind not in {"text", "image"}:
         raise ValueError(f"unsupported model kind: {model_kind}")
@@ -2843,6 +2848,7 @@ def write_model_done_marker(
             task_count=task_count,
             timestamp=time.time(),
         ),
+        pre_write_guard=pre_write_guard,
     )
 
 

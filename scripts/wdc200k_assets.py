@@ -451,7 +451,7 @@ class ImageOutcomeStore:
                     ),
                 )
                 if self._write_tracker is not None:
-                    self._write_tracker.before_commit(0, force=False)
+                    self._write_tracker.before_commit(0)
                 connection.commit()
                 return canonical
             persisted = json.loads(str(existing["outcome_json"]))
@@ -497,7 +497,7 @@ class ImageOutcomeStore:
                     (policy_fingerprint, url_key),
                 )
                 if self._write_tracker is not None:
-                    self._write_tracker.before_commit(0, force=False)
+                    self._write_tracker.before_commit(0)
                 connection.commit()
                 return ImageUrlClaimDecision(outcome=outcome)
 
@@ -546,7 +546,7 @@ class ImageOutcomeStore:
                 ),
             )
             if self._write_tracker is not None:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
             return ImageUrlClaimDecision(lease=lease)
         except BaseException:
@@ -625,7 +625,7 @@ class ImageOutcomeStore:
                         "conflicting terminal image outcome for URL"
                     )
             if self._write_tracker is not None:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
             return persisted
         except BaseException:
@@ -663,7 +663,7 @@ class ImageOutcomeStore:
                 ),
             )
             if cursor.rowcount and self._write_tracker is not None:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
             return cursor.rowcount == 1
         except BaseException:
@@ -703,7 +703,7 @@ class ImageOutcomeStore:
                 (policy_fingerprint, url_key),
             )
             if cursor.rowcount and self._write_tracker is not None:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
             return cursor.rowcount == 1
         except BaseException:

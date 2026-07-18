@@ -425,10 +425,45 @@ class WdcWebClient:
         web_failure_callback: Callable[[dict[str, Any]], None] | None = None,
         media_failure_callback: Callable[[dict[str, Any]], None] | None = None,
         network_policy_version: str = "wdc-web-v1",
+        pre_write_guard: Callable[[Path, int], None] | None = None,
+        write_tracker: Any | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.database_path = self.cache_dir / "wdc_web.sqlite3"
+        self.min_free_disk_bytes = max(0, int(min_free_disk_bytes))
+        if pre_write_guard is None:
+            reserve_bytes = self.min_free_disk_bytes
+
+            def pre_write_guard(path: Path, estimated_bytes: int) -> None:
+                probe = Path(path).resolve()
+                while not probe.exists() and probe != probe.parent:
+                    probe = probe.parent
+                free = int(shutil.disk_usage(probe).free)
+                required = reserve_bytes + max(0, int(estimated_bytes))
+                if free < required:
+                    raise OSError(
+                        "insufficient disk for WDC web cache target "
+                        f"{path}: free={free}, required={required}"
+                    )
+
+        if write_tracker is None:
+            try:
+                from wdc200k_io import GuardedWriteTracker
+            except ModuleNotFoundError:
+                from scripts.wdc200k_io import GuardedWriteTracker
+            write_tracker = GuardedWriteTracker(
+                self.database_path,
+                pre_write_guard,
+            )
+        elif Path(write_tracker.path).resolve() != (
+            self.database_path.resolve()
+        ):
+            raise ValueError(
+                "web cache write tracker targets a different database"
+            )
+        self._write_tracker = write_tracker
+        self._write_tracker.before_write(64 * 1024)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.image_dir = self.cache_dir / "wdc_images"
         self.session = session
         self._session_injected = session is not None
@@ -446,7 +481,6 @@ class WdcWebClient:
         self.max_image_pixels = max(1, int(max_image_pixels))
         self.max_total_image_bytes = max(1, int(max_total_image_bytes))
         self.max_total_cache_bytes = max(1, int(max_total_cache_bytes))
-        self.min_free_disk_bytes = max(0, int(min_free_disk_bytes))
         self.max_response_seconds = max(0.01, float(max_response_seconds))
         self.min_image_side = max(1, min_image_side)
         self.max_image_aspect_ratio = max(1.0, max_image_aspect_ratio)
@@ -481,6 +515,14 @@ class WdcWebClient:
         return connection
 
     def _initialize_database(self) -> None:
+        existing_bytes = (
+            self.database_path.stat().st_size
+            if self.database_path.is_file()
+            else 0
+        )
+        self._write_tracker.before_write(
+            max(64 * 1024, existing_bytes * 2)
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._migrate_page_cache(connection)
@@ -560,6 +602,8 @@ class WdcWebClient:
                     """
                 ).fetchone()[0]
             )
+            self._write_tracker.before_commit(0)
+            connection.commit()
 
     @staticmethod
     def _table_columns(
@@ -722,12 +766,6 @@ class WdcWebClient:
                 + amount
                 > self.max_total_cache_bytes
             ):
-                return False
-            try:
-                free = int(shutil.disk_usage(self.cache_dir).free)
-            except OSError:
-                return False
-            if free < self.min_free_disk_bytes + self._cache_bytes_in_flight + amount:
                 return False
             self._cache_bytes_in_flight += amount
             if image:
@@ -1056,6 +1094,11 @@ class WdcWebClient:
         error_class: str,
         http_status: int | None = None,
     ) -> None:
+        self._write_tracker.before_write(
+            16 * 1024
+            + 2 * len(image_url.encode("utf-8"))
+            + 2 * len(error_class.encode("utf-8"))
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if connection.execute(
@@ -1086,8 +1129,20 @@ class WdcWebClient:
                     time.time(),
                 ),
             )
+            self._write_tracker.before_commit(0)
+            connection.commit()
 
     def _store_page(self, payload: dict[str, Any]) -> None:
+        encoded_images = json.dumps(
+            payload["image_urls"],
+            ensure_ascii=False,
+        )
+        self._write_tracker.before_write(
+            16 * 1024
+            + 2 * len(str(payload["page_url"]).encode("utf-8"))
+            + 2 * len(str(payload["text"]).encode("utf-8"))
+            + 2 * len(encoded_images.encode("utf-8"))
+        )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -1111,13 +1166,15 @@ class WdcWebClient:
                     payload["page_url"],
                     payload["final_url"],
                     payload["text"],
-                    json.dumps(payload["image_urls"], ensure_ascii=False),
+                    encoded_images,
                     200,
                     int(payload.get("body_bytes", 0)),
                     self.network_policy_version,
                     time.time(),
                 ),
             )
+            self._write_tracker.before_commit(0)
+            connection.commit()
 
     def _store_page_failure(
         self,
@@ -1127,6 +1184,11 @@ class WdcWebClient:
         http_status: int | None,
         error: str,
     ) -> None:
+        self._write_tracker.before_write(
+            16 * 1024
+            + 2 * len(page_url.encode("utf-8"))
+            + 2 * len(error.encode("utf-8"))
+        )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -1156,6 +1218,8 @@ class WdcWebClient:
                     time.time(),
                 ),
             )
+            self._write_tracker.before_commit(0)
+            connection.commit()
         self._report_failure(
             self.web_failure_callback,
             {
@@ -1503,6 +1567,7 @@ class WdcWebClient:
         source: str,
         entity_id: str,
     ) -> dict[str, Any] | None:
+        self._write_tracker.before_commit(0)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         image_key = (
             stable_hash(image_url, length=24)
@@ -1622,6 +1687,7 @@ class WdcWebClient:
                     )
                     if cached_path != content_path:
                         try:
+                            self._write_tracker.before_commit(0)
                             os.link(cached_path, content_path)
                         except FileExistsError:
                             if self._sha256_path(content_path) != digest:
@@ -1718,6 +1784,7 @@ class WdcWebClient:
                             if not self._reserve_cache_bytes(len(chunk), image=True):
                                 return None
                             reserved_bytes += len(chunk)
+                            self._write_tracker.before_write(len(chunk))
                             handle.write(chunk)
 
                 source_mime_type = content_type.split(";", 1)[0]
@@ -1749,6 +1816,7 @@ class WdcWebClient:
                             return None
                     else:
                         try:
+                            self._write_tracker.before_commit(0)
                             os.link(raster_path, image_path)
                             created = True
                         except FileExistsError:
@@ -1866,6 +1934,7 @@ class WdcWebClient:
             int(lock_key[:8], 16) % len(self._image_content_locks)
         ]
         path = self.image_dir / file_name
+        self._write_tracker.before_write(64 * 1024)
         with content_lock:
             raster = self._validated_raster(path)
             actual_sha256 = (
@@ -1930,6 +1999,8 @@ class WdcWebClient:
                         )
                 else:
                     return
+                self._write_tracker.before_commit(0)
+                connection.commit()
             if remove_file:
                 try:
                     path.unlink(missing_ok=True)
@@ -1960,6 +2031,12 @@ class WdcWebClient:
     ) -> None:
         digest = self._sha256_path(path)
         size = path.stat().st_size
+        self._write_tracker.before_write(
+            16 * 1024
+            + 2 * len(original_url.encode("utf-8"))
+            + 2 * len(final_url.encode("utf-8"))
+            + 2 * len(path.name.encode("utf-8"))
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -2000,6 +2077,8 @@ class WdcWebClient:
                 """,
                 (original_url, self.network_policy_version),
             )
+            self._write_tracker.before_commit(0)
+            connection.commit()
 
     def _image_record(
         self,

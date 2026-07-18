@@ -551,6 +551,117 @@ def test_fetch_page_reuses_sqlite_cache_across_clients(tmp_path):
     assert (tmp_path / "wdc_web.sqlite3").is_file()
 
 
+def test_web_client_initialization_commit_uses_live_disk_guard(tmp_path):
+    zero_checks = 0
+
+    def reject_initial_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("web cache init reserve exhausted")
+
+    with pytest.raises(OSError, match="cache init reserve"):
+        WdcWebClient(
+            tmp_path,
+            session=FakeSession([]),
+            host_delay=0,
+            pre_write_guard=reject_initial_commit,
+        )
+
+    database_path = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        ).fetchone() == (0,)
+
+
+def test_web_client_migration_commit_guard_rolls_back_legacy_schema(
+    tmp_path,
+):
+    database_path = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE page_cache (
+                page_url TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                final_url TEXT,
+                text TEXT,
+                image_urls_json TEXT,
+                http_status INTEGER,
+                error TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+    zero_checks = 0
+
+    def reject_migration_commit(
+        _path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("migration commit reserve exhausted")
+
+    with pytest.raises(OSError, match="migration commit reserve"):
+        WdcWebClient(
+            tmp_path,
+            session=FakeSession([]),
+            host_delay=0,
+            pre_write_guard=reject_migration_commit,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(page_cache)")
+        }
+        assert "policy_fingerprint" not in columns
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'page_cache_legacy'"
+        ).fetchone() == (0,)
+
+
+def test_web_client_page_commit_guard_rolls_back_with_window_remaining(
+    tmp_path,
+):
+    zero_checks = 0
+
+    def reject_page_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 3:
+                raise OSError("page cache commit reserve exhausted")
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        pre_write_guard=reject_page_commit,
+    )
+    with pytest.raises(OSError, match="page cache commit reserve"):
+        client._store_page(
+            {
+                "page_url": "https://example.test/a",
+                "final_url": "https://example.test/a",
+                "text": "cached",
+                "image_urls": [],
+                "body_bytes": 6,
+            }
+        )
+
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM page_cache"
+        ).fetchone() == (0,)
+
+
 def test_web_client_requests_identity_content_encoding(tmp_path):
     session = FakeSession([])
 

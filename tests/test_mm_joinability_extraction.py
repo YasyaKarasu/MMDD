@@ -42,6 +42,8 @@ from run_mm_joinability_dynamic_vllm import (
     marker_matches_run,
     parse_args as parse_dynamic_vllm_args,
     start_server,
+    write_endpoint_file,
+    write_ready_marker,
     wait_for_any_marker_or_builder_exit,
     wait_for_marker_or_builder_exit,
 )
@@ -899,6 +901,7 @@ def _capture_dynamic_builder_launch(
     *,
     tmp_path: Path,
     runtime_dir: Path | None = None,
+    work_dir: Path | None = None,
 ) -> tuple[list[str], dict[str, object]]:
     captured: dict[str, object] = {}
 
@@ -948,12 +951,14 @@ def _capture_dynamic_builder_launch(
     ]
     if runtime_dir is not None:
         argv.extend(["--runtime_dir", str(runtime_dir)])
+    if work_dir is not None:
+        argv.extend(["--work_dir", str(work_dir)])
 
     assert dynamic_vllm_main(argv) == 0
     return captured["command"], captured["kwargs"]
 
 
-def test_dynamic_vllm_default_runtime_is_outside_task8_output(
+def test_dynamic_vllm_default_runtime_is_work_runtime(
     monkeypatch,
     tmp_path,
 ):
@@ -962,7 +967,7 @@ def test_dynamic_vllm_default_runtime_is_outside_task8_output(
         tmp_path=tmp_path,
     )
     output_dir = tmp_path / "output"
-    runtime_dir = tmp_path / ".output.wdc200k-runtime"
+    runtime_dir = tmp_path / "work_wdc_200k" / "runtime"
     runtime_options = {
         "--text_model_base_urls_file": "text_endpoints.txt",
         "--image_model_base_urls_file": "image_endpoints.txt",
@@ -982,12 +987,17 @@ def test_dynamic_vllm_default_runtime_is_outside_task8_output(
     assert popen_kwargs["start_new_session"] is True
 
 
-def test_dynamic_vllm_preserves_explicit_runtime_dir(monkeypatch, tmp_path):
-    explicit_runtime = tmp_path / "explicit-runtime"
+def test_dynamic_vllm_preserves_required_explicit_runtime_dir(
+    monkeypatch,
+    tmp_path,
+):
+    work_dir = tmp_path / "explicit-work"
+    explicit_runtime = work_dir / "runtime"
     command, _popen_kwargs = _capture_dynamic_builder_launch(
         monkeypatch,
         tmp_path=tmp_path,
         runtime_dir=explicit_runtime,
+        work_dir=work_dir,
     )
 
     assert command[command.index("--runtime_dir") + 1] == str(
@@ -1002,6 +1012,106 @@ def test_dynamic_vllm_preserves_explicit_runtime_dir(monkeypatch, tmp_path):
         "--model_image_done_marker",
     ):
         assert Path(command[command.index(option) + 1]).parent == explicit_runtime
+
+
+def test_dynamic_vllm_rejects_runtime_outside_work_before_any_write(
+    tmp_path,
+):
+    runtime = tmp_path / "outside-runtime"
+    with pytest.raises(ValueError, match="equal work_dir/runtime"):
+        dynamic_vllm_main(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--runtime_dir",
+                str(runtime),
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/vl",
+            ]
+        )
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--runtime_dir=escape",
+        "--text_model_base_urls_file=escape",
+        "--model_start_marker=escape",
+    ],
+)
+def test_dynamic_vllm_rejects_reserved_builder_passthrough(
+    tmp_path,
+    option,
+):
+    with pytest.raises(ValueError, match="controlled by"):
+        dynamic_vllm_main(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/vl",
+                "--",
+                option,
+            ]
+        )
+
+
+def test_endpoint_guard_failure_preserves_existing_file(tmp_path):
+    path = tmp_path / "endpoints.txt"
+    path.write_text("old\n", encoding="utf-8")
+    calls = 0
+
+    def fail_commit(_path, _estimated):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="reserve exhausted"):
+        write_endpoint_file(
+            path,
+            ["http://new.example/v1"],
+            pre_write_guard=fail_commit,
+        )
+    assert path.read_text(encoding="utf-8") == "old\n"
+    assert not path.with_suffix(".txt.tmp").exists()
+
+
+def test_ready_marker_guard_failure_preserves_existing_marker(tmp_path):
+    path = tmp_path / "ready.json"
+    path.write_text('{"old": true}\n', encoding="utf-8")
+    calls = 0
+
+    def fail_commit(_path, _estimated):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="reserve exhausted"):
+        write_ready_marker(
+            path,
+            run_fingerprint="run-v1",
+            text_jobset_fingerprint="text-v1",
+            image_jobset_fingerprint="image-v1",
+            text_task_count=1,
+            image_task_count=1,
+            start_fingerprint="a" * 64,
+            pre_write_guard=fail_commit,
+        )
+    assert json.loads(path.read_text(encoding="utf-8")) == {"old": True}
+    assert not path.with_suffix(".json.tmp").exists()
 
 
 def test_real_builder_and_default_runner_share_strict_marker_contract(

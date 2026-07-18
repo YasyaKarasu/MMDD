@@ -392,7 +392,7 @@ class PageOutcomeStore:
                 ),
             )
             if self._write_tracker is not None:
-                self._write_tracker.before_commit(0, force=False)
+                self._write_tracker.before_commit(0)
             connection.commit()
         persisted = self.get(policy_fingerprint, url_key)
         if persisted is None:

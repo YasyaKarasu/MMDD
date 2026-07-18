@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import model_marker_protocol as model_markers
+from build_wdc200k_mm_joinability_dataset import DiskGuard
+from wdc200k_io import GuardedWriteTracker, PreWriteGuard
+from wdc200k_runtime import (
+    DEFAULT_MIN_FREE_DISK_BYTES,
+    required_runtime_dir,
+)
 
 try:
     import requests
@@ -255,8 +261,12 @@ def wait_for_server(base_url: str, *, timeout_seconds: float, poll_seconds: floa
     raise RuntimeError(f"Timed out waiting for {base_url}/models: {last_error}")
 
 
-def write_endpoint_file(path: Path, urls: Iterable[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_endpoint_file(
+    path: Path,
+    urls: Iterable[str],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
     deduped: list[str] = []
     seen: set[str] = set()
     for url in urls:
@@ -264,7 +274,26 @@ def write_endpoint_file(path: Path, urls: Iterable[str]) -> None:
         if value and value not in seen:
             seen.add(value)
             deduped.append(value)
-    path.write_text("\n".join(deduped) + "\n", encoding="utf-8")
+    encoded = "\n".join(deduped) + "\n"
+    tracker = GuardedWriteTracker(path, pre_write_guard)
+    tracker.before_write(len(encoded.encode("utf-8")))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tracker.before_commit(0)
+        temporary.replace(path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def write_ready_marker(
@@ -277,6 +306,7 @@ def write_ready_marker(
     text_task_count: int | None = None,
     image_task_count: int | None = None,
     start_fingerprint: str | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
     if context is None:
         identity = (
@@ -304,6 +334,7 @@ def write_ready_marker(
             context,
             timestamp=time.time(),
         ),
+        pre_write_guard=pre_write_guard,
     )
 
 
@@ -437,6 +468,56 @@ def passthrough_has_arg(passthrough_args: list[str], option: str) -> bool:
     return any(value == option or value.startswith(f"{option}=") for value in passthrough_args)
 
 
+def passthrough_option_value(
+    passthrough_args: list[str],
+    option: str,
+) -> str | None:
+    values: list[str] = []
+    index = 0
+    while index < len(passthrough_args):
+        token = passthrough_args[index]
+        if token == option:
+            if index + 1 >= len(passthrough_args):
+                raise ValueError(f"{option} requires a value")
+            values.append(passthrough_args[index + 1])
+            index += 2
+            continue
+        if token.startswith(f"{option}="):
+            values.append(token.split("=", 1)[1])
+        index += 1
+    if len(values) > 1:
+        raise ValueError(f"{option} may be provided at most once")
+    return values[0] if values else None
+
+
+_RESERVED_BUILDER_OPTIONS = (
+    "--input_dir",
+    "--output_dir",
+    "--runtime_dir",
+    "--text_model_base_urls_file",
+    "--image_model_base_urls_file",
+    "--model_start_marker",
+    "--model_ready_marker",
+    "--model_text_done_marker",
+    "--model_image_done_marker",
+)
+
+
+def validate_builder_passthrough(passthrough_args: list[str]) -> None:
+    for option in _RESERVED_BUILDER_OPTIONS:
+        if passthrough_has_arg(passthrough_args, option):
+            raise ValueError(
+                f"{option} is controlled by the dynamic runner"
+            )
+    passthrough_option_value(passthrough_args, "--work_dir")
+    minimum = passthrough_option_value(
+        passthrough_args,
+        "--min_free_disk_bytes",
+    )
+    if minimum is not None and int(minimum) < 0:
+        raise ValueError("--min_free_disk_bytes must be non-negative")
+
+
 def with_default_model_workers(passthrough_args: list[str], workers: int) -> list[str]:
     if workers <= 0:
         return passthrough_args
@@ -470,7 +551,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--run_fingerprint", default="", help="Optional staged-run identity used to fence stale model markers.")
-    parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Defaults to a hidden sibling of OUTPUT_DIR.")
+    parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Must equal the WDC builder work directory plus /runtime.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
@@ -491,12 +572,33 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 
 def main(argv: list[str] | None = None) -> int:
     args, passthrough_args = parse_args(argv)
-    output_dir = Path(args.output_dir)
-    runtime_dir = (
-        Path(args.runtime_dir)
-        if args.runtime_dir
-        else output_dir.parent / f".{output_dir.name}.wdc200k-runtime"
+    validate_builder_passthrough(passthrough_args)
+    output_dir = Path(args.output_dir).resolve()
+    work_dir_value = passthrough_option_value(
+        passthrough_args,
+        "--work_dir",
     )
+    expected_runtime_dir = required_runtime_dir(output_dir, work_dir_value)
+    runtime_dir = (
+        Path(args.runtime_dir).resolve()
+        if args.runtime_dir
+        else expected_runtime_dir
+    )
+    if runtime_dir != expected_runtime_dir:
+        raise ValueError(
+            "runtime_dir must equal work_dir/runtime: "
+            f"{runtime_dir} != {expected_runtime_dir}"
+        )
+    minimum_value = passthrough_option_value(
+        passthrough_args,
+        "--min_free_disk_bytes",
+    )
+    minimum_free_disk_bytes = (
+        int(minimum_value)
+        if minimum_value is not None
+        else DEFAULT_MIN_FREE_DISK_BYTES
+    )
+    runtime_guard = DiskGuard(minimum_free_disk_bytes)
     text_endpoints_file = runtime_dir / "text_endpoints.txt"
     image_endpoints_file = runtime_dir / "image_endpoints.txt"
     model_start_marker = runtime_dir / "model_start.json"
@@ -564,12 +666,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     try:
+        runtime_guard(runtime_dir, 0)
         runtime_dir.mkdir(parents=True, exist_ok=True)
         for marker in (model_start_marker, model_ready_marker, text_done_marker, image_done_marker):
             if marker.exists():
                 marker.unlink()
-        write_endpoint_file(text_endpoints_file, [text_server.base_url])
-        write_endpoint_file(image_endpoints_file, [primary_image_server.base_url])
+        write_endpoint_file(
+            text_endpoints_file,
+            [text_server.base_url],
+            pre_write_guard=runtime_guard,
+        )
+        write_endpoint_file(
+            image_endpoints_file,
+            [primary_image_server.base_url],
+            pre_write_guard=runtime_guard,
+        )
 
         builder_passthrough_args = with_default_model_workers(passthrough_args, args.dynamic_model_workers)
         if args.run_fingerprint and not passthrough_has_arg(
@@ -629,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
         write_ready_marker(
             model_ready_marker,
             context=marker_context,
+            pre_write_guard=runtime_guard,
         )
 
         completed = wait_for_any_marker_or_builder_exit(
@@ -658,7 +770,14 @@ def main(argv: list[str] | None = None) -> int:
             text_proc = None
             secondary_image_proc = start_server(secondary_image_server)
             wait_for_server(secondary_image_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
-            write_endpoint_file(image_endpoints_file, [primary_image_server.base_url, secondary_image_server.base_url])
+            write_endpoint_file(
+                image_endpoints_file,
+                [
+                    primary_image_server.base_url,
+                    secondary_image_server.base_url,
+                ],
+                pre_write_guard=runtime_guard,
+            )
         elif completed == {"image"} and not marker_matches_run(
             text_done_marker,
             args.run_fingerprint,
@@ -676,7 +795,14 @@ def main(argv: list[str] | None = None) -> int:
             primary_image_proc = None
             secondary_text_proc = start_server(secondary_text_server)
             wait_for_server(secondary_text_server.base_url, timeout_seconds=args.server_start_timeout_seconds)
-            write_endpoint_file(text_endpoints_file, [text_server.base_url, secondary_text_server.base_url])
+            write_endpoint_file(
+                text_endpoints_file,
+                [
+                    text_server.base_url,
+                    secondary_text_server.base_url,
+                ],
+                pre_write_guard=runtime_guard,
+            )
 
         return int(builder_proc.wait())
     except ForwardedSignal as exc:

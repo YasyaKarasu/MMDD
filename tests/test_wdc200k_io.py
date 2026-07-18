@@ -116,7 +116,7 @@ def test_atomic_shard_amortizes_guard_checks_by_byte_window(
     assert len(positive_write_checks) < 5
 
 
-def test_amortized_commit_gate_rechecks_only_when_window_is_exhausted(
+def test_commit_gate_always_rechecks_with_write_window_remaining(
     tmp_path: Path,
 ) -> None:
     calls: list[int] = []
@@ -127,12 +127,39 @@ def test_amortized_commit_gate_rechecks_only_when_window_is_exhausted(
     )
 
     tracker.before_write(1)
-    tracker.before_commit(0, force=False)
-    assert calls == [0, 16]
+    tracker.before_commit(0)
+    assert calls == [0, 16, 0]
 
     tracker.before_write(15)
-    tracker.before_commit(0, force=False)
-    assert calls == [0, 16, 0]
+    tracker.before_commit(0)
+    assert calls == [0, 16, 0, 0]
+
+
+def test_sqlite_enqueue_commit_rechecks_with_window_remaining(
+    tmp_path: Path,
+) -> None:
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("live commit reserve exhausted")
+
+    path = tmp_path / "jobs.sqlite3"
+    store = SqliteJobStore(
+        path,
+        pre_write_guard=reject_commit,
+        guard_interval_bytes=64 * 1024 * 1024,
+    )
+    with pytest.raises(OSError, match="live commit reserve"):
+        store.enqueue("page", "one", {"payload": "x"})
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone() == (0,)
 
 
 def test_atomic_commit_does_not_reserve_temporary_bytes_twice(

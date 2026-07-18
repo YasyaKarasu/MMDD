@@ -31,6 +31,7 @@ from wdc200k_models import (
     validate_adapted_model_tasks,
     validate_model_stage,
     validate_model_stage_for_adapter,
+    write_model_done_marker,
     write_model_start_marker,
 )
 
@@ -350,7 +351,7 @@ def test_enqueue_staging_database_is_cleaned_when_initial_guard_fails(
     assert list(staging_dir.iterdir()) == []
 
 
-def test_model_result_commits_share_amortized_stage_tracker(
+def test_model_result_writes_are_amortized_but_commits_recheck_live_disk(
     tmp_path: Path,
 ) -> None:
     store_path = tmp_path / "models.sqlite3"
@@ -374,7 +375,7 @@ def test_model_result_commits_share_amortized_stage_tracker(
     store_calls = [call for call in calls if call[0] == store_path]
     assert result.success == len(records)
     assert any(size >= 64 * 1024 * 1024 for _path, size in store_calls)
-    assert len(store_calls) < len(records) // 2
+    assert sum(size == 0 for _path, size in store_calls) >= len(records)
 
 
 def test_manifest_validation_uses_guarded_controlled_membership_database(
@@ -2096,6 +2097,71 @@ def test_start_marker_requires_complete_upstream_manifests_and_is_fenced(
     assert payload["run_fingerprint"] == "run-v1"
     assert payload["text_jobset_fingerprint"] == jobset.text_fingerprint
     assert payload["image_jobset_fingerprint"] == jobset.image_fingerprint
+
+
+def test_model_start_marker_guard_failure_preserves_existing_marker(
+    tmp_path: Path,
+) -> None:
+    network, assets = write_strict_upstream_barriers(tmp_path)
+    marker = tmp_path / "start.json"
+    marker.write_text('{"old": true}\n', encoding="utf-8")
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+    )
+    calls = 0
+
+    def fail_commit(_path: Path, _estimated: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="reserve exhausted"):
+        write_model_start_marker(
+            marker,
+            jobset,
+            network_manifests=[network],
+            assets_manifest=assets,
+            assets_barrier=task5_barrier(),
+            run_fingerprint="run-v1",
+            pre_write_guard=fail_commit,
+        )
+    assert json.loads(marker.read_text(encoding="utf-8")) == {"old": True}
+    assert not marker.with_suffix(".json.tmp").exists()
+
+
+def test_model_done_marker_guard_failure_preserves_existing_marker(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "done.json"
+    marker.write_text('{"old": true}\n', encoding="utf-8")
+    calls = 0
+
+    def fail_commit(_path: Path, _estimated: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="reserve exhausted"):
+        write_model_done_marker(
+            marker,
+            model_kind="text",
+            task_count=1,
+            jobset_fingerprint="text-v1",
+            run_fingerprint="run-v1",
+            text_jobset_fingerprint="text-v1",
+            image_jobset_fingerprint="image-v1",
+            text_task_count=1,
+            image_task_count=1,
+            start_fingerprint="a" * 64,
+            pre_write_guard=fail_commit,
+        )
+    assert json.loads(marker.read_text(encoding="utf-8")) == {"old": True}
+    assert not marker.with_suffix(".json.tmp").exists()
 
 
 def test_model_stage_owns_start_ready_marker_handshake(
