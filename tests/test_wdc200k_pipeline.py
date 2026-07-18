@@ -33,6 +33,8 @@ from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
     run_pipeline,
 )
 import build_wdc200k_mm_joinability_dataset as pipeline_module  # noqa: E402
+from wdc200k_assets import ImageOutcomeStore  # noqa: E402
+from wdc200k_fetch import PageOutcomeStore  # noqa: E402
 
 
 def _statistics_archive(input_dir: Path) -> Path:
@@ -832,6 +834,195 @@ def test_resume_rejects_stale_image_attempt_policy_even_with_updated_checksum(
             page_transport=_PipelinePageTransport(),
             image_transport=_PipelineImageTransport(),
         )
+
+
+def _rewrite_network_registry(
+    config: PipelineConfig,
+    stage: str,
+    mutate: Any,
+) -> None:
+    registry_path = (
+        config.work_dir / "stage_manifests" / f"pipeline-{stage}.json"
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    network_ref = next(
+        item
+        for item in registry["producer_manifests"]
+        if json.loads(Path(item["path"]).read_text(encoding="utf-8"))[
+            "stage"
+        ]
+        == "wdc200k_network_fetch"
+    )
+    network_path = Path(network_ref["path"])
+    network = json.loads(network_path.read_text(encoding="utf-8"))
+    mutate(network, registry)
+    network_path.write_text(
+        json.dumps(network, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    network_ref["sha256"] = pipeline_module._sha256_path(network_path)
+    registry_path.write_text(
+        json.dumps(registry, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _validate_existing_network_registry(
+    config: PipelineConfig,
+    stage: str,
+) -> None:
+    registry_path = (
+        config.work_dir / "stage_manifests" / f"pipeline-{stage}.json"
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    pipeline_module._validate_stage_registry(
+        config,
+        stage,
+        expected_upstream_identity=registry["upstream_identity"],
+    )
+
+
+def test_registry_rejects_empty_forged_attempt_scope(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    outcomes = config.cache_dir / "page_cache/outcomes.sqlite3"
+    jobs = config.work_dir / "page_jobs/jobs.sqlite3"
+    manifest_path = config.work_dir / "page_jobs/network/network-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hidden_summary = PageOutcomeStore(outcomes).transport_attempt_summary(
+        manifest["policy_fingerprint"],
+        job_store_path=jobs,
+        job_kind="hidden-kind",
+        job_id_prefix="hidden-prefix",
+    )
+
+    def forge(network: dict[str, Any], registry: dict[str, Any]) -> None:
+        network["transport_attempts"] = hidden_summary
+        network["transport_attempt_authority"]["job_kind"] = "hidden-kind"
+        network["transport_attempt_authority"][
+            "job_id_prefix"
+        ] = "hidden-prefix"
+        registry["counters"].update(
+            pipeline_module._network_telemetry_counters(
+                "pages",
+                hidden_summary,
+                network["url_completion"],
+            )
+        )
+
+    _rewrite_network_registry(config, "pages", forge)
+
+    with pytest.raises(ValueError, match="transport attempt scope mismatch"):
+        _validate_existing_network_registry(config, "pages")
+
+
+def test_registry_binds_url_completion_to_progress_state(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    progress_path = config.work_dir / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["stage_telemetry"]["pages"]["completed_at"] += 100.0
+    progress_path.write_text(
+        json.dumps(progress, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="progress URL completion mismatch"):
+        _validate_existing_network_registry(config, "pages")
+
+
+def test_registry_recomputes_eta_summary_before_accepting_factor(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
+    run_pipeline(config, page_transport=_PipelinePageTransport())
+    progress_path = config.work_dir / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress_telemetry = progress["stage_telemetry"]["pages"]
+    progress_telemetry["eligible_final_half_samples"] = 1
+    progress_telemetry["excluded_final_half_samples"] = 0
+    progress_telemetry["max_symmetric_eta_factor"] = None
+    progress_path.write_text(
+        json.dumps(progress, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    def forge(network: dict[str, Any], registry: dict[str, Any]) -> None:
+        completion = network["url_completion"]
+        completion["eligible_final_half_samples"] = 1
+        completion["excluded_final_half_samples"] = 0
+        completion["max_symmetric_eta_factor"] = None
+        registry["counters"][
+            "page_eta_eligible_final_half_samples"
+        ] = 1
+        registry["counters"][
+            "page_eta_excluded_final_half_samples"
+        ] = 0
+
+    _rewrite_network_registry(config, "pages", forge)
+
+    with pytest.raises(ValueError, match="progress ETA summary mismatch"):
+        _validate_existing_network_registry(config, "pages")
+
+
+def test_registry_validation_is_read_only_for_transport_databases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+        extractor=_PipelineExtractor(),
+    )
+    tracked_roots = (
+        config.cache_dir / "page_cache",
+        config.cache_dir / "image_cache",
+        config.work_dir / "page_jobs",
+        config.work_dir / "image_jobs",
+    )
+
+    def snapshot() -> dict[str, tuple[int, int, str]]:
+        return {
+            str(path): (
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                pipeline_module._sha256_path(path),
+            )
+            for root in tracked_roots
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    constructed: list[str] = []
+    page_init = PageOutcomeStore.__init__
+    image_init = ImageOutcomeStore.__init__
+
+    def track_page(self: Any, *args: Any, **kwargs: Any) -> None:
+        constructed.append("pages")
+        page_init(self, *args, **kwargs)
+
+    def track_image(self: Any, *args: Any, **kwargs: Any) -> None:
+        constructed.append("images")
+        image_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(PageOutcomeStore, "__init__", track_page)
+    monkeypatch.setattr(
+        ImageOutcomeStore,
+        "__init__",
+        track_image,
+    )
+    _validate_existing_network_registry(config, "pages")
+    _validate_existing_network_registry(config, "images")
+
+    assert constructed == []
+    assert snapshot() == before
 
 
 def test_resume_repairs_corrupt_network_snapshot_from_authoritative_store(

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
@@ -25,7 +25,6 @@ from wdc200k_assets import (
     AssetPlanShards,
     ImageBudget,
     ImageFetchResult,
-    ImageOutcomeStore,
     MaterializedAssetShards,
     UniqueImageJobs,
     asset_materialization_input_fingerprint,
@@ -46,7 +45,6 @@ from wdc200k_archive import ArchiveResult, archive_pipeline_state
 from wdc200k_fetch import (
     FetchPolicy,
     FetchResult,
-    PageOutcomeStore,
     fetch_unique_pages,
     iter_finalized_page_refs,
     iter_page_fanout,
@@ -1196,6 +1194,235 @@ _ATTEMPT_COUNTER_FIELDS = (
 )
 
 
+def _read_only_sqlite(path: Path) -> sqlite3.Connection:
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError(f"telemetry SQLite database is missing: {path}")
+    wal_path = Path(f"{path}-wal")
+    if wal_path.is_file() and wal_path.stat().st_size > 0:
+        raise ValueError(
+            f"telemetry SQLite database has an uncheckpointed WAL: {path}"
+        )
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=30.0,
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _read_only_job_scope(path: Path, kind: str) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {"schema_version": "wdc200k-job-scope-v1", "kind": kind},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    records = 0
+    with _read_only_sqlite(path) as connection:
+        for row in connection.execute(
+            """
+            SELECT job_id, kind, payload_json, status, result_json,
+                   owner, lease_expires, lease_id, updated_at
+            FROM jobs WHERE kind = ? ORDER BY job_id
+            """,
+            (kind,),
+        ):
+            records += 1
+            digest.update(
+                json.dumps(
+                    list(row),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+    return {"records": records, "digest": digest.hexdigest()}
+
+
+def _read_only_transport_attempt_summary(
+    database_path: Path,
+    *,
+    stage: str,
+    policy_fingerprint: str,
+    job_store_path: Path,
+    job_kind: str,
+    job_id_prefix: str,
+) -> dict[str, Any]:
+    outcome_table = {
+        "pages": "page_outcomes",
+        "images": "image_outcomes",
+    }.get(stage)
+    if outcome_table is None:
+        raise ValueError(f"unsupported transport stage: {stage}")
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "schema_version": "wdc200k-transport-attempt-v1",
+                "stage": stage,
+                "policy_fingerprint": policy_fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    records = 0
+    physical = 0
+    terminal_replays = 0
+    unfinished = 0
+    blocked = 0
+    duplicates = 0
+    previous_physical_url: str | None = None
+    previous_physical_count = 0
+    job_uri = (
+        f"{Path(job_store_path).resolve().as_uri()}?mode=ro&immutable=1"
+    )
+    with _read_only_sqlite(database_path) as connection:
+        if not Path(job_store_path).resolve().is_file():
+            raise ValueError(
+                f"telemetry SQLite database is missing: {job_store_path}"
+            )
+        connection.execute(
+            "ATTACH DATABASE ? AS transport_attempt_jobs",
+            (job_uri,),
+        )
+        rows = connection.execute(
+            f"""
+            SELECT attempt.attempt_id, attempt.execution_id,
+                   attempt.stage, attempt.policy_fingerprint,
+                   attempt.url_key, attempt.url, attempt.started_at,
+                   attempt.finished_at, attempt.final_status,
+                   attempt.baseline_outcome_status, attempt.suppressed,
+                   baseline.status AS durable_baseline_outcome_status
+            FROM transport_attempts AS attempt
+            LEFT JOIN {outcome_table} AS baseline
+              ON baseline.policy_fingerprint = attempt.policy_fingerprint
+             AND baseline.url_key = attempt.url_key
+             AND baseline.updated_at <= attempt.started_at
+            WHERE attempt.stage = ?
+              AND attempt.policy_fingerprint = ?
+              AND EXISTS (
+                  SELECT 1 FROM transport_attempt_jobs.jobs AS job
+                  WHERE job.kind = ?
+                    AND job.job_id = ? || ':' || attempt.url_key
+              )
+            ORDER BY attempt.url_key, attempt.started_at,
+                     attempt.attempt_id
+            """,
+            (stage, policy_fingerprint, job_kind, job_id_prefix),
+        )
+        for row in rows:
+            values = list(row)
+            recorded_baseline = row["baseline_outcome_status"]
+            durable_baseline = row["durable_baseline_outcome_status"]
+            baseline = recorded_baseline or durable_baseline
+            suppressed = bool(row["suppressed"])
+            finished = row["finished_at"] is not None
+            final_status = row["final_status"]
+            if (
+                str(row["stage"]) != stage
+                or str(row["policy_fingerprint"]) != policy_fingerprint
+                or recorded_baseline not in {None, "success", "terminal"}
+                or durable_baseline not in {None, "success", "terminal"}
+                or (
+                    recorded_baseline is not None
+                    and durable_baseline is not None
+                    and recorded_baseline != durable_baseline
+                )
+                or (finished != (final_status is not None))
+                or (suppressed and final_status != "suppressed")
+                or (
+                    not suppressed
+                    and final_status
+                    not in {None, "success", "terminal", "exception"}
+                )
+            ):
+                raise ValueError("invalid transport attempt ledger row")
+            records += 1
+            if suppressed:
+                blocked += 1
+            else:
+                physical += 1
+                url_key = str(row["url_key"])
+                if url_key != previous_physical_url:
+                    duplicates += max(0, previous_physical_count - 1)
+                    previous_physical_url = url_key
+                    previous_physical_count = 1
+                else:
+                    previous_physical_count += 1
+                terminal_replays += int(baseline == "terminal")
+                unfinished += int(not finished)
+            digest.update(
+                json.dumps(
+                    values,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+    duplicates += max(0, previous_physical_count - 1)
+    return {
+        "stage": stage,
+        "policy_fingerprint": policy_fingerprint,
+        "database_path": str(Path(database_path).resolve()),
+        "records": records,
+        "digest": digest.hexdigest(),
+        "transport_attempts": physical,
+        "duplicate_physical_requests": duplicates,
+        "terminal_replays": terminal_replays,
+        "unfinished_transport_attempts": unfinished,
+        "blocked_durable_replays": blocked,
+    }
+
+
+def _expected_network_scope(
+    config: PipelineConfig,
+    stage: str,
+) -> tuple[str, str, str]:
+    policy = FetchPolicy(
+        retries=0,
+        deadline_seconds=config.web_max_response_seconds,
+        global_concurrency=config.web_global_concurrency,
+        per_host_concurrency=config.web_per_host_concurrency,
+        **(
+            {"policy_version": "wdc200k-image-fetch-v1"}
+            if stage == "images"
+            else {}
+        ),
+    )
+    if stage == "pages":
+        fingerprint = policy.fingerprint
+        return fingerprint, f"wdc200k-page:{fingerprint}", fingerprint
+    if stage != "images":
+        raise ValueError(f"unsupported network telemetry stage: {stage}")
+    fingerprint = stable_hash(
+        "wdc200k-image-fetch-v1",
+        policy.fingerprint,
+        length=40,
+    )
+    manifest_path = (
+        config.work_dir / "image_jobs" / "unique-images.jsonl.manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    completed = manifest.get("completed_shards") or []
+    if (
+        manifest.get("stage") != "wdc200k-unique-image-jobs-v1"
+        or manifest.get("complete") is not True
+        or len(completed) != 1
+    ):
+        raise ValueError("unique image job authority is invalid")
+    job_set = stable_hash(
+        str(manifest.get("input_fingerprint") or ""),
+        str(manifest.get("parameter_fingerprint") or ""),
+        str(completed[0].get("sha256") or ""),
+        length=40,
+    )
+    kind = f"wdc200k-image:{fingerprint}:{job_set}"
+    return fingerprint, kind, kind
+
+
 def _network_telemetry_counters(
     stage: str,
     attempts: dict[str, Any],
@@ -1240,6 +1467,12 @@ def _validate_network_telemetry(
     ):
         raise ValueError(f"network telemetry is missing: {path}")
     policy = str(payload.get("policy_fingerprint") or "")
+    expected_policy, expected_kind, expected_prefix = _expected_network_scope(
+        config,
+        registry_stage,
+    )
+    if policy != expected_policy:
+        raise ValueError("transport attempt policy mismatch")
     if attempts.get("policy_fingerprint") != policy:
         raise ValueError("transport attempt policy mismatch")
     if attempts.get("stage") != registry_stage:
@@ -1264,27 +1497,39 @@ def _validate_network_telemetry(
     job_store_path = Path(str(authority.get("job_store_path") or "")).resolve()
     job_kind = str(authority.get("job_kind") or "")
     job_id_prefix = str(authority.get("job_id_prefix") or "")
+    declared_scope = authority.get("job_scope")
     if (
         database_path != expected_database.resolve()
         or job_store_path != expected_jobs.resolve()
         or str(attempts.get("database_path") or "") != str(database_path)
-        or not job_kind
-        or not job_id_prefix
         or not database_path.is_file()
         or not job_store_path.is_file()
     ):
         raise ValueError("transport attempt authority identity mismatch")
-    store = (
-        PageOutcomeStore(database_path)
-        if registry_stage == "pages"
-        else ImageOutcomeStore(database_path)
-    )
-    actual = store.transport_attempt_summary(
-        policy,
-        job_store_path=job_store_path,
-        job_kind=job_kind,
-        job_id_prefix=job_id_prefix,
-    )
+    if job_kind != expected_kind or job_id_prefix != expected_prefix:
+        raise ValueError("transport attempt scope mismatch")
+    try:
+        actual_scope = _read_only_job_scope(job_store_path, job_kind)
+    except ValueError as error:
+        raise ValueError("transport attempt authority mismatch") from error
+    if (
+        not isinstance(declared_scope, dict)
+        or declared_scope != actual_scope
+        or int(actual_scope["records"])
+        != int((payload.get("counts") or {}).get("unique", -1))
+    ):
+        raise ValueError("transport attempt scope mismatch")
+    try:
+        actual = _read_only_transport_attempt_summary(
+            database_path,
+            stage=registry_stage,
+            policy_fingerprint=policy,
+            job_store_path=job_store_path,
+            job_kind=job_kind,
+            job_id_prefix=job_id_prefix,
+        )
+    except ValueError as error:
+        raise ValueError("transport attempt authority mismatch") from error
     if actual != attempts:
         raise ValueError("transport attempt authority mismatch")
     counts = payload.get("counts") or {}
@@ -1312,6 +1557,17 @@ def _validate_network_telemetry(
         or (factor is not None and (not math.isfinite(factor) or factor < 1.0))
     ):
         raise ValueError("URL completion summary identity mismatch")
+    try:
+        progress_reporter = ProgressReporter(replace(config, from_stage=None))
+        progress_completion = progress_reporter.stage_completion_summary(
+            registry_stage
+        )
+    except ValueError as error:
+        raise ValueError("progress ETA summary mismatch") from error
+    if progress_completion != completion:
+        raise ValueError("progress URL completion mismatch")
+    if eligible > 0 and factor is None:
+        raise ValueError("progress ETA summary mismatch")
     _network_telemetry_counters(registry_stage, attempts, completion)
 
 
@@ -2389,12 +2645,17 @@ def _run_pages(
         validation_database=page_validation_database,
         pre_write_guard=pre_write_guard,
     )
+    reporter.publish()
     url_completion = reporter.stage_completion_summary("pages")
     transport_authority = {
         "database_path": str(result.outcomes_path.resolve()),
         "job_store_path": str(result.job_store_path.resolve()),
         "job_kind": result.job_kind,
         "job_id_prefix": result.policy_fingerprint,
+        "job_scope": _read_only_job_scope(
+            result.job_store_path,
+            result.job_kind,
+        ),
     }
     network_manifest = _publish_network_manifest(
         root / "network",
@@ -2613,12 +2874,17 @@ def _run_images(
         expected_input_fingerprint=asset_input,
         pre_write_guard=pre_write_guard,
     )
+    reporter.publish()
     url_completion = reporter.stage_completion_summary("images")
     transport_authority = {
         "database_path": str(image_result.outcomes_path.resolve()),
         "job_store_path": str(image_result.job_store_path.resolve()),
         "job_kind": image_result.job_kind,
         "job_id_prefix": image_result.job_kind,
+        "job_scope": _read_only_job_scope(
+            image_result.job_store_path,
+            image_result.job_kind,
+        ),
     }
     network_manifest = _publish_network_manifest(
         root / "network",
