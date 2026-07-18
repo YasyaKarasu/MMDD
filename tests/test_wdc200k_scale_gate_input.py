@@ -507,6 +507,41 @@ def _pool_candidate(
     )
 
 
+def test_global_lowest_candidate_pool_returns_lowest_keys_in_order() -> None:
+    pool = gate_module._GlobalLowestCandidatePool(table_count=3)
+    keys = [
+        (5, "a-hash", "path-e"),
+        (1, "z-hash", "path-d"),
+        (1, "a-hash", "path-c"),
+        (1, "a-hash", "path-a"),
+        (3, "a-hash", "path-b"),
+    ]
+    for index, key in enumerate(keys):
+        ranked = _pool_candidate(f"Class{index}", key[0])
+        pool.add(
+            gate_module._RankedCandidate(
+                key=key,
+                candidate=ranked.candidate,
+                source_path=ranked.source_path,
+            )
+        )
+
+    assert [ranked.key for ranked in pool.selected()] == sorted(keys)[:3]
+
+
+def test_global_lowest_candidate_pool_retains_at_most_table_count() -> None:
+    table_count = 7
+    pool = gate_module._GlobalLowestCandidatePool(table_count)
+
+    for row_count in reversed(range(10_000)):
+        pool.add(_pool_candidate("Product", row_count))
+        assert pool.retained_count <= table_count
+
+    assert [ranked.candidate.rows for ranked in pool.selected()] == list(
+        range(table_count)
+    )
+
+
 def test_round_robin_quota_redistributes_sparse_bucket_capacity() -> None:
     capacities = {
         ("A", "top100"): 1,

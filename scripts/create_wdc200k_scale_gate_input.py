@@ -50,6 +50,27 @@ class _RankedCandidate:
         return self.key > other.key
 
 
+class _GlobalLowestCandidatePool:
+    """Keep a bounded heap containing the globally lowest-ranked candidates."""
+
+    def __init__(self, table_count: int) -> None:
+        self.table_count = table_count
+        self._heap: list[_RankedCandidate] = []
+
+    @property
+    def retained_count(self) -> int:
+        return len(self._heap)
+
+    def add(self, ranked: _RankedCandidate) -> None:
+        if len(self._heap) < self.table_count:
+            heapq.heappush(self._heap, ranked)
+        elif ranked.key < self._heap[0].key:
+            heapq.heapreplace(self._heap, ranked)
+
+    def selected(self) -> list[_RankedCandidate]:
+        return sorted(self._heap, key=lambda ranked: ranked.key)
+
+
 def _ordered_bucket_keys(
     buckets: dict[tuple[str, str], int],
 ) -> list[tuple[str, str]]:
