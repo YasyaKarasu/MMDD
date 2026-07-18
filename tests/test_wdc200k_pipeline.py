@@ -37,7 +37,9 @@ import build_wdc200k_mm_joinability_dataset as pipeline_module  # noqa: E402
 from wdc200k_assets import ImageOutcomeStore  # noqa: E402
 from wdc200k_fetch import PageOutcomeStore  # noqa: E402
 from wdc200k_eta import (  # noqa: E402
+    DurableUrlCounts,
     UrlProgressSnapshot,
+    UrlProgressTracker,
     decode_histogram_blob,
     encode_histogram_blob,
 )
@@ -654,6 +656,9 @@ def _url_snapshot(
     elapsed: float,
     deadline: float = 8.0,
     effective_concurrency: int = 128,
+    transport_overflow: int = 0,
+    active_overflow: int = 0,
+    commit_overflow: int = 0,
 ) -> UrlProgressSnapshot:
     completed_in_epoch = completed - baseline
     transport = [0] * 64
@@ -661,6 +666,8 @@ def _url_snapshot(
     if completed_in_epoch:
         transport[0] = completed_in_epoch
         commit[0] = completed_in_epoch
+    transport[-1] = max(transport[-1], transport_overflow)
+    commit[-1] = max(commit[-1], commit_overflow)
     return UrlProgressSnapshot(
         execution_epoch=epoch,
         baseline_completed=baseline,
@@ -677,9 +684,9 @@ def _url_snapshot(
         transport_event_histogram=tuple(transport),
         active_censor_histogram=(0,) * 64,
         commit_event_histogram=tuple(commit),
-        transport_overflow_events=0,
-        active_overflow_censors=0,
-        commit_overflow_events=0,
+        transport_overflow_events=transport_overflow,
+        active_overflow_censors=active_overflow,
+        commit_overflow_events=commit_overflow,
     )
 
 
@@ -1070,6 +1077,17 @@ def test_registry_accepts_completed_v1_progress_and_manifest_authority(
     _rewrite_network_registry(config, "pages", downgrade)
     _validate_existing_network_registry(config, "pages")
 
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["stage_telemetry"]["pages"][
+        "excluded_final_half_samples"
+    ] = 0
+    progress_path.write_text(
+        json.dumps(progress, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="progress URL completion mismatch"):
+        _validate_existing_network_registry(config, "pages")
+
 
 def test_registry_recomputes_eta_summary_before_accepting_factor(
     tmp_path: Path,
@@ -1434,6 +1452,95 @@ def test_progress_v2_maps_two_epochs_to_rollback_safe_logical_time(
     ProgressReporter(config)
 
 
+@pytest.mark.parametrize("stage", ["pages", "images"])
+def test_runner_epoch_elapsed_uses_first_callback_as_rate_and_time_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 100.0)
+    reporter = ProgressReporter(config)
+    normalize = pipeline_module._EpochElapsedNormalizer()
+    monotonic = [10.0]
+    tracker = UrlProgressTracker(
+        total=7,
+        deadline_seconds=8.0,
+        effective_concurrency=128,
+        execution_epoch=f"{stage}-epoch-1",
+        baseline_completed=2,
+        monotonic=lambda: monotonic[0],
+    )
+
+    for completed, now in ((2, 10.25), (3, 11.25), (4, 12.75)):
+        monotonic[0] = now
+        reporter.update(
+            stage=stage if completed == 2 else None,
+            url_snapshot=normalize(
+                tracker.snapshot(
+                    DurableUrlCounts(
+                        completed=completed,
+                        pending=7 - completed,
+                        leased=0,
+                        total=7,
+                    )
+                )
+            ),
+        )
+    reporter.publish()
+
+    resumed = ProgressReporter(config)
+    normalize_resumed = pipeline_module._EpochElapsedNormalizer()
+    monotonic[0] = 20.0
+    resumed_tracker = UrlProgressTracker(
+        total=7,
+        deadline_seconds=8.0,
+        effective_concurrency=128,
+        execution_epoch=f"{stage}-epoch-2",
+        baseline_completed=4,
+        monotonic=lambda: monotonic[0],
+    )
+    for completed, now in ((4, 24.5), (6, 26.5)):
+        monotonic[0] = now
+        resumed.update(
+            stage=stage if completed == 4 else None,
+            url_snapshot=normalize_resumed(
+                resumed_tracker.snapshot(
+                    DurableUrlCounts(
+                        completed=completed,
+                        pending=7 - completed,
+                        leased=0,
+                        total=7,
+                    )
+                )
+            ),
+        )
+    resumed.publish()
+
+    samples = json.loads(resumed.path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ][stage]["samples"]
+    assert [sample["epoch_elapsed_seconds"] for sample in samples] == [
+        0.0,
+        1.0,
+        2.5,
+        0.0,
+        2.0,
+    ]
+    first_baseline = samples[0]["baseline_timestamp"]
+    second_baseline = samples[3]["baseline_timestamp"]
+    assert [sample["timestamp"] for sample in samples] == [
+        first_baseline,
+        first_baseline + 1.0,
+        first_baseline + 2.5,
+        second_baseline,
+        second_baseline + 2.0,
+    ]
+    assert samples[1]["durable_rate"] == 1.0
+    assert samples[2]["durable_rate"] == 0.8
+    assert samples[4]["durable_rate"] == 1.0
+
+
 def test_progress_v2_tracks_all_disk_root_extrema_across_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1494,6 +1601,58 @@ def test_progress_v2_tracks_all_disk_root_extrema_across_resume(
             "start_free_bytes": 700,
             "min_free_bytes": 500,
         },
+    }
+
+
+def test_progress_resume_start_preserves_persisted_disk_current_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        _full_pipeline_config(tmp_path), progress_interval_seconds=60.0
+    )
+    monkeypatch.setattr(
+        pipeline_module.shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(2_000, 1_000, 1_000),
+    )
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        known_work_bytes=11,
+        known_cache_bytes=22,
+        known_output_bytes=33,
+        url_snapshot=_url_snapshot(
+            epoch="disk-current-1",
+            baseline=0,
+            completed=0,
+            total=1,
+            elapsed=0.0,
+        ),
+    )
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    resumed.start()
+    resumed.close()
+    payload = json.loads(resumed.path.read_text(encoding="utf-8"))
+
+    assert payload["disk"]["work_bytes"] == 11
+    assert payload["disk"]["cache_bytes"] == 22
+    assert payload["disk"]["output_bytes"] == 33
+    assert {
+        name: (
+            root["start_bytes"],
+            root["peak_bytes"],
+            root["current_bytes"],
+            root["start_free_bytes"],
+            root["min_free_bytes"],
+        )
+        for name, root in payload["disk"]["roots"].items()
+    } == {
+        "work": (11, 11, 11, 1_000, 1_000),
+        "cache": (22, 22, 22, 1_000, 1_000),
+        "output": (33, 33, 33, 1_000, 1_000),
     }
 
 
@@ -1592,6 +1751,61 @@ def test_progress_v2_restore_requires_complete_disk_roots(
 
     with pytest.raises(ValueError, match="disk roots"):
         ProgressReporter(replace(config, from_stage=from_stage))
+
+
+def _drop_sample_schema_markers(payload: dict[str, Any]) -> None:
+    for sample in payload["stage_telemetry"]["pages"]["samples"]:
+        sample.pop("telemetry_schema_version")
+
+
+def _drop_sample_schema_markers_and_disk(payload: dict[str, Any]) -> None:
+    _drop_sample_schema_markers(payload)
+    payload.pop("disk")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(
+            _drop_sample_schema_markers_and_disk,
+            id="stage-v2-samples-unmarked-disk-missing",
+        ),
+        pytest.param(
+            _drop_sample_schema_markers,
+            id="stage-v2-samples-unmarked",
+        ),
+        pytest.param(
+            lambda payload: payload["stage_telemetry"]["pages"].pop(
+                "telemetry_schema_version"
+            ),
+            id="sample-v2-stage-schema-missing",
+        ),
+        pytest.param(
+            lambda payload: payload["stage_telemetry"]["pages"].__setitem__(
+                "telemetry_schema_version", "wrong-schema"
+            ),
+            id="sample-v2-stage-schema-wrong",
+        ),
+        pytest.param(
+            lambda payload: payload["stage_telemetry"]["pages"]["samples"][
+                -1
+            ].__setitem__("telemetry_schema_version", "wrong-schema"),
+            id="stage-v2-sample-schema-wrong",
+        ),
+    ],
+)
+def test_progress_v2_schema_markers_fail_closed_before_from_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: Any,
+) -> None:
+    config, path = _published_v2_progress(tmp_path, monkeypatch)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tamper(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="progress"):
+        ProgressReporter(replace(config, from_stage="pages"))
 
 
 @pytest.mark.parametrize(
@@ -1736,6 +1950,64 @@ def test_progress_v2_restore_rejects_decreasing_events_and_reused_epochs(
 
 
 @pytest.mark.parametrize(
+    ("argument_name", "counter_name"),
+    [
+        ("transport_overflow", "transport_overflow_events"),
+        ("commit_overflow", "commit_overflow_events"),
+    ],
+)
+def test_progress_v2_restore_rejects_decreasing_cumulative_overflow(
+    tmp_path: Path,
+    argument_name: str,
+    counter_name: str,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="overflow-1",
+            baseline=0,
+            completed=0,
+            total=3,
+            elapsed=0.0,
+        ),
+    )
+    second = _url_snapshot(
+        epoch="overflow-1",
+        baseline=0,
+        completed=1,
+        total=3,
+        elapsed=1.0,
+        **{argument_name: 1},
+    )
+    reporter.update(url_snapshot=second)
+    third = _url_snapshot(
+        epoch="overflow-1",
+        baseline=0,
+        completed=2,
+        total=3,
+        elapsed=2.0,
+        **{argument_name: 2},
+    )
+    reporter.update(url_snapshot=third)
+    reporter.publish()
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    sample = payload["stage_telemetry"]["pages"]["samples"][-1]
+    forged = replace(third, **{counter_name: 0})
+    payload["stage_telemetry"]["pages"]["samples"][-1] = (
+        ProgressReporter._v2_sample(
+            forged,
+            baseline_timestamp=sample["baseline_timestamp"],
+        )
+    )
+    reporter.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="overflow"):
+        ProgressReporter(config)
+
+
+@pytest.mark.parametrize(
     "changed",
     [
         _url_snapshot(
@@ -1774,6 +2046,118 @@ def test_progress_v2_rejects_changed_epoch_baseline_or_concurrency_before_write(
 
     with pytest.raises(ValueError, match="progress"):
         reporter.update(url_snapshot=changed)
+
+
+def test_progress_completed_v1_preserves_recorded_eta_and_summary_authority(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    recorded = {
+        "rate_basis": "page_urls",
+        "completed_units": 2,
+        "total_units": 2,
+        "completed_at": 12,
+        "eligible_final_half_samples": 2,
+        "excluded_final_half_samples": 0,
+        "max_symmetric_eta_factor": 9,
+        "samples": [
+            {
+                "timestamp": 10.0,
+                "completed_units": 1,
+                "total_units": 2,
+                "rate": 1.0,
+                "rolling_rate": 1.0,
+                "predicted_remaining_seconds": 9.0,
+            },
+            {
+                "timestamp": 12.0,
+                "completed_units": 2,
+                "total_units": 2,
+                "rate": 1.0,
+                "rolling_rate": 1.0,
+                "predicted_remaining_seconds": 4.0,
+            },
+        ],
+    }
+    path = config.work_dir / "progress.json"
+    path.write_text(
+        json.dumps({"stage_telemetry": {"pages": recorded}}),
+        encoding="utf-8",
+    )
+
+    restored = ProgressReporter(config)
+
+    authority = restored.stage_completion_summary("pages")
+    assert authority == {
+        key: recorded[key]
+        for key in (
+            "rate_basis",
+            "completed_units",
+            "total_units",
+            "completed_at",
+            "eligible_final_half_samples",
+            "excluded_final_half_samples",
+            "max_symmetric_eta_factor",
+        )
+    }
+    assert type(authority["completed_at"]) is int
+    assert type(authority["max_symmetric_eta_factor"]) is int
+    assert restored._stage_telemetry["pages"]["samples"] == recorded["samples"]
+
+
+def test_progress_incomplete_v1_recorded_eta_cannot_change_v2_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    legacy_sample = {
+        "timestamp": 10.0,
+        "completed_units": 1,
+        "total_units": 3,
+        "rate": 1.0,
+        "rolling_rate": 1.0,
+        "predicted_remaining_seconds": 99.0,
+    }
+    incomplete = {
+        "rate_basis": "page_urls",
+        "completed_units": 1,
+        "total_units": 3,
+        "completed_at": None,
+        "eligible_final_half_samples": 0,
+        "excluded_final_half_samples": 0,
+        "max_symmetric_eta_factor": None,
+        "samples": [legacy_sample],
+    }
+    path = config.work_dir / "progress.json"
+    path.write_text(
+        json.dumps({"stage_telemetry": {"pages": incomplete}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 5.0)
+
+    upgraded = ProgressReporter(config)
+    upgraded.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="v2-after-recorded-v1",
+            baseline=1,
+            completed=1,
+            total=3,
+            elapsed=0.0,
+        ),
+    )
+    upgraded.publish()
+    samples = json.loads(path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ]["pages"]["samples"]
+
+    assert samples[0] == legacy_sample
+    assert samples[1]["baseline_completed"] == 1
+    assert samples[1]["completed_units"] == 1
+    assert samples[1]["epoch_elapsed_seconds"] == 0.0
+    assert samples[1]["timestamp"] >= legacy_sample["timestamp"]
 
 
 def test_progress_completed_v1_compatibility_and_incomplete_v1_upgrade(

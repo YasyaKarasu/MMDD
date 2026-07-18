@@ -457,7 +457,7 @@ class ProgressReporter:
             total = cls._uint(raw["total_units"], "v1 total")
             rate = cls._finite(raw["rate"], "v1 rate")
             rolling = cls._finite(raw["rolling_rate"], "v1 rolling rate")
-            predicted_raw = raw.get("predicted_remaining_seconds")
+            predicted_raw = raw["predicted_remaining_seconds"]
             predicted = (
                 None
                 if predicted_raw is None
@@ -472,17 +472,7 @@ class ProgressReporter:
             or (predicted is not None and predicted < 0.0)
         ):
             raise ValueError("progress v1 sample is invalid")
-        expected = (total - completed) / rate if rate > 0.0 else None
-        if expected != predicted:
-            raise ValueError("progress v1 ETA sample is inconsistent")
-        return {
-            "timestamp": timestamp,
-            "completed_units": completed,
-            "total_units": total,
-            "rate": rate,
-            "rolling_rate": rolling,
-            "predicted_remaining_seconds": predicted,
-        }
+        return dict(raw)
 
     @classmethod
     def _restore_v2_sample(cls, raw: dict[str, Any]) -> tuple[
@@ -572,6 +562,11 @@ class ProgressReporter:
             ):
                 raise ValueError("progress disk extrema are inconsistent")
             self._disk_roots[name] = restored
+            setattr(
+                self._state,
+                f"known_{name}_bytes",
+                restored["current_bytes"],
+            )
 
     def _restore_stage_telemetry(self) -> None:
         """Restore bounded URL telemetry and recompute every v2 estimate."""
@@ -586,22 +581,41 @@ class ProgressReporter:
         raw_stages = payload.get("stage_telemetry", {})
         if not isinstance(raw_stages, dict):
             raise ValueError("progress stage_telemetry must be an object")
-        has_v2_telemetry = any(
-            isinstance(raw, dict)
-            and isinstance(raw.get("samples"), list)
-            and any(
-                isinstance(sample, dict)
-                and "telemetry_schema_version" in sample
-                for sample in raw["samples"]
-            )
-            for raw in raw_stages.values()
-        )
+        has_v2_telemetry = False
+        marker_pairs: list[tuple[bool, bool]] = []
+        for raw in raw_stages.values():
+            if not isinstance(raw, dict):
+                continue
+            stage_has_v2 = "telemetry_schema_version" in raw
+            if stage_has_v2:
+                if raw["telemetry_schema_version"] != (
+                    URL_TELEMETRY_SCHEMA_VERSION
+                ):
+                    raise ValueError("progress stage schema is invalid")
+                has_v2_telemetry = True
+            sample_has_v2 = False
+            samples = raw.get("samples")
+            if isinstance(samples, list):
+                for sample in samples:
+                    if not isinstance(sample, dict) or (
+                        "telemetry_schema_version" not in sample
+                    ):
+                        continue
+                    if sample["telemetry_schema_version"] != (
+                        URL_TELEMETRY_SCHEMA_VERSION
+                    ):
+                        raise ValueError("progress sample schema is invalid")
+                    sample_has_v2 = True
+                    has_v2_telemetry = True
+            marker_pairs.append((stage_has_v2, sample_has_v2))
         if has_v2_telemetry and set(self._disk_roots) != {
             "work",
             "cache",
             "output",
         }:
             raise ValueError("progress v2 disk roots are incomplete")
+        if any(stage != sample for stage, sample in marker_pairs):
+            raise ValueError("progress stage and sample schemas are inconsistent")
         invalidated: set[str] = set()
         if self.config.from_stage is not None:
             invalidated = set(STAGES[STAGES.index(self.config.from_stage) :])
@@ -637,6 +651,8 @@ class ProgressReporter:
             epoch_concurrency = -1
             prior_transport: tuple[int, ...] | None = None
             prior_commit: tuple[int, ...] | None = None
+            prior_transport_overflow: int | None = None
+            prior_commit_overflow: int | None = None
             v2_started = False
 
             for sample_raw in samples:
@@ -674,6 +690,10 @@ class ProgressReporter:
                         epoch_concurrency = snapshot.effective_concurrency
                         prior_transport = snapshot.transport_event_histogram
                         prior_commit = snapshot.commit_event_histogram
+                        prior_transport_overflow = (
+                            snapshot.transport_overflow_events
+                        )
+                        prior_commit_overflow = snapshot.commit_overflow_events
                         if (
                             snapshot.epoch_elapsed_seconds != 0.0
                             or snapshot.completed_durable
@@ -686,6 +706,15 @@ class ProgressReporter:
                         ):
                             raise ValueError("progress v2 epoch baseline is invalid")
                     else:
+                        if (
+                            snapshot.transport_overflow_events
+                            < (prior_transport_overflow or 0)
+                            or snapshot.commit_overflow_events
+                            < (prior_commit_overflow or 0)
+                        ):
+                            raise ValueError(
+                                "progress v2 cumulative overflow decreased"
+                            )
                         if (
                             snapshot.baseline_completed != epoch_baseline
                             or float(sample["baseline_timestamp"])
@@ -711,6 +740,10 @@ class ProgressReporter:
                         epoch_elapsed = snapshot.epoch_elapsed_seconds
                         prior_transport = snapshot.transport_event_histogram
                         prior_commit = snapshot.commit_event_histogram
+                        prior_transport_overflow = (
+                            snapshot.transport_overflow_events
+                        )
+                        prior_commit_overflow = snapshot.commit_overflow_events
 
                 if stage_total is None:
                     stage_total = total
@@ -743,6 +776,7 @@ class ProgressReporter:
                 if completed_at_raw is None
                 else self._finite(completed_at_raw, "completed_at")
             )
+            completed_at_authority: Any = completed_at
             if completed_at is None:
                 if restored_completed == restored_total:
                     raise ValueError("progress completed stage lacks completed_at")
@@ -751,14 +785,14 @@ class ProgressReporter:
                     "excluded_final_half_samples": 0,
                     "max_symmetric_eta_factor": None,
                 }
-            else:
+                for key, expected in expected_summary.items():
+                    if raw.get(key) != expected:
+                        raise ValueError("progress ETA summary is inconsistent")
+            elif v2_started:
                 if (
                     restored_completed != restored_total
                     or completed_at < float(last_sample["timestamp"])
-                    or (
-                        v2_started
-                        and completed_at != float(last_sample["timestamp"])
-                    )
+                    or completed_at != float(last_sample["timestamp"])
                 ):
                     raise ValueError("progress completed_at is inconsistent")
                 expected_summary = self._eta_completion_summary(
@@ -766,16 +800,47 @@ class ProgressReporter:
                     total=restored_total,
                     completed_at=completed_at,
                 )
-            for key, expected in expected_summary.items():
-                if raw.get(key) != expected:
-                    raise ValueError("progress ETA summary is inconsistent")
+                for key, expected in expected_summary.items():
+                    if raw.get(key) != expected:
+                        raise ValueError("progress ETA summary is inconsistent")
+            else:
+                if (
+                    restored_completed != restored_total
+                    or completed_at < float(last_sample["timestamp"])
+                ):
+                    raise ValueError("progress completed_at is inconsistent")
+                eligible = self._uint(
+                    raw.get("eligible_final_half_samples"),
+                    "legacy eligible sample count",
+                )
+                excluded = self._uint(
+                    raw.get("excluded_final_half_samples"),
+                    "legacy excluded sample count",
+                )
+                factor_raw = raw.get("max_symmetric_eta_factor")
+                factor = (
+                    None
+                    if factor_raw is None
+                    else self._finite(factor_raw, "legacy ETA factor")
+                )
+                if (
+                    (factor is not None and factor < 1.0)
+                    or (eligible == 0) != (factor is None)
+                ):
+                    raise ValueError("progress legacy ETA summary is invalid")
+                completed_at_authority = completed_at_raw
+                expected_summary = {
+                    "eligible_final_half_samples": eligible,
+                    "excluded_final_half_samples": excluded,
+                    "max_symmetric_eta_factor": factor_raw,
+                }
 
             telemetry: dict[str, Any] = {
                 "rate_basis": rate_basis,
                 "samples": restored_samples,
                 "completed_units": restored_completed,
                 "total_units": restored_total,
-                "completed_at": completed_at,
+                "completed_at": completed_at_authority,
                 **expected_summary,
             }
             if v2_started:
@@ -1021,6 +1086,8 @@ class ProgressReporter:
         epoch_elapsed = -1.0
         prior_transport: tuple[int, ...] | None = None
         prior_commit: tuple[int, ...] | None = None
+        prior_transport_overflow: int | None = None
+        prior_commit_overflow: int | None = None
         for candidate in trial:
             if "telemetry_schema_version" not in candidate:
                 previous_completed = int(candidate["completed_units"])
@@ -1057,6 +1124,13 @@ class ProgressReporter:
                     raise ValueError("progress epoch baseline is invalid")
             else:
                 if (
+                    decoded.transport_overflow_events
+                    < (prior_transport_overflow or 0)
+                    or decoded.commit_overflow_events
+                    < (prior_commit_overflow or 0)
+                ):
+                    raise ValueError("progress cumulative overflow decreased")
+                if (
                     decoded.baseline_completed != epoch_baseline
                     or float(restored["baseline_timestamp"])
                     != epoch_baseline_timestamp
@@ -1088,6 +1162,8 @@ class ProgressReporter:
             epoch_elapsed = decoded.epoch_elapsed_seconds
             prior_transport = decoded.transport_event_histogram
             prior_commit = decoded.commit_event_histogram
+            prior_transport_overflow = decoded.transport_overflow_events
+            prior_commit_overflow = decoded.commit_overflow_events
 
         self._trim_samples(trial)
         telemetry = trial_raw
@@ -2883,6 +2959,26 @@ def _new_web_transport(
     )
 
 
+class _EpochElapsedNormalizer:
+    """Map raw tracker elapsed values to each epoch's first callback."""
+
+    def __init__(self) -> None:
+        self._first_elapsed_by_epoch: dict[str, float] = {}
+
+    def __call__(self, snapshot: UrlProgressSnapshot) -> UrlProgressSnapshot:
+        if not isinstance(snapshot, UrlProgressSnapshot):
+            raise ValueError("URL progress snapshot is invalid")
+        first_elapsed = self._first_elapsed_by_epoch.setdefault(
+            snapshot.execution_epoch, snapshot.epoch_elapsed_seconds
+        )
+        return replace(
+            snapshot,
+            epoch_elapsed_seconds=(
+                snapshot.epoch_elapsed_seconds - first_elapsed
+            ),
+        )
+
+
 def _page_refs(
     structural_root: Path,
     structural: Sequence[StructuralExpansionResult],
@@ -2942,14 +3038,10 @@ def _run_pages(
         if after_cache_write is not None:
             after_cache_write(record)
 
-    page_epoch_started = False
+    normalize_page_elapsed = _EpochElapsedNormalizer()
 
     def page_url_progress(snapshot: UrlProgressSnapshot) -> None:
-        nonlocal page_epoch_started
-        if not page_epoch_started:
-            snapshot = replace(snapshot, epoch_elapsed_seconds=0.0)
-            page_epoch_started = True
-        reporter.update(url_snapshot=snapshot)
+        reporter.update(url_snapshot=normalize_page_elapsed(snapshot))
 
     result = fetch_unique_pages(
         _page_refs(config.work_dir / "structural", structural, finalized),
@@ -3143,14 +3235,10 @@ def _run_images(
         image_completed += 1
         reporter.update(counters={"image_completed_live": image_completed})
 
-    image_epoch_started = False
+    normalize_image_elapsed = _EpochElapsedNormalizer()
 
     def image_url_progress(snapshot: UrlProgressSnapshot) -> None:
-        nonlocal image_epoch_started
-        if not image_epoch_started:
-            snapshot = replace(snapshot, epoch_elapsed_seconds=0.0)
-            image_epoch_started = True
-        reporter.update(url_snapshot=snapshot)
+        reporter.update(url_snapshot=normalize_image_elapsed(snapshot))
 
     if pre_write_guard is not None:
         pre_write_guard(root / "jobs.sqlite3", 0)
