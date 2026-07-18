@@ -1905,6 +1905,7 @@ def _run_images(
         planned=planned,
         image_fetch_result=image_result,
         expected_input_fingerprint=asset_input,
+        pre_write_guard=pre_write_guard,
     )
     network_manifest = _publish_network_manifest(
         root / "network",
