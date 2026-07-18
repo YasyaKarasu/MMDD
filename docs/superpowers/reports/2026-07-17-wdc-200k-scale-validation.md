@@ -7,10 +7,12 @@ WDC Schema.org 2023 tables. Code-level behavior can be verified locally with
 synthetic inputs. The 100-, 1,000-, and 10,000-table measurements below must be
 filled from actual runs by the formal-run operator.
 
-No real-table scale run, network pilot, GPU model invocation, or tmux lifecycle
-operation was performed while preparing this report. Every unmeasured field is
-marked **NOT RUN**; no value in this template is a synthetic substitute for a
-scale result.
+No 100-, 1,000-, or 10,000-table acceptance gate has completed, and no formal
+200K launch has occurred. After this report was initially prepared, one
+explicitly partial broad `round_robin` diagnostic was run and is disclosed
+below. It does not replace or pass any acceptance gate. Every unmeasured
+acceptance field remains marked **NOT RUN**; no value in this template is a
+synthetic substitute for a scale result.
 
 ## Reproducibility record
 
@@ -129,17 +131,101 @@ stage boundaries, interruption, peak, and completion.
 
 ## Broad round-robin diagnostic (partial, not acceptance)
 
-A separate 100-table `round_robin` diagnostic reached structural expansion
-before an intentional interruption. It observed 55,839 entities, 52,880
-unique pages, and 322,324,462 structural bytes. The interrupted initial
-process peaked at 293,064 KiB RSS. The resume ran for 7:14.51 and peaked at
-359,208 KiB RSS. The digest of the 391 outcomes durable before interruption
-was unchanged after resume; the final total was 4,906 outcomes, of which 4,515
-were live resume outcomes.
+After initial report preparation, a separate 100-table `round_robin`
+diagnostic reached structural expansion and made partial page-stage progress.
+Its provenance is:
 
-This run was interrupted and did not complete all required acceptance
-measurements or canonical artifact validation. It is broad diagnostic evidence
-only and does not count as the 100-table acceptance gate below.
+- Pipeline commit:
+  `4f178e8e52be85670c40d24f948857b8efc281e3`
+- Gate input: `/home/oycy/MMDD/gate_inputs/wdc_100`
+- `scale_gate_manifest.jsonl` SHA-256:
+  `c23fc5fc528ea72600e72b4919db4eff1d5c5fcbbd3dc5b32efc921e2b28d8c5`
+- `scale_gate_checksums.json` SHA-256:
+  `243f0c5e9ea19bf8982aa7a818517c4a0814d6998e82e8d413fb9198c4dd88f2`
+- Configured output/work/cache roots:
+  `/home/oycy/MMDD/output_wdc_gate100b`,
+  `/home/oycy/MMDD/work_wdc_gate100b`, and
+  `/home/oycy/MMDD/cache/wdc_gate100b`. The output root was not created
+  before interruption.
+- Runtime root: `/home/oycy/MMDD/work_wdc_gate100b/runtime`
+- `min_free_disk_bytes`: `107374182400`
+- Measurement tool: `/usr/bin/time -v`
+- Durable state paths:
+  `/home/oycy/MMDD/work_wdc_gate100b/progress.json`,
+  `/home/oycy/MMDD/cache/wdc_gate100b/page_cache/outcomes.sqlite3`, and
+  `/home/oycy/MMDD/work_wdc_gate100b/page_jobs/jobs.sqlite3`
+
+Both commands were launched from `/home/oycy/MMDD`. The exact initial command
+captured from the tmux run was:
+
+```bash
+/usr/bin/time -v conda run -n MMDD --no-capture-output python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir /home/oycy/MMDD/gate_inputs/wdc_100 \
+  --output_dir /home/oycy/MMDD/output_wdc_gate100b \
+  --work_dir /home/oycy/MMDD/work_wdc_gate100b \
+  --cache_dir /home/oycy/MMDD/cache/wdc_gate100b \
+  --text_model_path /home/oycy/MMDD/hf_models/Qwen3.5-9B \
+  --image_model_path /home/oycy/MMDD/hf_models/Qwen3-VL-8B-Thinking \
+  --run_fingerprint gate100b-20260718 \
+  --runtime_dir /home/oycy/MMDD/work_wdc_gate100b/runtime \
+  --max_source_tables 100 \
+  --selection_seed 13 \
+  --web_max_retries 0 \
+  --web_max_response_seconds 8 \
+  --web_global_concurrency 128 \
+  --web_per_host_concurrency 2 \
+  --max_image_attempts_per_entity 3 \
+  --max_images_per_entity 3 \
+  --min_free_disk_bytes 107374182400 \
+  --progress_interval_seconds 5
+```
+
+The exact resume command was:
+
+```bash
+/usr/bin/time -v conda run -n MMDD --no-capture-output python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir /home/oycy/MMDD/gate_inputs/wdc_100 \
+  --output_dir /home/oycy/MMDD/output_wdc_gate100b \
+  --work_dir /home/oycy/MMDD/work_wdc_gate100b \
+  --cache_dir /home/oycy/MMDD/cache/wdc_gate100b \
+  --text_model_path /home/oycy/MMDD/hf_models/Qwen3.5-9B \
+  --image_model_path /home/oycy/MMDD/hf_models/Qwen3-VL-8B-Thinking \
+  --run_fingerprint gate100b-20260718 \
+  --runtime_dir /home/oycy/MMDD/work_wdc_gate100b/runtime \
+  --max_source_tables 100 \
+  --selection_seed 13 \
+  --web_max_retries 0 \
+  --web_max_response_seconds 8 \
+  --web_global_concurrency 128 \
+  --web_per_host_concurrency 2 \
+  --max_image_attempts_per_entity 3 \
+  --max_images_per_entity 3 \
+  --min_free_disk_bytes 107374182400 \
+  --progress_interval_seconds 5 \
+  --resume
+```
+
+The initial process ran for 1:07.87 and peaked at 293,064 KiB RSS; its
+approximate interval was `2026-07-18T06:51:05Z` to
+`2026-07-18T06:52:13Z`. The resume ran for 7:14.51 and peaked at 359,208 KiB
+RSS; its approximate interval was `2026-07-18T06:53:58Z` to
+`2026-07-18T07:01:13Z`. These timestamps are derived from tmux pane end times
+and `/usr/bin/time -v` elapsed durations rather than independent wall-clock
+samples.
+
+The structural state recorded 100 selected and validated tables, 55,839
+entities, 52,880 unique pages, and 322,324,462 structural bytes. At cutoff
+`1784357532.9271808`, the 391 durable outcomes had full-row digest
+`e66fc91e303e61173b9e5166111c97352c0009a5736bcbb36b707cb55b28ef9f`.
+That digest was unchanged after resume. The database then held 4,906 total
+outcomes, while `progress.json` recorded 4,515 live resume outcomes.
+
+Both processes were interrupted. The diagnostic did not finish the page stage,
+did not publish a `dataset_manifest.json`, and did not perform canonical
+artifact validation. It is broad diagnostic evidence only and does not count
+as the 100-table acceptance gate below.
 
 ## 100-table acceptance gate
 
