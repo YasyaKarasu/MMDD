@@ -301,6 +301,127 @@ class CountingExtractor:
         }
 
 
+def test_enqueue_staging_database_uses_guarded_controlled_directory(
+    tmp_path: Path,
+) -> None:
+    staging_dir = tmp_path / "work" / "model-enqueue"
+    calls: list[tuple[Path, int]] = []
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+
+    jobset = enqueue_model_tasks(
+        [asset("a"), asset("b")],
+        store,
+        args=model_args(),
+        staging_dir=staging_dir,
+        pre_write_guard=lambda path, size=0: calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    staging_calls = [
+        (path, size)
+        for path, size in calls
+        if path.parent == staging_dir
+    ]
+    assert jobset.total_tasks == 2
+    assert any(size > 0 for _path, size in staging_calls)
+    assert any(size == 0 for _path, size in staging_calls)
+    assert list(staging_dir.iterdir()) == []
+
+
+def test_enqueue_staging_database_is_cleaned_when_initial_guard_fails(
+    tmp_path: Path,
+) -> None:
+    staging_dir = tmp_path / "work" / "model-enqueue"
+
+    def reject_staging(_path: Path, estimated_bytes: int = 0) -> None:
+        if estimated_bytes > 0:
+            raise RuntimeError("synthetic staging reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="staging reserve"):
+        enqueue_model_tasks(
+            [asset("a")],
+            SqliteJobStore(tmp_path / "models.sqlite3"),
+            args=model_args(),
+            staging_dir=staging_dir,
+            pre_write_guard=reject_staging,
+        )
+
+    assert list(staging_dir.iterdir()) == []
+
+
+def test_model_result_commits_share_amortized_stage_tracker(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "models.sqlite3"
+    store = SqliteJobStore(store_path)
+    records = [asset(f"asset-{index}") for index in range(40)]
+    jobset = enqueue_model_tasks(records, store, args=model_args())
+    calls: list[tuple[Path, int]] = []
+
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        group_size=len(records),
+        workers=4,
+        output_root=tmp_path / "outputs",
+        pre_write_guard=lambda path, size=0: calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    store_calls = [call for call in calls if call[0] == store_path]
+    assert result.success == len(records)
+    assert any(size >= 64 * 1024 * 1024 for _path, size in store_calls)
+    assert len(store_calls) < len(records) // 2
+
+
+def test_manifest_validation_uses_guarded_controlled_membership_database(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "work" / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+    )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "work" / "outputs",
+    )
+    calls: list[tuple[Path, int]] = []
+
+    loaded = models._load_valid_manifest(
+        result.manifest_path,
+        output_root=result.manifest_path.parent,
+        jobset=jobset,
+        pre_write_guard=lambda path, size=0: calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    validation_dir = store.path.parent / ".model-validation-staging"
+    assert loaded is not None
+    assert calls
+    assert all(
+        path == validation_dir or validation_dir in path.parents
+        for path, _size in calls
+    )
+    assert any(size > 0 for _path, size in calls)
+    assert any(size == 0 for _path, size in calls)
+    assert list(validation_dir.iterdir()) == []
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name LIKE 'observed_outputs_%'
+            """
+        ).fetchone() == (0,)
+
+
 def test_adapter_and_model_validators_bind_exact_task_membership(
     tmp_path: Path,
 ) -> None:
@@ -777,6 +898,196 @@ def test_result_written_before_finish_repairs_without_model_call(
         )
 
     time.sleep(0.1)
+    resumed = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    assert resumed.complete is True
+    assert extractor.asset_ids == ["a"]
+
+
+def test_first_model_result_commit_guard_rolls_back_prepared_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extractor = CountingExtractor()
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+    )
+    monkeypatch.setattr(
+        models.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+    armed = False
+
+    def reject_first_commit(
+        path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal armed
+        if Path(path) != store.path:
+            return
+        if estimated_bytes > 0:
+            armed = True
+        elif armed:
+            raise OSError("prepared result commit reserve exhausted")
+
+    with pytest.raises(OSError, match="prepared result commit reserve"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+            pre_write_guard=reject_first_commit,
+            lease_seconds=0.08,
+            heartbeat_seconds=0.02,
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == ("leased",)
+
+
+def test_second_model_result_commit_guard_leaves_repairable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extractor = CountingExtractor()
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+    )
+    monkeypatch.setattr(
+        models.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+    store_commit_checks = 0
+
+    def reject_second_commit(
+        path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal store_commit_checks
+        if Path(path) != store.path or estimated_bytes != 0:
+            return
+        with sqlite3.connect(store.path) as connection:
+            prepared = connection.execute(
+                """
+                SELECT COUNT(*) FROM model_results
+                WHERE committed = 0
+                """
+            ).fetchone()[0]
+        if prepared:
+            store_commit_checks += 1
+            raise OSError("final model result commit reserve exhausted")
+
+    with pytest.raises(OSError, match="final model result commit reserve"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+            pre_write_guard=reject_second_commit,
+            lease_seconds=0.08,
+            heartbeat_seconds=0.02,
+        )
+    assert store_commit_checks == 1
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT committed FROM model_results WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == ("leased",)
+    time.sleep(0.1)
+    resumed = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    assert resumed.complete is True
+    assert extractor.asset_ids == ["a"]
+
+
+def test_durable_result_repair_guard_failure_rolls_back_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extractor = CountingExtractor()
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+
+    def crash_after_prepare(_job_id: str, _record: dict) -> None:
+        raise RuntimeError("simulated prepared-result crash")
+
+    with pytest.raises(RuntimeError, match="prepared-result"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+            after_result_write=crash_after_prepare,
+            lease_seconds=0.08,
+            heartbeat_seconds=0.02,
+        )
+    time.sleep(0.1)
+    monkeypatch.setattr(
+        models.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+    zero_checks = 0
+
+    def reject_repair_commit(
+        _path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("durable repair commit reserve exhausted")
+
+    with pytest.raises(OSError, match="repair commit reserve"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+            pre_write_guard=reject_repair_commit,
+        )
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT status FROM jobs WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == ("leased",)
+        assert connection.execute(
+            "SELECT committed FROM model_results WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == (0,)
+
     resumed = run_model_stage(
         store,
         extractor,

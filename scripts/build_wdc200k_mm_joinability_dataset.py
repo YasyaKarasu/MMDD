@@ -1337,8 +1337,8 @@ def _structural_exact_counts(
     pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, int]:
     database_path = root / "structural-counts.sqlite3"
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, 0)
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    write_tracker.before_write(64 * 1024)
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS page_urls "
@@ -1347,6 +1347,10 @@ def _structural_exact_counts(
         connection.execute("DELETE FROM page_urls")
         for result in results:
             for record in _iter_jsonl(result.page_refs):
+                encoded = json.dumps(record, ensure_ascii=False)
+                write_tracker.before_write(
+                    4096 + 2 * len(encoded.encode("utf-8"))
+                )
                 connection.execute(
                     "INSERT OR IGNORE INTO page_urls (url_key) VALUES (?)",
                     (str(record["url_key"]),),
@@ -1354,6 +1358,7 @@ def _structural_exact_counts(
         unique_pages = int(
             connection.execute("SELECT COUNT(*) FROM page_urls").fetchone()[0]
         )
+        write_tracker.before_commit(0)
     entities = sum(result.entities_count for result in results)
     direct_images = sum(
         result.direct_image_references for result in results
@@ -1447,13 +1452,18 @@ def _run_selection_and_structural(
     if pre_write_guard is not None:
         pre_write_guard(reserve_database, 0)
     reserve_manager = (
-        ReserveManager.open(reserve_database, policy)
+        ReserveManager.open(
+            reserve_database,
+            policy,
+            pre_write_guard=pre_write_guard,
+        )
         if reserve_database.exists()
         else ReserveManager.create_from_jsonl(
             reserve_database,
             reserve_path=reserve_path,
             selected_path=selected_path,
             policy=policy,
+            pre_write_guard=pre_write_guard,
         )
     )
     total_shards = (
@@ -1529,13 +1539,25 @@ def _reconcile_page_jobs_from_outcomes(
     jobs_path: Path,
     outcomes_path: Path,
     policy_fingerprint: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
     """Finish crash-window jobs from already durable terminal outcomes."""
     if not jobs_path.is_file() or not outcomes_path.is_file():
         return
+    write_tracker = GuardedWriteTracker(jobs_path, pre_write_guard)
     with sqlite3.connect(jobs_path) as connection:
         connection.execute("ATTACH DATABASE ? AS page_cache", (str(outcomes_path),))
         kind = f"wdc200k-page:{policy_fingerprint}"
+        repair_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE kind = ? AND status NOT IN ('success', 'terminal')
+                """,
+                (kind,),
+            ).fetchone()[0]
+        )
+        write_tracker.before_write(4096 + repair_count * 512)
         connection.execute(
             """
             UPDATE jobs
@@ -1575,6 +1597,7 @@ def _reconcile_page_jobs_from_outcomes(
                 policy_fingerprint,
             ),
         )
+        write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -1630,6 +1653,7 @@ def _run_pages(
         jobs_path,
         outcomes_path,
         policy.fingerprint,
+        pre_write_guard=pre_write_guard,
     )
     page_completed = 0
     page_status_counts: dict[str, int] = {}
@@ -1666,6 +1690,7 @@ def _run_pages(
         result,
         _page_refs(config.work_dir / "structural", structural, finalized),
         validation_database=page_validation_database,
+        pre_write_guard=pre_write_guard,
     )
     network_manifest = _publish_network_manifest(
         root / "network",
@@ -1801,6 +1826,7 @@ def _run_images(
         unique_jobs,
         planned=planned,
         validation_database=unique_validation_database,
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(completed_shards=1, total_shards=3)
     policy = FetchPolicy(
@@ -1956,6 +1982,8 @@ def _run_models(
         input_fingerprint=adapted.input_fingerprint,
         text_input_fingerprint=adapted.input_fingerprint,
         image_input_fingerprint=adapted.input_fingerprint,
+        staging_dir=config.work_dir / "model_outputs" / "enqueue-staging",
+        pre_write_guard=pre_write_guard,
     )
     run_fingerprint = config.run_fingerprint or stable_hash(
         "wdc200k-model-run-v1",

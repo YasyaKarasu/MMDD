@@ -358,6 +358,41 @@ def test_outcome_counts_are_transactional_idempotent_and_constant_time(
     assert "group by" not in count_sql
 
 
+def test_page_outcome_commit_guard_rolls_back_and_resumes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    PageOutcomeStore(path)
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("page outcome commit reserve exhausted")
+
+    tracker = fetch_module.GuardedWriteTracker(
+        path,
+        reject_commit,
+        interval_bytes=1,
+    )
+    guarded = PageOutcomeStore(path, write_tracker=tracker)
+    outcome = {
+        "status": "success",
+        "final_url": "https://e.test/a",
+        "text": "ok",
+        "image_urls": [],
+    }
+    with pytest.raises(OSError, match="page outcome commit reserve"):
+        guarded.put("policy", "a" * 64, "https://e.test/a", outcome)
+
+    resumed = PageOutcomeStore(path)
+    assert resumed.counts("policy") == (0, 0)
+    resumed.put("policy", "a" * 64, "https://e.test/a", outcome)
+    assert resumed.counts("policy") == (1, 0)
+
+
 def test_legacy_outcome_schema_migrates_once_across_processes(
     tmp_path: Path,
 ) -> None:
@@ -775,6 +810,58 @@ def test_complete_page_fetch_validator_binds_jobs_refs_and_snapshots(
             refs,
             validation_database=tmp_path / "forged-job.sqlite3",
         )
+
+
+def test_page_validation_recovers_after_mid_batch_guard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refs = [
+        page_ref(str(index), f"https://e.test/{index}")
+        for index in range(20)
+    ]
+    result = fetch_unique_pages(
+        refs,
+        SqliteJobStore(tmp_path / "pages.sqlite3"),
+        CountingTransport(
+            {
+                record["page_url"]: {"text": "page", "image_urls": []}
+                for record in refs
+            }
+        ),
+        FetchPolicy(),
+    )
+    validation_database = tmp_path / "validate.sqlite3"
+    positive_calls = 0
+    monkeypatch.setattr(
+        fetch_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    def interrupt(path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal positive_calls
+        assert Path(path) == validation_database
+        if estimated_bytes > 0:
+            positive_calls += 1
+            if positive_calls == 2:
+                raise RuntimeError("synthetic validation reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="validation reserve"):
+        validate_complete_page_fetch(
+            result,
+            refs,
+            validation_database=validation_database,
+            pre_write_guard=interrupt,
+        )
+
+    snapshot = validate_complete_page_fetch(
+        result,
+        refs,
+        validation_database=validation_database,
+    )
+    assert positive_calls == 2
+    assert snapshot["unique"] == len(refs)
 
 
 def test_wdc_client_exposes_read_only_cached_page_outcome(

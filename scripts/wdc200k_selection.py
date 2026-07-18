@@ -543,9 +543,19 @@ _CLAIM_SELECT = """
 class ReserveManager:
     """Persist reserve cursors, used paths, and active class counts in SQLite."""
 
-    def __init__(self, database_path: Path, policy: SelectionPolicy) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        policy: SelectionPolicy,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+    ) -> None:
         self.database_path = database_path
         self.policy = policy
+        self._write_tracker = GuardedWriteTracker(
+            database_path,
+            pre_write_guard,
+        )
 
     @classmethod
     def create(
@@ -791,7 +801,11 @@ class ReserveManager:
         finally:
             temporary_path.unlink(missing_ok=True)
         _fsync_parent(database_path.parent)
-        return cls.open(database_path, policy)
+        return cls.open(
+            database_path,
+            policy,
+            pre_write_guard=pre_write_guard,
+        )
 
     @classmethod
     def create_from_jsonl(
@@ -817,6 +831,8 @@ class ReserveManager:
         cls,
         database_path: Path,
         policy: SelectionPolicy,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> ReserveManager:
         """Open existing reserve state and verify its selection policy."""
         if not database_path.is_file():
@@ -831,7 +847,11 @@ class ReserveManager:
         expected = json.dumps(asdict(policy), sort_keys=True)
         if row is None or str(row[0]) != expected:
             raise ValueError("reserve database policy does not match")
-        return cls(database_path, policy)
+        return cls(
+            database_path,
+            policy,
+            pre_write_guard=pre_write_guard,
+        )
 
     def class_counts(self) -> dict[str, int]:
         connection = self._connect()
@@ -960,6 +980,17 @@ class ReserveManager:
                 raise ValueError(
                     "active candidate metadata does not match persisted state"
                 )
+            self._write_tracker.before_write(
+                32 * 1024
+                + 2
+                * len(
+                    (
+                        operation_key
+                        + invalid_candidate.relative_path
+                        + reason
+                    ).encode("utf-8")
+                )
+            )
             predecessor = self._claim_by_replacement(
                 connection,
                 invalid_candidate.relative_path,
@@ -1029,6 +1060,7 @@ class ReserveManager:
                     raise RuntimeError(
                         "exhausted replacement operation was not visible"
                     )
+                self._write_tracker.before_commit(0, force=False)
                 connection.commit()
                 raise ReserveExhaustedError(claim)
             connection.execute(
@@ -1086,6 +1118,7 @@ class ReserveManager:
             claim = self._claim_by_operation(connection, operation_key)
             if claim is None:
                 raise RuntimeError("replacement journal insert was not visible")
+            self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return claim
         except BaseException:
@@ -1177,6 +1210,13 @@ class ReserveManager:
                     f"{operation_key}"
                 )
             if claim.status == "pending":
+                self._write_tracker.before_write(
+                    16 * 1024
+                    + 2
+                    * len(
+                        (operation_key + replacement_path).encode("utf-8")
+                    )
+                )
                 connection.execute(
                     """
                     UPDATE replacement_operations
@@ -1190,6 +1230,7 @@ class ReserveManager:
                     raise RuntimeError(
                         "acknowledged replacement operation disappeared"
                     )
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return claim
         except BaseException:
@@ -1365,11 +1406,14 @@ class ReserveManager:
             if not is_invalid(candidate):
                 return candidate
 
-    @staticmethod
     def _mark_consumed(
+        self,
         connection: sqlite3.Connection,
         relative_path: str,
     ) -> None:
+        self._write_tracker.before_write(
+            4096 + 2 * len(relative_path.encode("utf-8"))
+        )
         connection.execute(
             "UPDATE candidates SET used = 1 WHERE relative_path = ?",
             (relative_path,),

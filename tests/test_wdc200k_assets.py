@@ -43,6 +43,7 @@ from wdc200k_fetch import (  # noqa: E402
 from wdc200k_io import AtomicJsonlShard, SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
+import wdc200k_assets as assets_module  # noqa: E402
 
 
 def _open_image_outcome_store_process(
@@ -1836,6 +1837,207 @@ def test_url_claim_lease_fences_stale_owner_and_is_policy_scoped(
     ) is False
 
 
+def test_image_outcome_put_commit_guard_rolls_back_and_resumes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(path)
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("image outcome commit reserve exhausted")
+
+    tracker = assets_module.GuardedWriteTracker(
+        path,
+        reject_commit,
+        interval_bytes=1,
+    )
+    guarded = ImageOutcomeStore(path, write_tracker=tracker)
+    image_url = "https://i.test/put.jpg"
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    with pytest.raises(OSError, match="image outcome commit reserve"):
+        guarded.put(
+            "policy",
+            url_key,
+            image_url,
+            {"status": "terminal", "error_class": "TimeoutError"},
+        )
+
+    resumed = ImageOutcomeStore(path)
+    assert resumed.get("policy", url_key) is None
+    resumed.put(
+        "policy",
+        url_key,
+        image_url,
+        {"status": "terminal", "error_class": "TimeoutError"},
+    )
+    assert resumed.get("policy", url_key)["status"] == "terminal"
+
+
+def test_image_url_claim_commit_guard_rolls_back_lease(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(path)
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("image claim commit reserve exhausted")
+
+    tracker = assets_module.GuardedWriteTracker(
+        path,
+        reject_commit,
+        interval_bytes=1,
+    )
+    guarded = ImageOutcomeStore(path, write_tracker=tracker)
+    with pytest.raises(OSError, match="image claim commit reserve"):
+        guarded.claim_url(
+            "policy",
+            "a" * 64,
+            owner="worker",
+            lease_seconds=60,
+        )
+
+    resumed = ImageOutcomeStore(path)
+    decision = resumed.claim_url(
+        "policy",
+        "a" * 64,
+        owner="worker",
+        lease_seconds=60,
+    )
+    assert decision.lease is not None
+
+
+def test_image_outcome_snapshot_uses_guarded_membership_file(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity(
+                    "e1",
+                    image_urls=["https://i.test/one.jpg"],
+                ),
+                page(),
+            )
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint="snapshot-membership-v1",
+    )
+    unique = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique.jsonl",
+    )
+    store = ImageOutcomeStore(cache_dir / "outcomes.sqlite3")
+    calls: list[tuple[Path, int]] = []
+
+    snapshot = store.snapshot_for_jobs(
+        "policy",
+        unique,
+        pre_write_guard=lambda path, size=0: calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    assert snapshot["count"] == 0
+    assert snapshot["missing"] == 1
+    assert calls
+    assert {path.parent for path, _size in calls} == {cache_dir}
+    assert any(size > 0 for _path, size in calls)
+    assert any(size == 0 for _path, size in calls)
+    assert not list(cache_dir.glob(".image-membership-*"))
+
+
+def test_image_outcome_snapshot_cleans_membership_on_initial_guard_failure(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity(
+                    "e1",
+                    image_urls=["https://i.test/one.jpg"],
+                ),
+                page(),
+            )
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint="snapshot-guard-cleanup-v1",
+    )
+    unique = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique.jsonl",
+    )
+    store = ImageOutcomeStore(cache_dir / "outcomes.sqlite3")
+
+    def reject_initial_write(
+        _path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        if estimated_bytes > 0:
+            raise OSError("snapshot membership reserve exhausted")
+
+    with pytest.raises(OSError, match="membership reserve"):
+        store.snapshot_for_jobs(
+            "policy",
+            unique,
+            pre_write_guard=reject_initial_write,
+        )
+
+    assert not list(cache_dir.glob(".image-membership-*"))
+
+
+def test_image_outcome_snapshot_cleans_membership_on_connect_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity(
+                    "e1",
+                    image_urls=["https://i.test/one.jpg"],
+                ),
+                page(),
+            )
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint="snapshot-connect-cleanup-v1",
+    )
+    unique = build_unique_image_jobs(
+        planned,
+        tmp_path / "unique.jsonl",
+    )
+    store = ImageOutcomeStore(cache_dir / "outcomes.sqlite3")
+    original_connect = assets_module.sqlite3.connect
+
+    def reject_membership(path: object, *args: object, **kwargs: object):
+        if Path(path).name.startswith(".image-membership-"):
+            raise sqlite3.OperationalError("synthetic membership connect")
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        assets_module.sqlite3,
+        "connect",
+        reject_membership,
+    )
+    with pytest.raises(sqlite3.OperationalError, match="membership connect"):
+        store.snapshot_for_jobs("policy", unique)
+
+    assert not list(cache_dir.glob(".image-membership-*"))
+
+
 def test_live_foreign_lease_reports_incomplete_then_repairs_from_cache(
     tmp_path: Path,
 ) -> None:
@@ -2283,6 +2485,58 @@ def test_public_asset_validators_reconstruct_the_complete_producer_chain(
             image_fetch_result=fetched,
             expected_input_fingerprint="foreign-materialization-run",
         )
+
+
+def test_unique_image_validation_recovers_after_mid_batch_guard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planned = persist_entity_asset_plans(
+        [
+            (
+                entity(
+                    f"e{index}",
+                    image_urls=[f"https://i.test/{index}.jpg"],
+                ),
+                page(),
+            )
+            for index in range(24)
+        ],
+        output_root=tmp_path / "plans",
+        input_fingerprint="guarded-planning-v1",
+    )
+    unique = build_unique_image_jobs(planned, tmp_path / "unique.jsonl")
+    validation_database = tmp_path / "validate-unique.sqlite3"
+    positive_calls = 0
+    monkeypatch.setattr(
+        assets_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    def interrupt(path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal positive_calls
+        assert Path(path) == validation_database
+        if estimated_bytes > 0:
+            positive_calls += 1
+            if positive_calls == 2:
+                raise RuntimeError("synthetic image reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="image reserve"):
+        validate_unique_image_jobs(
+            unique,
+            planned=planned,
+            validation_database=validation_database,
+            pre_write_guard=interrupt,
+        )
+
+    resumed = validate_unique_image_jobs(
+        unique,
+        planned=planned,
+        validation_database=validation_database,
+    )
+    assert positive_calls == 2
+    assert resumed == unique
 
 
 def test_image_failures_fan_out_reference_counts_for_current_jobset(

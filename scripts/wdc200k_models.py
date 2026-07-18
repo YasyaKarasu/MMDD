@@ -15,9 +15,11 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
@@ -697,6 +699,8 @@ def enqueue_model_tasks(
     image_input_fingerprint: str | None = None,
     prompt_version: str = PROMPT_VERSION,
     policy_fingerprint: str = MODEL_POLICY_VERSION,
+    staging_dir: Path | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelJobSet:
     """Stream complete extraction payloads into isolated modality job sets."""
     if not input_fingerprint:
@@ -753,22 +757,41 @@ def enqueue_model_tasks(
                 ),
             )
     previews: list[ModelJobInfo] = []
-    staging = sqlite3.connect("")
-    staging.row_factory = sqlite3.Row
-    staging.execute(
-        """
-        CREATE TABLE incoming (
-            job_id TEXT PRIMARY KEY,
-            modality TEXT NOT NULL,
-            cache_key TEXT NOT NULL,
-            model_call_key TEXT NOT NULL,
-            asset_fingerprint TEXT NOT NULL,
-            payload_sha256 TEXT NOT NULL,
-            payload_json TEXT NOT NULL
-        )
-        """
+    staging_dir = Path(
+        staging_dir or store.path.parent / ".model-enqueue-staging"
     )
+    if pre_write_guard is not None:
+        pre_write_guard(staging_dir, 0)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, staging_name = tempfile.mkstemp(
+        prefix="incoming-",
+        suffix=".sqlite3",
+        dir=staging_dir,
+    )
+    os.close(descriptor)
+    staging_path = Path(staging_name)
+    staging: sqlite3.Connection | None = None
     try:
+        staging_tracker = GuardedWriteTracker(
+            staging_path,
+            pre_write_guard,
+        )
+        staging_tracker.before_write(64 * 1024)
+        staging = sqlite3.connect(staging_path)
+        staging.row_factory = sqlite3.Row
+        staging.execute(
+            """
+            CREATE TABLE incoming (
+                job_id TEXT PRIMARY KEY,
+                modality TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                model_call_key TEXT NOT NULL,
+                asset_fingerprint TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
         for order, record in enumerate(assets):
             if not isinstance(record, dict):
                 raise ValueError("model task input must be an object")
@@ -797,6 +820,9 @@ def enqueue_model_tasks(
                 jobset_fingerprint=fingerprints[modality],
             )
             encoded = _canonical_json(payload)
+            staging_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             store.reserve_write(
                 4096 + 2 * len(encoded.encode("utf-8"))
             )
@@ -844,6 +870,7 @@ def enqueue_model_tasks(
                         ),
                     )
                 )
+        staging_tracker.before_commit(0)
         staging.commit()
 
         counts: dict[str, int] = {}
@@ -1069,7 +1096,10 @@ def enqueue_model_tasks(
                     )
             store.guard_commit()
     finally:
-        staging.close()
+        if staging is not None:
+            staging.close()
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{staging_path}{suffix}").unlink(missing_ok=True)
     result = ModelJobSet(
         database_path=store.path,
         input_fingerprint=input_fingerprint,
@@ -1256,6 +1286,8 @@ def _canonical_extraction_record(
 def _repair_durable_results(
     database_path: Path,
     jobset: ModelJobSet,
+    *,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> int:
     repaired = 0
     with _connect(database_path) as connection:
@@ -1281,6 +1313,12 @@ def _repair_durable_results(
                 (jobset.kind_for(modality), time.time()),
             ).fetchall()
             for row in rows:
+                if write_tracker is not None:
+                    write_tracker.before_write(
+                        8192
+                        + 4
+                        * len(str(row["record_json"]).encode("utf-8"))
+                    )
                 now = time.time()
                 cursor = connection.execute(
                     """
@@ -1339,6 +1377,9 @@ def _repair_durable_results(
                     ),
                 )
                 repaired += 1
+        if repaired and write_tracker is not None:
+            write_tracker.before_commit(0)
+        connection.commit()
     return repaired
 
 
@@ -1457,7 +1498,7 @@ def _fenced_commit_model_record(
     after_result_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
-    pre_write_guard: PreWriteGuard | None = None,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> bool:
     if heartbeat.is_lost(str(job.job_id)):
         return False
@@ -1465,8 +1506,10 @@ def _fenced_commit_model_record(
     encoded = _canonical_json(canonical)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     now = time.time()
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, len(encoded.encode("utf-8")))
+    if write_tracker is not None:
+        write_tracker.before_write(
+            8192 + 4 * len(encoded.encode("utf-8"))
+        )
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -1524,6 +1567,8 @@ def _fenced_commit_model_record(
                 now,
             ),
         )
+        if write_tracker is not None:
+            write_tracker.before_commit(0, force=False)
         connection.commit()
         if status == "success" and after_cache_write is not None:
             after_cache_write(str(job.job_id), canonical)
@@ -1602,6 +1647,8 @@ def _fenced_commit_model_record(
                 digest,
             ),
         )
+        if write_tracker is not None:
+            write_tracker.before_commit(0, force=False)
         connection.commit()
     return True
 
@@ -1623,7 +1670,7 @@ def _process_claimed_group(
     after_cache_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
-    pre_write_guard: PreWriteGuard | None = None,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> int:
     model_jobs: list[Any] = []
     task_by_key: dict[str, Any] = {}
@@ -1655,7 +1702,7 @@ def _process_claimed_group(
                     heartbeat=heartbeat,
                     after_cache_write=after_cache_write,
                     after_result_write=after_result_write,
-                    pre_write_guard=pre_write_guard,
+                    write_tracker=write_tracker,
                 ):
                     handled += 1
                 continue
@@ -1680,7 +1727,7 @@ def _process_claimed_group(
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
-                pre_write_guard=pre_write_guard,
+                write_tracker=write_tracker,
             ):
                 handled += 1
         if not model_jobs:
@@ -1722,12 +1769,10 @@ def _process_claimed_group(
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
-                pre_write_guard=pre_write_guard,
+                write_tracker=write_tracker,
             ):
                 handled += 1
 
-        if pre_write_guard is not None:
-            pre_write_guard(store.path, 0)
         run_extraction_task_group(
             extractor=extractor,
             tasks=[
@@ -1942,6 +1987,7 @@ def _load_valid_manifest(
     *,
     output_root: Path,
     jobset: ModelJobSet,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelStageResult | None:
     if not path.exists():
         return None
@@ -2015,139 +2061,179 @@ def _load_valid_manifest(
         != 0
     ):
         raise ValueError("model output manifest/store count mismatch")
-    with _connect(jobset.database_path) as connection:
-        connection.execute(
-            "CREATE TEMP TABLE observed_outputs (job_id TEXT PRIMARY KEY)"
+    validation_dir = (
+        jobset.database_path.parent / ".model-validation-staging"
+    )
+    if pre_write_guard is not None:
+        pre_write_guard(validation_dir, 0)
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        temporary_root = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="observed-",
+                    dir=validation_dir,
+                )
+            )
         )
-        for status, shards in (
-            ("success", extraction_shards),
-            ("terminal", error_shards),
-        ):
-            observed = 0
-            for shard in shards:
-                with (output_root / shard.path).open(
-                    "r", encoding="utf-8"
-                ) as handle:
-                    for line in handle:
-                        record = json.loads(line)
-                        if not isinstance(record, dict):
-                            raise ValueError(
-                                "model output shard record is not an object"
+        membership_path = temporary_root / "membership.sqlite3"
+        validation_tracker = GuardedWriteTracker(
+            membership_path,
+            pre_write_guard,
+        )
+        validation_tracker.before_write(64 * 1024)
+        connection = stack.enter_context(_connect(jobset.database_path))
+        connection.execute(
+            "ATTACH DATABASE ? AS validation_db",
+            (str(membership_path),),
+        )
+        connection.execute(
+            """
+            CREATE TABLE validation_db.observed_outputs (
+                job_id TEXT PRIMARY KEY
+            )
+            """
+        )
+        try:
+            for status, shards in (
+                ("success", extraction_shards),
+                ("terminal", error_shards),
+            ):
+                observed = 0
+                for shard in shards:
+                    with (output_root / shard.path).open(
+                        "r", encoding="utf-8"
+                    ) as handle:
+                        for line in handle:
+                            validation_tracker.before_write(
+                                4096 + 2 * len(line.encode("utf-8"))
                             )
-                        _validate_output_record_provenance(
-                            record,
-                            status=status,
-                            jobset=jobset,
-                            expected=expected_provenance,
-                        )
-                        error_text = clean_text(record.get("error"))
-                        if (
-                            (status == "success" and error_text)
-                            or (status == "terminal" and not error_text)
-                        ):
-                            raise ValueError(
-                                f"model output {status} error semantics "
-                                "are invalid"
+                            record = json.loads(line)
+                            if not isinstance(record, dict):
+                                raise ValueError(
+                                    "model output shard record is not an object"
+                                )
+                            _validate_output_record_provenance(
+                                record,
+                                status=status,
+                                jobset=jobset,
+                                expected=expected_provenance,
                             )
-                        job_id = str(record["job_id"])
-                        try:
-                            connection.execute(
+                            error_text = clean_text(record.get("error"))
+                            if (
+                                (status == "success" and error_text)
+                                or (status == "terminal" and not error_text)
+                            ):
+                                raise ValueError(
+                                    f"model output {status} error semantics "
+                                    "are invalid"
+                                )
+                            job_id = str(record["job_id"])
+                            try:
+                                connection.execute(
+                                    """
+                                    INSERT INTO
+                                        validation_db.observed_outputs (
+                                            job_id
+                                        )
+                                    VALUES (?)
+                                    """,
+                                    (job_id,),
+                                )
+                            except sqlite3.IntegrityError as error:
+                                raise ValueError(
+                                    "duplicate model output job_id"
+                                ) from error
+                            durable = connection.execute(
                                 """
-                                INSERT INTO observed_outputs (job_id)
-                                VALUES (?)
+                                SELECT results.status,
+                                       results.record_json,
+                                       results.record_sha256,
+                                       results.jobset_fingerprint,
+                                       results.modality,
+                                       results.committed,
+                                       jobs.kind,
+                                       jobs.payload_json,
+                                       members.payload_sha256
+                                FROM model_results AS results
+                                JOIN jobs USING (job_id)
+                                JOIN model_job_members AS members
+                                  ON members.job_id = results.job_id
+                                 AND members.jobset_fingerprint =
+                                     results.jobset_fingerprint
+                                WHERE results.job_id = ?
                                 """,
                                 (job_id,),
-                            )
-                        except sqlite3.IntegrityError as error:
-                            raise ValueError(
-                                "duplicate model output job_id"
-                            ) from error
-                        durable = connection.execute(
-                            """
-                            SELECT results.status,
-                                   results.record_json,
-                                   results.record_sha256,
-                                   results.jobset_fingerprint,
-                                   results.modality,
-                                   results.committed,
-                                   jobs.kind,
-                                   jobs.payload_json,
-                                   members.payload_sha256
-                            FROM model_results AS results
-                            JOIN jobs USING (job_id)
-                            JOIN model_job_members AS members
-                              ON members.job_id = results.job_id
-                             AND members.jobset_fingerprint =
-                                 results.jobset_fingerprint
-                            WHERE results.job_id = ?
-                            """,
-                            (job_id,),
-                        ).fetchone()
-                        modality = str(record["modality"])
-                        if durable is None:
-                            raise ValueError(
-                                "model output does not match its durable "
-                                "member/result"
-                            )
-                        payload_encoded = str(durable["payload_json"])
-                        payload_digest = hashlib.sha256(
-                            payload_encoded.encode("utf-8")
-                        ).hexdigest()
-                        try:
-                            task_payload = json.loads(payload_encoded)
-                            durable_record = _decode_checked(
-                                str(durable["record_json"]),
-                                str(durable["record_sha256"]),
-                            )
-                        except (TypeError, ValueError, json.JSONDecodeError) as error:
-                            raise ValueError(
-                                "durable model payload/result is invalid"
-                            ) from error
-                        if not isinstance(task_payload, dict):
-                            raise ValueError(
-                                "durable model payload is not an object"
-                            )
-                        expected_kind = jobset.kind_for(modality)
-                        expected_jobset = jobset.fingerprint_for(modality)
-                        expected_record = {
-                            **durable_record,
-                            "job_kind": expected_kind,
-                            "payload_sha256": payload_digest,
-                        }
-                        if (
-                            str(durable["status"]) != status
-                            or str(durable["jobset_fingerprint"])
-                            != expected_jobset
-                            or str(durable["modality"]) != modality
-                            or int(durable["committed"]) != 1
-                            or str(durable["kind"]) != expected_kind
-                            or str(durable["payload_sha256"])
-                            != payload_digest
-                            or task_payload.get("job_id") != job_id
-                            or task_payload.get("jobset_fingerprint")
-                            != expected_jobset
-                            or task_payload.get("modality") != modality
-                            or record.get("job_kind") != expected_kind
-                            or record.get("payload_sha256")
-                            != payload_digest
-                            or not _record_matches_payload(
-                                record, task_payload
-                            )
-                            or _canonical_json(record)
-                            != _canonical_json(expected_record)
-                        ):
-                            raise ValueError(
-                                "model output does not match its durable "
-                                "member/result"
-                            )
-                        observed += 1
-            if observed != counts[status]:
-                raise ValueError(
-                    "model output shard record count mismatch"
-                )
-        missing = int(
-            connection.execute(
-                """
+                            ).fetchone()
+                            modality = str(record["modality"])
+                            if durable is None:
+                                raise ValueError(
+                                    "model output does not match its durable "
+                                    "member/result"
+                                )
+                            payload_encoded = str(durable["payload_json"])
+                            payload_digest = hashlib.sha256(
+                                payload_encoded.encode("utf-8")
+                            ).hexdigest()
+                            try:
+                                task_payload = json.loads(payload_encoded)
+                                durable_record = _decode_checked(
+                                    str(durable["record_json"]),
+                                    str(durable["record_sha256"]),
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                                json.JSONDecodeError,
+                            ) as error:
+                                raise ValueError(
+                                    "durable model payload/result is invalid"
+                                ) from error
+                            if not isinstance(task_payload, dict):
+                                raise ValueError(
+                                    "durable model payload is not an object"
+                                )
+                            expected_kind = jobset.kind_for(modality)
+                            expected_jobset = jobset.fingerprint_for(modality)
+                            expected_record = {
+                                **durable_record,
+                                "job_kind": expected_kind,
+                                "payload_sha256": payload_digest,
+                            }
+                            if (
+                                str(durable["status"]) != status
+                                or str(durable["jobset_fingerprint"])
+                                != expected_jobset
+                                or str(durable["modality"]) != modality
+                                or int(durable["committed"]) != 1
+                                or str(durable["kind"]) != expected_kind
+                                or str(durable["payload_sha256"])
+                                != payload_digest
+                                or task_payload.get("job_id") != job_id
+                                or task_payload.get("jobset_fingerprint")
+                                != expected_jobset
+                                or task_payload.get("modality") != modality
+                                or record.get("job_kind") != expected_kind
+                                or record.get("payload_sha256")
+                                != payload_digest
+                                or not _record_matches_payload(
+                                    record, task_payload
+                                )
+                                or _canonical_json(record)
+                                != _canonical_json(expected_record)
+                            ):
+                                raise ValueError(
+                                    "model output does not match its durable "
+                                    "member/result"
+                                )
+                            observed += 1
+                if observed != counts[status]:
+                    raise ValueError(
+                        "model output shard record count mismatch"
+                    )
+            missing = int(
+                connection.execute(
+                    """
                 SELECT COUNT(*)
                 FROM model_results AS results
                 JOIN model_job_members AS members
@@ -2157,7 +2243,9 @@ def _load_valid_manifest(
                 WHERE results.committed = 1
                   AND results.jobset_fingerprint IN (?, ?)
                   AND NOT EXISTS (
-                      SELECT 1 FROM observed_outputs
+                      SELECT 1
+                      FROM validation_db.observed_outputs
+                           AS observed_outputs
                       WHERE observed_outputs.job_id = results.job_id
                   )
                 """,
@@ -2165,12 +2253,15 @@ def _load_valid_manifest(
                     jobset.text_fingerprint,
                     jobset.image_fingerprint,
                 ),
-            ).fetchone()[0]
-        )
-        if missing:
-            raise ValueError(
-                "model output manifest is missing durable results"
+                ).fetchone()[0]
             )
+            if missing:
+                raise ValueError(
+                    "model output manifest is missing durable results"
+                )
+        finally:
+            validation_tracker.before_commit(0)
+            connection.commit()
     return ModelStageResult(
         output_root=output_root,
         manifest_path=path,
@@ -2206,6 +2297,7 @@ def _publish_outputs(
         manifest_path,
         output_root=stage_root,
         jobset=jobset,
+        pre_write_guard=pre_write_guard,
     )
     if resumed is not None:
         return resumed
@@ -2217,6 +2309,7 @@ def _publish_outputs(
             manifest_path,
             output_root=stage_root,
             jobset=jobset,
+            pre_write_guard=pre_write_guard,
         )
         if resumed is not None:
             return resumed
@@ -2342,6 +2435,7 @@ def _publish_outputs(
         manifest_path,
         output_root=stage_root,
         jobset=jobset,
+        pre_write_guard=pre_write_guard,
     )
     if published is None:
         raise RuntimeError("published model output manifest is incomplete")
@@ -2445,7 +2539,15 @@ def run_model_stage(
                 timeout_seconds=ready_timeout_seconds,
             )
     persistent_cache = _PersistentCache(store.path, delegate=cache)
-    _repair_durable_results(store.path, jobset)
+    result_write_tracker = GuardedWriteTracker(
+        store.path,
+        pre_write_guard,
+    )
+    _repair_durable_results(
+        store.path,
+        jobset,
+        write_tracker=result_write_tracker,
+    )
     processed = 0
     for modality in ("text", "image"):
         while stop_after is None or processed < stop_after:
@@ -2481,7 +2583,7 @@ def run_model_stage(
                 heartbeat_seconds=heartbeat_seconds,
                 after_result_write=after_result_write,
                 after_cache_write=after_cache_write,
-                pre_write_guard=pre_write_guard,
+                write_tracker=result_write_tracker,
             )
         snapshot = _job_snapshot(store.path, jobset)
         modality_complete = _kind_is_complete(
@@ -2515,6 +2617,7 @@ def run_model_stage(
         == jobset.total_tasks
     )
     if complete:
+        result_write_tracker.before_commit(0)
         return _publish_outputs(
             store.path,
             output_root=output_root,
@@ -3603,6 +3706,8 @@ def enqueue_model_tasks_from_manifest(
     image_input_fingerprint: str | None = None,
     prompt_version: str = PROMPT_VERSION,
     policy_fingerprint: str = MODEL_POLICY_VERSION,
+    staging_dir: Path | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelJobSet:
     """Validate Task 5 and enqueue its assets without loading all of them."""
     manifest_path = Path(manifest_path)
@@ -3643,4 +3748,6 @@ def enqueue_model_tasks_from_manifest(
         image_input_fingerprint=image_input_fingerprint,
         prompt_version=prompt_version,
         policy_fingerprint=policy_fingerprint,
+        staging_dir=staging_dir,
+        pre_write_guard=pre_write_guard,
     )

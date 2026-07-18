@@ -116,6 +116,25 @@ def test_atomic_shard_amortizes_guard_checks_by_byte_window(
     assert len(positive_write_checks) < 5
 
 
+def test_amortized_commit_gate_rechecks_only_when_window_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    tracker = wdc200k_io_module.GuardedWriteTracker(
+        tmp_path / "jobs.sqlite3",
+        lambda _path, size=0: calls.append(size),
+        interval_bytes=16,
+    )
+
+    tracker.before_write(1)
+    tracker.before_commit(0, force=False)
+    assert calls == [0, 16]
+
+    tracker.before_write(15)
+    tracker.before_commit(0, force=False)
+    assert calls == [0, 16, 0]
+
+
 def test_atomic_commit_does_not_reserve_temporary_bytes_twice(
     tmp_path: Path,
 ) -> None:
@@ -208,6 +227,78 @@ def test_sqlite_job_store_guard_fails_before_next_enqueue_transaction(
         assert connection.execute(
             "SELECT job_id FROM jobs ORDER BY job_id"
         ).fetchall() == [("one",)]
+
+
+def test_sqlite_job_store_claim_commit_guard_rolls_back_lease(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    SqliteJobStore(path).enqueue("page", "one", {"url": "https://e.test"})
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("claim commit reserve exhausted")
+
+    guarded = SqliteJobStore(
+        path,
+        pre_write_guard=reject_commit,
+        guard_interval_bytes=1,
+    )
+    with pytest.raises(OSError, match="claim commit reserve"):
+        guarded.claim("page", limit=1, owner="worker")
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT status, owner FROM jobs WHERE job_id = 'one'"
+        ).fetchone() == ("pending", None)
+    assert len(
+        SqliteJobStore(path).claim("page", limit=1, owner="worker")
+    ) == 1
+
+
+def test_sqlite_job_store_finish_commit_guard_preserves_lease(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.sqlite3"
+    store = SqliteJobStore(path)
+    store.enqueue("page", "one", {"url": "https://e.test"})
+    claimed = store.claim("page", limit=1, owner="worker")[0]
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("finish commit reserve exhausted")
+
+    guarded = SqliteJobStore(
+        path,
+        pre_write_guard=reject_commit,
+        guard_interval_bytes=1,
+    )
+    with pytest.raises(OSError, match="finish commit reserve"):
+        guarded.finish(
+            "one",
+            status="success",
+            owner="worker",
+            lease_id=claimed.lease_id,
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT status, owner FROM jobs WHERE job_id = 'one'"
+        ).fetchone() == ("leased", "worker")
+    store.finish(
+        "one",
+        status="success",
+        owner="worker",
+        lease_id=claimed.lease_id,
+    )
 
 
 def test_job_store_does_not_reclaim_terminal_outcomes(tmp_path: Path) -> None:

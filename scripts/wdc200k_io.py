@@ -95,12 +95,26 @@ class GuardedWriteTracker:
                 self._remaining = reservation
             self._remaining -= estimated
 
-    def before_commit(self, replacement_delta_bytes: int = 0) -> None:
-        _guard_write(
-            self.guard,
-            self.path,
-            max(0, int(replacement_delta_bytes)),
-        )
+    def before_commit(
+        self,
+        replacement_delta_bytes: int = 0,
+        *,
+        force: bool = True,
+    ) -> None:
+        replacement_delta = max(0, int(replacement_delta_bytes))
+        if force:
+            _guard_write(self.guard, self.path, replacement_delta)
+            return
+        if self.guard is None:
+            return
+        with self._lock:
+            if replacement_delta > self._remaining:
+                reservation = max(self.interval_bytes, replacement_delta)
+                _guard_write(self.guard, self.path, reservation)
+                self._remaining = reservation
+            self._remaining -= replacement_delta
+            if self._remaining == 0:
+                _guard_write(self.guard, self.path, 0)
 
 
 class GuardedTextWriter:
@@ -445,6 +459,7 @@ class SqliteJobStore:
                 """,
                 (job_id, kind, encoded_payload, now),
             )
+            self._write_tracker.before_commit(0, force=False)
             connection.commit()
         finally:
             connection.close()
@@ -502,6 +517,8 @@ class SqliteJobStore:
                 ).fetchall()
             else:
                 claimed = []
+            if job_ids:
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -565,6 +582,7 @@ class SqliteJobStore:
                 raise RuntimeError(
                     f"job {job_id!r} has no active lease owned by {owner!r}"
                 )
+            self._write_tracker.before_commit(0, force=False)
             connection.commit()
         finally:
             connection.close()

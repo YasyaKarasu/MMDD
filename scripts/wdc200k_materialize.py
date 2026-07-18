@@ -9,6 +9,8 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
+from contextlib import ExitStack
 from dataclasses import asdict
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -413,6 +415,7 @@ def _validate_upstream(
     inputs: MaterializationInputs,
     *,
     args: argparse.Namespace,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> _ValidatedUpstream:
     (
         source_paths,
@@ -428,6 +431,7 @@ def _validate_upstream(
         inputs.page_fetch_result,
         _iter_jsonl(page_ref_paths),
         validation_database=validation_root / "page-fetch.sqlite3",
+        pre_write_guard=pre_write_guard,
     )
     structural_identity = structural_asset_input_identity(
         (digest for _path, digest in structural_hashes),
@@ -447,12 +451,14 @@ def _validate_upstream(
         validation_database=(
             validation_root / "unique-image-membership.sqlite3"
         ),
+        pre_write_guard=pre_write_guard,
     )
     if inputs.image_fetch_result.unique_jobs != unique_jobs:
         raise ValueError("Task-5 image fetch unique-job substitution")
     validate_complete_image_fetch(
         inputs.image_fetch_result,
         unique_jobs=unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     expected_asset_input = asset_materialization_input_fingerprint(
         planned.manifest_path,
@@ -464,6 +470,7 @@ def _validate_upstream(
             planned=planned,
             image_fetch_result=inputs.image_fetch_result,
             expected_input_fingerprint=expected_asset_input,
+            pre_write_guard=pre_write_guard,
         )
     )
     expected_adapter_input = model_adapter_input_fingerprint(
@@ -1222,69 +1229,160 @@ def _validate_relation_closure(
 
 def _validate_source_catalog_closure(
     connection: sqlite3.Connection,
+    *,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
-    connection.executescript(
-        """
-        DROP TABLE IF EXISTS temp.valid_source_rows;
-        CREATE TEMP TABLE valid_source_rows (
-            source_table_id TEXT NOT NULL,
-            source_row_id INTEGER NOT NULL
-        );
-        INSERT INTO valid_source_rows (source_table_id, source_row_id)
-        SELECT source_catalog.source_table_id,
-               CAST(json_extract(source_row.value, '$.row_id') AS INTEGER)
-        FROM source_catalog
-        JOIN json_each(source_catalog.record_json, '$.rows') AS source_row
-        WHERE json_type(source_row.value, '$.row_id') IN ('integer', 'text');
-        CREATE INDEX valid_source_rows_identity
-            ON valid_source_rows(source_table_id, source_row_id);
-        """
+    database_rows = connection.execute("PRAGMA database_list").fetchall()
+    database_file = next(
+        (
+            str(row[2])
+            for row in database_rows
+            if str(row[1]) == "main" and str(row[2])
+        ),
+        "",
     )
-    relations = (
-        (
-            "entity",
-            "entity_sources",
-            "entity_id",
-        ),
-        (
-            "link",
-            "links",
-            "link_id",
-        ),
-        (
-            "extraction",
-            "extractions",
-            "cache_key",
-        ),
+    if not database_file:
+        raise ValueError(
+            "source catalog closure requires a file-backed database"
+        )
+    database_path = Path(database_file)
+    validation_root = (
+        database_path.parent / ".source-closure-validation"
     )
-    for kind, table, identity_column in relations:
-        missing = connection.execute(
-            f"""
-            SELECT relation.{identity_column} AS identity,
-                   relation.source_table_id,
-                   relation.source_row_id
-            FROM {table} AS relation
-            LEFT JOIN source_catalog
-              ON source_catalog.source_table_id =
-                 relation.source_table_id
-            LEFT JOIN valid_source_rows
-              ON valid_source_rows.source_table_id =
-                 relation.source_table_id
-             AND valid_source_rows.source_row_id =
-                 relation.source_row_id
-            WHERE source_catalog.source_table_id IS NULL
-               OR valid_source_rows.source_table_id IS NULL
-            LIMIT 1
+    guard = None if write_tracker is None else write_tracker.guard
+    if guard is not None:
+        guard(validation_root, 0)
+    validation_root.mkdir(parents=True, exist_ok=True)
+    source_rows = int(
+        connection.execute(
             """
-        ).fetchone()
-        if missing is not None:
-            raise ValueError(
-                f"{kind} source catalog relation is missing: "
-                f"{missing['identity']} "
-                f"({missing['source_table_id']}, "
-                f"{missing['source_row_id']})"
+            SELECT COALESCE(
+                SUM(json_array_length(record_json, '$.rows')),
+                0
             )
-    connection.execute("DROP TABLE temp.valid_source_rows")
+            FROM source_catalog
+            """
+        ).fetchone()[0]
+    )
+    with ExitStack() as stack:
+        temporary_root = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="closure-",
+                    dir=validation_root,
+                )
+            )
+        )
+        validation_path = temporary_root / "source-rows.sqlite3"
+        validation_tracker = GuardedWriteTracker(
+            validation_path,
+            guard,
+        )
+        validation_tracker.before_write(
+            64 * 1024 + source_rows * 256
+        )
+        attached = False
+        try:
+            connection.execute(
+                "ATTACH DATABASE ? AS validation_db",
+                (str(validation_path),),
+            )
+            attached = True
+            connection.execute(
+                """
+                CREATE TABLE validation_db.source_row_validation (
+                    source_table_id TEXT NOT NULL,
+                    source_row_id INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO validation_db.source_row_validation (
+                    source_table_id,
+                    source_row_id
+                )
+                SELECT source_catalog.source_table_id,
+                       CAST(
+                           json_extract(
+                               source_row.value,
+                               '$.row_id'
+                           ) AS INTEGER
+                       )
+                FROM source_catalog
+                JOIN json_each(
+                    source_catalog.record_json,
+                    '$.rows'
+                ) AS source_row
+                WHERE json_type(
+                    source_row.value,
+                    '$.row_id'
+                ) IN ('integer', 'text')
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX
+                    validation_db.source_row_validation_identity
+                ON source_row_validation (
+                    source_table_id,
+                    source_row_id
+                )
+                """
+            )
+            relations = (
+                (
+                    "entity",
+                    "entity_sources",
+                    "entity_id",
+                ),
+                (
+                    "link",
+                    "links",
+                    "link_id",
+                ),
+                (
+                    "extraction",
+                    "extractions",
+                    "cache_key",
+                ),
+            )
+            for kind, table, identity_column in relations:
+                missing = connection.execute(
+                    f"""
+                    SELECT relation.{identity_column} AS identity,
+                           relation.source_table_id,
+                           relation.source_row_id
+                    FROM {table} AS relation
+                    LEFT JOIN source_catalog
+                      ON source_catalog.source_table_id =
+                         relation.source_table_id
+                    LEFT JOIN
+                        validation_db.source_row_validation
+                        AS valid_source_rows
+                      ON valid_source_rows.source_table_id =
+                         relation.source_table_id
+                     AND valid_source_rows.source_row_id =
+                         relation.source_row_id
+                    WHERE source_catalog.source_table_id IS NULL
+                       OR valid_source_rows.source_table_id IS NULL
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if missing is not None:
+                    raise ValueError(
+                        f"{kind} source catalog relation is missing: "
+                        f"{missing['identity']} "
+                        f"({missing['source_table_id']}, "
+                        f"{missing['source_row_id']})"
+                    )
+            validation_tracker.before_commit(0)
+            connection.commit()
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            if attached:
+                connection.execute("DETACH DATABASE validation_db")
 
 
 def _commit_index_batch(
@@ -1301,24 +1399,48 @@ def _commit_index_batch(
         connection.execute("BEGIN IMMEDIATE")
 
 
-def _build_index(inputs: MaterializationShardInputs) -> None:
+def _build_index(
+    inputs: MaterializationShardInputs,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    write_tracker = GuardedWriteTracker(
+        inputs.lookup_database,
+        pre_write_guard,
+    )
+    write_tracker.before_write(64 * 1024)
     _initialize_index(inputs.lookup_database)
     with _connect(inputs.lookup_database) as connection:
         connection.execute("BEGIN IMMEDIATE")
-        _index_entities(connection, inputs.entity_paths)
-        _index_assets(connection, inputs.asset_paths)
-        _index_links(connection, inputs.link_paths)
+        _index_entities(
+            connection,
+            inputs.entity_paths,
+            write_tracker=write_tracker,
+        )
+        _index_assets(
+            connection,
+            inputs.asset_paths,
+            write_tracker=write_tracker,
+        )
+        _index_links(
+            connection,
+            inputs.link_paths,
+            write_tracker=write_tracker,
+        )
         _index_extractions(
             connection,
             inputs.extraction_paths,
             status="success",
+            write_tracker=write_tracker,
         )
         _index_extractions(
             connection,
             inputs.error_paths,
             status="terminal",
+            write_tracker=write_tracker,
         )
         _validate_relation_closure(connection)
+        write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -1833,19 +1955,29 @@ def materialize_dataset_shard(
     *,
     args: argparse.Namespace,
     split: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializedTable:
     """Materialize one source table using only its SQLite-selected records."""
     if split not in {"train", "dev", "test"}:
         raise ValueError(f"invalid split: {split}")
-    _build_index(inputs)
+    _build_index(inputs, pre_write_guard=pre_write_guard)
+    catalog_tracker = GuardedWriteTracker(
+        inputs.lookup_database,
+        pre_write_guard,
+    )
     _catalog_source_records(
         inputs.lookup_database,
         [inputs.source_table],
         args=args,
         expected_tables=1,
+        write_tracker=catalog_tracker,
     )
     with _connect(inputs.lookup_database) as connection:
-        _validate_source_catalog_closure(connection)
+        _validate_source_catalog_closure(
+            connection,
+            write_tracker=catalog_tracker,
+        )
+        catalog_tracker.before_commit(0)
     return _materialize_from_index(
         inputs.source_table,
         inputs.lookup_database,
@@ -1958,6 +2090,7 @@ def _store_table_unit(
     source_ordinal: int,
     source_sha256: str,
     split: str,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> bool:
     source_table_id = str(
         materialized.source_table["source_table_id"]
@@ -2048,6 +2181,8 @@ def _store_table_unit(
                 _canonical_json(counts),
             ),
         )
+        if write_tracker is not None:
+            write_tracker.before_commit(0, force=False)
         connection.commit()
     return True
 
@@ -2136,6 +2271,7 @@ def _materialize_all_tables(
                 source_ordinal=int(row["ordinal"]),
                 source_sha256=str(row["record_sha256"]),
                 split=split,
+                write_tracker=write_tracker,
             )
             if after_table_commit is not None:
                 after_table_commit(source_table_id)
@@ -2459,7 +2595,13 @@ def _deduplicated_failures(
     *,
     kind: str,
     records: Iterable[dict[str, Any]],
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> Iterator[dict[str, Any]]:
+    write_tracker = GuardedWriteTracker(
+        database_path,
+        pre_write_guard,
+    )
+    write_tracker.before_write(64 * 1024)
     with _connect(database_path) as connection:
         connection.execute(
             """
@@ -2476,6 +2618,9 @@ def _deduplicated_failures(
         )
         for record in records:
             encoded = _canonical_json(record)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             cursor = connection.execute(
                 """
@@ -2487,6 +2632,7 @@ def _deduplicated_failures(
             )
             if cursor.rowcount == 1:
                 yield record
+        write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -2762,6 +2908,7 @@ def _finalize_dataset(
                 _failure_records(upstream.structural_failure_paths),
                 _failure_records((upstream.page_failure_path,)),
             ),
+            pre_write_guard=pre_write_guard,
         ),
         pre_write_guard=pre_write_guard,
     )
@@ -2779,7 +2926,9 @@ def _finalize_dataset(
                 aggregation_database=(
                     upstream.image_failure_aggregation_database
                 ),
+                pre_write_guard=pre_write_guard,
             ),
+            pre_write_guard=pre_write_guard,
         ),
         pre_write_guard=pre_write_guard,
     )
@@ -2795,6 +2944,7 @@ def _finalize_dataset(
                 _failure_records(upstream.adapter_error_paths),
                 _failure_records(upstream.model_error_paths),
             ),
+            pre_write_guard=pre_write_guard,
         ),
         pre_write_guard=pre_write_guard,
     )
@@ -2927,7 +3077,13 @@ def materialize_dataset(
         or work_root.is_relative_to(output_root)
     ):
         raise ValueError("work_root and output_root must be separate")
-    upstream = _validate_upstream(inputs, args=args)
+    if pre_write_guard is not None:
+        pre_write_guard(work_root / "upstream-validation", 0)
+    upstream = _validate_upstream(
+        inputs,
+        args=args,
+        pre_write_guard=pre_write_guard,
+    )
     parameter_fingerprint = _parameter_fingerprint(args)
     resumed = _load_published_result(
         output_root,
@@ -2965,8 +3121,16 @@ def materialize_dataset(
         expected_tables=upstream.expected_tables,
         pre_write_guard=pre_write_guard,
     )
+    closure_tracker = GuardedWriteTracker(
+        database_path,
+        pre_write_guard,
+    )
     with _connect(database_path) as connection:
-        _validate_source_catalog_closure(connection)
+        _validate_source_catalog_closure(
+            connection,
+            write_tracker=closure_tracker,
+        )
+        closure_tracker.before_commit(0)
     if pre_write_guard is not None:
         pre_write_guard(database_path, 0)
     _assign_splits(

@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -265,8 +266,14 @@ class ImageJobExecution:
 class ImageOutcomeStore:
     """Durable policy-scoped terminal outcomes for unique image URLs."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        write_tracker: GuardedWriteTracker | None = None,
+    ) -> None:
         self.path = Path(path)
+        self._write_tracker = write_tracker
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
@@ -422,6 +429,10 @@ class ImageOutcomeStore:
                 (policy_fingerprint, url_key),
             ).fetchone()
             if existing is None:
+                if self._write_tracker is not None:
+                    self._write_tracker.before_write(
+                        4096 + 2 * len(url_key.encode("utf-8"))
+                    )
                 connection.execute(
                     """
                     INSERT INTO image_outcomes (
@@ -439,6 +450,9 @@ class ImageOutcomeStore:
                         time.time(),
                     ),
                 )
+                if self._write_tracker is not None:
+                    self._write_tracker.before_commit(0, force=False)
+                connection.commit()
                 return canonical
             persisted = json.loads(str(existing["outcome_json"]))
             if persisted != canonical:
@@ -482,6 +496,8 @@ class ImageOutcomeStore:
                     """,
                     (policy_fingerprint, url_key),
                 )
+                if self._write_tracker is not None:
+                    self._write_tracker.before_commit(0, force=False)
                 connection.commit()
                 return ImageUrlClaimDecision(outcome=outcome)
 
@@ -529,6 +545,8 @@ class ImageOutcomeStore:
                     current_time,
                 ),
             )
+            if self._write_tracker is not None:
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return ImageUrlClaimDecision(lease=lease)
         except BaseException:
@@ -606,6 +624,8 @@ class ImageOutcomeStore:
                     raise ValueError(
                         "conflicting terminal image outcome for URL"
                     )
+            if self._write_tracker is not None:
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return persisted
         except BaseException:
@@ -642,6 +662,8 @@ class ImageOutcomeStore:
                     current_time,
                 ),
             )
+            if cursor.rowcount and self._write_tracker is not None:
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return cursor.rowcount == 1
         except BaseException:
@@ -680,6 +702,8 @@ class ImageOutcomeStore:
                 """,
                 (policy_fingerprint, url_key),
             )
+            if cursor.rowcount and self._write_tracker is not None:
+                self._write_tracker.before_commit(0, force=False)
             connection.commit()
             return cursor.rowcount == 1
         except BaseException:
@@ -767,6 +791,7 @@ class ImageOutcomeStore:
         jobs: UniqueImageJobs,
         *,
         commit_every: int = 10_000,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> dict[str, Any]:
         """Digest only the current job-set outcomes using a disk-backed join."""
         if commit_every <= 0:
@@ -779,12 +804,29 @@ class ImageOutcomeStore:
         missing = 0
         inserted = 0
         previous: str | None = None
-        connection = self._connect()
+        descriptor, membership_name = tempfile.mkstemp(
+            prefix=".image-membership-",
+            suffix=".sqlite3",
+            dir=self.path.parent,
+        )
+        os.close(descriptor)
+        membership_path = Path(membership_name)
+        connection: sqlite3.Connection | None = None
         try:
-            connection.execute("PRAGMA temp_store=FILE")
+            write_tracker = GuardedWriteTracker(
+                membership_path,
+                pre_write_guard,
+            )
+            write_tracker.before_write(64 * 1024)
+            connection = sqlite3.connect(membership_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "ATTACH DATABASE ? AS outcomes_db",
+                (str(self.path),),
+            )
             connection.execute(
                 """
-                CREATE TEMP TABLE current_image_job_keys (
+                CREATE TABLE current_image_job_keys (
                     url_key TEXT PRIMARY KEY
                 ) WITHOUT ROWID
                 """
@@ -798,6 +840,9 @@ class ImageOutcomeStore:
                     raise ValueError(
                         "unique image jobs are not strictly ordered"
                     )
+                write_tracker.before_write(
+                    4096 + 2 * len(url_key.encode("utf-8"))
+                )
                 connection.execute(
                     """
                     INSERT INTO current_image_job_keys (url_key)
@@ -808,7 +853,9 @@ class ImageOutcomeStore:
                 inserted += 1
                 previous = url_key
                 if inserted % commit_every == 0:
+                    write_tracker.before_commit(0)
                     connection.commit()
+            write_tracker.before_commit(0)
             connection.commit()
             if inserted != jobs.records:
                 raise ValueError("unique image job record count mismatch")
@@ -821,7 +868,7 @@ class ImageOutcomeStore:
                     outcomes.outcome_json,
                     outcomes.payload_sha256
                 FROM current_image_job_keys AS keys
-                LEFT JOIN image_outcomes AS outcomes
+                LEFT JOIN outcomes_db.image_outcomes AS outcomes
                   ON outcomes.policy_fingerprint = ?
                  AND outcomes.url_key = keys.url_key
                 ORDER BY keys.url_key
@@ -846,7 +893,10 @@ class ImageOutcomeStore:
                 terminal += int(status == "terminal")
                 count += 1
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{membership_path}{suffix}").unlink(missing_ok=True)
         return {
             "count": count,
             "success": success,
@@ -1436,6 +1486,7 @@ def validate_unique_image_jobs(
     *,
     planned: AssetPlanShards,
     validation_database: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> UniqueImageJobs:
     """Replay exact first-per-URL membership from planning mappings."""
     planned = _validated_planning_result(planned)
@@ -1453,6 +1504,11 @@ def validate_unique_image_jobs(
     ):
         raise ValueError("unique image job output path mismatch")
     validation_database = Path(validation_database)
+    write_tracker = GuardedWriteTracker(
+        validation_database,
+        pre_write_guard,
+    )
+    write_tracker.before_write(64 * 1024)
     validation_database.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(validation_database) as connection:
         connection.row_factory = sqlite3.Row
@@ -1500,6 +1556,9 @@ def validate_unique_image_jobs(
 
         for mapping in _iter_jsonl(planned.image_mapping_paths):
             url_key, encoded = validated_record(mapping)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO expected_unique_images (
@@ -1512,6 +1571,9 @@ def validate_unique_image_jobs(
         try:
             for record in _iter_jsonl((jobs.output_path,)):
                 url_key, encoded = validated_record(record)
+                write_tracker.before_write(
+                    4096 + 2 * len(encoded.encode("utf-8"))
+                )
                 if previous_url_key and url_key <= previous_url_key:
                     raise ValueError(
                         "unique image membership order mismatch"
@@ -1580,6 +1642,7 @@ def validate_unique_image_jobs(
             != membership_digest("actual_unique_images")
         ):
             raise ValueError("unique image exact membership mismatch")
+        write_tracker.before_commit(0)
         connection.commit()
     return jobs
 
@@ -2039,7 +2102,10 @@ def fetch_unique_images(
         pre_write_guard,
     )
     outcome_write_tracker.before_write(64 * 1024)
-    outcome_store = ImageOutcomeStore(outcomes_path)
+    outcome_store = ImageOutcomeStore(
+        outcomes_path,
+        write_tracker=outcome_write_tracker,
+    )
     _enqueue_unique_images(
         [unique_jobs.output_path],
         store=store,
@@ -2264,6 +2330,7 @@ def fetch_unique_images(
     outcome_snapshot = outcome_store.snapshot_for_jobs(
         fingerprint,
         unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     success = int(outcome_snapshot["success"])
     terminal = int(outcome_snapshot["terminal"])
@@ -2361,6 +2428,7 @@ def iter_image_failures(
     *,
     planned: AssetPlanShards,
     aggregation_database: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Aggregate current-jobset failure fanout without loading mappings."""
     planned = _validated_planning_result(planned)
@@ -2368,13 +2436,20 @@ def iter_image_failures(
         result.unique_jobs,
         planned=planned,
         validation_database=aggregation_database,
+        pre_write_guard=pre_write_guard,
     )
     validate_complete_image_fetch(
         result,
         unique_jobs=result.unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     outcome_store = ImageOutcomeStore(result.outcomes_path)
     aggregation_database = Path(aggregation_database)
+    write_tracker = GuardedWriteTracker(
+        aggregation_database,
+        pre_write_guard,
+    )
+    write_tracker.before_write(64 * 1024)
     aggregation_database.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(aggregation_database) as connection:
         connection.row_factory = sqlite3.Row
@@ -2396,6 +2471,10 @@ def iter_image_failures(
             """
         )
         for job in _iter_jsonl((result.unique_jobs.output_path,)):
+            encoded_job = json.dumps(job, ensure_ascii=False)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded_job.encode("utf-8"))
+            )
             url_key = clean_text(job.get("url_key"))
             if not url_key:
                 raise ValueError("unique image failure job has no url_key")
@@ -2413,6 +2492,10 @@ def iter_image_failures(
                 ),
             )
         for mapping in _iter_jsonl(planned.image_mapping_paths):
+            encoded_mapping = json.dumps(mapping, ensure_ascii=False)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded_mapping.encode("utf-8"))
+            )
             url_key = clean_text(mapping.get("url_key"))
             current = connection.execute(
                 """
@@ -2441,6 +2524,7 @@ def iter_image_failures(
                 """,
                 (url_key, reference_key),
             )
+        write_tracker.before_commit(0)
         connection.commit()
         for job in connection.execute(
             """
@@ -2712,6 +2796,8 @@ def _load_materialized_assets(
 
 def _validate_complete_image_fetch(
     result: ImageFetchResult,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     if not result.complete:
         raise ValueError("image fetch result is not complete")
@@ -2772,6 +2858,7 @@ def _validate_complete_image_fetch(
     outcome_snapshot = outcome_store.snapshot_for_jobs(
         result.policy_fingerprint,
         unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     if (
         int(outcome_snapshot["count"]) != result.outcomes_count
@@ -2836,12 +2923,16 @@ def validate_complete_image_fetch(
     result: ImageFetchResult,
     *,
     unique_jobs: UniqueImageJobs,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     """Validate image fetch state against independently supplied jobs."""
     validated_jobs = _validated_unique_image_jobs(unique_jobs)
     if result.unique_jobs != validated_jobs:
         raise ValueError("image fetch unique-job result mismatch")
-    return _validate_complete_image_fetch(result)
+    return _validate_complete_image_fetch(
+        result,
+        pre_write_guard=pre_write_guard,
+    )
 
 
 def validate_materialized_asset_shards(
@@ -2850,12 +2941,14 @@ def validate_materialized_asset_shards(
     planned: AssetPlanShards,
     image_fetch_result: ImageFetchResult,
     expected_input_fingerprint: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[MaterializedAssetShards, Any]:
     """Reconstruct Task-5 fingerprint, shards, counts, and strict barrier."""
     planned = _validated_planning_result(planned)
     fetch_snapshot = validate_complete_image_fetch(
         image_fetch_result,
         unique_jobs=image_fetch_result.unique_jobs,
+        pre_write_guard=pre_write_guard,
     )
     expected_unique_input = stable_hash(
         ASSET_PLANNING_SCHEMA_VERSION,
@@ -2979,7 +3072,10 @@ def materialize_asset_shards(
         raise ValueError(
             "image fetch jobs do not belong to this asset planning manifest"
         )
-    fetch_snapshot = _validate_complete_image_fetch(fetch_result)
+    fetch_snapshot = _validate_complete_image_fetch(
+        fetch_result,
+        pre_write_guard=pre_write_guard,
+    )
     output_root = Path(output_root)
     manifest_path = output_root / "asset-materialization-manifest.json"
     expected = {

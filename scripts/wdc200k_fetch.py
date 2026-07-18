@@ -116,8 +116,14 @@ class FetchResult:
 class PageOutcomeStore:
     """Disk-backed outcome and reference mappings keyed by policy and URL."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        write_tracker: GuardedWriteTracker | None = None,
+    ) -> None:
         self.path = Path(path)
+        self._write_tracker = write_tracker
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
@@ -385,6 +391,9 @@ class PageOutcomeStore:
                     terminal_increment,
                 ),
             )
+            if self._write_tracker is not None:
+                self._write_tracker.before_commit(0, force=False)
+            connection.commit()
         persisted = self.get(policy_fingerprint, url_key)
         if persisted is None:
             raise RuntimeError("page outcome disappeared after durable write")
@@ -1039,7 +1048,10 @@ def fetch_unique_pages(
         pre_write_guard,
     )
     outcome_write_tracker.before_write(64 * 1024)
-    outcome_store = PageOutcomeStore(outcomes_path)
+    outcome_store = PageOutcomeStore(
+        outcomes_path,
+        write_tracker=outcome_write_tracker,
+    )
     _enqueue_page_refs(
         page_refs,
         store=store,
@@ -1359,6 +1371,7 @@ def validate_complete_page_fetch(
     page_refs: Iterable[dict[str, Any]],
     *,
     validation_database: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     """Re-derive a complete Task-4 identity from durable producer state."""
     if (
@@ -1381,6 +1394,11 @@ def validate_complete_page_fetch(
         raise ValueError("page fetch job store or snapshot is missing")
 
     validation_database = Path(validation_database)
+    write_tracker = GuardedWriteTracker(
+        validation_database,
+        pre_write_guard,
+    )
+    write_tracker.before_write(64 * 1024)
     validation_database.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(validation_database) as connection:
         connection.row_factory = sqlite3.Row
@@ -1404,6 +1422,10 @@ def validate_complete_page_fetch(
             """
         )
         for record in page_refs:
+            encoded_record = json.dumps(record, ensure_ascii=False)
+            write_tracker.before_write(
+                8192 + 2 * len(encoded_record.encode("utf-8"))
+            )
             url_key, page_url, _host = _validated_ref(record)
             reference_key = stable_hash(
                 record.get("entity_id", ""),
@@ -1456,6 +1478,7 @@ def validate_complete_page_fetch(
                 """,
                 (url_key, page_url),
             )
+        write_tracker.before_commit(0)
         connection.commit()
         connection.execute(
             "ATTACH DATABASE ? AS outcomes_db",

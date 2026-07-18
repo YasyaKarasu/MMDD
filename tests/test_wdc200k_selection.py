@@ -734,6 +734,143 @@ def test_reserve_database_guard_failure_preserves_selection_checkpoint(
     assert 0 < len(positive_checks) < 4
 
 
+def test_replacement_claim_guard_failure_rolls_back_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    replacement = TableCandidate(
+        "Product",
+        "minimum3",
+        "replacement.test",
+        "Product/Product_replacement.test_October2023.json.gz",
+        2,
+        4,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite3"
+    ReserveManager.create(
+        database,
+        reserve=[replacement],
+        selected=[invalid],
+        policy=policy,
+    )
+    monkeypatch.setattr(
+        selection_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError(
+                    "replacement claim commit reserve exhausted"
+                )
+
+    guarded = ReserveManager.open(
+        database,
+        policy,
+        pre_write_guard=reject_commit,
+    )
+    with pytest.raises(OSError, match="claim commit reserve"):
+        guarded.claim_replacement(
+            operation_key="replace-one",
+            invalid_candidate=invalid,
+            reason="invalid gzip",
+        )
+
+    resumed = ReserveManager.open(database, policy)
+    assert resumed.pending_claims() == []
+    assert replacement.relative_path not in resumed.used_paths()
+    claim = resumed.claim_replacement(
+        operation_key="replace-one",
+        invalid_candidate=invalid,
+        reason="invalid gzip",
+    )
+    assert claim.replacement == replacement
+
+
+def test_replacement_ack_guard_failure_preserves_pending_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = TableCandidate(
+        "Product",
+        "minimum3",
+        "invalid.test",
+        "Product/Product_invalid.test_October2023.json.gz",
+        1,
+        3,
+    )
+    replacement = TableCandidate(
+        "Product",
+        "minimum3",
+        "replacement.test",
+        "Product/Product_replacement.test_October2023.json.gz",
+        2,
+        4,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite3"
+    manager = ReserveManager.create(
+        database,
+        reserve=[replacement],
+        selected=[invalid],
+        policy=policy,
+    )
+    claim = manager.claim_replacement(
+        operation_key="replace-one",
+        invalid_candidate=invalid,
+        reason="invalid gzip",
+    )
+    monkeypatch.setattr(
+        selection_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError(
+                    "replacement ack commit reserve exhausted"
+                )
+
+    guarded = ReserveManager.open(
+        database,
+        policy,
+        pre_write_guard=reject_commit,
+    )
+    with pytest.raises(OSError, match="ack commit reserve"):
+        guarded.acknowledge(
+            operation_key=claim.operation_key,
+            replacement_path=replacement.relative_path,
+        )
+
+    resumed = ReserveManager.open(database, policy)
+    assert resumed.pending_claims() == [claim]
+    assert resumed.acknowledge(
+        operation_key=claim.operation_key,
+        replacement_path=replacement.relative_path,
+    ).status == "acked"
+
+
 def test_reserve_manager_create_does_not_reuse_fixed_temporary_path(
     tmp_path: Path,
 ) -> None:

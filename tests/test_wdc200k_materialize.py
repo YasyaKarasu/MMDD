@@ -1017,6 +1017,221 @@ def test_materializer_matches_existing_query_builder_field_for_field(
     assert len(actual.evidence_recoveries) == 4
 
 
+def test_public_shard_materializer_guards_actual_index_and_cleans_validation(
+    tmp_path: Path,
+) -> None:
+    inputs = _shard_inputs(tmp_path)
+    calls: list[tuple[Path, int]] = []
+
+    materialize_dataset_shard(
+        inputs,
+        args=_args(tmp_path),
+        split="train",
+        pre_write_guard=lambda path, size=0: calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    assert calls
+    validation_root = (
+        inputs.lookup_database.parent
+        / ".source-closure-validation"
+    )
+    assert all(
+        path == inputs.lookup_database
+        or path == validation_root
+        or validation_root in path.parents
+        for path, _size in calls
+    )
+    assert any(
+        path == inputs.lookup_database for path, _size in calls
+    )
+    assert any(
+        path == validation_root or validation_root in path.parents
+        for path, _size in calls
+    )
+    assert any(size >= 64 * 1024 * 1024 for _path, size in calls)
+    with sqlite3.connect(inputs.lookup_database) as connection:
+        validation_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'source_row_validation'
+            """
+        ).fetchone()
+    assert validation_table is None
+    assert list(validation_root.iterdir()) == []
+
+
+def test_source_catalog_closure_failure_does_not_pollute_durable_database(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    materializer._initialize_index(database_path)
+    source_record = {
+        "source_table_id": "source-1",
+        "rows": [{"row_id": 0}],
+    }
+    with materializer._connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO source_catalog (
+                source_table_id, ordinal, page_title, split_group,
+                split, record_sha256, record_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "source-1",
+                0,
+                "Source",
+                "source-1",
+                "train",
+                "source-sha",
+                json.dumps(source_record),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO entity_sources (
+                entity_id, source_table_id, source_row_id
+            ) VALUES (?, ?, ?)
+            """,
+            ("entity-missing-row", "source-1", 99),
+        )
+    calls: list[tuple[Path, int]] = []
+    tracker = materializer.GuardedWriteTracker(
+        database_path,
+        lambda path, size=0: calls.append((Path(path), size)),
+    )
+    calls.clear()
+
+    with materializer._connect(database_path) as connection:
+        with pytest.raises(ValueError, match="source catalog relation"):
+            materializer._validate_source_catalog_closure(
+                connection,
+                write_tracker=tracker,
+            )
+
+    validation_root = (
+        database_path.parent / ".source-closure-validation"
+    )
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'source_row_validation'
+            """
+        ).fetchone() == (0,)
+    assert calls
+    assert all(
+        path == validation_root or validation_root in path.parents
+        for path, _size in calls
+    )
+    assert list(validation_root.iterdir()) == []
+
+
+def test_table_unit_commit_guard_failure_rolls_back_and_resumes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    materializer._initialize_index(database_path)
+    table = materializer.MaterializedTable(
+        source_table={"source_table_id": "source-1"},
+        entities=[],
+        bridge_assets=[],
+        table_asset_links=[],
+        query_tables=[],
+        data_lake_tables=[],
+        qrels=[],
+        decision={},
+        attribute_extractions=[],
+        evidence_recoveries=[],
+    )
+    zero_checks = 0
+
+    def reject_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("table unit commit reserve exhausted")
+
+    tracker = materializer.GuardedWriteTracker(
+        database_path,
+        reject_commit,
+        interval_bytes=1,
+    )
+    tracker.before_write(4096)
+    with pytest.raises(OSError, match="table unit commit reserve"):
+        materializer._store_table_unit(
+            database_path,
+            table,
+            source_ordinal=0,
+            source_sha256="source-sha",
+            split="train",
+            write_tracker=tracker,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_units"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM materialized_records"
+        ).fetchone() == (0,)
+    assert materializer._store_table_unit(
+        database_path,
+        table,
+        source_ordinal=0,
+        source_sha256="source-sha",
+        split="train",
+    )
+
+
+def test_failure_deduplication_recovers_after_mid_batch_guard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    records = [
+        {"entity_id": f"entity-{index}", "error": "failed"}
+        for index in range(24)
+    ]
+    positive_calls = 0
+    monkeypatch.setattr(
+        materializer.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    def interrupt(path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal positive_calls
+        assert Path(path) == database_path
+        if estimated_bytes > 0:
+            positive_calls += 1
+            if positive_calls == 2:
+                raise RuntimeError("synthetic diagnostic reserve exhausted")
+
+    with pytest.raises(RuntimeError, match="diagnostic reserve"):
+        list(
+            materializer._deduplicated_failures(
+                database_path,
+                kind="page",
+                records=records,
+                pre_write_guard=interrupt,
+            )
+        )
+
+    resumed = list(
+        materializer._deduplicated_failures(
+            database_path,
+            kind="page",
+            records=records,
+        )
+    )
+    assert positive_calls == 2
+    assert resumed == records
+
+
 def test_empty_assets_keep_full_source_and_raw_data_lake_table(
     tmp_path: Path,
 ) -> None:

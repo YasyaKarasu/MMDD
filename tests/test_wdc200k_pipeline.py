@@ -9,6 +9,7 @@ import sys
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -209,6 +210,71 @@ def test_disk_guard_checks_the_actual_target_filesystem(
     guard(output / "dataset.json", 400)
     with pytest.raises(DiskSpaceInsufficientError, match="estimated=60"):
         guard(cache / "images" / "asset.jpg", 60)
+
+
+def test_structural_exact_count_database_recovers_after_guard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "structural"
+    root.mkdir()
+    page_refs = root / "page-refs.jsonl"
+    records = [
+        {"url_key": f"url-{index}", "page_url": f"https://e.test/{index}"}
+        for index in range(24)
+    ]
+    page_refs.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    result = SimpleNamespace(
+        source_tables=root / "source-tables.jsonl",
+        entities=root / "entities.jsonl",
+        page_refs=page_refs,
+        direct_image_refs=root / "direct-images.jsonl",
+        structural_failures=root / "failures.jsonl",
+        validated_selection=root / "validated-selection.jsonl",
+        manifest=root / "manifest.json",
+        entities_count=24,
+        direct_image_references=0,
+        page_references=24,
+        tables=1,
+        output_bytes=page_refs.stat().st_size,
+    )
+    database_path = root / "structural-counts.sqlite3"
+    positive_calls = 0
+    monkeypatch.setattr(
+        pipeline_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        1,
+    )
+
+    def interrupt(path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal positive_calls
+        assert Path(path) == database_path
+        if estimated_bytes > 0:
+            positive_calls += 1
+            if positive_calls == 2:
+                raise DiskSpaceInsufficientError(
+                    "synthetic structural reserve exhausted"
+                )
+
+    config = _full_pipeline_config(tmp_path / "config")
+    with pytest.raises(DiskSpaceInsufficientError, match="structural reserve"):
+        pipeline_module._structural_exact_counts(
+            root,
+            (result,),
+            config,
+            pre_write_guard=interrupt,
+        )
+
+    counts = pipeline_module._structural_exact_counts(
+        root,
+        (result,),
+        config,
+    )
+    assert positive_calls == 2
+    assert counts["unique_page_urls"] == len(records)
 
 
 def test_dry_run_validates_without_writes_or_network(
