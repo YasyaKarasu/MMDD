@@ -22,6 +22,8 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedTextWriter,
+        GuardedWriteTracker,
         PreWriteGuard,
         StageFingerprint,
         StageManifest,
@@ -50,6 +52,8 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            GuardedTextWriter,
+            GuardedWriteTracker,
             PreWriteGuard,
             StageFingerprint,
             StageManifest,
@@ -110,7 +114,7 @@ class _AtomicSourceTableShard(AtomicJsonlShard):
 
     def _write_value(self, value: Any) -> None:
         for chunk in self._encoder.iterencode(value):
-            self._handle.write(chunk)
+            self.write_text(chunk)
 
     def write_source_table(
         self,
@@ -119,8 +123,6 @@ class _AtomicSourceTableShard(AtomicJsonlShard):
     ) -> None:
         if self._handle.closed:
             raise RuntimeError("cannot write to a closed shard")
-        if self.pre_write_guard is not None:
-            self.pre_write_guard(self.path, 0)
         prefix_fields = (
             "source_table_id",
             "source_file",
@@ -132,23 +134,23 @@ class _AtomicSourceTableShard(AtomicJsonlShard):
             "columns",
         )
         suffix_fields = ("provenance_builder", "metadata")
-        self._handle.write("{")
+        self.write_text("{")
         first_field = True
         for field in prefix_fields:
             if not first_field:
-                self._handle.write(", ")
+                self.write_text(", ")
             self._write_value(field)
-            self._handle.write(": ")
+            self.write_text(": ")
             self._write_value(source_table[field])
             first_field = False
-        self._handle.write(", ")
+        self.write_text(", ")
         self._write_value("rows")
-        self._handle.write(": [")
+        self.write_text(": [")
         first_row = True
         row_count = 0
         for row in rows:
             if not first_row:
-                self._handle.write(", ")
+                self.write_text(", ")
             self._write_value(row)
             first_row = False
             row_count += 1
@@ -157,13 +159,13 @@ class _AtomicSourceTableShard(AtomicJsonlShard):
                 f"streamed {row_count} rows but source table expected "
                 f"{source_table['num_rows']}"
             )
-        self._handle.write("]")
+        self.write_text("]")
         for field in suffix_fields:
-            self._handle.write(", ")
+            self.write_text(", ")
             self._write_value(field)
-            self._handle.write(": ")
+            self.write_text(": ")
             self._write_value(source_table[field])
-        self._handle.write("}\n")
+        self.write_text("}\n")
         self._records += 1
 
 
@@ -254,6 +256,7 @@ def _prepare_selection_records(
     shard_id: str,
     explicit_fingerprint: str | None,
     spool_root: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[
     Iterable[TableCandidate | dict[str, Any]],
     str,
@@ -276,9 +279,11 @@ def _prepare_selection_records(
         )
 
     spool_path = spool_root / "selection-records.jsonl"
+    tracker = GuardedWriteTracker(spool_path, pre_write_guard)
     digest = hashlib.sha256()
     try:
-        with spool_path.open("w", encoding="utf-8") as handle:
+        with spool_path.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             for record in records:
                 canonical = _canonical_selection_record(record)
                 encoded = json.dumps(
@@ -380,6 +385,7 @@ def _read_table_once(
     min_rows: int,
     min_cols: int,
     spool_root: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> _ExpandedTable:
     digest = hashlib.sha256()
     spool_root.mkdir(parents=True, exist_ok=True)
@@ -397,6 +403,9 @@ def _read_table_once(
     os.close(profile_descriptor)
     raw_rows_path = Path(raw_name)
     profile_path = Path(profile_name)
+    raw_tracker = GuardedWriteTracker(raw_rows_path, pre_write_guard)
+    profile_tracker = GuardedWriteTracker(profile_path, pre_write_guard)
+    profile_tracker.before_write(64 * 1024)
     connection = sqlite3.connect(profile_path)
     column_names: list[str] = []
     seen_columns: set[str] = set()
@@ -414,7 +423,8 @@ def _read_table_once(
             ) WITHOUT ROWID
             """
         )
-        with raw_rows_path.open("w", encoding="utf-8") as raw_spool:
+        with raw_rows_path.open("w", encoding="utf-8") as raw_handle:
+            raw_spool = GuardedTextWriter(raw_handle, raw_tracker)
             with gzip.open(path, "rb") as handle:
                 for line_number, raw_line in enumerate(handle, start=1):
                     digest.update(raw_line)
@@ -427,6 +437,9 @@ def _read_table_once(
                             f"non-object JSON row at line {line_number}"
                         )
                     row_count += 1
+                    profile_tracker.before_write(
+                        4096 + 2 * len(text.encode("utf-8"))
+                    )
                     for column_name, raw_value in payload.items():
                         if column_name in wdc_adapter.EXCLUDED_COLUMNS:
                             continue
@@ -456,6 +469,7 @@ def _read_table_once(
                             examples[column_name].append(value)
                     json.dump(payload, raw_spool, ensure_ascii=False)
                     raw_spool.write("\n")
+        profile_tracker.before_commit(0)
         if row_count < min_rows:
             raise ValueError("too_few_rows")
         if len(column_names) < min_cols:
@@ -953,8 +967,11 @@ def finalize_validated_selection(
     )
     os.close(descriptor)
     database_path = Path(database_name)
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, 0)
+    database_tracker = GuardedWriteTracker(
+        database_path,
+        pre_write_guard,
+    )
+    database_tracker.before_write(64 * 1024)
     writer = AtomicJsonlShard(
         final_path,
         pre_write_guard=pre_write_guard,
@@ -988,6 +1005,9 @@ def finalize_validated_selection(
                     if not line.strip():
                         continue
                     record = json.loads(line)
+                    database_tracker.before_write(
+                        4096 + 2 * len(line.encode("utf-8"))
+                    )
                     if (
                         not isinstance(record, dict)
                         or not required_fields.issubset(record)
@@ -1024,6 +1044,7 @@ def finalize_validated_selection(
                 f"validated selection target is {record_count}, "
                 f"expected target {target_tables}"
             )
+        database_tracker.before_commit(0)
         connection.commit()
         completed = writer.commit()
         completed = _relative_completed(
@@ -1145,6 +1166,7 @@ def expand_selected_shard(
         shard_id=shard_id,
         explicit_fingerprint=input_fingerprint,
         spool_root=spool_root,
+        pre_write_guard=pre_write_guard,
     )
     fingerprint = StageFingerprint(
         stage="wdc200k_structural",
@@ -1243,6 +1265,7 @@ def expand_selected_shard(
                         min_rows=min_rows,
                         min_cols=min_cols,
                         spool_root=spool_root,
+                        pre_write_guard=pre_write_guard,
                     )
                     break
                 except Exception as error:

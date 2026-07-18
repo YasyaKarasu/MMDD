@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
@@ -60,8 +61,8 @@ def test_atomic_shard_guard_runs_before_open_write_and_commit(
     shard.commit()
 
     assert calls[0] == (target, 0)
-    assert calls[-1][0] == target
-    assert calls[-1][1] > 0
+    assert any(path == target and size > 0 for path, size in calls)
+    assert calls[-1] == (target, 0)
 
 
 def test_atomic_shard_guard_failure_before_commit_preserves_checkpoint(
@@ -77,12 +78,23 @@ def test_atomic_shard_guard_failure_before_commit_preserves_checkpoint(
             if estimated_checks == 2:
                 raise OSError("disk reserve")
 
-    shard = AtomicJsonlShard(target, pre_write_guard=guard)
-    shard.write({"id": "a"})
+    checkpoint = AtomicJsonlShard(
+        tmp_path / "part-00000.jsonl",
+        pre_write_guard=guard,
+        guard_interval_bytes=20,
+    )
+    checkpoint.write({"id": "checkpoint"})
+    committed = checkpoint.commit()
+    shard = AtomicJsonlShard(
+        target,
+        pre_write_guard=guard,
+        guard_interval_bytes=20,
+    )
     with pytest.raises(OSError, match="disk reserve"):
-        shard.commit()
+        shard.write({"id": "next"})
     shard.abort()
 
+    assert validate_completed_shard(committed, tmp_path)
     assert not target.exists()
 
 
@@ -102,6 +114,100 @@ def test_atomic_shard_amortizes_guard_checks_by_byte_window(
     positive_write_checks = calls[1:-1]
     assert positive_write_checks == [30, 30]
     assert len(positive_write_checks) < 5
+
+
+def test_atomic_commit_does_not_reserve_temporary_bytes_twice(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    commit_phase = False
+    reserve = 1_000
+    free = reserve + 1
+
+    def guard(_path: Path, estimated: int = 0) -> None:
+        calls.append(estimated)
+        if commit_phase and free < reserve + estimated:
+            raise OSError("double-counted temporary bytes")
+
+    shard = AtomicJsonlShard(
+        tmp_path / "part.jsonl",
+        pre_write_guard=guard,
+        guard_interval_bytes=64,
+    )
+    shard.write({"payload": "x" * 200})
+
+    commit_phase = True
+    completed = shard.commit()
+
+    assert completed.bytes > 64
+    assert calls[-1] == 0
+
+
+def test_external_merge_guard_fails_midstream_without_touching_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_paths = []
+    for index in range(2):
+        path = tmp_path / f"run-{index}.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps([str(value), value, {"id": value}]) + "\n"
+                for value in range(index, 12, 2)
+            ),
+            encoding="utf-8",
+        )
+        run_paths.append(path)
+    calls = 0
+    monkeypatch.setattr(
+        wdc200k_io_module.GuardedWriteTracker,
+        "DEFAULT_INTERVAL_BYTES",
+        80,
+    )
+
+    def guard(_path: Path, estimated: int = 0) -> None:
+        nonlocal calls
+        if estimated:
+            calls += 1
+            if calls == 2:
+                raise OSError("mid-merge reserve")
+
+    with pytest.raises(OSError, match="mid-merge reserve"):
+        wdc200k_io_module._merge_run_group(
+            run_paths,
+            tmp_path / "merged.jsonl",
+            guard,
+        )
+
+    assert all(path.is_file() for path in run_paths)
+
+
+def test_sqlite_job_store_guard_fails_before_next_enqueue_transaction(
+    tmp_path: Path,
+) -> None:
+    checks = 0
+
+    def guard(_path: Path, estimated: int = 0) -> None:
+        nonlocal checks
+        if estimated:
+            checks += 1
+            if checks == 3:
+                raise OSError("job reserve")
+
+    path = tmp_path / "jobs.sqlite3"
+    store = SqliteJobStore(
+        path,
+        pre_write_guard=guard,
+        guard_interval_bytes=5_000,
+    )
+    store.enqueue("page", "one", {"payload": "x"})
+    with pytest.raises(OSError, match="job reserve"):
+        store.enqueue("page", "two", {"payload": "y"})
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT job_id FROM jobs ORDER BY job_id"
+        ).fetchall() == [("one",)]
 
 
 def test_job_store_does_not_reclaim_terminal_outcomes(tmp_path: Path) -> None:

@@ -37,6 +37,8 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedTextWriter,
+        GuardedWriteTracker,
         PreWriteGuard,
         SqliteJobStore,
         validate_completed_shard,
@@ -62,6 +64,8 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            GuardedTextWriter,
+            GuardedWriteTracker,
             PreWriteGuard,
             SqliteJobStore,
             validate_completed_shard,
@@ -365,11 +369,17 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             json.dump(
                 payload,
                 handle,
@@ -378,8 +388,9 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
                 sort_keys=True,
             )
             handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
         _fsync_directory(path.parent)
     except BaseException:
@@ -694,6 +705,7 @@ def enqueue_model_tasks(
         text_model_name="text",
         image_model_name="image",
     )
+    store.reserve_write(64 * 1024)
     _initialize_tables(store.path)
     input_by_kind = {
         "text": text_input_fingerprint or input_fingerprint,
@@ -785,6 +797,9 @@ def enqueue_model_tasks(
                 jobset_fingerprint=fingerprints[modality],
             )
             encoded = _canonical_json(payload)
+            store.reserve_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             payload_digest = hashlib.sha256(
                 encoded.encode("utf-8")
             ).hexdigest()
@@ -1052,6 +1067,7 @@ def enqueue_model_tasks(
                             fingerprints[modality],
                         ),
                     )
+            store.guard_commit()
     finally:
         staging.close()
     result = ModelJobSet(
@@ -1067,6 +1083,7 @@ def enqueue_model_tasks(
         jobs=tuple(previews),
     )
     with _connect(store.path) as connection:
+        store.reserve_write(4096)
         connection.execute(
             """
             INSERT INTO model_jobset_pairs (
@@ -1092,6 +1109,7 @@ def enqueue_model_tasks(
                 time.time(),
             ),
         )
+        store.guard_commit()
     return result
 
 
@@ -2319,7 +2337,7 @@ def _publish_outputs(
         }
         if pre_write_guard is not None:
             pre_write_guard(manifest_path, 0)
-        _atomic_json(manifest_path, payload)
+        _atomic_json(manifest_path, payload, pre_write_guard)
     published = _load_valid_manifest(
         manifest_path,
         output_root=stage_root,
@@ -3179,6 +3197,8 @@ def adapt_model_tasks_from_manifests(
     output_root.mkdir(parents=True, exist_ok=True)
     index_path = output_root / "model-task-adapter.sqlite3"
     index_path.unlink(missing_ok=True)
+    index_tracker = GuardedWriteTracker(index_path, pre_write_guard)
+    index_tracker.before_write(64 * 1024)
     with sqlite3.connect(index_path) as connection:
         connection.execute(
             "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
@@ -3201,17 +3221,26 @@ def adapt_model_tasks_from_manifests(
         )
         for record in _iter_jsonl_paths(asset_paths):
             record = _verify_task5_asset_bytes(record)
+            encoded = _canonical_json(record)
+            index_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             connection.execute(
                 "INSERT OR REPLACE INTO assets VALUES (?, ?)",
-                (str(record["asset_id"]), _canonical_json(record)),
+                (str(record["asset_id"]), encoded),
             )
         for record in _iter_jsonl_paths(entity_paths):
+            encoded = _canonical_json(record)
+            index_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             connection.execute(
                 "INSERT OR REPLACE INTO entities VALUES (?, ?)",
-                (str(record["entity_id"]), _canonical_json(record)),
+                (str(record["entity_id"]), encoded),
             )
         for record in _iter_jsonl_paths(link_paths):
             for asset_id in record.get("asset_ids") or []:
+                index_tracker.before_write(4096)
                 connection.execute(
                     "INSERT OR IGNORE INTO links VALUES (?, ?, ?)",
                     (
@@ -3220,6 +3249,7 @@ def adapt_model_tasks_from_manifests(
                         str(asset_id),
                     ),
                 )
+        index_tracker.before_commit(0)
         connection.commit()
 
     task_writer = _AdapterShardWriter(
@@ -3354,6 +3384,7 @@ def adapt_model_tasks_from_manifests(
             "counts": {"tasks": task_count, "errors": error_count},
             "complete": True,
         },
+        pre_write_guard,
     )
     return AdaptedModelTasks(
         output_root=output_root,

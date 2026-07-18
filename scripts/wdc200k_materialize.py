@@ -41,6 +41,8 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedTextWriter,
+        GuardedWriteTracker,
         PreWriteGuard,
         validate_completed_shard,
     )
@@ -93,6 +95,8 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            GuardedTextWriter,
+            GuardedWriteTracker,
             PreWriteGuard,
             validate_completed_shard,
         )
@@ -845,8 +849,14 @@ def _index_entities(
     paths: Iterable[Path],
     *,
     commit_every: int = 0,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     for count, record in enumerate(_iter_jsonl(paths), start=1):
+        if write_tracker is not None:
+            encoded = _canonical_json(record)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
         entity_id = clean_text(record.get("entity_id"))
         if not entity_id:
             raise ValueError("entity is missing entity_id")
@@ -897,7 +907,12 @@ def _index_entities(
         }
         for alias in aliases:
             _insert_alias(connection, alias, entity_id)
-        _commit_index_batch(connection, count, commit_every)
+        _commit_index_batch(
+            connection,
+            count,
+            commit_every,
+            write_tracker=write_tracker,
+        )
 
 
 def _index_assets(
@@ -905,8 +920,14 @@ def _index_assets(
     paths: Iterable[Path],
     *,
     commit_every: int = 0,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     for count, record in enumerate(_iter_jsonl(paths), start=1):
+        if write_tracker is not None:
+            encoded = _canonical_json(record)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
         asset_id = clean_text(record.get("asset_id"))
         entity_id = clean_text(record.get("entity_id"))
         if not asset_id or not entity_id:
@@ -919,7 +940,12 @@ def _index_assets(
             columns={"entity_id": entity_id, "record": record},
             kind="asset",
         )
-        _commit_index_batch(connection, count, commit_every)
+        _commit_index_batch(
+            connection,
+            count,
+            commit_every,
+            write_tracker=write_tracker,
+        )
 
 
 def _index_links(
@@ -927,8 +953,14 @@ def _index_links(
     paths: Iterable[Path],
     *,
     commit_every: int = 0,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     for count, record in enumerate(_iter_jsonl(paths), start=1):
+        if write_tracker is not None:
+            encoded = _canonical_json(record)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
         source_table_id = clean_text(record.get("source_table_id"))
         entity_id = clean_text(record.get("entity_id"))
         link_id = clean_text(record.get("link_id"))
@@ -975,7 +1007,12 @@ def _index_links(
         ):
             _insert_alias(connection, alias, entity_id)
             _insert_alias(connection, alias.casefold(), entity_id)
-        _commit_index_batch(connection, count, commit_every)
+        _commit_index_batch(
+            connection,
+            count,
+            commit_every,
+            write_tracker=write_tracker,
+        )
 
 
 def _extraction_identity(record: dict[str, Any]) -> tuple[str, str, str]:
@@ -995,8 +1032,14 @@ def _index_extractions(
     *,
     status: str,
     commit_every: int = 0,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     for count, record in enumerate(_iter_jsonl(paths), start=1):
+        if write_tracker is not None:
+            encoded = _canonical_json(record)
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
         cache_key, entity_id, asset_id = _extraction_identity(record)
         entity_row = connection.execute(
             """
@@ -1063,7 +1106,12 @@ def _index_extractions(
                 },
                 kind="model error",
             )
-        _commit_index_batch(connection, count, commit_every)
+        _commit_index_batch(
+            connection,
+            count,
+            commit_every,
+            write_tracker=write_tracker,
+        )
 
 
 def _validate_relation_closure(
@@ -1243,8 +1291,12 @@ def _commit_index_batch(
     connection: sqlite3.Connection,
     count: int,
     commit_every: int,
+    *,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     if commit_every > 0 and count % commit_every == 0:
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
         connection.commit()
         connection.execute("BEGIN IMMEDIATE")
 
@@ -1273,7 +1325,11 @@ def _build_index(inputs: MaterializationShardInputs) -> None:
 def _prepare_authoritative_index(
     database_path: Path,
     upstream: _ValidatedUpstream,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    write_tracker.before_write(64 * 1024)
     _initialize_index(database_path)
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1292,27 +1348,39 @@ def _prepare_authoritative_index(
             (upstream.identity,),
         )
         _index_entities(
-            connection, upstream.entity_paths, commit_every=1_000
+            connection,
+            upstream.entity_paths,
+            commit_every=1_000,
+            write_tracker=write_tracker,
         )
         _index_assets(
-            connection, upstream.asset_paths, commit_every=1_000
+            connection,
+            upstream.asset_paths,
+            commit_every=1_000,
+            write_tracker=write_tracker,
         )
         _index_links(
-            connection, upstream.link_paths, commit_every=1_000
+            connection,
+            upstream.link_paths,
+            commit_every=1_000,
+            write_tracker=write_tracker,
         )
         _index_extractions(
             connection,
             upstream.extraction_paths,
             status="success",
             commit_every=1_000,
+            write_tracker=write_tracker,
         )
         _index_extractions(
             connection,
             upstream.model_error_paths,
             status="terminal",
             commit_every=1_000,
+            write_tracker=write_tracker,
         )
         _validate_relation_closure(connection)
+        write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -1376,6 +1444,7 @@ def _catalog_source_records(
     *,
     args: argparse.Namespace,
     expected_tables: int,
+    write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1388,6 +1457,10 @@ def _catalog_source_records(
             if not source_table_id:
                 raise ValueError("source table is missing source_table_id")
             encoded = _canonical_json(source_table)
+            if write_tracker is not None:
+                write_tracker.before_write(
+                    4096 + 2 * len(encoded.encode("utf-8"))
+                )
             digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             existing = connection.execute(
                 """
@@ -1432,6 +1505,8 @@ def _catalog_source_records(
                         f"duplicate source table ID: {source_table_id}"
                     ) from error
             if (ordinal + 1) % 10 == 0:
+                if write_tracker is not None:
+                    write_tracker.before_commit(0)
                 connection.commit()
                 connection.execute("BEGIN IMMEDIATE")
         observed = int(
@@ -1447,6 +1522,8 @@ def _catalog_source_records(
                 f"source table count {observed_stream}/{observed} does "
                 f"not match expected {expected_tables}"
             )
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -1456,19 +1533,25 @@ def _catalog_sources(
     *,
     args: argparse.Namespace,
     expected_tables: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     _catalog_source_records(
         database_path,
         _iter_jsonl(source_paths),
         args=args,
         expected_tables=expected_tables,
+        write_tracker=write_tracker,
     )
 
 
 def _assign_splits(
     database_path: Path,
     args: argparse.Namespace,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     ratios = [
         float(args.train_ratio),
         float(args.dev_ratio),
@@ -1505,6 +1588,9 @@ def _assign_splits(
             """
         ):
             group = str(row["split_group"])
+            write_tracker.before_write(
+                4096 + 2 * len(group.encode("utf-8"))
+            )
             connection.execute(
                 """
                 INSERT INTO split_groups (
@@ -1546,6 +1632,7 @@ def _assign_splits(
                 else "test"
             )
             group = str(row["split_group"])
+            write_tracker.before_write(8192)
             connection.execute(
                 "UPDATE split_groups SET split = ? WHERE split_group = ?",
                 (split, group),
@@ -1554,6 +1641,7 @@ def _assign_splits(
                 "UPDATE source_catalog SET split = ? WHERE split_group = ?",
                 (split, group),
             )
+        write_tracker.before_commit(0)
         connection.commit()
 
 
@@ -1972,6 +2060,7 @@ def _materialize_all_tables(
     after_table_commit: Callable[[str], None] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     with _connect(database_path) as connection:
         cursor = connection.execute(
             """
@@ -2024,8 +2113,23 @@ def _materialize_all_tables(
                 args=args,
                 split=split,
             )
-            if pre_write_guard is not None:
-                pre_write_guard(database_path, 0)
+            estimated_bytes = 4096
+            for record in (
+                materialized.source_table,
+                materialized.decision,
+                *materialized.entities,
+                *materialized.bridge_assets,
+                *materialized.table_asset_links,
+                *materialized.query_tables,
+                *materialized.data_lake_tables,
+                *materialized.qrels,
+                *materialized.attribute_extractions,
+                *materialized.evidence_recoveries,
+            ):
+                estimated_bytes += 2 * len(
+                    _canonical_json(record).encode("utf-8")
+                )
+            write_tracker.before_write(estimated_bytes)
             _store_table_unit(
                 database_path,
                 materialized,
@@ -2233,12 +2337,12 @@ def _write_splits(
     *,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> CompletedShard:
-    if pre_write_guard is not None:
-        pre_write_guard(path, 0)
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             handle.write("{")
             first_split = True
             with _connect(database_path) as connection:
@@ -2318,12 +2422,11 @@ def _write_splits(
                 )
             )
             handle.write("}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
         digest = _sha256_path(temporary)
         size = temporary.stat().st_size
-        if pre_write_guard is not None:
-            pre_write_guard(path, size)
+        tracker.before_commit(0)
         temporary.replace(path)
         _fsync_directory(path.parent)
         return CompletedShard(
@@ -2848,7 +2951,11 @@ def materialize_dataset(
     )
     if pre_write_guard is not None:
         pre_write_guard(database_path, 0)
-    _prepare_authoritative_index(database_path, upstream)
+    _prepare_authoritative_index(
+        database_path,
+        upstream,
+        pre_write_guard=pre_write_guard,
+    )
     if pre_write_guard is not None:
         pre_write_guard(database_path, 0)
     _catalog_sources(
@@ -2856,12 +2963,17 @@ def materialize_dataset(
         upstream.source_paths,
         args=args,
         expected_tables=upstream.expected_tables,
+        pre_write_guard=pre_write_guard,
     )
     with _connect(database_path) as connection:
         _validate_source_catalog_closure(connection)
     if pre_write_guard is not None:
         pre_write_guard(database_path, 0)
-    _assign_splits(database_path, args)
+    _assign_splits(
+        database_path,
+        args,
+        pre_write_guard=pre_write_guard,
+    )
     _materialize_all_tables(
         database_path,
         args=args,

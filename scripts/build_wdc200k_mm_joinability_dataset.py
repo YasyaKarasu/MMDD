@@ -53,6 +53,8 @@ from wdc200k_fetch import (
 from wdc200k_io import (
     AtomicJsonlShard,
     CompletedShard,
+    GuardedTextWriter,
+    GuardedWriteTracker,
     PreWriteGuard,
     SqliteJobStore,
     validate_completed_shard,
@@ -515,14 +517,14 @@ def _atomic_json(
     *,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
-    if pre_write_guard is not None:
-        pre_write_guard(path, 0)
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
     )
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             json.dump(
                 payload,
                 handle,
@@ -531,10 +533,9 @@ def _atomic_json(
                 indent=2,
             )
             handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if pre_write_guard is not None:
-            pre_write_guard(path, temporary.stat().st_size)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -905,6 +906,12 @@ def _validate_runtime_paths(config: PipelineConfig) -> None:
                 f"runtime paths conflict: {previous} and {name}: {path}"
             )
         seen[path] = name
+        if name != "runtime_dir" and not path.is_relative_to(
+            config.runtime_dir
+        ):
+            raise ValueError(
+                f"{name} must be inside runtime_dir: {path}"
+            )
 
 
 def _preflight(
@@ -1618,7 +1625,7 @@ def _run_pages(
     if pre_write_guard is not None:
         pre_write_guard(jobs_path, 0)
         pre_write_guard(outcomes_path, 0)
-    SqliteJobStore(jobs_path)
+    SqliteJobStore(jobs_path, pre_write_guard=pre_write_guard)
     _reconcile_page_jobs_from_outcomes(
         jobs_path,
         outcomes_path,
@@ -1643,7 +1650,7 @@ def _run_pages(
 
     result = fetch_unique_pages(
         _page_refs(config.work_dir / "structural", structural, finalized),
-        SqliteJobStore(jobs_path),
+        SqliteJobStore(jobs_path, pre_write_guard=pre_write_guard),
         transport,
         policy,
         outcomes_path=outcomes_path,
@@ -1728,6 +1735,7 @@ def _run_asset_planning(
             page_result.policy_fingerprint,
         ),
         join_path=entity_page_join,
+        pre_write_guard=pre_write_guard,
     )
     budget = ImageBudget(
         attempts_per_entity=config.max_image_attempts_per_entity,
@@ -1813,7 +1821,10 @@ def _run_images(
         pre_write_guard(root / "jobs.sqlite3", 0)
     image_result = fetch_unique_images(
         unique_jobs,
-        SqliteJobStore(root / "jobs.sqlite3"),
+        SqliteJobStore(
+            root / "jobs.sqlite3",
+            pre_write_guard=pre_write_guard,
+        ),
         transport,
         policy,
         outcomes_path=config.cache_dir / "image_cache" / "outcomes.sqlite3",
@@ -1930,7 +1941,10 @@ def _run_models(
     model_jobs_path = config.work_dir / "model_outputs" / "jobs.sqlite3"
     if pre_write_guard is not None:
         pre_write_guard(model_jobs_path, 0)
-    store = SqliteJobStore(model_jobs_path)
+    store = SqliteJobStore(
+        model_jobs_path,
+        pre_write_guard=pre_write_guard,
+    )
     jobset = enqueue_model_tasks(
         (
             record

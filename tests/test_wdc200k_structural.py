@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import wdc200k_io as wdc200k_io_module  # noqa: E402
+import wdc200k_structural as structural_module  # noqa: E402
 from build_wdc_mm_joinability_dataset import (  # noqa: E402
     iter_wdc_rows,
     read_wdc_table,
@@ -30,6 +31,59 @@ from wdc200k_structural import (  # noqa: E402
     expand_selected_shard,
     finalize_validated_selection,
 )
+
+
+def test_streamed_source_table_guard_stops_mid_table_and_keeps_checkpoint(
+    tmp_path: Path,
+) -> None:
+    enabled = False
+    checks = 0
+
+    def guard(_path: Path, estimated: int = 0) -> None:
+        nonlocal checks
+        if enabled and estimated:
+            checks += 1
+            if checks == 2:
+                raise OSError("source reserve")
+
+    checkpoint_writer = wdc200k_io_module.AtomicJsonlShard(
+        tmp_path / "part-00000.jsonl",
+        pre_write_guard=guard,
+        guard_interval_bytes=100,
+    )
+    checkpoint_writer.write({"source_table_id": "committed"})
+    checkpoint = checkpoint_writer.commit()
+    enabled = True
+    writer = structural_module._AtomicSourceTableShard(
+        tmp_path / "part-00001.jsonl",
+        pre_write_guard=guard,
+        guard_interval_bytes=100,
+    )
+    source_table = {
+        "source_table_id": "streamed",
+        "source_file": "source.json.gz",
+        "page_title": "Streamed",
+        "caption": "",
+        "section_title": "",
+        "num_rows": 10,
+        "num_cols": 1,
+        "columns": [],
+        "provenance_builder": "test",
+        "metadata": {},
+    }
+
+    with pytest.raises(OSError, match="source reserve"):
+        writer.write_source_table(
+            source_table,
+            (
+                {"row_id": index, "values": ["x" * 30]}
+                for index in range(10)
+            ),
+        )
+    writer.abort()
+
+    assert wdc200k_io_module.validate_completed_shard(checkpoint, tmp_path)
+    assert not (tmp_path / "part-00001.jsonl").exists()
 
 
 def write_wdc_gzip(

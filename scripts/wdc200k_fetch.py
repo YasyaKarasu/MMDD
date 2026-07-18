@@ -25,6 +25,8 @@ try:
     from stage1_io import stable_hash
     from wdc200k_io import (
         CompletedShard,
+        GuardedTextWriter,
+        GuardedWriteTracker,
         Job,
         PreWriteGuard,
         SqliteJobStore,
@@ -39,6 +41,8 @@ except ModuleNotFoundError as error:
         from stage1_io import stable_hash
         from wdc200k_io import (
             CompletedShard,
+            GuardedTextWriter,
+            GuardedWriteTracker,
             Job,
             PreWriteGuard,
             SqliteJobStore,
@@ -676,17 +680,24 @@ def _fetch_one(
     }
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
             handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:
@@ -715,13 +726,16 @@ def _snapshot_guard(progress_path: Path) -> Iterator[None]:
 def _atomic_failure_snapshot(
     path: Path,
     records: Iterable[dict[str, Any]],
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             for record in records:
                 json.dump(
                     record,
@@ -731,8 +745,9 @@ def _atomic_failure_snapshot(
                     separators=(",", ":"),
                 )
                 handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:
@@ -775,6 +790,7 @@ def _publish_snapshots(
     failure_path: Path,
     progress_path: Path,
     inflight: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
     with _snapshot_guard(progress_path):
         _atomic_failure_snapshot(
@@ -787,6 +803,7 @@ def _publish_snapshots(
                 for outcome in outcome_store.iter(policy_fingerprint)
                 if outcome["status"] == "terminal"
             ),
+            pre_write_guard,
         )
         return _publish_progress_unlocked(
             outcome_store,
@@ -796,6 +813,7 @@ def _publish_snapshots(
             unique=unique,
             progress_path=progress_path,
             inflight=inflight,
+            pre_write_guard=pre_write_guard,
         )
 
 
@@ -808,6 +826,7 @@ def _publish_progress(
     unique: int,
     progress_path: Path,
     inflight: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
     with _snapshot_guard(progress_path):
         return _publish_progress_unlocked(
@@ -818,6 +837,7 @@ def _publish_progress(
             unique=unique,
             progress_path=progress_path,
             inflight=inflight,
+            pre_write_guard=pre_write_guard,
         )
 
 
@@ -830,6 +850,7 @@ def _publish_progress_unlocked(
     unique: int,
     progress_path: Path,
     inflight: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
     success, terminal = outcome_store.counts(policy_fingerprint)
     leased = _leased_count(store, kind)
@@ -849,6 +870,7 @@ def _publish_progress_unlocked(
             "inflight": observed_inflight,
             "updated_at": time.time(),
         },
+        pre_write_guard,
     )
     return success, terminal
 
@@ -861,6 +883,7 @@ def _enqueue_page_refs(
     policy_fingerprint: str,
     kind: str,
     commit_every: int = 10_000,
+    outcome_write_tracker: GuardedWriteTracker | None = None,
 ) -> None:
     """Stream refs into two idempotent SQLite indexes in bounded transactions."""
     job_connection = store._connect()
@@ -868,6 +891,11 @@ def _enqueue_page_refs(
     pending = 0
     try:
         for record in page_refs:
+            encoded_record = json.dumps(record, ensure_ascii=False)
+            estimated = 8192 + 2 * len(encoded_record.encode("utf-8"))
+            store.reserve_write(estimated)
+            if outcome_write_tracker is not None:
+                outcome_write_tracker.before_write(estimated)
             url_key, page_url, host = _validated_ref(record)
             reference_key = stable_hash(
                 record.get("entity_id", ""),
@@ -937,9 +965,15 @@ def _enqueue_page_refs(
             )
             pending += 1
             if pending >= commit_every:
+                if outcome_write_tracker is not None:
+                    outcome_write_tracker.before_commit(0)
+                store.guard_commit()
                 reference_connection.commit()
                 job_connection.commit()
                 pending = 0
+        if outcome_write_tracker is not None:
+            outcome_write_tracker.before_commit(0)
+        store.guard_commit()
         reference_connection.commit()
         job_connection.commit()
     except BaseException:
@@ -1000,6 +1034,11 @@ def fetch_unique_pages(
     if pre_write_guard is not None:
         for target in (store.path, outcomes_path, failure_path, progress_path):
             pre_write_guard(target, 0)
+    outcome_write_tracker = GuardedWriteTracker(
+        outcomes_path,
+        pre_write_guard,
+    )
+    outcome_write_tracker.before_write(64 * 1024)
     outcome_store = PageOutcomeStore(outcomes_path)
     _enqueue_page_refs(
         page_refs,
@@ -1007,6 +1046,7 @@ def fetch_unique_pages(
         outcome_store=outcome_store,
         policy_fingerprint=fingerprint,
         kind=kind,
+        outcome_write_tracker=outcome_write_tracker,
     )
 
     unique = _job_count(store, kind)
@@ -1055,6 +1095,7 @@ def fetch_unique_pages(
         unique=unique,
         progress_path=progress_path,
         inflight=0,
+        pre_write_guard=pre_write_guard,
     )
 
     def add_ready(host: str) -> None:
@@ -1199,6 +1240,7 @@ def fetch_unique_pages(
                                 unique=unique,
                                 progress_path=progress_path,
                                 inflight=0,
+                                pre_write_guard=pre_write_guard,
                             )
                             time.sleep(
                                 min(
@@ -1225,8 +1267,15 @@ def fetch_unique_pages(
                         host_states.pop(host, None)
                         ready_set.discard(host)
                     outcome = future.result()
-                    if pre_write_guard is not None:
-                        pre_write_guard(outcomes_path, 0)
+                    outcome_write_tracker.before_write(
+                        4096
+                        + 2 * len(
+                            json.dumps(
+                                outcome,
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
                     persisted = outcome_store.put(
                         fingerprint,
                         str(job.payload["url_key"]),
@@ -1254,6 +1303,7 @@ def fetch_unique_pages(
                             unique=unique,
                             progress_path=progress_path,
                             inflight=len(futures),
+                            pre_write_guard=pre_write_guard,
                         )
                         completions_since_progress = 0
                 submit_ready(pool)
@@ -1267,6 +1317,7 @@ def fetch_unique_pages(
             failure_path=failure_path,
             progress_path=progress_path,
             inflight=len(futures),
+            pre_write_guard=pre_write_guard,
         )
         raise
 
@@ -1279,6 +1330,7 @@ def fetch_unique_pages(
         failure_path=failure_path,
         progress_path=progress_path,
         inflight=0,
+        pre_write_guard=pre_write_guard,
     )
     leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)

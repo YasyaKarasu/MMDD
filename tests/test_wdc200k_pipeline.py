@@ -154,6 +154,43 @@ def test_runtime_state_must_stay_outside_input_cache_and_output(
         run_pipeline(config)
 
 
+def test_runtime_files_must_be_children_of_the_runtime_root(
+    tmp_path: Path,
+) -> None:
+    base = _full_pipeline_config(tmp_path)
+    outside = base.work_dir / "page_jobs" / "start.json"
+    config = replace(
+        base,
+        model_start_marker=outside,
+        model_ready_marker=base.runtime_dir / "ready.json",
+        model_text_done_marker=base.runtime_dir / "text-done.json",
+        model_image_done_marker=base.runtime_dir / "image-done.json",
+        dry_run=True,
+    )
+
+    with pytest.raises(ValueError, match="inside runtime_dir"):
+        run_pipeline(config)
+
+
+def test_runtime_files_inside_runtime_root_are_accepted(
+    tmp_path: Path,
+) -> None:
+    base = _full_pipeline_config(tmp_path)
+    runtime = base.runtime_dir
+    config = replace(
+        base,
+        text_model_base_urls_file=str(runtime / "text-endpoints.json"),
+        image_model_base_urls_file=str(runtime / "image-endpoints.json"),
+        model_start_marker=runtime / "start.json",
+        model_ready_marker=runtime / "ready.json",
+        model_text_done_marker=runtime / "text-done.json",
+        model_image_done_marker=runtime / "image-done.json",
+        dry_run=True,
+    )
+
+    assert run_pipeline(config).status == "dry_run"
+
+
 def test_disk_guard_checks_the_actual_target_filesystem(
     tmp_path: Path,
 ) -> None:
@@ -886,6 +923,7 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
     runtime = tmp_path / "runtime"
     config = replace(
         base,
+        runtime_dir=runtime,
         run_fingerprint="dynamic-run-v1",
         model_start_marker=runtime / "start.json",
         model_ready_marker=runtime / "ready.json",

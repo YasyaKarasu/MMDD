@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import ExitStack
@@ -57,6 +58,70 @@ def _guard_write(
         guard(Path(path), max(0, int(estimated_bytes)))
 
 
+class GuardedWriteTracker:
+    """Amortize filesystem checks while reserving bounded write windows."""
+
+    DEFAULT_INTERVAL_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        path: Path,
+        guard: PreWriteGuard | None,
+        *,
+        interval_bytes: int | None = None,
+    ) -> None:
+        interval = (
+            self.DEFAULT_INTERVAL_BYTES
+            if interval_bytes is None
+            else int(interval_bytes)
+        )
+        if interval <= 0:
+            raise ValueError("guard interval must be positive")
+        self.path = Path(path)
+        self.guard = guard
+        self.interval_bytes = interval
+        self._remaining = 0
+        self._lock = threading.Lock()
+        _guard_write(self.guard, self.path, 0)
+
+    def before_write(self, estimated_bytes: int) -> None:
+        estimated = max(0, int(estimated_bytes))
+        if self.guard is None or estimated == 0:
+            return
+        with self._lock:
+            if estimated > self._remaining:
+                reservation = max(self.interval_bytes, estimated)
+                _guard_write(self.guard, self.path, reservation)
+                self._remaining = reservation
+            self._remaining -= estimated
+
+    def before_commit(self, replacement_delta_bytes: int = 0) -> None:
+        _guard_write(
+            self.guard,
+            self.path,
+            max(0, int(replacement_delta_bytes)),
+        )
+
+
+class GuardedTextWriter:
+    """Text writer that accounts UTF-8 bytes before touching the file."""
+
+    def __init__(
+        self,
+        handle: TextIO,
+        tracker: GuardedWriteTracker,
+    ) -> None:
+        self.handle = handle
+        self.tracker = tracker
+
+    def write(self, value: str) -> int:
+        self.tracker.before_write(len(value.encode("utf-8")))
+        return self.handle.write(value)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.handle, name)
+
+
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -76,7 +141,7 @@ def _fsync_directory(path: Path) -> None:
 class AtomicJsonlShard:
     """Write a JSONL shard that becomes visible only after a durable commit."""
 
-    DEFAULT_GUARD_INTERVAL_BYTES = 64 * 1024 * 1024
+    DEFAULT_GUARD_INTERVAL_BYTES = GuardedWriteTracker.DEFAULT_INTERVAL_BYTES
 
     def __init__(
         self,
@@ -91,8 +156,11 @@ class AtomicJsonlShard:
         self.temporary_path = path.with_suffix(path.suffix + ".tmp")
         self.pre_write_guard = pre_write_guard
         self.guard_interval_bytes = int(guard_interval_bytes)
-        self._guarded_capacity = 0
-        _guard_write(self.pre_write_guard, self.path)
+        self._tracker = GuardedWriteTracker(
+            self.path,
+            pre_write_guard,
+            interval_bytes=self.guard_interval_bytes,
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.temporary_path.open("w", encoding="utf-8")
         self._records = 0
@@ -102,20 +170,12 @@ class AtomicJsonlShard:
         if self._handle.closed:
             raise RuntimeError("cannot write to a closed shard")
         encoded = json.dumps(record, ensure_ascii=False) + "\n"
-        encoded_bytes = len(encoded.encode("utf-8"))
-        if encoded_bytes > self._guarded_capacity:
-            self._guarded_capacity = max(
-                self.guard_interval_bytes,
-                encoded_bytes,
-            )
-            _guard_write(
-                self.pre_write_guard,
-                self.path,
-                self._guarded_capacity,
-            )
-        self._handle.write(encoded)
-        self._guarded_capacity -= encoded_bytes
+        self.write_text(encoded)
         self._records += 1
+
+    def write_text(self, value: str) -> None:
+        self._tracker.before_write(len(value.encode("utf-8")))
+        self._handle.write(value)
 
     def commit(self) -> CompletedShard:
         if self._handle.closed:
@@ -123,7 +183,7 @@ class AtomicJsonlShard:
         self._handle.flush()
         os.fsync(self._handle.fileno())
         size = self.temporary_path.stat().st_size
-        _guard_write(self.pre_write_guard, self.path, size)
+        self._tracker.before_commit(0)
         self._handle.close()
         digest = _sha256_path(self.temporary_path)
         self.temporary_path.replace(self.path)
@@ -246,7 +306,7 @@ class StageManifest:
         self.complete = bool(payload.get("complete", False))
 
     def _save(self) -> None:
-        _guard_write(self.pre_write_guard, self.path)
+        tracker = GuardedWriteTracker(self.path, self.pre_write_guard)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
         payload = {
@@ -272,7 +332,8 @@ class StageManifest:
         if self.fingerprint.schema_version:
             payload["schema_version"] = self.fingerprint.schema_version
         try:
-            with temporary_path.open("w", encoding="utf-8") as handle:
+            with temporary_path.open("w", encoding="utf-8") as raw_handle:
+                handle = GuardedTextWriter(raw_handle, tracker)
                 json.dump(
                     payload,
                     handle,
@@ -281,13 +342,9 @@ class StageManifest:
                     sort_keys=True,
                 )
                 handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _guard_write(
-                self.pre_write_guard,
-                self.path,
-                temporary_path.stat().st_size,
-            )
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            tracker.before_commit(0)
             temporary_path.replace(self.path)
             _fsync_directory(self.path.parent)
         except BaseException:
@@ -310,8 +367,20 @@ class Job:
 class SqliteJobStore:
     """Persistent SQLite-backed leases and terminal outcomes."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+        guard_interval_bytes: int | None = None,
+    ) -> None:
         self.path = path
+        self._write_tracker = GuardedWriteTracker(
+            path,
+            pre_write_guard,
+            interval_bytes=guard_interval_bytes,
+        )
+        self._write_tracker.before_write(64 * 1024)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect()
         try:
@@ -352,8 +421,20 @@ class SqliteJobStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def reserve_write(self, estimated_bytes: int) -> None:
+        """Reserve bounded capacity before a caller-managed transaction."""
+        self._write_tracker.before_write(estimated_bytes)
+
+    def guard_commit(self) -> None:
+        """Recheck the reserve before committing already allocated pages."""
+        self._write_tracker.before_commit(0)
+
     def enqueue(self, kind: str, job_id: str, payload: dict[str, Any]) -> None:
         now = time.time()
+        encoded_payload = json.dumps(payload, ensure_ascii=False)
+        self._write_tracker.before_write(
+            4096 + 2 * len(encoded_payload.encode("utf-8"))
+        )
         connection = self._connect()
         try:
             connection.execute(
@@ -362,7 +443,7 @@ class SqliteJobStore:
                     job_id, kind, payload_json, status, updated_at
                 ) VALUES (?, ?, ?, 'pending', ?)
                 """,
-                (job_id, kind, json.dumps(payload, ensure_ascii=False), now),
+                (job_id, kind, encoded_payload, now),
             )
             connection.commit()
         finally:
@@ -396,6 +477,9 @@ class SqliteJobStore:
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             if job_ids:
+                self._write_tracker.before_write(
+                    4096 + len(job_ids) * 512
+                )
                 placeholders = ",".join("?" for _ in job_ids)
                 for job_id in job_ids:
                     connection.execute(
@@ -441,6 +525,19 @@ class SqliteJobStore:
         if not lease_id:
             raise ValueError("lease_id is required to finish a leased job")
         now = time.time()
+        encoded_result = (
+            None
+            if result is None
+            else json.dumps(result, ensure_ascii=False)
+        )
+        self._write_tracker.before_write(
+            4096
+            + (
+                0
+                if encoded_result is None
+                else 2 * len(encoded_result.encode("utf-8"))
+            )
+        )
         connection = self._connect()
         try:
             cursor = connection.execute(
@@ -456,7 +553,7 @@ class SqliteJobStore:
                 """,
                 (
                     status,
-                    None if result is None else json.dumps(result, ensure_ascii=False),
+                    encoded_result,
                     now,
                     job_id,
                     owner,
@@ -513,9 +610,10 @@ def _write_sorted_run(
     path: Path,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
-    _guard_write(pre_write_guard, path)
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     records.sort(key=lambda item: (item[0], item[1]))
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8") as raw_handle:
+        handle = GuardedTextWriter(raw_handle, tracker)
         for key, ordinal, record in records:
             write_jsonl_record(handle, [key, ordinal, record])
 
@@ -545,8 +643,9 @@ def _merge_run_group(
     output_path: Path,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
-    _guard_write(pre_write_guard, output_path)
-    with output_path.open("w", encoding="utf-8") as handle:
+    tracker = GuardedWriteTracker(output_path, pre_write_guard)
+    with output_path.open("w", encoding="utf-8") as raw_handle:
+        handle = GuardedTextWriter(raw_handle, tracker)
         for key, ordinal, record in _iter_merged_runs(run_paths):
             write_jsonl_record(handle, [key, ordinal, record])
 

@@ -29,6 +29,8 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        GuardedTextWriter,
+        GuardedWriteTracker,
         PreWriteGuard,
         StageFingerprint,
         StageManifest,
@@ -62,6 +64,8 @@ except ModuleNotFoundError as error:
         io_helpers = importlib.import_module("wdc200k_io")
         AtomicJsonlShard = io_helpers.AtomicJsonlShard
         CompletedShard = io_helpers.CompletedShard
+        GuardedTextWriter = io_helpers.GuardedTextWriter
+        GuardedWriteTracker = io_helpers.GuardedWriteTracker
         PreWriteGuard = io_helpers.PreWriteGuard
         StageFingerprint = io_helpers.StageFingerprint
         StageManifest = io_helpers.StageManifest
@@ -907,18 +911,17 @@ def _atomic_json(
     payload: dict[str, Any],
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
-    if pre_write_guard is not None:
-        pre_write_guard(path, 0)
+    tracker = GuardedWriteTracker(path, pre_write_guard)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8") as raw_handle:
+            handle = GuardedTextWriter(raw_handle, tracker)
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
             handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if pre_write_guard is not None:
-            pre_write_guard(path, temporary.stat().st_size)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        tracker.before_commit(0)
         temporary.replace(path)
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:
@@ -1041,11 +1044,14 @@ def iter_entity_page_join(
     *,
     join_path: Path,
     commit_every: int = 10_000,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> Iterator[tuple[dict[str, Any], dict[str, Any] | None]]:
     """Stream Task 3 entities joined to Task 4 fanout via bounded disk state."""
     if commit_every <= 0:
         raise ValueError("commit_every must be positive")
     join_path = Path(join_path)
+    write_tracker = GuardedWriteTracker(join_path, pre_write_guard)
+    write_tracker.before_write(64 * 1024)
     join_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(join_path, timeout=30.0)
     try:
@@ -1075,6 +1081,9 @@ def iter_entity_page_join(
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            write_tracker.before_write(
+                4096 + 2 * len(encoded.encode("utf-8"))
+            )
             existing = connection.execute(
                 """
                 SELECT page_json
@@ -1098,8 +1107,10 @@ def iter_entity_page_join(
             )
             pending += 1
             if pending >= commit_every:
+                write_tracker.before_commit(0)
                 connection.commit()
                 pending = 0
+        write_tracker.before_commit(0)
         connection.commit()
 
         for current_entity in _iter_jsonl(entity_paths):
@@ -1649,6 +1660,10 @@ def _enqueue_unique_images(
                 "page_url": str(record.get("page_url") or ""),
                 "policy_fingerprint": policy_fingerprint,
             }
+            encoded_payload = json.dumps(payload, ensure_ascii=False)
+            store.reserve_write(
+                4096 + 2 * len(encoded_payload.encode("utf-8"))
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO jobs (
@@ -1658,14 +1673,16 @@ def _enqueue_unique_images(
                 (
                     f"{kind}:{url_key}",
                     kind,
-                    json.dumps(payload, ensure_ascii=False),
+                    encoded_payload,
                     time.time(),
                 ),
             )
             pending += 1
             if pending >= commit_every:
+                store.guard_commit()
                 connection.commit()
                 pending = 0
+        store.guard_commit()
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -1922,10 +1939,12 @@ def _execute_image_job(
     claim_poll_seconds: float,
     after_url_claim: Callable[[ImageUrlLease], None] | None,
     pre_write_guard: PreWriteGuard | None,
+    outcome_write_tracker: GuardedWriteTracker,
 ) -> ImageJobExecution:
     """Wait for or acquire the shared policy+URL claim before networking."""
     url_key = str(payload["url_key"])
     while True:
+        outcome_write_tracker.before_write(4096)
         decision = outcome_store.claim_url(
             policy_fingerprint,
             url_key,
@@ -2015,6 +2034,11 @@ def fetch_unique_images(
             f"{store.path.stem}-image-outcomes.sqlite3"
         )
     )
+    outcome_write_tracker = GuardedWriteTracker(
+        outcomes_path,
+        pre_write_guard,
+    )
+    outcome_write_tracker.before_write(64 * 1024)
     outcome_store = ImageOutcomeStore(outcomes_path)
     _enqueue_unique_images(
         [unique_jobs.output_path],
@@ -2152,6 +2176,7 @@ def fetch_unique_images(
                 claim_poll_seconds=float(url_claim_poll_seconds),
                 after_url_claim=after_url_claim,
                 pre_write_guard=pre_write_guard,
+                outcome_write_tracker=outcome_write_tracker,
             )
             futures[future] = (job, host)
             add_ready(host)
@@ -2188,13 +2213,21 @@ def fetch_unique_images(
                 execution = future.result()
                 if execution.lease is None:
                     persisted = execution.outcome
+                    outcome_write_tracker.before_write(4096)
                     outcome_store.clear_claim_if_outcome(
                         fingerprint,
                         str(job.payload["url_key"]),
                     )
                 else:
-                    if pre_write_guard is not None:
-                        pre_write_guard(outcomes_path, 0)
+                    outcome_write_tracker.before_write(
+                        4096
+                        + 2 * len(
+                            json.dumps(
+                                execution.outcome,
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
                     persisted = outcome_store.put_claimed(
                         fingerprint,
                         str(job.payload["url_key"]),
@@ -2204,12 +2237,14 @@ def fetch_unique_images(
                     )
                     if after_cache_write is not None:
                         after_cache_write(persisted)
+                    outcome_write_tracker.before_write(4096)
                     released = outcome_store.finish_claim(
                         fingerprint,
                         str(job.payload["url_key"]),
                         lease=execution.lease,
                     )
                     if not released:
+                        outcome_write_tracker.before_write(4096)
                         outcome_store.clear_claim_if_outcome(
                             fingerprint,
                             str(job.payload["url_key"]),
