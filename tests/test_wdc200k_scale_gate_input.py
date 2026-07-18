@@ -507,10 +507,97 @@ def _pool_candidate(
     )
 
 
+def test_round_robin_quota_redistributes_sparse_bucket_capacity() -> None:
+    capacities = {
+        ("A", "top100"): 1,
+        ("B", "top100"): 1,
+        ("C", "top100"): 4,
+    }
+
+    quotas = gate_module._allocate_round_robin_quotas(
+        capacities,
+        table_count=5,
+    )
+    pool = gate_module._RoundRobinCandidatePool(quotas)
+    for schema_class, row_count in (
+        ("C", 6),
+        ("A", 1),
+        ("C", 5),
+        ("B", 2),
+        ("C", 4),
+        ("C", 3),
+    ):
+        pool.add(_pool_candidate(schema_class, row_count))
+
+    assert quotas == {
+        ("A", "top100"): 1,
+        ("B", "top100"): 1,
+        ("C", "top100"): 3,
+    }
+    assert [
+        (ranked.candidate.schema_class, ranked.candidate.rows)
+        for ranked in pool.selected()
+    ] == [
+        ("A", 1),
+        ("B", 2),
+        ("C", 3),
+        ("C", 4),
+        ("C", 5),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("capacities", "table_count", "expected"),
+    [
+        ([2, 2], 3, [2, 1]),
+        ([3, 3, 3], 2, [1, 1, 0]),
+        ([1, 4, 1], 5, [1, 3, 1]),
+        ([1, 1, 4], 6, [1, 1, 4]),
+    ],
+)
+def test_round_robin_quota_properties(
+    capacities: list[int],
+    table_count: int,
+    expected: list[int],
+) -> None:
+    keyed = {
+        (f"Class{index}", "top100"): capacity
+        for index, capacity in enumerate(capacities)
+    }
+
+    quotas = gate_module._allocate_round_robin_quotas(
+        keyed,
+        table_count=table_count,
+    )
+
+    assert list(quotas.values()) == expected
+    assert sum(quotas.values()) == table_count
+    assert all(
+        0 <= quotas[key] <= capacity
+        for key, capacity in keyed.items()
+    )
+
+
+def test_round_robin_quota_rejects_insufficient_capacity() -> None:
+    with pytest.raises(ValueError, match="requested 5"):
+        gate_module._allocate_round_robin_quotas(
+            {
+                ("A", "top100"): 1,
+                ("B", "top100"): 2,
+            },
+            table_count=5,
+        )
+
+
 def test_candidate_pool_round_robins_two_buckets_for_three_tables() -> None:
     pool = gate_module._RoundRobinCandidatePool(
-        table_count=3,
-        bucket_count=2,
+        gate_module._allocate_round_robin_quotas(
+            {
+                ("A", "top100"): 2,
+                ("B", "top100"): 2,
+            },
+            table_count=3,
+        )
     )
     for schema_class, row_count in (
         ("A", 100),
@@ -528,8 +615,13 @@ def test_candidate_pool_round_robins_two_buckets_for_three_tables() -> None:
 
 def test_candidate_pool_keeps_round_robin_order_after_first_round() -> None:
     pool = gate_module._RoundRobinCandidatePool(
-        table_count=4,
-        bucket_count=2,
+        gate_module._allocate_round_robin_quotas(
+            {
+                ("A", "top100"): 2,
+                ("B", "top100"): 3,
+            },
+            table_count=4,
+        )
     )
     for schema_class, row_count in (
         ("A", 100),
@@ -548,17 +640,22 @@ def test_candidate_pool_keeps_round_robin_order_after_first_round() -> None:
 
 def test_candidate_pool_retention_is_global_table_count_plus_buckets() -> None:
     bucket_count = 80
-    pool = gate_module._RoundRobinCandidatePool(
+    quotas = gate_module._allocate_round_robin_quotas(
+        {
+            (f"Class{index:03d}", "top100"): 100
+            for index in range(bucket_count)
+        },
         table_count=7,
-        bucket_count=bucket_count,
     )
+    pool = gate_module._RoundRobinCandidatePool(quotas)
     for bucket_index in range(bucket_count):
         schema_class = f"Class{bucket_index:03d}"
         for row_index in range(100):
             pool.add(_pool_candidate(schema_class, row_index))
 
     assert pool.bucket_count == bucket_count
-    assert pool.retained_count <= 7 + bucket_count
+    assert sum(pool.quotas.values()) == 7
+    assert pool.retained_count + pool.bucket_count <= 7 + bucket_count
 
 
 def test_publish_noreplace_preserves_empty_directory_created_in_window(

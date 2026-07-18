@@ -50,20 +50,62 @@ class _RankedCandidate:
         return self.key > other.key
 
 
+def _ordered_bucket_keys(
+    buckets: dict[tuple[str, str], int],
+) -> list[tuple[str, str]]:
+    classes = sorted(
+        {
+            schema_class
+            for schema_class, _subset in buckets
+        }
+    )
+    return [
+        (schema_class, subset)
+        for subset in SUBSETS
+        for schema_class in classes
+        if (schema_class, subset) in buckets
+    ]
+
+
+def _allocate_round_robin_quotas(
+    capacities: dict[tuple[str, str], int],
+    *,
+    table_count: int,
+) -> dict[tuple[str, str], int]:
+    if sum(capacities.values()) < table_count:
+        raise ValueError(
+            f"requested {table_count} existing tables but found "
+            f"only {sum(capacities.values())}"
+        )
+    bucket_order = _ordered_bucket_keys(capacities)
+    quotas = {key: 0 for key in bucket_order}
+    remaining = table_count
+    while remaining:
+        added = False
+        for key in bucket_order:
+            if quotas[key] >= capacities[key]:
+                continue
+            quotas[key] += 1
+            remaining -= 1
+            added = True
+            if not remaining:
+                break
+        if not added:
+            raise ValueError("round-robin quota allocation exhausted capacity")
+    return quotas
+
+
 class _RoundRobinCandidatePool:
     """Keep a bounded low-row heap per bucket for round-robin output."""
 
-    def __init__(self, table_count: int, bucket_count: int) -> None:
-        if bucket_count <= 0:
-            raise ValueError("bucket_count must be positive")
-        self.table_count = table_count
-        self.expected_bucket_count = bucket_count
-        self.per_bucket_cap = (
-            table_count + bucket_count - 1
-        ) // bucket_count
+    def __init__(self, quotas: dict[tuple[str, str], int]) -> None:
+        if not quotas:
+            raise ValueError("quotas must not be empty")
+        self.quotas = dict(quotas)
+        self.table_count = sum(quotas.values())
         self._buckets: dict[
             tuple[str, str], list[_RankedCandidate]
-        ] = {}
+        ] = {key: [] for key in quotas}
 
     @property
     def bucket_count(self) -> int:
@@ -76,29 +118,19 @@ class _RoundRobinCandidatePool:
     def add(self, ranked: _RankedCandidate) -> None:
         candidate = ranked.candidate
         bucket_key = (candidate.schema_class, candidate.subset)
-        bucket = self._buckets.get(bucket_key)
-        if bucket is None:
-            if len(self._buckets) >= self.expected_bucket_count:
-                raise ValueError("candidate introduced an unexpected bucket")
-            bucket = []
-            self._buckets[bucket_key] = bucket
-        if len(bucket) < self.per_bucket_cap:
+        if bucket_key not in self._buckets:
+            raise ValueError("candidate introduced an unexpected bucket")
+        cap = self.quotas[bucket_key]
+        if cap == 0:
+            return
+        bucket = self._buckets[bucket_key]
+        if len(bucket) < cap:
             heapq.heappush(bucket, ranked)
         elif ranked.key < bucket[0].key:
             heapq.heapreplace(bucket, ranked)
 
     def selected(self) -> list[_RankedCandidate]:
-        classes = sorted(
-            schema_class
-            for schema_class, _subset in self._buckets
-        )
-        classes = list(dict.fromkeys(classes))
-        bucket_order = [
-            (schema_class, subset)
-            for subset in SUBSETS
-            for schema_class in classes
-            if (schema_class, subset) in self._buckets
-        ]
+        bucket_order = _ordered_bucket_keys(self.quotas)
         ordered_buckets = {
             key: sorted(self._buckets[key], key=lambda ranked: ranked.key)
             for key in bucket_order
@@ -221,7 +253,7 @@ def _select_candidates(
 ) -> list[_RankedCandidate]:
     index_path = staging_dir / ".candidate-index.sqlite3"
     connection = sqlite3.connect(index_path)
-    nonempty_buckets: set[tuple[str, str]] = set()
+    capacities: dict[tuple[str, str], int] = defaultdict(int)
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA temp_store=MEMORY")
@@ -248,16 +280,17 @@ def _select_candidates(
                 # provisional and are skipped; malformed rows fail above.
                 if not source_path.is_file():
                     continue
-                nonempty_buckets.add(
+                capacities[
                     (candidate.schema_class, candidate.subset)
-                )
+                ] += 1
         connection.commit()
-        if not nonempty_buckets:
+        if not capacities:
             raise ValueError("no existing candidate tables were found")
-        pool = _RoundRobinCandidatePool(
-            table_count,
-            len(nonempty_buckets),
+        quotas = _allocate_round_robin_quotas(
+            dict(capacities),
+            table_count=table_count,
         )
+        pool = _RoundRobinCandidatePool(quotas)
         for archive in _statistics_archives(source_dir):
             for candidate in read_statistics_catalog(archive):
                 source_path = _validated_source_path(
