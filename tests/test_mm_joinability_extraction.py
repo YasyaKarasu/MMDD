@@ -789,6 +789,7 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
         builder_script=Path("/repo/scripts/build_mm_joinability_dataset.py"),
         input_dir=Path("/data/input"),
         output_dir=Path("/data/output"),
+        runtime_dir=tmp_path / "runtime",
         text_server=text_server,
         primary_image_server=image_server,
         text_endpoints_file=tmp_path / "text_endpoints.txt",
@@ -812,6 +813,9 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
     assert "--model_image_done_marker" in command
     assert "--text_model_base_urls_file" in command
     assert "--image_model_base_urls_file" in command
+    assert command[command.index("--runtime_dir") + 1] == str(
+        tmp_path / "runtime"
+    )
     assert "http://127.0.0.1:8001/v1" in command
     assert "http://127.0.0.1:8000/v1" in command
     assert command[-4:] == [
@@ -969,6 +973,7 @@ def test_dynamic_vllm_default_runtime_is_outside_task8_output(
     }
 
     assert command[1] == "/repo/scripts/build_wdc200k_mm_joinability_dataset.py"
+    assert command[command.index("--runtime_dir") + 1] == str(runtime_dir)
     for option, filename in runtime_options.items():
         path = Path(command[command.index(option) + 1])
         assert path == runtime_dir / filename
@@ -985,6 +990,9 @@ def test_dynamic_vllm_preserves_explicit_runtime_dir(monkeypatch, tmp_path):
         runtime_dir=explicit_runtime,
     )
 
+    assert command[command.index("--runtime_dir") + 1] == str(
+        explicit_runtime
+    )
     for option in (
         "--text_model_base_urls_file",
         "--image_model_base_urls_file",
