@@ -96,6 +96,24 @@ def _event_histogram(
     return tuple(counts), overflow
 
 
+def _eligible_symmetric_factor(
+    *,
+    completed: int,
+    total: int,
+    predicted: float | None,
+    actual: float,
+) -> float | None:
+    eligible = 2 * completed >= total and completed < total
+    if not eligible:
+        return None
+    assert predicted is not None, "eligible sample has no ETA prediction"
+    assert math.isfinite(predicted), "eligible ETA prediction is not finite"
+    assert predicted > 0.0, "eligible ETA prediction is not positive"
+    assert math.isfinite(actual), "eligible actual remaining time is not finite"
+    assert actual > 0.0, "eligible actual remaining time is not positive"
+    return max(predicted / actual, actual / predicted)
+
+
 def _replay(path: Path) -> ReplayResult:
     fixture = _fixture(path)
     total = int(fixture["total"])
@@ -167,10 +185,12 @@ def _replay(path: Path) -> ReplayResult:
         estimate = estimate_url_eta(snapshot)
         actual = final_elapsed - elapsed
         predicted = estimate.predicted_remaining_seconds
-        eligible = 2 * len(durable) >= total and len(durable) < total
-        factor = None
-        if eligible and predicted is not None and predicted > 0.0 and actual > 0.0:
-            factor = max(predicted / actual, actual / predicted)
+        factor = _eligible_symmetric_factor(
+            completed=len(durable),
+            total=total,
+            predicted=predicted,
+            actual=actual,
+        )
         samples.append(
             ReplaySample(
                 completed_units=len(durable),
@@ -185,11 +205,18 @@ def _replay(path: Path) -> ReplayResult:
             )
         )
 
-    eligible_samples = [sample for sample in samples if sample.symmetric_factor]
-    worst = max(eligible_samples, key=lambda sample: sample.symmetric_factor or 0.0)
+    eligible_samples = [
+        sample
+        for sample in samples
+        if 2 * sample.completed_units >= total
+        and sample.completed_units < total
+    ]
+    assert all(sample.symmetric_factor is not None for sample in eligible_samples)
+    worst = max(eligible_samples, key=lambda sample: float(sample.symmetric_factor))
+    assert worst.symmetric_factor is not None
     return ReplayResult(
         samples=tuple(samples),
-        max_symmetric_factor=worst.symmetric_factor or 0.0,
+        max_symmetric_factor=worst.symmetric_factor,
         worst_completed_units=worst.completed_units,
     )
 
@@ -256,10 +283,38 @@ def test_gate_prefix_replay_passes_without_future_state() -> None:
     assert page.max_symmetric_factor == pytest.approx(1.8978047370910645)
     assert page.worst_completed_units == 82
     assert image.max_symmetric_factor <= 1.8537476708755196
+    assert sum(sample.symmetric_factor is not None for sample in page.samples) == 50
+    assert sum(sample.symmetric_factor is not None for sample in image.samples) == 67
     assert all(
         sample.used_future_state is False
         for sample in page.samples + image.samples
     )
+
+
+@pytest.mark.parametrize(
+    ("predicted", "actual"),
+    [
+        (None, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (math.nan, 1.0),
+        (math.inf, 1.0),
+        (1.0, 0.0),
+        (1.0, math.nan),
+        (1.0, math.inf),
+    ],
+)
+def test_eligible_factor_rejects_non_positive_or_non_finite_samples(
+    predicted: float | None,
+    actual: float,
+) -> None:
+    with pytest.raises(AssertionError):
+        _eligible_symmetric_factor(
+            completed=50,
+            total=100,
+            predicted=predicted,
+            actual=actual,
+        )
 
 
 def test_snapshot_and_estimate_have_the_exact_public_fields() -> None:
@@ -450,6 +505,34 @@ def test_completed_snapshot_has_zero_remaining_eta() -> None:
     ],
 )
 def test_snapshot_rejects_invalid_topology_and_schema(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        _snapshot(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "transport_event_histogram": _histogram(64, {0: 1}),
+            "transport_overflow_events": 1,
+        },
+        {
+            "local_buffered_not_started": 0,
+            "in_flight_jobs": 1,
+            "physical_in_flight": 1,
+            "active_censor_histogram": _histogram(64, {0: 1}),
+            "active_overflow_censors": 1,
+        },
+        {
+            "commit_event_histogram": _histogram(32, {0: 1}),
+            "commit_overflow_events": 1,
+        },
+    ],
+    ids=("transport", "active-censor", "commit"),
+)
+def test_snapshot_rejects_overflow_not_represented_in_last_bin(
     overrides: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError):

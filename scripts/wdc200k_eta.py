@@ -146,8 +146,8 @@ class UrlProgressSnapshot:
             ),
         )
         for overflow, histogram, name in overflow_pairs:
-            if overflow > sum(histogram):
-                raise ValueError(f"{name} exceeds its histogram total")
+            if overflow > histogram[-1]:
+                raise ValueError(f"{name} exceeds its final histogram bin")
 
 
 @dataclass(frozen=True)
