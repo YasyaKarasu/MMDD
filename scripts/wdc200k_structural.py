@@ -22,6 +22,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         StageFingerprint,
         StageManifest,
         validate_completed_shard,
@@ -49,6 +50,7 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            PreWriteGuard,
             StageFingerprint,
             StageManifest,
             validate_completed_shard,
@@ -117,6 +119,8 @@ class _AtomicSourceTableShard(AtomicJsonlShard):
     ) -> None:
         if self._handle.closed:
             raise RuntimeError("cannot write to a closed shard")
+        if self.pre_write_guard is not None:
+            self.pre_write_guard(self.path, 0)
         prefix_fields = (
             "source_table_id",
             "source_file",
@@ -845,6 +849,7 @@ def finalize_validated_selection(
     *,
     output_root: Path,
     target_tables: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> FinalizedSelectionResult:
     """Atomically publish the global selection after every structural shard.
 
@@ -907,7 +912,11 @@ def finalize_validated_selection(
     )
     final_manifest: StageManifest | None = None
     if manifest_path.exists():
-        final_manifest = StageManifest(manifest_path, fingerprint)
+        final_manifest = StageManifest(
+            manifest_path,
+            fingerprint,
+            pre_write_guard=pre_write_guard,
+        )
         if final_manifest.complete:
             expected_final_path = final_path.relative_to(
                 output_root
@@ -944,7 +953,12 @@ def finalize_validated_selection(
     )
     os.close(descriptor)
     database_path = Path(database_name)
-    writer = AtomicJsonlShard(final_path)
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, 0)
+    writer = AtomicJsonlShard(
+        final_path,
+        pre_write_guard=pre_write_guard,
+    )
     connection = sqlite3.connect(database_path)
     record_count = 0
     required_fields = {
@@ -1018,7 +1032,11 @@ def finalize_validated_selection(
             output_root,
         )
         if final_manifest is None:
-            final_manifest = StageManifest(manifest_path, fingerprint)
+            final_manifest = StageManifest(
+                manifest_path,
+                fingerprint,
+                pre_write_guard=pre_write_guard,
+            )
         final_manifest.record_shard(completed)
         final_manifest.mark_complete()
     except BaseException:
@@ -1098,6 +1116,7 @@ def expand_selected_shard(
     input_fingerprint: str | None = None,
     min_rows: int = 1,
     min_cols: int = 1,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> StructuralExpansionResult:
     """Expand one provisional-selection shard with durable replacement recovery."""
     if not shard_id or any(
@@ -1111,6 +1130,8 @@ def expand_selected_shard(
     input_root = Path(input_root)
     paths = _paths(output_root, shard_id)
     spool_root = output_root / ".structural_spool" / shard_id
+    if pre_write_guard is not None:
+        pre_write_guard(spool_root, 0)
     spool_root.mkdir(parents=True, exist_ok=True)
     for stale_spool_file in spool_root.iterdir():
         if stale_spool_file.is_file():
@@ -1138,7 +1159,11 @@ def expand_selected_shard(
         schema_version=STRUCTURAL_SCHEMA_VERSION,
     )
     try:
-        manifest = StageManifest(paths.manifest, fingerprint)
+        manifest = StageManifest(
+            paths.manifest,
+            fingerprint,
+            pre_write_guard=pre_write_guard,
+        )
     except BaseException:
         if selection_spool_path is not None:
             selection_spool_path.unlink(missing_ok=True)
@@ -1163,17 +1188,29 @@ def expand_selected_shard(
 
     try:
         writers = {
-            "source_tables": _AtomicSourceTableShard(paths.source_tables),
-            "entities": AtomicJsonlShard(paths.entities),
-            "page_refs": AtomicJsonlShard(paths.page_refs),
+            "source_tables": _AtomicSourceTableShard(
+                paths.source_tables,
+                pre_write_guard=pre_write_guard,
+            ),
+            "entities": AtomicJsonlShard(
+                paths.entities,
+                pre_write_guard=pre_write_guard,
+            ),
+            "page_refs": AtomicJsonlShard(
+                paths.page_refs,
+                pre_write_guard=pre_write_guard,
+            ),
             "direct_image_refs": AtomicJsonlShard(
-                paths.direct_image_refs
+                paths.direct_image_refs,
+                pre_write_guard=pre_write_guard,
             ),
             "structural_failures": AtomicJsonlShard(
-                paths.structural_failures
+                paths.structural_failures,
+                pre_write_guard=pre_write_guard,
             ),
             "validated_selection": AtomicJsonlShard(
-                paths.validated_selection
+                paths.validated_selection,
+                pre_write_guard=pre_write_guard,
             ),
         }
     except BaseException:

@@ -29,6 +29,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         StageFingerprint,
         StageManifest,
         SqliteJobStore,
@@ -61,6 +62,7 @@ except ModuleNotFoundError as error:
         io_helpers = importlib.import_module("wdc200k_io")
         AtomicJsonlShard = io_helpers.AtomicJsonlShard
         CompletedShard = io_helpers.CompletedShard
+        PreWriteGuard = io_helpers.PreWriteGuard
         StageFingerprint = io_helpers.StageFingerprint
         StageManifest = io_helpers.StageManifest
         SqliteJobStore = io_helpers.SqliteJobStore
@@ -856,12 +858,14 @@ class _BoundedShardWriter:
         self,
         directory: Path,
         records_per_shard: int,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> None:
         self.directory = directory
         self.records_per_shard = records_per_shard
         self.current: AtomicJsonlShard | None = None
         self.current_records = 0
         self.completed: list[CompletedShard] = []
+        self.pre_write_guard = pre_write_guard
 
     def write(self, record: dict[str, Any]) -> None:
         if (
@@ -873,7 +877,10 @@ class _BoundedShardWriter:
                 self.directory
                 / f"part-{len(self.completed):05d}.jsonl"
             )
-            self.current = AtomicJsonlShard(path)
+            self.current = AtomicJsonlShard(
+                path,
+                pre_write_guard=self.pre_write_guard,
+            )
             self.current_records = 0
         self.current.write(record)
         self.current_records += 1
@@ -895,7 +902,13 @@ class _BoundedShardWriter:
         self.current_records = 0
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    if pre_write_guard is not None:
+        pre_write_guard(path, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -904,6 +917,8 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if pre_write_guard is not None:
+            pre_write_guard(path, temporary.stat().st_size)
         temporary.replace(path)
         descriptor = os.open(path.parent, os.O_RDONLY)
         try:
@@ -915,14 +930,18 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-def _atomic_json_if_changed(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json_if_changed(
+    path: Path,
+    payload: dict[str, Any],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
     if path.exists():
         try:
             if json.loads(path.read_text(encoding="utf-8")) == payload:
                 return
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-    _atomic_json(path, payload)
+    _atomic_json(path, payload, pre_write_guard)
 
 
 def _relative_completed(
@@ -1174,6 +1193,7 @@ def persist_entity_asset_plans(
     input_fingerprint: str,
     budget: ImageBudget = ImageBudget(),
     records_per_shard: int = 10_000,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> AssetPlanShards:
     """Persist entity/page inputs and all selected URL mappings in shards."""
     if not input_fingerprint:
@@ -1195,10 +1215,12 @@ def persist_entity_asset_plans(
     entity_writer = _BoundedShardWriter(
         output_root / "entity_plans",
         records_per_shard,
+        pre_write_guard,
     )
     mapping_writer = _BoundedShardWriter(
         output_root / "image_mappings",
         records_per_shard,
+        pre_write_guard,
     )
     try:
         for entity, page_outcome in entity_pages:
@@ -1253,6 +1275,7 @@ def persist_entity_asset_plans(
             ],
             "complete": True,
         },
+        pre_write_guard,
     )
     return AssetPlanShards(
         output_root=output_root,
@@ -1274,6 +1297,7 @@ def build_unique_image_jobs(
     *,
     chunk_records: int = 100_000,
     merge_fan_in: int = 64,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> UniqueImageJobs:
     """Publish one image job per globally unique normalized URL."""
     resumed = _validated_planning_result(planned)
@@ -1303,6 +1327,7 @@ def build_unique_image_jobs(
             input_fingerprint=input_fingerprint,
             parameter_fingerprint=parameter_fingerprint,
         ),
+        pre_write_guard=pre_write_guard,
     )
     if manifest.complete:
         if len(manifest.completed_shards) != 1:
@@ -1317,6 +1342,7 @@ def build_unique_image_jobs(
             key_fn=lambda record: record["url_key"],
             chunk_records=chunk_records,
             merge_fan_in=merge_fan_in,
+            pre_write_guard=pre_write_guard,
         )
         manifest.record_shard(completed)
         manifest.mark_complete()
@@ -1832,6 +1858,7 @@ def _fetch_image_job(
     *,
     transport: Any,
     image_dir: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     image_url = str(payload["image_url"])
     cached = _transport_image_outcome(transport, image_url)
@@ -1839,6 +1866,11 @@ def _fetch_image_job(
         if cached["status"] == "success":
             return _content_address_outcome(cached, image_dir)
         return cached
+    if pre_write_guard is not None:
+        pre_write_guard(
+            image_dir,
+            int(getattr(transport, "max_image_bytes", 0) or 0),
+        )
     try:
         downloaded = transport.download_image(
             image_url,
@@ -1889,6 +1921,7 @@ def _execute_image_job(
     claim_lease_seconds: float,
     claim_poll_seconds: float,
     after_url_claim: Callable[[ImageUrlLease], None] | None,
+    pre_write_guard: PreWriteGuard | None,
 ) -> ImageJobExecution:
     """Wait for or acquire the shared policy+URL claim before networking."""
     url_key = str(payload["url_key"])
@@ -1912,6 +1945,7 @@ def _execute_image_job(
                     payload,
                     transport=transport,
                     image_dir=image_dir,
+                    pre_write_guard=pre_write_guard,
                 ),
                 lease=decision.lease,
             )
@@ -1940,9 +1974,13 @@ def fetch_unique_images(
     url_claim_poll_seconds: float = 0.05,
     after_url_claim: Callable[[ImageUrlLease], None] | None = None,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ImageFetchResult:
     """Fetch globally unique image URLs with bounded fair durable jobs."""
     unique_jobs = _validated_unique_image_jobs(unique_jobs)
+    if pre_write_guard is not None:
+        for target in (store.path, outcomes_path or store.path, image_dir):
+            pre_write_guard(Path(target), 0)
     if policy.retries != 0:
         raise ValueError("image fetching permits exactly zero retries")
     transport_policy = getattr(
@@ -2113,6 +2151,7 @@ def fetch_unique_images(
                 claim_lease_seconds=effective_url_claim_lease,
                 claim_poll_seconds=float(url_claim_poll_seconds),
                 after_url_claim=after_url_claim,
+                pre_write_guard=pre_write_guard,
             )
             futures[future] = (job, host)
             add_ready(host)
@@ -2154,6 +2193,8 @@ def fetch_unique_images(
                         str(job.payload["url_key"]),
                     )
                 else:
+                    if pre_write_guard is not None:
+                        pre_write_guard(outcomes_path, 0)
                     persisted = outcome_store.put_claimed(
                         fingerprint,
                         str(job.payload["url_key"]),
@@ -2232,7 +2273,11 @@ def fetch_unique_images(
             **outcome_snapshot,
         },
     }
-    _atomic_json_if_changed(fetch_manifest_path, fetch_manifest)
+    _atomic_json_if_changed(
+        fetch_manifest_path,
+        fetch_manifest,
+        pre_write_guard,
+    )
     fetch_manifest_sha256 = _sha256_file(fetch_manifest_path)
     return ImageFetchResult(
         unique=unique,
@@ -2881,6 +2926,7 @@ def materialize_asset_shards(
     min_text_asset_chunk_chars: int = 120,
     max_text_asset_chunks_per_entity: int = 3,
     records_per_shard: int = 10_000,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializedAssetShards:
     """Stream canonical bridge assets and source-table links into shards."""
     if not input_fingerprint:
@@ -2947,10 +2993,12 @@ def materialize_asset_shards(
     asset_writer = _BoundedShardWriter(
         output_root / "bridge_assets",
         records_per_shard,
+        pre_write_guard,
     )
     link_writer = _BoundedShardWriter(
         output_root / "table_asset_links",
         records_per_shard,
+        pre_write_guard,
     )
     try:
         for planned_record in _iter_jsonl(planned.entity_plan_paths):
@@ -3025,6 +3073,7 @@ def materialize_asset_shards(
             ],
             "complete": True,
         },
+        pre_write_guard,
     )
     return MaterializedAssetShards(
         output_root=output_root,

@@ -26,6 +26,7 @@ try:
     from wdc200k_io import (
         CompletedShard,
         Job,
+        PreWriteGuard,
         SqliteJobStore,
         validate_completed_shard,
     )
@@ -39,6 +40,7 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             CompletedShard,
             Job,
+            PreWriteGuard,
             SqliteJobStore,
             validate_completed_shard,
         )
@@ -624,11 +626,18 @@ def _fetch_one(
     *,
     transport: Any,
     policy: FetchPolicy,
+    pre_write_guard: PreWriteGuard | None = None,
+    target_path: Path | None = None,
 ) -> dict[str, Any]:
     page_url = str(job.payload["page_url"])
     cached = _transport_cached_outcome(transport, page_url, policy)
     if cached is not None:
         return cached
+    if pre_write_guard is not None:
+        pre_write_guard(
+            target_path or Path("."),
+            int(getattr(transport, "max_page_bytes", 0) or 0),
+        )
     try:
         payload = transport.fetch_page(
             page_url,
@@ -957,6 +966,7 @@ def fetch_unique_pages(
     max_wait_seconds: float = 0.0,
     poll_interval_seconds: float = 0.05,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> FetchResult:
     """Fetch each Task-3 URL key once for this exact policy.
 
@@ -987,6 +997,9 @@ def fetch_unique_pages(
         progress_path
         or store.path.with_name(f"{store.path.stem}-page-progress.json")
     )
+    if pre_write_guard is not None:
+        for target in (store.path, outcomes_path, failure_path, progress_path):
+            pre_write_guard(target, 0)
     outcome_store = PageOutcomeStore(outcomes_path)
     _enqueue_page_refs(
         page_refs,
@@ -1145,6 +1158,8 @@ def fetch_unique_pages(
                 job,
                 transport=transport,
                 policy=policy,
+                pre_write_guard=pre_write_guard,
+                target_path=outcomes_path,
             )
             futures[future] = (job, host)
             add_ready(host)
@@ -1210,6 +1225,8 @@ def fetch_unique_pages(
                         host_states.pop(host, None)
                         ready_set.discard(host)
                     outcome = future.result()
+                    if pre_write_guard is not None:
+                        pre_write_guard(outcomes_path, 0)
                     persisted = outcome_store.put(
                         fingerprint,
                         str(job.payload["url_key"]),

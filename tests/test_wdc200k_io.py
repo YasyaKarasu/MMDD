@@ -47,6 +47,63 @@ def test_atomic_shard_is_visible_only_after_commit(tmp_path: Path) -> None:
     assert validate_completed_shard(record, root=tmp_path)
 
 
+def test_atomic_shard_guard_runs_before_open_write_and_commit(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, int]] = []
+    target = tmp_path / "target" / "part.jsonl"
+    shard = AtomicJsonlShard(
+        target,
+        pre_write_guard=lambda path, size=0: calls.append((path, size)),
+    )
+    shard.write({"id": "a"})
+    shard.commit()
+
+    assert calls[0] == (target, 0)
+    assert calls[-1][0] == target
+    assert calls[-1][1] > 0
+
+
+def test_atomic_shard_guard_failure_before_commit_preserves_checkpoint(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "part.jsonl"
+    estimated_checks = 0
+
+    def guard(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal estimated_checks
+        if estimated_bytes:
+            estimated_checks += 1
+            if estimated_checks == 2:
+                raise OSError("disk reserve")
+
+    shard = AtomicJsonlShard(target, pre_write_guard=guard)
+    shard.write({"id": "a"})
+    with pytest.raises(OSError, match="disk reserve"):
+        shard.commit()
+    shard.abort()
+
+    assert not target.exists()
+
+
+def test_atomic_shard_amortizes_guard_checks_by_byte_window(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    shard = AtomicJsonlShard(
+        tmp_path / "part.jsonl",
+        pre_write_guard=lambda _path, size=0: calls.append(size),
+        guard_interval_bytes=30,
+    )
+    for index in range(5):
+        shard.write({"id": index})
+    shard.commit()
+
+    positive_write_checks = calls[1:-1]
+    assert positive_write_checks == [30, 30]
+    assert len(positive_write_checks) < 5
+
+
 def test_job_store_does_not_reclaim_terminal_outcomes(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "jobs.sqlite3")
     store.enqueue("page", "url-1", {"url": "https://example.test/a"})

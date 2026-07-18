@@ -22,6 +22,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         StageFingerprint,
         StageManifest,
         external_unique_jsonl,
@@ -34,6 +35,7 @@ except ModuleNotFoundError as error:
     from scripts.wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         StageFingerprint,
         StageManifest,
         external_unique_jsonl,
@@ -1497,12 +1499,16 @@ def _write_selection_outputs(
     selection_dir: Path,
     policy: SelectionPolicy,
     sort_chunk_records: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[CompletedShard, CompletedShard]:
     unsorted_path = selection_dir / "catalog-unsorted.jsonl"
     canonical_path = selection_dir / "catalog-canonical.jsonl"
     unique_path = selection_dir / "catalog-unique.jsonl"
     sorted_path = selection_dir / "catalog-ranked.jsonl"
-    unsorted = AtomicJsonlShard(unsorted_path)
+    unsorted = AtomicJsonlShard(
+        unsorted_path,
+        pre_write_guard=pre_write_guard,
+    )
     selected: AtomicJsonlShard | None = None
     reserve: AtomicJsonlShard | None = None
     try:
@@ -1514,8 +1520,12 @@ def _write_selection_outputs(
             canonical_path,
             key_fn=_record_canonical_key,
             chunk_records=sort_chunk_records,
+            pre_write_guard=pre_write_guard,
         )
-        unique = AtomicJsonlShard(unique_path)
+        unique = AtomicJsonlShard(
+            unique_path,
+            pre_write_guard=pre_write_guard,
+        )
         try:
             previous_path: str | None = None
             with canonical_path.open("r", encoding="utf-8") as handle:
@@ -1546,13 +1556,16 @@ def _write_selection_outputs(
                 record["relative_path"],
             ],
             chunk_records=sort_chunk_records,
+            pre_write_guard=pre_write_guard,
         )
 
         selected = AtomicJsonlShard(
-            selection_dir / "selected_tables.jsonl"
+            selection_dir / "selected_tables.jsonl",
+            pre_write_guard=pre_write_guard,
         )
         reserve = AtomicJsonlShard(
-            selection_dir / "reserve_tables.jsonl"
+            selection_dir / "reserve_tables.jsonl",
+            pre_write_guard=pre_write_guard,
         )
         selected_by_stratum: dict[tuple[str, str], int] = defaultdict(int)
         with sorted_path.open("r", encoding="utf-8") as handle:
@@ -1592,6 +1605,7 @@ def run_selection(
     policy: SelectionPolicy,
     *,
     sort_chunk_records: int = 100_000,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
     """Create or resume the durable provisional selection stage."""
     if sort_chunk_records <= 0:
@@ -1600,6 +1614,8 @@ def run_selection(
     if not archives:
         raise ValueError(f"no statistics archives found under {input_dir}")
     selection_dir = work_dir / "selection"
+    if pre_write_guard is not None:
+        pre_write_guard(selection_dir, 0)
     selection_dir.mkdir(parents=True, exist_ok=True)
     input_fingerprint = stable_hash(
         *(
@@ -1626,6 +1642,7 @@ def run_selection(
             input_fingerprint=input_fingerprint,
             parameter_fingerprint=parameter_fingerprint,
         ),
+        pre_write_guard=pre_write_guard,
     )
     if manifest.complete:
         if not all(
@@ -1646,6 +1663,7 @@ def run_selection(
         selection_dir,
         policy,
         sort_chunk_records,
+        pre_write_guard,
     )
     manifest.record_shard(selected_completed)
     manifest.record_shard(reserve_completed)

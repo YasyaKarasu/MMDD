@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import gzip
+import os
 import shutil
 import subprocess
 import sys
@@ -20,8 +21,11 @@ if str(SCRIPTS) not in sys.path:
 
 from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
     STAGES,
+    DiskGuard,
     DiskSpaceInsufficientError,
     PipelineConfig,
+    ProgressReporter,
+    _publish_network_manifest,
     invalidate_from_stage,
     parse_args,
     run_pipeline,
@@ -76,7 +80,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     args = parse_args(
         [
             "--input_dir",
-            str(tmp_path),
+            str(tmp_path / "input"),
             "--output_dir",
             str(tmp_path / "out"),
         ]
@@ -93,6 +97,8 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.resume is True
     assert args.refresh_page_cache is False
     assert args.refresh_image_cache is False
+    config = PipelineConfig.from_args(args)
+    assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
         "selection",
         "structural",
@@ -119,6 +125,53 @@ def test_pipeline_config_requires_separate_roots(tmp_path: Path) -> None:
                 ]
             )
         )
+
+
+def test_runtime_state_must_stay_outside_input_cache_and_output(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    _statistics_archive(input_dir)
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(input_dir),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--cache_dir",
+                str(tmp_path / "cache"),
+                "--runtime_dir",
+                str(tmp_path / "output" / "runtime"),
+                "--dry_run",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="outside output"):
+        run_pipeline(config)
+
+
+def test_disk_guard_checks_the_actual_target_filesystem(
+    tmp_path: Path,
+) -> None:
+    work = tmp_path / "work"
+    cache = tmp_path / "cache"
+    output = tmp_path / "output"
+    for root in (work, cache, output):
+        root.mkdir()
+    free_by_root = {work: 1_000, cache: 150, output: 500}
+
+    def usage(path: Path) -> Any:
+        return shutil._ntuple_diskusage(2_000, 2_000 - free_by_root[path], free_by_root[path])
+
+    guard = DiskGuard(100, usage_fn=usage)
+    guard(work / "nested" / "part.jsonl", 800)
+    guard(output / "dataset.json", 400)
+    with pytest.raises(DiskSpaceInsufficientError, match="estimated=60"):
+        guard(cache / "images" / "asset.jpg", 60)
 
 
 def test_dry_run_validates_without_writes_or_network(
@@ -247,7 +300,11 @@ def test_stop_after_structural_emits_exact_counts_without_network(
     assert progress["stage"] == "structural"
     assert progress["counters"]["entities"] == 2
     assert progress["disk"]["free_bytes"] >= 0
-    assert "[wdc200k]" in capsys.readouterr().out
+    stdout = capsys.readouterr().out
+    assert "[wdc200k]" in stdout
+    assert "work=" in stdout and "cache=" in stdout and "output=" in stdout
+    assert "free_work=" in stdout and "free_cache=" in stdout
+    assert "free_output=" in stdout and "reserve=" in stdout
     assert not config.cache_dir.exists()
     assert not config.output_dir.exists()
 
@@ -288,7 +345,7 @@ def test_from_stage_moves_named_and_downstream_without_deleting(
         "cache", encoding="utf-8"
     )
 
-    stale = invalidate_from_stage(config, "pages")
+    archived = invalidate_from_stage(config, "pages")
 
     assert (
         config.work_dir / "stage_manifests/pipeline-structural.json"
@@ -296,8 +353,11 @@ def test_from_stage_moves_named_and_downstream_without_deleting(
     assert not (
         config.work_dir / "stage_manifests/pipeline-pages.json"
     ).exists()
-    assert (stale / "stage_manifests/pipeline-pages.json").read_text() == "pages"
-    assert (stale / "page_jobs/state").read_text() == "page"
+    destinations = {move.source: move.destination for move in archived.moves}
+    assert destinations[
+        config.work_dir / "stage_manifests/pipeline-pages.json"
+    ].read_text() == "pages"
+    assert destinations[config.work_dir / "page_jobs"].joinpath("state").read_text() == "page"
     assert (config.cache_dir / "page_cache/keep").read_text() == "cache"
 
 
@@ -478,6 +538,37 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
         assert registry["producer_type"]
 
 
+def test_resume_repairs_corrupt_network_snapshot_from_authoritative_store(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    page_transport = _PipelinePageTransport()
+    image_transport = _PipelineImageTransport()
+    run_pipeline(
+        config,
+        page_transport=page_transport,
+        image_transport=image_transport,
+        extractor=_PipelineExtractor(),
+    )
+    manifest_path = config.work_dir / "page_jobs/network/network-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    outcome_path = manifest_path.parent / manifest["completed_shards"][0]["path"]
+    expected = outcome_path.read_bytes()
+    outcome_path.write_text("corrupt\n", encoding="utf-8")
+    calls = (page_transport.calls, image_transport.calls)
+
+    resumed = run_pipeline(
+        config,
+        page_transport=page_transport,
+        image_transport=image_transport,
+        extractor=_PipelineExtractor(),
+    )
+
+    assert resumed.status == "complete"
+    assert outcome_path.read_bytes() == expected
+    assert (page_transport.calls, image_transport.calls) == calls
+
+
 @pytest.mark.parametrize("terminal_failure", [False, True])
 def test_page_outcome_survives_interruption_before_job_commit(
     tmp_path: Path,
@@ -545,7 +636,7 @@ def test_from_stage_rejects_tampered_upstream_before_moving_state(
         )
 
     assert (config.work_dir / "page_jobs").is_dir()
-    assert not (config.work_dir / "stale").exists()
+    assert not (config.work_dir / ".archive-transactions").exists()
 
 
 def test_from_stage_rejects_corrupt_upstream_shard_before_moving_state(
@@ -578,7 +669,7 @@ def test_from_stage_rejects_corrupt_upstream_shard_before_moving_state(
         )
 
     assert (config.work_dir / "page_jobs").is_dir()
-    assert not (config.work_dir / "stale").exists()
+    assert not (config.work_dir / ".archive-transactions").exists()
 
 
 def test_stop_after_selection_does_not_expand_structural_tables(
@@ -613,6 +704,91 @@ def test_progress_stdout_is_bounded_between_periodic_snapshots(
     assert len(progress_lines) <= 3
 
 
+def test_progress_rolling_rate_uses_a_fixed_time_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    reporter = ProgressReporter(config)
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    reporter._state.stage = "test"
+    reporter._state.started_at = 0.0
+    reporter._state.stage_started_at = 0.0
+    reporter._rolling_samples.clear()
+
+    clock[0] = 10.0
+    reporter.update(completed_shards=90, total_shards=200)
+    reporter._snapshot()
+    clock[0] = 70.0
+    reporter.update(completed_shards=100)
+    snapshot = reporter._snapshot()
+
+    assert snapshot["rates"]["shards_per_second"] == pytest.approx(100 / 70)
+    assert snapshot["rates"]["rolling_shards_per_second"] == pytest.approx(10 / 60)
+    assert snapshot["rates"]["rolling_shards_per_second"] != snapshot["rates"]["shards_per_second"]
+
+
+def test_tree_bytes_tolerates_files_removed_during_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VanishedEntry:
+        path = str(tmp_path / ".progress.tmp")
+
+        def is_dir(self, *, follow_symlinks: bool) -> bool:
+            return False
+
+        def is_file(self, *, follow_symlinks: bool) -> bool:
+            return True
+
+        def stat(self, *, follow_symlinks: bool) -> Any:
+            raise FileNotFoundError(self.path)
+
+    class Entries:
+        def __enter__(self) -> list[VanishedEntry]:
+            return [VanishedEntry()]
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(pipeline_module.os, "scandir", lambda _path: Entries())
+
+    assert pipeline_module._tree_bytes(tmp_path) == 0
+
+
+def test_network_outcome_manifest_repairs_only_the_corrupt_shard(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "network"
+    records = [{"job_id": index} for index in range(5)]
+    arguments = {
+        "policy_fingerprint": "policy-v1",
+        "unique": 5,
+        "success": 5,
+        "terminal": 0,
+        "pending": 0,
+        "leased": 0,
+        "records_per_shard": 2,
+    }
+    manifest_path = _publish_network_manifest(root, iter(records), **arguments)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shards = [root / item["path"] for item in manifest["completed_shards"]]
+    assert [item["records"] for item in manifest["completed_shards"]] == [2, 2, 1]
+    mtimes = [path.stat().st_mtime_ns for path in shards]
+
+    shards[1].write_text("corrupt\n", encoding="utf-8")
+    os.utime(shards[1], ns=(1, 1))
+    corrupt_mtime = shards[1].stat().st_mtime_ns
+    repaired_path = _publish_network_manifest(root, iter(records), **arguments)
+    repaired = json.loads(repaired_path.read_text(encoding="utf-8"))
+
+    assert len(repaired["completed_shards"]) == 3
+    assert shards[0].stat().st_mtime_ns == mtimes[0]
+    assert shards[2].stat().st_mtime_ns == mtimes[2]
+    assert shards[1].stat().st_mtime_ns != corrupt_mtime
+
+
 def test_resume_rejects_tampered_existing_registry_chain(
     tmp_path: Path,
 ) -> None:
@@ -633,32 +809,73 @@ def test_resume_rejects_tampered_existing_registry_chain(
         run_pipeline(config, page_transport=_PipelinePageTransport())
 
 
-def test_page_commit_rechecks_disk_reserve(
+def test_page_cache_guard_stops_before_outcome_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(_full_pipeline_config(tmp_path), stop_after="pages")
-    page_checks = 0
-    original = pipeline_module._check_disk_reserve
+    original = pipeline_module.DiskGuard.__call__
+    guarded_targets: list[Path] = []
 
-    def fail_after_page_commit(current: PipelineConfig, stage: str) -> None:
-        nonlocal page_checks
-        if stage == "pages":
-            page_checks += 1
-            if page_checks == 2:
-                raise DiskSpaceInsufficientError("synthetic reserve exhausted")
-        original(current, stage)
+    def fail_before_cache_write(
+        guard: DiskGuard,
+        target: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        target = Path(target).resolve()
+        guarded_targets.append(target)
+        if target == config.cache_dir / "page_cache" / "outcomes.sqlite3":
+            raise DiskSpaceInsufficientError("synthetic cache reserve exhausted")
+        original(guard, target, estimated_bytes)
 
     monkeypatch.setattr(
-        pipeline_module,
-        "_check_disk_reserve",
-        fail_after_page_commit,
+        pipeline_module.DiskGuard,
+        "__call__",
+        fail_before_cache_write,
     )
 
-    with pytest.raises(DiskSpaceInsufficientError, match="reserve exhausted"):
+    with pytest.raises(DiskSpaceInsufficientError, match="cache reserve"):
         run_pipeline(config, page_transport=_PipelinePageTransport())
 
-    assert page_checks == 2
+    outcomes = config.cache_dir / "page_cache" / "outcomes.sqlite3"
+    assert outcomes in guarded_targets
+    assert not outcomes.exists()
+    assert (config.work_dir / "stage_manifests/pipeline-structural.json").is_file()
+
+
+def test_output_guard_stops_before_first_materialized_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    original = pipeline_module.DiskGuard.__call__
+
+    def fail_on_output_descendant(
+        guard: DiskGuard,
+        target: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        target = Path(target).resolve()
+        if target != config.output_dir and target.is_relative_to(config.output_dir):
+            raise DiskSpaceInsufficientError("synthetic output reserve exhausted")
+        original(guard, target, estimated_bytes)
+
+    monkeypatch.setattr(
+        pipeline_module.DiskGuard,
+        "__call__",
+        fail_on_output_descendant,
+    )
+
+    with pytest.raises(DiskSpaceInsufficientError, match="output reserve"):
+        run_pipeline(
+            config,
+            page_transport=_PipelinePageTransport(),
+            image_transport=_PipelineImageTransport(),
+            extractor=_PipelineExtractor(),
+        )
+
+    assert not (config.output_dir / "source_tables").exists()
+    assert (config.work_dir / "stage_manifests/pipeline-models.json").is_file()
 
 
 def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
@@ -730,7 +947,12 @@ def test_from_stage_rebuilds_downstream_and_reuses_durable_url_cache(
 
     assert refreshed.status == "complete"
     assert (page_transport.calls, image_transport.calls) == physical_calls
-    stale_outputs = tuple((config.work_dir / "stale").glob("*/final_output"))
+    stale_outputs = tuple(
+        (
+            config.output_dir.parent
+            / f".{config.output_dir.name}.wdc200k-stale"
+        ).glob("*/root")
+    )
     assert len(stale_outputs) == 1
     assert (stale_outputs[0] / "dataset_manifest.json").is_file()
 
@@ -763,7 +985,10 @@ def test_explicit_page_cache_refresh_archives_cache_without_deleting(
     assert page_transport.calls == 2
     assert image_transport.calls == image_calls
     archived = tuple(
-        (config.work_dir / "stale").glob("*/cache/page_cache/outcomes.sqlite3")
+        (
+            config.cache_dir.parent
+            / f".{config.cache_dir.name}.wdc200k-stale"
+        ).glob("*/page_cache/outcomes.sqlite3")
     )
     assert len(archived) == 1
     assert (config.cache_dir / "page_cache/outcomes.sqlite3").is_file()

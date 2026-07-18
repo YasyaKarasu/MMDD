@@ -37,6 +37,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         SqliteJobStore,
         validate_completed_shard,
     )
@@ -61,6 +62,7 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            PreWriteGuard,
             SqliteJobStore,
             validate_completed_shard,
         )
@@ -1437,6 +1439,7 @@ def _fenced_commit_model_record(
     after_result_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> bool:
     if heartbeat.is_lost(str(job.job_id)):
         return False
@@ -1444,6 +1447,8 @@ def _fenced_commit_model_record(
     encoded = _canonical_json(canonical)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     now = time.time()
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, len(encoded.encode("utf-8")))
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -1600,6 +1605,7 @@ def _process_claimed_group(
     after_cache_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> int:
     model_jobs: list[Any] = []
     task_by_key: dict[str, Any] = {}
@@ -1631,6 +1637,7 @@ def _process_claimed_group(
                     heartbeat=heartbeat,
                     after_cache_write=after_cache_write,
                     after_result_write=after_result_write,
+                    pre_write_guard=pre_write_guard,
                 ):
                     handled += 1
                 continue
@@ -1655,6 +1662,7 @@ def _process_claimed_group(
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
+                pre_write_guard=pre_write_guard,
             ):
                 handled += 1
         if not model_jobs:
@@ -1696,9 +1704,12 @@ def _process_claimed_group(
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
+                pre_write_guard=pre_write_guard,
             ):
                 handled += 1
 
+        if pre_write_guard is not None:
+            pre_write_guard(store.path, 0)
         run_extraction_task_group(
             extractor=extractor,
             tasks=[
@@ -2168,6 +2179,7 @@ def _publish_outputs(
     output_root: Path,
     jobset: ModelJobSet,
     records_per_shard: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelStageResult:
     identity = _manifest_identity(jobset)
     stage_root = output_root / identity
@@ -2268,7 +2280,8 @@ def _publish_outputs(
                             writers[status] = AtomicJsonlShard(
                                 stage_root
                                 / root_name
-                                / f"part-{index:05d}.jsonl"
+                                / f"part-{index:05d}.jsonl",
+                                pre_write_guard=pre_write_guard,
                             )
                         writers[status].write(record)
                         counts[status] += 1
@@ -2304,6 +2317,8 @@ def _publish_outputs(
             },
             "complete": True,
         }
+        if pre_write_guard is not None:
+            pre_write_guard(manifest_path, 0)
         _atomic_json(manifest_path, payload)
     published = _load_valid_manifest(
         manifest_path,
@@ -2345,6 +2360,7 @@ def run_model_stage(
     text_done_marker: Path | None = None,
     image_done_marker: Path | None = None,
     run_fingerprint: str = "",
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> ModelStageResult:
     """Run bounded claims, durably committing each result before job finish."""
     jobset = jobset or _latest_jobset(store.path)
@@ -2370,6 +2386,9 @@ def run_model_stage(
     output_root = Path(
         output_root or store.path.parent / "model_outputs"
     )
+    if pre_write_guard is not None:
+        pre_write_guard(store.path, 0)
+        pre_write_guard(output_root, 0)
     owner = owner or f"model-worker-{os.getpid()}-{uuid.uuid4().hex}"
     _initialize_tables(store.path)
     if (
@@ -2444,6 +2463,7 @@ def run_model_stage(
                 heartbeat_seconds=heartbeat_seconds,
                 after_result_write=after_result_write,
                 after_cache_write=after_cache_write,
+                pre_write_guard=pre_write_guard,
             )
         snapshot = _job_snapshot(store.path, jobset)
         modality_complete = _kind_is_complete(
@@ -2482,6 +2502,7 @@ def run_model_stage(
             output_root=output_root,
             jobset=jobset,
             records_per_shard=records_per_shard,
+            pre_write_guard=pre_write_guard,
         )
     return ModelStageResult(
         output_root=output_root,
@@ -2807,17 +2828,20 @@ class _AdapterShardWriter:
         root: Path,
         *,
         records_per_shard: int,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> None:
         self.root = root
         self.records_per_shard = records_per_shard
         self.completed: list[CompletedShard] = []
         self.writer: AtomicJsonlShard | None = None
         self.current_records = 0
+        self.pre_write_guard = pre_write_guard
 
     def write(self, record: dict[str, Any]) -> None:
         if self.writer is None:
             self.writer = AtomicJsonlShard(
-                self.root / f"part-{len(self.completed):05d}.jsonl"
+                self.root / f"part-{len(self.completed):05d}.jsonl",
+                pre_write_guard=self.pre_write_guard,
             )
             self.current_records = 0
         self.writer.write(record)
@@ -2996,6 +3020,7 @@ def adapt_model_tasks_from_manifests(
     output_root: Path,
     args: argparse.Namespace,
     records_per_shard: int = 10_000,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> AdaptedModelTasks:
     """Disk-index Task-3/Task-5 artifacts into authoritative model tasks."""
     if records_per_shard <= 0:
@@ -3149,6 +3174,8 @@ def adapt_model_tasks_from_manifests(
         assets_manifest=Path(assets_manifest),
     )
     output_root = Path(output_root)
+    if pre_write_guard is not None:
+        pre_write_guard(output_root, 0)
     output_root.mkdir(parents=True, exist_ok=True)
     index_path = output_root / "model-task-adapter.sqlite3"
     index_path.unlink(missing_ok=True)
@@ -3198,10 +3225,12 @@ def adapt_model_tasks_from_manifests(
     task_writer = _AdapterShardWriter(
         output_root / "tasks",
         records_per_shard=records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     error_writer = _AdapterShardWriter(
         output_root / "planning_errors",
         records_per_shard=records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     task_count = 0
     error_count = 0
@@ -3312,6 +3341,8 @@ def adapt_model_tasks_from_manifests(
         for shard in error_shards
     ]
     manifest_path = output_root / "model-task-adapter-manifest.json"
+    if pre_write_guard is not None:
+        pre_write_guard(manifest_path, 0)
     _atomic_json(
         manifest_path,
         {

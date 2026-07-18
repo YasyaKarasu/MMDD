@@ -12,9 +12,10 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import build_mm_joinability_dataset as join_builder
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder
@@ -39,6 +40,7 @@ from wdc200k_assets import (
     validate_materialized_asset_shards,
     validate_unique_image_jobs,
 )
+from wdc200k_archive import ArchiveResult, archive_pipeline_state
 from wdc200k_fetch import (
     FetchPolicy,
     FetchResult,
@@ -51,6 +53,7 @@ from wdc200k_fetch import (
 from wdc200k_io import (
     AtomicJsonlShard,
     CompletedShard,
+    PreWriteGuard,
     SqliteJobStore,
     validate_completed_shard,
 )
@@ -96,6 +99,41 @@ STAGES = (
 
 class DiskSpaceInsufficientError(RuntimeError):
     """Raised before a stage could violate the configured disk reserve."""
+
+
+class DiskGuard:
+    """Check the filesystem containing an actual write target."""
+
+    def __init__(
+        self,
+        reserve_bytes: int,
+        *,
+        usage_fn: Callable[[Path], Any] | None = None,
+    ) -> None:
+        if reserve_bytes < 0:
+            raise ValueError("disk reserve must be non-negative")
+        self.reserve_bytes = int(reserve_bytes)
+        self.usage_fn = usage_fn or shutil.disk_usage
+
+    @staticmethod
+    def _existing_ancestor(path: Path) -> Path:
+        probe = Path(path).resolve()
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe
+
+    def __call__(self, path: Path, estimated_bytes: int = 0) -> None:
+        estimated = max(0, int(estimated_bytes))
+        target = Path(path).resolve()
+        probe = self._existing_ancestor(target)
+        free = int(self.usage_fn(probe).free)
+        required = self.reserve_bytes + estimated
+        if free < required:
+            raise DiskSpaceInsufficientError(
+                "insufficient disk for target "
+                f"{target}: free={free}, reserve={self.reserve_bytes}, "
+                f"estimated={estimated}, required={required}"
+            )
 
 
 @dataclass(frozen=True)
@@ -235,16 +273,28 @@ class PipelineConfig:
             image_model_name=args.image_model_name,
             text_model_base_url=args.text_model_base_url,
             text_model_base_urls=tuple(args.text_model_base_urls or ()),
-            text_model_base_urls_file=args.text_model_base_urls_file,
+            text_model_base_urls_file=(
+                str(Path(args.text_model_base_urls_file).resolve())
+                if args.text_model_base_urls_file
+                else None
+            ),
             text_model_api_key=args.text_model_api_key,
             image_model_base_url=args.image_model_base_url,
             image_model_base_urls=tuple(args.image_model_base_urls or ()),
-            image_model_base_urls_file=args.image_model_base_urls_file,
+            image_model_base_urls_file=(
+                str(Path(args.image_model_base_urls_file).resolve())
+                if args.image_model_base_urls_file
+                else None
+            ),
             image_model_api_key=args.image_model_api_key,
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
             run_fingerprint=args.run_fingerprint,
-            runtime_dir=(Path(args.runtime_dir).resolve() if args.runtime_dir else None),
+            runtime_dir=(
+                Path(args.runtime_dir).resolve()
+                if args.runtime_dir
+                else work_dir / "runtime"
+            ),
             model_start_marker=(
                 Path(args.model_start_marker).resolve()
                 if args.model_start_marker
@@ -300,10 +350,19 @@ class _ProgressState:
 class ProgressReporter:
     """Publish bounded-cost progress to JSON and direct stdout."""
 
-    def __init__(self, config: PipelineConfig) -> None:
+    _ROLLING_WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+    ) -> None:
         self.config = config
         self.path = config.work_dir / "progress.json"
         self._state = _ProgressState()
+        self._rolling_samples: deque[tuple[float, int]] = deque()
+        self._pre_write_guard = pre_write_guard
         self._lock = threading.Lock()
         self._publish_lock = threading.Lock()
         self._stop = threading.Event()
@@ -338,6 +397,7 @@ class ProgressReporter:
             if stage is not None and stage != self._state.stage:
                 self._state.stage = stage
                 self._state.stage_started_at = time.time()
+                self._rolling_samples.clear()
             if completed_shards is not None:
                 self._state.completed_shards = completed_shards
             if total_shards is not None:
@@ -360,10 +420,34 @@ class ProgressReporter:
             complete = self._state.completed_shards
             total = self._state.total_shards
             rate = complete / elapsed if elapsed > 0 else 0.0
+            self._rolling_samples.append((now, complete))
+            cutoff = now - self._ROLLING_WINDOW_SECONDS
+            while (
+                len(self._rolling_samples) > 1
+                and self._rolling_samples[1][0] <= cutoff
+            ):
+                self._rolling_samples.popleft()
+            rolling_rate = 0.0
+            if len(self._rolling_samples) > 1:
+                first_time, first_complete = self._rolling_samples[0]
+                rolling_elapsed = now - first_time
+                if rolling_elapsed > 0:
+                    rolling_rate = max(
+                        0.0,
+                        (complete - first_complete) / rolling_elapsed,
+                    )
             remaining = max(0, total - complete)
             eta = remaining / rate if rate > 0 else None
-            disk_probe = self.config.work_dir
-            free = shutil.disk_usage(disk_probe).free
+            free_by_root = {
+                name: int(
+                    shutil.disk_usage(DiskGuard._existing_ancestor(path)).free
+                )
+                for name, path in (
+                    ("work", self.config.work_dir),
+                    ("cache", self.config.cache_dir),
+                    ("output", self.config.output_dir),
+                )
+            }
             return {
                 "stage": self._state.stage,
                 "completed_shards": complete,
@@ -371,7 +455,7 @@ class ProgressReporter:
                 "counters": dict(sorted(self._state.counters.items())),
                 "rates": {
                     "shards_per_second": rate,
-                    "rolling_shards_per_second": rate,
+                    "rolling_shards_per_second": rolling_rate,
                 },
                 "eta_seconds": eta,
                 "elapsed_seconds": max(0.0, now - self._state.started_at),
@@ -380,7 +464,8 @@ class ProgressReporter:
                     "work_bytes": self._state.known_work_bytes,
                     "cache_bytes": self._state.known_cache_bytes,
                     "output_bytes": self._state.known_output_bytes,
-                    "free_bytes": free,
+                    "free_bytes": free_by_root["work"],
+                    "free_bytes_by_root": free_by_root,
                     "reserve_bytes": self.config.min_free_disk_bytes,
                 },
             }
@@ -388,15 +473,31 @@ class ProgressReporter:
     def publish(self) -> None:
         with self._publish_lock:
             snapshot = self._snapshot()
-            _atomic_json(self.path, snapshot)
+            _atomic_json(
+                self.path,
+                snapshot,
+                pre_write_guard=self._pre_write_guard,
+            )
             print(
                 "[wdc200k] "
                 f"stage={snapshot['stage']} "
                 f"shards={snapshot['completed_shards']}/"
                 f"{snapshot['total_shards']} "
                 f"rate={snapshot['rates']['shards_per_second']:.3f}/s "
+                "rolling="
+                f"{snapshot['rates']['rolling_shards_per_second']:.3f}/s "
                 f"eta={snapshot['eta_seconds']} "
+                f"work={snapshot['disk']['work_bytes']} "
+                f"cache={snapshot['disk']['cache_bytes']} "
+                f"output={snapshot['disk']['output_bytes']} "
                 f"free={snapshot['disk']['free_bytes']} "
+                "free_work="
+                f"{snapshot['disk']['free_bytes_by_root']['work']} "
+                "free_cache="
+                f"{snapshot['disk']['free_bytes_by_root']['cache']} "
+                "free_output="
+                f"{snapshot['disk']['free_bytes_by_root']['output']} "
+                f"reserve={snapshot['disk']['reserve_bytes']} "
                 f"counters={json.dumps(snapshot['counters'], sort_keys=True)}",
                 flush=True,
             )
@@ -408,7 +509,14 @@ class ProgressReporter:
         self.publish()
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    if pre_write_guard is not None:
+        pre_write_guard(path, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
@@ -425,6 +533,8 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if pre_write_guard is not None:
+            pre_write_guard(path, temporary.stat().st_size)
         temporary.replace(path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -567,7 +677,12 @@ def _load_stage_registry(path: Path) -> StageRegistry:
     )
 
 
-def _validate_producer_manifest(stage: str, path: Path) -> None:
+def _validate_producer_manifest(
+    stage: str,
+    path: Path,
+    *,
+    allow_network_shard_repair: bool = False,
+) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("complete") is not True:
         raise ValueError(f"{stage} producer manifest is incomplete: {path}")
@@ -626,6 +741,11 @@ def _validate_producer_manifest(stage: str, path: Path) -> None:
                     f"{stage} producer manifest has invalid shard: {path}"
                 ) from error
             if not validate_completed_shard(completed, root):
+                if (
+                    allow_network_shard_repair
+                    and producer_stage == "wdc200k_network_fetch"
+                ):
+                    continue
                 raise ValueError(
                     f"{stage} producer shard checksum mismatch: "
                     f"{root / completed.path}"
@@ -637,6 +757,7 @@ def _validate_stage_registry(
     stage: str,
     *,
     expected_upstream_identity: str,
+    allow_network_shard_repair: bool = False,
 ) -> StageRegistry:
     path = _producer_registry_path(config, stage)
     registry = _load_stage_registry(path)
@@ -656,7 +777,11 @@ def _validate_stage_registry(
             raise ValueError(
                 f"producer manifest checksum mismatch: {reference.path}"
             )
-        _validate_producer_manifest(stage, reference.path)
+        _validate_producer_manifest(
+            stage,
+            reference.path,
+            allow_network_shard_repair=allow_network_shard_repair,
+        )
     return registry
 
 
@@ -667,6 +792,7 @@ def _write_stage_registry(
     producer_manifests: Iterable[Path],
     counters: dict[str, int],
     upstream_identity: str,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> StageRegistry:
     manifests = [
         {
@@ -687,6 +813,7 @@ def _write_stage_registry(
             "counters": dict(sorted(counters.items())),
             "complete": True,
         },
+        pre_write_guard=pre_write_guard,
     )
     return _validate_stage_registry(
         config,
@@ -706,48 +833,28 @@ _STAGE_WORK_PATHS: dict[str, tuple[str, ...]] = {
 }
 
 
-def invalidate_from_stage(config: PipelineConfig, stage: str) -> Path:
-    """Atomically archive the named and downstream state without deleting it."""
+def invalidate_from_stage(
+    config: PipelineConfig,
+    stage: str,
+) -> ArchiveResult:
+    """Recoverably archive the named and downstream state without deletion."""
     if stage not in STAGES:
         raise ValueError(f"unknown stage: {stage}")
-    timestamp = f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{time.time_ns()}"
-    stale = config.work_dir / "stale" / timestamp
-    start = STAGES.index(stage)
-    for current in STAGES[start:]:
-        registry = _producer_registry_path(config, current)
-        if registry.exists():
-            destination = stale / registry.relative_to(config.work_dir)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            registry.replace(destination)
-        for relative in _STAGE_WORK_PATHS[current]:
-            source = config.work_dir / relative
-            if not source.exists():
-                continue
-            destination = stale / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source.replace(destination)
-    if start <= STAGES.index("materialize") and config.output_dir.exists():
-        destination = stale / "final_output"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        config.output_dir.replace(destination)
-    return stale
-
-
-def _archive_requested_caches(config: PipelineConfig, stale: Path) -> None:
-    relative_paths: list[Path] = []
-    if config.refresh_page_cache:
-        relative_paths.extend((Path("page_cache"), Path("page_transport")))
-    if config.refresh_image_cache:
-        relative_paths.extend(
-            (Path("image_cache"), Path("images"), Path("image_transport"))
-        )
-    for relative in relative_paths:
-        source = config.cache_dir / relative
-        if not source.exists():
-            continue
-        destination = stale / "cache" / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        source.replace(destination)
+    return archive_pipeline_state(
+        work_dir=config.work_dir,
+        output_dir=config.output_dir,
+        cache_dir=config.cache_dir,
+        stages=STAGES,
+        from_stage=stage,
+        stage_work_paths=_STAGE_WORK_PATHS,
+        stage_registry_paths={
+            current: _producer_registry_path(config, current)
+            for current in STAGES
+        },
+        runtime_dir=config.runtime_dir,
+        refresh_page_cache=config.refresh_page_cache,
+        refresh_image_cache=config.refresh_image_cache,
+    )
 
 
 def _statistics_archives(input_dir: Path) -> tuple[Path, ...]:
@@ -765,7 +872,45 @@ def _statistics_archives(input_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(archives))
 
 
-def _preflight(config: PipelineConfig) -> tuple[Path, ...]:
+def _validate_runtime_paths(config: PipelineConfig) -> None:
+    if config.runtime_dir is None:
+        raise ValueError("runtime_dir must be configured")
+    candidates: list[tuple[str, Path]] = [("runtime_dir", config.runtime_dir)]
+    for name, value in (
+        ("text_model_base_urls_file", config.text_model_base_urls_file),
+        ("image_model_base_urls_file", config.image_model_base_urls_file),
+        ("model_start_marker", config.model_start_marker),
+        ("model_ready_marker", config.model_ready_marker),
+        ("model_text_done_marker", config.model_text_done_marker),
+        ("model_image_done_marker", config.model_image_done_marker),
+    ):
+        if value is not None:
+            candidates.append((name, Path(value).resolve()))
+    protected = (
+        ("input", config.input_dir),
+        ("cache", config.cache_dir),
+        ("output", config.output_dir),
+    )
+    for name, path in candidates:
+        for root_name, root in protected:
+            if path == root or path.is_relative_to(root):
+                raise ValueError(
+                    f"{name} must be outside {root_name} root: {path}"
+                )
+    seen: dict[Path, str] = {}
+    for name, path in candidates:
+        previous = seen.get(path)
+        if previous is not None:
+            raise ValueError(
+                f"runtime paths conflict: {previous} and {name}: {path}"
+            )
+        seen[path] = name
+
+
+def _preflight(
+    config: PipelineConfig,
+    disk_guard: DiskGuard | None = None,
+) -> tuple[Path, ...]:
     archives = _statistics_archives(config.input_dir)
     if config.max_source_tables <= 0:
         raise ValueError("max_source_tables must be positive")
@@ -785,6 +930,7 @@ def _preflight(config: PipelineConfig) -> tuple[Path, ...]:
     )
     if any(marker_values) and not all(marker_values):
         raise ValueError("all four staged model markers must be provided together")
+    _validate_runtime_paths(config)
     if config.refresh_page_cache and (
         config.from_stage is None
         or STAGES.index(config.from_stage) > STAGES.index("pages")
@@ -799,27 +945,27 @@ def _preflight(config: PipelineConfig) -> tuple[Path, ...]:
         raise ValueError(
             "--refresh_image_cache requires --from_stage images or earlier"
         )
-    probe = config.work_dir.parent
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    free = shutil.disk_usage(probe).free
-    if free < config.min_free_disk_bytes:
-        raise DiskSpaceInsufficientError(
-            f"insufficient disk: free={free}, reserve={config.min_free_disk_bytes}"
-        )
+    guard = disk_guard or DiskGuard(config.min_free_disk_bytes)
+    for root in (config.work_dir, config.cache_dir, config.output_dir):
+        guard(root, 0)
     return archives
 
 
-def _check_disk_reserve(config: PipelineConfig, stage: str) -> None:
-    probe = config.work_dir if config.work_dir.exists() else config.work_dir.parent
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    free = shutil.disk_usage(probe).free
-    if free < config.min_free_disk_bytes:
-        raise DiskSpaceInsufficientError(
-            f"insufficient disk before {stage}: free={free}, "
-            f"reserve={config.min_free_disk_bytes}"
+def _check_disk_reserve(
+    config: PipelineConfig,
+    stage: str,
+    target: Path | None = None,
+    estimated_bytes: int = 0,
+) -> None:
+    try:
+        DiskGuard(config.min_free_disk_bytes)(
+            target or config.work_dir,
+            estimated_bytes,
         )
+    except DiskSpaceInsufficientError as error:
+        raise DiskSpaceInsufficientError(
+            f"insufficient disk before {stage}: {error}"
+        ) from None
 
 
 def _tree_bytes(path: Path) -> int:
@@ -831,12 +977,20 @@ def _tree_bytes(path: Path) -> int:
     stack = [path]
     while stack:
         current = stack.pop()
-        with os.scandir(current) as entries:
-            for entry in entries:
-                if entry.is_dir(follow_symlinks=False):
-                    stack.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(
+                                follow_symlinks=False
+                            ).st_size
+                    except FileNotFoundError:
+                        continue
+        except FileNotFoundError:
+            continue
     return total
 
 
@@ -907,6 +1061,7 @@ def _validate_existing_registry_chain(
             config,
             stage,
             expected_upstream_identity=upstream,
+            allow_network_shard_repair=True,
         )
         upstream = _registry_identity(config, stage)
 
@@ -1046,42 +1201,85 @@ def _publish_network_manifest(
     terminal: int,
     pending: int,
     leased: int,
+    records_per_shard: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> Path:
+    if records_per_shard <= 0:
+        raise ValueError("records_per_shard must be positive")
     manifest_path = root / "network-manifest.json"
+    counts = {
+        "unique": unique,
+        "success": success,
+        "terminal": terminal,
+        "pending": pending,
+        "leased": leased,
+    }
+    previous: dict[str, CompletedShard] = {}
     if manifest_path.is_file():
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         declared = payload.get("counts") or {}
-        if (
+        if not (
             payload.get("stage") == "wdc200k_network_fetch"
             and payload.get("complete") is True
             and payload.get("policy_fingerprint") == policy_fingerprint
-            and declared
-            == {
-                "unique": unique,
-                "success": success,
-                "terminal": terminal,
-                "pending": pending,
-                "leased": leased,
-            }
+            and int(payload.get("records_per_shard", -1))
+            == records_per_shard
+            and declared == counts
         ):
-            _validate_producer_manifest("pages", manifest_path)
-            return manifest_path
-        raise ValueError(f"network manifest conflicts with durable state: {manifest_path}")
-    writer = AtomicJsonlShard(root / "outcomes" / "part-00000.jsonl")
-    try:
-        for record in records:
-            writer.write(record)
-        completed = writer.commit()
-    except BaseException:
-        writer.abort()
-        raise
-    relative = CompletedShard(
-        path=(root / "outcomes" / "part-00000.jsonl").relative_to(root).as_posix(),
-        records=completed.records,
-        bytes=completed.bytes,
-        sha256=completed.sha256,
-    )
-    if relative.records != unique:
+            raise ValueError(
+                f"network manifest conflicts with durable state: {manifest_path}"
+            )
+        for item in payload.get("completed_shards") or []:
+            completed = CompletedShard(
+                path=str(item["path"]),
+                records=int(item["records"]),
+                bytes=int(item["bytes"]),
+                sha256=str(item["sha256"]),
+            )
+            previous[completed.path] = completed
+
+    completed_shards: list[CompletedShard] = []
+    chunk: list[dict[str, Any]] = []
+
+    def publish_chunk(index: int, batch: list[dict[str, Any]]) -> None:
+        relative_path = f"outcomes/part-{index:05d}.jsonl"
+        prior = previous.get(relative_path)
+        if (
+            prior is not None
+            and prior.records == len(batch)
+            and validate_completed_shard(prior, root)
+        ):
+            completed_shards.append(prior)
+            return
+        path = root / relative_path
+        writer = AtomicJsonlShard(
+            path,
+            pre_write_guard=pre_write_guard,
+        )
+        try:
+            for record in batch:
+                writer.write(record)
+            committed = writer.commit()
+        except BaseException:
+            writer.abort()
+            raise
+        completed_shards.append(
+            CompletedShard(
+                path=relative_path,
+                records=committed.records,
+                bytes=committed.bytes,
+                sha256=committed.sha256,
+            )
+        )
+
+    for record in records:
+        chunk.append(record)
+        if len(chunk) >= records_per_shard:
+            publish_chunk(len(completed_shards), chunk)
+            chunk = []
+    if chunk or not completed_shards:
+        publish_chunk(len(completed_shards), chunk)
+    if sum(shard.records for shard in completed_shards) != unique:
         raise ValueError("network outcome count does not match durable jobs")
     _atomic_json(
         manifest_path,
@@ -1089,16 +1287,14 @@ def _publish_network_manifest(
             "stage": "wdc200k_network_fetch",
             "schema_version": "wdc200k-network-fetch-v1",
             "policy_fingerprint": policy_fingerprint,
-            "counts": {
-                "unique": unique,
-                "success": success,
-                "terminal": terminal,
-                "pending": pending,
-                "leased": leased,
-            },
-            "completed_shards": [asdict(relative)],
+            "records_per_shard": records_per_shard,
+            "counts": counts,
+            "completed_shards": [
+                asdict(shard) for shard in completed_shards
+            ],
             "complete": True,
         },
+        pre_write_guard=pre_write_guard,
     )
     return manifest_path
 
@@ -1131,8 +1327,11 @@ def _structural_exact_counts(
     root: Path,
     results: Sequence[StructuralExpansionResult],
     config: PipelineConfig,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, int]:
     database_path = root / "structural-counts.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, 0)
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS page_urls "
@@ -1198,6 +1397,7 @@ def _run_selection_and_structural(
     *,
     input_identity: str,
     selection_only: bool = False,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[
     tuple[StructuralExpansionResult, ...],
     FinalizedSelectionResult | None,
@@ -1214,6 +1414,7 @@ def _run_selection_and_structural(
         config.input_dir,
         config.work_dir,
         policy,
+        pre_write_guard=pre_write_guard,
     )
     selection_dir = config.work_dir / "selection"
     selection_manifest = selection_dir / "manifest.json"
@@ -1227,6 +1428,7 @@ def _run_selection_and_structural(
         producer_manifests=(selection_manifest,),
         counters=selection_counters,
         upstream_identity=input_identity,
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(counters=selection_counters)
     if selection_only:
@@ -1235,6 +1437,8 @@ def _run_selection_and_structural(
     selected_path = selection_dir / "selected_tables.jsonl"
     reserve_path = selection_dir / "reserve_tables.jsonl"
     reserve_database = selection_dir / "reserve.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(reserve_database, 0)
     reserve_manager = (
         ReserveManager.open(reserve_database, policy)
         if reserve_database.exists()
@@ -1268,8 +1472,8 @@ def _run_selection_and_structural(
             shard_id=f"{index:05d}",
             min_rows=1,
             min_cols=1,
+            pre_write_guard=pre_write_guard,
         )
-        _check_disk_reserve(config, "structural")
         results.append(result)
         validated_tables += result.tables
         emitted_entities += result.entities_count
@@ -1284,10 +1488,16 @@ def _run_selection_and_structural(
         (result.manifest for result in results),
         output_root=structural_root,
         target_tables=config.max_source_tables,
+        pre_write_guard=pre_write_guard,
     )
     counters = {
         **selection_counters,
-        **_structural_exact_counts(structural_root, results, config),
+        **_structural_exact_counts(
+            structural_root,
+            results,
+            config,
+            pre_write_guard=pre_write_guard,
+        ),
     }
     _write_stage_registry(
         config,
@@ -1298,6 +1508,7 @@ def _run_selection_and_structural(
         ),
         counters=counters,
         upstream_identity=_registry_identity(config, "selection"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=total_shards,
@@ -1392,8 +1603,8 @@ def _run_pages(
     transport: Any,
     *,
     after_cache_write: Any | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[FetchResult, dict[str, Any], Path]:
-    _check_disk_reserve(config, "pages")
     reporter.update(stage="pages", completed_shards=0, total_shards=1)
     root = config.work_dir / "page_jobs"
     policy = FetchPolicy(
@@ -1404,6 +1615,9 @@ def _run_pages(
     )
     jobs_path = root / "jobs.sqlite3"
     outcomes_path = config.cache_dir / "page_cache" / "outcomes.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(jobs_path, 0)
+        pre_write_guard(outcomes_path, 0)
     SqliteJobStore(jobs_path)
     _reconcile_page_jobs_from_outcomes(
         jobs_path,
@@ -1415,7 +1629,6 @@ def _run_pages(
 
     def after_page_outcome(record: dict[str, Any]) -> None:
         nonlocal page_completed
-        _check_disk_reserve(config, "pages")
         status = str(record.get("status") or "terminal")
         page_completed += 1
         page_status_counts[status] = page_status_counts.get(status, 0) + 1
@@ -1437,11 +1650,15 @@ def _run_pages(
         failure_path=root / "page-failures.jsonl",
         progress_path=root / "page-progress.json",
         after_cache_write=after_page_outcome,
+        pre_write_guard=pre_write_guard,
     )
+    page_validation_database = root / "validation.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(page_validation_database, 0)
     snapshot = validate_complete_page_fetch(
         result,
         _page_refs(config.work_dir / "structural", structural, finalized),
-        validation_database=root / "validation.sqlite3",
+        validation_database=page_validation_database,
     )
     network_manifest = _publish_network_manifest(
         root / "network",
@@ -1452,6 +1669,8 @@ def _run_pages(
         terminal=result.terminal,
         pending=result.remaining,
         leased=result.leased,
+        records_per_shard=config.records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     counters = {
         "unique_page_jobs": result.unique,
@@ -1465,6 +1684,7 @@ def _run_pages(
         producer_manifests=(network_manifest,),
         counters=counters,
         upstream_identity=_registry_identity(config, "structural"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=1,
@@ -1482,8 +1702,9 @@ def _run_asset_planning(
     finalized: FinalizedSelectionResult,
     page_result: FetchResult,
     page_snapshot: dict[str, Any],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[AssetPlanShards, str]:
-    _check_disk_reserve(config, "asset_planning")
     reporter.update(
         stage="asset_planning", completed_shards=0, total_shards=1
     )
@@ -1495,13 +1716,18 @@ def _run_asset_planning(
         structural_identity,
         str(page_snapshot["identity"]),
     )
+    entity_page_join = (
+        config.work_dir / "asset_planning" / "entity-pages.sqlite3"
+    )
+    if pre_write_guard is not None:
+        pre_write_guard(entity_page_join, 0)
     entity_pages = iter_entity_page_join(
         (item.entities for item in structural),
         iter_page_fanout(
             page_result.outcomes_path,
             page_result.policy_fingerprint,
         ),
-        join_path=config.work_dir / "asset_planning" / "entity-pages.sqlite3",
+        join_path=entity_page_join,
     )
     budget = ImageBudget(
         attempts_per_entity=config.max_image_attempts_per_entity,
@@ -1513,6 +1739,7 @@ def _run_asset_planning(
         input_fingerprint=planning_input,
         budget=budget,
         records_per_shard=config.records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     validate_asset_plan_shards(
         planned,
@@ -1528,6 +1755,7 @@ def _run_asset_planning(
         producer_manifests=(planned.manifest_path,),
         counters=counters,
         upstream_identity=_registry_identity(config, "pages"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=1,
@@ -1542,6 +1770,8 @@ def _run_images(
     reporter: ProgressReporter,
     planned: AssetPlanShards,
     transport: Any,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[
     UniqueImageJobs,
     ImageFetchResult,
@@ -1549,17 +1779,20 @@ def _run_images(
     AssetStageBarrier,
     Path,
 ]:
-    _check_disk_reserve(config, "images")
     reporter.update(stage="images", completed_shards=0, total_shards=3)
     root = config.work_dir / "image_jobs"
     unique_jobs = build_unique_image_jobs(
         planned,
         root / "unique-images.jsonl",
+        pre_write_guard=pre_write_guard,
     )
+    unique_validation_database = root / "unique-validation.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(unique_validation_database, 0)
     validate_unique_image_jobs(
         unique_jobs,
         planned=planned,
-        validation_database=root / "unique-validation.sqlite3",
+        validation_database=unique_validation_database,
     )
     reporter.update(completed_shards=1, total_shards=3)
     policy = FetchPolicy(
@@ -1574,9 +1807,10 @@ def _run_images(
     def after_image_outcome(_record: dict[str, Any]) -> None:
         nonlocal image_completed
         image_completed += 1
-        _check_disk_reserve(config, "images")
         reporter.update(counters={"image_completed_live": image_completed})
 
+    if pre_write_guard is not None:
+        pre_write_guard(root / "jobs.sqlite3", 0)
     image_result = fetch_unique_images(
         unique_jobs,
         SqliteJobStore(root / "jobs.sqlite3"),
@@ -1585,6 +1819,7 @@ def _run_images(
         outcomes_path=config.cache_dir / "image_cache" / "outcomes.sqlite3",
         image_dir=config.cache_dir / "images",
         after_cache_write=after_image_outcome,
+        pre_write_guard=pre_write_guard,
     )
     validate_complete_image_fetch(
         image_result,
@@ -1611,6 +1846,7 @@ def _run_images(
             config.max_text_asset_chunks_per_entity
         ),
         records_per_shard=config.records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     materialized, barrier = validate_materialized_asset_shards(
         materialized,
@@ -1630,6 +1866,8 @@ def _run_images(
         terminal=image_result.terminal,
         pending=image_result.remaining,
         leased=image_result.leased,
+        records_per_shard=config.records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     counters = {
         "unique_image_jobs": unique_jobs.records,
@@ -1650,6 +1888,7 @@ def _run_images(
         ),
         counters=counters,
         upstream_identity=_registry_identity(config, "asset_planning"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=3,
@@ -1670,8 +1909,9 @@ def _run_models(
     assets_barrier: AssetStageBarrier,
     network_manifests: Sequence[Path],
     extractor: Any,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[AdaptedModelTasks, ModelStageResult, ModelStageAuthority, argparse.Namespace]:
-    _check_disk_reserve(config, "models")
     reporter.update(stage="models", completed_shards=0, total_shards=2)
     args = _runtime_args(config)
     adapted = adapt_model_tasks_from_manifests(
@@ -1684,9 +1924,13 @@ def _run_models(
         output_root=config.work_dir / "adapted_model_tasks",
         args=args,
         records_per_shard=config.records_per_shard,
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(completed_shards=1, total_shards=2)
-    store = SqliteJobStore(config.work_dir / "model_outputs" / "jobs.sqlite3")
+    model_jobs_path = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    if pre_write_guard is not None:
+        pre_write_guard(model_jobs_path, 0)
+    store = SqliteJobStore(model_jobs_path)
     jobset = enqueue_model_tasks(
         (
             record
@@ -1711,7 +1955,6 @@ def _run_models(
     def after_model_result(_job_id: str, _record: dict[str, Any]) -> None:
         nonlocal model_completed
         model_completed += 1
-        _check_disk_reserve(config, "models")
         reporter.update(counters={"model_completed_live": model_completed})
 
     result = run_model_stage(
@@ -1734,16 +1977,20 @@ def _run_models(
         text_done_marker=config.model_text_done_marker,
         image_done_marker=config.model_image_done_marker,
         run_fingerprint=run_fingerprint,
+        pre_write_guard=pre_write_guard,
     )
     authority = ModelStageAuthority.current(args)
+    model_validation_store = (
+        config.work_dir / "model_outputs" / "validation.sqlite3"
+    )
+    if pre_write_guard is not None:
+        pre_write_guard(model_validation_store, 0)
     validate_model_stage_for_adapter(
         result,
         adapted,
         args=args,
         authority=authority,
-        validation_store_path=(
-            config.work_dir / "model_outputs" / "validation.sqlite3"
-        ),
+        validation_store_path=model_validation_store,
     )
     counters = {
         "model_text_tasks": result.text_total,
@@ -1757,6 +2004,7 @@ def _run_models(
         producer_manifests=(adapted.manifest_path, result.manifest_path),
         counters=counters,
         upstream_identity=_registry_identity(config, "images"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=2,
@@ -1782,8 +2030,9 @@ def _run_materialize(
     model_result: ModelStageResult,
     authority: ModelStageAuthority,
     args: argparse.Namespace,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializationResult:
-    _check_disk_reserve(config, "materialize")
     reporter.update(stage="materialize", completed_shards=0, total_shards=1)
     result = materialize_dataset(
         MaterializationInputs(
@@ -1804,14 +2053,7 @@ def _run_materialize(
         output_root=config.output_dir,
         args=args,
         records_per_shard=config.records_per_shard,
-        after_table_commit=(
-            lambda _source_table_id: _check_disk_reserve(
-                config, "materialize"
-            )
-        ),
-        after_finalize_commit=(
-            lambda _artifact: _check_disk_reserve(config, "materialize")
-        ),
+        pre_write_guard=pre_write_guard,
     )
     counters = {
         str(key): int(value)
@@ -1824,6 +2066,7 @@ def _run_materialize(
         producer_manifests=(result.manifest_path,),
         counters=counters,
         upstream_identity=_registry_identity(config, "models"),
+        pre_write_guard=pre_write_guard,
     )
     reporter.update(
         completed_shards=1,
@@ -1843,7 +2086,8 @@ def run_pipeline(
     after_page_cache_write: Any | None = None,
 ) -> PipelineResult:
     """Run the validated staged pipeline without replaying durable outcomes."""
-    archives = _preflight(config)
+    disk_guard = DiskGuard(config.min_free_disk_bytes)
+    archives = _preflight(config, disk_guard)
     source_identity = _input_identity(archives)
     if config.dry_run:
         return PipelineResult(
@@ -1854,15 +2098,14 @@ def run_pipeline(
         )
     if config.from_stage:
         _validate_upstream_for_refresh(config, config.from_stage, archives)
-        stale = invalidate_from_stage(config, config.from_stage)
-        _archive_requested_caches(config, stale)
+        invalidate_from_stage(config, config.from_stage)
     elif config.resume:
         _validate_existing_registry_chain(config, archives)
     elif any(_producer_registry_path(config, stage).exists() for stage in STAGES):
         raise ValueError(
             "pipeline state exists; use --resume or --from_stage selection"
         )
-    reporter = ProgressReporter(config)
+    reporter = ProgressReporter(config, pre_write_guard=disk_guard)
     reporter.start()
     try:
         structural, finalized, counters = (
@@ -1871,6 +2114,7 @@ def run_pipeline(
                 reporter,
                 input_identity=source_identity,
                 selection_only=config.stop_after == "selection",
+                pre_write_guard=disk_guard,
             )
         )
         if config.stop_after == "selection":
@@ -1902,6 +2146,7 @@ def run_pipeline(
             finalized,
             page_transport,
             after_cache_write=after_page_cache_write,
+            pre_write_guard=disk_guard,
         )
         counters.update(
             {
@@ -1924,6 +2169,7 @@ def run_pipeline(
             finalized,
             page_result,
             page_snapshot,
+            pre_write_guard=disk_guard,
         )
         counters.update(
             {
@@ -1946,7 +2192,13 @@ def run_pipeline(
             materialized_assets,
             assets_barrier,
             image_network_manifest,
-        ) = _run_images(config, reporter, planned, image_transport)
+        ) = _run_images(
+            config,
+            reporter,
+            planned,
+            image_transport,
+            pre_write_guard=disk_guard,
+        )
         counters.update(
             {
                 "unique_image_jobs": unique_jobs.records,
@@ -1976,6 +2228,7 @@ def run_pipeline(
             assets_barrier,
             (page_network_manifest, image_network_manifest),
             extractor,
+            pre_write_guard=disk_guard,
         )
         counters.update(
             {
@@ -2007,6 +2260,7 @@ def run_pipeline(
             model_result,
             authority,
             args,
+            pre_write_guard=disk_guard,
         )
         return PipelineResult(
             status="complete",

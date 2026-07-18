@@ -45,6 +45,18 @@ class CompletedShard:
     sha256: str
 
 
+PreWriteGuard = Callable[[Path, int], None]
+
+
+def _guard_write(
+    guard: PreWriteGuard | None,
+    path: Path,
+    estimated_bytes: int = 0,
+) -> None:
+    if guard is not None:
+        guard(Path(path), max(0, int(estimated_bytes)))
+
+
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -64,9 +76,23 @@ def _fsync_directory(path: Path) -> None:
 class AtomicJsonlShard:
     """Write a JSONL shard that becomes visible only after a durable commit."""
 
-    def __init__(self, path: Path) -> None:
+    DEFAULT_GUARD_INTERVAL_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+        guard_interval_bytes: int = DEFAULT_GUARD_INTERVAL_BYTES,
+    ) -> None:
+        if guard_interval_bytes <= 0:
+            raise ValueError("guard_interval_bytes must be positive")
         self.path = path
         self.temporary_path = path.with_suffix(path.suffix + ".tmp")
+        self.pre_write_guard = pre_write_guard
+        self.guard_interval_bytes = int(guard_interval_bytes)
+        self._guarded_capacity = 0
+        _guard_write(self.pre_write_guard, self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.temporary_path.open("w", encoding="utf-8")
         self._records = 0
@@ -75,7 +101,20 @@ class AtomicJsonlShard:
     def write(self, record: dict[str, Any]) -> None:
         if self._handle.closed:
             raise RuntimeError("cannot write to a closed shard")
-        write_jsonl_record(self._handle, record)
+        encoded = json.dumps(record, ensure_ascii=False) + "\n"
+        encoded_bytes = len(encoded.encode("utf-8"))
+        if encoded_bytes > self._guarded_capacity:
+            self._guarded_capacity = max(
+                self.guard_interval_bytes,
+                encoded_bytes,
+            )
+            _guard_write(
+                self.pre_write_guard,
+                self.path,
+                self._guarded_capacity,
+            )
+        self._handle.write(encoded)
+        self._guarded_capacity -= encoded_bytes
         self._records += 1
 
     def commit(self) -> CompletedShard:
@@ -83,9 +122,10 @@ class AtomicJsonlShard:
             raise RuntimeError("cannot commit a closed shard")
         self._handle.flush()
         os.fsync(self._handle.fileno())
+        size = self.temporary_path.stat().st_size
+        _guard_write(self.pre_write_guard, self.path, size)
         self._handle.close()
         digest = _sha256_path(self.temporary_path)
-        size = self.temporary_path.stat().st_size
         self.temporary_path.replace(self.path)
         _fsync_directory(self.path.parent)
         self._committed = True
@@ -139,9 +179,16 @@ class StageFingerprint:
 class StageManifest:
     """Atomically persisted stage progress that can be safely resumed."""
 
-    def __init__(self, path: Path, fingerprint: StageFingerprint) -> None:
+    def __init__(
+        self,
+        path: Path,
+        fingerprint: StageFingerprint,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+    ) -> None:
         self.path = path
         self.fingerprint = fingerprint
+        self.pre_write_guard = pre_write_guard
         self.completed_shards: list[CompletedShard] = []
         self.complete = False
         if self.path.exists():
@@ -199,6 +246,7 @@ class StageManifest:
         self.complete = bool(payload.get("complete", False))
 
     def _save(self) -> None:
+        _guard_write(self.pre_write_guard, self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
         payload = {
@@ -235,6 +283,11 @@ class StageManifest:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            _guard_write(
+                self.pre_write_guard,
+                self.path,
+                temporary_path.stat().st_size,
+            )
             temporary_path.replace(self.path)
             _fsync_directory(self.path.parent)
         except BaseException:
@@ -458,7 +511,9 @@ def _external_key(key: Any) -> str:
 def _write_sorted_run(
     records: list[tuple[str, int, dict[str, Any]]],
     path: Path,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
+    _guard_write(pre_write_guard, path)
     records.sort(key=lambda item: (item[0], item[1]))
     with path.open("w", encoding="utf-8") as handle:
         for key, ordinal, record in records:
@@ -485,7 +540,12 @@ def _iter_merged_runs(
         )
 
 
-def _merge_run_group(run_paths: list[Path], output_path: Path) -> None:
+def _merge_run_group(
+    run_paths: list[Path],
+    output_path: Path,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    _guard_write(pre_write_guard, output_path)
     with output_path.open("w", encoding="utf-8") as handle:
         for key, ordinal, record in _iter_merged_runs(run_paths):
             write_jsonl_record(handle, [key, ordinal, record])
@@ -494,11 +554,17 @@ def _merge_run_group(run_paths: list[Path], output_path: Path) -> None:
 class _RunAccumulator:
     """Incrementally compact sorted runs with bounded per-level metadata."""
 
-    def __init__(self, temporary_dir: Path, merge_fan_in: int) -> None:
+    def __init__(
+        self,
+        temporary_dir: Path,
+        merge_fan_in: int,
+        pre_write_guard: PreWriteGuard | None = None,
+    ) -> None:
         self.temporary_dir = temporary_dir
         self.merge_fan_in = merge_fan_in
         self._levels: list[list[Path]] = []
         self._merge_index = 0
+        self.pre_write_guard = pre_write_guard
 
     @property
     def pending_path_count(self) -> int:
@@ -529,7 +595,7 @@ class _RunAccumulator:
             / f"merge-online-{self._merge_index:08d}.jsonl"
         )
         self._merge_index += 1
-        _merge_run_group(group, merged_path)
+        _merge_run_group(group, merged_path, self.pre_write_guard)
         for grouped_path in group:
             grouped_path.unlink()
         self._add_at_level(merged_path, level_index + 1)
@@ -539,6 +605,7 @@ def _reduce_sorted_runs(
     run_paths: list[Path],
     temporary_dir: Path,
     merge_fan_in: int,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> list[Path]:
     merge_pass = 0
     while len(run_paths) > merge_fan_in:
@@ -554,7 +621,7 @@ def _reduce_sorted_runs(
                 temporary_dir
                 / f"merge-{merge_pass:04d}-{group_index:08d}.jsonl"
             )
-            _merge_run_group(group, merged_path)
+            _merge_run_group(group, merged_path, pre_write_guard)
             for run_path in group:
                 run_path.unlink()
             reduced_paths.append(merged_path)
@@ -569,16 +636,25 @@ def external_unique_jsonl(
     key_fn: Callable[[dict[str, Any]], Any],
     chunk_records: int,
     merge_fan_in: int = 64,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> CompletedShard:
     """Externally sort JSONL records and keep the first record for each key."""
     if chunk_records <= 0:
         raise ValueError("chunk_records must be positive")
     if merge_fan_in < 2:
         raise ValueError("merge_fan_in must be at least 2")
+    _guard_write(pre_write_guard, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="wdc200k-unique-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix=".wdc200k-unique-",
+        dir=output_path.parent,
+    ) as temporary:
         temporary_dir = Path(temporary)
-        run_accumulator = _RunAccumulator(temporary_dir, merge_fan_in)
+        run_accumulator = _RunAccumulator(
+            temporary_dir,
+            merge_fan_in,
+            pre_write_guard,
+        )
         run_index = 0
         chunk: list[tuple[str, int, dict[str, Any]]] = []
         ordinal = 0
@@ -588,20 +664,24 @@ def external_unique_jsonl(
             if len(chunk) >= chunk_records:
                 run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
                 run_index += 1
-                _write_sorted_run(chunk, run_path)
+                _write_sorted_run(chunk, run_path, pre_write_guard)
                 run_accumulator.add(run_path)
                 chunk = []
         if chunk:
             run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
-            _write_sorted_run(chunk, run_path)
+            _write_sorted_run(chunk, run_path, pre_write_guard)
             run_accumulator.add(run_path)
         run_paths = _reduce_sorted_runs(
             run_accumulator.pending_paths(),
             temporary_dir,
             merge_fan_in,
+            pre_write_guard,
         )
 
-        output = AtomicJsonlShard(output_path)
+        output = AtomicJsonlShard(
+            output_path,
+            pre_write_guard=pre_write_guard,
+        )
         try:
             previous_key: str | None = None
             has_previous_key = False

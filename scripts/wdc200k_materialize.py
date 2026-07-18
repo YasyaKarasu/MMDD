@@ -41,6 +41,7 @@ try:
     from wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
+        PreWriteGuard,
         validate_completed_shard,
     )
     from wdc200k_models import (
@@ -92,6 +93,7 @@ except ModuleNotFoundError as error:
         from wdc200k_io import (
             AtomicJsonlShard,
             CompletedShard,
+            PreWriteGuard,
             validate_completed_shard,
         )
         from wdc200k_models import (
@@ -1968,6 +1970,7 @@ def _materialize_all_tables(
     args: argparse.Namespace,
     expected_tables: int,
     after_table_commit: Callable[[str], None] | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
     with _connect(database_path) as connection:
         cursor = connection.execute(
@@ -2021,6 +2024,8 @@ def _materialize_all_tables(
                 args=args,
                 split=split,
             )
+            if pre_write_guard is not None:
+                pre_write_guard(database_path, 0)
             _store_table_unit(
                 database_path,
                 materialized,
@@ -2050,11 +2055,15 @@ class _AtomicArtifactWriter:
         output_root: Path,
         artifact: str,
         records_per_shard: int,
+        pre_write_guard: PreWriteGuard | None = None,
     ) -> None:
         self.output_root = output_root
         self.artifact = artifact
         self.records_per_shard = records_per_shard
+        self.pre_write_guard = pre_write_guard
         self.directory = output_root / artifact
+        if pre_write_guard is not None:
+            pre_write_guard(self.directory, 0)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.completed: list[CompletedShard] = []
         self._writer: AtomicJsonlShard | None = None
@@ -2065,7 +2074,10 @@ class _AtomicArtifactWriter:
             self.directory
             / f"part-{len(self.completed):05d}.jsonl"
         )
-        self._writer = AtomicJsonlShard(path)
+        self._writer = AtomicJsonlShard(
+            path,
+            pre_write_guard=self.pre_write_guard,
+        )
         self._current_count = 0
 
     def _commit(self) -> None:
@@ -2107,8 +2119,10 @@ class _AtomicArtifactWriter:
 def _atomic_json(
     path: Path,
     payload: dict[str, Any],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> CompletedShard:
-    writer = AtomicJsonlShard(path)
+    writer = AtomicJsonlShard(path, pre_write_guard=pre_write_guard)
     try:
         writer.write(payload)
         return writer.commit()
@@ -2120,8 +2134,10 @@ def _atomic_json(
 def _atomic_jsonl_from_records(
     path: Path,
     records: Iterable[dict[str, Any]],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> CompletedShard:
-    writer = AtomicJsonlShard(path)
+    writer = AtomicJsonlShard(path, pre_write_guard=pre_write_guard)
     try:
         for record in records:
             writer.write(record)
@@ -2214,7 +2230,11 @@ def _write_splits(
     database_path: Path,
     path: Path,
     args: argparse.Namespace,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> CompletedShard:
+    if pre_write_guard is not None:
+        pre_write_guard(path, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -2302,6 +2322,8 @@ def _write_splits(
             os.fsync(handle.fileno())
         digest = _sha256_path(temporary)
         size = temporary.stat().st_size
+        if pre_write_guard is not None:
+            pre_write_guard(path, size)
         temporary.replace(path)
         _fsync_directory(path.parent)
         return CompletedShard(
@@ -2568,8 +2590,11 @@ def _finalize_dataset(
     parameter_fingerprint: str,
     records_per_shard: int,
     after_finalize_commit: Callable[[str], None] | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializationResult:
     counts = _validate_global_counts(database_path, upstream)
+    if pre_write_guard is not None:
+        pre_write_guard(output_root, 0)
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_shards: dict[str, tuple[CompletedShard, ...]] = {}
     for artifact in _CORE_ARTIFACTS:
@@ -2577,6 +2602,7 @@ def _finalize_dataset(
             output_root,
             artifact,
             records_per_shard,
+            pre_write_guard=pre_write_guard,
         )
         try:
             for record in _iter_materialized(database_path, artifact):
@@ -2591,6 +2617,7 @@ def _finalize_dataset(
     qrels = _atomic_jsonl_from_records(
         output_root / "qrels.jsonl",
         _iter_materialized(database_path, "qrels"),
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit("single:qrels.jsonl")
@@ -2599,6 +2626,7 @@ def _finalize_dataset(
         _iter_materialized(
             database_path, "table_queryability_decisions"
         ),
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit(
@@ -2608,11 +2636,16 @@ def _finalize_dataset(
         database_path,
         output_root / "splits.json",
         args,
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit("single:splits.json")
     stats_payload = _stats_payload(database_path, counts, args)
-    stats = _atomic_json(output_root / "stats.json", stats_payload)
+    stats = _atomic_json(
+        output_root / "stats.json",
+        stats_payload,
+        pre_write_guard=pre_write_guard,
+    )
     if after_finalize_commit is not None:
         after_finalize_commit("single:stats.json")
     diagnostics: dict[str, CompletedShard] = {}
@@ -2627,6 +2660,7 @@ def _finalize_dataset(
                 _failure_records((upstream.page_failure_path,)),
             ),
         ),
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{web_failure_name}")
@@ -2644,6 +2678,7 @@ def _finalize_dataset(
                 ),
             ),
         ),
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{media_failure_name}")
@@ -2658,6 +2693,7 @@ def _finalize_dataset(
                 _failure_records(upstream.model_error_paths),
             ),
         ),
+        pre_write_guard=pre_write_guard,
     )
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{model_error_name}")
@@ -2753,7 +2789,11 @@ def _finalize_dataset(
         ),
     }
     manifest_path = output_root / "dataset_manifest.json"
-    _atomic_json(manifest_path, manifest)
+    _atomic_json(
+        manifest_path,
+        manifest,
+        pre_write_guard=pre_write_guard,
+    )
     return MaterializationResult(
         output_root=output_root,
         manifest_path=manifest_path,
@@ -2771,6 +2811,7 @@ def materialize_dataset(
     records_per_shard: int = 50_000,
     after_table_commit: Callable[[str], None] | None = None,
     after_finalize_commit: Callable[[str], None] | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializationResult:
     """Validate upstream barriers and stream the canonical final dataset."""
     if records_per_shard <= 0:
@@ -2794,6 +2835,8 @@ def materialize_dataset(
     if resumed is not None:
         return resumed
 
+    if pre_write_guard is not None:
+        pre_write_guard(work_root, 0)
     work_root.mkdir(parents=True, exist_ok=True)
     database_path = (
         work_root
@@ -2803,7 +2846,11 @@ def materialize_dataset(
             f"{parameter_fingerprint}.sqlite3"
         )
     )
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, 0)
     _prepare_authoritative_index(database_path, upstream)
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, 0)
     _catalog_sources(
         database_path,
         upstream.source_paths,
@@ -2812,12 +2859,15 @@ def materialize_dataset(
     )
     with _connect(database_path) as connection:
         _validate_source_catalog_closure(connection)
+    if pre_write_guard is not None:
+        pre_write_guard(database_path, 0)
     _assign_splits(database_path, args)
     _materialize_all_tables(
         database_path,
         args=args,
         expected_tables=upstream.expected_tables,
         after_table_commit=after_table_commit,
+        pre_write_guard=pre_write_guard,
     )
     return _finalize_dataset(
         database_path,
@@ -2827,4 +2877,5 @@ def materialize_dataset(
         parameter_fingerprint=parameter_fingerprint,
         records_per_shard=records_per_shard,
         after_finalize_commit=after_finalize_commit,
+        pre_write_guard=pre_write_guard,
     )
