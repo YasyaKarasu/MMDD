@@ -535,7 +535,11 @@ def with_default_model_workers(passthrough_args: list[str], workers: int) -> lis
 
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Start vLLM servers and run build_mm_joinability_dataset.py with modality-agnostic dynamic GPU reallocation.",
+        description=(
+            "Start vLLM servers and run "
+            "build_wdc200k_mm_joinability_dataset.py with "
+            "modality-agnostic dynamic GPU reallocation."
+        ),
         allow_abbrev=False,
     )
     parser.add_argument("--input_dir", required=True)

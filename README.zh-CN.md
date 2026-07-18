@@ -323,78 +323,168 @@ python scripts/build_mm_table_dataset.py `
 
 后续读取数据时建议优先读取 `dataset_manifest.json` 中列出的 shards，而不是直接 glob 目录。这样即使复用旧的 `output_dir`，也不会误读旧 run 留下的 stale part 文件。
 
-## WDC Schema.org Joinability Builder
+## WDC Schema.org 200K Joinability Pipeline
 
-`build_wdc_mm_joinability_dataset.py` 会读取本地 WDC Schema.org Table Corpus
-2023 的 gzip host tables，并直接复用现有 joinability core 来生成
-query/target、qrels 和 evidence paths。建议先用下面的有界配置运行：
+`build_wdc200k_mm_joinability_dataset.py` 是面向 20 万表规模的分阶段、可恢复入口。
+`build_wdc_mm_joinability_dataset.py` 仍是旧的有界 builder；它的逐表行数上限与
+内存模型不适用于正式 200K 运行。
+
+三类根目录必须彼此独立：
+
+```text
+output_wdc_200k/   只放最终 canonical dataset artifacts
+work_wdc_200k/     selection、shards、durable jobs、checkpoints、
+                   stage manifests、runtime markers、progress.json
+cache/wdc_200k/    可复用的网络、媒体、模型成功及失败结果
+```
+
+不要让三者互相嵌套，也不要复用同一路径。只有 `output_dir` 包含 source/query/data
+lake tables、entities、assets、links、extractions、qrels、splits、errors、
+`stats.json` 与 `dataset_manifest.json`。source table 的行数没有上限，每个入选表
+的所有行都会保留。不要传 `--max_rows_per_source_table`：兼容参数会拒绝任何值，
+包括 0。WDC `image` 列只用于发现素材，不会进入表 artifact。
+
+### Preflight、分阶段运行与恢复
+
+下面的只读 preflight 只验证 statistics archives、路径隔离、runtime 路径、磁盘
+reserve 与参数，不执行任何 stage：
 
 ```bash
-conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py \
+conda run -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
-  --output_dir output_wdc_mm_joinability_run_001 \
-  --cache_dir cache/wdc_mm_joinability_run_001 \
-  --max_source_tables 100 \
-  --max_scanned_files 1000 \
-  --max_rows_per_source_table 100 \
-  --max_images_per_entity 2 \
-  --web_workers 4 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --dry_run
+```
+
+structural preflight 会在 `work_dir` 写确定性的 selection/structural 状态，但不会
+执行网络与模型任务：
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --web_max_retries 0 \
+  --web_max_response_seconds 8 \
+  --web_global_concurrency 128 \
+  --web_per_host_concurrency 2 \
+  --max_image_attempts_per_entity 3 \
+  --max_images_per_entity 3 \
+  --stop_after structural
+```
+
+继续前先检查 `work_wdc_200k/progress.json` 与 structural manifests。用完全相同的
+四个根目录和参数恢复；已完成且 checksum 有效的 shard、成功 URL 和 terminal
+失败 URL 都不会重放：
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --resume \
   --text_model_base_url http://127.0.0.1:8001/v1 \
   --image_model_base_url http://127.0.0.1:8000/v1
 ```
 
-直接运行时，两个 OpenAI-compatible 文本/图片模型 endpoint 必须在模型抽取
-阶段开始前可用。脚本会惰性地在 WDC class 目录之间轮转扫描，并限制同时在途的
-网页任务数量；source tables、entities、bridge assets、table-asset links、
-queries、targets、attribute extractions 和 evidence recoveries 都按 shard 写出。
-安全默认值是最多接受 100 个 source tables、尝试 1000 个 gzip 文件、每表保留
-100 行、每个实体保留 2 张图片。`--max_scanned_files` 会独立统计每个尝试过的
-gzip，包括损坏或被拒绝的文件，而不是只统计接受的表。只有同时显式添加
-`--allow_unbounded` 才允许把单表行数设为 `0` 或使用非正的扫描/表数量上限。
-启动与结束日志以及 `stats.json` 会记录安全配置，并报告扫描、source-table 或行截断。
-后续 query 阶段会在内存中维护 entity/asset 索引，因此建议
-始终采用分阶段、有明确上限的构建。WDC 原始 `image` 属性只用于发现图片，不会出现在任何
-source/query/target/raw table 中。
-
-每个被选中的实体都会抓取 `page_url`，以提取页面可见文本和页面图片候选；即使
-WDC `image` 属性里的直接图片已经下载成功，也不会跳过网页请求。直接图片优先，
-但直接图片和网页图片共同使用同一个 `--max_images_per_entity` 配额。网页缓存位于
-`<cache_dir>/wdc_web.sqlite3`，图片位于 `<cache_dir>/wdc_images`，模型抽取缓存位于
-`<cache_dir>/model_attribute_extractions.jsonl`。网络和媒体错误不会中止全局构建，
-而会分别写到输出目录的 `web_fetch_failures.jsonl` 和
-`media_download_failures.jsonl`。
-
-网页客户端会拒绝带 userinfo 的 URL 和解析到非公网 IP 的地址。每个重定向 hop
-只解析并验证一次，实际 TCP 连接固定到该已验证 IP；HTTPS 仍使用原始 hostname
-进行 SNI 和证书校验。A/AAAA 与 CNAME 解析使用 requirements 中声明的
-`dnspython`，并受响应剩余绝对 deadline 限制；不会回退到无界的 stdlib resolver。
-外部 SVG 会被明确拒绝，不进行光栅化。
-`--web_max_image_pixels`、`--web_max_image_bytes`、
-`--web_max_total_image_bytes`、`--web_max_total_cache_bytes`、
-`--min_free_disk_bytes` 和 `--web_max_response_seconds` 分别限制图片像素、单响应
-大小、图片缓存总量、页面 body 加图片的总缓存量、最低剩余磁盘空间和单次响应的
-总 wall-clock 时间。响应流式读取期间也会持续预留配额并检查磁盘空间。
-
-也可以使用动态双 vLLM runner，让它在网页素材准备期间启动模型，并在某个模态
-完成后重新分配 GPU：
+`--stop_after` 用于建立 stage barrier。需要有意重建某个 stage 及其下游时使用
+`--from_stage`；它会先验证上游，再归档被替换的状态，而不是删除：
 
 ```bash
-conda run -n MMDD python scripts/run_mm_joinability_dynamic_vllm.py \
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
-  --output_dir output_wdc_mm_joinability_run_001 \
-  --work_dir work_wdc_mm_joinability_run_001 \
-  --text_model_path /path/to/text-model \
-  --image_model_path /path/to/vision-model \
-  --cache_dir cache/wdc_mm_joinability_run_001 \
-  --max_source_tables 100 \
-  --max_image_attempts_per_entity 3 \
-  --max_images_per_entity 3 \
-  --web_global_concurrency 16
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --from_stage pages \
+  --stop_after pages
 ```
 
-runner 会自动传入 `--precompute_model_cache`、两个模态的 endpoint files，
-以及 model start/ready/done markers。runner 对 endpoint、模型 identity 和 marker
-参数拥有唯一控制权；如果要手工管理 endpoint 池，请直接运行 builder。
+`--refresh_page_cache` 只能配合 `--from_stage pages` 或更早 stage，
+`--refresh_image_cache` 只能配合 `--from_stage images` 或更早 stage。普通
+`--resume` 会同时复用成功和 terminal 失败。
+
+### 真实表 100/1,000 规模门禁
+
+完整 corpus 中 mandatory `top100` 候选数已经超过 100 和 1,000，因此不能仅把
+完整输入上的 `--max_source_tables` 改成 100/1,000。应先创建隔离的、精确大小的
+真实 WDC 表门禁输入：
+
+```bash
+conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
+  --source_dir wdc_schemaorg_2023 \
+  --target_dir gate_inputs/wdc_100 \
+  --table_count 100 \
+  --seed 13
+
+conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
+  --source_dir wdc_schemaorg_2023 \
+  --target_dir gate_inputs/wdc_1000 \
+  --table_count 1000 \
+  --seed 13
+```
+
+helper 会轮转 class/subset 桶，并按
+`(rows, stable_hash(seed, relative_path), relative_path)` 选择低行数表。它只生成
+production parser 可读的过滤版 statistics ZIP 与指向绝对源文件的 gzip symlink；
+不会复制、删除、抓取或修改 corpus。目标必须不存在或严格为空。
+`scale_gate_manifest.jsonl` 记录绝对 source、相对 target 与源 gzip SHA-256，
+`scale_gate_checksums.json` 覆盖 manifest 和过滤 ZIP。这些目录是运维规模门禁
+子语料，不是正式 200K 抽样结果。分别用它们作为 `--input_dir`，配套
+`--max_source_tables 100/1000` 和全新的 output/work/cache 根目录运行。10K
+structural gate 直接使用完整 corpus。
+
+### Direct endpoints、动态 vLLM 与 tmux
+
+上面的 resume 命令就是 direct runner：operator 自行提供已启动的
+OpenAI-compatible 文本/图片 endpoints。动态 runner 会启动并重分配两个 vLLM
+模态，未占用参数会透传到 staged WDC 200K builder：
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --text_model_path /path/to/text-model \
+  --image_model_path /path/to/vision-model \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --resume
+```
+
+dynamic runner 独占 `work_wdc_200k/runtime` 下的 endpoint files、模型 identity 与
+start/ready/done markers。
+
+structural tmux preflight 应让进程 stdout 直接显示在 pane 中，并用第二个 window
+读取原子 progress snapshot：
+
+```bash
+tmux new-session -d -s wdc_200k \
+  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_200k --max_source_tables 200000 --selection_seed 13 --stop_after structural'
+tmux new-window -t wdc_200k -n progress \
+  "watch -n 5 'conda run -n MMDD python -m json.tool work_wdc_200k/progress.json'"
+tmux attach-session -t wdc_200k
+```
+
+不要把 stdout/stderr 重定向到 log 文件：runner 会直接输出有界的周期进度，持久
+进度位于 `work_wdc_200k/progress.json`。规模门禁测量与验收字段记录在
+`docs/superpowers/reports/2026-07-17-wdc-200k-scale-validation.md`。
 
 ## Stage-1 逻辑连通性 Pipeline
 

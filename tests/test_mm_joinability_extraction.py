@@ -1007,6 +1007,23 @@ def test_dynamic_vllm_default_builder_is_wdc200k() -> None:
     assert passthrough == []
 
 
+def test_dynamic_vllm_help_names_staged_wdc200k_builder() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_mm_joinability_dynamic_vllm.py"),
+            "--help",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "build_wdc200k_mm_joinability_dataset.py" in completed.stdout
+    assert "run build_mm_joinability_dataset.py" not in completed.stdout
+
+
 def test_dynamic_vllm_preserves_required_explicit_runtime_dir(
     monkeypatch,
     tmp_path,
