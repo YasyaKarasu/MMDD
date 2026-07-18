@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
 import json
 import math
@@ -20,6 +21,7 @@ if str(SCRIPTS) not in sys.path:
 
 from wdc200k_eta import (  # noqa: E402
     DurableUrlCounts,
+    MAX_URL_COMPLETION_PUBLICATIONS,
     UrlEtaEstimate,
     UrlProgressTracker,
     UrlProgressSnapshot,
@@ -27,6 +29,8 @@ from wdc200k_eta import (  # noqa: E402
     encode_histogram_blob,
     estimate_url_eta,
     fixed_bin,
+    completion_publication_interval,
+    next_completion_milestone,
 )
 import wdc200k_eta as eta_module  # noqa: E402
 
@@ -261,9 +265,15 @@ def _legacy_replay(path: Path) -> tuple[float, int]:
 
 
 def test_gate_event_fixtures_are_aggregate_and_frozen() -> None:
+    expected_sha256 = {
+        PAGE_FIXTURE: "d6273029d1a364851ee1273076373703e847d35f4c95a1d2632cd5f5b5b2c11b",
+        IMAGE_FIXTURE: "4d33f75476f95b8d120706167059f6752ca58f9624eaf226905a7ce9e786afaa",
+    }
     for path, expected_count in ((PAGE_FIXTURE, 100), (IMAGE_FIXTURE, 135)):
         payload = path.read_bytes()
+        assert hashlib.sha256(payload).hexdigest() == expected_sha256[path]
         assert b"url" not in payload.lower()
+        assert b"host" not in payload.lower()
         assert b"payload" not in payload.lower()
         fixture = json.loads(payload)
         assert set(fixture) == {
@@ -276,6 +286,9 @@ def test_gate_event_fixtures_are_aggregate_and_frozen() -> None:
             "events",
         }
         events = fixture["events"]
+        assert [item["elapsed_seconds"] for item in events] == sorted(
+            item["elapsed_seconds"] for item in events
+        )
         assert sorted({item["attempt_ordinal"] for item in events}) == list(
             range(expected_count)
         )
@@ -284,6 +297,18 @@ def test_gate_event_fixtures_are_aggregate_and_frozen() -> None:
         assert sum(item["kind"] == "start" for item in events) == expected_count
         assert sum(item["kind"] == "finish" for item in events) == expected_count
         assert sum(item["kind"] == "durable" for item in events) == expected_count
+        per_ordinal = {
+            ordinal: {
+                item["kind"]: item["elapsed_seconds"]
+                for item in events
+                if item["attempt_ordinal"] == ordinal
+            }
+            for ordinal in range(expected_count)
+        }
+        assert all(
+            times["start"] < times["finish"] < times["durable"]
+            for times in per_ordinal.values()
+        )
 
 
 def test_frozen_fixtures_reproduce_legacy_gate_factors() -> None:
@@ -367,6 +392,41 @@ def test_snapshot_and_estimate_have_the_exact_public_fields() -> None:
 )
 def test_fixed_bin_exact_edges(value: float, expected: tuple[int, bool]) -> None:
     assert fixed_bin(value, 8.0, 64) == expected
+
+
+@pytest.mark.parametrize("horizon", [0.1, 1.3])
+@pytest.mark.parametrize("bin_count", [64, 32], ids=["transport", "commit"])
+def test_fixed_bin_all_nonbinary_exact_edges(
+    horizon: float,
+    bin_count: int,
+) -> None:
+    for index in range(bin_count):
+        edge = index * horizon / bin_count
+        assert fixed_bin(edge, horizon, bin_count) == (index, False)
+    assert fixed_bin(horizon, horizon, bin_count) == (bin_count - 1, True)
+
+
+def test_absolute_completion_milestones_span_resumes_jumps_and_batches() -> None:
+    interval = completion_publication_interval(256, requested_interval=1)
+    assert interval == 2
+    assert MAX_URL_COMPLETION_PUBLICATIONS == 224
+
+    # A resume starts after the durable absolute baseline, never relative to it.
+    assert next_completion_milestone(0, interval) == 2
+    assert next_completion_milestone(101, interval) == 102
+    assert next_completion_milestone(200, interval) == 202
+
+    # One refresh coalesces an external jump or a batch crossing many milestones.
+    assert next_completion_milestone(211, interval) == 212
+    assert next_completion_milestone(256, interval) == 258
+    publications = list(range(interval, 257, interval))
+    assert len(publications) <= MAX_URL_COMPLETION_PUBLICATIONS
+
+
+def test_requested_progress_interval_cannot_bypass_production_bound() -> None:
+    assert completion_publication_interval(256, 1) == 2
+    assert completion_publication_interval(256, 7) == 7
+    assert completion_publication_interval(224, 1) == 1
 
 
 def test_km_risk_set_rmst_and_maturity_boundary_hand_calculation() -> None:

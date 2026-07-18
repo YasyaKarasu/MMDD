@@ -61,6 +61,8 @@ from wdc200k_io import (
     validate_completed_shard,
 )
 from wdc200k_eta import (
+    MAX_URL_EXECUTION_EPOCHS,
+    MAX_URL_STAGE_SAMPLES,
     URL_TELEMETRY_SCHEMA_VERSION,
     UrlEtaEstimate,
     UrlProgressSnapshot,
@@ -365,7 +367,8 @@ class ProgressReporter:
     """Publish bounded-cost progress to JSON and direct stdout."""
 
     _ROLLING_WINDOW_SECONDS = 60.0
-    _MAX_STAGE_SAMPLES = 256
+    _MAX_STAGE_SAMPLES = MAX_URL_STAGE_SAMPLES
+    _MAX_EXECUTION_EPOCHS = MAX_URL_EXECUTION_EPOCHS
 
     def __init__(
         self,
@@ -680,6 +683,10 @@ class ProgressReporter:
                     if epoch != current_epoch:
                         if epoch in seen_epochs:
                             raise ValueError("progress v2 epoch is noncontiguous")
+                        if len(seen_epochs) >= self._MAX_EXECUTION_EPOCHS:
+                            raise ValueError(
+                                "progress URL execution epochs exceed 32"
+                            )
                         seen_epochs.add(epoch)
                         current_epoch = epoch
                         epoch_baseline = snapshot.baseline_completed
@@ -977,27 +984,6 @@ class ProgressReporter:
             **ProgressReporter._estimate_fields(estimate),
         }
 
-    @classmethod
-    def _trim_samples(cls, samples: list[dict[str, Any]]) -> None:
-        while len(samples) > cls._MAX_STAGE_SAMPLES:
-            first = samples[0]
-            if "execution_epoch" not in first:
-                del samples[0]
-                continue
-            epoch = first["execution_epoch"]
-            next_epoch = next(
-                (
-                    index
-                    for index, sample in enumerate(samples[1:], start=1)
-                    if sample.get("execution_epoch") != epoch
-                ),
-                len(samples),
-            )
-            if next_epoch < len(samples):
-                del samples[:next_epoch]
-            else:
-                del samples[1]
-
     def _update_url_locked(self, snapshot: UrlProgressSnapshot) -> None:
         if not isinstance(snapshot, UrlProgressSnapshot):
             raise ValueError("url_snapshot must be UrlProgressSnapshot")
@@ -1023,6 +1009,8 @@ class ProgressReporter:
             self._state.rate_basis = rate_basis
             return
         samples = [] if telemetry is None else telemetry["samples"]
+        if len(samples) >= self._MAX_STAGE_SAMPLES:
+            raise ValueError("progress URL stage exceeds 256 samples")
         active = self._active_epochs.get(stage)
         if active is None:
             prior_epochs = {
@@ -1032,6 +1020,8 @@ class ProgressReporter:
             }
             if snapshot.execution_epoch in prior_epochs:
                 raise ValueError("progress execution epoch must be unique")
+            if len(prior_epochs) >= self._MAX_EXECUTION_EPOCHS:
+                raise ValueError("progress URL execution epochs exceed 32")
             if (
                 snapshot.epoch_elapsed_seconds != 0.0
                 or snapshot.completed_durable != snapshot.baseline_completed
@@ -1165,7 +1155,6 @@ class ProgressReporter:
             prior_transport_overflow = decoded.transport_overflow_events
             prior_commit_overflow = decoded.commit_overflow_events
 
-        self._trim_samples(trial)
         telemetry = trial_raw
         telemetry["samples"] = trial
         self._stage_telemetry[stage] = telemetry

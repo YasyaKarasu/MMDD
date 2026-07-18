@@ -44,6 +44,8 @@ try:
         DurableUrlCounts,
         UrlProgressSnapshot,
         UrlProgressTracker,
+        completion_publication_interval,
+        next_completion_milestone,
     )
 except ModuleNotFoundError as error:
     if error.name not in {
@@ -90,6 +92,10 @@ except ModuleNotFoundError as error:
         DurableUrlCounts = eta_helpers.DurableUrlCounts
         UrlProgressSnapshot = eta_helpers.UrlProgressSnapshot
         UrlProgressTracker = eta_helpers.UrlProgressTracker
+        completion_publication_interval = (
+            eta_helpers.completion_publication_interval
+        )
+        next_completion_milestone = eta_helpers.next_completion_milestone
     finally:
         sys.path.remove(scripts_directory)
 
@@ -2271,12 +2277,9 @@ def fetch_unique_images(
     enqueued = _job_count(store, kind)
     if enqueued != unique:
         raise ValueError("image job set was not enqueued completely")
-    if progress_callback_every is not None and progress_callback_every <= 0:
-        raise ValueError("progress_callback_every must be positive")
-    callback_interval = (
-        max(1, (unique + 255) // 256)
-        if progress_callback_every is None
-        else int(progress_callback_every)
+    callback_interval = completion_publication_interval(
+        unique,
+        progress_callback_every,
     )
     owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
     execution_id = f"image-execution-{os.getpid()}-{uuid.uuid4().hex}"
@@ -2296,31 +2299,34 @@ def fetch_unique_images(
     )
     callback_last_published = initial_refresh.completed
     local_durable_completed = 0
-    callback_last_local = 0
+    callback_next_milestone = next_completion_milestone(
+        initial_refresh.completed,
+        callback_interval,
+    )
     if progress_callback is not None:
         initial_snapshot = progress_tracker.snapshot(initial_refresh)
         progress_callback(initial_snapshot)
 
     def publish_url_progress(*, force: bool = False) -> None:
-        nonlocal callback_last_published, callback_last_local
+        nonlocal callback_last_published, callback_next_milestone
         if progress_callback is None:
             return
-        if (
-            force
-            or local_durable_completed - callback_last_local
-            >= callback_interval
-        ):
+        completed_hint = initial_refresh.completed + local_durable_completed
+        if force or completed_hint >= callback_next_milestone:
             refresh = _refresh_image_url_counts(
                 store,
                 kind,
                 outcomes_path,
                 fingerprint,
             )
-            callback_last_local = local_durable_completed
             if refresh.completed != callback_last_published:
                 snapshot = progress_tracker.snapshot(refresh)
                 progress_callback(snapshot)
                 callback_last_published = refresh.completed
+            callback_next_milestone = next_completion_milestone(
+                refresh.completed,
+                callback_interval,
+            )
     buffer_limit = (
         policy.global_concurrency * 4
         if claim_buffer is None
@@ -2480,11 +2486,14 @@ def fetch_unique_images(
                 tuple(futures),
                 return_when=FIRST_COMPLETED,
             )
-            completed_jobs = [futures[future][0] for future in completed]
-            for completed_job in completed_jobs:
-                progress_tracker.future_finished(completed_job.job_id)
-            for future in completed:
-                job, host = futures.pop(future)
+            completed_items = [
+                (future, *futures[future]) for future in completed
+            ]
+            for future, job, _host in completed_items:
+                if not future.cancelled() and future.exception() is None:
+                    progress_tracker.future_finished(job.job_id)
+            for future, job, host in completed_items:
+                futures.pop(future)
                 active_by_host[host] -= 1
                 if active_by_host[host] == 0:
                     del active_by_host[host]
@@ -2493,6 +2502,7 @@ def fetch_unique_images(
                 else:
                     host_queues.pop(host, None)
                     ready_set.discard(host)
+            for future, job, _host in completed_items:
                 execution = future.result()
                 if execution.lease is None:
                     persisted = execution.outcome

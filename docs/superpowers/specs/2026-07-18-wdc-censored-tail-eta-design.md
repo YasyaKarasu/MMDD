@@ -69,8 +69,21 @@ from local buffered state to completed. Thus no-transport paths obey the same
 job topology without fabricating a latency event.
 
 The scheduler maintains local aggregates in a thread-safe, bounded tracker.
-Immediately before each bounded callback (at most 256 per stage), it performs
-one indexed, read-only aggregate refresh of exact durable job/outcome counts;
+Each stage permits at most 224 completion publications plus one mandatory
+baseline publication for each of at most 32 execution epochs, for an absolute
+maximum of 256 persisted samples. The production completion interval is
+`ceil(total / 224)`. Completion milestones are absolute multiples of that
+interval, not counts relative to the current process baseline. Resume starts
+at the first milestone strictly above the indexed durable baseline, so it
+neither resets nor repeats old milestones. A user `progress_callback_every`
+can only increase the effective interval. A refresh that crosses several
+milestones, including an external durable-completion jump or a completed
+future batch, emits one current snapshot. The forced final publication counts
+toward the 224 budget and is coalesced when the same durable completion was
+already published.
+
+Immediately before each bounded callback, the scheduler performs one indexed,
+read-only aggregate refresh of exact durable job/outcome counts;
 this occurs outside the callback and returns only scalar counts. It then
 obtains `unobserved_nonlocal` by subtraction, so completions made by another
 live execution are visible and concurrent leases cannot break the topology
@@ -80,6 +93,14 @@ for ages and durations. The callback never scans SQLite and never retains a
 URL. A batch returned by `wait(FIRST_COMPLETED)` enters
 `finished_not_durable` before its serial outcome/job commits, then leaves that
 state one result at a time.
+
+The durable finish fence is also the tracker transition fence. If the attempt
+finish guard or SQLite transaction fails, the worker future fails and the
+tracker correctly remains physical-active. For a completed future batch, the
+scheduler distinguishes failed futures first and calls `future_finished` only
+for futures that crossed the finish fence successfully. It releases scheduler
+resources before calling `future.result()`, which propagates the original
+guard or SQLite exception without replacement, retry, or conversion.
 
 At the start of an epoch, the tracker records `epoch_started_monotonic`; every
 snapshot captures topology, histograms, and `captured_monotonic` under the same
@@ -106,15 +127,17 @@ contains the capped horizon:
 
 ```text
 T[j] = j * H / 64, j = 0..64
-bin(x) = min(63, floor(64 * max(0, x) / H))
+bin(x) = bisect_right(T, max(0, x)) - 1, for x < H
 ```
 
 Durations and active ages `>= H` increment the corresponding overflow counter
 and bin 63. Overflow values are not assigned a fabricated duration beyond the
 policy deadline.
 
-Exact-edge tests require `T[j]` for `0 <= j < 64` to enter bin `j`, and `H`
-to enter bin 63 with overflow set.
+The `x >= H` overflow check occurs before the bisection. Exact-edge tests use
+the same generated edges and require `T[j]` for `0 <= j < 64` to enter bin
+`j`, and `H` to enter bin 63 with overflow set. This definition also applies
+to non-binary horizons such as `0.1` and `1.3`.
 
 Commit horizon `C` is `min(2.0, H)` seconds, with 32 linear bins
 `C[j] = j*C/32`. Commit durations `>= C` increment `commit_overflow_events`
@@ -248,7 +271,7 @@ histograms cannot decrease; `active_censor_histogram` is current state and may
 change. Resume validates prior epochs, then starts a new epoch with empty
 histograms and a fresh durable baseline.
 
-Epoch authority is append-only and fail-closed:
+Epoch and sample authority is append-only and fail-closed:
 
 - an epoch identifier is non-empty, unique within the stage, and occupies one
   contiguous sample range; a later sample cannot return to an older epoch;
@@ -260,6 +283,11 @@ Epoch authority is append-only and fail-closed:
 - elapsed time and durable completion are monotonic inside the epoch;
 - a new epoch's baseline completion is at least the prior sample's completion,
   while the stage total/deadline/rate basis remain identical.
+- the 33rd unique execution epoch or 257th sample is rejected before telemetry
+  append or `progress.json` replacement; previously published bytes and sample
+  objects remain unchanged;
+- no accepted sample or epoch is trimmed, compacted, or excluded to recover
+  capacity. Every generated eligible final-half sample remains authoritative.
 
 ## Validation and compatibility
 
@@ -292,8 +320,9 @@ Unit tests use a fake logical clock and deterministic snapshots:
 2. queue-only, in-flight-only, commit-only, and mixed drain equations;
 3. topology equality, monotonicity, finite-number, bin-length, and deadline
    validation failures;
-4. exact-edge binning, `uint64` blob length/range/tamper validation, at most
-   256 samples regardless of URL count, and the worst-width file below 3 MiB;
+4. all exact edges for binary and non-binary horizons, `uint64` blob
+   length/range/tamper validation, 224 absolute completion publications plus
+   at most 32 epoch baselines, and the worst-width file below 3 MiB;
 5. resume preserves prior samples, starts an empty-histogram epoch from the
    durable baseline, and does not replay attempts;
 6. epoch identifiers are unique/contiguous, baselines bind to the durable
@@ -305,6 +334,10 @@ Unit tests use a fake logical clock and deterministic snapshots:
 9. v1 completed telemetry remains readable; incomplete v1 upgrades to v2;
 10. disk-guard failure leaves the prior atomic progress snapshot intact;
 11. dry-run/structural runs create no v2 telemetry.
+12. finish-fence guard and SQLite failures retain physical-active tracker
+    authority, leave the attempt unfinished, and propagate the root error;
+13. frozen fixtures have fixed SHA-256 digests, global chronology, and strict
+    per-attempt start/finish/durable ordering, with no host, URL, or payload.
 
 Before any production implementation, aggregate regression fixtures are
 created from the exact gate-100 page and image attempt start/finish timestamps

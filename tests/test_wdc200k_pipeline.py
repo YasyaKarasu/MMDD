@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import gzip
+import hashlib
 import os
 import base64
 import shutil
@@ -35,7 +36,12 @@ from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
 )
 import build_wdc200k_mm_joinability_dataset as pipeline_module  # noqa: E402
 from wdc200k_assets import ImageOutcomeStore  # noqa: E402
-from wdc200k_fetch import PageOutcomeStore  # noqa: E402
+from wdc200k_fetch import (  # noqa: E402
+    FetchPolicy,
+    PageOutcomeStore,
+    fetch_unique_pages,
+)
+from wdc200k_io import SqliteJobStore  # noqa: E402
 from wdc200k_eta import (  # noqa: E402
     DurableUrlCounts,
     UrlProgressSnapshot,
@@ -1541,6 +1547,196 @@ def test_runner_epoch_elapsed_uses_first_callback_as_rate_and_time_origin(
     assert samples[4]["durable_rate"] == 1.0
 
 
+def _stub_network_runner_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    network_manifest = tmp_path / "network-manifest.json"
+    monkeypatch.setattr(
+        pipeline_module,
+        "_publish_network_manifest",
+        lambda *_args, **_kwargs: network_manifest,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_network_telemetry_counters",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_read_only_job_scope", lambda *_args: {}
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_write_stage_registry", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_registry_identity", lambda *_args: "upstream"
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_refresh_known_disk", lambda *_args, **_kwargs: None
+    )
+    return network_manifest
+
+
+def test_run_pages_wires_nonzero_tracker_elapsed_through_reporter_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 100.0)
+    _stub_network_runner_tail(monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline_module, "_page_refs", lambda *_args: iter(()))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_reconcile_page_jobs_from_outcomes",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_complete_page_fetch",
+        lambda *_args, **_kwargs: {"identity": "pages"},
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_page_outcomes", lambda *_args: iter(())
+    )
+
+    result = SimpleNamespace(
+        job_store_path=config.work_dir / "page_jobs" / "jobs.sqlite3",
+        job_kind="page-kind",
+        outcomes_path=config.cache_dir / "page_cache" / "outcomes.sqlite3",
+        policy_fingerprint="page-policy",
+        unique=2,
+        success=2,
+        terminal=0,
+        remaining=0,
+        leased=0,
+        transport_attempt_summary={},
+    )
+
+    def fake_fetch(*_args: Any, progress_callback, **_kwargs: Any):
+        for completed, elapsed in ((0, 5.0), (1, 6.5), (2, 7.0)):
+            progress_callback(
+                _url_snapshot(
+                    epoch="wired-pages",
+                    baseline=0,
+                    completed=completed,
+                    total=2,
+                    elapsed=elapsed,
+                )
+            )
+        return result
+
+    monkeypatch.setattr(pipeline_module, "fetch_unique_pages", fake_fetch)
+    reporter = ProgressReporter(config)
+    pipeline_module._run_pages(
+        config,
+        reporter,
+        (),
+        SimpleNamespace(manifest=tmp_path / "selection.json"),
+        object(),
+    )
+
+    restored = ProgressReporter(replace(config, resume=True))
+    samples = restored._stage_telemetry["pages"]["samples"]
+    assert [sample["epoch_elapsed_seconds"] for sample in samples] == [
+        0.0,
+        1.5,
+        2.0,
+    ]
+    assert [sample["timestamp"] for sample in samples] == [100.0, 101.5, 102.0]
+
+
+def test_run_images_wires_nonzero_tracker_elapsed_through_reporter_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 200.0)
+    network_manifest = _stub_network_runner_tail(monkeypatch, tmp_path)
+    unique_jobs = SimpleNamespace(
+        records=2,
+        manifest_path=tmp_path / "unique-manifest.json",
+    )
+    monkeypatch.setattr(
+        pipeline_module, "build_unique_image_jobs", lambda *_args, **_kwargs: unique_jobs
+    )
+    monkeypatch.setattr(
+        pipeline_module, "validate_unique_image_jobs", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "validate_complete_image_fetch", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_image_outcomes", lambda *_args: iter(())
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "asset_materialization_input_fingerprint",
+        lambda *_args: "asset-input",
+    )
+    materialized = SimpleNamespace(
+        bridge_assets=0,
+        table_asset_links=0,
+        manifest_path=tmp_path / "materialized-manifest.json",
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "materialize_asset_shards",
+        lambda *_args, **_kwargs: materialized,
+    )
+    barrier = SimpleNamespace()
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_materialized_asset_shards",
+        lambda *_args, **_kwargs: (materialized, barrier),
+    )
+    image_result = SimpleNamespace(
+        job_store_path=config.work_dir / "image_jobs" / "jobs.sqlite3",
+        job_kind="image-kind",
+        outcomes_path=config.cache_dir / "image_cache" / "outcomes.sqlite3",
+        policy_fingerprint="image-policy",
+        fetch_manifest_path=tmp_path / "fetch-manifest.json",
+        unique=2,
+        success=2,
+        terminal=0,
+        remaining=0,
+        leased=0,
+        outcomes_count=2,
+        transport_attempt_summary={},
+    )
+
+    def fake_download(*_args: Any, progress_callback, **_kwargs: Any):
+        for completed, elapsed in ((0, 4.25), (1, 5.75), (2, 6.25)):
+            progress_callback(
+                _url_snapshot(
+                    epoch="wired-images",
+                    baseline=0,
+                    completed=completed,
+                    total=2,
+                    elapsed=elapsed,
+                )
+            )
+        return image_result
+
+    monkeypatch.setattr(pipeline_module, "fetch_unique_images", fake_download)
+    reporter = ProgressReporter(config)
+    returned = pipeline_module._run_images(
+        config,
+        reporter,
+        SimpleNamespace(manifest_path=tmp_path / "plan-manifest.json"),
+        object(),
+    )
+    assert returned[-1] == network_manifest
+
+    restored = ProgressReporter(replace(config, resume=True))
+    samples = restored._stage_telemetry["images"]["samples"]
+    assert [sample["epoch_elapsed_seconds"] for sample in samples] == [
+        0.0,
+        1.5,
+        2.0,
+    ]
+    assert [sample["timestamp"] for sample in samples] == [200.0, 201.5, 202.0]
+
+
 def test_progress_v2_tracks_all_disk_root_extrema_across_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1656,7 +1852,7 @@ def test_progress_resume_start_preserves_persisted_disk_current_bytes(
     }
 
 
-def test_progress_v2_is_bounded_canonical_and_strictly_restorable(
+def test_progress_v2_rejects_257th_sample_without_changing_published_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1665,7 +1861,7 @@ def test_progress_v2_is_bounded_canonical_and_strictly_restorable(
     reporter = ProgressReporter(config)
     baseline = UINT64_MAX - 256
     for stage, epoch in (("pages", "wide-pages"), ("images", "wide-images")):
-        for offset in range(257):
+        for offset in range(256):
             reporter.update(
                 stage=stage if offset == 0 else None,
                 url_snapshot=_url_snapshot(
@@ -1678,7 +1874,21 @@ def test_progress_v2_is_bounded_canonical_and_strictly_restorable(
                     effective_concurrency=UINT64_MAX,
                 ),
             )
-    reporter.publish()
+        reporter.publish()
+        published = reporter.path.read_bytes()
+        with pytest.raises(ValueError, match="sample|bound|256"):
+            reporter.update(
+                url_snapshot=_url_snapshot(
+                    epoch=epoch,
+                    baseline=baseline,
+                    completed=baseline + 256,
+                    total=UINT64_MAX,
+                    elapsed=256.0,
+                    deadline=1e300,
+                    effective_concurrency=UINT64_MAX,
+                )
+            )
+        assert reporter.path.read_bytes() == published
 
     payload = json.loads(reporter.path.read_text(encoding="utf-8"))
     assert reporter.path.stat().st_size < 3 * 1024 * 1024
@@ -1705,6 +1915,162 @@ def test_progress_v2_is_bounded_canonical_and_strictly_restorable(
             assert commit == rebuilt.commit_event_histogram
             assert encode_histogram_blob(rebuilt) == sample["histogram_blob"]
     ProgressReporter(config)
+
+
+def test_progress_v2_rejects_33rd_epoch_without_changing_published_bytes(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), resume=True)
+    for ordinal in range(32):
+        reporter = ProgressReporter(config)
+        reporter.update(
+            stage="pages",
+            url_snapshot=_url_snapshot(
+                epoch=f"epoch-{ordinal}",
+                baseline=0,
+                completed=0,
+                total=1,
+                elapsed=0.0,
+            ),
+        )
+        reporter.publish()
+
+    published = reporter.path.read_bytes()
+    overflow = ProgressReporter(config)
+    with pytest.raises(ValueError, match="epoch|32"):
+        overflow.update(
+            stage="pages",
+            url_snapshot=_url_snapshot(
+                epoch="epoch-32",
+                baseline=0,
+                completed=0,
+                total=1,
+                elapsed=0.0,
+            ),
+        )
+    assert overflow.path.read_bytes() == published
+
+
+def test_page_progress_absolute_schedule_preserves_interrupted_epoch_authority(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    urls = [f"https://progress.example/{ordinal}" for ordinal in range(256)]
+    refs = [
+        {
+            "entity_id": str(ordinal),
+            "page_url": url,
+            "url_key": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        }
+        for ordinal, url in enumerate(urls)
+    ]
+
+    class FastTransport:
+        network_policy_fingerprint = "wdc-web-v1"
+
+        def fetch_page(self, url: str, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "page_url": url,
+                "final_url": url,
+                "text": url,
+                "image_urls": [],
+            }
+
+    policy = FetchPolicy(
+        global_concurrency=16,
+        per_host_concurrency=16,
+    )
+    jobs = SqliteJobStore(tmp_path / "progress-jobs.sqlite3")
+    outcomes = tmp_path / "progress-outcomes.sqlite3"
+    first = ProgressReporter(config)
+    first_normalizer = pipeline_module._EpochElapsedNormalizer()
+
+    def interrupting_callback(snapshot: UrlProgressSnapshot) -> None:
+        first.update(
+            stage="pages" if first._state.stage != "pages" else None,
+            url_snapshot=first_normalizer(snapshot),
+        )
+        first.publish()
+        if snapshot.completed_durable == 200:
+            raise KeyboardInterrupt("synthetic durable cutoff")
+
+    with pytest.raises(KeyboardInterrupt, match="durable cutoff"):
+        fetch_unique_pages(
+            refs,
+            jobs,
+            FastTransport(),
+            policy,
+            outcomes_path=outcomes,
+            claim_buffer=16,
+            lease_seconds=60.0,
+            progress_callback=interrupting_callback,
+            progress_callback_every=1,
+        )
+
+    before_resume = json.loads(first.path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ]["pages"]["samples"]
+    assert before_resume[-1]["completed_units"] == 200
+    eligible_before_resume = [
+        sample
+        for sample in before_resume
+        if sample["completed_units"] * 2 >= sample["total_units"]
+    ]
+    assert eligible_before_resume
+
+    with sqlite3.connect(jobs.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET lease_expires = 0 WHERE status = 'leased'"
+        )
+
+    resumed = ProgressReporter(replace(config, resume=True))
+    resumed_normalizer = pipeline_module._EpochElapsedNormalizer()
+    resumed_generated: list[dict[str, Any]] = []
+
+    def resumed_callback(snapshot: UrlProgressSnapshot) -> None:
+        resumed.update(
+            stage="pages" if resumed._state.stage != "pages" else None,
+            url_snapshot=resumed_normalizer(snapshot),
+        )
+        resumed_generated.append(
+            json.loads(
+                json.dumps(
+                    resumed._stage_telemetry["pages"]["samples"][-1]
+                )
+            )
+        )
+        resumed.publish()
+
+    result = fetch_unique_pages(
+        refs,
+        jobs,
+        FastTransport(),
+        policy,
+        outcomes_path=outcomes,
+        claim_buffer=16,
+        lease_seconds=60.0,
+        progress_callback=resumed_callback,
+        progress_callback_every=1,
+    )
+    assert result.complete
+
+    telemetry = json.loads(resumed.path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ]["pages"]
+    samples = telemetry["samples"]
+    authoritative_samples = [*before_resume, *resumed_generated]
+    assert samples == authoritative_samples
+    assert len(samples) <= 256
+    assert len({sample["execution_epoch"] for sample in samples}) == 2
+    assert [sample["completed_units"] for sample in samples].count(200) == 2
+    expected_authority = ProgressReporter._eta_completion_summary(
+        authoritative_samples,
+        total=256,
+        completed_at=telemetry["completed_at"],
+    )
+    assert {
+        key: telemetry[key] for key in expected_authority
+    } == expected_authority
 
 
 def test_progress_restore_rejects_files_above_four_mibibytes(

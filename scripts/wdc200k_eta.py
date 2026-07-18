@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from bisect import bisect_right
 import math
 import struct
 import threading
@@ -12,6 +13,11 @@ from typing import Callable
 UINT64_MAX = 2**64 - 1
 TRANSPORT_BIN_COUNT = 64
 COMMIT_BIN_COUNT = 32
+MAX_URL_COMPLETION_PUBLICATIONS = 224
+MAX_URL_EXECUTION_EPOCHS = 32
+MAX_URL_STAGE_SAMPLES = (
+    MAX_URL_COMPLETION_PUBLICATIONS + MAX_URL_EXECUTION_EPOCHS
+)
 MATURITY_FRACTION = 1.0 / 3.0
 URL_TELEMETRY_SCHEMA_VERSION = "wdc200k-url-telemetry-v2"
 _HISTOGRAM_STRUCT = struct.Struct("<" + "Q" * 160)
@@ -413,10 +419,50 @@ def fixed_bin(
     overflow = numeric_value >= numeric_horizon
     if overflow:
         return bin_count - 1, True
-    index = math.floor(
-        bin_count * max(0.0, numeric_value) / numeric_horizon
+    edges = tuple(
+        index * numeric_horizon / bin_count
+        for index in range(bin_count + 1)
     )
+    index = bisect_right(edges, max(0.0, numeric_value)) - 1
     return min(bin_count - 1, index), False
+
+
+def completion_publication_interval(
+    total: int,
+    requested_interval: int | None = None,
+) -> int:
+    """Return the bounded production interval for absolute completions."""
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise ValueError("total must be a non-negative integer")
+    if requested_interval is not None and (
+        isinstance(requested_interval, bool)
+        or not isinstance(requested_interval, int)
+        or requested_interval <= 0
+    ):
+        raise ValueError("requested_interval must be a positive integer")
+    production = max(
+        1,
+        (total + MAX_URL_COMPLETION_PUBLICATIONS - 1)
+        // MAX_URL_COMPLETION_PUBLICATIONS,
+    )
+    return max(production, requested_interval or production)
+
+
+def next_completion_milestone(completed: int, interval: int) -> int:
+    """Return the first stage-global absolute milestone after completed."""
+    if (
+        isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or completed < 0
+    ):
+        raise ValueError("completed must be a non-negative integer")
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, int)
+        or interval <= 0
+    ):
+        raise ValueError("interval must be a positive integer")
+    return (completed // interval + 1) * interval
 
 
 def encode_histogram_blob(snapshot: UrlProgressSnapshot) -> str:

@@ -36,6 +36,8 @@ try:
         DurableUrlCounts,
         UrlProgressSnapshot,
         UrlProgressTracker,
+        completion_publication_interval,
+        next_completion_milestone,
     )
 except ModuleNotFoundError as error:
     if error.name not in {"stage1_io", "wdc200k_io", "wdc200k_eta"}:
@@ -57,6 +59,8 @@ except ModuleNotFoundError as error:
             DurableUrlCounts,
             UrlProgressSnapshot,
             UrlProgressTracker,
+            completion_publication_interval,
+            next_completion_milestone,
         )
     finally:
         sys.path.remove(scripts_directory)
@@ -1567,12 +1571,9 @@ def fetch_unique_pages(
     )
 
     unique = _job_count(store, kind)
-    if progress_callback_every is not None and progress_callback_every <= 0:
-        raise ValueError("progress_callback_every must be positive")
-    callback_interval = (
-        max(1, (unique + 255) // 256)
-        if progress_callback_every is None
-        else int(progress_callback_every)
+    callback_interval = completion_publication_interval(
+        unique,
+        progress_callback_every,
     )
     owner = f"fetch-{os.getpid()}-{uuid.uuid4().hex}"
     execution_id = f"page-execution-{os.getpid()}-{uuid.uuid4().hex}"
@@ -1592,31 +1593,34 @@ def fetch_unique_pages(
     )
     callback_last_published = initial_refresh.completed
     local_durable_completed = 0
-    callback_last_local = 0
+    callback_next_milestone = next_completion_milestone(
+        initial_refresh.completed,
+        callback_interval,
+    )
     if progress_callback is not None:
         initial_snapshot = progress_tracker.snapshot(initial_refresh)
         progress_callback(initial_snapshot)
 
     def publish_url_progress(*, force: bool = False) -> None:
-        nonlocal callback_last_published, callback_last_local
+        nonlocal callback_last_published, callback_next_milestone
         if progress_callback is None:
             return
-        if (
-            force
-            or local_durable_completed - callback_last_local
-            >= callback_interval
-        ):
+        completed_hint = initial_refresh.completed + local_durable_completed
+        if force or completed_hint >= callback_next_milestone:
             refresh = _refresh_page_url_counts(
                 store,
                 kind,
                 outcomes_path,
                 fingerprint,
             )
-            callback_last_local = local_durable_completed
             if refresh.completed != callback_last_published:
                 snapshot = progress_tracker.snapshot(refresh)
                 progress_callback(snapshot)
                 callback_last_published = refresh.completed
+            callback_next_milestone = next_completion_milestone(
+                refresh.completed,
+                callback_interval,
+            )
     buffer_limit = (
         max(policy.global_concurrency, policy.global_concurrency * 4)
         if claim_buffer is None
@@ -1831,12 +1835,14 @@ def fetch_unique_pages(
                     tuple(futures),
                     return_when=FIRST_COMPLETED,
                 )
-                completed_jobs = [futures[future][0] for future in completed]
-                for completed_job in completed_jobs:
-                    progress_tracker.future_finished(completed_job.job_id)
-                for future in completed:
-                    completions_since_progress += 1
-                    job, host = futures.pop(future)
+                completed_items = [
+                    (future, *futures[future]) for future in completed
+                ]
+                for future, job, _host in completed_items:
+                    if not future.cancelled() and future.exception() is None:
+                        progress_tracker.future_finished(job.job_id)
+                for future, job, host in completed_items:
+                    futures.pop(future)
                     state = host_states[host]
                     state.active -= 1
                     state.semaphore.release()
@@ -1845,6 +1851,8 @@ def fetch_unique_pages(
                     elif state.active == 0:
                         host_states.pop(host, None)
                         ready_set.discard(host)
+                for future, job, _host in completed_items:
+                    completions_since_progress += 1
                     outcome = future.result()
                     outcome_write_tracker.before_write(
                         4096

@@ -36,7 +36,7 @@ from wdc200k_fetch import (  # noqa: E402
 from wdc200k_io import SqliteJobStore  # noqa: E402
 from wdc200k_io import AtomicJsonlShard  # noqa: E402
 from stage1_io import stable_hash  # noqa: E402
-from wdc200k_eta import UrlProgressSnapshot  # noqa: E402
+from wdc200k_eta import DurableUrlCounts, UrlProgressSnapshot  # noqa: E402
 
 
 def page_ref(entity_id: str, url: str) -> dict[str, str]:
@@ -192,7 +192,7 @@ def test_page_progress_callback_starts_from_durable_baseline_and_is_bounded(
     )
 
     assert result.complete
-    assert [snapshot.completed_durable for snapshot in updates] == [1, 3, 5]
+    assert [snapshot.completed_durable for snapshot in updates] == [1, 2, 4, 5]
     assert all(snapshot.total == 5 for snapshot in updates)
     assert len({snapshot.execution_epoch for snapshot in updates}) == 1
 
@@ -714,6 +714,102 @@ def test_page_transport_attempt_start_is_disk_guarded(
     assert PageOutcomeStore(path).transport_attempt_summary("policy")[
         "records"
     ] == 0
+
+
+@pytest.mark.parametrize("failure_mode", ["guard", "sqlite"])
+def test_page_finish_fence_failure_preserves_root_error_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    url = "https://e.test/finish-fence"
+    reference = page_ref("finish-fence", url)
+    policy = FetchPolicy(global_concurrency=1, per_host_concurrency=1)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    PageOutcomeStore(outcomes_path)
+    expected_type: type[BaseException]
+    expected_message: str
+    guard = None
+    if failure_mode == "guard":
+        expected_type = OSError
+        expected_message = "page finish guard sentinel"
+
+        def reject_finish(path: Path, estimated_bytes: int = 0) -> None:
+            if Path(path) != outcomes_path or estimated_bytes != 0:
+                return
+            with sqlite3.connect(outcomes_path) as connection:
+                unfinished = connection.execute(
+                    "SELECT COUNT(*) FROM transport_attempts "
+                    "WHERE finished_at IS NULL"
+                ).fetchone()[0]
+            if unfinished:
+                raise OSError(expected_message)
+
+        guard = reject_finish
+    else:
+        expected_type = sqlite3.IntegrityError
+        expected_message = "page finish sqlite sentinel"
+        with sqlite3.connect(outcomes_path) as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_page_transport_finish "
+                "BEFORE UPDATE OF finished_at ON transport_attempts "
+                "WHEN NEW.finished_at IS NOT NULL "
+                f"BEGIN SELECT RAISE(ABORT, '{expected_message}'); END"
+            )
+
+    trackers = []
+    tracker_type = fetch_module.UrlProgressTracker
+
+    def capture_tracker(*args: Any, **kwargs: Any):
+        tracker = tracker_type(*args, **kwargs)
+        trackers.append(tracker)
+        return tracker
+
+    monkeypatch.setattr(fetch_module, "UrlProgressTracker", capture_tracker)
+    transport = CountingTransport({url: {"text": "fetched"}})
+    with pytest.raises(expected_type, match=expected_message):
+        fetch_unique_pages(
+            [reference],
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            lease_seconds=60.0,
+            pre_write_guard=guard,
+        )
+
+    failed_snapshot = trackers[0].snapshot(
+        DurableUrlCounts(completed=0, pending=0, leased=1, total=1)
+    )
+    assert failed_snapshot.physical_in_flight == 1
+    assert failed_snapshot.finished_not_durable == 0
+    outcome_store = PageOutcomeStore(outcomes_path)
+    assert outcome_store.get(policy.fingerprint, reference["url_key"]) is None
+    summary = outcome_store.transport_attempt_summary(policy.fingerprint)
+    assert summary["unfinished_transport_attempts"] == 1
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+        ).fetchall() == [("leased", 1)]
+        connection.execute(
+            "UPDATE jobs SET lease_expires = 0 WHERE status = 'leased'"
+        )
+    if failure_mode == "sqlite":
+        with sqlite3.connect(outcomes_path) as connection:
+            connection.execute("DROP TRIGGER fail_page_transport_finish")
+
+    resumed_transport = CountingTransport({url: {"text": "retried"}})
+    resumed = fetch_unique_pages(
+        [reference],
+        jobs,
+        resumed_transport,
+        policy,
+        outcomes_path=outcomes_path,
+        lease_seconds=60.0,
+    )
+    assert resumed.complete
+    assert resumed_transport.calls == [url]
 
 
 def test_page_outcome_fanout_streams_every_entity_reference(

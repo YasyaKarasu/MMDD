@@ -174,6 +174,7 @@ git commit -m "Add censored-tail URL ETA estimator"
 - `DurableUrlCounts(completed: int, pending: int, leased: int, total: int)` contains only scalars from the indexed external refresh.
 - Page/image `progress_callback` becomes `Callable[[UrlProgressSnapshot], None] | None`.
 - Page and image modules each expose a private `_refresh_*_url_counts(...) -> DurableUrlCounts` using indexed `jobs.kind` and policy/outcome joins.
+- Page and image schedulers share a production publication bound of 224 completion snapshots. They use `ceil(total / 224)` and stage-global absolute completion multiples across resume; `progress_callback_every` cannot reduce that interval. Up to 32 mandatory execution-epoch baselines reserve the remaining sample capacity.
 
 - [ ] **Step 1: Write failing tracker race/topology tests**
 
@@ -182,6 +183,12 @@ Use a fake monotonic clock and barriers to interleave 128 starts/finishes with s
 - [ ] **Step 2: Write failing fetcher transition tests**
 
 Page tests must cover physical success, exception, synchronous cache reconciliation, final-check suppression, batch `FIRST_COMPLETED`, and another execution's durable completion. Image tests must additionally cover image-claim wait, another claimant's outcome, and claim loss. Assert no-physical paths create no latency event and still move jobs to durable completion.
+
+Add symmetric page/image guard and SQLite finish-fence failures. Assert the
+original exception type and message, unfinished attempt ledger, no false
+durable completion, physical-active tracker state, and successful retry after
+resume. In a completed batch, mark only successful futures finished, release
+scheduler resources, and propagate failed `future.result()` unchanged.
 
 - [ ] **Step 3: Run RED tests**
 
@@ -201,7 +208,7 @@ Add/verify indexes supporting `jobs(kind, status)` and outcome `(policy_fingerpr
 
 - [ ] **Step 6: Integrate page and image schedulers**
 
-Place tracker hooks immediately after the existing durable attempt start/finish fences and around future/durable commits. Before each existing bounded callback interval, run one external refresh, pass it into `tracker.snapshot`, then invoke the callback. Preserve the initial durable-baseline callback and forced final callback.
+Place tracker hooks immediately after the existing durable attempt start/finish fences and around future/durable commits. Before each bounded absolute-completion milestone, run one external refresh, pass it into `tracker.snapshot`, then invoke the callback. Preserve one mandatory initial durable-baseline callback per epoch. Coalesce the forced final callback with an already published completion and count it within the 224 completion budget. Cover multiple resumes, external jumps, and completed batches.
 
 - [ ] **Step 7: Run GREEN, focused regressions, and disk checks**
 
@@ -210,7 +217,7 @@ conda run -n MMDD python -m pytest tests/test_wdc200k_eta.py tests/test_wdc200k_
 conda run -n MMDD python -m pytest tests/test_wdc200k_pipeline.py -q
 ```
 
-Expected: all tests pass; callback count remains at most 256 plus initial/final coalescing, physical attempt summaries are unchanged, and disk-guard tests remain green.
+Expected: all tests pass; each stage retains every publication and has at most 224 completion samples plus 32 epoch baselines, physical attempt summaries are unchanged, and disk-guard tests remain green.
 
 - [ ] **Step 8: Commit Task 2**
 
@@ -242,7 +249,7 @@ Add a fake disk-usage sequence for all three roots. Assert start is captured onc
 
 - [ ] **Step 2: Write failing codec/size/tamper tests**
 
-Construct two stages with 256 maximum-width samples. Assert decoded blob length 1,280, canonical base64 round-trip, output `< 3 * 1024 * 1024`, and restore rejects truncated/extra/noncanonical blobs, counter overflow, decreasing event histograms, topology mismatch, duplicate/noncontiguous epochs, changed deadline/total, and forged ETA components.
+Construct two stages with 256 maximum-width samples. Assert decoded blob length 1,280, canonical base64 round-trip, output `< 3 * 1024 * 1024`, and restore rejects truncated/extra/noncanonical blobs, counter overflow, decreasing event histograms, topology mismatch, duplicate/noncontiguous epochs, changed deadline/total, and forged ETA components. The 257th sample and 33rd unique epoch must fail before replacing the previously published progress bytes.
 
 - [ ] **Step 3: Write failing pipeline authority/compatibility tests**
 
@@ -258,7 +265,7 @@ Expected: v2 persistence/restore tests fail because the reporter still accepts s
 
 - [ ] **Step 5: Implement v2 reporter epochs**
 
-On the first snapshot of an epoch, allocate a rollback-safe logical baseline and require elapsed zero. For later snapshots, derive timestamp only from the persisted baseline plus monotonic elapsed. Call `estimate_url_eta`, serialize the exact histograms, retain at most 256 samples, and recompute final-half summaries from restored sample predictions.
+On the first snapshot of an epoch, allocate a rollback-safe logical baseline and require elapsed zero. For later snapshots, derive timestamp only from the persisted baseline plus monotonic elapsed. Call `estimate_url_eta`, serialize the exact histograms, append at most 256 samples, and recompute final-half summaries from restored sample predictions. Never trim an accepted sample or epoch to recover capacity; fail closed before append instead.
 
 During the same atomic snapshot, update output/work/cache current bytes, peak bytes, and per-root minimum free bytes. Initialize start bytes/free bytes only when absent. Restore and merge extrema before the first resume publication so a restarted process cannot erase a prior peak or raise a prior minimum-free value.
 

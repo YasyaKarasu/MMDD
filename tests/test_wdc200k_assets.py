@@ -44,7 +44,7 @@ from wdc200k_io import AtomicJsonlShard, SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
 import wdc200k_assets as assets_module  # noqa: E402
-from wdc200k_eta import UrlProgressSnapshot  # noqa: E402
+from wdc200k_eta import DurableUrlCounts, UrlProgressSnapshot  # noqa: E402
 
 
 def _open_image_outcome_store_process(
@@ -2312,6 +2312,111 @@ def test_image_transport_attempt_start_is_disk_guarded(
     assert ImageOutcomeStore(path).transport_attempt_summary("policy")[
         "records"
     ] == 0
+
+
+@pytest.mark.parametrize("failure_mode", ["guard", "sqlite"])
+def test_image_finish_fence_failure_preserves_root_error_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    image_url = "https://i.test/finish-fence.jpg"
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", [image_url])
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(outcomes_path)
+    expected_type: type[BaseException]
+    expected_message: str
+    guard = None
+    if failure_mode == "guard":
+        expected_type = OSError
+        expected_message = "image finish guard sentinel"
+
+        def reject_finish(path: Path, estimated_bytes: int = 0) -> None:
+            if Path(path) != outcomes_path or estimated_bytes != 0:
+                return
+            with sqlite3.connect(outcomes_path) as connection:
+                unfinished = connection.execute(
+                    "SELECT COUNT(*) FROM transport_attempts "
+                    "WHERE finished_at IS NULL"
+                ).fetchone()[0]
+            if unfinished:
+                raise OSError(expected_message)
+
+        guard = reject_finish
+    else:
+        expected_type = sqlite3.IntegrityError
+        expected_message = "image finish sqlite sentinel"
+        with sqlite3.connect(outcomes_path) as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_image_transport_finish "
+                "BEFORE UPDATE OF finished_at ON transport_attempts "
+                "WHEN NEW.finished_at IS NOT NULL "
+                f"BEGIN SELECT RAISE(ABORT, '{expected_message}'); END"
+            )
+
+    trackers = []
+    tracker_type = assets_module.UrlProgressTracker
+
+    def capture_tracker(*args, **kwargs):
+        tracker = tracker_type(*args, **kwargs)
+        trackers.append(tracker)
+        return tracker
+
+    monkeypatch.setattr(assets_module, "UrlProgressTracker", capture_tracker)
+    transport = FakeImageTransport(tmp_path, {image_url: "unique"})
+    with pytest.raises(expected_type, match=expected_message):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            lease_seconds=60.0,
+            pre_write_guard=guard,
+        )
+
+    failed_snapshot = trackers[0].snapshot(
+        DurableUrlCounts(completed=0, pending=0, leased=1, total=1)
+    )
+    assert failed_snapshot.physical_in_flight == 1
+    assert failed_snapshot.finished_not_durable == 0
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    outcome_store = ImageOutcomeStore(outcomes_path)
+    assert outcome_store.get(fingerprint, url_key) is None
+    summary = outcome_store.transport_attempt_summary(fingerprint)
+    assert summary["unfinished_transport_attempts"] == 1
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+        ).fetchall() == [("leased", 1)]
+        connection.execute(
+            "UPDATE jobs SET lease_expires = 0 WHERE status = 'leased'"
+        )
+    if failure_mode == "sqlite":
+        with sqlite3.connect(outcomes_path) as connection:
+            connection.execute("DROP TRIGGER fail_image_transport_finish")
+
+    resumed_transport = FakeImageTransport(tmp_path, {image_url: "unique"})
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        resumed_transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        lease_seconds=60.0,
+    )
+    assert resumed.complete
+    assert resumed_transport.calls == [image_url]
 
 
 def test_image_outcome_initialization_commit_uses_live_guard(
