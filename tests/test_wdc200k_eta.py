@@ -5,6 +5,8 @@ import inspect
 import json
 import math
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from pathlib import Path
 
@@ -17,7 +19,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from wdc200k_eta import (  # noqa: E402
+    DurableUrlCounts,
     UrlEtaEstimate,
+    UrlProgressTracker,
     UrlProgressSnapshot,
     decode_histogram_blob,
     encode_histogram_blob,
@@ -29,6 +33,20 @@ from wdc200k_eta import (  # noqa: E402
 PAGE_FIXTURE = ROOT / "tests/fixtures/wdc_gate100_page_eta_events.json"
 IMAGE_FIXTURE = ROOT / "tests/fixtures/wdc_gate100_image_eta_events.json"
 UINT64_MAX = 2**64 - 1
+
+
+class FakeMonotonic:
+    def __init__(self) -> None:
+        self._value = 0.0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._value
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self._value += seconds
 
 
 def _histogram(size: int, values: dict[int, int] | None = None) -> tuple[int, ...]:
@@ -602,3 +620,196 @@ def test_estimator_rejects_non_finite_derived_rate() -> None:
 def test_fixed_bin_rejects_non_finite_values(value: float) -> None:
     with pytest.raises(ValueError):
         fixed_bin(value, 8.0, 64)
+
+
+def _counts(
+    *, completed: int = 0, pending: int = 0, leased: int = 0, total: int = 1
+) -> DurableUrlCounts:
+    return DurableUrlCounts(
+        completed=completed,
+        pending=pending,
+        leased=leased,
+        total=total,
+    )
+
+
+def test_tracker_captures_exact_mutable_censors_and_monotonic_histograms() -> None:
+    clock = FakeMonotonic()
+    tracker = UrlProgressTracker(
+        total=1,
+        deadline_seconds=8.0,
+        effective_concurrency=1,
+        execution_epoch="epoch-race",
+        baseline_completed=0,
+        monotonic=clock,
+    )
+    tracker.buffered(1)
+    tracker.job_submitted("job")
+    tracker.physical_started("job")
+
+    clock.advance(1.0)
+    young = tracker.snapshot(_counts(leased=1))
+    clock.advance(2.0)
+    older = tracker.snapshot(_counts(leased=1))
+    assert sum(young.active_censor_histogram) == 1
+    assert sum(older.active_censor_histogram) == 1
+    assert young.active_censor_histogram != older.active_censor_histogram
+    assert young.epoch_elapsed_seconds == 1.0
+    assert older.epoch_elapsed_seconds == 3.0
+
+    tracker.physical_finished("job")
+    tracker.future_finished("job")
+    clock.advance(0.25)
+    tracker.durable_completed("job")
+    completed = tracker.snapshot(_counts(completed=1))
+    assert sum(completed.transport_event_histogram) == 1
+    assert sum(completed.commit_event_histogram) == 1
+    assert completed.active_censor_histogram == (0,) * 64
+    assert completed.completed_durable == completed.total == 1
+
+
+def test_tracker_interleaves_128_workers_with_atomic_topology_snapshots() -> None:
+    total = 128
+    clock = FakeMonotonic()
+    tracker = UrlProgressTracker(
+        total=total,
+        deadline_seconds=4.0,
+        effective_concurrency=total,
+        execution_epoch="epoch-128",
+        baseline_completed=0,
+        monotonic=clock,
+    )
+    tracker.buffered(total)
+    all_started = threading.Barrier(total + 1)
+    release_finishes = threading.Barrier(total + 1)
+    all_futures_finished = threading.Barrier(total + 1)
+    release_commits = threading.Barrier(total + 1)
+
+    def run(index: int) -> None:
+        job_id = f"job-{index}"
+        tracker.job_submitted(job_id)
+        tracker.physical_started(job_id)
+        all_started.wait(timeout=5)
+        release_finishes.wait(timeout=5)
+        tracker.physical_finished(job_id)
+        tracker.future_finished(job_id)
+        all_futures_finished.wait(timeout=5)
+        release_commits.wait(timeout=5)
+        tracker.durable_completed(job_id)
+
+    with ThreadPoolExecutor(max_workers=total) as pool:
+        futures = [pool.submit(run, index) for index in range(total)]
+        all_started.wait(timeout=5)
+        clock.advance(1.0)
+        active = tracker.snapshot(_counts(leased=total, total=total))
+        assert active.local_buffered_not_started == 0
+        assert active.in_flight_jobs == total
+        assert active.physical_in_flight == total
+        assert sum(active.active_censor_histogram) == total
+        assert active.physical_in_flight <= active.in_flight_jobs
+
+        release_finishes.wait(timeout=5)
+        all_futures_finished.wait(timeout=5)
+        clock.advance(0.5)
+        finished = tracker.snapshot(_counts(leased=total, total=total))
+        assert finished.in_flight_jobs == 0
+        assert finished.finished_not_durable == total
+        assert sum(finished.transport_event_histogram) == total
+        assert all(
+            after >= before
+            for before, after in zip(
+                active.transport_event_histogram,
+                finished.transport_event_histogram,
+            )
+        )
+
+        release_commits.wait(timeout=5)
+        for future in futures:
+            future.result(timeout=5)
+
+    durable = tracker.snapshot(_counts(completed=total, total=total))
+    assert durable.completed_durable == total
+    assert durable.finished_not_durable == 0
+    assert sum(durable.commit_event_histogram) == total
+    assert (
+        durable.completed_durable
+        + durable.local_buffered_not_started
+        + durable.in_flight_jobs
+        + durable.finished_not_durable
+        + durable.unobserved_nonlocal
+        == total
+    )
+
+
+def test_tracker_external_durable_completion_reduces_unobserved_residual() -> None:
+    tracker = UrlProgressTracker(
+        total=3,
+        deadline_seconds=8.0,
+        effective_concurrency=1,
+        execution_epoch="epoch-external",
+        baseline_completed=1,
+        monotonic=lambda: 10.0,
+    )
+    initial = tracker.snapshot(
+        _counts(completed=1, pending=1, leased=1, total=3)
+    )
+    external = tracker.snapshot(
+        _counts(completed=2, pending=1, leased=0, total=3)
+    )
+    assert initial.unobserved_nonlocal == 2
+    assert external.unobserved_nonlocal == 1
+
+
+def test_tracker_rejects_unknown_duplicate_and_out_of_order_transitions() -> None:
+    clock = FakeMonotonic()
+    tracker = UrlProgressTracker(
+        total=2,
+        deadline_seconds=8.0,
+        effective_concurrency=1,
+        execution_epoch="epoch-errors",
+        baseline_completed=0,
+        monotonic=clock,
+    )
+    tracker.buffered(2)
+    tracker.job_submitted("known")
+    with pytest.raises(ValueError, match="buffer"):
+        tracker.buffered(1)
+    with pytest.raises(ValueError, match="duplicate|already"):
+        tracker.job_submitted("known")
+    with pytest.raises(ValueError, match="unknown"):
+        tracker.physical_started("missing")
+    tracker.physical_started("known")
+    with pytest.raises(ValueError, match="duplicate|already"):
+        tracker.physical_started("known")
+    with pytest.raises(ValueError, match="physical"):
+        tracker.future_finished("known")
+    tracker.physical_finished("known")
+    with pytest.raises(ValueError, match="physical|active"):
+        tracker.physical_finished("known")
+    tracker.future_finished("known")
+    with pytest.raises(ValueError, match="duplicate|already"):
+        tracker.future_finished("known")
+    tracker.durable_completed("known")
+    with pytest.raises(ValueError, match="unknown|durable"):
+        tracker.durable_completed("known")
+
+
+def test_tracker_rejects_buffer_and_histogram_uint64_overflow() -> None:
+    clock = FakeMonotonic()
+    tracker = UrlProgressTracker(
+        total=1,
+        deadline_seconds=1.0,
+        effective_concurrency=1,
+        execution_epoch="epoch-overflow",
+        baseline_completed=0,
+        monotonic=clock,
+    )
+    with pytest.raises(ValueError, match="buffer"):
+        tracker.buffered(2)
+    tracker.buffered(1)
+    tracker.job_submitted("job")
+    tracker.physical_started("job")
+    clock.advance(1.0)
+    tracker._transport_event_histogram[-1] = UINT64_MAX
+    with pytest.raises(OverflowError, match="uint64"):
+        tracker.physical_finished("job")

@@ -60,6 +60,7 @@ from wdc200k_io import (
     SqliteJobStore,
     validate_completed_shard,
 )
+from wdc200k_eta import UrlProgressSnapshot
 from wdc200k_materialize import (
     MaterializationInputs,
     MaterializationResult,
@@ -2619,10 +2620,10 @@ def _run_pages(
         if after_cache_write is not None:
             after_cache_write(record)
 
-    def page_url_progress(completed: int, total: int) -> None:
+    def page_url_progress(snapshot: UrlProgressSnapshot) -> None:
         reporter.update(
-            completed_units=completed,
-            total_units=total,
+            completed_units=snapshot.completed_durable,
+            total_units=snapshot.total,
             rate_basis="page_urls",
         )
 
@@ -2818,10 +2819,10 @@ def _run_images(
         image_completed += 1
         reporter.update(counters={"image_completed_live": image_completed})
 
-    def image_url_progress(completed: int, total: int) -> None:
+    def image_url_progress(snapshot: UrlProgressSnapshot) -> None:
         reporter.update(
-            completed_units=completed,
-            total_units=total,
+            completed_units=snapshot.completed_durable,
+            total_units=snapshot.total,
             rate_basis="image_urls",
         )
 

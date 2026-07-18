@@ -40,6 +40,11 @@ try:
         validate_completed_shard,
     )
     from wdc200k_structural import _normalize_http_url
+    from wdc200k_eta import (
+        DurableUrlCounts,
+        UrlProgressSnapshot,
+        UrlProgressTracker,
+    )
 except ModuleNotFoundError as error:
     if error.name not in {
         "build_mm_table_dataset",
@@ -47,6 +52,7 @@ except ModuleNotFoundError as error:
         "wdc200k_fetch",
         "wdc200k_io",
         "wdc200k_structural",
+        "wdc200k_eta",
     }:
         raise
     scripts_directory = str(Path(__file__).resolve().parent)
@@ -80,6 +86,10 @@ except ModuleNotFoundError as error:
         _normalize_http_url = importlib.import_module(
             "wdc200k_structural"
         )._normalize_http_url
+        eta_helpers = importlib.import_module("wdc200k_eta")
+        DurableUrlCounts = eta_helpers.DurableUrlCounts
+        UrlProgressSnapshot = eta_helpers.UrlProgressSnapshot
+        UrlProgressTracker = eta_helpers.UrlProgressTracker
     finally:
         sys.path.remove(scripts_directory)
 
@@ -1779,19 +1789,31 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
-def _durable_image_completions(
+def _refresh_image_url_counts(
     store: SqliteJobStore,
     kind: str,
     outcomes_path: Path,
     policy_fingerprint: str,
-) -> int:
-    """Count terminal outcomes for exactly this durable image job set."""
+) -> DurableUrlCounts:
+    """Refresh indexed durable image-job counts without materializing URLs."""
     with store._connect() as connection:
         connection.execute(
             "ATTACH DATABASE ? AS image_progress_outcomes",
             (str(outcomes_path),),
         )
-        return int(
+        status_counts = {
+            str(row["status"]): int(row["count"])
+            for row in connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM jobs
+                WHERE kind = ?
+                GROUP BY status
+                """,
+                (kind,),
+            )
+        }
+        completed = int(
             connection.execute(
                 """
                 SELECT COUNT(*)
@@ -1802,11 +1824,32 @@ def _durable_image_completions(
                         job.payload_json, '$.url_key'
                     )
                 WHERE job.kind = ?
+                  AND job.status IN ('success', 'terminal')
                   AND outcome.status IN ('success', 'terminal')
                 """,
                 (policy_fingerprint, kind),
             ).fetchone()[0]
         )
+    return DurableUrlCounts(
+        completed=completed,
+        pending=(
+            status_counts.get("pending", 0)
+            + status_counts.get("retryable", 0)
+        ),
+        leased=status_counts.get("leased", 0),
+        total=sum(status_counts.values()),
+    )
+
+
+def _durable_image_completions(
+    store: SqliteJobStore,
+    kind: str,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> int:
+    return _refresh_image_url_counts(
+        store, kind, outcomes_path, policy_fingerprint
+    ).completed
 
 
 def _job_snapshot(store: SqliteJobStore, kind: str) -> dict[str, int]:
@@ -1986,6 +2029,8 @@ def _fetch_image_job(
     outcome_store: ImageOutcomeStore,
     policy_fingerprint: str,
     execution_id: str,
+    job_id: str,
+    progress_tracker: UrlProgressTracker,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> dict[str, Any]:
     image_url = str(payload["image_url"])
@@ -2019,6 +2064,7 @@ def _fetch_image_job(
         baseline_outcome_status=None,
         suppressed=False,
     )
+    progress_tracker.physical_started(job_id)
     outcome: dict[str, Any] | None = None
     try:
         try:
@@ -2066,6 +2112,7 @@ def _fetch_image_job(
                 else "exception"
             ),
         )
+        progress_tracker.physical_finished(job_id)
 
 
 def _execute_image_job(
@@ -2076,6 +2123,8 @@ def _execute_image_job(
     outcome_store: ImageOutcomeStore,
     policy_fingerprint: str,
     execution_id: str,
+    job_id: str,
+    progress_tracker: UrlProgressTracker,
     claim_owner: str,
     claim_lease_seconds: float,
     claim_poll_seconds: float,
@@ -2109,6 +2158,8 @@ def _execute_image_job(
                     outcome_store=outcome_store,
                     policy_fingerprint=policy_fingerprint,
                     execution_id=execution_id,
+                    job_id=job_id,
+                    progress_tracker=progress_tracker,
                     pre_write_guard=pre_write_guard,
                 ),
                 lease=decision.lease,
@@ -2138,7 +2189,7 @@ def fetch_unique_images(
     url_claim_poll_seconds: float = 0.05,
     after_url_claim: Callable[[ImageUrlLease], None] | None = None,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
-    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[UrlProgressSnapshot], None] | None = None,
     progress_callback_every: int | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> ImageFetchResult:
@@ -2207,31 +2258,49 @@ def fetch_unique_images(
         if progress_callback_every is None
         else int(progress_callback_every)
     )
-    callback_completed = _durable_image_completions(
+    owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
+    execution_id = f"image-execution-{os.getpid()}-{uuid.uuid4().hex}"
+    initial_refresh = _refresh_image_url_counts(
         store,
         kind,
         outcomes_path,
         fingerprint,
     )
-    callback_last_published = callback_completed
+    progress_tracker = UrlProgressTracker(
+        total=unique,
+        deadline_seconds=policy.deadline_seconds,
+        effective_concurrency=policy.global_concurrency,
+        execution_epoch=execution_id,
+        baseline_completed=initial_refresh.completed,
+        monotonic=time.monotonic,
+    )
+    callback_last_published = initial_refresh.completed
+    local_durable_completed = 0
+    callback_last_local = 0
     if progress_callback is not None:
-        progress_callback(callback_completed, unique)
+        initial_snapshot = progress_tracker.snapshot(initial_refresh)
+        progress_callback(initial_snapshot)
 
     def publish_url_progress(*, force: bool = False) -> None:
-        nonlocal callback_last_published
+        nonlocal callback_last_published, callback_last_local
         if progress_callback is None:
             return
         if (
             force
-            or callback_completed - callback_last_published
+            or local_durable_completed - callback_last_local
             >= callback_interval
         ):
-            if callback_completed != callback_last_published:
-                progress_callback(callback_completed, unique)
-                callback_last_published = callback_completed
-
-    owner = f"image-{os.getpid()}-{uuid.uuid4().hex}"
-    execution_id = f"image-execution-{os.getpid()}-{uuid.uuid4().hex}"
+            refresh = _refresh_image_url_counts(
+                store,
+                kind,
+                outcomes_path,
+                fingerprint,
+            )
+            callback_last_local = local_durable_completed
+            if refresh.completed != callback_last_published:
+                snapshot = progress_tracker.snapshot(refresh)
+                progress_callback(snapshot)
+                callback_last_published = refresh.completed
     buffer_limit = (
         policy.global_concurrency * 4
         if claim_buffer is None
@@ -2269,6 +2338,7 @@ def fetch_unique_images(
             ready_hosts.append(host)
 
     def finish_cached(job: Any, outcome: dict[str, Any]) -> None:
+        nonlocal local_durable_completed
         outcome_store.clear_claim_if_outcome(
             fingerprint,
             str(job.payload["url_key"]),
@@ -2283,6 +2353,9 @@ def fetch_unique_images(
             owner=owner,
             lease_id=job.lease_id,
         )
+        progress_tracker.buffered_durable()
+        local_durable_completed += 1
+        publish_url_progress()
 
     def claim_more() -> int:
         nonlocal claimed_buffered, maximum_claimed, maximum_host_states
@@ -2295,6 +2368,8 @@ def fetch_unique_images(
             owner=owner,
             lease_seconds=effective_lease,
         )
+        if claimed:
+            progress_tracker.buffered(len(claimed))
         for job in claimed:
             cached = outcome_store.get(
                 fingerprint,
@@ -2343,6 +2418,7 @@ def fetch_unique_images(
             job = queue.popleft()
             claimed_buffered -= 1
             active_by_host[host] = active_by_host.get(host, 0) + 1
+            progress_tracker.job_submitted(job.job_id)
             future = pool.submit(
                 _execute_image_job,
                 job.payload,
@@ -2351,6 +2427,8 @@ def fetch_unique_images(
                 outcome_store=outcome_store,
                 policy_fingerprint=fingerprint,
                 execution_id=execution_id,
+                job_id=job.job_id,
+                progress_tracker=progress_tracker,
                 claim_owner=(
                     f"{owner}:{job.job_id}:{job.lease_id}"
                 ),
@@ -2382,6 +2460,9 @@ def fetch_unique_images(
                 tuple(futures),
                 return_when=FIRST_COMPLETED,
             )
+            completed_jobs = [futures[future][0] for future in completed]
+            for completed_job in completed_jobs:
+                progress_tracker.future_finished(completed_job.job_id)
             for future in completed:
                 job, host = futures.pop(future)
                 active_by_host[host] -= 1
@@ -2410,15 +2491,27 @@ def fetch_unique_images(
                             ).encode("utf-8")
                         )
                     )
-                    persisted = outcome_store.put_claimed(
-                        fingerprint,
-                        str(job.payload["url_key"]),
-                        str(job.payload["image_url"]),
-                        execution.outcome,
-                        lease=execution.lease,
-                    )
-                    if after_cache_write is not None:
-                        after_cache_write(persisted)
+                    try:
+                        persisted = outcome_store.put_claimed(
+                            fingerprint,
+                            str(job.payload["url_key"]),
+                            str(job.payload["image_url"]),
+                            execution.outcome,
+                            lease=execution.lease,
+                        )
+                    except ValueError as error:
+                        if str(error) != "stale or expired image URL claim":
+                            raise
+                        durable = outcome_store.get(
+                            fingerprint,
+                            str(job.payload["url_key"]),
+                        )
+                        if durable is None:
+                            raise
+                        persisted = durable
+                    else:
+                        if after_cache_write is not None:
+                            after_cache_write(persisted)
                     outcome_write_tracker.before_write(4096)
                     released = outcome_store.finish_claim(
                         fingerprint,
@@ -2441,7 +2534,8 @@ def fetch_unique_images(
                     owner=owner,
                     lease_id=job.lease_id,
                 )
-                callback_completed += 1
+                progress_tracker.durable_completed(job.job_id)
+                local_durable_completed += 1
                 publish_url_progress()
             submit_ready(pool)
 
@@ -2471,7 +2565,6 @@ def fetch_unique_images(
         and int(outcome_snapshot["missing"]) == 0
         and outcome_snapshot["url_key_digest"] == unique_key_digest
     )
-    callback_completed = min(unique, success + terminal)
     publish_url_progress(force=True)
     fetch_manifest_path = _image_fetch_manifest_path(
         outcomes_path,

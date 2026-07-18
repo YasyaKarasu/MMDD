@@ -32,8 +32,13 @@ try:
         SqliteJobStore,
         validate_completed_shard,
     )
+    from wdc200k_eta import (
+        DurableUrlCounts,
+        UrlProgressSnapshot,
+        UrlProgressTracker,
+    )
 except ModuleNotFoundError as error:
-    if error.name not in {"stage1_io", "wdc200k_io"}:
+    if error.name not in {"stage1_io", "wdc200k_io", "wdc200k_eta"}:
         raise
     scripts_directory = str(Path(__file__).resolve().parent)
     sys.path.insert(0, scripts_directory)
@@ -47,6 +52,11 @@ except ModuleNotFoundError as error:
             PreWriteGuard,
             SqliteJobStore,
             validate_completed_shard,
+        )
+        from wdc200k_eta import (
+            DurableUrlCounts,
+            UrlProgressSnapshot,
+            UrlProgressTracker,
         )
     finally:
         sys.path.remove(scripts_directory)
@@ -942,19 +952,31 @@ def _job_count(store: SqliteJobStore, kind: str) -> int:
         )
 
 
-def _durable_page_completions(
+def _refresh_page_url_counts(
     store: SqliteJobStore,
     kind: str,
     outcomes_path: Path,
     policy_fingerprint: str,
-) -> int:
-    """Count terminal outcomes for exactly this durable page job set."""
+) -> DurableUrlCounts:
+    """Refresh indexed durable page-job counts without materializing URLs."""
     with store._connect() as connection:
         connection.execute(
             "ATTACH DATABASE ? AS page_progress_outcomes",
             (str(outcomes_path),),
         )
-        return int(
+        status_counts = {
+            str(row["status"]): int(row["count"])
+            for row in connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM jobs
+                WHERE kind = ?
+                GROUP BY status
+                """,
+                (kind,),
+            )
+        }
+        completed = int(
             connection.execute(
                 """
                 SELECT COUNT(*)
@@ -965,11 +987,32 @@ def _durable_page_completions(
                         job.payload_json, '$.url_key'
                     )
                 WHERE job.kind = ?
+                  AND job.status IN ('success', 'terminal')
                   AND outcome.status IN ('success', 'terminal')
                 """,
                 (policy_fingerprint, kind),
             ).fetchone()[0]
         )
+    return DurableUrlCounts(
+        completed=completed,
+        pending=(
+            status_counts.get("pending", 0)
+            + status_counts.get("retryable", 0)
+        ),
+        leased=status_counts.get("leased", 0),
+        total=sum(status_counts.values()),
+    )
+
+
+def _durable_page_completions(
+    store: SqliteJobStore,
+    kind: str,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> int:
+    return _refresh_page_url_counts(
+        store, kind, outcomes_path, policy_fingerprint
+    ).completed
 
 
 def _leased_count(
@@ -1036,6 +1079,7 @@ def _fetch_one(
     policy: FetchPolicy,
     outcome_store: PageOutcomeStore,
     execution_id: str,
+    progress_tracker: UrlProgressTracker,
     pre_write_guard: PreWriteGuard | None = None,
     target_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -1068,6 +1112,7 @@ def _fetch_one(
         baseline_outcome_status=None,
         suppressed=False,
     )
+    progress_tracker.physical_started(job.job_id)
     outcome: dict[str, Any] | None = None
     try:
         try:
@@ -1124,6 +1169,7 @@ def _fetch_one(
                 else "exception"
             ),
         )
+        progress_tracker.physical_finished(job.job_id)
 
 
 def _atomic_json(
@@ -1446,7 +1492,7 @@ def fetch_unique_pages(
     max_wait_seconds: float = 0.0,
     poll_interval_seconds: float = 0.05,
     after_cache_write: Callable[[dict[str, Any]], None] | None = None,
-    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[UrlProgressSnapshot], None] | None = None,
     progress_callback_every: int | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> FetchResult:
@@ -1508,31 +1554,49 @@ def fetch_unique_pages(
         if progress_callback_every is None
         else int(progress_callback_every)
     )
-    callback_completed = _durable_page_completions(
+    owner = f"fetch-{os.getpid()}-{uuid.uuid4().hex}"
+    execution_id = f"page-execution-{os.getpid()}-{uuid.uuid4().hex}"
+    initial_refresh = _refresh_page_url_counts(
         store,
         kind,
         outcomes_path,
         fingerprint,
     )
-    callback_last_published = callback_completed
+    progress_tracker = UrlProgressTracker(
+        total=unique,
+        deadline_seconds=policy.deadline_seconds,
+        effective_concurrency=policy.global_concurrency,
+        execution_epoch=execution_id,
+        baseline_completed=initial_refresh.completed,
+        monotonic=time.monotonic,
+    )
+    callback_last_published = initial_refresh.completed
+    local_durable_completed = 0
+    callback_last_local = 0
     if progress_callback is not None:
-        progress_callback(callback_completed, unique)
+        initial_snapshot = progress_tracker.snapshot(initial_refresh)
+        progress_callback(initial_snapshot)
 
     def publish_url_progress(*, force: bool = False) -> None:
-        nonlocal callback_last_published
+        nonlocal callback_last_published, callback_last_local
         if progress_callback is None:
             return
         if (
             force
-            or callback_completed - callback_last_published
+            or local_durable_completed - callback_last_local
             >= callback_interval
         ):
-            if callback_completed != callback_last_published:
-                progress_callback(callback_completed, unique)
-                callback_last_published = callback_completed
-
-    owner = f"fetch-{os.getpid()}-{uuid.uuid4().hex}"
-    execution_id = f"page-execution-{os.getpid()}-{uuid.uuid4().hex}"
+            refresh = _refresh_page_url_counts(
+                store,
+                kind,
+                outcomes_path,
+                fingerprint,
+            )
+            callback_last_local = local_durable_completed
+            if refresh.completed != callback_last_published:
+                snapshot = progress_tracker.snapshot(refresh)
+                progress_callback(snapshot)
+                callback_last_published = refresh.completed
     buffer_limit = (
         max(policy.global_concurrency, policy.global_concurrency * 4)
         if claim_buffer is None
@@ -1587,6 +1651,7 @@ def fetch_unique_pages(
             ready_set.add(host)
 
     def complete_from_cache(job: Job, outcome: dict[str, Any]) -> None:
+        nonlocal local_durable_completed
         store.finish(
             job.job_id,
             status=str(outcome["status"]),
@@ -1597,6 +1662,9 @@ def fetch_unique_pages(
             owner=owner,
             lease_id=job.lease_id,
         )
+        progress_tracker.buffered_durable()
+        local_durable_completed += 1
+        publish_url_progress()
 
     def claim_more() -> int:
         nonlocal claimed_count, maximum_claimed, maximum_host_limiters
@@ -1610,6 +1678,8 @@ def fetch_unique_pages(
             owner=owner,
             lease_seconds=effective_lease_seconds,
         )
+        if claimed:
+            progress_tracker.buffered(len(claimed))
         for job in claimed:
             cached = outcome_store.get(
                 fingerprint,
@@ -1676,6 +1746,7 @@ def fetch_unique_pages(
             job = state.jobs.popleft()
             state.active += 1
             claimed_count -= 1
+            progress_tracker.job_submitted(job.job_id)
             future = pool.submit(
                 _fetch_one,
                 job,
@@ -1683,6 +1754,7 @@ def fetch_unique_pages(
                 policy=policy,
                 outcome_store=outcome_store,
                 execution_id=execution_id,
+                progress_tracker=progress_tracker,
                 pre_write_guard=pre_write_guard,
                 target_path=outcomes_path,
             )
@@ -1739,6 +1811,9 @@ def fetch_unique_pages(
                     tuple(futures),
                     return_when=FIRST_COMPLETED,
                 )
+                completed_jobs = [futures[future][0] for future in completed]
+                for completed_job in completed_jobs:
+                    progress_tracker.future_finished(completed_job.job_id)
                 for future in completed:
                     completions_since_progress += 1
                     job, host = futures.pop(future)
@@ -1778,7 +1853,8 @@ def fetch_unique_pages(
                         owner=owner,
                         lease_id=job.lease_id,
                     )
-                    callback_completed += 1
+                    progress_tracker.durable_completed(job.job_id)
+                    local_durable_completed += 1
                     publish_url_progress()
                     if completions_since_progress >= progress_every:
                         _publish_progress(
@@ -1820,12 +1896,6 @@ def fetch_unique_pages(
     )
     leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
-    callback_completed = _durable_page_completions(
-        store,
-        kind,
-        outcomes_path,
-        fingerprint,
-    )
     publish_url_progress(force=True)
     transport_attempt_summary = outcome_store.transport_attempt_summary(
         fingerprint,

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import tracemalloc
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from wdc200k_fetch import (  # noqa: E402
 from wdc200k_io import SqliteJobStore  # noqa: E402
 from wdc200k_io import AtomicJsonlShard  # noqa: E402
 from stage1_io import stable_hash  # noqa: E402
+from wdc200k_eta import UrlProgressSnapshot  # noqa: E402
 
 
 def page_ref(entity_id: str, url: str) -> dict[str, str]:
@@ -178,22 +180,304 @@ def test_page_progress_callback_starts_from_durable_baseline_and_is_bounded(
         policy,
         outcomes_path=outcomes_path,
     )
-    updates: list[tuple[int, int]] = []
+    updates: list[UrlProgressSnapshot] = []
     result = fetch_unique_pages(
         [page_ref(f"e{index}", url) for index, url in enumerate(urls)],
         jobs,
         transport,
         policy,
         outcomes_path=outcomes_path,
-        progress_callback=lambda completed, total: updates.append(
-            (completed, total)
-        ),
+        progress_callback=updates.append,
         progress_callback_every=2,
     )
 
     assert result.complete
-    assert updates == [(1, 5), (3, 5), (5, 5)]
-    assert updates == sorted(updates)
+    assert [snapshot.completed_durable for snapshot in updates] == [1, 3, 5]
+    assert all(snapshot.total == 5 for snapshot in updates)
+    assert len({snapshot.execution_epoch for snapshot in updates}) == 1
+
+
+def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    physical = "https://a.test/physical"
+    failed = "https://b.test/failed"
+    cached = "https://c.test/cached"
+    suppressed = "https://d.test/suppressed"
+    refs = [
+        page_ref("physical", physical),
+        page_ref("failed", failed),
+        page_ref("cached", cached),
+        page_ref("suppressed", suppressed),
+    ]
+    policy = FetchPolicy(global_concurrency=4, per_host_concurrency=1)
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    outcome_store = PageOutcomeStore(outcomes_path)
+    for url in (cached, suppressed):
+        outcome_store.put(
+            policy.fingerprint,
+            hashlib.sha256(url.encode("utf-8")).hexdigest(),
+            url,
+            {"status": "success", "text": url, "image_urls": []},
+        )
+    suppressed_key = hashlib.sha256(suppressed.encode("utf-8")).hexdigest()
+    original_get = fetch_module.PageOutcomeStore.get
+    get_calls = 0
+
+    def hide_suppressed_once(self, fingerprint: str, url_key: str):
+        nonlocal get_calls
+        if url_key == suppressed_key:
+            get_calls += 1
+            if get_calls == 1:
+                return None
+        return original_get(self, fingerprint, url_key)
+
+    monkeypatch.setattr(
+        fetch_module.PageOutcomeStore,
+        "get",
+        hide_suppressed_once,
+    )
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_pages(
+        refs,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        CountingTransport(
+            {
+                physical: {"text": "ok"},
+                failed: TimeoutError("deadline"),
+                suppressed: {"text": "must not run"},
+            }
+        ),
+        policy,
+        outcomes_path=outcomes_path,
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+
+    assert result.complete
+    assert snapshots[0].completed_durable == 0
+    final = snapshots[-1]
+    assert final.completed_durable == final.total == 4
+    assert sum(final.transport_event_histogram) == 2
+    assert sum(final.commit_event_histogram) == 3
+    assert final.physical_in_flight == 0
+    assert final.in_flight_jobs == 0
+    assert final.finished_not_durable == 0
+
+
+def test_page_claim_batch_is_buffered_before_synchronous_cache_callback(
+    tmp_path: Path,
+) -> None:
+    urls = ["https://e.test/claim-a", "https://e.test/claim-b"]
+    cached = min(
+        urls,
+        key=lambda url: hashlib.sha256(url.encode("utf-8")).hexdigest(),
+    )
+    physical = next(url for url in urls if url != cached)
+    policy = FetchPolicy(global_concurrency=1, per_host_concurrency=1)
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    PageOutcomeStore(outcomes_path).put(
+        policy.fingerprint,
+        hashlib.sha256(cached.encode("utf-8")).hexdigest(),
+        cached,
+        {"status": "success", "text": "cached", "image_urls": []},
+    )
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_pages(
+        [page_ref(str(index), url) for index, url in enumerate(urls)],
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        CountingTransport({physical: {"text": "physical"}}),
+        policy,
+        outcomes_path=outcomes_path,
+        claim_buffer=2,
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+
+    assert result.complete
+    cached_snapshot = next(
+        item for item in snapshots if item.completed_durable == 1
+    )
+    assert cached_snapshot.local_buffered_not_started == 1
+    assert cached_snapshot.unobserved_nonlocal == 0
+
+
+def test_page_first_completed_batch_moves_all_futures_before_serial_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    barrier = threading.Barrier(2)
+
+    class BatchTransport(CountingTransport):
+        def fetch_page(self, url: str, **kwargs: Any) -> dict[str, Any]:
+            barrier.wait(timeout=5)
+            return super().fetch_page(url, **kwargs)
+
+    urls = ["https://a.test/batch", "https://b.test/batch"]
+    real_wait = fetch_module.wait
+
+    def wait_for_whole_batch(fs, *, return_when):
+        assert return_when is fetch_module.FIRST_COMPLETED
+        done, pending = real_wait(fs)
+        return done, pending
+
+    monkeypatch.setattr(fetch_module, "wait", wait_for_whole_batch)
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_pages(
+        [page_ref(str(index), url) for index, url in enumerate(urls)],
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        BatchTransport({url: {"text": url} for url in urls}),
+        FetchPolicy(global_concurrency=2, per_host_concurrency=1),
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+
+    assert result.complete
+    first_durable = next(
+        snapshot for snapshot in snapshots if snapshot.completed_durable == 1
+    )
+    assert first_durable.in_flight_jobs == 0
+    assert first_durable.finished_not_durable == 1
+
+
+def test_page_external_execution_completion_is_visible_in_final_snapshot(
+    tmp_path: Path,
+) -> None:
+    url = "https://e.test/external"
+    ref = page_ref("external", url)
+    policy = FetchPolicy(global_concurrency=1, per_host_concurrency=1)
+    kind = fetch_module._job_kind(policy.fingerprint)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    jobs.enqueue(
+        kind,
+        f"{policy.fingerprint}:{ref['url_key']}",
+        {**ref, "host": "e.test"},
+    )
+    foreign = jobs.claim(kind, 1, "foreign", lease_seconds=60)[0]
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    outcome_store = PageOutcomeStore(outcomes_path)
+
+    def finish_elsewhere() -> None:
+        time.sleep(0.03)
+        outcome_store.put(
+            policy.fingerprint,
+            ref["url_key"],
+            url,
+            {"status": "success", "text": "external", "image_urls": []},
+        )
+        jobs.finish(
+            foreign.job_id,
+            "success",
+            {"url_key": ref["url_key"]},
+            owner="foreign",
+            lease_id=foreign.lease_id,
+        )
+
+    thread = threading.Thread(target=finish_elsewhere)
+    thread.start()
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_pages(
+        [ref],
+        jobs,
+        CountingTransport({url: {"text": "must not run"}}),
+        policy,
+        outcomes_path=outcomes_path,
+        max_wait_seconds=0.3,
+        poll_interval_seconds=0.01,
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+    thread.join(timeout=2)
+
+    assert result.complete
+    assert [item.completed_durable for item in snapshots] == [0, 1]
+    assert snapshots[0].unobserved_nonlocal == 1
+    assert snapshots[-1].unobserved_nonlocal == 0
+    assert sum(snapshots[-1].transport_event_histogram) == 0
+
+
+def test_page_url_refresh_uses_kind_status_and_outcome_key_indexes(
+    tmp_path: Path,
+) -> None:
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    PageOutcomeStore(outcomes_path)
+    kind = "wdc200k-page:policy"
+    jobs.enqueue(kind, "job", {"url_key": "a" * 64})
+    counts = fetch_module._refresh_page_url_counts(
+        jobs, kind, outcomes_path, "policy"
+    )
+    assert (counts.completed, counts.pending, counts.leased, counts.total) == (
+        0,
+        1,
+        0,
+        1,
+    )
+    with jobs._connect() as connection:
+        connection.execute(
+            "ATTACH DATABASE ? AS page_progress_outcomes",
+            (str(outcomes_path),),
+        )
+        status_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT status, COUNT(*) FROM jobs "
+            "WHERE kind = ? GROUP BY status",
+            (kind,),
+        ).fetchall()
+        completed_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM jobs AS job "
+            "JOIN page_progress_outcomes.page_outcomes AS outcome "
+            "ON outcome.policy_fingerprint = ? "
+            "AND outcome.url_key = json_extract(job.payload_json, '$.url_key') "
+            "WHERE job.kind = ? AND job.status IN ('success', 'terminal') "
+            "AND outcome.status IN ('success', 'terminal')",
+            ("policy", kind),
+        ).fetchall()
+    details = [str(row[3]) for row in status_plan + completed_plan]
+    assert not any("SCAN jobs" in detail for detail in details)
+    assert any("jobs_kind_status" in detail for detail in details)
+    assert any(
+        "sqlite_autoindex_page_outcomes_1" in detail for detail in details
+    )
+
+
+def test_page_url_refresh_million_rows_keeps_python_peak_below_16_mib(
+    tmp_path: Path,
+) -> None:
+    jobs = SqliteJobStore(tmp_path / "million-jobs.sqlite3")
+    outcomes_path = tmp_path / "million-outcomes.sqlite3"
+    PageOutcomeStore(outcomes_path)
+    kind = "wdc200k-page:million"
+    with jobs._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            WITH digits(d) AS (
+                VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+            )
+            INSERT INTO jobs (
+                job_id, kind, payload_json, status, updated_at
+            )
+            SELECT printf('bulk-%07d',
+                    a.d + 10*b.d + 100*c.d + 1000*d.d
+                    + 10000*e.d + 100000*f.d),
+                   ?, '{"url_key":"missing"}', 'pending', 0.0
+            FROM digits AS a CROSS JOIN digits AS b
+            CROSS JOIN digits AS c CROSS JOIN digits AS d
+            CROSS JOIN digits AS e CROSS JOIN digits AS f
+            """,
+            (kind,),
+        )
+        connection.commit()
+
+    tracemalloc.start()
+    counts = fetch_module._refresh_page_url_counts(
+        jobs, kind, outcomes_path, "policy"
+    )
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert counts.total == counts.pending == 1_000_000
+    assert peak < 16 * 1024 * 1024
 
 
 def test_page_transport_summary_is_scoped_to_current_job_store(

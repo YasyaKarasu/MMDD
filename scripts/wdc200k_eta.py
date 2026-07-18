@@ -4,7 +4,9 @@ import base64
 import binascii
 import math
 import struct
+import threading
 from dataclasses import dataclass
+from typing import Callable
 
 
 UINT64_MAX = 2**64 - 1
@@ -148,6 +150,229 @@ class UrlProgressSnapshot:
         for overflow, histogram, name in overflow_pairs:
             if overflow > histogram[-1]:
                 raise ValueError(f"{name} exceeds its final histogram bin")
+
+
+@dataclass(frozen=True)
+class DurableUrlCounts:
+    completed: int
+    pending: int
+    leased: int
+    total: int
+
+    def __post_init__(self) -> None:
+        for name in ("completed", "pending", "leased", "total"):
+            _require_uint64(getattr(self, name), name)
+        if self.completed + self.pending + self.leased > self.total:
+            raise ValueError("durable URL counts exceed total")
+
+
+class UrlProgressTracker:
+    """Bounded local scheduler state and fixed-width latency aggregates."""
+
+    def __init__(
+        self,
+        total: int,
+        deadline_seconds: float,
+        effective_concurrency: int,
+        execution_epoch: str,
+        baseline_completed: int,
+        monotonic: Callable[[], float],
+    ) -> None:
+        self._total = _require_uint64(total, "total")
+        self._baseline_completed = _require_uint64(
+            baseline_completed, "baseline_completed"
+        )
+        if self._baseline_completed > self._total:
+            raise ValueError("baseline_completed exceeds total")
+        self._deadline_seconds = _require_finite(
+            deadline_seconds, "deadline_seconds", positive=True
+        )
+        self._effective_concurrency = _require_uint64(
+            effective_concurrency, "effective_concurrency"
+        )
+        if self._effective_concurrency == 0:
+            raise ValueError("effective_concurrency must be positive")
+        if not isinstance(execution_epoch, str) or not execution_epoch:
+            raise ValueError("execution_epoch must be a non-empty string")
+        if not callable(monotonic):
+            raise ValueError("monotonic must be callable")
+        self._execution_epoch = execution_epoch
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._epoch_started_monotonic = _require_finite(
+            monotonic(), "monotonic"
+        )
+        self._buffered = 0
+        self._submitted: set[str] = set()
+        self._physical_starts: dict[str, float] = {}
+        self._finished: dict[str, float] = {}
+        self._transport_event_histogram = [0] * TRANSPORT_BIN_COUNT
+        self._commit_event_histogram = [0] * COMMIT_BIN_COUNT
+        self._transport_overflow_events = 0
+        self._commit_overflow_events = 0
+
+    @staticmethod
+    def _job_id(job_id: str) -> str:
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("job_id must be a non-empty string")
+        return job_id
+
+    @staticmethod
+    def _delta(delta: int) -> int:
+        if isinstance(delta, bool) or not isinstance(delta, int) or delta <= 0:
+            raise ValueError("buffer delta must be a positive integer")
+        return delta
+
+    @staticmethod
+    def _increment(values: list[int], index: int) -> None:
+        if values[index] == UINT64_MAX:
+            raise OverflowError("histogram counter exceeds uint64")
+        values[index] += 1
+
+    def _now_locked(self) -> float:
+        return _require_finite(self._monotonic(), "monotonic")
+
+    def buffered(self, delta: int) -> None:
+        count = self._delta(delta)
+        with self._lock:
+            local_total = (
+                self._buffered + len(self._submitted) + len(self._finished)
+            )
+            if local_total + count > self._total:
+                raise ValueError("buffered jobs exceed total")
+            self._buffered += count
+
+    def buffered_durable(self, delta: int = 1) -> None:
+        count = self._delta(delta)
+        with self._lock:
+            if count > self._buffered:
+                raise ValueError("buffered durable jobs exceed buffer")
+            self._buffered -= count
+
+    def job_submitted(self, job_id: str) -> None:
+        identity = self._job_id(job_id)
+        with self._lock:
+            if identity in self._submitted or identity in self._finished:
+                raise ValueError(f"job {identity!r} is already tracked")
+            if self._buffered == 0:
+                raise ValueError("job submission has no buffered job")
+            self._buffered -= 1
+            self._submitted.add(identity)
+
+    def physical_started(self, job_id: str) -> None:
+        identity = self._job_id(job_id)
+        with self._lock:
+            if identity not in self._submitted:
+                raise ValueError(f"unknown submitted job {identity!r}")
+            if identity in self._physical_starts:
+                raise ValueError(f"physical job {identity!r} already started")
+            self._physical_starts[identity] = self._now_locked()
+
+    def physical_finished(self, job_id: str) -> None:
+        identity = self._job_id(job_id)
+        with self._lock:
+            if identity not in self._submitted:
+                raise ValueError(f"unknown submitted job {identity!r}")
+            if identity not in self._physical_starts:
+                raise ValueError(f"physical job {identity!r} is not active")
+            now = self._now_locked()
+            duration = max(0.0, now - self._physical_starts[identity])
+            index, overflow = fixed_bin(
+                duration, self._deadline_seconds, TRANSPORT_BIN_COUNT
+            )
+            self._increment(self._transport_event_histogram, index)
+            if overflow:
+                if self._transport_overflow_events == UINT64_MAX:
+                    self._transport_event_histogram[index] -= 1
+                    raise OverflowError("transport overflow exceeds uint64")
+                self._transport_overflow_events += 1
+            del self._physical_starts[identity]
+
+    def future_finished(self, job_id: str) -> None:
+        identity = self._job_id(job_id)
+        with self._lock:
+            if identity in self._physical_starts:
+                raise ValueError("physical job must finish before its future")
+            if identity in self._finished:
+                raise ValueError(f"job {identity!r} future already finished")
+            if identity not in self._submitted:
+                raise ValueError(f"unknown submitted job {identity!r}")
+            self._submitted.remove(identity)
+            self._finished[identity] = self._now_locked()
+
+    def durable_completed(self, job_id: str) -> None:
+        identity = self._job_id(job_id)
+        with self._lock:
+            if identity not in self._finished:
+                raise ValueError(f"unknown finished job {identity!r} for durable")
+            now = self._now_locked()
+            duration = max(0.0, now - self._finished[identity])
+            horizon = min(2.0, self._deadline_seconds)
+            index, overflow = fixed_bin(duration, horizon, COMMIT_BIN_COUNT)
+            self._increment(self._commit_event_histogram, index)
+            if overflow:
+                if self._commit_overflow_events == UINT64_MAX:
+                    self._commit_event_histogram[index] -= 1
+                    raise OverflowError("commit overflow exceeds uint64")
+                self._commit_overflow_events += 1
+            del self._finished[identity]
+
+    def snapshot(self, refresh: DurableUrlCounts) -> UrlProgressSnapshot:
+        if not isinstance(refresh, DurableUrlCounts):
+            raise ValueError("refresh must be DurableUrlCounts")
+        if refresh.total != self._total:
+            raise ValueError("durable refresh total does not match tracker total")
+        if refresh.completed < self._baseline_completed:
+            raise ValueError("durable completion count precedes baseline")
+        with self._lock:
+            captured = self._now_locked()
+            elapsed = captured - self._epoch_started_monotonic
+            if elapsed < 0.0:
+                raise ValueError("monotonic clock moved backwards")
+            active_histogram = [0] * TRANSPORT_BIN_COUNT
+            active_overflow = 0
+            for started in self._physical_starts.values():
+                index, overflow = fixed_bin(
+                    max(0.0, captured - started),
+                    self._deadline_seconds,
+                    TRANSPORT_BIN_COUNT,
+                )
+                if active_histogram[index] == UINT64_MAX:
+                    raise OverflowError("active censor counter exceeds uint64")
+                active_histogram[index] += 1
+                active_overflow += int(overflow)
+            buffered = self._buffered
+            in_flight = len(self._submitted)
+            physical = len(self._physical_starts)
+            finished = len(self._finished)
+            local = buffered + in_flight + finished
+            if refresh.completed + local > self._total:
+                raise ValueError("local and durable URL topology exceeds total")
+            unobserved = self._total - refresh.completed - local
+            transport_histogram = tuple(self._transport_event_histogram)
+            commit_histogram = tuple(self._commit_event_histogram)
+            transport_overflow = self._transport_overflow_events
+            commit_overflow = self._commit_overflow_events
+        return UrlProgressSnapshot(
+            execution_epoch=self._execution_epoch,
+            baseline_completed=self._baseline_completed,
+            completed_durable=refresh.completed,
+            total=self._total,
+            local_buffered_not_started=buffered,
+            in_flight_jobs=in_flight,
+            physical_in_flight=physical,
+            finished_not_durable=finished,
+            unobserved_nonlocal=unobserved,
+            deadline_seconds=self._deadline_seconds,
+            effective_concurrency=self._effective_concurrency,
+            epoch_elapsed_seconds=elapsed,
+            transport_event_histogram=transport_histogram,
+            active_censor_histogram=tuple(active_histogram),
+            commit_event_histogram=commit_histogram,
+            transport_overflow_events=transport_overflow,
+            active_overflow_censors=active_overflow,
+            commit_overflow_events=commit_overflow,
+        )
 
 
 @dataclass(frozen=True)

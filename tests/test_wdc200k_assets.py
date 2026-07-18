@@ -44,6 +44,7 @@ from wdc200k_io import AtomicJsonlShard, SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
 import wdc200k_assets as assets_module  # noqa: E402
+from wdc200k_eta import UrlProgressSnapshot  # noqa: E402
 
 
 def _open_image_outcome_store_process(
@@ -977,9 +978,13 @@ def test_cold_concurrent_job_sets_make_one_shared_url_request(
     start_barrier = threading.Barrier(2)
     results = []
     failures: list[BaseException] = []
+    snapshots: dict[str, list[UrlProgressSnapshot]] = {
+        "cold-left": [],
+        "cold-right": [],
+    }
     result_lock = threading.Lock()
 
-    def run(current_jobs) -> None:
+    def run(name: str, current_jobs) -> None:
         try:
             start_barrier.wait(timeout=2)
             result = fetch_unique_images(
@@ -989,6 +994,8 @@ def test_cold_concurrent_job_sets_make_one_shared_url_request(
                 policy,
                 outcomes_path=outcomes_path,
                 image_dir=tmp_path / "content",
+                progress_callback=snapshots[name].append,
+                progress_callback_every=1,
             )
             with result_lock:
                 results.append(result)
@@ -997,8 +1004,11 @@ def test_cold_concurrent_job_sets_make_one_shared_url_request(
                 failures.append(error)
 
     threads = [
-        threading.Thread(target=run, args=(current_jobs,))
-        for current_jobs in (jobs_left, jobs_right)
+        threading.Thread(target=run, args=(name, current_jobs))
+        for name, current_jobs in (
+            ("cold-left", jobs_left),
+            ("cold-right", jobs_right),
+        )
     ]
     for thread in threads:
         thread.start()
@@ -1009,6 +1019,12 @@ def test_cold_concurrent_job_sets_make_one_shared_url_request(
     assert len(results) == 2
     assert all(result.complete for result in results)
     assert transport.calls == [image_url]
+    final_transport_events = sorted(
+        sum(items[-1].transport_event_histogram)
+        for items in snapshots.values()
+    )
+    assert final_transport_events == [0, 1]
+    assert all(items[-1].completed_durable == 1 for items in snapshots.values())
     with sqlite3.connect(store.path) as connection:
         assert connection.execute(
             """
@@ -1107,7 +1123,7 @@ def test_image_progress_callback_starts_from_durable_baseline_and_is_bounded(
         outcomes_path=outcomes_path,
         image_dir=tmp_path / "content",
     )
-    updates: list[tuple[int, int]] = []
+    updates: list[UrlProgressSnapshot] = []
     result = fetch_unique_images(
         write_unique_jobs(tmp_path / "all.jsonl", urls),
         jobs,
@@ -1115,15 +1131,175 @@ def test_image_progress_callback_starts_from_durable_baseline_and_is_bounded(
         policy,
         outcomes_path=outcomes_path,
         image_dir=tmp_path / "content",
-        progress_callback=lambda completed, total: updates.append(
-            (completed, total)
-        ),
+        progress_callback=updates.append,
         progress_callback_every=2,
     )
 
     assert result.complete
-    assert updates == [(1, 5), (3, 5), (5, 5)]
-    assert updates == sorted(updates)
+    assert [snapshot.completed_durable for snapshot in updates] == [0, 2, 4, 5]
+    assert all(snapshot.total == 5 for snapshot in updates)
+    assert len({snapshot.execution_epoch for snapshot in updates}) == 1
+
+
+def test_image_tracker_distinguishes_physical_and_synchronous_cache_paths(
+    tmp_path: Path,
+) -> None:
+    physical = "https://i.test/physical.jpg"
+    failed = "https://i.test/failed.jpg"
+    cached = "https://i.test/cached.jpg"
+    unique_jobs = write_unique_jobs(
+        tmp_path / "unique.jsonl",
+        [physical, failed, cached],
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=3,
+        per_host_concurrency=3,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(outcomes_path).put(
+        fingerprint,
+        hashlib.sha256(cached.encode("utf-8")).hexdigest(),
+        cached,
+        {
+            "status": "terminal",
+            "image_url": cached,
+            "original_url": cached,
+            "error_class": "cached",
+        },
+    )
+    snapshots: list[UrlProgressSnapshot] = []
+    result = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        FakeImageTransport(
+            tmp_path,
+            {physical: "unique", failed: TimeoutError("deadline")},
+        ),
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+
+    assert result.complete
+    final = snapshots[-1]
+    assert final.completed_durable == final.total == 3
+    assert sum(final.transport_event_histogram) == 2
+    assert sum(final.commit_event_histogram) == 2
+    assert final.physical_in_flight == 0
+
+
+def test_image_claim_loss_reconciles_another_claimants_durable_outcome(
+    tmp_path: Path,
+) -> None:
+    image_url = "https://i.test/claim-loss.jpg"
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", [image_url])
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+
+    def steal_and_finish(lease) -> None:
+        store = ImageOutcomeStore(outcomes_path)
+        decision = store.claim_url(
+            fingerprint,
+            url_key,
+            owner="other-claimant",
+            lease_seconds=60,
+            now=lease.lease_until + 1.0,
+        )
+        assert decision.lease is not None
+        store.put_claimed(
+            fingerprint,
+            url_key,
+            image_url,
+            {
+                "status": "terminal",
+                "image_url": image_url,
+                "original_url": image_url,
+                "error_class": "other_claimant",
+            },
+            lease=decision.lease,
+            now=lease.lease_until + 2.0,
+        )
+        assert store.finish_claim(
+            fingerprint,
+            url_key,
+            lease=decision.lease,
+        )
+
+    snapshots: list[UrlProgressSnapshot] = []
+    transport = FakeImageTransport(tmp_path, {})
+    result = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        after_url_claim=steal_and_finish,
+        progress_callback=snapshots.append,
+        progress_callback_every=1,
+    )
+
+    assert result.complete
+    assert transport.calls == []
+    assert snapshots[-1].completed_durable == 1
+    assert sum(snapshots[-1].transport_event_histogram) == 0
+    assert sum(snapshots[-1].commit_event_histogram) == 1
+
+
+def test_image_url_refresh_uses_kind_status_and_outcome_key_indexes(
+    tmp_path: Path,
+) -> None:
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    ImageOutcomeStore(outcomes_path)
+    kind = "wdc200k-image:policy:set"
+    jobs.enqueue(kind, "job", {"url_key": "a" * 64})
+    counts = assets_module._refresh_image_url_counts(
+        jobs, kind, outcomes_path, "policy"
+    )
+    assert (counts.completed, counts.pending, counts.leased, counts.total) == (
+        0,
+        1,
+        0,
+        1,
+    )
+    with jobs._connect() as connection:
+        connection.execute(
+            "ATTACH DATABASE ? AS image_progress_outcomes",
+            (str(outcomes_path),),
+        )
+        status_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT status, COUNT(*) FROM jobs "
+            "WHERE kind = ? GROUP BY status",
+            (kind,),
+        ).fetchall()
+        completed_plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM jobs AS job "
+            "JOIN image_progress_outcomes.image_outcomes AS outcome "
+            "ON outcome.policy_fingerprint = ? "
+            "AND outcome.url_key = json_extract(job.payload_json, '$.url_key') "
+            "WHERE job.kind = ? AND job.status IN ('success', 'terminal') "
+            "AND outcome.status IN ('success', 'terminal')",
+            ("policy", kind),
+        ).fetchall()
+    details = [str(row[3]) for row in status_plan + completed_plan]
+    assert not any("SCAN jobs" in detail for detail in details)
+    assert any("jobs_kind_status" in detail for detail in details)
+    assert any(
+        "sqlite_autoindex_image_outcomes_1" in detail for detail in details
+    )
 
 
 def test_unique_image_fetch_uses_real_wdc_client_cache_contract(
