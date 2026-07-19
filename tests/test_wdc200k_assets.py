@@ -2473,6 +2473,88 @@ def test_image_commit_failure_drains_other_completed_future_without_refetch(
     assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
 
 
+def test_completed_future_error_precedence_uses_submission_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_urls = [
+        "https://first.test/precedence.jpg",
+        "https://second.test/precedence.jpg",
+    ]
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", image_urls)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: image_url for image_url in image_urls},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=2,
+        per_host_concurrency=1,
+    )
+    real_wait = assets_module.wait
+    submitted_urls: list[str] = []
+
+    def reverse_completed_submission_order(fs, *, return_when):
+        submitted = list(fs)
+        completed, pending = real_wait(submitted)
+        assert not pending
+        submitted_urls.extend(
+            str(future.result().outcome["image_url"])
+            for future in submitted
+        )
+        return list(reversed(submitted)), pending
+
+    def fail_by_submission_order(outcome: dict) -> None:
+        submission_index = submitted_urls.index(str(outcome["image_url"]))
+        if submission_index == 0:
+            raise RuntimeError("earlier submitted image sentinel")
+        raise ValueError("later submitted image sentinel")
+
+    monkeypatch.setattr(
+        assets_module,
+        "wait",
+        reverse_completed_submission_order,
+    )
+    with pytest.raises(RuntimeError, match="earlier submitted image sentinel"):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            claim_buffer=2,
+            lease_seconds=3600,
+            url_claim_lease_seconds=3600,
+            after_cache_write=fail_by_submission_order,
+        )
+
+    assert len(submitted_urls) == 2
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    assert len(list(ImageOutcomeStore(outcomes_path).iter(fingerprint))) == 2
+
+    monkeypatch.setattr(assets_module, "wait", real_wait)
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        claim_buffer=2,
+        lease_seconds=3600,
+        url_claim_lease_seconds=3600,
+    )
+
+    assert resumed.complete
+    assert sorted(transport.calls) == sorted(image_urls)
+    assert resumed.transport_attempt_summary["duplicate_physical_requests"] == 0
+    assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
+
+
 def test_url_claim_crash_before_request_expires_and_reclaims(
     tmp_path: Path,
 ) -> None:

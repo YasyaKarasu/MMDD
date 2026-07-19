@@ -2532,10 +2532,12 @@ def fetch_unique_images(
         raise_failures: bool,
     ) -> None:
         nonlocal local_durable_completed
+        completed_set = set(completed)
+        # Submission order defines deterministic first-error precedence.
         completed_items = [
-            (future, *futures[future])
-            for future in completed
-            if future in futures
+            (future, *metadata)
+            for future, metadata in futures.items()
+            if future in completed_set
         ]
         first_error: BaseException | None = None
         durable_completions = 0
