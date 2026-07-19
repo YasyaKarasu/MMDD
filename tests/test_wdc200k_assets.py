@@ -2163,6 +2163,233 @@ def test_keyboard_interrupt_drains_finished_future_and_immediately_resumes(
     assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
 
 
+def test_keyboard_interrupt_drains_worker_completed_during_executor_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_urls = [
+        "https://i.test/shutdown-a.jpg",
+        "https://i.test/shutdown-b.jpg",
+    ]
+    worker_started = threading.Event()
+    shutdown_started = threading.Event()
+    release_worker = threading.Event()
+
+    class ShutdownTransport(FakeImageTransport):
+        def download_image(self, image_url: str, **kwargs):
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+            assert shutdown_started.is_set()
+            return super().download_image(image_url, **kwargs)
+
+    executor_type = assets_module.ThreadPoolExecutor
+
+    class ShutdownObservedExecutor(executor_type):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            shutdown_started.set()
+            release_worker.set()
+            return super().shutdown(
+                wait=wait,
+                cancel_futures=cancel_futures,
+            )
+
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", image_urls)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    transport = ShutdownTransport(
+        tmp_path,
+        {image_url: image_url for image_url in image_urls},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    real_wait = assets_module.wait
+
+    def interrupt_before_worker_finishes(fs, *, return_when):
+        assert worker_started.wait(timeout=5)
+        assert not shutdown_started.is_set()
+        assert all(not future.done() for future in fs)
+        raise KeyboardInterrupt("interrupt before executor shutdown")
+
+    monkeypatch.setattr(assets_module, "wait", interrupt_before_worker_finishes)
+    monkeypatch.setattr(
+        assets_module,
+        "ThreadPoolExecutor",
+        ShutdownObservedExecutor,
+    )
+    with pytest.raises(KeyboardInterrupt, match="before executor shutdown"):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            claim_buffer=2,
+            lease_seconds=3600,
+            url_claim_lease_seconds=3600,
+    )
+
+    assert shutdown_started.is_set()
+    assert len(transport.calls) == 1
+    assert transport.calls[0] in image_urls
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status"
+        ).fetchall() == [("retryable", 1), ("success", 1)]
+    with sqlite3.connect(outcomes_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_url_claims"
+        ).fetchone() == (0,)
+
+    monkeypatch.setattr(assets_module, "wait", real_wait)
+    monkeypatch.setattr(assets_module, "ThreadPoolExecutor", executor_type)
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        claim_buffer=2,
+        lease_seconds=3600,
+        url_claim_lease_seconds=3600,
+    )
+
+    assert resumed.complete
+    assert sorted(transport.calls) == sorted(image_urls)
+    assert resumed.transport_attempt_summary["duplicate_physical_requests"] == 0
+    assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
+
+
+@pytest.mark.parametrize("cleanup_target", ["job", "url"])
+def test_image_cleanup_failure_preserves_root_and_foreign_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_target: str,
+) -> None:
+    image_url = "https://i.test/cleanup-root.jpg"
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", [image_url])
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    jobs.enqueue("foreign-kind", "foreign-job", {"url": "foreign"})
+    foreign_job = jobs.claim(
+        "foreign-kind",
+        limit=1,
+        owner="foreign-execution",
+        lease_seconds=3600,
+    )[0]
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    kind = assets_module._image_kind(fingerprint, unique_jobs)
+    foreign_url_key = "f" * 64
+    outcome_store = ImageOutcomeStore(outcomes_path)
+    foreign_url_lease = outcome_store.claim_url(
+        fingerprint,
+        foreign_url_key,
+        owner="foreign-execution:foreign-job:foreign-lease",
+        lease_seconds=3600,
+    ).lease
+    assert foreign_url_lease is not None
+
+    if cleanup_target == "job":
+        original_release = SqliteJobStore.release_owner_leases
+
+        def fail_current_job_release(self, release_kind, *, owner):
+            if self.path == jobs.path and release_kind == kind:
+                with self._connect() as connection:
+                    assert connection.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE kind = ? "
+                        "AND status = 'leased' AND owner = ?",
+                        (release_kind, owner),
+                    ).fetchone() == (1,)
+                raise OSError("current job cleanup sentinel")
+            return original_release(self, release_kind, owner=owner)
+
+        monkeypatch.setattr(
+            SqliteJobStore,
+            "release_owner_leases",
+            fail_current_job_release,
+        )
+    else:
+        original_release = ImageOutcomeStore.release_claims_by_owner_prefix
+
+        def fail_current_url_release(
+            self,
+            policy_fingerprint,
+            *,
+            owner_prefix,
+        ):
+            if self.path == outcomes_path and policy_fingerprint == fingerprint:
+                with self._connect() as connection:
+                    assert connection.execute(
+                        "SELECT COUNT(*) FROM image_url_claims "
+                        "WHERE policy_fingerprint = ? "
+                        "AND substr(owner, 1, length(?)) = ?",
+                        (policy_fingerprint, owner_prefix, owner_prefix),
+                    ).fetchone() == (1,)
+                raise OSError("current URL cleanup sentinel")
+            return original_release(
+                self,
+                policy_fingerprint,
+                owner_prefix=owner_prefix,
+            )
+
+        monkeypatch.setattr(
+            ImageOutcomeStore,
+            "release_claims_by_owner_prefix",
+            fail_current_url_release,
+        )
+
+    transport = FakeImageTransport(tmp_path, {image_url: "unused"})
+    with pytest.raises(RuntimeError, match="root scheduler sentinel") as caught:
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            lease_seconds=3600,
+            url_claim_lease_seconds=3600,
+            after_url_claim=lambda _lease: (
+                _ for _ in ()
+            ).throw(RuntimeError("root scheduler sentinel")),
+        )
+
+    assert "cleanup sentinel" not in str(caught.value)
+    assert transport.calls == []
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, owner, lease_id FROM jobs WHERE job_id = ?",
+            (foreign_job.job_id,),
+        ).fetchone() == (
+            "leased",
+            "foreign-execution",
+            foreign_job.lease_id,
+        )
+        assert connection.execute(
+            "SELECT status FROM jobs WHERE kind = ?",
+            (kind,),
+        ).fetchone() == (
+            "leased" if cleanup_target == "job" else "retryable",
+        )
+    with sqlite3.connect(outcomes_path) as connection:
+        claims = connection.execute(
+            "SELECT url_key, owner FROM image_url_claims ORDER BY url_key"
+        ).fetchall()
+    assert (foreign_url_key, foreign_url_lease.owner) in claims
+    assert len(claims) == (2 if cleanup_target == "url" else 1)
+
+
 def test_image_commit_failure_drains_other_completed_future_without_refetch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
