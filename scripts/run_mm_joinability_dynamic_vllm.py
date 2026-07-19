@@ -224,9 +224,24 @@ def install_process_group_signal_handlers(
     processes: Callable[[], Iterable[subprocess.Popen[str] | None]],
 ) -> dict[int, object]:
     previous_handlers: dict[int, object] = {}
+    shutdown_initiated = False
+    handler_active = False
+    followup_forwarded = False
 
     def handle_signal(signum: int, _frame: object) -> None:
-        forward_signal_to_live_process_groups(signum, processes())
+        nonlocal shutdown_initiated, handler_active, followup_forwarded
+        if handler_active or followup_forwarded:
+            return
+        is_followup = shutdown_initiated
+        shutdown_initiated = True
+        handler_active = True
+        try:
+            if is_followup:
+                followup_forwarded = True
+                mask_process_group_signals_for_cleanup()
+            forward_signal_to_live_process_groups(signum, processes())
+        finally:
+            handler_active = False
         raise ForwardedSignal(signum)
 
     for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -839,12 +854,15 @@ def main(argv: list[str] | None = None) -> int:
         return int(builder_proc.wait())
     except ForwardedSignal as exc:
         try:
-            wait_for_forwarded_process_exit(
-                builder_proc,
-                timeout_seconds=args.forwarded_signal_grace_seconds,
-            )
-        except ForwardedSignal:
-            pass
+            try:
+                wait_for_forwarded_process_exit(
+                    builder_proc,
+                    timeout_seconds=args.forwarded_signal_grace_seconds,
+                )
+            except ForwardedSignal:
+                pass
+        finally:
+            mask_process_group_signals_for_cleanup()
         return 128 + exc.signum
     finally:
         mask_process_group_signals_for_cleanup()

@@ -2086,6 +2086,8 @@ def _run_dynamic_forwarded_signal_grace_main(
 
     def fake_signal(signum, handler):
         installed_handlers[signum] = handler
+        if handler == signal.SIG_IGN:
+            events.append(("mask", signum))
         return signal.SIG_DFL
 
     def fake_forward_signal(signum, processes):
@@ -2116,7 +2118,6 @@ def _run_dynamic_forwarded_signal_grace_main(
         "forward_signal_to_live_process_groups",
         fake_forward_signal,
     )
-    monkeypatch.setattr(runner, "mask_process_group_signals_for_cleanup", lambda: None)
     monkeypatch.setattr(runner, "restore_signal_handlers", lambda _handlers: None)
     monkeypatch.setattr(runner, "wait_for_server", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -2148,14 +2149,14 @@ def _run_dynamic_forwarded_signal_grace_main(
         ]
     )
     builder = next(process for process in started if process.role == "builder")
-    return code, events, builder
+    return code, events, builder, installed_handlers
 
 
 def test_dynamic_vllm_forwarded_signal_grace_waits_before_best_effort_stop(
     monkeypatch,
     tmp_path,
 ):
-    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+    code, events, builder, _handlers = _run_dynamic_forwarded_signal_grace_main(
         monkeypatch,
         tmp_path,
         builder_grace_times_out=False,
@@ -2166,6 +2167,14 @@ def test_dynamic_vllm_forwarded_signal_grace_waits_before_best_effort_stop(
         "builder_grace_wait"
     )
     assert events.index("builder_grace_wait") < events.index("best_effort_stop")
+    mask_indices = [
+        index
+        for index, event in enumerate(events)
+        if event[0] == "mask"
+    ]
+    assert len(mask_indices) == 6
+    assert events.index("builder_grace_wait") < mask_indices[0]
+    assert mask_indices[-1] < events.index("best_effort_stop")
     assert builder.wait_timeouts == [7.5]
     assert ("kill", "builder", signal.SIGTERM) not in events
 
@@ -2174,7 +2183,7 @@ def test_dynamic_vllm_forwarded_signal_grace_timeout_falls_back_to_existing_stop
     monkeypatch,
     tmp_path,
 ):
-    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+    code, events, builder, _handlers = _run_dynamic_forwarded_signal_grace_main(
         monkeypatch,
         tmp_path,
         builder_grace_times_out=True,
@@ -2195,7 +2204,7 @@ def test_dynamic_vllm_forwarded_signal_grace_skips_already_exited_builder_in_mai
     monkeypatch,
     tmp_path,
 ):
-    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+    code, events, builder, _handlers = _run_dynamic_forwarded_signal_grace_main(
         monkeypatch,
         tmp_path,
         builder_grace_times_out=False,
@@ -2215,11 +2224,13 @@ def test_dynamic_vllm_second_forwarded_signal_interrupts_grace_and_keeps_first_e
     monkeypatch,
     tmp_path,
 ):
-    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
-        monkeypatch,
-        tmp_path,
-        builder_grace_times_out=False,
-        second_signal_during_grace=signal.SIGTERM,
+    code, events, builder, installed_handlers = (
+        _run_dynamic_forwarded_signal_grace_main(
+            monkeypatch,
+            tmp_path,
+            builder_grace_times_out=False,
+            second_signal_during_grace=signal.SIGTERM,
+        )
     )
 
     assert code == 128 + signal.SIGINT
@@ -2230,10 +2241,46 @@ def test_dynamic_vllm_second_forwarded_signal_interrupts_grace_and_keeps_first_e
     assert events.index("builder_grace_wait") < events.index(
         ("forward", signal.SIGTERM)
     )
+    first_mask = next(event for event in events if event[0] == "mask")
+    assert events.index(first_mask) < events.index(("forward", signal.SIGTERM))
     assert events.index(("forward", signal.SIGTERM)) < events.index(
         "best_effort_stop"
     )
     assert builder.wait_timeouts == [7.5, 30.0]
+    assert set(installed_handlers.values()) == {signal.SIG_IGN}
+
+
+def test_dynamic_vllm_recursive_signal_delivery_forwards_only_root_signal(
+    monkeypatch,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    installed = {}
+    forwarded = []
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return signal.SIG_DFL
+
+    def recursive_forward(signum, processes):
+        forwarded.append((signum, tuple(processes)))
+        if len(forwarded) == 1:
+            installed[signum](signum, None)
+
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(
+        runner,
+        "forward_signal_to_live_process_groups",
+        recursive_forward,
+    )
+    live_processes = (object(),)
+    runner.install_process_group_signal_handlers(lambda: live_processes)
+
+    with pytest.raises(runner.ForwardedSignal) as raised:
+        installed[signal.SIGINT](signal.SIGINT, None)
+
+    assert raised.value.signum == signal.SIGINT
+    assert forwarded == [(signal.SIGINT, live_processes)]
 
 
 def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(
