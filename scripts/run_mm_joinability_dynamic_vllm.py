@@ -12,6 +12,7 @@ queue can use the new server without restarting.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import subprocess
@@ -597,8 +598,13 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 def main(argv: list[str] | None = None) -> int:
     args, passthrough_args = parse_args(argv)
     validate_builder_passthrough(passthrough_args)
-    if args.forwarded_signal_grace_seconds < 0:
-        raise ValueError("--forwarded_signal_grace_seconds must be non-negative")
+    if not (
+        math.isfinite(args.forwarded_signal_grace_seconds)
+        and args.forwarded_signal_grace_seconds >= 0
+    ):
+        raise ValueError(
+            "--forwarded_signal_grace_seconds must be finite and non-negative"
+        )
     output_dir = Path(args.output_dir).resolve()
     work_dir_value = passthrough_option_value(
         passthrough_args,
@@ -832,10 +838,13 @@ def main(argv: list[str] | None = None) -> int:
 
         return int(builder_proc.wait())
     except ForwardedSignal as exc:
-        wait_for_forwarded_process_exit(
-            builder_proc,
-            timeout_seconds=args.forwarded_signal_grace_seconds,
-        )
+        try:
+            wait_for_forwarded_process_exit(
+                builder_proc,
+                timeout_seconds=args.forwarded_signal_grace_seconds,
+            )
+        except ForwardedSignal:
+            pass
         return 128 + exc.signum
     finally:
         mask_process_group_signals_for_cleanup()

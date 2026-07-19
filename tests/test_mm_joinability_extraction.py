@@ -1093,9 +1093,11 @@ def test_dynamic_vllm_rejects_runtime_outside_work_before_any_write(
     assert not runtime.exists()
 
 
-def test_dynamic_vllm_forwarded_signal_grace_rejects_negative_before_writes_or_spawns(
+@pytest.mark.parametrize("grace_value", ["-0.01", "nan", "inf", "-inf"])
+def test_dynamic_vllm_forwarded_signal_grace_rejects_invalid_before_writes_or_spawns(
     monkeypatch,
     tmp_path,
+    grace_value,
 ):
     import run_mm_joinability_dynamic_vllm as runner
 
@@ -1113,7 +1115,7 @@ def test_dynamic_vllm_forwarded_signal_grace_rejects_negative_before_writes_or_s
     monkeypatch.setattr(runner, "write_endpoint_file", record_write)
     monkeypatch.setattr(runner.subprocess, "Popen", ForbiddenPopen)
 
-    with pytest.raises(ValueError, match="must be non-negative"):
+    with pytest.raises(ValueError, match="must be"):
         dynamic_vllm_main(
             [
                 "--input_dir",
@@ -1124,8 +1126,7 @@ def test_dynamic_vllm_forwarded_signal_grace_rejects_negative_before_writes_or_s
                 "/models/text",
                 "--image_model_path",
                 "/models/vl",
-                "--forwarded_signal_grace_seconds",
-                "-0.01",
+                f"--forwarded_signal_grace_seconds={grace_value}",
             ]
         )
 
@@ -2028,13 +2029,14 @@ def _run_dynamic_forwarded_signal_grace_main(
     *,
     builder_grace_times_out: bool,
     builder_already_exited: bool = False,
+    second_signal_during_grace: int | None = None,
 ):
     import run_mm_joinability_dynamic_vllm as runner
 
     events = []
     started = []
     by_pid = {}
-    process_supplier = {}
+    installed_handlers = {}
 
     class FakePopen:
         def __init__(self, command, **_kwargs):
@@ -2072,30 +2074,31 @@ def _run_dynamic_forwarded_signal_grace_main(
             self.wait_timeouts.append(timeout)
             if self.role == "builder" and timeout == 7.5:
                 events.append("builder_grace_wait")
+                if second_signal_during_grace is not None:
+                    installed_handlers[second_signal_during_grace](
+                        second_signal_during_grace,
+                        None,
+                    )
                 if builder_grace_times_out:
                     raise subprocess.TimeoutExpired(self.command, timeout)
             self._poll = 0
             return 0
 
-    def fake_install_process_group_signal_handlers(processes):
-        process_supplier["get"] = processes
-        return {}
+    def fake_signal(signum, handler):
+        installed_handlers[signum] = handler
+        return signal.SIG_DFL
 
     def fake_forward_signal(signum, processes):
         assert [process.role for process in processes if process is not None]
-        events.append("forward")
-
-    def raise_forwarded_signal(**_kwargs):
-        runner.forward_signal_to_live_process_groups(
-            signal.SIGINT,
-            process_supplier["get"](),
-        )
-        if builder_already_exited:
+        events.append(("forward", signum))
+        if builder_already_exited and signum == signal.SIGINT:
             builder = next(
                 process for process in started if process.role == "builder"
             )
             builder._poll = 0
-        raise runner.ForwardedSignal(signal.SIGINT)
+
+    def raise_forwarded_signal(**_kwargs):
+        installed_handlers[signal.SIGINT](signal.SIGINT, None)
 
     def fake_killpg(pid, signum):
         events.append(("kill", by_pid[pid].role, signum))
@@ -2107,11 +2110,7 @@ def _run_dynamic_forwarded_signal_grace_main(
         return original_best_effort(processes)
 
     monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(
-        runner,
-        "install_process_group_signal_handlers",
-        fake_install_process_group_signal_handlers,
-    )
+    monkeypatch.setattr(runner.signal, "signal", fake_signal)
     monkeypatch.setattr(
         runner,
         "forward_signal_to_live_process_groups",
@@ -2163,7 +2162,9 @@ def test_dynamic_vllm_forwarded_signal_grace_waits_before_best_effort_stop(
     )
 
     assert code == 128 + signal.SIGINT
-    assert events.index("forward") < events.index("builder_grace_wait")
+    assert events.index(("forward", signal.SIGINT)) < events.index(
+        "builder_grace_wait"
+    )
     assert events.index("builder_grace_wait") < events.index("best_effort_stop")
     assert builder.wait_timeouts == [7.5]
     assert ("kill", "builder", signal.SIGTERM) not in events
@@ -2180,7 +2181,9 @@ def test_dynamic_vllm_forwarded_signal_grace_timeout_falls_back_to_existing_stop
     )
 
     assert code == 128 + signal.SIGINT
-    assert events.index("forward") < events.index("builder_grace_wait")
+    assert events.index(("forward", signal.SIGINT)) < events.index(
+        "builder_grace_wait"
+    )
     assert events.index("builder_grace_wait") < events.index("best_effort_stop")
     assert events.index("best_effort_stop") < events.index(
         ("kill", "builder", signal.SIGTERM)
@@ -2200,10 +2203,37 @@ def test_dynamic_vllm_forwarded_signal_grace_skips_already_exited_builder_in_mai
     )
 
     assert code == 128 + signal.SIGINT
-    assert events.index("forward") < events.index("best_effort_stop")
+    assert events.index(("forward", signal.SIGINT)) < events.index(
+        "best_effort_stop"
+    )
     assert "builder_grace_wait" not in events
     assert builder.wait_timeouts == []
     assert ("kill", "builder", signal.SIGTERM) not in events
+
+
+def test_dynamic_vllm_second_forwarded_signal_interrupts_grace_and_keeps_first_exit_code(
+    monkeypatch,
+    tmp_path,
+):
+    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+        monkeypatch,
+        tmp_path,
+        builder_grace_times_out=False,
+        second_signal_during_grace=signal.SIGTERM,
+    )
+
+    assert code == 128 + signal.SIGINT
+    assert [event for event in events if event[0] == "forward"] == [
+        ("forward", signal.SIGINT),
+        ("forward", signal.SIGTERM),
+    ]
+    assert events.index("builder_grace_wait") < events.index(
+        ("forward", signal.SIGTERM)
+    )
+    assert events.index(("forward", signal.SIGTERM)) < events.index(
+        "best_effort_stop"
+    )
+    assert builder.wait_timeouts == [7.5, 30.0]
 
 
 def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(
