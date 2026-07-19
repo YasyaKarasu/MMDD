@@ -199,6 +199,20 @@ def forward_signal_to_live_process_groups(
             continue
 
 
+def wait_for_forwarded_process_exit(
+    process: subprocess.Popen[str] | None,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    if process is None or process.poll() is not None:
+        return True
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 class ForwardedSignal(BaseException):
     def __init__(self, signum: int):
         super().__init__(signum)
@@ -558,6 +572,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--vllm_bin", default="vllm")
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
+    parser.add_argument("--forwarded_signal_grace_seconds", type=float, default=30.0)
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--run_fingerprint", default="", help="Optional staged-run identity used to fence stale model markers.")
     parser.add_argument("--runtime_dir", default="", help="Marker/endpoint directory. Must equal the WDC builder work directory plus /runtime.")
@@ -582,6 +597,8 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 def main(argv: list[str] | None = None) -> int:
     args, passthrough_args = parse_args(argv)
     validate_builder_passthrough(passthrough_args)
+    if args.forwarded_signal_grace_seconds < 0:
+        raise ValueError("--forwarded_signal_grace_seconds must be non-negative")
     output_dir = Path(args.output_dir).resolve()
     work_dir_value = passthrough_option_value(
         passthrough_args,
@@ -815,6 +832,10 @@ def main(argv: list[str] | None = None) -> int:
 
         return int(builder_proc.wait())
     except ForwardedSignal as exc:
+        wait_for_forwarded_process_exit(
+            builder_proc,
+            timeout_seconds=args.forwarded_signal_grace_seconds,
+        )
         return 128 + exc.signum
     finally:
         mask_process_group_signals_for_cleanup()

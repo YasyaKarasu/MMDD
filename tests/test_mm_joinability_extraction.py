@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -876,6 +877,23 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     assert args.model_start_timeout_seconds is None
 
 
+def test_dynamic_vllm_forwarded_signal_grace_defaults_to_thirty_seconds():
+    args, _passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+        ]
+    )
+
+    assert args.forwarded_signal_grace_seconds == 30.0
+
+
 def test_dynamic_vllm_accepts_staged_run_fingerprint():
     args, passthrough = parse_dynamic_vllm_args(
         [
@@ -1072,6 +1090,46 @@ def test_dynamic_vllm_rejects_runtime_outside_work_before_any_write(
                 "/models/vl",
             ]
         )
+    assert not runtime.exists()
+
+
+def test_dynamic_vllm_forwarded_signal_grace_rejects_negative_before_writes_or_spawns(
+    monkeypatch,
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    side_effects = []
+    runtime = tmp_path / "work_wdc_200k" / "runtime"
+
+    def record_write(*_args, **_kwargs):
+        side_effects.append("write")
+
+    class ForbiddenPopen:
+        def __init__(self, *_args, **_kwargs):
+            side_effects.append("spawn")
+            raise AssertionError("process spawned before grace validation")
+
+    monkeypatch.setattr(runner, "write_endpoint_file", record_write)
+    monkeypatch.setattr(runner.subprocess, "Popen", ForbiddenPopen)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        dynamic_vllm_main(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/vl",
+                "--forwarded_signal_grace_seconds",
+                "-0.01",
+            ]
+        )
+
+    assert side_effects == []
     assert not runtime.exists()
 
 
@@ -1754,6 +1812,9 @@ def test_dynamic_vllm_masks_signal_handlers_during_best_effort_cleanup(
         def poll(self):
             return self._poll
 
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.command, timeout)
+
     def previous_handler(signum, _frame):
         events.append(("previous_handler", signum))
 
@@ -1850,6 +1911,275 @@ def test_dynamic_vllm_forwards_signal_to_every_live_process_group():
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=3)
+
+
+def _wait_for_test_path(path: Path, *, timeout_seconds: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for test path: {path}")
+
+
+def test_dynamic_vllm_waits_for_signalled_builder_cleanup_without_fallback_signal(
+    monkeypatch,
+    tmp_path,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    ready = tmp_path / "ready"
+    received = tmp_path / "received"
+    release = tmp_path / "release"
+    cleaned = tmp_path / "cleaned"
+    fallback = tmp_path / "fallback"
+    child_code = "\n".join(
+        [
+            "import os, signal, sys, time",
+            "from pathlib import Path",
+            "ready, received, release, cleaned, fallback = map(Path, sys.argv[1:])",
+            "def handle_sigterm(_signum, _frame):",
+            "    fallback.write_text('sigterm', encoding='utf-8')",
+            "    os._exit(143)",
+            "def handle_sigint(_signum, _frame):",
+            "    received.write_text('sigint', encoding='utf-8')",
+            "    while not release.exists():",
+            "        time.sleep(0.01)",
+            "    time.sleep(0.1)",
+            "    cleaned.write_text('complete', encoding='utf-8')",
+            "    os._exit(0)",
+            "signal.signal(signal.SIGTERM, handle_sigterm)",
+            "signal.signal(signal.SIGINT, handle_sigint)",
+            "ready.write_text('ready', encoding='utf-8')",
+            "while True:",
+            "    time.sleep(1)",
+        ]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(ready),
+            str(received),
+            str(release),
+            str(cleaned),
+            str(fallback),
+        ],
+        start_new_session=True,
+    )
+    real_killpg = runner.os.killpg
+    sent_signals = []
+
+    def tracking_killpg(pid, signum):
+        sent_signals.append(signum)
+        real_killpg(pid, signum)
+
+    monkeypatch.setattr(runner.os, "killpg", tracking_killpg)
+    try:
+        _wait_for_test_path(ready)
+        runner.forward_signal_to_live_process_groups(signal.SIGINT, [process])
+        _wait_for_test_path(received)
+        assert process.poll() is None
+
+        release.write_text("release", encoding="utf-8")
+        assert runner.wait_for_forwarded_process_exit(
+            process,
+            timeout_seconds=2.0,
+        )
+        runner.stop_process(process, timeout_seconds=0.1)
+
+        assert process.returncode == 0
+        assert cleaned.read_text(encoding="utf-8") == "complete"
+        assert not fallback.exists()
+        assert sent_signals == [signal.SIGINT]
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=3)
+
+
+def test_dynamic_vllm_forwarded_signal_grace_skips_absent_or_exited_process():
+    import run_mm_joinability_dynamic_vllm as runner
+
+    class ExitedProcess:
+        def poll(self):
+            return 17
+
+        def wait(self, timeout=None):
+            raise AssertionError(f"unexpected wait with timeout {timeout}")
+
+    exited = ExitedProcess()
+
+    assert runner.wait_for_forwarded_process_exit(
+        None,
+        timeout_seconds=1.0,
+    )
+    assert runner.wait_for_forwarded_process_exit(
+        exited,
+        timeout_seconds=1.0,
+    )
+    runner.stop_process(exited)
+
+
+def _run_dynamic_forwarded_signal_grace_main(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    builder_grace_times_out: bool,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    events = []
+    started = []
+    by_pid = {}
+    process_supplier = {}
+
+    class FakePopen:
+        def __init__(self, command, **_kwargs):
+            self.command = command
+            self.pid = 12345 + len(started)
+            self._poll = None
+            self.wait_timeouts = []
+            self.role = (
+                "builder"
+                if command[0] == "/usr/bin/python"
+                else command[command.index("--served-model-name") + 1]
+            )
+            started.append(self)
+            by_pid[self.pid] = self
+            if self.role == "builder":
+                marker = Path(
+                    command[command.index("--model_start_marker") + 1]
+                )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    json.dumps(
+                        strict_start_marker(
+                            run_fingerprint="",
+                            text_tasks=1,
+                            image_tasks=1,
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            if self.role == "builder" and timeout == 7.5:
+                events.append("builder_grace_wait")
+                if builder_grace_times_out:
+                    raise subprocess.TimeoutExpired(self.command, timeout)
+            self._poll = 0
+            return 0
+
+    def fake_install_process_group_signal_handlers(processes):
+        process_supplier["get"] = processes
+        return {}
+
+    def fake_forward_signal(signum, processes):
+        assert [process.role for process in processes if process is not None]
+        events.append("forward")
+
+    def raise_forwarded_signal(**_kwargs):
+        runner.forward_signal_to_live_process_groups(
+            signal.SIGINT,
+            process_supplier["get"](),
+        )
+        raise runner.ForwardedSignal(signal.SIGINT)
+
+    def fake_killpg(pid, signum):
+        events.append(("kill", by_pid[pid].role, signum))
+
+    original_best_effort = runner.stop_processes_best_effort
+
+    def recording_best_effort(processes):
+        events.append("best_effort_stop")
+        return original_best_effort(processes)
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        runner,
+        "install_process_group_signal_handlers",
+        fake_install_process_group_signal_handlers,
+    )
+    monkeypatch.setattr(
+        runner,
+        "forward_signal_to_live_process_groups",
+        fake_forward_signal,
+    )
+    monkeypatch.setattr(runner, "mask_process_group_signals_for_cleanup", lambda: None)
+    monkeypatch.setattr(runner, "restore_signal_handlers", lambda _handlers: None)
+    monkeypatch.setattr(runner, "wait_for_server", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_any_marker_or_builder_exit",
+        raise_forwarded_signal,
+    )
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg)
+    monkeypatch.setattr(
+        runner,
+        "stop_processes_best_effort",
+        recording_best_effort,
+    )
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+            "--forwarded_signal_grace_seconds",
+            "7.5",
+        ]
+    )
+    builder = next(process for process in started if process.role == "builder")
+    return code, events, builder
+
+
+def test_dynamic_vllm_forwarded_signal_grace_waits_before_best_effort_stop(
+    monkeypatch,
+    tmp_path,
+):
+    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+        monkeypatch,
+        tmp_path,
+        builder_grace_times_out=False,
+    )
+
+    assert code == 128 + signal.SIGINT
+    assert events.index("forward") < events.index("builder_grace_wait")
+    assert events.index("builder_grace_wait") < events.index("best_effort_stop")
+    assert builder.wait_timeouts == [7.5]
+    assert ("kill", "builder", signal.SIGTERM) not in events
+
+
+def test_dynamic_vllm_forwarded_signal_grace_timeout_falls_back_to_existing_stop(
+    monkeypatch,
+    tmp_path,
+):
+    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+        monkeypatch,
+        tmp_path,
+        builder_grace_times_out=True,
+    )
+
+    assert code == 128 + signal.SIGINT
+    assert events.index("forward") < events.index("builder_grace_wait")
+    assert events.index("builder_grace_wait") < events.index("best_effort_stop")
+    assert events.index("best_effort_stop") < events.index(
+        ("kill", "builder", signal.SIGTERM)
+    )
+    assert builder.wait_timeouts == [7.5, 30.0]
 
 
 def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(
