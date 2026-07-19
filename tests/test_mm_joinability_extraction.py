@@ -2027,6 +2027,7 @@ def _run_dynamic_forwarded_signal_grace_main(
     tmp_path: Path,
     *,
     builder_grace_times_out: bool,
+    builder_already_exited: bool = False,
 ):
     import run_mm_joinability_dynamic_vllm as runner
 
@@ -2089,6 +2090,11 @@ def _run_dynamic_forwarded_signal_grace_main(
             signal.SIGINT,
             process_supplier["get"](),
         )
+        if builder_already_exited:
+            builder = next(
+                process for process in started if process.role == "builder"
+            )
+            builder._poll = 0
         raise runner.ForwardedSignal(signal.SIGINT)
 
     def fake_killpg(pid, signum):
@@ -2180,6 +2186,24 @@ def test_dynamic_vllm_forwarded_signal_grace_timeout_falls_back_to_existing_stop
         ("kill", "builder", signal.SIGTERM)
     )
     assert builder.wait_timeouts == [7.5, 30.0]
+
+
+def test_dynamic_vllm_forwarded_signal_grace_skips_already_exited_builder_in_main(
+    monkeypatch,
+    tmp_path,
+):
+    code, events, builder = _run_dynamic_forwarded_signal_grace_main(
+        monkeypatch,
+        tmp_path,
+        builder_grace_times_out=False,
+        builder_already_exited=True,
+    )
+
+    assert code == 128 + signal.SIGINT
+    assert events.index("forward") < events.index("best_effort_stop")
+    assert "builder_grace_wait" not in events
+    assert builder.wait_timeouts == []
+    assert ("kill", "builder", signal.SIGTERM) not in events
 
 
 def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(
