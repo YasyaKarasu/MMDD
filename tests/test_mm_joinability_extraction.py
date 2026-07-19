@@ -2030,6 +2030,7 @@ def _run_dynamic_forwarded_signal_grace_main(
     builder_grace_times_out: bool,
     builder_already_exited: bool = False,
     second_signal_during_grace: int | None = None,
+    inject_signal_during_mask: int | None = None,
 ):
     import run_mm_joinability_dynamic_vllm as runner
 
@@ -2037,6 +2038,9 @@ def _run_dynamic_forwarded_signal_grace_main(
     started = []
     by_pid = {}
     installed_handlers = {}
+    initial_mask = {signal.SIGUSR1}
+    blocked_signals = set(initial_mask)
+    mask_install_count = 0
 
     class FakePopen:
         def __init__(self, command, **_kwargs):
@@ -2085,10 +2089,31 @@ def _run_dynamic_forwarded_signal_grace_main(
             return 0
 
     def fake_signal(signum, handler):
+        nonlocal mask_install_count
         installed_handlers[signum] = handler
         if handler == signal.SIG_IGN:
+            mask_install_count += 1
             events.append(("mask", signum))
+            if mask_install_count == 2 and inject_signal_during_mask is not None:
+                if inject_signal_during_mask in blocked_signals:
+                    events.append(("deferred", inject_signal_during_mask))
+                else:
+                    installed_handlers[inject_signal_during_mask](
+                        inject_signal_during_mask,
+                        None,
+                    )
         return signal.SIG_DFL
+
+    def fake_pthread_sigmask(how, signals):
+        requested = frozenset(signals)
+        previous = frozenset(blocked_signals)
+        events.append(("sigmask", how, requested))
+        if how == signal.SIG_BLOCK:
+            blocked_signals.update(requested)
+        elif how == signal.SIG_SETMASK:
+            blocked_signals.clear()
+            blocked_signals.update(requested)
+        return previous
 
     def fake_forward_signal(signum, processes):
         assert [process.role for process in processes if process is not None]
@@ -2113,6 +2138,7 @@ def _run_dynamic_forwarded_signal_grace_main(
 
     monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
     monkeypatch.setattr(runner.signal, "signal", fake_signal)
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", fake_pthread_sigmask)
     monkeypatch.setattr(
         runner,
         "forward_signal_to_live_process_groups",
@@ -2281,6 +2307,76 @@ def test_dynamic_vllm_recursive_signal_delivery_forwards_only_root_signal(
 
     assert raised.value.signum == signal.SIGINT
     assert forwarded == [(signal.SIGINT, live_processes)]
+
+
+def test_dynamic_vllm_atomic_mask_defers_delivery_during_handler_install(
+    monkeypatch,
+    tmp_path,
+):
+    code, events, _builder, _handlers = (
+        _run_dynamic_forwarded_signal_grace_main(
+            monkeypatch,
+            tmp_path,
+            builder_grace_times_out=False,
+            inject_signal_during_mask=signal.SIGINT,
+        )
+    )
+    managed = frozenset(
+        (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    )
+    prior_mask = frozenset({signal.SIGUSR1})
+    block_event = ("sigmask", signal.SIG_BLOCK, managed)
+    restore_event = ("sigmask", signal.SIG_SETMASK, prior_mask)
+    block_index = events.index(block_event)
+    restore_index = events.index(restore_event)
+    mask_indices = [
+        index
+        for index, event in enumerate(events)
+        if event[0] == "mask" and block_index < index < restore_index
+    ]
+
+    assert code == 128 + signal.SIGINT
+    assert [event for event in events if event[0] == "forward"] == [
+        ("forward", signal.SIGINT)
+    ]
+    assert ("deferred", signal.SIGINT) in events
+    assert block_index < mask_indices[0]
+    assert mask_indices[-1] < restore_index
+
+
+def test_dynamic_vllm_atomic_mask_restores_previous_mask_after_install_error(
+    monkeypatch,
+):
+    import run_mm_joinability_dynamic_vllm as runner
+
+    managed = frozenset(
+        (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    )
+    prior_mask = frozenset({signal.SIGUSR1})
+    mask_calls = []
+
+    def fake_pthread_sigmask(how, signals):
+        requested = frozenset(signals)
+        mask_calls.append((how, requested))
+        if how == signal.SIG_BLOCK:
+            return prior_mask
+        return managed
+
+    def fail_second_install(signum, _handler):
+        if signum == signal.SIGHUP:
+            raise RuntimeError("signal install failed")
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", fake_pthread_sigmask)
+    monkeypatch.setattr(runner.signal, "signal", fail_second_install)
+
+    with pytest.raises(RuntimeError, match="signal install failed"):
+        runner.mask_process_group_signals_for_cleanup()
+
+    assert mask_calls == [
+        (signal.SIG_BLOCK, managed),
+        (signal.SIG_SETMASK, prior_mask),
+    ]
 
 
 def test_dynamic_vllm_installs_explicit_signal_handlers_and_restores_them(

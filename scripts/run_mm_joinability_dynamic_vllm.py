@@ -257,8 +257,13 @@ def restore_signal_handlers(previous_handlers: dict[int, object]) -> None:
 
 
 def mask_process_group_signals_for_cleanup() -> None:
-    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(signum, signal.SIG_IGN)
+    managed_signals = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, signal.SIG_IGN)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def stop_processes_best_effort(
