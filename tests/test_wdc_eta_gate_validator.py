@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -21,6 +23,8 @@ from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
 )
 from validate_wdc_eta_gate import (  # noqa: E402
     GateValidationError,
+    canonical_prefix_sha256,
+    main,
     validate_eta_gate,
 )
 from wdc200k_eta import UrlProgressSnapshot  # noqa: E402
@@ -217,6 +221,69 @@ def _progress_with_all_exclusions(
         ]
     )
     return _progress_with_page_snapshots(root, monkeypatch, samples)
+
+
+def _matching_progress_pair(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: 3_000.0)
+    config = _config(root)
+    reporter = ProgressReporter(config)
+    reporter.update(
+        stage="pages",
+        url_snapshot=_snapshot(
+            epoch="pages-epoch", completed=0, total=4, elapsed=0.0
+        ),
+    )
+    reporter.update(
+        url_snapshot=_snapshot(
+            epoch="pages-epoch", completed=2, total=4, elapsed=2.0
+        )
+    )
+    reporter.publish()
+    before = root / "evidence" / "progress-before-resume.json"
+    before.parent.mkdir()
+    shutil.copyfile(reporter.path, before)
+    reporter.update(
+        url_snapshot=_snapshot(
+            epoch="pages-epoch", completed=4, total=4, elapsed=4.0
+        )
+    )
+    reporter.update(
+        stage="images",
+        url_snapshot=_snapshot(
+            epoch="images-epoch", completed=0, total=2, elapsed=0.0
+        ),
+    )
+    reporter.update(
+        url_snapshot=_snapshot(
+            epoch="images-epoch", completed=2, total=2, elapsed=2.0
+        )
+    )
+    reporter.publish()
+    os.chmod(before, 0o640)
+    os.chmod(reporter.path, 0o600)
+    return before, reporter.path
+
+
+def _add_prefix_field(
+    before: Path,
+    final: Path,
+    *,
+    before_value: Any,
+    final_value: Any,
+) -> None:
+    before_payload = _payload(before)
+    final_payload = _payload(final)
+    before_payload["stage_telemetry"]["pages"]["samples"][0][
+        "prefix_fixture"
+    ] = before_value
+    final_payload["stage_telemetry"]["pages"]["samples"][0][
+        "prefix_fixture"
+    ] = final_value
+    _write_payload(before, before_payload)
+    _write_payload(final, final_payload)
 
 
 def _payload(path: Path) -> dict[str, Any]:
@@ -442,3 +509,187 @@ def test_zero_eligible_has_explicit_reason(
     assert stage["max_symmetric_eta_factor"] is None
     assert stage["worst_record"] is None
     assert stage["worst_reason"] == "ZERO_ELIGIBLE_SAMPLES"
+
+
+def test_equal_prefix_reports_exact_digests_without_writing_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    original = {
+        path: (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+            stat.S_IMODE(path.stat().st_mode),
+        )
+        for path in (before, final)
+    }
+
+    result = validate_eta_gate(final, before)
+
+    prefix = result["stages"]["pages"]["resume_prefix"]
+    assert prefix["matches"] is True
+    assert prefix["prefix_length"] == 2
+    assert prefix["before_prefix_sha256"] == prefix["final_prefix_sha256"]
+    for path, properties in original.items():
+        assert (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+            stat.S_IMODE(path.stat().st_mode),
+        ) == properties
+
+
+@pytest.mark.parametrize(
+    ("before_value", "final_value"),
+    [(1, 2), (1, 1.0)],
+    ids=["value", "type"],
+)
+def test_prefix_rejects_value_or_type_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_value: Any,
+    final_value: Any,
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    _add_prefix_field(
+        before,
+        final,
+        before_value=before_value,
+        final_value=final_value,
+    )
+
+    with pytest.raises(GateValidationError) as caught:
+        validate_eta_gate(final, before)
+
+    assert caught.value.code == "PREFIX_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "final_value",
+    [["b", "a"], ["a", "inserted", "b"]],
+    ids=["reorder", "insertion"],
+)
+def test_prefix_rejects_nested_list_reorder_or_insertion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_value: list[str],
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    _add_prefix_field(
+        before,
+        final,
+        before_value=["a", "b"],
+        final_value=final_value,
+    )
+
+    with pytest.raises(GateValidationError) as caught:
+        validate_eta_gate(final, before)
+
+    assert caught.value.code == "PREFIX_MISMATCH"
+
+
+def test_prefix_rejects_shorter_final_sample_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final = _native_v2_progress(tmp_path / "final", monkeypatch)
+    before = _progress_with_tied_factors(tmp_path / "before", monkeypatch)
+    payload = _payload(before)
+    payload["stage_telemetry"].pop("images")
+    _write_payload(before, payload)
+
+    with pytest.raises(GateValidationError) as caught:
+        validate_eta_gate(final, before)
+
+    assert caught.value.code == "PREFIX_TOO_LONG"
+
+
+def test_prefix_rejects_stage_missing_from_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    payload = _payload(before)
+    selection = json.loads(
+        json.dumps(payload["stage_telemetry"]["pages"])
+    )
+    selection["rate_basis"] = None
+    payload["stage_telemetry"] = {"selection": selection}
+    _write_payload(before, payload)
+
+    with pytest.raises(GateValidationError) as caught:
+        validate_eta_gate(final, before)
+
+    assert caught.value.code == "PREFIX_STAGE_MISSING"
+
+
+def test_canonical_prefix_sha256_uses_exact_canonical_bytes() -> None:
+    assert canonical_prefix_sha256([{"b": 1, "a": "é"}]) == (
+        "d81bebe19bd25f2b7fa8e294836721d40b558a8ce454d3117dc61b54a65c3d05"
+    )
+
+
+def test_cli_success_stdout_is_stable_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    capsys.readouterr()
+    argv = ["--progress", str(final), "--before-resume", str(before)]
+
+    assert main(argv) == 0
+    first = capsys.readouterr()
+    assert main(argv) == 0
+    second = capsys.readouterr()
+
+    assert first.err == second.err == ""
+    assert first.out == second.out
+    assert first.out.endswith("\n")
+    assert json.loads(first.out)["status"] == "ok"
+
+
+def test_cli_prefix_mismatch_is_stable_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    before, final = _matching_progress_pair(tmp_path, monkeypatch)
+    _add_prefix_field(before, final, before_value=1, final_value=2)
+    capsys.readouterr()
+
+    assert main(
+        ["--progress", str(final), "--before-resume", str(before)]
+    ) == 1
+    captured = capsys.readouterr()
+
+    assert json.loads(captured.out) == {
+        "error": {
+            "code": "PREFIX_MISMATCH",
+            "message": "pages sample prefix differs",
+        },
+        "status": "error",
+    }
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["--unknown"],
+        ["--progress", "a", "--progress", "b"],
+        ["--progress", "a", "--before-resume", "b", "--before-resume", "c"],
+        ["--before-resume"],
+        ["--progress"],
+        ["unexpected-positional"],
+    ],
+)
+def test_cli_usage_errors_are_stdout_only(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "CLI_USAGE_ERROR"
+    assert captured.err == ""

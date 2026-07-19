@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Sequence
 
 from build_wdc200k_mm_joinability_dataset import PipelineConfig, ProgressReporter
 from wdc200k_eta import URL_TELEMETRY_SCHEMA_VERSION
@@ -118,6 +120,77 @@ def _input_identity(restored: RestoredProgress) -> dict[str, str]:
     return {"path": str(restored.path), "sha256": restored.sha256}
 
 
+def canonical_prefix_sha256(samples: Sequence[dict[str, Any]]) -> str:
+    try:
+        canonical = json.dumps(
+            list(samples),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise GateValidationError(
+            "JSON_SERIALIZATION_FAILED",
+            "unable to serialize canonical sample prefix",
+        ) from error
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _type_strict_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _type_strict_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _type_strict_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return bool(left == right)
+
+
+def _compare_resume_prefixes(
+    final: RestoredProgress,
+    before: RestoredProgress,
+) -> dict[str, dict[str, Any]]:
+    prefixes: dict[str, dict[str, Any]] = {}
+    for stage, before_telemetry in sorted(before.stage_telemetry.items()):
+        final_telemetry = final.stage_telemetry.get(stage)
+        if final_telemetry is None:
+            raise GateValidationError(
+                "PREFIX_STAGE_MISSING", f"{stage} stage is missing from final"
+            )
+        before_samples = before_telemetry["samples"]
+        final_samples = final_telemetry["samples"]
+        if len(before_samples) > len(final_samples):
+            raise GateValidationError(
+                "PREFIX_TOO_LONG",
+                f"{stage} sample prefix is longer than final",
+            )
+        final_prefix = final_samples[: len(before_samples)]
+        before_digest = canonical_prefix_sha256(before_samples)
+        final_digest = canonical_prefix_sha256(final_prefix)
+        if not all(
+            _type_strict_equal(before_sample, final_sample)
+            for before_sample, final_sample in zip(
+                before_samples, final_prefix
+            )
+        ):
+            raise GateValidationError(
+                "PREFIX_MISMATCH", f"{stage} sample prefix differs"
+            )
+        prefixes[stage] = {
+            "prefix_length": len(before_samples),
+            "before_prefix_sha256": before_digest,
+            "final_prefix_sha256": final_digest,
+            "matches": True,
+        }
+    return prefixes
+
+
 def _enumerate_stage(
     stage: str,
     telemetry: dict[str, Any],
@@ -204,15 +277,108 @@ def validate_eta_gate(
         before_resume = restore_progress_read_only(before_resume_path)
         _require_native_v2(before_resume, require_complete=False)
 
+    prefixes = (
+        {}
+        if before_resume is None
+        else _compare_resume_prefixes(progress, before_resume)
+    )
+    stages = {
+        stage: _enumerate_stage(stage, telemetry)
+        for stage, telemetry in sorted(progress.stage_telemetry.items())
+        if stage in {"pages", "images"}
+    }
+    for stage, prefix in prefixes.items():
+        if stage in stages:
+            stages[stage]["resume_prefix"] = prefix
+
     return {
         "status": "ok",
         "progress": _input_identity(progress),
         "before_resume": (
             None if before_resume is None else _input_identity(before_resume)
         ),
-        "stages": {
-            stage: _enumerate_stage(stage, telemetry)
-            for stage, telemetry in sorted(progress.stage_telemetry.items())
-            if stage in {"pages", "images"}
-        },
+        "stages": stages,
     }
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise GateValidationError("CLI_USAGE_ERROR", message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = JsonArgumentParser(
+        description="Validate immutable WDC URL ETA gate evidence."
+    )
+    parser.add_argument(
+        "--progress",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="final progress.json path (required)",
+    )
+    parser.add_argument(
+        "--before-resume",
+        action="append",
+        metavar="PATH",
+        help="optional progress-before-resume.json path",
+    )
+    return parser
+
+
+def _json_line(payload: dict[str, Any]) -> str:
+    try:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ) + "\n"
+    except (TypeError, ValueError) as error:
+        raise GateValidationError(
+            "JSON_SERIALIZATION_FAILED",
+            "unable to serialize validation result",
+        ) from error
+
+
+def _error_payload(error: GateValidationError) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "error": {"code": error.code, "message": error.message},
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+        if len(args.progress) != 1:
+            raise GateValidationError(
+                "CLI_USAGE_ERROR", "--progress must be provided exactly once"
+            )
+        before_values = args.before_resume or []
+        if len(before_values) > 1:
+            raise GateValidationError(
+                "CLI_USAGE_ERROR",
+                "--before-resume may be provided at most once",
+            )
+    except GateValidationError as error:
+        sys.stdout.write(_json_line(_error_payload(error)))
+        return 2
+
+    try:
+        result = validate_eta_gate(
+            Path(args.progress[0]),
+            Path(before_values[0]) if before_values else None,
+        )
+        output = _json_line(result)
+    except GateValidationError as error:
+        output = _json_line(_error_payload(error))
+        sys.stdout.write(output)
+        return 1
+    sys.stdout.write(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
