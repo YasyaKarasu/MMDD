@@ -532,6 +532,48 @@ class SqliteJobStore:
             connection.close()
         return [self._job_from_row(row) for row in claimed]
 
+    def release_owner_leases(self, kind: str, *, owner: str) -> int:
+        """Make unfinished leases for one kind and execution claimable."""
+        if not kind:
+            raise ValueError("job kind must not be empty")
+        if not owner:
+            raise ValueError("job lease owner must not be empty")
+        now = time.time()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM jobs
+                    WHERE kind = ? AND status = 'leased' AND owner = ?
+                    """,
+                    (kind, owner),
+                ).fetchone()[0]
+            )
+            if count:
+                self._write_tracker.before_write(4096 + count * 512)
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'retryable', owner = NULL,
+                        lease_expires = NULL, lease_id = NULL, updated_at = ?
+                    WHERE kind = ? AND status = 'leased' AND owner = ?
+                    """,
+                    (now, kind, owner),
+                )
+                if cursor.rowcount != count:
+                    raise RuntimeError("job lease release count changed")
+                self._write_tracker.before_commit(0)
+            connection.commit()
+            return count
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def finish(
         self,
         job_id: str,

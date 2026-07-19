@@ -466,6 +466,73 @@ def test_job_store_fences_same_owner_lease_generations(tmp_path: Path) -> None:
     )
 
 
+def test_job_store_releases_only_current_owner_leases_for_kind(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    for job_id in ("finished", "interrupted", "foreign"):
+        store.enqueue("image-kind", job_id, {"url": job_id})
+    store.enqueue("other-kind", "other", {"url": "other"})
+    current = store.claim(
+        "image-kind",
+        limit=2,
+        owner="current-execution",
+        lease_seconds=3600,
+    )
+    foreign = store.claim(
+        "image-kind",
+        limit=1,
+        owner="foreign-execution",
+        lease_seconds=3600,
+    )[0]
+    other_kind = store.claim(
+        "other-kind",
+        limit=1,
+        owner="current-execution",
+        lease_seconds=3600,
+    )[0]
+    store.finish(
+        current[0].job_id,
+        status="success",
+        owner="current-execution",
+        lease_id=current[0].lease_id,
+    )
+
+    assert (
+        store.release_owner_leases("image-kind", owner="current-execution")
+        == 1
+    )
+    reclaimed = store.claim(
+        "image-kind",
+        limit=1,
+        owner="resumed-execution",
+        lease_seconds=3600,
+    )
+
+    assert [job.job_id for job in reclaimed] == [current[1].job_id]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT status, owner, lease_id FROM jobs WHERE job_id = ?",
+            (current[0].job_id,),
+        ).fetchone() == ("success", None, None)
+        assert connection.execute(
+            "SELECT status, owner, lease_id FROM jobs WHERE job_id = ?",
+            (foreign.job_id,),
+        ).fetchone() == (
+            "leased",
+            "foreign-execution",
+            foreign.lease_id,
+        )
+        assert connection.execute(
+            "SELECT status, owner, lease_id FROM jobs WHERE job_id = ?",
+            (other_kind.job_id,),
+        ).fetchone() == (
+            "leased",
+            "current-execution",
+            other_kind.lease_id,
+        )
+
+
 def test_completed_shard_validation_detects_content_changes(tmp_path: Path) -> None:
     shard = AtomicJsonlShard(tmp_path / "part-00000.jsonl")
     shard.write({"id": "a"})

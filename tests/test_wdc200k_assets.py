@@ -2087,6 +2087,165 @@ def test_crash_after_image_outcome_write_repairs_job_without_download(
         ).fetchone() == (0,)
 
 
+def test_keyboard_interrupt_drains_finished_future_and_immediately_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_urls = [
+        "https://i.test/interrupt-a.jpg",
+        "https://i.test/interrupt-b.jpg",
+    ]
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", image_urls)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: image_url for image_url in image_urls},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    real_wait = assets_module.wait
+    interrupted = False
+
+    def interrupt_after_worker_finishes(fs, *, return_when):
+        nonlocal interrupted
+        completed, pending = real_wait(fs)
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("synthetic image scheduler interrupt")
+        return completed, pending
+
+    monkeypatch.setattr(assets_module, "wait", interrupt_after_worker_finishes)
+    with pytest.raises(KeyboardInterrupt, match="scheduler interrupt"):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            claim_buffer=2,
+            lease_seconds=3600,
+            url_claim_lease_seconds=3600,
+        )
+
+    assert len(transport.calls) == 1
+    with sqlite3.connect(jobs.path) as connection:
+        assert connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status"
+        ).fetchall() == [("retryable", 1), ("success", 1)]
+    with sqlite3.connect(outcomes_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_url_claims"
+        ).fetchone() == (0,)
+
+    monkeypatch.setattr(assets_module, "wait", real_wait)
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        claim_buffer=2,
+        lease_seconds=3600,
+        url_claim_lease_seconds=3600,
+    )
+
+    assert resumed.complete
+    assert sorted(transport.calls) == sorted(image_urls)
+    assert resumed.transport_attempt_summary["transport_attempts"] == 2
+    assert resumed.transport_attempt_summary["duplicate_physical_requests"] == 0
+    assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
+
+
+def test_image_commit_failure_drains_other_completed_future_without_refetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_commit_url = "https://failed.test/commit.jpg"
+    other_url = "https://other.test/commit.jpg"
+    image_urls = [failed_commit_url, other_url]
+    unique_jobs = write_unique_jobs(tmp_path / "unique.jsonl", image_urls)
+    jobs = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    transport = FakeImageTransport(
+        tmp_path,
+        {image_url: image_url for image_url in image_urls},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=2,
+        per_host_concurrency=1,
+    )
+    real_wait = assets_module.wait
+
+    def both_done_failed_commit_first(fs, *, return_when):
+        completed, pending = real_wait(fs)
+        return (
+            sorted(
+                completed,
+                key=lambda future: (
+                    future.result().outcome["image_url"]
+                    != failed_commit_url
+                ),
+            ),
+            pending,
+        )
+
+    def fail_selected_cache_callback(outcome: dict) -> None:
+        if outcome["image_url"] == failed_commit_url:
+            raise RuntimeError("selected image commit sentinel")
+
+    def fail_progress_after_completion(snapshot: UrlProgressSnapshot) -> None:
+        if snapshot.completed_durable:
+            raise ValueError("later image progress sentinel")
+
+    monkeypatch.setattr(assets_module, "wait", both_done_failed_commit_first)
+    with pytest.raises(RuntimeError, match="selected image commit sentinel"):
+        fetch_unique_images(
+            unique_jobs,
+            jobs,
+            transport,
+            policy,
+            outcomes_path=outcomes_path,
+            image_dir=tmp_path / "content",
+            claim_buffer=2,
+            lease_seconds=3600,
+            url_claim_lease_seconds=3600,
+            after_cache_write=fail_selected_cache_callback,
+            progress_callback=fail_progress_after_completion,
+            progress_callback_every=1,
+        )
+
+    fingerprint = assets_module._image_policy_fingerprint(policy)
+    outcome_store = ImageOutcomeStore(outcomes_path)
+    assert len(list(outcome_store.iter(fingerprint))) == 2
+
+    monkeypatch.setattr(assets_module, "wait", real_wait)
+    resumed = fetch_unique_images(
+        unique_jobs,
+        jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+        claim_buffer=2,
+        lease_seconds=3600,
+        url_claim_lease_seconds=3600,
+    )
+
+    assert resumed.complete
+    assert sorted(transport.calls) == sorted(image_urls)
+    assert resumed.transport_attempt_summary["duplicate_physical_requests"] == 0
+    assert resumed.transport_attempt_summary["unfinished_transport_attempts"] == 0
+
+
 def test_url_claim_crash_before_request_expires_and_reclaims(
     tmp_path: Path,
 ) -> None:
@@ -2283,6 +2442,72 @@ def test_url_claim_lease_fences_stale_owner_and_is_policy_scoped(
         lease=expired,
         now=22,
     ) is False
+
+
+def test_url_claim_release_is_execution_prefix_and_policy_scoped(
+    tmp_path: Path,
+) -> None:
+    store = ImageOutcomeStore(tmp_path / "outcomes.sqlite3")
+    owned_key = "a" * 64
+    foreign_key = "b" * 64
+    other_policy_key = "c" * 64
+    owned = store.claim_url(
+        "policy-one",
+        owned_key,
+        owner="current-execution:job:lease",
+        lease_seconds=3600,
+        now=10,
+    ).lease
+    foreign = store.claim_url(
+        "policy-one",
+        foreign_key,
+        owner="current-execution-other:job:lease",
+        lease_seconds=3600,
+        now=10,
+    ).lease
+    other_policy = store.claim_url(
+        "policy-two",
+        other_policy_key,
+        owner="current-execution:job:lease",
+        lease_seconds=3600,
+        now=10,
+    ).lease
+    assert owned is not None
+    assert foreign is not None
+    assert other_policy is not None
+
+    assert (
+        store.release_claims_by_owner_prefix(
+            "policy-one",
+            owner_prefix="current-execution:",
+        )
+        == 1
+    )
+    reclaimed = store.claim_url(
+        "policy-one",
+        owned_key,
+        owner="resumed-execution:job:lease",
+        lease_seconds=3600,
+        now=10,
+    )
+    still_foreign = store.claim_url(
+        "policy-one",
+        foreign_key,
+        owner="waiter",
+        lease_seconds=3600,
+        now=10,
+    )
+    still_other_policy = store.claim_url(
+        "policy-two",
+        other_policy_key,
+        owner="waiter",
+        lease_seconds=3600,
+        now=10,
+    )
+
+    assert reclaimed.lease is not None
+    assert still_foreign.retry_at == foreign.lease_until
+    assert still_other_policy.retry_at == other_policy.lease_until
 
 
 def test_image_outcome_put_commit_guard_rolls_back_and_resumes(
@@ -2513,10 +2738,7 @@ def test_image_finish_fence_failure_preserves_root_error_and_resumes(
     with sqlite3.connect(jobs.path) as connection:
         assert connection.execute(
             "SELECT status, COUNT(*) FROM jobs GROUP BY status"
-        ).fetchall() == [("leased", 1)]
-        connection.execute(
-            "UPDATE jobs SET lease_expires = 0 WHERE status = 'leased'"
-        )
+        ).fetchall() == [("retryable", 1)]
     if failure_mode == "sqlite":
         with sqlite3.connect(outcomes_path) as connection:
             connection.execute("DROP TRIGGER fail_image_transport_finish")
@@ -2605,8 +2827,7 @@ def test_image_mixed_completed_batch_commits_success_before_root_failure(
     with sqlite3.connect(jobs.path) as connection:
         assert connection.execute(
             "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status"
-        ).fetchall() == [("leased", 1), ("success", 1)]
-        connection.execute("UPDATE jobs SET lease_expires = 0 WHERE status='leased'")
+        ).fetchall() == [("retryable", 1), ("success", 1)]
 
     monkeypatch.setattr(ImageOutcomeStore, "finish_transport_attempt", original_finish)
     resumed_transport = FakeImageTransport(tmp_path, {failed_url: "retry"})
@@ -2836,7 +3057,7 @@ def test_image_outcome_snapshot_cleans_membership_on_connect_failure(
     assert not list(cache_dir.glob(".image-membership-*"))
 
 
-def test_live_foreign_lease_reports_incomplete_then_repairs_from_cache(
+def test_interrupted_cache_write_immediately_repairs_without_refetch(
     tmp_path: Path,
 ) -> None:
     image_url = "https://i.test/leased.jpg"
@@ -2873,25 +3094,9 @@ def test_live_foreign_lease_reports_incomplete_then_repairs_from_cache(
         outcomes_path=tmp_path / "outcomes.sqlite3",
         image_dir=tmp_path / "content",
     )
-    assert concurrent.complete is False
-    assert concurrent.leased == 1
-    assert concurrent.remaining == 1
-    assert transport.calls == [image_url]
-
-    with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            "UPDATE jobs SET lease_expires = 0 WHERE kind = ?",
-            (concurrent.job_kind,),
-        )
-    repaired = fetch_unique_images(
-        unique_jobs,
-        store,
-        transport,
-        policy,
-        outcomes_path=tmp_path / "outcomes.sqlite3",
-        image_dir=tmp_path / "content",
-    )
-    assert repaired.complete is True
+    assert concurrent.complete is True
+    assert concurrent.leased == 0
+    assert concurrent.remaining == 0
     assert transport.calls == [image_url]
 
 

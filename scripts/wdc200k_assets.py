@@ -701,6 +701,57 @@ class ImageOutcomeStore(TransportAttemptStoreMixin):
         finally:
             connection.close()
 
+    def release_claims_by_owner_prefix(
+        self,
+        policy_fingerprint: str,
+        *,
+        owner_prefix: str,
+    ) -> int:
+        """Release leased URL claims scoped to one execution owner prefix."""
+        if not policy_fingerprint:
+            raise ValueError("policy fingerprint must not be empty")
+        if not owner_prefix:
+            raise ValueError("URL claim owner prefix must not be empty")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            parameters = (
+                policy_fingerprint,
+                owner_prefix,
+                owner_prefix,
+            )
+            count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM image_url_claims
+                    WHERE policy_fingerprint = ? AND status = 'leased'
+                      AND substr(owner, 1, length(?)) = ?
+                    """,
+                    parameters,
+                ).fetchone()[0]
+            )
+            if count:
+                self._write_tracker.before_write(4096 + count * 512)
+                cursor = connection.execute(
+                    """
+                    DELETE FROM image_url_claims
+                    WHERE policy_fingerprint = ? AND status = 'leased'
+                      AND substr(owner, 1, length(?)) = ?
+                    """,
+                    parameters,
+                )
+                if cursor.rowcount != count:
+                    raise RuntimeError("image URL claim release count changed")
+                self._write_tracker.before_commit(0)
+            connection.commit()
+            return count
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def clear_claim_if_outcome(
         self,
         policy_fingerprint: str,
@@ -2358,6 +2409,7 @@ def fetch_unique_images(
     ready_hosts: deque[str] = deque()
     ready_set: set[str] = set()
     futures: dict[Future[ImageJobExecution], tuple[Any, str]] = {}
+    reported_finished: set[Future[ImageJobExecution]] = set()
     claimed_buffered = 0
     maximum_claimed = 0
     maximum_inflight = 0
@@ -2474,48 +2526,48 @@ def fetch_unique_images(
             maximum_inflight = max(maximum_inflight, len(futures))
             rotations = len(ready_hosts) or 1
 
-    with ThreadPoolExecutor(
-        max_workers=policy.global_concurrency,
-        thread_name_prefix="wdc-image",
-    ) as pool:
-        while True:
-            claimed_now = claim_more()
-            submit_ready(pool)
-            if not futures:
-                if claimed_buffered:
-                    raise RuntimeError("image scheduler made no progress")
-                if claimed_now == 0:
-                    break
+    def commit_completed_futures(
+        completed: Iterable[Future[ImageJobExecution]],
+        *,
+        raise_failures: bool,
+    ) -> None:
+        nonlocal local_durable_completed
+        completed_items = [
+            (future, *futures[future])
+            for future in completed
+            if future in futures
+        ]
+        first_error: BaseException | None = None
+        durable_completions = 0
+
+        def finish_tracking(
+            future: Future[ImageJobExecution],
+            host: str,
+        ) -> None:
+            futures.pop(future)
+            reported_finished.discard(future)
+            active_by_host[host] -= 1
+            if active_by_host[host] == 0:
+                del active_by_host[host]
+            if host_queues.get(host):
+                add_ready(host)
+            else:
+                host_queues.pop(host, None)
+                ready_set.discard(host)
+
+        for future, job, host in completed_items:
+            if future.cancelled() or future.exception() is not None:
+                finish_tracking(future, host)
+                if raise_failures and first_error is None:
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        first_error = error
                 continue
-            completed, _pending = wait(
-                tuple(futures),
-                return_when=FIRST_COMPLETED,
-            )
-            completed_items = [
-                (future, *futures[future]) for future in completed
-            ]
-            successful_items = [
-                item
-                for item in completed_items
-                if not item[0].cancelled()
-                and item[0].exception() is None
-            ]
-            failed_items = [
-                item for item in completed_items if item not in successful_items
-            ]
-            for _future, job, _host in successful_items:
+            if future not in reported_finished:
                 progress_tracker.future_finished(job.job_id)
-            for future, job, host in completed_items:
-                futures.pop(future)
-                active_by_host[host] -= 1
-                if active_by_host[host] == 0:
-                    del active_by_host[host]
-                if host_queues.get(host):
-                    add_ready(host)
-                else:
-                    host_queues.pop(host, None)
-                    ready_set.discard(host)
-            for future, job, _host in successful_items:
+                reported_finished.add(future)
+            try:
                 execution = future.result()
                 if execution.lease is None:
                     persisted = execution.outcome
@@ -2579,11 +2631,84 @@ def fetch_unique_images(
                 )
                 progress_tracker.durable_completed(job.job_id)
                 local_durable_completed += 1
-            if successful_items:
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            finish_tracking(future, host)
+            durable_completions += 1
+        if durable_completions:
+            try:
                 publish_url_progress()
-            for future, _job, _host in failed_items:
-                future.result()
-            submit_ready(pool)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def release_execution_leases() -> None:
+        job_release_error: BaseException | None = None
+        try:
+            store.release_owner_leases(kind, owner=owner)
+        except BaseException as error:
+            job_release_error = error
+        try:
+            outcome_store.release_claims_by_owner_prefix(
+                fingerprint,
+                owner_prefix=f"{owner}:",
+            )
+        except BaseException as error:
+            if job_release_error is not None:
+                raise job_release_error from error
+            raise
+        if job_release_error is not None:
+            raise job_release_error
+
+    try:
+        try:
+            with ThreadPoolExecutor(
+                max_workers=policy.global_concurrency,
+                thread_name_prefix="wdc-image",
+            ) as pool:
+                while True:
+                    claimed_now = claim_more()
+                    submit_ready(pool)
+                    if not futures:
+                        if claimed_buffered:
+                            raise RuntimeError(
+                                "image scheduler made no progress"
+                            )
+                        if claimed_now == 0:
+                            break
+                        continue
+                    completed, _pending = wait(
+                        tuple(futures),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    commit_completed_futures(
+                        completed,
+                        raise_failures=True,
+                    )
+                    submit_ready(pool)
+        except BaseException:
+            try:
+                commit_completed_futures(
+                    tuple(
+                        future for future in futures if future.done()
+                    ),
+                    raise_failures=False,
+                )
+            except BaseException:
+                pass
+            raise
+    except BaseException:
+        try:
+            release_execution_leases()
+        except BaseException:
+            pass
+        raise
+    else:
+        release_execution_leases()
 
     outcome_snapshot = outcome_store.snapshot_for_jobs(
         fingerprint,
