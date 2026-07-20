@@ -729,3 +729,185 @@ def test_sweep_counts_unlink_error_and_continues_cache_compactions(
     assert [record["cache_key"] for record in builder.iter_jsonl_records([model_cache.path])] == [
         "model-shared"
     ]
+
+
+def test_build_dataset_materializes_only_settled_replacement_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    write_entitables_file(input_dir / "tables.json", ["t0", "t1", "t2"])
+    candidate_tables = [
+        {
+            "source_table_id": table_id,
+            "page_title": table_id,
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": 0,
+                            "column_name": "Entity",
+                            "text": table_id,
+                            "wiki_title": f"Page {table_id}",
+                        }
+                    ],
+                }
+            ],
+        }
+        for table_id in ("t0", "t1", "t2")
+    ]
+
+    def fake_candidates(
+        _input_dir: Path,
+        _args: object,
+        counters: builder.SourceCandidateCounters,
+    ):
+        counters.processed_tables = 3
+        yield from candidate_tables
+
+    def fake_evaluate(
+        tables: list[dict[str, object]],
+        context: builder.CandidateEvaluationContext,
+        _args: object,
+    ) -> list[builder.CandidateEvaluation]:
+        for table in tables:
+            builder.update_entities_from_table(
+                context.entity_records, context.wiki_to_entity_id, table
+            )
+            table_id = str(table["source_table_id"])
+            entity_id = context.wiki_to_entity_id[f"Page {table_id}"]
+            asset_id = f"asset-{table_id}"
+            context.assets[asset_id] = {
+                "asset_id": asset_id,
+                "entity_id": entity_id,
+                "asset_type": "text",
+            }
+            context.entity_to_assets[entity_id] = [asset_id]
+            context.registry.register(
+                table_id,
+                builder.CandidateDependencies(
+                    entities={entity_id}, assets={asset_id}
+                ),
+            )
+        return [
+            builder.CandidateEvaluation(
+                source_table=table,
+                queryable=table["source_table_id"] != "t0",
+                decision={"reason": "candidate-only"},
+            )
+            for table in tables
+        ]
+
+    def fake_final_records(**kwargs: object):
+        source_table = kwargs["source_table"]
+        assert isinstance(source_table, dict)
+        table_id = str(source_table["source_table_id"])
+        queryable = table_id != "t0"
+        query_id = f"query-{table_id}"
+        target_id = f"target-{table_id}"
+        return (
+            [{"table_id": query_id, "source_table_id": table_id}] if queryable else [],
+            [{"table_id": target_id, "source_table_id": table_id}],
+            [
+                {
+                    "query_table_id": query_id,
+                    "candidate_table_id": target_id,
+                    "relevance": 1,
+                    "source_table_id": table_id,
+                }
+            ]
+            if queryable
+            else [],
+            {"reason": "queryable" if queryable else "failed"},
+        )
+
+    monkeypatch.setattr(builder, "iter_random_source_tables", fake_candidates)
+    monkeypatch.setattr(builder, "evaluate_candidate_batch", fake_evaluate)
+    monkeypatch.setattr(builder, "build_table_join_records", fake_final_records)
+    monkeypatch.setattr(builder, "LocalAttributeExtractor", lambda _args: None)
+
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--max_source_tables",
+            "2",
+            "--unrecoverable_replacement_rounds",
+            "1",
+            "--unrecoverable_drop_probability",
+            "1",
+            "--no_wikipedia",
+            "--no_model_progress",
+            "--records_per_shard",
+            "1",
+        ]
+    )
+
+    stats = builder.build_dataset(args)
+
+    source_rows = list(
+        builder.iter_jsonl_records(sorted((output_dir / "source_tables").glob("*.jsonl")))
+    )
+    decisions = list(
+        builder.iter_jsonl_records([output_dir / "table_queryability_decisions.jsonl"])
+    )
+    bridge_assets = list(
+        builder.iter_jsonl_records(sorted((output_dir / "bridge_assets").glob("*.jsonl")))
+    )
+    qrels = list(builder.iter_jsonl_records([output_dir / "qrels.jsonl"]))
+    splits = json.loads((output_dir / "splits.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (output_dir / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert [row["source_table_id"] for row in source_rows] == ["t2", "t1"]
+    assert {row["source_table_id"] for row in decisions} == {"t1", "t2"}
+    assert {row["asset_id"] for row in bridge_assets} == {"asset-t1", "asset-t2"}
+    assert all(row.get("source_table_id") != "t0" for row in qrels)
+    assert all(
+        "t0" not in payload.get("source_table_ids", [])
+        for payload in splits.values()
+        if isinstance(payload, dict)
+    )
+    assert manifest["artifacts"]["source_tables"]["total_records"] == len(source_rows)
+    assert sum(
+        shard["records"]
+        for shard in manifest["artifacts"]["source_tables"]["shards"]
+    ) == len(source_rows)
+    assert stats["sampling_seed"] == args.seed
+    assert stats["unrecoverable_replacement_rounds"] == 1
+    assert stats["unrecoverable_drop_probability"] == 1.0
+    assert stats["replacement_selection"] == {
+        "rounds": [
+            {
+                "round_index": 0,
+                "evaluated": 2,
+                "unrecoverable": 1,
+                "discarded": 1,
+                "retained_failed": 0,
+                "replacements": 1,
+            },
+            {
+                "round_index": 1,
+                "evaluated": 1,
+                "unrecoverable": 0,
+                "discarded": 0,
+                "retained_failed": 0,
+                "replacements": 0,
+            },
+        ],
+        "candidates_consumed": 3,
+        "candidate_exhausted": False,
+        "unfilled_slots": 0,
+    }
+    assert set(stats["cleanup"]) == set(builder.CacheCleanupStats.__dataclass_fields__)
+    assert manifest["source_sampling"] == {
+        "mode": "seeded_random_file_and_table_order",
+        "seed": args.seed,
+        "unrecoverable_replacement_rounds": 1,
+        "unrecoverable_drop_probability": 1.0,
+    }

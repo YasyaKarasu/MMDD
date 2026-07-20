@@ -22,7 +22,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -267,18 +267,28 @@ class CandidateMaterialRegistry:
                 stats.image_bytes_removed += byte_count
 
     def _compact_caches(self, stats: CacheCleanupStats) -> None:
-        compactions = (
+        compactions = []
+        if self.wikipedia_client is not None:
+            compactions.extend(
+                [
+                    (
+                        self.wikipedia_client.page_cache_path,
+                        self.wikipedia_client.page_cache.values(),
+                        "Wikipedia page",
+                    ),
+                    (
+                        self.wikipedia_client.image_cache_path,
+                        self.wikipedia_client.image_cache.values(),
+                        "Wikipedia imageinfo",
+                    ),
+                ]
+            )
+        compactions.append(
             (
-                self.wikipedia_client.page_cache_path,
-                self.wikipedia_client.page_cache.values(),
-                "Wikipedia page",
-            ),
-            (
-                self.wikipedia_client.image_cache_path,
-                self.wikipedia_client.image_cache.values(),
-                "Wikipedia imageinfo",
-            ),
-            (self.extraction_cache.path, self.extraction_cache.items.values(), "model extraction"),
+                self.extraction_cache.path,
+                self.extraction_cache.items.values(),
+                "model extraction",
+            )
         )
         for path, records, label in compactions:
             try:
@@ -323,12 +333,13 @@ class CandidateMaterialRegistry:
             ]
         self._unlink_exclusive_images(discarded, retained, removed_assets, stats)
 
-        for key in discarded.page_keys - retained.page_keys:
-            if self.wikipedia_client.page_cache.pop(key, None) is not None:
-                stats.page_records_removed += 1
-        for key in discarded.imageinfo_keys - retained.imageinfo_keys:
-            if self.wikipedia_client.image_cache.pop(key, None) is not None:
-                stats.imageinfo_records_removed += 1
+        if self.wikipedia_client is not None:
+            for key in discarded.page_keys - retained.page_keys:
+                if self.wikipedia_client.page_cache.pop(key, None) is not None:
+                    stats.page_records_removed += 1
+            for key in discarded.imageinfo_keys - retained.imageinfo_keys:
+                if self.wikipedia_client.image_cache.pop(key, None) is not None:
+                    stats.imageinfo_records_removed += 1
         with self.extraction_cache._lock:
             for key in discarded.model_keys - retained.model_keys:
                 if self.extraction_cache.items.pop(key, None) is not None:
@@ -2782,6 +2793,9 @@ def build_bridge_assets_parallel(
 
 def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     args.query_rows_per_table = configured_query_rows_per_table(args)
+    policy = replacement_policy_from_args(args)
+    if args.max_source_tables is not None and args.max_source_tables < 0:
+        raise ValueError("max source tables must be non-negative or None")
     media_config = media_policy_config_from_args(args)
     input_dir = Path(args.input_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -2810,62 +2824,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     extraction_dir = output_dir / "attribute_extractions"
     recovery_dir = output_dir / "evidence_recoveries"
 
-    entity_records: dict[str, dict[str, Any]] = {}
-    wiki_to_entity_id: dict[str, str] = {}
-    source_split_records: list[dict[str, str]] = []
-    skip_reasons: Counter[str] = Counter()
-    processed_tables = 0
-    skipped_tables = 0
-    source_table_count = 0
-
-    json_files = sorted(input_dir.rglob("*.json"))
-    logging.info("Found %d JSON files under %s", len(json_files), input_dir)
-    source_writer = ShardedJsonlWriter(source_tables_dir, records_per_shard)
-    stop = False
-    with source_writer as source_handle:
-        for json_file in iter_with_progress(json_files, "Reading EntiTables JSON"):
-            if stop:
-                break
-            payload = read_entitables_json(json_file)
-            if payload is None:
-                skipped_tables += 1
-                skip_reasons["malformed_json_file"] += 1
-                continue
-            for table_id, table_obj in payload.items():
-                if args.max_source_tables is not None and source_table_count >= args.max_source_tables:
-                    stop = True
-                    break
-                processed_tables += 1
-                result = parse_source_table(
-                    str(table_id),
-                    table_obj,
-                    json_file,
-                    input_dir,
-                    args.min_rows,
-                    args.min_cols,
-                    args.wiki_link_threshold,
-                )
-                if result.source_table is None:
-                    skipped_tables += 1
-                    skip_reasons[result.skip_reason or "unknown"] += 1
-                    continue
-                source_table = result.source_table
-                write_jsonl_record(source_handle, source_table)
-                source_table_count += 1
-                source_split_records.append(
-                    {
-                        "source_table_id": source_table["source_table_id"],
-                        "page_title": source_table.get("page_title") or "",
-                    }
-                )
-                update_entities_from_table(entity_records, wiki_to_entity_id, source_table)
-                if source_table_count % flush_every == 0:
-                    source_handle.flush()
-        source_handle.flush()
-
-    entities = finalize_entities(entity_records)
-    entities_writer = write_sharded_jsonl(entities_dir, entities, records_per_shard)
-
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
         if args.wikipedia_user_agent == DEFAULT_WIKIPEDIA_USER_AGENT:
@@ -2881,19 +2839,134 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             media_config=media_config,
             media_failure_recorder=media_failure_recorder,
         )
-    bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
-    with bridge_assets_writer:
-        entity_to_assets, api_failures, text_asset_count, image_asset_count = build_bridge_assets(
-            entities,
-            args.max_entities,
-            args.max_images_per_entity,
-            args.text_asset_chunk_chars,
-            args.min_text_asset_chunk_chars,
-            args.max_text_asset_chunks_per_entity,
-            wikipedia_client,
-            bridge_assets_writer,
-            flush_every,
+    cache = ExtractionCache(
+        cache_paths["model_attribute_extractions"],
+        reuse=not args.no_reuse_model_cache,
+    )
+    concurrency_state = ModelConcurrencyState.from_args(args)
+    progress: ModelAnalysisProgress | None = None
+    write_model_start_marker(
+        clean_text(getattr(args, "model_start_marker", "")),
+        text_task_count=0,
+        image_task_count=0,
+    )
+    wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
+    extractor: LocalAttributeExtractor | None = LocalAttributeExtractor(args)
+
+    candidate_entity_records: dict[str, dict[str, Any]] = {}
+    candidate_wiki_to_entity_id: dict[str, str] = {}
+    assets: dict[str, dict[str, Any]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    registry = CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia_client,
+        extraction_cache=cache,
+    )
+    evaluation_context = CandidateEvaluationContext(
+        entity_records=candidate_entity_records,
+        wiki_to_entity_id=candidate_wiki_to_entity_id,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia_client,
+        extractor=extractor,
+        cache=cache,
+        progress=progress,
+        concurrency_state=concurrency_state,
+        registry=registry,
+    )
+    counters = SourceCandidateCounters()
+    candidate_tables: Iterator[dict[str, Any]] = iter_random_source_tables(
+        input_dir, args, counters
+    )
+    if args.max_source_tables is None:
+        all_candidates = list(candidate_tables)
+        candidate_tables = iter(all_candidates)
+        target_count = len(all_candidates)
+    else:
+        target_count = args.max_source_tables
+    cleanup_totals = CacheCleanupStats()
+    selection_rng = random.Random(int(stable_hash("replacement", args.seed), 16))
+    try:
+        selection = run_replacement_rounds(
+            candidate_tables=candidate_tables,
+            target_count=target_count,
+            policy=policy,
+            rng=selection_rng,
+            evaluate_batch=lambda batch: evaluate_candidate_batch(
+                batch, evaluation_context, args
+            ),
+            discard_table=lambda table_id: cleanup_totals.add(
+                evaluation_context.registry.discard(table_id)
+            ),
         )
+        final_source_tables = [
+            item.source_table for item in selection.final_evaluations
+        ]
+        final_table_ids = {
+            str(source_table["source_table_id"])
+            for source_table in final_source_tables
+        }
+        cleanup_totals.add(registry.sweep(final_table_ids))
+    except BaseException:
+        if progress is not None:
+            progress.close()
+        raise
+
+    entity_records: dict[str, dict[str, Any]] = {}
+    wiki_to_entity_id: dict[str, str] = {}
+    for source_table in final_source_tables:
+        update_entities_from_table(entity_records, wiki_to_entity_id, source_table)
+    entities = finalize_entities(entity_records)
+    asset_entities = entities[: args.max_entities] if args.max_entities else entities
+    final_entity_ids = {str(entity["entity_id"]) for entity in asset_entities}
+    assets_to_remove = {
+        asset_id
+        for asset_id, asset in assets.items()
+        if str(asset.get("entity_id")) not in final_entity_ids
+    }
+    for asset_id in assets_to_remove:
+        assets.pop(asset_id, None)
+    for entity_id in list(entity_to_assets):
+        if entity_id not in final_entity_ids:
+            entity_to_assets.pop(entity_id, None)
+            continue
+        entity_to_assets[entity_id] = [
+            asset_id
+            for asset_id in entity_to_assets[entity_id]
+            if asset_id in assets
+        ]
+
+    source_split_records = [
+        {
+            "source_table_id": str(source_table["source_table_id"]),
+            "page_title": source_table.get("page_title") or "",
+        }
+        for source_table in final_source_tables
+    ]
+    source_table_count = len(final_source_tables)
+    source_writer = ShardedJsonlWriter(source_tables_dir, records_per_shard)
+    with source_writer as source_handle:
+        for source_table in final_source_tables:
+            write_jsonl_record(source_handle, source_table)
+            if source_writer.total_records % flush_every == 0:
+                source_handle.flush()
+        source_handle.flush()
+
+    entities_writer = write_sharded_jsonl(entities_dir, entities, records_per_shard)
+    bridge_assets_writer = ShardedJsonlWriter(bridge_assets_dir, records_per_shard)
+    with bridge_assets_writer as bridge_assets_handle:
+        for asset_id in sorted(assets):
+            write_jsonl_record(bridge_assets_handle, assets[asset_id])
+            if bridge_assets_writer.total_records % flush_every == 0:
+                bridge_assets_handle.flush()
+    text_asset_count = sum(
+        asset.get("asset_type") == "text" for asset in assets.values()
+    )
+    image_asset_count = sum(
+        asset.get("asset_type") == "image" for asset in assets.values()
+    )
+    api_failures = int(getattr(wikipedia_client, "api_failures", 0))
     wikimedia_media = (
         wikipedia_client.media_summary()
         if wikipedia_client is not None and hasattr(wikipedia_client, "media_summary")
@@ -2913,10 +2986,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     splits = source_splits(source_split_records, args)
     source_to_split = split_map(splits)
-    assets = load_assets(bridge_assets_writer.paths())
-    cache = ExtractionCache(cache_paths["model_attribute_extractions"], reuse=not args.no_reuse_model_cache)
-    concurrency_state = ModelConcurrencyState.from_args(args)
-    progress: ModelAnalysisProgress | None = None
     if getattr(args, "model_progress", True):
         planned_keys = estimate_model_analysis_keys(
             source_paths=source_writer.paths(),
@@ -2934,7 +3003,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     precomputed_text_task_count = 0
     precomputed_image_task_count = 0
-    extractor: LocalAttributeExtractor | None = None
     if getattr(args, "precompute_model_cache", False) or getattr(args, "precompute_text_model_cache", False):
         text_tasks = collect_extraction_tasks_from_tables(
             source_paths=source_writer.paths(),
@@ -2963,14 +3031,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             precomputed_text_task_count,
             precomputed_image_task_count,
         )
-        write_model_start_marker(
-            clean_text(getattr(args, "model_start_marker", "")),
-            text_task_count=precomputed_text_task_count,
-            image_task_count=precomputed_image_task_count,
-        )
         if pending_text_tasks or pending_image_tasks:
-            wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
-            extractor = LocalAttributeExtractor(args)
             tasks_by_kind = {"text": pending_text_tasks}
             if getattr(args, "precompute_model_cache", False):
                 tasks_by_kind["image"] = pending_image_tasks
@@ -2995,15 +3056,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                     model_kind="image",
                     task_count=0,
                 )
-    else:
-        write_model_start_marker(
-            clean_text(getattr(args, "model_start_marker", "")),
-            text_task_count=0,
-            image_task_count=0,
-        )
-        wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
-        extractor = LocalAttributeExtractor(args)
-
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)
     data_lake_writer = ShardedJsonlWriter(data_lake_tables_dir, records_per_shard)
     extraction_writer = ShardedJsonlWriter(extraction_dir, records_per_shard)
@@ -3065,9 +3117,21 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
     write_json(output_dir / "splits.json", splits)
 
+    replacement_selection = {
+        "rounds": [asdict(round_stats) for round_stats in selection.rounds],
+        "candidates_consumed": selection.candidates_consumed,
+        "candidate_exhausted": selection.candidate_exhausted,
+        "unfilled_slots": selection.unfilled_slots,
+    }
+    source_sampling = {
+        "mode": "seeded_random_file_and_table_order",
+        "seed": args.seed,
+        "unrecoverable_replacement_rounds": policy.rounds,
+        "unrecoverable_drop_probability": policy.drop_probability,
+    }
     stats = {
-        "processed_tables": processed_tables,
-        "skipped_tables": skipped_tables,
+        "processed_tables": counters.processed_tables,
+        "skipped_tables": counters.skipped_tables,
         "source_tables": source_table_count,
         "queryable_source_tables": queryable_source_tables,
         "rejected_source_tables": rejected_source_tables,
@@ -3089,7 +3153,15 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
         "query_rows_per_table": args.query_rows_per_table,
-        "skipped_reasons": dict(skip_reasons),
+        "skipped_reasons": dict(counters.skip_reasons),
+        "sampling_mode": source_sampling["mode"],
+        "sampling_seed": args.seed,
+        "unrecoverable_replacement_rounds": policy.rounds,
+        "unrecoverable_drop_probability": policy.drop_probability,
+        "random_candidates_structurally_accepted": selection.candidates_consumed,
+        "initial_slots_filled": target_count - selection.unfilled_slots,
+        "replacement_selection": replacement_selection,
+        "cleanup": asdict(cleanup_totals),
         "notes": [
             "source_tables are the fixed data-lake base pool",
             "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table aligned rows",
@@ -3125,6 +3197,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
         },
+        "source_sampling": source_sampling,
         "model_endpoints": {
             "text_model_base_url": args.text_model_base_url,
             "text_model_base_urls": getattr(args, "text_model_base_urls", None),
