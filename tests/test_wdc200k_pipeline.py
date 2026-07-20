@@ -1640,15 +1640,17 @@ def test_progress_v2_replaces_zero_progress_telemetry_when_scope_changes(
     first.publish()
 
     resumed = ProgressReporter(config)
+    new_snapshot = _url_snapshot(
+        epoch="new-sampled-scope",
+        baseline=0,
+        completed=0,
+        total=1_106_793,
+        elapsed=0.0,
+    )
+    assert new_snapshot.unobserved_nonlocal == new_snapshot.total
     resumed.update(
         stage=stage,
-        url_snapshot=_url_snapshot(
-            epoch="new-sampled-scope",
-            baseline=0,
-            completed=0,
-            total=1_106_793,
-            elapsed=0.0,
-        ),
+        url_snapshot=new_snapshot,
     )
     resumed.publish()
 
@@ -1662,6 +1664,59 @@ def test_progress_v2_replaces_zero_progress_telemetry_when_scope_changes(
         "new-sampled-scope"
     )
     ProgressReporter(config)
+
+
+@pytest.mark.parametrize(
+    "nonzero_field",
+    [
+        "local_buffered_not_started",
+        "in_flight_jobs",
+        "physical_in_flight",
+        "finished_not_durable",
+    ],
+)
+def test_progress_v2_scope_replacement_requires_empty_new_topology(
+    tmp_path: Path,
+    nonzero_field: str,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="old-empty-scope",
+            baseline=0,
+            completed=0,
+            total=10,
+            elapsed=0.0,
+        ),
+    )
+    first.publish()
+
+    snapshot = _url_snapshot(
+        epoch="new-nonempty-scope",
+        baseline=0,
+        completed=0,
+        total=5,
+        elapsed=0.0,
+    )
+    changes: dict[str, Any] = {
+        nonzero_field: 1,
+        "unobserved_nonlocal": snapshot.total - 1,
+    }
+    if nonzero_field == "physical_in_flight":
+        active = [0] * 64
+        active[0] = 1
+        changes.update(
+            in_flight_jobs=1,
+            active_censor_histogram=tuple(active),
+        )
+    nonempty = replace(snapshot, **changes)
+    assert nonempty.unobserved_nonlocal == nonempty.total - 1
+
+    resumed = ProgressReporter(config)
+    with pytest.raises(ValueError, match="baseline|progress|total|scope"):
+        resumed.update(stage="pages", url_snapshot=nonempty)
 
 
 @pytest.mark.parametrize("stage", ["pages", "images"])
@@ -1698,12 +1753,115 @@ def test_progress_v2_rejects_scope_change_after_durable_completion(
             stage=stage,
             url_snapshot=_url_snapshot(
                 epoch="new-scope",
-                baseline=1,
-                completed=1,
+                baseline=0,
+                completed=0,
                 total=5,
                 elapsed=0.0,
             ),
         )
+
+
+def test_progress_v2_completed_stage_rejects_scope_change(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="completed-scope",
+            baseline=0,
+            completed=0,
+            total=1,
+            elapsed=0.0,
+        ),
+    )
+    first.update(
+        url_snapshot=_url_snapshot(
+            epoch="completed-scope",
+            baseline=0,
+            completed=1,
+            total=1,
+            elapsed=1.0,
+        )
+    )
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    with pytest.raises(ValueError, match="already complete"):
+        resumed.update(
+            stage="pages",
+            url_snapshot=_url_snapshot(
+                epoch="changed-after-completion",
+                baseline=0,
+                completed=0,
+                total=2,
+                elapsed=0.0,
+            ),
+        )
+
+
+def test_progress_v2_active_epoch_rejects_scope_change(
+    tmp_path: Path,
+) -> None:
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="active-scope",
+            baseline=0,
+            completed=0,
+            total=10,
+            elapsed=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="total"):
+        reporter.update(
+            url_snapshot=_url_snapshot(
+                epoch="active-scope",
+                baseline=0,
+                completed=0,
+                total=5,
+                elapsed=0.0,
+            )
+        )
+
+
+def test_progress_v2_same_scope_zero_resume_preserves_old_telemetry(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = ProgressReporter(config)
+    first.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="same-scope-before-resume",
+            baseline=0,
+            completed=0,
+            total=10,
+            elapsed=0.0,
+        ),
+    )
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    resumed.update(
+        stage="pages",
+        url_snapshot=_url_snapshot(
+            epoch="same-scope-after-resume",
+            baseline=0,
+            completed=0,
+            total=10,
+            elapsed=0.0,
+        ),
+    )
+    telemetry = resumed._stage_telemetry["pages"]
+
+    assert [sample["execution_epoch"] for sample in telemetry["samples"]] == [
+        "same-scope-before-resume",
+        "same-scope-after-resume",
+    ]
 
 
 @pytest.mark.parametrize("stage", ["pages", "images"])

@@ -1055,6 +1055,11 @@ class ProgressReporter:
             and snapshot.baseline_completed
             == snapshot.completed_durable
             == 0
+            and snapshot.local_buffered_not_started == 0
+            and snapshot.in_flight_jobs == 0
+            and snapshot.physical_in_flight == 0
+            and snapshot.finished_not_durable == 0
+            and snapshot.unobserved_nonlocal == snapshot.total
             and not any(snapshot.transport_event_histogram)
             and not any(snapshot.active_censor_histogram)
             and not any(snapshot.commit_event_histogram)
