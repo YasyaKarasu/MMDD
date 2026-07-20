@@ -1621,6 +1621,92 @@ def test_progress_v2_maps_two_epochs_to_rollback_safe_logical_time(
 
 
 @pytest.mark.parametrize("stage", ["pages", "images"])
+def test_progress_v2_replaces_zero_progress_telemetry_when_scope_changes(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = ProgressReporter(config)
+    first.update(
+        stage=stage,
+        url_snapshot=_url_snapshot(
+            epoch="old-full-scope",
+            baseline=0,
+            completed=0,
+            total=27_795_316,
+            elapsed=0.0,
+        ),
+    )
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    resumed.update(
+        stage=stage,
+        url_snapshot=_url_snapshot(
+            epoch="new-sampled-scope",
+            baseline=0,
+            completed=0,
+            total=1_106_793,
+            elapsed=0.0,
+        ),
+    )
+    resumed.publish()
+
+    telemetry = json.loads(resumed.path.read_text(encoding="utf-8"))[
+        "stage_telemetry"
+    ][stage]
+    assert telemetry["completed_units"] == 0
+    assert telemetry["total_units"] == 1_106_793
+    assert len(telemetry["samples"]) == 1
+    assert telemetry["samples"][0]["execution_epoch"] == (
+        "new-sampled-scope"
+    )
+    ProgressReporter(config)
+
+
+@pytest.mark.parametrize("stage", ["pages", "images"])
+def test_progress_v2_rejects_scope_change_after_durable_completion(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = ProgressReporter(config)
+    first.update(
+        stage=stage,
+        url_snapshot=_url_snapshot(
+            epoch="old-active-scope",
+            baseline=0,
+            completed=0,
+            total=10,
+            elapsed=0.0,
+        ),
+    )
+    first.update(
+        url_snapshot=_url_snapshot(
+            epoch="old-active-scope",
+            baseline=0,
+            completed=1,
+            total=10,
+            elapsed=1.0,
+        )
+    )
+    first.publish()
+
+    resumed = ProgressReporter(config)
+    with pytest.raises(ValueError, match="baseline|total|scope"):
+        resumed.update(
+            stage=stage,
+            url_snapshot=_url_snapshot(
+                epoch="new-scope",
+                baseline=1,
+                completed=1,
+                total=5,
+                elapsed=0.0,
+            ),
+        )
+
+
+@pytest.mark.parametrize("stage", ["pages", "images"])
 def test_runner_epoch_elapsed_uses_first_callback_as_rate_and_time_origin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

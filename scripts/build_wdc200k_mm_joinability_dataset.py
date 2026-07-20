@@ -1041,6 +1041,31 @@ class ProgressReporter:
             self._state.total_units = snapshot.total
             self._state.rate_basis = rate_basis
             return
+        if (
+            telemetry is not None
+            and stage not in self._active_epochs
+            and telemetry.get("completed_at") is None
+            and snapshot.total != int(telemetry["total_units"])
+            and int(telemetry["completed_units"]) == 0
+            and all(
+                int(sample["completed_units"]) == 0
+                for sample in telemetry["samples"]
+            )
+            and snapshot.epoch_elapsed_seconds == 0.0
+            and snapshot.baseline_completed
+            == snapshot.completed_durable
+            == 0
+            and not any(snapshot.transport_event_histogram)
+            and not any(snapshot.active_censor_histogram)
+            and not any(snapshot.commit_event_histogram)
+        ):
+            # A previous run may have persisted the initial URL telemetry
+            # before its authoritative job scope was replaced (for example,
+            # full-corpus jobs superseded by sampled jobs). With no durable
+            # work in either epoch, retaining that obsolete scope is unsafe
+            # and provides no progress history worth preserving.
+            self._stage_telemetry.pop(stage)
+            telemetry = None
         samples = [] if telemetry is None else telemetry["samples"]
         v2_samples = [
             sample
