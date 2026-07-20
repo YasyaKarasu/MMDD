@@ -352,6 +352,106 @@ def test_candidate_evaluation_collects_records_without_final_shard_writes(
     assert not (output_dir / "evidence_recoveries").exists()
 
 
+def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "final")]
+    )
+    tables = [
+        {
+            "source_table_id": table_id,
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": 0,
+                            "column_name": "Entity",
+                            "text": f"Entity {table_id}",
+                            "wiki_title": page_title,
+                        }
+                    ],
+                }
+            ],
+        }
+        for table_id, page_title in (("discarded", "Page A"), ("retained", "Page B"))
+    ]
+    pages = {
+        "Page A": {
+            "wiki_title": "Page A",
+            "images": [
+                {"title": "File:Exclusive.jpg"},
+                {"title": "File:Shared.jpg"},
+            ],
+        },
+        "Page B": {
+            "wiki_title": "Page B",
+            "images": [{"title": "File:Shared.jpg"}],
+        },
+    }
+    image_cache: dict[str, dict[str, object]] = {}
+
+    def get_imageinfo(file_title: str) -> dict[str, object]:
+        record = image_cache.setdefault(file_title, {"file_title": file_title})
+        return record
+
+    wikipedia = SimpleNamespace(
+        page_cache_path=tmp_path / "cache" / "wiki_pages.jsonl",
+        image_cache_path=tmp_path / "cache" / "wiki_images.jsonl",
+        page_cache=dict(pages),
+        image_cache=image_cache,
+        get_page=pages.get,
+        get_imageinfo=get_imageinfo,
+        download_image=lambda _imageinfo, _asset_id: None,
+    )
+    cache = builder.ExtractionCache(tmp_path / "cache" / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extraction_cache=cache,
+    )
+    context = builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=SimpleNamespace(),
+        registry=registry,
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch(tables, context, args)
+
+    assert assets == {}
+    assert registry.dependencies["discarded"].imageinfo_keys == {
+        "File:Exclusive.jpg",
+        "File:Shared.jpg",
+    }
+    assert registry.dependencies["retained"].imageinfo_keys == {"File:Shared.jpg"}
+
+    stats = registry.sweep({"retained"})
+
+    assert stats.imageinfo_records_removed == 1
+    assert stats.shared_dependencies_protected >= 1
+    assert image_cache.keys() == {"File:Shared.jpg"}
+    assert [
+        record["file_title"]
+        for record in builder.iter_jsonl_records([wikipedia.image_cache_path])
+    ] == ["File:Shared.jpg"]
+
+
 def write_keyed_cache(path: Path, key_name: str, keys: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

@@ -361,7 +361,10 @@ def _candidate_entity_ids(
 
 
 def _ensure_candidate_assets(
-    entity_ids: set[str], context: CandidateEvaluationContext, args: argparse.Namespace
+    entity_ids: set[str],
+    context: CandidateEvaluationContext,
+    args: argparse.Namespace,
+    imageinfo_keys_accessed: set[str],
 ) -> None:
     entities_by_id = {
         entity["entity_id"]: entity
@@ -381,6 +384,7 @@ def _ensure_candidate_assets(
             min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
             max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
             wikipedia_client=context.wikipedia_client,
+            imageinfo_keys_accessed=imageinfo_keys_accessed,
         ):
             asset_id = str(asset["asset_id"])
             context.assets[asset_id] = asset
@@ -393,6 +397,7 @@ def _candidate_dependencies(
     context: CandidateEvaluationContext,
     extraction_records: Iterable[dict[str, Any]],
     recovery_records: Iterable[dict[str, Any]],
+    imageinfo_keys_accessed: Iterable[str] = (),
 ) -> CandidateDependencies:
     asset_ids = {
         asset_id
@@ -428,7 +433,8 @@ def _candidate_dependencies(
             normalize_title(str(context.entity_records[entity_id]["wiki_title"]))
             for entity_id in entity_ids
         },
-        imageinfo_keys={
+        imageinfo_keys={normalize_title(key) for key in imageinfo_keys_accessed}
+        | {
             normalize_title(file_title)
             for asset in referenced_assets
             if (file_title := clean_text(asset.get("metadata", {}).get("file_title")))
@@ -448,7 +454,8 @@ def evaluate_candidate_batch(
             context.entity_records, context.wiki_to_entity_id, source_table
         )
         entity_ids = _candidate_entity_ids(source_table, context.wiki_to_entity_id)
-        _ensure_candidate_assets(entity_ids, context, args)
+        imageinfo_keys_accessed: set[str] = set()
+        _ensure_candidate_assets(entity_ids, context, args, imageinfo_keys_accessed)
         extraction_writer = ListRecordWriter()
         recovery_writer = ListRecordWriter()
         query_tables, _data_lake_tables, _qrels, decision = build_table_join_records(
@@ -473,6 +480,7 @@ def evaluate_candidate_batch(
                 context=context,
                 extraction_records=extraction_writer.records,
                 recovery_records=recovery_writer.records,
+                imageinfo_keys_accessed=imageinfo_keys_accessed,
             ),
         )
         evaluations.append(
@@ -2575,6 +2583,7 @@ def build_bridge_assets_for_entity(
     min_text_asset_chunk_chars: int,
     max_text_asset_chunks_per_entity: int,
     wikipedia_client: WikipediaClient,
+    imageinfo_keys_accessed: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     page = wikipedia_client.get_page(entity["wiki_title"])
     if not page or page.get("missing"):
@@ -2628,6 +2637,8 @@ def build_bridge_assets_for_entity(
         if normalized_title in seen_images or not is_useful_image(normalized_title):
             continue
         seen_images.add(normalized_title)
+        if imageinfo_keys_accessed is not None:
+            imageinfo_keys_accessed.add(normalized_title)
         imageinfo = wikipedia_client.get_imageinfo(normalized_title)
         if not imageinfo or not imageinfo.get("url"):
             continue
