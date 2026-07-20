@@ -1475,6 +1475,19 @@ def _producer_registry_path(config: PipelineConfig, stage: str) -> Path:
     return config.work_dir / "stage_manifests" / f"pipeline-{stage}.json"
 
 
+def _has_complete_sampling_authority(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        payload.get("complete") is True
+        and isinstance(payload.get("compact_source_authority"), dict)
+    )
+
+
 @dataclass(frozen=True)
 class ProducerManifestRef:
     path: Path
@@ -2021,6 +2034,7 @@ def _validate_producer_manifest(
     path: Path,
     *,
     allow_network_shard_repair: bool = False,
+    compact_replacements: bool = False,
 ) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("complete") is not True:
@@ -2052,21 +2066,6 @@ def _validate_producer_manifest(
         if producer_stage in {"wdc200k_structural", "wdc200k_validated_selection"}
         else path.parent
     )
-    compact_replacements = False
-    if stage == "structural":
-        sampling_manifest = config.work_dir / "sampling" / "manifest.json"
-        if sampling_manifest.is_file():
-            try:
-                validate_sampling_source_authority(
-                    sampling_manifest,
-                    structural_output_root=config.work_dir / "structural",
-                )
-            except ValueError as error:
-                raise ValueError(
-                    "structural producer shard checksum mismatch: "
-                    "compact source authority"
-                ) from error
-            compact_replacements = True
     shard_fields = (
         "completed_shards",
         "entity_plan_shards",
@@ -2132,6 +2131,21 @@ def _validate_stage_registry(
     ):
         raise ValueError(f"pipeline registry identity mismatch: {path}")
     expected_telemetry_counters: dict[str, int] = {}
+    compact_replacements = False
+    if stage == "structural":
+        sampling_manifest = config.work_dir / "sampling" / "manifest.json"
+        if _has_complete_sampling_authority(sampling_manifest):
+            try:
+                validate_sampling_source_authority(
+                    sampling_manifest,
+                    structural_output_root=config.work_dir / "structural",
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "structural producer shard checksum mismatch: "
+                    "compact source authority"
+                ) from error
+            compact_replacements = True
     for reference in registry.producer_manifests:
         if not reference.path.is_file():
             raise ValueError(f"producer manifest is missing: {reference.path}")
@@ -2144,6 +2158,7 @@ def _validate_stage_registry(
             stage,
             reference.path,
             allow_network_shard_repair=allow_network_shard_repair,
+            compact_replacements=compact_replacements,
         )
         producer_payload = json.loads(
             reference.path.read_text(encoding="utf-8")
@@ -2862,7 +2877,10 @@ def _run_selection_and_structural(
 
     sampling_manifest = config.work_dir / "sampling" / "manifest.json"
     structural_registry = _producer_registry_path(config, "structural")
-    if sampling_manifest.is_file() and structural_registry.is_file():
+    if (
+        _has_complete_sampling_authority(sampling_manifest)
+        and structural_registry.is_file()
+    ):
         authority = validate_sampling_source_authority(
             sampling_manifest,
             structural_output_root=config.work_dir / "structural",

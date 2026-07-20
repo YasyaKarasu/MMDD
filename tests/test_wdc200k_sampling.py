@@ -372,6 +372,38 @@ def test_stage_resume_reuses_valid_shards_without_duplicate_writes(tmp_path: Pat
     assert len(list(iter_sampled_records(second, "sampled_entities"))) == 8
 
 
+def test_completed_resume_does_not_repeat_full_source_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _ = _structural_fixture(structural_root)
+    output_root = tmp_path / "sampling"
+    sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+    )
+    import wdc200k_sampling as sampling_module
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_validate_sampling_closure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed resume repeated full closure")
+        ),
+    )
+
+    resumed = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+    )
+    assert resumed.sampled_entities == 8
+
+
 def test_incomplete_manifest_resumes_missing_artifact_without_rewriting_completed(
     tmp_path: Path,
 ) -> None:
@@ -469,6 +501,44 @@ def test_real_commit_interruption_resumes_with_identical_bytes_and_selection(
         artifact: [path.read_bytes() for path in paths]
         for artifact, paths in resumed.artifact_paths.items()
     } == expected
+
+
+def test_authority_publish_interruption_leaves_manifest_incomplete_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _ = _structural_fixture(structural_root)
+    output_root = tmp_path / "sampling"
+    import wdc200k_sampling as sampling_module
+
+    original_publish = sampling_module._publish_compact_authority
+
+    def interrupt(*_args, **_kwargs):
+        raise RuntimeError("authority publish interrupted")
+
+    monkeypatch.setattr(sampling_module, "_publish_compact_authority", interrupt)
+    with pytest.raises(RuntimeError, match="authority publish"):
+        sample_structural_artifacts(
+            structural_output_root=structural_root,
+            structural_manifests=[manifest_path],
+            output_root=output_root,
+            policy=SamplingPolicy(),
+        )
+    assert json.loads((output_root / "manifest.json").read_text())["complete"] is False
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_publish_compact_authority",
+        original_publish,
+    )
+    resumed = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+    )
+    assert resumed.sampled_entities == 8
 
 
 def test_sampling_policy_defaults_and_rejects_budget_that_cannot_cover_tables() -> None:
@@ -687,7 +757,7 @@ def test_sampling_closure_rejects_resigned_wrong_entity_row_and_wiki(
     }
     result.manifest_path.write_text(json.dumps(payload) + "\n")
 
-    with pytest.raises(ValueError, match="source row|wiki"):
+    with pytest.raises(ValueError, match="closure"):
         sample_structural_artifacts(
             structural_output_root=structural_root,
             structural_manifests=[manifest_path],
@@ -730,7 +800,7 @@ def test_sampling_closure_rejects_resigned_wrong_entity_id(tmp_path: Path) -> No
     }
     result.manifest_path.write_text(json.dumps(payload) + "\n")
 
-    with pytest.raises(ValueError, match="entity identity"):
+    with pytest.raises(ValueError, match="closure"):
         sample_structural_artifacts(
             structural_output_root=structural_root,
             structural_manifests=[manifest_path],

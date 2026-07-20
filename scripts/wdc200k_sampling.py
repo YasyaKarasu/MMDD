@@ -399,12 +399,30 @@ def _publish_compact_authority(
     authority: dict[str, Any],
 ) -> None:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_authority = dict(authority)
+    expected_authority["closure_fingerprint"] = stable_hash(
+        SAMPLING_SCHEMA_VERSION,
+        "sampling-closure-v1",
+        json.dumps(
+            authority.get("source_table_shards") or [],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            payload.get("completed_shards") or [],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        length=40,
+    )
     existing = payload.get("compact_source_authority")
     if existing is not None:
-        if existing != authority:
+        if existing != expected_authority and existing.get(
+            "closure_fingerprint"
+        ) is not None:
             raise ValueError("sampling compact source authority conflicts")
-        return
-    payload["compact_source_authority"] = authority
+    payload["compact_source_authority"] = expected_authority
+    payload["complete"] = True
     temporary = manifest_path.with_suffix(manifest_path.suffix + ".authority.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -540,6 +558,23 @@ def validate_sampling_artifacts(
         or int(totals.get("bytes", -1)) != sum(item.bytes for item in declared)
     ):
         raise ValueError("sampling artifact declaration totals mismatch")
+    expected_closure = stable_hash(
+        SAMPLING_SCHEMA_VERSION,
+        "sampling-closure-v1",
+        json.dumps(
+            compact.get("source_table_shards") or [],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            payload.get("completed_shards") or [],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        length=40,
+    )
+    if compact.get("closure_fingerprint") != expected_closure:
+        raise ValueError("sampling closure fingerprint mismatch")
     expected_names: set[str] | None = None
     for items in grouped.values():
         names = {path.name for _completed, path in items}
@@ -764,13 +799,23 @@ def sample_structural_artifacts(
             validate_completed_shard(shard, output_root) for shard in manifest.completed_shards
         ):
             raise ValueError("completed sampling manifest failed shard validation")
+        payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+        compact = payload.get("compact_source_authority")
+        if not isinstance(compact, dict) or not clean_text(
+            compact.get("closure_fingerprint")
+        ):
+            repair_result = _result(output_root, manifest)
+            _validate_sampling_closure(
+                repair_result,
+                manifests,
+                structural_output_root,
+            )
+            _publish_compact_authority(
+                manifest.path,
+                _compact_authority_payload(manifests, structural_output_root),
+            )
         artifact_authority = validate_sampling_artifacts(manifest.path)
         completed_result = _result(output_root, manifest, artifact_authority)
-        _validate_sampling_closure(
-            completed_result,
-            manifests,
-            structural_output_root,
-        )
         validate_sampling_source_authority(
             manifest.path,
             structural_output_root=structural_output_root,
@@ -888,7 +933,6 @@ def sample_structural_artifacts(
             eligible_tables=current.eligible_tables,
             sampled_entities=current.sampled_entities,
         )
-        manifest.mark_complete()
         _publish_compact_authority(
             manifest.path,
             _compact_authority_payload(manifests, structural_output_root),

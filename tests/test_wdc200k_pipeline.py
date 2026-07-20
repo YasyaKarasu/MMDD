@@ -909,6 +909,62 @@ def test_pipeline_resume_after_sampling_does_not_require_replaced_full_shards(
     assert transport.calls == 1
 
 
+def test_pipeline_resumes_incomplete_sampling_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="sampling")
+    original_commit = pipeline_module.AtomicJsonlShard.commit
+    interrupted = False
+
+    def interrupt(self):
+        nonlocal interrupted
+        if not interrupted and self.path.parent.name == "sampled_page_refs":
+            interrupted = True
+            raise RuntimeError("sampling commit interrupted")
+        return original_commit(self)
+
+    monkeypatch.setattr(pipeline_module.AtomicJsonlShard, "commit", interrupt)
+    with pytest.raises(RuntimeError, match="sampling commit"):
+        run_pipeline(config)
+    monkeypatch.setattr(pipeline_module.AtomicJsonlShard, "commit", original_commit)
+
+    resumed = run_pipeline(config)
+
+    assert resumed.stage == "sampling"
+
+
+def test_structural_registry_validates_compact_authority_once_for_many_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="sampling")
+    run_pipeline(config)
+    registry_path = config.work_dir / "stage_manifests/pipeline-structural.json"
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    payload["producer_manifests"].append(payload["producer_manifests"][0])
+    registry_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    calls = 0
+    original = pipeline_module.validate_sampling_source_authority
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_sampling_source_authority",
+        counted,
+    )
+    pipeline_module._validate_stage_registry(
+        config,
+        "structural",
+        expected_upstream_identity=payload["upstream_identity"],
+    )
+    assert calls == 1
+
+
 def test_models_and_materialize_resume_after_full_structural_shards_removed(
     tmp_path: Path,
 ) -> None:
