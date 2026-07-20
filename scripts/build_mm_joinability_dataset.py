@@ -89,6 +89,32 @@ class ReplacementPolicy:
     drop_probability: float
 
 
+@dataclass(frozen=True)
+class CandidateEvaluation:
+    source_table: dict[str, Any]
+    queryable: bool
+    decision: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ReplacementRoundStats:
+    round_index: int
+    evaluated: int
+    unrecoverable: int
+    discarded: int
+    retained_failed: int
+    replacements: int
+
+
+@dataclass(frozen=True)
+class ReplacementSelection:
+    final_evaluations: list[CandidateEvaluation]
+    rounds: list[ReplacementRoundStats]
+    candidates_consumed: int
+    candidate_exhausted: bool
+    unfilled_slots: int
+
+
 @dataclass
 class SourceCandidateCounters:
     processed_tables: int = 0
@@ -138,6 +164,117 @@ def iter_random_source_tables(
                 counters.skip_reasons[result.skip_reason or "unknown"] += 1
                 continue
             yield result.source_table
+
+
+def run_replacement_rounds(
+    *,
+    candidate_tables: Iterator[dict[str, Any]],
+    target_count: int,
+    policy: ReplacementPolicy,
+    rng: Any,
+    evaluate_batch: Callable[[list[dict[str, Any]]], list[CandidateEvaluation]],
+    discard_table: Callable[[str], None],
+) -> ReplacementSelection:
+    if target_count < 0:
+        raise ValueError("target count must be non-negative")
+
+    slot_tables: list[dict[str, Any]] = []
+    candidate_exhausted = False
+    while len(slot_tables) < target_count:
+        try:
+            slot_tables.append(next(candidate_tables))
+        except StopIteration:
+            candidate_exhausted = True
+            break
+
+    candidates_consumed = len(slot_tables)
+    replacement_counts = [0] * len(slot_tables)
+    final_evaluations: list[CandidateEvaluation | None] = [None] * len(slot_tables)
+    pending_slots = list(range(len(slot_tables)))
+    round_stats: list[ReplacementRoundStats] = []
+    round_index = 0
+
+    while pending_slots:
+        batch = [slot_tables[slot_index] for slot_index in pending_slots]
+        evaluations = evaluate_batch(batch)
+        if len(evaluations) != len(batch):
+            raise ValueError(
+                "candidate evaluation count does not match the requested batch"
+            )
+        for source_table, evaluation in zip(batch, evaluations):
+            expected_id = source_table.get("source_table_id")
+            actual_id = evaluation.source_table.get("source_table_id")
+            if actual_id != expected_id:
+                raise ValueError(
+                    "candidate evaluation source ID does not match the requested batch"
+                )
+
+        unrecoverable = 0
+        discarded = 0
+        retained_failed = 0
+        replacements = 0
+        next_pending_slots: list[int] = []
+        for slot_index, evaluation in zip(pending_slots, evaluations):
+            if evaluation.queryable:
+                final_evaluations[slot_index] = evaluation
+                continue
+
+            unrecoverable += 1
+            if replacement_counts[slot_index] >= policy.rounds:
+                retained_failed += 1
+                final_evaluations[slot_index] = evaluation
+                continue
+
+            if rng.random() >= policy.drop_probability:
+                retained_failed += 1
+                final_evaluations[slot_index] = evaluation
+                continue
+
+            if candidate_exhausted:
+                retained_failed += 1
+                final_evaluations[slot_index] = evaluation
+                continue
+            try:
+                replacement_table = next(candidate_tables)
+            except StopIteration:
+                candidate_exhausted = True
+                retained_failed += 1
+                final_evaluations[slot_index] = evaluation
+                continue
+
+            source_table_id = str(evaluation.source_table["source_table_id"])
+            discard_table(source_table_id)
+            slot_tables[slot_index] = replacement_table
+            replacement_counts[slot_index] += 1
+            candidates_consumed += 1
+            discarded += 1
+            replacements += 1
+            next_pending_slots.append(slot_index)
+
+        round_stats.append(
+            ReplacementRoundStats(
+                round_index=round_index,
+                evaluated=len(evaluations),
+                unrecoverable=unrecoverable,
+                discarded=discarded,
+                retained_failed=retained_failed,
+                replacements=replacements,
+            )
+        )
+        pending_slots = next_pending_slots
+        round_index += 1
+
+    return ReplacementSelection(
+        final_evaluations=[
+            evaluation
+            for evaluation in final_evaluations
+            if evaluation is not None
+        ],
+        rounds=round_stats,
+        candidates_consumed=candidates_consumed,
+        candidate_exhausted=candidate_exhausted,
+        unfilled_slots=target_count - len(slot_tables),
+    )
 
 
 def resolve_shared_cache_paths(args: argparse.Namespace) -> dict[str, Path]:

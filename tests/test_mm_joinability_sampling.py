@@ -11,6 +11,36 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import build_mm_joinability_dataset as builder
 
 
+class StubRandom:
+    def __init__(self, draws: list[float]):
+        self.draws = iter(draws)
+
+    def random(self) -> float:
+        return next(self.draws)
+
+
+def replacement_tables() -> list[dict[str, str]]:
+    return [{"source_table_id": f"t{index}"} for index in range(5)]
+
+
+def evaluator_for(
+    queryability: dict[str, bool],
+):
+    def evaluate_batch(
+        tables: list[dict[str, str]],
+    ) -> list[builder.CandidateEvaluation]:
+        return [
+            builder.CandidateEvaluation(
+                source_table=table,
+                queryable=queryability[table["source_table_id"]],
+                decision={"source_table_id": table["source_table_id"]},
+            )
+            for table in tables
+        ]
+
+    return evaluate_batch
+
+
 def write_entitables_file(path: Path, table_ids: list[str]) -> None:
     payload = {
         table_id: {
@@ -104,3 +134,100 @@ def test_different_seeds_produce_different_candidate_order(
     entitables_dir: Path,
 ) -> None:
     assert candidate_ids(entitables_dir, 13) != candidate_ids(entitables_dir, 29)
+
+
+def test_queryable_table_never_draws_or_replaces() -> None:
+    tables = replacement_tables()
+    discarded: list[str] = []
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(tables),
+        target_count=1,
+        policy=builder.ReplacementPolicy(rounds=2, drop_probability=0.5),
+        rng=StubRandom([]),
+        evaluate_batch=evaluator_for({"t0": True}),
+        discard_table=discarded.append,
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t0"
+    ]
+    assert selection.rounds == [builder.ReplacementRoundStats(0, 1, 0, 0, 0, 0)]
+    assert selection.candidates_consumed == 1
+    assert selection.candidate_exhausted is False
+    assert selection.unfilled_slots == 0
+    assert discarded == []
+
+
+def test_failed_table_is_retained_when_draw_equals_probability() -> None:
+    tables = replacement_tables()
+    discarded: list[str] = []
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(tables),
+        target_count=1,
+        policy=builder.ReplacementPolicy(rounds=2, drop_probability=0.5),
+        rng=StubRandom([0.5]),
+        evaluate_batch=evaluator_for({"t0": False}),
+        discard_table=discarded.append,
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t0"
+    ]
+    assert selection.rounds == [builder.ReplacementRoundStats(0, 1, 1, 0, 1, 0)]
+    assert selection.candidates_consumed == 1
+    assert discarded == []
+
+
+def test_failed_slot_replaces_twice_then_retains_at_limit() -> None:
+    tables = replacement_tables()
+    discarded: list[str] = []
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(tables),
+        target_count=2,
+        policy=builder.ReplacementPolicy(rounds=2, drop_probability=0.5),
+        rng=StubRandom([0.1, 0.1]),
+        evaluate_batch=evaluator_for(
+            {"t0": False, "t1": True, "t2": False, "t3": False}
+        ),
+        discard_table=discarded.append,
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t3",
+        "t1",
+    ]
+    assert selection.rounds == [
+        builder.ReplacementRoundStats(0, 2, 1, 1, 0, 1),
+        builder.ReplacementRoundStats(1, 1, 1, 1, 0, 1),
+        builder.ReplacementRoundStats(2, 1, 1, 0, 1, 0),
+    ]
+    assert selection.candidates_consumed == 4
+    assert selection.candidate_exhausted is False
+    assert selection.unfilled_slots == 0
+    assert discarded == ["t0", "t2"]
+
+
+def test_exhausted_replacement_retains_failed_table_without_cleanup() -> None:
+    tables = replacement_tables()
+    discarded: list[str] = []
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(tables[:1]),
+        target_count=1,
+        policy=builder.ReplacementPolicy(rounds=2, drop_probability=1.0),
+        rng=StubRandom([0.0]),
+        evaluate_batch=evaluator_for({"t0": False}),
+        discard_table=discarded.append,
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t0"
+    ]
+    assert selection.rounds == [builder.ReplacementRoundStats(0, 1, 1, 0, 1, 0)]
+    assert selection.candidates_consumed == 1
+    assert selection.candidate_exhausted is True
+    assert selection.unfilled_slots == 0
+    assert discarded == []
