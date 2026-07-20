@@ -165,6 +165,7 @@ class CandidateEvaluationContext:
     progress: ModelAnalysisProgress | None
     concurrency_state: ModelConcurrencyState
     registry: CandidateMaterialRegistry
+    entity_imageinfo_keys: dict[str, set[str]] = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -372,7 +373,9 @@ def _ensure_candidate_assets(
         if entity["entity_id"] in entity_ids
     }
     for entity_id in entity_ids:
+        entity_imageinfo_keys = context.entity_imageinfo_keys.setdefault(entity_id, set())
         if entity_id in context.entity_to_assets:
+            imageinfo_keys_accessed.update(entity_imageinfo_keys)
             continue
         context.entity_to_assets[entity_id] = []
         if context.wikipedia_client is None:
@@ -384,11 +387,12 @@ def _ensure_candidate_assets(
             min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
             max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
             wikipedia_client=context.wikipedia_client,
-            imageinfo_keys_accessed=imageinfo_keys_accessed,
+            imageinfo_keys_accessed=entity_imageinfo_keys,
         ):
             asset_id = str(asset["asset_id"])
             context.assets[asset_id] = asset
             context.entity_to_assets[entity_id].append(asset_id)
+        imageinfo_keys_accessed.update(entity_imageinfo_keys)
 
 
 def _candidate_dependencies(
