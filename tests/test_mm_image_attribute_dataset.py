@@ -21,3 +21,23 @@ def test_take_zero_returns_no_rows():
 
     row = {"source_table_id": "table", "entity_id": "entity"}
     assert _take([row], 0, seed=1, table_cap=20, entity_cap=1) == []
+
+
+def test_public_sample_omits_asset_metadata_and_uses_sample_image_name():
+    from build_mm_image_attribute_dataset import public_sample
+
+    sample = {
+        "sample_id": "sample-1",
+        "asset_id": "asset_img_private",
+        "entity_id": "entity-1",
+        "ground_truth_value": "2008",
+    }
+
+    result = public_sample(sample, ".jpg")
+
+    assert result == {
+        "sample_id": "sample-1",
+        "entity_id": "entity-1",
+        "ground_truth_value": "2008",
+        "image_path": "images/sample-1.jpg",
+    }

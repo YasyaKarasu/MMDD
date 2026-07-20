@@ -68,6 +68,12 @@ def column_bucket(num_cols: int) -> str:
     return "2-4" if num_cols <= 4 else "5-7" if num_cols <= 7 else "8-12" if num_cols <= 12 else "13+"
 
 
+def public_sample(sample: dict[str, Any], image_suffix: str) -> dict[str, Any]:
+    record = {key: value for key, value in sample.items() if key != "asset_id"}
+    record["image_path"] = (Path("images") / f"{sample['sample_id']}{image_suffix}").as_posix()
+    return record
+
+
 def _cells(table: dict[str, Any], row_id: int) -> dict[str, str]:
     for row in table.get("rows", []):
         if row.get("row_id") == row_id:
@@ -240,14 +246,14 @@ def run(args: argparse.Namespace) -> None:
     table_map = {row["source_table_id"]: row for row in iter_manifest_records(input_dir, "source_tables") if row.get("source_table_id") in selected_table_ids}
     asset_map = {row["asset_id"]: row for row in iter_manifest_records(input_dir, "bridge_assets") if row.get("asset_id") in selected_asset_ids}
     for split, samples in by_split.items():
-        assets=[]; tables=[]; seen_assets=set(); seen_tables=set()
+        public_samples=[]; tables=[]; seen_tables=set()
         for sample in samples:
-            asset=asset_map[sample["asset_id"]]; source=Path(asset["local_path"]); suffix=source.suffix or ".img"; relative=Path("images") / f"{sample['asset_id']}{suffix}"
+            asset=asset_map[sample["asset_id"]]; source=Path(asset["local_path"]); suffix=source.suffix or ".img"; relative=Path("images") / f"{sample['sample_id']}{suffix}"
             target=temporary / relative; target.parent.mkdir(parents=True, exist_ok=True)
-            if sample["asset_id"] not in seen_assets: shutil.copy2(source, target); copied={**asset, "local_path": relative.as_posix(), "relative_path": relative.as_posix()}; assets.append(copied); seen_assets.add(sample["asset_id"])
-            sample["image_path"] = relative.as_posix()
+            shutil.copy2(source, target)
+            public_samples.append(public_sample(sample, suffix))
             if sample["source_table_id"] not in seen_tables: tables.append(table_map[sample["source_table_id"]]); seen_tables.add(sample["source_table_id"])
-        write_jsonl(temporary / "samples" / f"{split}.jsonl", samples); write_jsonl(temporary / "assets" / f"{split}.jsonl", assets); write_jsonl(temporary / "tables" / f"{split}.jsonl", tables)
+        write_jsonl(temporary / "samples" / f"{split}.jsonl", public_samples); write_jsonl(temporary / "tables" / f"{split}.jsonl", tables)
     write_json(temporary / "stats.json", {"selected": {key: len(value) for key, value in by_split.items()}, "positives": sum(x["extractable"] for x in chosen), "negatives": sum(not x["extractable"] for x in chosen), "exclusions": dict(excluded)})
     write_json(temporary / "manifest.json", {"format": "mm_image_attribute_dataset_v1", "input_dir": str(input_dir), "seed": args.seed})
     if output_dir.exists(): shutil.rmtree(output_dir)
