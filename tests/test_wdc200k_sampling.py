@@ -17,6 +17,7 @@ from wdc200k_sampling import (
     iter_sampled_records,
     sample_structural_artifacts,
     sample_table_entities,
+    validate_sampling_source_authority,
 )
 import build_wdc200k_mm_joinability_dataset as pipeline
 
@@ -226,6 +227,12 @@ def _structural_fixture(root: Path) -> tuple[Path, dict[str, Any]]:
         _write_shard(root, "entities/part-00000.jsonl", entities),
         _write_shard(root, "page_refs/part-00000.jsonl", pages),
         _write_shard(root, "direct_image_refs/part-00000.jsonl", images),
+        _write_shard(root, "structural_failures/part-00000.jsonl", []),
+        _write_shard(
+            root,
+            "selection/validated-00000.jsonl",
+            [{"source_table_id": "table-1", "rows": 8}],
+        ),
     ]
     manifest = StageManifest(
         root / "structural-00000.json",
@@ -344,6 +351,143 @@ def test_sampling_policy_defaults_and_rejects_budget_that_cannot_cover_tables() 
     assert policy.min_rows_per_output_table == 2
     with pytest.raises(ValueError, match="global entity budget"):
         SamplingPolicy(global_entity_budget=15).validate_budget(eligible_tables=2)
+
+
+def test_prefilter_uses_canonical_entity_column_choice() -> None:
+    source = _source(rows=5)
+    source["metadata"]["candidate_entity_columns"] = [1, 0]
+    source["metadata"]["column_profiles"][0]["wiki_link_ratio"] = 1.0
+    source["metadata"]["column_profiles"][1]["wiki_link_ratio"] = 0.0
+    source["metadata"]["column_profiles"][1]["non_empty_ratio"] = 0.0
+    for row in source["rows"]:
+        row["cells"][1]["text"] = ""
+    pages = [_page(f"entity-{index}") for index in range(5)]
+
+    sampled, decision = _sample(source, pages=pages, images=[])
+
+    assert decision["eligible"] is True
+    assert len(sampled) == 5
+
+
+def test_prefilter_rejects_urls_rejected_by_structural_normalizer() -> None:
+    malformed = [
+        {
+            **_page(f"entity-{index}"),
+            "page_url": "https://[",
+        }
+        for index in range(5)
+    ]
+
+    sampled, decision = _sample(_source(rows=5), pages=malformed, images=[])
+
+    assert sampled == []
+    assert decision["reason"] == "insufficient_material_support_for_candidate"
+
+
+def test_global_budget_uses_actual_sampled_count(tmp_path: Path) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _source_record = _structural_fixture(structural_root)
+
+    result = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=tmp_path / "sampling",
+        policy=SamplingPolicy(
+            sampled_entities_per_table=10,
+            global_entity_budget=8,
+        ),
+    )
+
+    assert result.sampled_entities == 8
+
+
+def test_insufficient_global_budget_reports_shortfall_and_stays_incomplete(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _source_record = _structural_fixture(structural_root)
+    output_root = tmp_path / "sampling"
+
+    with pytest.raises(
+        ValueError,
+        match=r"budget=7, required=8, shortfall=1",
+    ):
+        sample_structural_artifacts(
+            structural_output_root=structural_root,
+            structural_manifests=[manifest_path],
+            output_root=output_root,
+            policy=SamplingPolicy(global_entity_budget=7),
+        )
+
+    payload = json.loads((output_root / "manifest.json").read_text())
+    assert payload["complete"] is False
+
+
+def test_completed_sampling_rejects_cross_artifact_closure_violation(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _source_record = _structural_fixture(structural_root)
+    output_root = tmp_path / "sampling"
+    result = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+    )
+    page_path = result.artifact_paths["sampled_page_refs"][0]
+    records = [json.loads(line) for line in page_path.read_text().splitlines()]
+    records[0]["entity_id"] = "not-sampled"
+    writer = AtomicJsonlShard(page_path)
+    for record in records:
+        writer.write(record)
+    completed = writer.commit()
+    payload = json.loads(result.manifest_path.read_text())
+    declared = next(
+        item
+        for item in payload["completed_shards"]
+        if item["path"].startswith("sampled_page_refs/")
+    )
+    declared.update(
+        records=completed.records,
+        bytes=completed.bytes,
+        sha256=completed.sha256,
+    )
+    result.manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    with pytest.raises(ValueError, match="closure"):
+        sample_structural_artifacts(
+            structural_output_root=structural_root,
+            structural_manifests=[manifest_path],
+            output_root=output_root,
+            policy=SamplingPolicy(),
+        )
+
+
+def test_compact_authority_survives_removed_full_entity_and_reference_shards(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _source_record = _structural_fixture(structural_root)
+    result = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=tmp_path / "sampling",
+        policy=SamplingPolicy(),
+    )
+    for directory in ("entities", "page_refs", "direct_image_refs"):
+        for path in (structural_root / directory).glob("*.jsonl"):
+            path.unlink()
+
+    authority = validate_sampling_source_authority(
+        result.manifest_path,
+        structural_output_root=structural_root,
+    )
+
+    assert authority.source_tables == (
+        structural_root / "source_tables/part-00000.jsonl",
+    )
+    assert authority.source_tables_count == 1
 
 
 def test_pipeline_cli_exposes_sampling_defaults(tmp_path: Path) -> None:

@@ -134,6 +134,7 @@ def test_every_entity_uses_direct_first_then_page_images() -> None:
         "https://i.test/direct.jpg",
         "https://i.test/a.jpg",
         "https://i.test/b.jpg",
+        "https://i.test/c.jpg",
     ]
     assert plan.page_was_required is True
 
@@ -232,6 +233,54 @@ def test_successful_direct_image_never_disables_page_assets() -> None:
         "image",
         "image",
     ]
+
+
+def test_direct_failure_does_not_consume_page_image_success_quota() -> None:
+    direct = "https://i.test/direct.jpg"
+    page_images = [f"https://i.test/page-{index}.jpg" for index in range(3)]
+    result = materialize_entity_assets(
+        entity(image_urls=[direct]),
+        page(image_urls=page_images),
+        image_outcomes={
+            direct: image_outcome(direct, status="terminal"),
+            **{
+                url: image_outcome(url, sha256=f"page-{index}")
+                for index, url in enumerate(page_images)
+            },
+        },
+        budget=ImageBudget(attempts_per_entity=3, retained_per_entity=3),
+    )
+
+    images = [
+        asset for asset in result.bridge_assets if asset["asset_type"] == "image"
+    ]
+    assert [asset["image_url"] for asset in images] == page_images
+
+
+def test_one_direct_success_keeps_page_text_and_two_remaining_page_images() -> None:
+    direct = "https://i.test/direct.jpg"
+    page_images = [f"https://i.test/page-{index}.jpg" for index in range(3)]
+    result = materialize_entity_assets(
+        entity(image_urls=[direct]),
+        page(
+            text="e1 page text remains available after a direct image succeeds.",
+            image_urls=page_images,
+        ),
+        image_outcomes={
+            direct: image_outcome(direct, sha256="direct"),
+            **{
+                url: image_outcome(url, sha256=f"page-{index}")
+                for index, url in enumerate(page_images)
+            },
+        },
+        budget=ImageBudget(attempts_per_entity=3, retained_per_entity=3),
+    )
+
+    images = [
+        asset for asset in result.bridge_assets if asset["asset_type"] == "image"
+    ]
+    assert any(asset["asset_type"] == "text" for asset in result.bridge_assets)
+    assert [asset["image_url"] for asset in images] == [direct, *page_images[:2]]
 
 
 def image_outcome(

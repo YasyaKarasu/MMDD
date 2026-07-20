@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from wdc200k_io import (
     StageManifest,
     validate_completed_shard,
 )
+from wdc200k_structural import _normalize_http_url
 
 
 SAMPLING_SCHEMA_VERSION = "wdc200k-entity-sampling-v1"
@@ -58,12 +60,23 @@ class SamplingPolicy:
         if self.global_entity_budget is not None and self.global_entity_budget < 0:
             raise ValueError("global_entity_budget must be non-negative")
 
-    def validate_budget(self, *, eligible_tables: int) -> None:
-        required = eligible_tables * self.sampled_entities_per_table
+    def validate_budget(
+        self,
+        *,
+        eligible_tables: int,
+        sampled_entities: int | None = None,
+    ) -> None:
+        required = (
+            eligible_tables * self.sampled_entities_per_table
+            if sampled_entities is None
+            else sampled_entities
+        )
         if self.global_entity_budget is not None and self.global_entity_budget < required:
+            shortfall = required - self.global_entity_budget
             raise ValueError(
                 "global entity budget cannot cover every eligible table: "
-                f"budget={self.global_entity_budget}, required={required}"
+                f"budget={self.global_entity_budget}, required={required}, "
+                f"shortfall={shortfall}"
             )
 
 
@@ -78,6 +91,14 @@ class SamplingResult:
     sampled_page_refs: int
     sampled_direct_image_refs: int
     strata: dict[str, int]
+
+
+@dataclass(frozen=True)
+class SamplingSourceAuthority:
+    source_tables: tuple[Path, ...]
+    source_tables_count: int
+    structural_manifests: tuple[Path, ...]
+    structural_manifest_sha256: tuple[str, ...]
 
 
 def _sha256_path(path: Path) -> str:
@@ -99,8 +120,7 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
 
 
 def _http_url(record: Mapping[str, Any], field: str) -> bool:
-    value = clean_text(record.get(field)).casefold()
-    return value.startswith("http://") or value.startswith("https://")
+    return _normalize_http_url(record.get(field)) is not None
 
 
 def _appearance(entity: Mapping[str, Any]) -> tuple[str, Any]:
@@ -152,11 +172,10 @@ def sample_table_entities(
     if int(source_table.get("num_cols", 0)) < 3:
         decision["reason"] = "fewer_than_three_columns"
         return [], decision
-    entity_columns = source_table.get("metadata", {}).get("candidate_entity_columns") or []
-    if not entity_columns:
+    entity_column = join_builder.choose_entity_column(dict(source_table))
+    if entity_column is None:
         decision["reason"] = "missing_entity_column"
         return [], decision
-    entity_column = int(entity_columns[0])
     cells = _cells_by_index(source_table)
     non_empty_entity_rows = {
         row_id for row_id, values in cells.items() if clean_text(values.get(entity_column))
@@ -290,9 +309,14 @@ def sample_table_entities(
 
 def _manifest_artifacts(manifest_path: Path, root: Path) -> dict[str, Path]:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if payload.get("complete") is not True:
+    if (
+        payload.get("stage") != "wdc200k_structural"
+        or payload.get("schema_version") != "wdc200k-structural-v2"
+        or payload.get("complete") is not True
+    ):
         raise ValueError(f"structural manifest is incomplete: {manifest_path}")
     result: dict[str, Path] = {}
+    seen_artifacts: list[str] = []
     for raw in payload.get("completed_shards") or []:
         completed = CompletedShard(
             path=str(raw["path"]),
@@ -301,21 +325,139 @@ def _manifest_artifacts(manifest_path: Path, root: Path) -> dict[str, Path]:
             sha256=str(raw["sha256"]),
         )
         path = (root / completed.path).resolve()
-        if (
-            not path.is_relative_to(root.resolve())
-            or not path.is_file()
-            or path.stat().st_size != completed.bytes
+        if not path.is_relative_to(root.resolve()) or not validate_completed_shard(
+            completed, root
         ):
-            raise ValueError(f"structural shard metadata failed: {completed.path}")
+            raise ValueError(f"structural shard checksum failed: {completed.path}")
         prefix = completed.path.split("/", 1)[0]
+        artifact = (
+            "validated_selection"
+            if completed.path.startswith("selection/validated-")
+            else prefix
+        )
+        seen_artifacts.append(artifact)
         if prefix in {"source_tables", "entities", "page_refs", "direct_image_refs"}:
             if prefix in result:
                 raise ValueError(f"duplicate structural artifact {prefix}")
             result[prefix] = path
-    required = {"source_tables", "entities", "page_refs", "direct_image_refs"}
-    if set(result) != required:
+    required_inputs = {"source_tables", "entities", "page_refs", "direct_image_refs"}
+    exact_artifacts = required_inputs | {
+        "structural_failures",
+        "validated_selection",
+    }
+    if set(result) != required_inputs or set(seen_artifacts) != exact_artifacts or len(
+        seen_artifacts
+    ) != len(exact_artifacts):
         raise ValueError("structural manifest is missing sampling inputs")
     return result
+
+
+def _compact_authority_payload(
+    structural_manifests: Sequence[Path],
+    structural_output_root: Path,
+) -> dict[str, Any]:
+    source_shards: list[dict[str, Any]] = []
+    manifest_records: list[dict[str, Any]] = []
+    for manifest_path in structural_manifests:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sources = [
+            item
+            for item in payload.get("completed_shards") or []
+            if str(item.get("path", "")).startswith("source_tables/")
+        ]
+        if len(sources) != 1:
+            raise ValueError("sampling source authority has invalid source set")
+        source_shards.append(dict(sources[0]))
+        manifest_records.append(
+            {
+                "path": manifest_path.resolve().as_posix(),
+                "sha256": _sha256_path(manifest_path),
+                "stage": payload.get("stage"),
+                "schema_version": payload.get("schema_version"),
+                "input_fingerprint": payload.get("input_fingerprint"),
+                "parameter_fingerprint": payload.get("parameter_fingerprint"),
+            }
+        )
+    return {
+        "schema_version": "wdc200k-compact-source-authority-v1",
+        "structural_output_root": structural_output_root.resolve().as_posix(),
+        "structural_manifests": manifest_records,
+        "source_table_shards": source_shards,
+        "source_tables": sum(int(item["records"]) for item in source_shards),
+    }
+
+
+def _publish_compact_authority(
+    manifest_path: Path,
+    authority: dict[str, Any],
+) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    existing = payload.get("compact_source_authority")
+    if existing is not None:
+        if existing != authority:
+            raise ValueError("sampling compact source authority conflicts")
+        return
+    payload["compact_source_authority"] = authority
+    temporary = manifest_path.with_suffix(manifest_path.suffix + ".authority.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(manifest_path)
+
+
+def validate_sampling_source_authority(
+    sampling_manifest: Path,
+    *,
+    structural_output_root: Path,
+) -> SamplingSourceAuthority:
+    payload = json.loads(Path(sampling_manifest).read_text(encoding="utf-8"))
+    authority = payload.get("compact_source_authority")
+    if (
+        payload.get("stage") != "wdc200k_entity_sampling"
+        or payload.get("schema_version") != SAMPLING_SCHEMA_VERSION
+        or payload.get("complete") is not True
+        or not isinstance(authority, dict)
+        or authority.get("schema_version")
+        != "wdc200k-compact-source-authority-v1"
+    ):
+        raise ValueError("sampling compact source authority is invalid")
+    root = Path(structural_output_root).resolve()
+    if authority.get("structural_output_root") != root.as_posix():
+        raise ValueError("sampling compact source root mismatch")
+    source_paths: list[Path] = []
+    total = 0
+    for raw in authority.get("source_table_shards") or []:
+        completed = CompletedShard(
+            path=str(raw["path"]),
+            records=int(raw["records"]),
+            bytes=int(raw["bytes"]),
+            sha256=str(raw["sha256"]),
+        )
+        if not completed.path.startswith("source_tables/") or not validate_completed_shard(
+            completed, root
+        ):
+            raise ValueError("sampling compact source shard validation failed")
+        source_paths.append(root / completed.path)
+        total += completed.records
+    if not source_paths or total != int(authority.get("source_tables", -1)):
+        raise ValueError("sampling compact source count mismatch")
+    manifest_records = authority.get("structural_manifests") or []
+    manifests = tuple(
+        Path(str(item["path"]))
+        for item in manifest_records
+    )
+    if len(manifests) != len(source_paths):
+        raise ValueError("sampling compact source manifest count mismatch")
+    return SamplingSourceAuthority(
+        source_tables=tuple(source_paths),
+        source_tables_count=total,
+        structural_manifests=manifests,
+        structural_manifest_sha256=tuple(
+            str(item["sha256"]) for item in manifest_records
+        ),
+    )
 
 
 def _relative_completed(completed: CompletedShard, path: Path, root: Path) -> CompletedShard:
@@ -375,6 +517,62 @@ def _result(root: Path, manifest: StageManifest) -> SamplingResult:
     )
 
 
+def _source_record_count(manifest_path: Path) -> int:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sources = [
+        item
+        for item in payload.get("completed_shards") or []
+        if str(item.get("path", "")).startswith("source_tables/")
+    ]
+    if len(sources) != 1:
+        raise ValueError("sampling closure source authority is invalid")
+    return int(sources[0]["records"])
+
+
+def _validate_sampling_closure(
+    result: SamplingResult,
+    structural_manifests: Sequence[Path],
+) -> None:
+    expected_shards = len(structural_manifests)
+    if any(
+        len(result.artifact_paths[artifact]) != expected_shards
+        for artifact in ARTIFACTS
+    ):
+        raise ValueError("sampling closure artifact shard set is incomplete")
+    for index, structural_manifest in enumerate(structural_manifests):
+        entities = list(
+            _iter_jsonl(result.artifact_paths["sampled_entities"][index])
+        )
+        decisions = list(
+            _iter_jsonl(result.artifact_paths["prefilter_tables"][index])
+        )
+        if len(decisions) != _source_record_count(structural_manifest):
+            raise ValueError("sampling closure prefilter/source count mismatch")
+        sampled_ids: dict[str, str] = {}
+        sampled_by_table: dict[str, int] = defaultdict(int)
+        for entity in entities:
+            entity_id = str(entity["entity_id"])
+            table_id = str(entity["source_table_id"])
+            if entity_id in sampled_ids:
+                raise ValueError("sampling closure has duplicate sampled entity")
+            sampled_ids[entity_id] = table_id
+            sampled_by_table[table_id] += 1
+        decision_ids: set[str] = set()
+        for decision in decisions:
+            table_id = str(decision["source_table_id"])
+            if table_id in decision_ids:
+                raise ValueError("sampling closure has duplicate table decision")
+            decision_ids.add(table_id)
+            if int(decision["sampled_entities"]) != sampled_by_table.get(table_id, 0):
+                raise ValueError("sampling closure decision/entity count mismatch")
+        for artifact in ("sampled_page_refs", "sampled_direct_image_refs"):
+            for reference in _iter_jsonl(result.artifact_paths[artifact][index]):
+                entity_id = str(reference["entity_id"])
+                table_id = str(reference["source_table_id"])
+                if sampled_ids.get(entity_id) != table_id:
+                    raise ValueError("sampling closure reference is not sampled")
+
+
 def sample_structural_artifacts(
     *,
     structural_output_root: Path,
@@ -409,7 +607,13 @@ def sample_structural_artifacts(
             validate_completed_shard(shard, output_root) for shard in manifest.completed_shards
         ):
             raise ValueError("completed sampling manifest failed shard validation")
-        return _result(output_root, manifest)
+        completed_result = _result(output_root, manifest)
+        _validate_sampling_closure(completed_result, manifests)
+        validate_sampling_source_authority(
+            manifest.path,
+            structural_output_root=structural_output_root,
+        )
+        return completed_result
     try:
         for index, structural_manifest in enumerate(manifests):
             expected_relatives = {
@@ -517,8 +721,16 @@ def sample_structural_artifacts(
                     writer.abort()
                 raise
         current = _result(output_root, manifest)
-        policy.validate_budget(eligible_tables=current.eligible_tables)
+        _validate_sampling_closure(current, manifests)
+        policy.validate_budget(
+            eligible_tables=current.eligible_tables,
+            sampled_entities=current.sampled_entities,
+        )
         manifest.mark_complete()
+        _publish_compact_authority(
+            manifest.path,
+            _compact_authority_payload(manifests, structural_output_root),
+        )
     except BaseException:
         raise
     return _result(output_root, manifest)

@@ -66,6 +66,7 @@ from wdc200k_structural import (
     finalize_validated_selection,
 )
 from stage1_io import iter_manifest_records, load_split_map
+from stage1_io import stable_hash
 
 
 class _MemoryCache:
@@ -113,6 +114,32 @@ class _RecordSink:
 
     def write_record(self, record: dict[str, Any]) -> None:
         self.records.append(record)
+
+
+def test_unsampled_source_rows_receive_stable_derived_entity_identity(
+    tmp_path: Path,
+) -> None:
+    source = _source_table()
+    sampled = _entities()[:1]
+    entity_path = tmp_path / "sampled_entities.jsonl"
+    writer = AtomicJsonlShard(entity_path)
+    writer.write(sampled[0])
+    writer.commit()
+    database = tmp_path / "index.sqlite3"
+    materializer._initialize_index(database)
+    with materializer._connect(database) as connection:
+        materializer._index_entities(connection, [entity_path])
+        connection.commit()
+
+    entities, _assets, _links, _extractions, wiki_to_entity = (
+        materializer._table_inputs(database, source)
+    )
+
+    unsampled_title = source["rows"][1]["cells"][0]["wiki_title"]
+    assert len(entities) == 1
+    assert wiki_to_entity[unsampled_title] == (
+        "ent_" + stable_hash(unsampled_title, length=16)
+    )
 
 
 def _args(tmp_path: Path) -> argparse.Namespace:

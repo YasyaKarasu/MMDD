@@ -100,7 +100,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-ASSET_PLANNING_SCHEMA_VERSION = "wdc200k-asset-planning-v1"
+ASSET_PLANNING_SCHEMA_VERSION = "wdc200k-asset-planning-v2"
 UNIQUE_IMAGE_JOB_SCHEMA_VERSION = "wdc200k-unique-image-jobs-v1"
 ASSET_MATERIALIZATION_SCHEMA_VERSION = "wdc200k-asset-materialization-v1"
 
@@ -1297,6 +1297,7 @@ def plan_entity_assets(
     seen: set[str] = set()
     references: list[ImageReference] = []
     for candidates, source in candidate_groups:
+        group_attempts = 0
         for candidate in candidates:
             normalized = _normalize_http_url(candidate)
             if normalized is None or normalized in seen:
@@ -1316,11 +1317,9 @@ def plan_entity_assets(
                     page_url=page_url,
                 )
             )
-            if len(references) >= budget.attempts_per_entity:
-                return EntityAssetPlan(
-                    entity_id=entity_id,
-                    image_refs=tuple(references),
-                )
+            group_attempts += 1
+            if group_attempts >= budget.attempts_per_entity:
+                break
     return EntityAssetPlan(
         entity_id=entity_id,
         image_refs=tuple(references),

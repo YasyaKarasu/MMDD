@@ -70,7 +70,12 @@ def _statistics_archive(input_dir: Path, *, rows: int = 2) -> Path:
     return archive
 
 
-def _write_selected_table(input_dir: Path, *, rows_count: int = 2) -> None:
+def _write_selected_table(
+    input_dir: Path,
+    *,
+    rows_count: int = 2,
+    material_rows: int | None = None,
+) -> None:
     path = (
         input_dir
         / "Thing"
@@ -109,6 +114,11 @@ def _write_selected_table(input_dir: Path, *, rows_count: int = 2) -> None:
             ("Epsilon", "Iowa"),
         )[: max(0, rows_count - 2)]
     )
+    if material_rows is not None:
+        for index, row in enumerate(rows):
+            if index >= material_rows:
+                row["page_url"] = ""
+                row["image"] = ""
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
@@ -462,7 +472,7 @@ def test_stop_after_structural_emits_exact_counts_without_network(
     assert result.counters["unique_page_urls"] == 1
     assert result.counters["direct_image_references"] == 3
     assert result.counters["page_request_upper_bound"] == 1
-    assert result.counters["image_request_upper_bound"] == 6
+    assert result.counters["image_request_upper_bound"] == 12
     progress = json.loads(
         (config.work_dir / "progress.json").read_text(encoding="utf-8")
     )
@@ -644,10 +654,18 @@ class _PipelineExtractor:
         }
 
 
-def _full_pipeline_config(tmp_path: Path) -> PipelineConfig:
+def _full_pipeline_config(
+    tmp_path: Path,
+    *,
+    material_rows: int = 5,
+) -> PipelineConfig:
     input_dir = tmp_path / "input"
     _statistics_archive(input_dir, rows=5)
-    _write_selected_table(input_dir, rows_count=5)
+    _write_selected_table(
+        input_dir,
+        rows_count=5,
+        material_rows=material_rows,
+    )
     return PipelineConfig.from_args(
         parse_args(
             [
@@ -870,6 +888,71 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
                     "registry_counters",
                 )
             }
+
+
+def test_pipeline_resume_after_sampling_does_not_require_replaced_full_shards(
+    tmp_path: Path,
+) -> None:
+    initial = replace(_full_pipeline_config(tmp_path), stop_after="sampling")
+    assert run_pipeline(initial).stage == "sampling"
+    for directory in ("entities", "page_refs", "direct_image_refs"):
+        for path in (initial.work_dir / "structural" / directory).glob("*.jsonl"):
+            path.unlink()
+
+    transport = _PipelinePageTransport()
+    resumed = run_pipeline(
+        replace(initial, stop_after="pages", from_stage="pages"),
+        page_transport=transport,
+    )
+
+    assert resumed.stage == "pages"
+    assert transport.calls == 1
+
+
+def test_models_and_materialize_resume_after_full_structural_shards_removed(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+        extractor=_PipelineExtractor(),
+    )
+    for directory in ("entities", "page_refs", "direct_image_refs"):
+        for path in (config.work_dir / "structural" / directory).glob("*.jsonl"):
+            path.unlink()
+
+    resumed = run_pipeline(
+        replace(config, from_stage="models"),
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+        extractor=_PipelineExtractor(),
+    )
+
+    assert resumed.status == "complete"
+    assert resumed.counters["unique_wiki_entities"] == 5
+
+
+def test_prefilter_rejected_table_still_materializes_as_complete_raw_table(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path, material_rows=2)
+
+    result = run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+        extractor=_PipelineExtractor(),
+    )
+
+    assert result.status == "complete"
+    assert result.counters["prefilter_rejected_tables"] == 1
+    assert result.counters["source_tables"] == 1
+    assert result.counters["data_lake_tables"] == 1
+    source_path = next((config.output_dir / "source_tables").glob("*.jsonl"))
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    assert len(source["rows"]) == 5
 
 
 def test_resume_rejects_tampered_page_attempt_authority(

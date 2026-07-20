@@ -3149,7 +3149,9 @@ def _strict_asset_manifest(
         _completed_from_payload(item)
         for item in payload.get("table_asset_link_shards", [])
     ]
-    if not link_shards:
+    if not link_shards and barrier.table_asset_links != 0:
+        raise ValueError("Task-5 manifest is missing required shards")
+    if not asset_shards and barrier.bridge_assets != 0:
         raise ValueError("Task-5 manifest is missing required shards")
     if not all(
         validate_completed_shard(shard, root)
@@ -3189,6 +3191,7 @@ def adapt_model_tasks_from_manifests(
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be positive")
     import wdc200k_structural as structural
+    from wdc200k_sampling import validate_sampling_source_authority
 
     structural_output_root = Path(structural_output_root)
     structural_paths = sorted(Path(path) for path in structural_manifests)
@@ -3215,6 +3218,14 @@ def adapt_model_tasks_from_manifests(
     validated_selection_paths: list[Path] = []
     table_count = 0
     manifest_hashes: list[tuple[Path, str]] = []
+    compact_authority = (
+        validate_sampling_source_authority(
+            Path(sampling_manifest),
+            structural_output_root=structural_output_root,
+        )
+        if sampling_manifest is not None
+        else None
+    )
     for manifest_path in structural_paths:
         manifest_key = manifest_path.resolve().as_posix()
         actual_manifest_sha256 = _sha256_path(manifest_path)
@@ -3234,14 +3245,25 @@ def adapt_model_tasks_from_manifests(
             != structural_barrier.parameter_fingerprints[manifest_key]
         ):
             raise ValueError("structural barrier fingerprint mismatch")
-        validated, records, manifest_hash = (
-            structural._validated_shard_from_manifest(
-                manifest_path,
-                output_root=structural_output_root,
+        if compact_authority is None:
+            validated, records, manifest_hash = (
+                structural._validated_shard_from_manifest(
+                    manifest_path,
+                    output_root=structural_output_root,
+                )
             )
-        )
-        validated_selection_paths.append(validated)
-        table_count += records
+            validated_selection_paths.append(validated)
+            table_count += records
+        else:
+            manifest_hash = actual_manifest_sha256
+            source_shards = [
+                item
+                for item in manifest_payload["completed_shards"]
+                if str(item["path"]).startswith("source_tables/")
+            ]
+            if len(source_shards) != 1:
+                raise ValueError("compact structural source set mismatch")
+            table_count += int(source_shards[0]["records"])
         manifest_hashes.append(
             (manifest_path.resolve(), manifest_hash)
         )
@@ -3265,6 +3287,8 @@ def adapt_model_tasks_from_manifests(
         entity_paths = sorted(Path(path) for path in sampled_entity_paths)
         if not entity_paths or any(not path.is_file() for path in entity_paths):
             raise ValueError("sampled entity paths are missing")
+    if compact_authority is not None:
+        source_paths = list(compact_authority.source_tables)
 
     final_path = Path(finalized_selection_manifest)
     final_payload = _validated_complete_manifest(final_path)
@@ -3313,25 +3337,26 @@ def adapt_model_tasks_from_manifests(
         raise ValueError(
             "Task-3 finalized-selection fingerprint/validation failed"
         )
-    sentinel = object()
-    expected_records = _iter_jsonl_paths(validated_selection_paths)
-    actual_records = _iter_jsonl_paths(
-        [structural_output_root / final_shard.path]
-    )
-    for expected_record, actual_record in zip_longest(
-        expected_records,
-        actual_records,
-        fillvalue=sentinel,
-    ):
-        if (
-            expected_record is sentinel
-            or actual_record is sentinel
-            or _canonical_json(expected_record)
-            != _canonical_json(actual_record)
+    if compact_authority is None:
+        sentinel = object()
+        expected_records = _iter_jsonl_paths(validated_selection_paths)
+        actual_records = _iter_jsonl_paths(
+            [structural_output_root / final_shard.path]
+        )
+        for expected_record, actual_record in zip_longest(
+            expected_records,
+            actual_records,
+            fillvalue=sentinel,
         ):
-            raise ValueError(
-                "Task-3 finalized-selection content binding failed"
-            )
+            if (
+                expected_record is sentinel
+                or actual_record is sentinel
+                or _canonical_json(expected_record)
+                != _canonical_json(actual_record)
+            ):
+                raise ValueError(
+                    "Task-3 finalized-selection content binding failed"
+                )
     _, asset_paths, link_paths = _strict_asset_manifest(
         Path(assets_manifest),
         barrier=assets_barrier,

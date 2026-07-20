@@ -162,6 +162,7 @@ class MaterializationInputs:
     model_authority: ModelStageAuthority
     work_root: Path
     sampling_manifest: Path | None = None
+    sampled_entity_paths: tuple[Path, ...] = ()
     sampled_page_ref_paths: tuple[Path, ...] = ()
 
 
@@ -285,6 +286,16 @@ def _structural_inputs(
     list[tuple[Path, str]],
 ]:
     root = Path(inputs.structural_output_root)
+    from wdc200k_sampling import validate_sampling_source_authority
+
+    compact_authority = (
+        validate_sampling_source_authority(
+            Path(inputs.sampling_manifest),
+            structural_output_root=root,
+        )
+        if inputs.sampling_manifest is not None
+        else None
+    )
     manifests = sorted(Path(path) for path in inputs.structural_manifests)
     barrier = inputs.structural_barrier
     if (
@@ -323,14 +334,25 @@ def _structural_inputs(
             != barrier.parameter_fingerprints[key]
         ):
             raise ValueError("Task-3 structural fingerprint mismatch")
-        validated_path, records, validated_digest = (
-            structural._validated_shard_from_manifest(
-                manifest_path,
-                output_root=root,
+        if compact_authority is None:
+            validated_path, records, validated_digest = (
+                structural._validated_shard_from_manifest(
+                    manifest_path,
+                    output_root=root,
+                )
             )
-        )
-        validated_paths.append(validated_path)
-        tables += records
+            validated_paths.append(validated_path)
+            tables += records
+        else:
+            validated_digest = digest
+            source_items = [
+                item
+                for item in payload.get("completed_shards", [])
+                if str(item["path"]).startswith("source_tables/")
+            ]
+            if len(source_items) != 1:
+                raise ValueError("compact structural source set mismatch")
+            tables += int(source_items[0]["records"])
         manifest_hashes.append((manifest_path.resolve(), validated_digest))
         completed = [
             _completed_from_payload(item)
@@ -386,22 +408,29 @@ def _structural_inputs(
         raise ValueError(
             "Task-3 global barrier fingerprint/validation failed"
         )
-    sentinel = object()
-    expected_records = _iter_jsonl(validated_paths)
-    actual_records = _iter_jsonl([root / final_shard.path])
-    for expected, actual in zip_longest(
-        expected_records,
-        actual_records,
-        fillvalue=sentinel,
-    ):
-        if (
-            expected is sentinel
-            or actual is sentinel
-            or _canonical_json(expected) != _canonical_json(actual)
+    if compact_authority is None:
+        sentinel = object()
+        expected_records = _iter_jsonl(validated_paths)
+        actual_records = _iter_jsonl([root / final_shard.path])
+        for expected, actual in zip_longest(
+            expected_records,
+            actual_records,
+            fillvalue=sentinel,
         ):
-            raise ValueError(
-                "Task-3 global selection content binding failed"
-            )
+            if (
+                expected is sentinel
+                or actual is sentinel
+                or _canonical_json(expected) != _canonical_json(actual)
+            ):
+                raise ValueError(
+                    "Task-3 global selection content binding failed"
+                )
+    else:
+        source_paths = list(compact_authority.source_tables)
+        if not inputs.sampled_entity_paths:
+            raise ValueError("sampled entity authority is missing")
+        entity_paths = [Path(path) for path in inputs.sampled_entity_paths]
+        entities = sum(1 for _record in _iter_jsonl(entity_paths))
     return (
         source_paths,
         entity_paths,
@@ -1922,6 +1951,10 @@ def _table_inputs(
                 if row is not None:
                     wiki_to_entity_id[title] = str(row["entity_id"])
                     break
+            else:
+                wiki_to_entity_id[title] = (
+                    "ent_" + stable_hash(title, length=16)
+                )
     return entities, assets, links, extractions, wiki_to_entity_id
 
 

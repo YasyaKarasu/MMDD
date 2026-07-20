@@ -91,6 +91,7 @@ from wdc200k_sampling import (
     SamplingPolicy,
     SamplingResult,
     sample_structural_artifacts,
+    validate_sampling_source_authority,
 )
 from wdc200k_selection import (
     ReserveManager,
@@ -2050,6 +2051,21 @@ def _validate_producer_manifest(
         if producer_stage in {"wdc200k_structural", "wdc200k_validated_selection"}
         else path.parent
     )
+    compact_replacements = False
+    if stage == "structural":
+        sampling_manifest = config.work_dir / "sampling" / "manifest.json"
+        if sampling_manifest.is_file():
+            try:
+                validate_sampling_source_authority(
+                    sampling_manifest,
+                    structural_output_root=config.work_dir / "structural",
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "structural producer shard checksum mismatch: "
+                    "compact source authority"
+                ) from error
+            compact_replacements = True
     shard_fields = (
         "completed_shards",
         "entity_plan_shards",
@@ -2080,6 +2096,10 @@ def _validate_producer_manifest(
                 raise ValueError(
                     f"{stage} producer manifest has invalid shard: {path}"
                 ) from error
+            if compact_replacements and completed.path.startswith(
+                ("entities/", "page_refs/", "direct_image_refs/")
+            ):
+                continue
             if not validate_completed_shard(completed, root):
                 if (
                     allow_network_shard_repair
@@ -2758,7 +2778,7 @@ def _structural_exact_counts(
     )
     page_references = sum(result.page_references for result in results)
     validated_tables = sum(result.tables for result in results)
-    image_requests = entities * config.max_image_attempts_per_entity
+    image_requests = entities * config.max_image_attempts_per_entity * 2
     page_upper_bytes = unique_pages * config.web_max_page_bytes
     image_upper_bytes = image_requests * config.web_max_image_bytes
     estimated_next_stage_bytes = (
@@ -2838,6 +2858,62 @@ def _run_selection_and_structural(
     reporter.update(counters=selection_counters)
     if selection_only:
         return (), None, selection_counters
+
+    sampling_manifest = config.work_dir / "sampling" / "manifest.json"
+    structural_registry = _producer_registry_path(config, "structural")
+    if sampling_manifest.is_file() and structural_registry.is_file():
+        authority = validate_sampling_source_authority(
+            sampling_manifest,
+            structural_output_root=config.work_dir / "structural",
+        )
+        structural_root = config.work_dir / "structural"
+        reconstructed: list[StructuralExpansionResult] = []
+        for manifest_path, source_path in zip(
+            authority.structural_manifests,
+            authority.source_tables,
+        ):
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            completed = payload.get("completed_shards") or []
+
+            def artifact(prefix: str) -> Path:
+                item = next(
+                    raw
+                    for raw in completed
+                    if str(raw["path"]).startswith(prefix)
+                )
+                return structural_root / str(item["path"])
+
+            reconstructed.append(
+                StructuralExpansionResult(
+                    source_tables=source_path,
+                    entities=artifact("entities/"),
+                    page_refs=artifact("page_refs/"),
+                    direct_image_refs=artifact("direct_image_refs/"),
+                    structural_failures=artifact("structural_failures/"),
+                    validated_selection=artifact("selection/validated-"),
+                    manifest=manifest_path,
+                    tables=sum(1 for _record in _iter_jsonl(source_path)),
+                    entities_count=0,
+                    page_references=0,
+                    direct_image_references=0,
+                )
+            )
+        final_manifest = (
+            structural_root
+            / "stage_manifests"
+            / "validated-selection-global.json"
+        )
+        final_payload = json.loads(final_manifest.read_text(encoding="utf-8"))
+        final_completed = final_payload.get("completed_shards") or []
+        if len(final_completed) != 1:
+            raise ValueError("compact final selection authority is invalid")
+        finalized = FinalizedSelectionResult(
+            validated_selection=structural_root / str(final_completed[0]["path"]),
+            manifest=final_manifest,
+            tables=int(final_completed[0]["records"]),
+        )
+        counters = dict(_load_stage_registry(structural_registry).counters)
+        return tuple(reconstructed), finalized, counters
 
     selected_path = selection_dir / "selected_tables.jsonl"
     reserve_path = selection_dir / "reserve_tables.jsonl"
@@ -3606,6 +3682,7 @@ def _run_materialize(
             model_authority=authority,
             work_root=config.work_dir,
             sampling_manifest=sampling.manifest_path,
+            sampled_entity_paths=sampling.artifact_paths["sampled_entities"],
             sampled_page_ref_paths=sampling.artifact_paths["sampled_page_refs"],
         ),
         output_root=config.output_dir,
@@ -3721,6 +3798,7 @@ def run_pipeline(
                 "image_request_upper_bound": (
                     sampling.sampled_entities
                     * config.max_image_attempts_per_entity
+                    * 2
                 ),
                 "page_disk_upper_bound_bytes": (
                     sampling.sampled_page_refs * config.web_max_page_bytes
@@ -3728,6 +3806,7 @@ def run_pipeline(
                 "image_disk_upper_bound_bytes": (
                     sampling.sampled_entities
                     * config.max_image_attempts_per_entity
+                    * 2
                     * config.web_max_image_bytes
                 ),
                 **{
@@ -3744,6 +3823,7 @@ def run_pipeline(
             sampling.sampled_page_refs * config.estimated_page_result_bytes
             + sampling.sampled_entities
             * config.max_image_attempts_per_entity
+            * 2
             * config.estimated_image_result_bytes
         )
         if config.stop_after == "sampling":
