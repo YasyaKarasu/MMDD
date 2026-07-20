@@ -234,6 +234,76 @@ def test_exhausted_replacement_retains_failed_table_without_cleanup() -> None:
     assert discarded == []
 
 
+def test_replacement_registers_shared_dependencies_before_discard_cleanup(
+    tmp_path: Path,
+) -> None:
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=None,
+        extraction_cache=cache,
+    )
+    shared = builder.CandidateDependencies(
+        entities={"entity-shared"},
+        assets={"asset-shared"},
+        model_keys={"model-shared"},
+    )
+    work = {"fetches": 0, "inferences": 0}
+    deleted_before_replacement_registration: list[bool] = []
+
+    def evaluate_batch(
+        tables: list[dict[str, str]],
+    ) -> list[builder.CandidateEvaluation]:
+        evaluations = []
+        for table in tables:
+            table_id = table["source_table_id"]
+            if "asset-shared" not in assets:
+                work["fetches"] += 1
+                assets["asset-shared"] = {
+                    "asset_id": "asset-shared",
+                    "entity_id": "entity-shared",
+                }
+                entity_to_assets["entity-shared"] = ["asset-shared"]
+            if "model-shared" not in cache.items:
+                work["inferences"] += 1
+                cache.items["model-shared"] = {"cache_key": "model-shared"}
+            registry.register(table_id, shared)
+            evaluations.append(
+                builder.CandidateEvaluation(
+                    source_table=table,
+                    queryable=table_id == "t1",
+                    decision={},
+                )
+            )
+        return evaluations
+
+    def discard_table(table_id: str) -> None:
+        deleted_before_replacement_registration.append(
+            "t1" not in registry.dependencies
+        )
+        registry.discard(table_id)
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(replacement_tables()[:2]),
+        target_count=1,
+        policy=builder.ReplacementPolicy(rounds=1, drop_probability=1.0),
+        rng=StubRandom([0.0]),
+        evaluate_batch=evaluate_batch,
+        discard_table=discard_table,
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t1"
+    ]
+    assert work == {"fetches": 1, "inferences": 1}
+    assert deleted_before_replacement_registration == [False]
+    assert set(assets) == {"asset-shared"}
+    assert set(cache.items) == {"model-shared"}
+
+
 def test_candidate_evaluation_collects_records_without_final_shard_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -911,3 +981,107 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         "unrecoverable_replacement_rounds": 1,
         "unrecoverable_drop_probability": 1.0,
     }
+
+
+def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    candidate_tables = [
+        {
+            "source_table_id": table_id,
+            "page_title": table_id,
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": 0,
+                            "column_name": "Entity",
+                            "text": wiki_title,
+                            "wiki_title": wiki_title,
+                        }
+                    ],
+                }
+            ],
+        }
+        for table_id, wiki_title in (("first", "Page Z"), ("second", "Page A"))
+    ]
+
+    monkeypatch.setattr(
+        builder,
+        "iter_random_source_tables",
+        lambda _input_dir, _args, _counters: iter(candidate_tables),
+    )
+
+    def fake_ensure_assets(
+        entity_ids: set[str],
+        context: builder.CandidateEvaluationContext,
+        _args: object,
+        _imageinfo_keys_accessed: set[str],
+    ) -> None:
+        for entity_id in entity_ids:
+            asset_id = f"asset-{entity_id}"
+            context.assets.setdefault(
+                asset_id,
+                {
+                    "asset_id": asset_id,
+                    "entity_id": entity_id,
+                    "entity_wiki_title": context.entity_records[entity_id]["wiki_title"],
+                    "asset_type": "text",
+                },
+            )
+            context.entity_to_assets.setdefault(entity_id, [asset_id])
+
+    def fake_join_records(**kwargs: object):
+        source_table = kwargs["source_table"]
+        wiki_to_entity_id = kwargs["wiki_to_entity_id"]
+        entity_to_assets = kwargs["entity_to_assets"]
+        assert isinstance(source_table, dict)
+        wiki_title = source_table["rows"][0]["cells"][0]["wiki_title"]
+        entity_id = wiki_to_entity_id[wiki_title]
+        queryable = bool(entity_to_assets.get(entity_id))
+        table_id = str(source_table["source_table_id"])
+        return (
+            [{"table_id": f"query-{table_id}", "source_table_id": table_id}]
+            if queryable
+            else [],
+            [],
+            [],
+            {"source_table_id": table_id, "reason": "queryable" if queryable else "failed"},
+        )
+
+    monkeypatch.setattr(builder, "_ensure_candidate_assets", fake_ensure_assets)
+    monkeypatch.setattr(builder, "build_table_join_records", fake_join_records)
+    monkeypatch.setattr(builder, "LocalAttributeExtractor", lambda _args: None)
+
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--max_source_tables",
+            "2",
+            "--max_entities",
+            "1",
+            "--no_wikipedia",
+            "--no_model_progress",
+        ]
+    )
+
+    stats = builder.build_dataset(args)
+
+    bridge_assets = list(
+        builder.iter_jsonl_records(sorted((output_dir / "bridge_assets").glob("*.jsonl")))
+    )
+    decisions = list(
+        builder.iter_jsonl_records([output_dir / "table_queryability_decisions.jsonl"])
+    )
+    assert [asset["entity_wiki_title"] for asset in bridge_assets] == ["Page Z"]
+    assert {
+        decision["source_table_id"]: decision["reason"] for decision in decisions
+    } == {"first": "queryable", "second": "failed"}
+    assert stats["queryable_source_tables"] == 1

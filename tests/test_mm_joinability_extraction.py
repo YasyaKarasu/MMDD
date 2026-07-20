@@ -918,6 +918,73 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
     assert events == ["builder_started"]
 
 
+def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    '{"text_task_count": 0, "image_task_count": 0, "round_mode": true}',
+                    encoding="utf-8",
+                )
+                Path(command[command.index("--model_text_done_marker") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+                Path(command[command.index("--model_image_done_marker") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+            else:
+                events.append("server_started")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.wait_for_server", lambda *_args, **_kwargs: None)
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events[0] == "builder_started"
+    assert events.count("server_started") == 2
+
+
+def test_model_start_marker_can_signal_round_mode(tmp_path):
+    marker = tmp_path / "model_start.json"
+
+    joinability_dataset.write_model_start_marker(
+        str(marker), text_task_count=0, image_task_count=0, round_mode=True
+    )
+
+    assert '"round_mode": true' in marker.read_text(encoding="utf-8")
+
+
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
     release_text = threading.Event()
     text_started = threading.Event()

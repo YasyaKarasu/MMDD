@@ -165,6 +165,8 @@ class CandidateEvaluationContext:
     progress: ModelAnalysisProgress | None
     concurrency_state: ModelConcurrencyState
     registry: CandidateMaterialRegistry
+    max_entities: int | None = None
+    eligible_entity_ids: set[str] = dataclass_field(default_factory=set)
     entity_imageinfo_keys: dict[str, set[str]] = dataclass_field(default_factory=dict)
 
 
@@ -359,17 +361,32 @@ class CandidateMaterialRegistry:
 
 def _candidate_entity_ids(
     source_table: dict[str, Any], wiki_to_entity_id: dict[str, str]
-) -> set[str]:
-    entity_ids: set[str] = set()
+) -> list[str]:
+    entity_ids: list[str] = []
+    seen: set[str] = set()
     for row in source_table.get("rows", []):
         for cell in row.get("cells", []):
             wiki_title = clean_text(cell.get("wiki_title"))
             if not wiki_title:
                 continue
             entity_id = wiki_to_entity_id.get(normalize_title(wiki_title))
-            if entity_id:
-                entity_ids.add(entity_id)
+            if entity_id and entity_id not in seen:
+                seen.add(entity_id)
+                entity_ids.append(entity_id)
     return entity_ids
+
+
+def _eligible_candidate_entity_ids(
+    candidate_entity_ids: Iterable[str], context: CandidateEvaluationContext
+) -> set[str]:
+    candidate_ids = list(candidate_entity_ids)
+    for entity_id in candidate_ids:
+        if entity_id in context.eligible_entity_ids:
+            continue
+        if context.max_entities and len(context.eligible_entity_ids) >= context.max_entities:
+            continue
+        context.eligible_entity_ids.add(entity_id)
+    return set(candidate_ids) & context.eligible_entity_ids
 
 
 def _ensure_candidate_assets(
@@ -468,7 +485,9 @@ def evaluate_candidate_batch(
         update_entities_from_table(
             context.entity_records, context.wiki_to_entity_id, source_table
         )
-        entity_ids = _candidate_entity_ids(source_table, context.wiki_to_entity_id)
+        entity_ids = _eligible_candidate_entity_ids(
+            _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
+        )
         imageinfo_keys_accessed: set[str] = set()
         _ensure_candidate_assets(entity_ids, context, args, imageinfo_keys_accessed)
         extraction_writer = ListRecordWriter()
@@ -577,6 +596,7 @@ def run_replacement_rounds(
     replacement_counts = [0] * len(slot_tables)
     final_evaluations: list[CandidateEvaluation | None] = [None] * len(slot_tables)
     pending_slots = list(range(len(slot_tables)))
+    pending_discards: list[str] = []
     round_stats: list[ReplacementRoundStats] = []
     round_index = 0
 
@@ -594,6 +614,9 @@ def run_replacement_rounds(
                 raise ValueError(
                     "candidate evaluation source ID does not match the requested batch"
                 )
+        for source_table_id in pending_discards:
+            discard_table(source_table_id)
+        pending_discards.clear()
 
         unrecoverable = 0
         discarded = 0
@@ -629,7 +652,7 @@ def run_replacement_rounds(
                 continue
 
             source_table_id = str(evaluation.source_table["source_table_id"])
-            discard_table(source_table_id)
+            pending_discards.append(source_table_id)
             slot_tables[slot_index] = replacement_table
             replacement_counts[slot_index] += 1
             candidates_consumed += 1
@@ -2091,7 +2114,13 @@ def write_model_done_marker(path_value: str, *, model_kind: str, task_count: int
     )
 
 
-def write_model_start_marker(path_value: str, *, text_task_count: int, image_task_count: int) -> None:
+def write_model_start_marker(
+    path_value: str,
+    *,
+    text_task_count: int,
+    image_task_count: int,
+    round_mode: bool = False,
+) -> None:
     if not clean_text(path_value):
         return
     path = Path(path_value)
@@ -2102,6 +2131,7 @@ def write_model_start_marker(path_value: str, *, text_task_count: int, image_tas
                 "status": "model_cache_ready_to_start",
                 "text_task_count": text_task_count,
                 "image_task_count": image_task_count,
+                "round_mode": round_mode,
                 "timestamp": time.time(),
             },
             ensure_ascii=False,
@@ -2849,6 +2879,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         clean_text(getattr(args, "model_start_marker", "")),
         text_task_count=0,
         image_task_count=0,
+        round_mode=True,
     )
     wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
     extractor: LocalAttributeExtractor | None = LocalAttributeExtractor(args)
@@ -2874,6 +2905,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         progress=progress,
         concurrency_state=concurrency_state,
         registry=registry,
+        max_entities=args.max_entities,
     )
     counters = SourceCandidateCounters()
     candidate_tables: Iterator[dict[str, Any]] = iter_random_source_tables(
@@ -2918,24 +2950,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     for source_table in final_source_tables:
         update_entities_from_table(entity_records, wiki_to_entity_id, source_table)
     entities = finalize_entities(entity_records)
-    asset_entities = entities[: args.max_entities] if args.max_entities else entities
-    final_entity_ids = {str(entity["entity_id"]) for entity in asset_entities}
-    assets_to_remove = {
-        asset_id
-        for asset_id, asset in assets.items()
-        if str(asset.get("entity_id")) not in final_entity_ids
-    }
-    for asset_id in assets_to_remove:
-        assets.pop(asset_id, None)
-    for entity_id in list(entity_to_assets):
-        if entity_id not in final_entity_ids:
-            entity_to_assets.pop(entity_id, None)
-            continue
-        entity_to_assets[entity_id] = [
-            asset_id
-            for asset_id in entity_to_assets[entity_id]
-            if asset_id in assets
-        ]
 
     source_split_records = [
         {
