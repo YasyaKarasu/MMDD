@@ -16,15 +16,16 @@ import io
 import json
 import logging
 import mimetypes
+import random
 import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
 
 try:
@@ -80,6 +81,63 @@ DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
 DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
 DEFAULT_IMAGE_MODEL_MAX_TOKENS = 384
 _MODEL_ERROR_LOG_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class ReplacementPolicy:
+    rounds: int
+    drop_probability: float
+
+
+@dataclass
+class SourceCandidateCounters:
+    processed_tables: int = 0
+    skipped_tables: int = 0
+    skip_reasons: Counter[str] = dataclass_field(default_factory=Counter)
+
+
+def replacement_policy_from_args(args: argparse.Namespace) -> ReplacementPolicy:
+    rounds = int(args.unrecoverable_replacement_rounds)
+    probability = float(args.unrecoverable_drop_probability)
+    if rounds < 0:
+        raise ValueError("unrecoverable replacement rounds must be non-negative")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("unrecoverable drop probability must be within [0, 1]")
+    return ReplacementPolicy(rounds, probability)
+
+
+def iter_random_source_tables(
+    input_dir: Path,
+    args: argparse.Namespace,
+    counters: SourceCandidateCounters,
+) -> Iterator[dict[str, Any]]:
+    rng = random.Random(args.seed)
+    json_files = list(input_dir.rglob("*.json"))
+    rng.shuffle(json_files)
+    for json_file in json_files:
+        payload = read_entitables_json(json_file)
+        if payload is None:
+            counters.skipped_tables += 1
+            counters.skip_reasons["malformed_json_file"] += 1
+            continue
+        table_items = list(payload.items())
+        rng.shuffle(table_items)
+        for table_id, table_obj in table_items:
+            counters.processed_tables += 1
+            result = parse_source_table(
+                str(table_id),
+                table_obj,
+                json_file,
+                input_dir,
+                args.min_rows,
+                args.min_cols,
+                args.wiki_link_threshold,
+            )
+            if result.source_table is None:
+                counters.skipped_tables += 1
+                counters.skip_reasons[result.skip_reason or "unknown"] += 1
+                continue
+            yield result.source_table
 
 
 def resolve_shared_cache_paths(args: argparse.Namespace) -> dict[str, Path]:
@@ -2677,6 +2735,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stream chunk size in bytes for Wikimedia media bandwidth accounting.",
     )
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--unrecoverable_replacement_rounds", type=int, default=2)
+    parser.add_argument("--unrecoverable_drop_probability", type=float, default=0.5)
     parser.add_argument("--flush_every_records", type=int, default=500)
     parser.add_argument("--records_per_shard", type=int, default=50000)
     parser.add_argument("--no_wikipedia", action="store_true", help="Skip MediaWiki API calls. Queryable tables will normally be zero.")
