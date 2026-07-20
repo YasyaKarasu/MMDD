@@ -96,6 +96,14 @@ class CandidateEvaluation:
     decision: dict[str, Any]
 
 
+class ListRecordWriter:
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def write_record(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+
+
 @dataclass(frozen=True)
 class ReplacementRoundStats:
     round_index: int
@@ -143,6 +151,20 @@ class CandidateDependencies:
             "model_keys",
         ):
             object.__setattr__(self, field_name, frozenset(getattr(self, field_name)))
+
+
+@dataclass
+class CandidateEvaluationContext:
+    entity_records: dict[str, dict[str, Any]]
+    wiki_to_entity_id: dict[str, str]
+    assets: dict[str, dict[str, Any]]
+    entity_to_assets: dict[str, list[str]]
+    wikipedia_client: WikipediaClient | None
+    extractor: LocalAttributeExtractor | None
+    cache: ExtractionCache
+    progress: ModelAnalysisProgress | None
+    concurrency_state: ModelConcurrencyState
+    registry: CandidateMaterialRegistry
 
 
 @dataclass
@@ -321,6 +343,146 @@ class CandidateMaterialRegistry:
             if table_id not in retained_ids:
                 total.add(self.discard(table_id))
         return total
+
+
+def _candidate_entity_ids(
+    source_table: dict[str, Any], wiki_to_entity_id: dict[str, str]
+) -> set[str]:
+    entity_ids: set[str] = set()
+    for row in source_table.get("rows", []):
+        for cell in row.get("cells", []):
+            wiki_title = clean_text(cell.get("wiki_title"))
+            if not wiki_title:
+                continue
+            entity_id = wiki_to_entity_id.get(normalize_title(wiki_title))
+            if entity_id:
+                entity_ids.add(entity_id)
+    return entity_ids
+
+
+def _ensure_candidate_assets(
+    entity_ids: set[str], context: CandidateEvaluationContext, args: argparse.Namespace
+) -> None:
+    entities_by_id = {
+        entity["entity_id"]: entity
+        for entity in finalize_entities(context.entity_records)
+        if entity["entity_id"] in entity_ids
+    }
+    for entity_id in entity_ids:
+        if entity_id in context.entity_to_assets:
+            continue
+        context.entity_to_assets[entity_id] = []
+        if context.wikipedia_client is None:
+            continue
+        for asset in build_bridge_assets_for_entity(
+            entity=entities_by_id[entity_id],
+            max_images_per_entity=args.max_images_per_entity,
+            text_asset_chunk_chars=args.text_asset_chunk_chars,
+            min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
+            max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
+            wikipedia_client=context.wikipedia_client,
+        ):
+            asset_id = str(asset["asset_id"])
+            context.assets[asset_id] = asset
+            context.entity_to_assets[entity_id].append(asset_id)
+
+
+def _candidate_dependencies(
+    *,
+    entity_ids: set[str],
+    context: CandidateEvaluationContext,
+    extraction_records: Iterable[dict[str, Any]],
+    recovery_records: Iterable[dict[str, Any]],
+) -> CandidateDependencies:
+    asset_ids = {
+        asset_id
+        for entity_id in entity_ids
+        for asset_id in context.entity_to_assets.get(entity_id, [])
+        if asset_id in context.assets
+    }
+    referenced_assets = [context.assets[asset_id] for asset_id in asset_ids]
+    model_keys = {
+        clean_text(record.get("cache_key"))
+        for record in extraction_records
+        if clean_text(record.get("cache_key"))
+    }
+    model_keys.update(
+        clean_text(record.get("evidence", {}).get("extraction_cache_key"))
+        for record in recovery_records
+        if clean_text(record.get("evidence", {}).get("extraction_cache_key"))
+    )
+    return CandidateDependencies(
+        entities=entity_ids,
+        assets=asset_ids,
+        paths={
+            Path(local_path)
+            for asset in referenced_assets
+            if (local_path := clean_text(asset.get("local_path")))
+        },
+        urls={
+            image_url
+            for asset in referenced_assets
+            if (image_url := clean_text(asset.get("image_url")))
+        },
+        page_keys={
+            normalize_title(str(context.entity_records[entity_id]["wiki_title"]))
+            for entity_id in entity_ids
+        },
+        imageinfo_keys={
+            normalize_title(file_title)
+            for asset in referenced_assets
+            if (file_title := clean_text(asset.get("metadata", {}).get("file_title")))
+        },
+        model_keys=model_keys,
+    )
+
+
+def evaluate_candidate_batch(
+    source_tables: list[dict[str, Any]],
+    context: CandidateEvaluationContext,
+    args: argparse.Namespace,
+) -> list[CandidateEvaluation]:
+    evaluations: list[CandidateEvaluation] = []
+    for source_table in source_tables:
+        update_entities_from_table(
+            context.entity_records, context.wiki_to_entity_id, source_table
+        )
+        entity_ids = _candidate_entity_ids(source_table, context.wiki_to_entity_id)
+        _ensure_candidate_assets(entity_ids, context, args)
+        extraction_writer = ListRecordWriter()
+        recovery_writer = ListRecordWriter()
+        query_tables, _data_lake_tables, _qrels, decision = build_table_join_records(
+            source_table=source_table,
+            split="candidate",
+            assets=context.assets,
+            entity_to_assets=context.entity_to_assets,
+            wiki_to_entity_id=context.wiki_to_entity_id,
+            extractor=context.extractor,
+            cache=context.cache,
+            progress=context.progress,
+            concurrency_state=context.concurrency_state,
+            extraction_writer=extraction_writer,
+            recovery_writer=recovery_writer,
+            args=args,
+        )
+        table_id = str(source_table["source_table_id"])
+        context.registry.register(
+            table_id,
+            _candidate_dependencies(
+                entity_ids=entity_ids,
+                context=context,
+                extraction_records=extraction_writer.records,
+                recovery_records=recovery_writer.records,
+            ),
+        )
+        evaluations.append(
+            CandidateEvaluation(
+                source_table=source_table,
+                queryable=bool(query_tables),
+                decision=dict(decision),
+            )
+        )
+    return evaluations
 
 
 def replacement_policy_from_args(args: argparse.Namespace) -> ReplacementPolicy:

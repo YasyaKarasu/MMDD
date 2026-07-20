@@ -234,6 +234,124 @@ def test_exhausted_replacement_retains_failed_table_without_cleanup() -> None:
     assert discarded == []
 
 
+def test_candidate_evaluation_collects_records_without_final_shard_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "final"
+    args = builder.parse_args(
+        ["--input_dir", str(tmp_path), "--output_dir", str(output_dir)]
+    )
+    tables = [
+        {
+            "source_table_id": table_id,
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": 0,
+                            "column_name": "Entity",
+                            "text": f"Entity {table_id}",
+                            "wiki_title": f"Page {table_id}",
+                        }
+                    ],
+                }
+            ],
+        }
+        for table_id in ("recoverable", "failed")
+    ]
+    page_cache_path = tmp_path / "cache" / "wiki_pages.jsonl"
+    image_cache_path = tmp_path / "cache" / "wiki_images.jsonl"
+    wikipedia = SimpleNamespace(
+        page_cache_path=page_cache_path,
+        image_cache_path=image_cache_path,
+        page_cache={
+            f"Page {table_id}": {"wiki_title": f"Page {table_id}"}
+            for table_id in ("recoverable", "failed")
+        },
+        image_cache={
+            f"File:{table_id}.jpg": {"file_title": f"File:{table_id}.jpg"}
+            for table_id in ("recoverable", "failed")
+        },
+    )
+    cache = builder.ExtractionCache(tmp_path / "cache" / "model.jsonl")
+    entity_records: dict[str, dict[str, object]] = {}
+    wiki_to_entity_id: dict[str, str] = {}
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extraction_cache=cache,
+    )
+    context = builder.CandidateEvaluationContext(
+        entity_records=entity_records,
+        wiki_to_entity_id=wiki_to_entity_id,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=SimpleNamespace(),
+        registry=registry,
+    )
+
+    def fake_assets_for_entity(**kwargs: object) -> list[dict[str, object]]:
+        entity = kwargs["entity"]
+        assert isinstance(entity, dict)
+        table_id = str(entity["wiki_title"]).removeprefix("Page ")
+        return [
+            {
+                "asset_id": f"asset-{table_id}",
+                "entity_id": entity["entity_id"],
+                "entity_wiki_title": entity["wiki_title"],
+                "asset_type": "image",
+                "local_path": str(tmp_path / f"{table_id}.jpg"),
+                "image_url": f"https://images.example/{table_id}.jpg",
+                "metadata": {"file_title": f"File:{table_id}.jpg"},
+            }
+        ]
+
+    def fake_build_table_join_records(**kwargs: object):
+        source_table = kwargs["source_table"]
+        assert isinstance(source_table, dict)
+        table_id = str(source_table["source_table_id"])
+        extraction_writer = kwargs["extraction_writer"]
+        recovery_writer = kwargs["recovery_writer"]
+        extraction_writer.write_record({"cache_key": f"model-{table_id}"})
+        recovery_writer.write_record(
+            {"evidence": {"extraction_cache_key": f"model-{table_id}"}}
+        )
+        query_tables = [{"table_id": f"query-{table_id}"}] if table_id == "recoverable" else []
+        return query_tables, [], [], {"reason": "queryable" if query_tables else "failed"}
+
+    monkeypatch.setattr(builder, "build_bridge_assets_for_entity", fake_assets_for_entity)
+    monkeypatch.setattr(builder, "build_table_join_records", fake_build_table_join_records)
+
+    evaluations = builder.evaluate_candidate_batch(tables, context, args)
+
+    assert [evaluation.queryable for evaluation in evaluations] == [True, False]
+    assert [evaluation.decision["reason"] for evaluation in evaluations] == [
+        "queryable",
+        "failed",
+    ]
+    for table_id in ("recoverable", "failed"):
+        entity_id = wiki_to_entity_id[f"Page {table_id}"]
+        assert registry.dependencies[table_id] == builder.CandidateDependencies(
+            entities={entity_id},
+            assets={f"asset-{table_id}"},
+            paths={tmp_path / f"{table_id}.jpg"},
+            urls={f"https://images.example/{table_id}.jpg"},
+            page_keys={f"Page {table_id}"},
+            imageinfo_keys={f"File:{table_id}.jpg"},
+            model_keys={f"model-{table_id}"},
+        )
+    assert not (output_dir / "attribute_extractions").exists()
+    assert not (output_dir / "evidence_recoveries").exists()
+
+
 def write_keyed_cache(path: Path, key_name: str, keys: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
