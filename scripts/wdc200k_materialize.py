@@ -161,6 +161,8 @@ class MaterializationInputs:
     model_result: ModelStageResult
     model_authority: ModelStageAuthority
     work_root: Path
+    sampling_manifest: Path | None = None
+    sampled_page_ref_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -426,16 +428,25 @@ def _validate_upstream(
         entities,
         structural_hashes,
     ) = _structural_inputs(inputs)
+    effective_page_ref_paths = (
+        list(inputs.sampled_page_ref_paths)
+        if inputs.sampled_page_ref_paths
+        else page_ref_paths
+    )
     validation_root = Path(inputs.work_root) / "upstream-validation"
     page_snapshot = validate_complete_page_fetch(
         inputs.page_fetch_result,
-        _iter_jsonl(page_ref_paths),
+        _iter_jsonl(effective_page_ref_paths),
         validation_database=validation_root / "page-fetch.sqlite3",
         pre_write_guard=pre_write_guard,
     )
-    structural_identity = structural_asset_input_identity(
-        (digest for _path, digest in structural_hashes),
-        inputs.structural_barrier.final_manifest_sha256,
+    structural_identity = (
+        _sha256_path(Path(inputs.sampling_manifest))
+        if inputs.sampling_manifest is not None
+        else structural_asset_input_identity(
+            (digest for _path, digest in structural_hashes),
+            inputs.structural_barrier.final_manifest_sha256,
+        )
     )
     expected_planning_input = asset_planning_input_fingerprint(
         structural_identity,
@@ -480,6 +491,12 @@ def _validate_upstream(
         ),
         assets_manifest=materialized_assets.manifest_path,
     )
+    if inputs.sampling_manifest is not None:
+        expected_adapter_input = stable_hash(
+            expected_adapter_input,
+            _sha256_path(Path(inputs.sampling_manifest)),
+            length=40,
+        )
     adapted = validate_adapted_model_tasks(
         inputs.adapted_model_tasks,
         expected_input_fingerprint=expected_adapter_input,
@@ -546,6 +563,11 @@ def _validate_upstream(
             inputs.structural_barrier.final_manifest_sha256
         ),
         "page_fetch_identity": page_snapshot["identity"],
+        "sampling_manifest_sha256": (
+            _sha256_path(Path(inputs.sampling_manifest))
+            if inputs.sampling_manifest is not None
+            else None
+        ),
         "asset_planning_manifest_sha256": _sha256_path(
             planned.manifest_path
         ),
@@ -579,7 +601,7 @@ def _validate_upstream(
     return _ValidatedUpstream(
         source_paths=tuple(source_paths),
         entity_paths=tuple(entity_paths),
-        page_ref_paths=tuple(page_ref_paths),
+        page_ref_paths=tuple(effective_page_ref_paths),
         structural_failure_paths=tuple(failure_paths),
         page_failure_path=Path(inputs.page_fetch_result.failure_path),
         asset_paths=tuple(asset_paths),

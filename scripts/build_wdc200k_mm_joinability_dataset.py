@@ -35,7 +35,6 @@ from wdc200k_assets import (
     iter_image_outcomes,
     materialize_asset_shards,
     persist_entity_asset_plans,
-    structural_asset_input_identity,
     validate_asset_plan_shards,
     validate_complete_image_fetch,
     validate_materialized_asset_shards,
@@ -46,7 +45,6 @@ from wdc200k_fetch import (
     FetchPolicy,
     FetchResult,
     fetch_unique_pages,
-    iter_finalized_page_refs,
     iter_page_fanout,
     iter_page_outcomes,
     validate_complete_page_fetch,
@@ -89,6 +87,11 @@ from wdc200k_models import (
     validate_model_stage_for_adapter,
 )
 from wdc200k_runtime import resolve_work_dir
+from wdc200k_sampling import (
+    SamplingPolicy,
+    SamplingResult,
+    sample_structural_artifacts,
+)
 from wdc200k_selection import (
     ReserveManager,
     SelectionPolicy,
@@ -105,6 +108,7 @@ from wdc200k_structural import (
 STAGES = (
     "selection",
     "structural",
+    "sampling",
     "pages",
     "asset_planning",
     "images",
@@ -169,6 +173,9 @@ class PipelineConfig:
     web_per_host_concurrency: int = 2
     max_image_attempts_per_entity: int = 3
     max_images_per_entity: int = 3
+    sampled_entities_per_table: int = 8
+    entity_sampling_seed: int = 20260720
+    global_entity_budget: int | None = None
     min_free_disk_bytes: int = 1_000_000_000
     selection_shard_tables: int = 100
     records_per_shard: int = 10_000
@@ -254,6 +261,9 @@ class PipelineConfig:
                 args.max_image_attempts_per_entity
             ),
             max_images_per_entity=args.max_images_per_entity,
+            sampled_entities_per_table=args.sampled_entities_per_table,
+            entity_sampling_seed=args.entity_sampling_seed,
+            global_entity_budget=args.global_entity_budget,
             min_free_disk_bytes=args.min_free_disk_bytes,
             selection_shard_tables=args.selection_shard_tables,
             records_per_shard=args.records_per_shard,
@@ -1483,6 +1493,7 @@ class StageRegistry:
 _PRODUCER_TYPES = {
     "selection": "wdc200k-selection",
     "structural": "wdc200k-structural-barrier",
+    "sampling": "wdc200k-entity-sampling",
     "pages": "wdc200k-page-network",
     "asset_planning": "wdc200k-asset-planning",
     "images": "wdc200k-image-and-assets",
@@ -1499,6 +1510,16 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "class_max_tables",
     ),
     "structural": ("selection_shard_tables",),
+    "sampling": (
+        "sampled_entities_per_table",
+        "entity_sampling_seed",
+        "global_entity_budget",
+        "query_rows_per_table",
+        "min_column_non_empty_ratio",
+        "min_recovered_value_ratio",
+        "min_recovery_denominator",
+        "min_rows_per_output_table",
+    ),
     "pages": (
         "web_max_retries",
         "web_max_response_seconds",
@@ -2006,6 +2027,7 @@ def _validate_producer_manifest(
     expected = {
         "selection": {"wdc200k_selection"},
         "structural": {"wdc200k_structural", "wdc200k_validated_selection"},
+        "sampling": {"wdc200k_entity_sampling"},
         "pages": {"wdc200k_network_fetch"},
         "asset_planning": {"wdc200k_asset_planning"},
         "images": {
@@ -2161,6 +2183,7 @@ def _write_stage_registry(
 _STAGE_WORK_PATHS: dict[str, tuple[str, ...]] = {
     "selection": ("selection",),
     "structural": ("structural",),
+    "sampling": ("sampling",),
     "pages": ("page_jobs",),
     "asset_planning": ("asset_planning",),
     "images": ("image_jobs", "materialized_assets"),
@@ -2274,6 +2297,16 @@ def _preflight(
         raise ValueError("max_image_attempts_per_entity must be non-negative")
     if config.max_images_per_entity < 0:
         raise ValueError("max_images_per_entity must be non-negative")
+    SamplingPolicy(
+        sampled_entities_per_table=config.sampled_entities_per_table,
+        entity_sampling_seed=config.entity_sampling_seed,
+        query_rows_per_table=config.query_rows_per_table,
+        min_column_non_empty_ratio=config.min_column_non_empty_ratio,
+        min_recovered_value_ratio=config.min_recovered_value_ratio,
+        min_recovery_denominator=config.min_recovery_denominator,
+        min_rows_per_output_table=config.min_rows_per_output_table,
+        global_entity_budget=config.global_entity_budget,
+    )
     marker_values = (
         config.model_start_marker,
         config.model_ready_marker,
@@ -3000,22 +3033,63 @@ class _EpochElapsedNormalizer:
 
 
 def _page_refs(
-    structural_root: Path,
-    structural: Sequence[StructuralExpansionResult],
-    finalized: FinalizedSelectionResult,
+    sampling: SamplingResult,
 ) -> Iterator[dict[str, Any]]:
-    return iter_finalized_page_refs(
-        structural_root,
-        finalized.manifest,
-        (item.manifest for item in structural),
+    for path in sampling.artifact_paths["sampled_page_refs"]:
+        yield from _iter_jsonl(path)
+
+
+def _run_sampling(
+    config: PipelineConfig,
+    reporter: ProgressReporter,
+    structural: Sequence[StructuralExpansionResult],
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> SamplingResult:
+    reporter.update(stage="sampling", completed_shards=0, total_shards=1)
+    result = sample_structural_artifacts(
+        structural_output_root=config.work_dir / "structural",
+        structural_manifests=tuple(item.manifest for item in structural),
+        output_root=config.work_dir / "sampling",
+        policy=SamplingPolicy(
+            sampled_entities_per_table=config.sampled_entities_per_table,
+            entity_sampling_seed=config.entity_sampling_seed,
+            query_rows_per_table=config.query_rows_per_table,
+            min_column_non_empty_ratio=config.min_column_non_empty_ratio,
+            min_recovered_value_ratio=config.min_recovered_value_ratio,
+            min_recovery_denominator=config.min_recovery_denominator,
+            min_rows_per_output_table=config.min_rows_per_output_table,
+            global_entity_budget=config.global_entity_budget,
+        ),
+        pre_write_guard=pre_write_guard,
     )
+    counters = {
+        "eligible_tables": result.eligible_tables,
+        "prefilter_rejected_tables": result.rejected_tables,
+        "sampled_entities": result.sampled_entities,
+        "sampled_page_references": result.sampled_page_refs,
+        "sampled_direct_image_references": result.sampled_direct_image_refs,
+        **{
+            f"sampled_{stratum}_entities": count
+            for stratum, count in result.strata.items()
+        },
+    }
+    _write_stage_registry(
+        config,
+        "sampling",
+        producer_manifests=(result.manifest_path,),
+        counters=counters,
+        upstream_identity=_registry_identity(config, "structural"),
+        pre_write_guard=pre_write_guard,
+    )
+    reporter.update(completed_shards=1, total_shards=1, counters=counters)
+    return result
 
 
 def _run_pages(
     config: PipelineConfig,
     reporter: ProgressReporter,
-    structural: Sequence[StructuralExpansionResult],
-    finalized: FinalizedSelectionResult,
+    sampling: SamplingResult,
     transport: Any,
     *,
     after_cache_write: Any | None = None,
@@ -3064,7 +3138,7 @@ def _run_pages(
         reporter.update(url_snapshot=normalize_page_elapsed(snapshot))
 
     result = fetch_unique_pages(
-        _page_refs(config.work_dir / "structural", structural, finalized),
+        _page_refs(sampling),
         SqliteJobStore(jobs_path, pre_write_guard=pre_write_guard),
         transport,
         policy,
@@ -3080,7 +3154,7 @@ def _run_pages(
         pre_write_guard(page_validation_database, 0)
     snapshot = validate_complete_page_fetch(
         result,
-        _page_refs(config.work_dir / "structural", structural, finalized),
+        _page_refs(sampling),
         validation_database=page_validation_database,
         pre_write_guard=pre_write_guard,
     )
@@ -3127,7 +3201,7 @@ def _run_pages(
         "pages",
         producer_manifests=(network_manifest,),
         counters=counters,
-        upstream_identity=_registry_identity(config, "structural"),
+        upstream_identity=_registry_identity(config, "sampling"),
         pre_write_guard=pre_write_guard,
     )
     reporter.update(
@@ -3142,8 +3216,7 @@ def _run_pages(
 def _run_asset_planning(
     config: PipelineConfig,
     reporter: ProgressReporter,
-    structural: Sequence[StructuralExpansionResult],
-    finalized: FinalizedSelectionResult,
+    sampling: SamplingResult,
     page_result: FetchResult,
     page_snapshot: dict[str, Any],
     *,
@@ -3152,10 +3225,7 @@ def _run_asset_planning(
     reporter.update(
         stage="asset_planning", completed_shards=0, total_shards=1
     )
-    structural_identity = structural_asset_input_identity(
-        (_sha256_path(item.manifest) for item in structural),
-        _sha256_path(finalized.manifest),
-    )
+    structural_identity = _sha256_path(sampling.manifest_path)
     planning_input = asset_planning_input_fingerprint(
         structural_identity,
         str(page_snapshot["identity"]),
@@ -3166,7 +3236,7 @@ def _run_asset_planning(
     if pre_write_guard is not None:
         pre_write_guard(entity_page_join, 0)
     entity_pages = iter_entity_page_join(
-        (item.entities for item in structural),
+        sampling.artifact_paths["sampled_entities"],
         iter_page_fanout(
             page_result.outcomes_path,
             page_result.policy_fingerprint,
@@ -3382,6 +3452,7 @@ def _run_models(
     structural: Sequence[StructuralExpansionResult],
     finalized: FinalizedSelectionResult,
     structural_barrier: StructuralStageBarrier,
+    sampling: SamplingResult,
     materialized_assets: MaterializedAssetShards,
     assets_barrier: AssetStageBarrier,
     network_manifests: Sequence[Path],
@@ -3402,6 +3473,8 @@ def _run_models(
         args=args,
         records_per_shard=config.records_per_shard,
         pre_write_guard=pre_write_guard,
+        sampled_entity_paths=sampling.artifact_paths["sampled_entities"],
+        sampling_manifest=sampling.manifest_path,
     )
     reporter.update(completed_shards=1, total_shards=2)
     model_jobs_path = config.work_dir / "model_outputs" / "jobs.sqlite3"
@@ -3503,6 +3576,7 @@ def _run_materialize(
     structural: Sequence[StructuralExpansionResult],
     finalized: FinalizedSelectionResult,
     structural_barrier: StructuralStageBarrier,
+    sampling: SamplingResult,
     page_result: FetchResult,
     planned: AssetPlanShards,
     unique_jobs: UniqueImageJobs,
@@ -3531,6 +3605,8 @@ def _run_materialize(
             model_result=model_result,
             model_authority=authority,
             work_root=config.work_dir,
+            sampling_manifest=sampling.manifest_path,
+            sampled_page_ref_paths=sampling.artifact_paths["sampled_page_refs"],
         ),
         output_root=config.output_dir,
         args=args,
@@ -3622,6 +3698,61 @@ def run_pipeline(
                 statistics_archives=len(archives),
                 counters=counters,
             )
+        sampling = _run_sampling(
+            config,
+            reporter,
+            structural,
+            pre_write_guard=disk_guard,
+        )
+        counters.update(
+            {
+                "eligible_tables": sampling.eligible_tables,
+                "prefilter_rejected_tables": sampling.rejected_tables,
+                "sampled_entities": sampling.sampled_entities,
+                "sampled_page_references": sampling.sampled_page_refs,
+                "sampled_direct_image_references": (
+                    sampling.sampled_direct_image_refs
+                ),
+                "page_references": sampling.sampled_page_refs,
+                "page_request_upper_bound": sampling.sampled_page_refs,
+                "direct_image_references": (
+                    sampling.sampled_direct_image_refs
+                ),
+                "image_request_upper_bound": (
+                    sampling.sampled_entities
+                    * config.max_image_attempts_per_entity
+                ),
+                "page_disk_upper_bound_bytes": (
+                    sampling.sampled_page_refs * config.web_max_page_bytes
+                ),
+                "image_disk_upper_bound_bytes": (
+                    sampling.sampled_entities
+                    * config.max_image_attempts_per_entity
+                    * config.web_max_image_bytes
+                ),
+                **{
+                    f"sampled_{stratum}_entities": count
+                    for stratum, count in sampling.strata.items()
+                },
+            }
+        )
+        counters["network_disk_upper_bound_bytes"] = (
+            counters["page_disk_upper_bound_bytes"]
+            + counters["image_disk_upper_bound_bytes"]
+        )
+        counters["estimated_next_stage_bytes"] = (
+            sampling.sampled_page_refs * config.estimated_page_result_bytes
+            + sampling.sampled_entities
+            * config.max_image_attempts_per_entity
+            * config.estimated_image_result_bytes
+        )
+        if config.stop_after == "sampling":
+            return PipelineResult(
+                status="stopped",
+                stage="sampling",
+                statistics_archives=len(archives),
+                counters=counters,
+            )
         structural_barrier = _structural_barrier(structural, finalized)
         if page_transport is None:
             page_transport = _new_web_transport(
@@ -3632,8 +3763,7 @@ def run_pipeline(
         page_result, page_snapshot, page_network_manifest = _run_pages(
             config,
             reporter,
-            structural,
-            finalized,
+            sampling,
             page_transport,
             after_cache_write=after_page_cache_write,
             pre_write_guard=disk_guard,
@@ -3660,8 +3790,7 @@ def run_pipeline(
         planned, _planning_input = _run_asset_planning(
             config,
             reporter,
-            structural,
-            finalized,
+            sampling,
             page_result,
             page_snapshot,
             pre_write_guard=disk_guard,
@@ -3728,6 +3857,7 @@ def run_pipeline(
             structural,
             finalized,
             structural_barrier,
+            sampling,
             materialized_assets,
             assets_barrier,
             (page_network_manifest, image_network_manifest),
@@ -3755,6 +3885,7 @@ def run_pipeline(
             structural,
             finalized,
             structural_barrier,
+            sampling,
             page_result,
             planned,
             unique_jobs,
@@ -3817,6 +3948,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max_image_attempts_per_entity", type=int, default=3
     )
     parser.add_argument("--max_images_per_entity", type=int, default=3)
+    parser.add_argument("--sampled_entities_per_table", type=int, default=8)
+    parser.add_argument("--entity_sampling_seed", type=int, default=20260720)
+    parser.add_argument("--global_entity_budget", type=int)
     parser.add_argument("--min_free_disk_bytes", type=int, default=1_000_000_000)
     parser.add_argument("--selection_shard_tables", type=int, default=100)
     parser.add_argument("--records_per_shard", type=int, default=10_000)

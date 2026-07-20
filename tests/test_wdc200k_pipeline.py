@@ -55,7 +55,7 @@ URL_TELEMETRY_V2 = "wdc200k-url-telemetry-v2"
 UINT64_MAX = 2**64 - 1
 
 
-def _statistics_archive(input_dir: Path) -> Path:
+def _statistics_archive(input_dir: Path, *, rows: int = 2) -> Path:
     class_dir = input_dir / "Thing"
     class_dir.mkdir(parents=True)
     archive = class_dir / "Thing_statistics.zip"
@@ -65,12 +65,12 @@ def _statistics_archive(input_dir: Path) -> Path:
                 "table_statistics/"
                 f"Thing_October2023_statistics_{subset}.csv",
                 "host,number_of_rows,column_count,column_name_and_density\n"
-                f"{subset}.example,2,4,\n",
+                f"{subset}.example,{rows},5,\n",
             )
     return archive
 
 
-def _write_selected_table(input_dir: Path) -> None:
+def _write_selected_table(input_dir: Path, *, rows_count: int = 2) -> None:
     path = (
         input_dir
         / "Thing"
@@ -80,12 +80,14 @@ def _write_selected_table(input_dir: Path) -> None:
         {
             "name": "Alpha",
             "State": "Texas",
+            "Category": "Place",
             "page_url": "https://pages.example/shared",
             "image": "https://images.example/alpha.jpg",
         },
         {
             "name": "Beta",
             "State": "Ohio",
+            "Category": "Place",
             "page_url": "https://pages.example/shared",
             "image": [
                 "https://images.example/beta-1.jpg",
@@ -93,6 +95,20 @@ def _write_selected_table(input_dir: Path) -> None:
             ],
         },
     ]
+    rows.extend(
+        {
+            "name": name,
+            "State": state,
+            "Category": "Place",
+            "page_url": "https://pages.example/shared",
+            "image": "",
+        }
+        for name, state in (
+            ("Gamma", "Utah"),
+            ("Delta", "Maine"),
+            ("Epsilon", "Iowa"),
+        )[: max(0, rows_count - 2)]
+    )
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
@@ -124,6 +140,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert STAGES == (
         "selection",
         "structural",
+        "sampling",
         "pages",
         "asset_planning",
         "images",
@@ -608,7 +625,13 @@ class _PipelineExtractor:
     ) -> dict[str, Any]:
         assert "State" in candidates
         entity_name = str(entity["display_texts"][0])
-        value = {"Alpha": "Texas", "Beta": "Ohio"}[entity_name]
+        value = {
+            "Alpha": "Texas",
+            "Beta": "Ohio",
+            "Gamma": "Utah",
+            "Delta": "Maine",
+            "Epsilon": "Iowa",
+        }[entity_name]
         return {
             "attributes": [
                 {
@@ -623,8 +646,8 @@ class _PipelineExtractor:
 
 def _full_pipeline_config(tmp_path: Path) -> PipelineConfig:
     input_dir = tmp_path / "input"
-    _statistics_archive(input_dir)
-    _write_selected_table(input_dir)
+    _statistics_archive(input_dir, rows=5)
+    _write_selected_table(input_dir, rows_count=5)
     return PipelineConfig.from_args(
         parse_args(
             [
@@ -1630,8 +1653,7 @@ def test_run_pages_wires_nonzero_tracker_elapsed_through_reporter_restore(
     pipeline_module._run_pages(
         config,
         reporter,
-        (),
-        SimpleNamespace(manifest=tmp_path / "selection.json"),
+        SimpleNamespace(artifact_paths={"sampled_page_refs": ()}),
         object(),
     )
 

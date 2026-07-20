@@ -3182,6 +3182,8 @@ def adapt_model_tasks_from_manifests(
     args: argparse.Namespace,
     records_per_shard: int = 10_000,
     pre_write_guard: PreWriteGuard | None = None,
+    sampled_entity_paths: Iterable[Path] | None = None,
+    sampling_manifest: Path | None = None,
 ) -> AdaptedModelTasks:
     """Disk-index Task-3/Task-5 artifacts into authoritative model tasks."""
     if records_per_shard <= 0:
@@ -3259,6 +3261,11 @@ def adapt_model_tasks_from_manifests(
             if shard.path.startswith("entities/")
         )
 
+    if sampled_entity_paths is not None:
+        entity_paths = sorted(Path(path) for path in sampled_entity_paths)
+        if not entity_paths or any(not path.is_file() for path in entity_paths):
+            raise ValueError("sampled entity paths are missing")
+
     final_path = Path(finalized_selection_manifest)
     final_payload = _validated_complete_manifest(final_path)
     if (
@@ -3334,6 +3341,12 @@ def adapt_model_tasks_from_manifests(
         finalized_selection_manifest=final_path,
         assets_manifest=Path(assets_manifest),
     )
+    if sampling_manifest is not None:
+        input_fingerprint = stable_hash(
+            input_fingerprint,
+            _sha256_path(Path(sampling_manifest)),
+            length=40,
+        )
     output_root = Path(output_root)
     if pre_write_guard is not None:
         pre_write_guard(output_root, 0)
