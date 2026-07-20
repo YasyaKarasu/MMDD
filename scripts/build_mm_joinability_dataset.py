@@ -122,6 +122,207 @@ class SourceCandidateCounters:
     skip_reasons: Counter[str] = dataclass_field(default_factory=Counter)
 
 
+@dataclass(frozen=True)
+class CandidateDependencies:
+    entities: frozenset[str] = dataclass_field(default_factory=frozenset)
+    assets: frozenset[str] = dataclass_field(default_factory=frozenset)
+    paths: frozenset[Path] = dataclass_field(default_factory=frozenset)
+    urls: frozenset[str] = dataclass_field(default_factory=frozenset)
+    page_keys: frozenset[str] = dataclass_field(default_factory=frozenset)
+    imageinfo_keys: frozenset[str] = dataclass_field(default_factory=frozenset)
+    model_keys: frozenset[str] = dataclass_field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "entities",
+            "assets",
+            "paths",
+            "urls",
+            "page_keys",
+            "imageinfo_keys",
+            "model_keys",
+        ):
+            object.__setattr__(self, field_name, frozenset(getattr(self, field_name)))
+
+
+@dataclass
+class CacheCleanupStats:
+    entities_removed: int = 0
+    assets_removed: int = 0
+    page_records_removed: int = 0
+    imageinfo_records_removed: int = 0
+    model_records_removed: int = 0
+    image_files_removed: int = 0
+    image_bytes_removed: int = 0
+    shared_dependencies_protected: int = 0
+    errors: int = 0
+
+    def add(self, other: CacheCleanupStats) -> None:
+        for field_name in self.__dataclass_fields__:
+            setattr(self, field_name, getattr(self, field_name) + getattr(other, field_name))
+
+
+def compact_keyed_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class CandidateMaterialRegistry:
+    def __init__(
+        self,
+        *,
+        assets: dict[str, dict[str, Any]],
+        entity_to_assets: dict[str, list[str]],
+        wikipedia_client: Any,
+        extraction_cache: ExtractionCache,
+    ) -> None:
+        self.assets = assets
+        self.entity_to_assets = entity_to_assets
+        self.wikipedia_client = wikipedia_client
+        self.extraction_cache = extraction_cache
+        self.dependencies: dict[str, CandidateDependencies] = {}
+
+    def register(self, table_id: str, dependencies: CandidateDependencies) -> None:
+        self.dependencies[table_id] = dependencies
+
+    def _retained_dependencies(self) -> CandidateDependencies:
+        unions: dict[str, set[Any]] = {
+            "entities": set(),
+            "assets": set(),
+            "paths": set(),
+            "urls": set(),
+            "page_keys": set(),
+            "imageinfo_keys": set(),
+            "model_keys": set(),
+        }
+        for dependencies in self.dependencies.values():
+            for field_name, values in unions.items():
+                values.update(getattr(dependencies, field_name))
+        return CandidateDependencies(**unions)
+
+    @staticmethod
+    def _resolved_paths(paths: Iterable[Path]) -> set[Path]:
+        return {Path(path).expanduser().resolve() for path in paths}
+
+    def _unlink_exclusive_images(
+        self,
+        discarded: CandidateDependencies,
+        retained: CandidateDependencies,
+        removed_assets: Iterable[dict[str, Any]],
+        stats: CacheCleanupStats,
+    ) -> None:
+        retained_paths = self._resolved_paths(retained.paths)
+        retained_urls = set(retained.urls)
+        urls_by_path: dict[Path, set[str]] = defaultdict(set)
+        for asset in removed_assets:
+            local_path = clean_text(asset.get("local_path"))
+            source_url = clean_text(asset.get("image_url"))
+            if local_path:
+                urls_by_path[Path(local_path).expanduser().resolve()].add(source_url)
+
+        for path in sorted(self._resolved_paths(discarded.paths)):
+            source_urls = urls_by_path.get(path, set())
+            if path in retained_paths or any(url in retained_urls for url in source_urls if url):
+                continue
+            try:
+                byte_count = path.stat().st_size
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                stats.errors += 1
+                logging.warning("Failed to remove discarded candidate image %s: %s", path, exc)
+            else:
+                stats.image_files_removed += 1
+                stats.image_bytes_removed += byte_count
+
+    def _compact_caches(self, stats: CacheCleanupStats) -> None:
+        compactions = (
+            (
+                self.wikipedia_client.page_cache_path,
+                self.wikipedia_client.page_cache.values(),
+                "Wikipedia page",
+            ),
+            (
+                self.wikipedia_client.image_cache_path,
+                self.wikipedia_client.image_cache.values(),
+                "Wikipedia imageinfo",
+            ),
+            (self.extraction_cache.path, self.extraction_cache.items.values(), "model extraction"),
+        )
+        for path, records, label in compactions:
+            try:
+                compact_keyed_jsonl(path, records)
+            except OSError as exc:
+                stats.errors += 1
+                logging.warning("Failed to compact %s cache %s: %s", label, path, exc)
+
+    def discard(self, table_id: str) -> CacheCleanupStats:
+        discarded = self.dependencies.pop(table_id, None)
+        stats = CacheCleanupStats()
+        if discarded is None:
+            return stats
+        retained = self._retained_dependencies()
+        stats.shared_dependencies_protected = sum(
+            len(getattr(discarded, field_name) & getattr(retained, field_name))
+            for field_name in (
+                "entities",
+                "assets",
+                "paths",
+                "urls",
+                "page_keys",
+                "imageinfo_keys",
+                "model_keys",
+            )
+        )
+
+        for entity_id in discarded.entities - retained.entities:
+            if self.entity_to_assets.pop(entity_id, None) is not None:
+                stats.entities_removed += 1
+
+        exclusive_asset_ids = discarded.assets - retained.assets
+        removed_assets = []
+        for asset_id in exclusive_asset_ids:
+            asset = self.assets.pop(asset_id, None)
+            if asset is not None:
+                removed_assets.append(asset)
+                stats.assets_removed += 1
+        for entity_id, asset_ids in self.entity_to_assets.items():
+            self.entity_to_assets[entity_id] = [
+                asset_id for asset_id in asset_ids if asset_id not in exclusive_asset_ids
+            ]
+        self._unlink_exclusive_images(discarded, retained, removed_assets, stats)
+
+        for key in discarded.page_keys - retained.page_keys:
+            if self.wikipedia_client.page_cache.pop(key, None) is not None:
+                stats.page_records_removed += 1
+        for key in discarded.imageinfo_keys - retained.imageinfo_keys:
+            if self.wikipedia_client.image_cache.pop(key, None) is not None:
+                stats.imageinfo_records_removed += 1
+        with self.extraction_cache._lock:
+            for key in discarded.model_keys - retained.model_keys:
+                if self.extraction_cache.items.pop(key, None) is not None:
+                    stats.model_records_removed += 1
+
+        self._compact_caches(stats)
+        return stats
+
+    def sweep(self, final_table_ids: Iterable[str]) -> CacheCleanupStats:
+        retained_ids = set(final_table_ids)
+        total = CacheCleanupStats()
+        for table_id in list(self.dependencies):
+            if table_id not in retained_ids:
+                total.add(self.discard(table_id))
+        return total
+
+
 def replacement_policy_from_args(args: argparse.Namespace) -> ReplacementPolicy:
     rounds = int(args.unrecoverable_replacement_rounds)
     probability = float(args.unrecoverable_drop_probability)

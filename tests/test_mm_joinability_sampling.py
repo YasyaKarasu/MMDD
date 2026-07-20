@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -231,3 +232,197 @@ def test_exhausted_replacement_retains_failed_table_without_cleanup() -> None:
     assert selection.candidate_exhausted is True
     assert selection.unfilled_slots == 0
     assert discarded == []
+
+
+def write_keyed_cache(path: Path, key_name: str, keys: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps({key_name: key, "value": key}) + "\n" for key in keys),
+        encoding="utf-8",
+    )
+
+
+def cleanup_registry(tmp_path: Path) -> tuple[
+    builder.CandidateMaterialRegistry,
+    dict[str, dict[str, str]],
+    dict[str, list[str]],
+    SimpleNamespace,
+    builder.ExtractionCache,
+    Path,
+    Path,
+]:
+    exclusive_image = tmp_path / "exclusive.jpg"
+    shared_image = tmp_path / "shared.jpg"
+    exclusive_image.write_bytes(b"exclusive-image")
+    shared_image.write_bytes(b"shared-image")
+
+    page_path = tmp_path / "wikipedia" / "wiki_pages.jsonl"
+    image_path = tmp_path / "wikipedia" / "wiki_images.jsonl"
+    model_path = tmp_path / "model_attribute_extractions.jsonl"
+    write_keyed_cache(page_path, "wiki_title", ["Page A", "Page shared"])
+    write_keyed_cache(image_path, "file_title", ["File:A.jpg", "File:Shared.jpg"])
+    write_keyed_cache(model_path, "cache_key", ["model-a", "model-shared"])
+
+    wikipedia = SimpleNamespace(
+        page_cache_path=page_path,
+        image_cache_path=image_path,
+        page_cache={
+            "Page A": {"wiki_title": "Page A", "value": "Page A"},
+            "Page shared": {"wiki_title": "Page shared", "value": "Page shared"},
+        },
+        image_cache={
+            "File:A.jpg": {"file_title": "File:A.jpg", "value": "File:A.jpg"},
+            "File:Shared.jpg": {
+                "file_title": "File:Shared.jpg",
+                "value": "File:Shared.jpg",
+            },
+        },
+    )
+    model_cache = builder.ExtractionCache(model_path)
+    assets = {
+        "asset-a": {
+            "asset_id": "asset-a",
+            "local_path": str(exclusive_image),
+            "image_url": "https://images.example/a.jpg",
+        },
+        "asset-shared": {
+            "asset_id": "asset-shared",
+            "local_path": str(shared_image),
+            "image_url": "https://images.example/shared.jpg",
+        },
+    }
+    entity_to_assets = {
+        "entity-a": ["asset-a", "asset-shared"],
+        "entity-shared": ["asset-a", "asset-shared"],
+    }
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extraction_cache=model_cache,
+    )
+    registry.register(
+        "A",
+        builder.CandidateDependencies(
+            entities=frozenset({"entity-a", "entity-shared"}),
+            assets=frozenset({"asset-a", "asset-shared"}),
+            paths=frozenset({exclusive_image, shared_image}),
+            urls=frozenset(
+                {"https://images.example/a.jpg", "https://images.example/shared.jpg"}
+            ),
+            page_keys=frozenset({"Page A", "Page shared"}),
+            imageinfo_keys=frozenset({"File:A.jpg", "File:Shared.jpg"}),
+            model_keys=frozenset({"model-a", "model-shared"}),
+        ),
+    )
+    registry.register(
+        "B",
+        builder.CandidateDependencies(
+            entities=frozenset({"entity-shared"}),
+            assets=frozenset({"asset-shared"}),
+            paths=frozenset({shared_image}),
+            urls=frozenset({"https://images.example/shared.jpg"}),
+            page_keys=frozenset({"Page shared"}),
+            imageinfo_keys=frozenset({"File:Shared.jpg"}),
+            model_keys=frozenset({"model-shared"}),
+        ),
+    )
+    return (
+        registry,
+        assets,
+        entity_to_assets,
+        wikipedia,
+        model_cache,
+        exclusive_image,
+        shared_image,
+    )
+
+
+def test_discard_removes_exclusive_material_and_preserves_shared_dependencies(
+    tmp_path: Path,
+) -> None:
+    (
+        registry,
+        assets,
+        entity_to_assets,
+        wikipedia,
+        model_cache,
+        exclusive_image,
+        shared_image,
+    ) = cleanup_registry(tmp_path)
+    exclusive_bytes = exclusive_image.stat().st_size
+
+    stats = registry.discard("A")
+
+    assert assets == {"asset-shared": assets["asset-shared"]}
+    assert entity_to_assets == {"entity-shared": ["asset-shared"]}
+    assert wikipedia.page_cache.keys() == {"Page shared"}
+    assert wikipedia.image_cache.keys() == {"File:Shared.jpg"}
+    assert model_cache.items.keys() == {"model-shared"}
+    assert not exclusive_image.exists()
+    assert shared_image.exists()
+    assert stats == builder.CacheCleanupStats(
+        entities_removed=1,
+        assets_removed=1,
+        page_records_removed=1,
+        imageinfo_records_removed=1,
+        model_records_removed=1,
+        image_files_removed=1,
+        image_bytes_removed=exclusive_bytes,
+        shared_dependencies_protected=7,
+    )
+    assert [record["wiki_title"] for record in builder.iter_jsonl_records([wikipedia.page_cache_path])] == [
+        "Page shared"
+    ]
+    assert [record["file_title"] for record in builder.iter_jsonl_records([wikipedia.image_cache_path])] == [
+        "File:Shared.jpg"
+    ]
+    assert [record["cache_key"] for record in builder.iter_jsonl_records([model_cache.path])] == [
+        "model-shared"
+    ]
+
+
+def test_sweep_counts_unlink_error_and_continues_cache_compactions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        registry,
+        _assets,
+        _entity_to_assets,
+        wikipedia,
+        model_cache,
+        exclusive_image,
+        shared_image,
+    ) = cleanup_registry(tmp_path)
+    original_unlink = Path.unlink
+
+    def fail_exclusive_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == exclusive_image:
+            raise OSError("injected unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_exclusive_unlink)
+
+    stats = registry.sweep({"B"})
+
+    assert stats.page_records_removed == 1
+    assert stats.imageinfo_records_removed == 1
+    assert stats.model_records_removed == 1
+    assert stats.image_files_removed == 0
+    assert stats.image_bytes_removed == 0
+    assert stats.shared_dependencies_protected == 7
+    assert stats.errors == 1
+    assert exclusive_image.exists()
+    assert shared_image.exists()
+    assert wikipedia.page_cache.keys() == {"Page shared"}
+    assert wikipedia.image_cache.keys() == {"File:Shared.jpg"}
+    assert model_cache.items.keys() == {"model-shared"}
+    assert [record["wiki_title"] for record in builder.iter_jsonl_records([wikipedia.page_cache_path])] == [
+        "Page shared"
+    ]
+    assert [record["file_title"] for record in builder.iter_jsonl_records([wikipedia.image_cache_path])] == [
+        "File:Shared.jpg"
+    ]
+    assert [record["cache_key"] for record in builder.iter_jsonl_records([model_cache.path])] == [
+        "model-shared"
+    ]
