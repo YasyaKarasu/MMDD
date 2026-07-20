@@ -3191,7 +3191,10 @@ def adapt_model_tasks_from_manifests(
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be positive")
     import wdc200k_structural as structural
-    from wdc200k_sampling import validate_sampling_source_authority
+    from wdc200k_sampling import (
+        validate_sampling_artifacts,
+        validate_sampling_source_authority,
+    )
 
     structural_output_root = Path(structural_output_root)
     structural_paths = sorted(Path(path) for path in structural_manifests)
@@ -3223,6 +3226,11 @@ def adapt_model_tasks_from_manifests(
             Path(sampling_manifest),
             structural_output_root=structural_output_root,
         )
+        if sampling_manifest is not None
+        else None
+    )
+    sampled_authority = (
+        validate_sampling_artifacts(Path(sampling_manifest))
         if sampling_manifest is not None
         else None
     )
@@ -3287,6 +3295,13 @@ def adapt_model_tasks_from_manifests(
         entity_paths = sorted(Path(path) for path in sampled_entity_paths)
         if not entity_paths or any(not path.is_file() for path in entity_paths):
             raise ValueError("sampled entity paths are missing")
+        if sampled_authority is not None and tuple(
+            path.resolve() for path in entity_paths
+        ) != tuple(
+            path.resolve()
+            for path in sampled_authority.artifact_paths["sampled_entities"]
+        ):
+            raise ValueError("sampled entity paths do not match manifest authority")
     if compact_authority is not None:
         source_paths = list(compact_authority.source_tables)
 

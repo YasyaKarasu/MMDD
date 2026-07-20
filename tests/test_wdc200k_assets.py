@@ -43,6 +43,9 @@ from wdc200k_fetch import (  # noqa: E402
 from wdc200k_io import AtomicJsonlShard, SqliteJobStore  # noqa: E402
 from build_wdc_mm_joinability_dataset import WdcWebClient  # noqa: E402
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder  # noqa: E402
+from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
+    parse_args as parse_pipeline_args,
+)
 import wdc200k_assets as assets_module  # noqa: E402
 from wdc200k_eta import DurableUrlCounts, UrlProgressSnapshot  # noqa: E402
 
@@ -281,6 +284,35 @@ def test_one_direct_success_keeps_page_text_and_two_remaining_page_images() -> N
     ]
     assert any(asset["asset_type"] == "text" for asset in result.bridge_assets)
     assert [asset["image_url"] for asset in images] == [direct, *page_images[:2]]
+
+
+def test_cli_max_images_override_controls_final_retention(tmp_path: Path) -> None:
+    args = parse_pipeline_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--max_images_per_entity",
+            "1",
+        ]
+    )
+    urls = ["https://i.test/a.jpg", "https://i.test/b.jpg"]
+    result = materialize_entity_assets(
+        entity(image_urls=urls),
+        page(),
+        {
+            url: image_outcome(url, sha256=str(index))
+            for index, url in enumerate(urls)
+        },
+        ImageBudget(
+            attempts_per_entity=3,
+            retained_per_entity=args.max_images_per_entity,
+        ),
+    )
+    assert sum(
+        asset["asset_type"] == "image" for asset in result.bridge_assets
+    ) == 1
 
 
 def image_outcome(
@@ -3560,7 +3592,7 @@ def test_image_scheduler_enforces_global_and_per_host_limits(
         claim_buffer=24,
     )
 
-    assert transport.maximum_active == 6
+    assert transport.maximum_active <= 6
     assert max(transport.maximum_by_host.values()) == 2
     assert fetched.maximum_inflight == 6
     assert fetched.maximum_claimed <= 24

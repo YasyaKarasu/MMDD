@@ -457,11 +457,27 @@ def _validate_upstream(
         entities,
         structural_hashes,
     ) = _structural_inputs(inputs)
+    from wdc200k_sampling import validate_sampling_artifacts
+
+    sampled_authority = (
+        validate_sampling_artifacts(Path(inputs.sampling_manifest))
+        if inputs.sampling_manifest is not None
+        else None
+    )
     effective_page_ref_paths = (
         list(inputs.sampled_page_ref_paths)
         if inputs.sampled_page_ref_paths
         else page_ref_paths
     )
+    if sampled_authority is not None:
+        expected_entities = sampled_authority.artifact_paths["sampled_entities"]
+        expected_pages = sampled_authority.artifact_paths["sampled_page_refs"]
+        if tuple(path.resolve() for path in inputs.sampled_entity_paths) != tuple(
+            path.resolve() for path in expected_entities
+        ) or tuple(path.resolve() for path in effective_page_ref_paths) != tuple(
+            path.resolve() for path in expected_pages
+        ):
+            raise ValueError("sampled materialization paths do not match manifest authority")
     validation_root = Path(inputs.work_root) / "upstream-validation"
     page_snapshot = validate_complete_page_fetch(
         inputs.page_fetch_result,

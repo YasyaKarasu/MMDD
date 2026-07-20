@@ -101,6 +101,13 @@ class SamplingSourceAuthority:
     structural_manifest_sha256: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SamplingArtifactsAuthority:
+    artifact_paths: dict[str, tuple[Path, ...]]
+    counts: dict[str, int]
+    checksums: dict[str, tuple[str, ...]]
+
+
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -450,6 +457,12 @@ def validate_sampling_source_authority(
     )
     if len(manifests) != len(source_paths):
         raise ValueError("sampling compact source manifest count mismatch")
+    for manifest_path, record in zip(manifests, manifest_records):
+        if (
+            not manifest_path.is_file()
+            or _sha256_path(manifest_path) != str(record["sha256"])
+        ):
+            raise ValueError("sampling compact structural manifest checksum mismatch")
     return SamplingSourceAuthority(
         source_tables=tuple(source_paths),
         source_tables_count=total,
@@ -478,8 +491,105 @@ def _paths_from_manifest(manifest: StageManifest, root: Path) -> dict[str, tuple
     return {key: tuple(sorted(paths)) for key, paths in grouped.items()}
 
 
-def _result(root: Path, manifest: StageManifest) -> SamplingResult:
-    paths = _paths_from_manifest(manifest, root)
+def validate_sampling_artifacts(
+    sampling_manifest: Path,
+) -> SamplingArtifactsAuthority:
+    manifest_path = Path(sampling_manifest)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        payload.get("stage") != "wdc200k_entity_sampling"
+        or payload.get("schema_version") != SAMPLING_SCHEMA_VERSION
+        or payload.get("complete") is not True
+    ):
+        raise ValueError("sampling artifact manifest is incomplete")
+    root = manifest_path.parent
+    grouped: dict[str, list[tuple[CompletedShard, Path]]] = {
+        artifact: [] for artifact in ARTIFACTS
+    }
+    seen_paths: set[str] = set()
+    for raw in payload.get("completed_shards") or []:
+        completed = CompletedShard(
+            path=str(raw["path"]),
+            records=int(raw["records"]),
+            bytes=int(raw["bytes"]),
+            sha256=str(raw["sha256"]),
+        )
+        prefix = completed.path.split("/", 1)[0]
+        if prefix not in grouped or completed.path in seen_paths:
+            raise ValueError("sampling artifact set has unknown or duplicate shard")
+        seen_paths.add(completed.path)
+        if not validate_completed_shard(completed, root):
+            raise ValueError("sampling artifact checksum validation failed")
+        grouped[prefix].append((completed, root / completed.path))
+    shard_counts = {artifact: len(items) for artifact, items in grouped.items()}
+    compact = payload.get("compact_source_authority") or {}
+    expected_shards = len(compact.get("structural_manifests") or [])
+    if (
+        not shard_counts
+        or len(set(shard_counts.values())) != 1
+        or next(iter(shard_counts.values()), 0) == 0
+        or next(iter(shard_counts.values())) != expected_shards
+    ):
+        raise ValueError("sampling artifact set is incomplete")
+    totals = payload.get("totals") or {}
+    declared = [completed for items in grouped.values() for completed, _path in items]
+    if (
+        int(totals.get("shards", -1)) != len(declared)
+        or int(totals.get("records", -1))
+        != sum(item.records for item in declared)
+        or int(totals.get("bytes", -1)) != sum(item.bytes for item in declared)
+    ):
+        raise ValueError("sampling artifact declaration totals mismatch")
+    expected_names: set[str] | None = None
+    for items in grouped.values():
+        names = {path.name for _completed, path in items}
+        if expected_names is None:
+            expected_names = names
+        elif names != expected_names:
+            raise ValueError("sampling artifact set shard grouping mismatch")
+    return SamplingArtifactsAuthority(
+        artifact_paths={
+            artifact: tuple(path for _completed, path in sorted(items, key=lambda item: item[1]))
+            for artifact, items in grouped.items()
+        },
+        counts={
+            artifact: sum(completed.records for completed, _path in items)
+            for artifact, items in grouped.items()
+        },
+        checksums={
+            artifact: tuple(
+                completed.sha256
+                for completed, _path in sorted(items, key=lambda item: item[1])
+            )
+            for artifact, items in grouped.items()
+        },
+    )
+
+
+def validate_sampling_consumed_paths(
+    sampling_manifest: Path,
+    supplied_paths: Mapping[str, Sequence[Path]],
+) -> SamplingArtifactsAuthority:
+    authority = validate_sampling_artifacts(sampling_manifest)
+    if set(supplied_paths) != set(ARTIFACTS):
+        raise ValueError("sampling consumed paths do not match manifest authority")
+    for artifact, expected in authority.artifact_paths.items():
+        supplied = tuple(Path(path).resolve() for path in supplied_paths[artifact])
+        if supplied != tuple(path.resolve() for path in expected):
+            raise ValueError("sampling consumed paths do not match manifest authority")
+    return authority
+
+
+def _result(
+    root: Path,
+    manifest: StageManifest,
+    authority: SamplingArtifactsAuthority | None = None,
+) -> SamplingResult:
+    paths = (
+        authority.artifact_paths
+        if authority is not None
+        else _paths_from_manifest(manifest, root)
+    )
     eligible = 0
     rejected = 0
     for path in paths["prefilter_tables"]:
@@ -532,6 +642,7 @@ def _source_record_count(manifest_path: Path) -> int:
 def _validate_sampling_closure(
     result: SamplingResult,
     structural_manifests: Sequence[Path],
+    structural_output_root: Path,
 ) -> None:
     expected_shards = len(structural_manifests)
     if any(
@@ -540,6 +651,32 @@ def _validate_sampling_closure(
     ):
         raise ValueError("sampling closure artifact shard set is incomplete")
     for index, structural_manifest in enumerate(structural_manifests):
+        structural_payload = json.loads(
+            structural_manifest.read_text(encoding="utf-8")
+        )
+        source_item = next(
+            item
+            for item in structural_payload["completed_shards"]
+            if str(item["path"]).startswith("source_tables/")
+        )
+        source_tables = list(
+            _iter_jsonl(Path(structural_output_root) / str(source_item["path"]))
+        )
+        source_rows: dict[tuple[str, Any], tuple[int, str]] = {}
+        source_table_ids: set[str] = set()
+        for source_table in source_tables:
+            table_id = str(source_table["source_table_id"])
+            source_table_ids.add(table_id)
+            entity_column = join_builder.choose_entity_column(source_table)
+            if entity_column is None:
+                continue
+            for fallback, row in enumerate(source_table.get("rows") or []):
+                row_id = row.get("row_id", fallback)
+                cell = join_builder.get_cell(row, entity_column)
+                source_rows[(table_id, row_id)] = (
+                    entity_column,
+                    clean_text(cell.get("wiki_title")),
+                )
         entities = list(
             _iter_jsonl(result.artifact_paths["sampled_entities"][index])
         )
@@ -553,8 +690,26 @@ def _validate_sampling_closure(
         for entity in entities:
             entity_id = str(entity["entity_id"])
             table_id = str(entity["source_table_id"])
+            row_id = entity["source_row_id"]
             if entity_id in sampled_ids:
                 raise ValueError("sampling closure has duplicate sampled entity")
+            expected = source_rows.get((table_id, row_id))
+            appearances = entity.get("appears_in") or []
+            if expected is None:
+                raise ValueError("sampling closure entity source row is missing")
+            expected_entity_id = (
+                f"ent_{stable_hash(expected[1], length=16)}"
+            )
+            if entity_id != expected_entity_id:
+                raise ValueError("sampling closure entity identity mismatch")
+            if (
+                clean_text(entity.get("wiki_title")) != expected[1]
+                or len(appearances) != 1
+                or str(appearances[0].get("source_table_id")) != table_id
+                or appearances[0].get("row_id") != row_id
+                or int(appearances[0].get("column_index", -1)) != expected[0]
+            ):
+                raise ValueError("sampling closure entity wiki/appearance mismatch")
             sampled_ids[entity_id] = table_id
             sampled_by_table[table_id] += 1
         decision_ids: set[str] = set()
@@ -565,6 +720,8 @@ def _validate_sampling_closure(
             decision_ids.add(table_id)
             if int(decision["sampled_entities"]) != sampled_by_table.get(table_id, 0):
                 raise ValueError("sampling closure decision/entity count mismatch")
+        if decision_ids != source_table_ids:
+            raise ValueError("sampling closure decision/source identity mismatch")
         for artifact in ("sampled_page_refs", "sampled_direct_image_refs"):
             for reference in _iter_jsonl(result.artifact_paths[artifact][index]):
                 entity_id = str(reference["entity_id"])
@@ -607,8 +764,13 @@ def sample_structural_artifacts(
             validate_completed_shard(shard, output_root) for shard in manifest.completed_shards
         ):
             raise ValueError("completed sampling manifest failed shard validation")
-        completed_result = _result(output_root, manifest)
-        _validate_sampling_closure(completed_result, manifests)
+        artifact_authority = validate_sampling_artifacts(manifest.path)
+        completed_result = _result(output_root, manifest, artifact_authority)
+        _validate_sampling_closure(
+            completed_result,
+            manifests,
+            structural_output_root,
+        )
         validate_sampling_source_authority(
             manifest.path,
             structural_output_root=structural_output_root,
@@ -721,7 +883,7 @@ def sample_structural_artifacts(
                     writer.abort()
                 raise
         current = _result(output_root, manifest)
-        _validate_sampling_closure(current, manifests)
+        _validate_sampling_closure(current, manifests, structural_output_root)
         policy.validate_budget(
             eligible_tables=current.eligible_tables,
             sampled_entities=current.sampled_entities,
@@ -733,7 +895,8 @@ def sample_structural_artifacts(
         )
     except BaseException:
         raise
-    return _result(output_root, manifest)
+    artifact_authority = validate_sampling_artifacts(manifest.path)
+    return _result(output_root, manifest, artifact_authority)
 
 
 def iter_sampled_records(

@@ -91,6 +91,7 @@ from wdc200k_sampling import (
     SamplingPolicy,
     SamplingResult,
     sample_structural_artifacts,
+    validate_sampling_consumed_paths,
     validate_sampling_source_authority,
 )
 from wdc200k_selection import (
@@ -3111,7 +3112,11 @@ class _EpochElapsedNormalizer:
 def _page_refs(
     sampling: SamplingResult,
 ) -> Iterator[dict[str, Any]]:
-    for path in sampling.artifact_paths["sampled_page_refs"]:
+    authority = validate_sampling_consumed_paths(
+        sampling.manifest_path,
+        sampling.artifact_paths,
+    )
+    for path in authority.artifact_paths["sampled_page_refs"]:
         yield from _iter_jsonl(path)
 
 
