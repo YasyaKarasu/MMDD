@@ -38,6 +38,7 @@ from run_mm_joinability_dynamic_vllm import (
     default_vllm_extra_args,
     main as dynamic_vllm_main,
     parse_args as parse_dynamic_vllm_args,
+    read_pending_model_task_count,
     start_server,
 )
 
@@ -976,6 +977,66 @@ def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
     assert events.count("server_started") == 2
 
 
+def test_dynamic_vllm_skips_servers_for_zero_runner_startup_count_in_round_mode(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "text_task_count": 0,
+                            "image_task_count": 0,
+                            "round_mode": True,
+                            "runner_startup_task_count": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                events.append("server_started")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.start_server",
+        lambda _server: pytest.fail("zero-target round must not start model servers"),
+    )
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events == ["builder_started"]
+
+
 def test_model_start_marker_can_signal_round_mode(tmp_path):
     marker = tmp_path / "model_start.json"
 
@@ -1003,6 +1064,7 @@ def test_round_mode_start_marker_requests_services_without_inflating_actual_coun
     assert payload["runner_startup_task_count"] > 0
     assert payload["text_task_count"] == 0
     assert payload["image_task_count"] == 0
+    assert read_pending_model_task_count(marker) == payload["runner_startup_task_count"]
 
 
 def test_candidate_rounds_defer_done_markers_until_accumulated_work_finishes(
@@ -1386,6 +1448,108 @@ def test_resolve_extraction_tasks_does_not_cache_failed_model_outputs(tmp_path):
     assert records[0][1]["error"]
     assert cache.get(task.cache_key) is None
     assert not (tmp_path / "model_cache.jsonl").exists() or not (tmp_path / "model_cache.jsonl").read_text(encoding="utf-8").strip()
+
+
+def test_failed_precompute_result_is_reused_during_table_evaluation_only(tmp_path):
+    calls = 0
+
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("model unavailable")
+
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    args.model_attribute_errors_path = str(tmp_path / "model_attribute_errors.jsonl")
+    source_table = {
+        "source_table_id": "src",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "State"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": "Alpha",
+                        "wiki_title": "Alpha",
+                    },
+                    {"column_index": 1, "column_name": "State", "text": "Alabama"},
+                ],
+            }
+        ],
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    assets = {
+        "asset_text": {
+            "asset_id": "asset_text",
+            "asset_type": "text",
+            "content": "Alpha is in Alabama.",
+        }
+    }
+    entity_to_assets = {"entity_alpha": ["asset_text"]}
+    wiki_to_entity_id = {"Alpha": "entity_alpha"}
+    tasks = joinability_dataset.collect_table_extraction_tasks(
+        source_table=source_table,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        args=args,
+    )
+    cache_path = tmp_path / "model_attribute_extractions.jsonl"
+    cache = ExtractionCache(cache_path)
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=1, cached_keys=set(), enabled=False
+    )
+
+    counts = precompute_extraction_task_groups(
+        extractor=FakeExtractor(),
+        cache=cache,
+        tasks_by_kind={"text": tasks},
+        args=args,
+        state=state,
+        progress=progress,
+        write_done_markers=False,
+    )
+    joinability_dataset.build_table_join_records(
+        source_table=source_table,
+        split="candidate",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=FakeExtractor(),
+        cache=cache,
+        progress=progress,
+        concurrency_state=state,
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=joinability_dataset.ListRecordWriter(),
+        args=args,
+    )
+
+    assert counts == {"text": 1}
+    assert calls == 1
+    assert progress.model == 1
+    assert progress.errors == 1
+    assert not cache_path.exists() or not cache_path.read_text(encoding="utf-8").strip()
+    assert len(
+        (tmp_path / "model_attribute_errors.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ) == 1
+    assert tasks_requiring_model_analysis(
+        tasks, ExtractionCache(cache_path), args
+    ) == tasks
 
 
 def test_resolve_extraction_tasks_writes_failed_model_outputs_to_error_log(tmp_path):

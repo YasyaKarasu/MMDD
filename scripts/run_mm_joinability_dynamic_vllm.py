@@ -211,9 +211,16 @@ def read_pending_model_task_count(path: Path) -> int | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
-    if isinstance(payload, dict) and payload.get("round_mode") is True:
+    if not isinstance(payload, dict):
         return None
-    if not isinstance(payload, dict) or not {
+    if "runner_startup_task_count" in payload:
+        try:
+            return max(0, int(payload["runner_startup_task_count"]))
+        except (TypeError, ValueError):
+            return None
+    if payload.get("round_mode") is True:
+        return None
+    if not {
         "text_task_count",
         "image_task_count",
     }.issubset(payload):

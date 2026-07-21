@@ -1264,6 +1264,7 @@ class ExtractionCache:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.items: dict[str, dict[str, Any]] = {}
+        self.transient_items: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         if reuse and path.exists():
             for record in iter_jsonl_records([path]):
@@ -1275,11 +1276,19 @@ class ExtractionCache:
         with self._lock:
             return self.items.get(key)
 
+    def get_transient(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self.transient_items.get(key)
+
     def put(self, key: str, record: dict[str, Any]) -> None:
         with self._lock:
             self.items[key] = record
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def put_transient(self, key: str, record: dict[str, Any]) -> None:
+        with self._lock:
+            self.transient_items[key] = record
 
 
 class ModelAnalysisProgress:
@@ -1604,6 +1613,8 @@ def tasks_requiring_model_analysis(
         if task.cache_key in seen:
             continue
         seen.add(task.cache_key)
+        if cache.get_transient(task.cache_key) is not None:
+            continue
         cached = cache.get(task.cache_key)
         if cached:
             cached_record = cached
@@ -1645,6 +1656,15 @@ def resolve_extraction_tasks(
     for task in tasks:
         if task.cache_key in resolved_by_key or task.cache_key in uncached_by_key:
             continue
+        transient = cache.get_transient(task.cache_key)
+        if transient is not None:
+            resolved_by_key[task.cache_key] = transient
+            if progress is not None:
+                progress.mark(
+                    task.cache_key,
+                    "error" if clean_text(transient.get("error")) else "model",
+                )
+            continue
         cached = cache.get(task.cache_key)
         if cached:
             cached_record = cached
@@ -1668,6 +1688,8 @@ def resolve_extraction_tasks(
         has_error = bool(clean_text(record.get("error")))
         if not has_error or getattr(args, "cache_failed_model_outputs", False):
             cache.put(cache_key, record)
+        else:
+            cache.put_transient(cache_key, record)
         if has_error:
             append_model_error_record(getattr(args, "model_attribute_errors_path", ""), record)
         if progress is not None:
@@ -2286,6 +2308,14 @@ def extract_asset_attributes(
         asset_type=str(asset.get("asset_type")),
         args=args,
     )
+    transient = cache.get_transient(cache_key)
+    if transient is not None:
+        if progress is not None:
+            progress.mark(
+                cache_key,
+                "error" if clean_text(transient.get("error")) else "model",
+            )
+        return transient
     cached = cache.get(cache_key)
     if cached:
         cached_record = cached
@@ -2320,6 +2350,8 @@ def extract_asset_attributes(
     }
     if not record["error"] or getattr(args, "cache_failed_model_outputs", False):
         cache.put(cache_key, record)
+    else:
+        cache.put_transient(cache_key, record)
     if progress is not None:
         progress.mark(cache_key, "error" if record["error"] else "model")
     return record
