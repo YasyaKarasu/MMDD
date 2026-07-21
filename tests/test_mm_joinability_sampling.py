@@ -226,6 +226,53 @@ def test_failed_slot_replaces_twice_then_retains_at_limit() -> None:
     assert discarded == ["t0", "t2"]
 
 
+def test_model_start_waits_for_initial_batch_preparation() -> None:
+    tables = replacement_tables()[:3]
+    events: list[str] = []
+
+    def table_ids(batch: list[dict[str, str]]) -> str:
+        return ",".join(table["source_table_id"] for table in batch)
+
+    def start_after_preparation(initial_batch: list[dict[str, str]]) -> None:
+        events.append(f"prepare:{table_ids(initial_batch)}")
+        events.append("start")
+
+    def evaluate_batch(
+        batch: list[dict[str, str]],
+    ) -> list[builder.CandidateEvaluation]:
+        ids = table_ids(batch)
+        if events[-1] != "start":
+            events.append(f"prepare:{ids}")
+        events.append(f"evaluate:{ids}")
+        return [
+            builder.CandidateEvaluation(
+                source_table=table,
+                queryable=table["source_table_id"] != "t0",
+                decision={},
+            )
+            for table in batch
+        ]
+
+    builder.run_replacement_rounds(
+        candidate_tables=iter(tables),
+        target_count=2,
+        policy=builder.ReplacementPolicy(rounds=1, drop_probability=1.0),
+        rng=StubRandom([0.0]),
+        evaluate_batch=evaluate_batch,
+        discard_tables=lambda _table_ids: None,
+        on_initial_batch=start_after_preparation,
+    )
+
+    assert events == [
+        "prepare:t0,t1",
+        "start",
+        "evaluate:t0,t1",
+        "prepare:t2",
+        "evaluate:t2",
+    ]
+    assert events.count("start") == 1
+
+
 def test_replacement_round_flushes_discarded_tables_as_one_batch() -> None:
     discarded_batches: list[list[str]] = []
 

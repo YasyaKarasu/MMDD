@@ -439,6 +439,21 @@ def _ensure_candidate_assets(
         imageinfo_keys_accessed.update(entity_imageinfo_keys)
 
 
+def prepare_candidate_batch(
+    source_tables: list[dict[str, Any]],
+    context: CandidateEvaluationContext,
+    args: argparse.Namespace,
+) -> None:
+    for source_table in source_tables:
+        update_entities_from_table(
+            context.entity_records, context.wiki_to_entity_id, source_table
+        )
+        entity_ids = _eligible_candidate_entity_ids(
+            _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
+        )
+        _ensure_candidate_assets(entity_ids, context, args, set())
+
+
 def _candidate_dependencies(
     *,
     entity_ids: set[str],
@@ -637,6 +652,7 @@ def run_replacement_rounds(
     rng: Any,
     evaluate_batch: Callable[[list[dict[str, Any]]], list[CandidateEvaluation]],
     discard_tables: Callable[[list[str]], None],
+    on_initial_batch: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> ReplacementSelection:
     if target_count < 0:
         raise ValueError("target count must be non-negative")
@@ -649,6 +665,9 @@ def run_replacement_rounds(
         except StopIteration:
             candidate_exhausted = True
             break
+
+    if on_initial_batch is not None:
+        on_initial_batch(slot_tables)
 
     candidates_consumed = len(slot_tables)
     replacement_counts = [0] * len(slot_tables)
@@ -2999,16 +3018,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         target_count = len(all_candidates)
     else:
         target_count = args.max_source_tables
-    write_model_start_marker(
-        clean_text(getattr(args, "model_start_marker", "")),
-        text_task_count=0,
-        image_task_count=0,
-        round_mode=True,
-        round_mode_requires_services=target_count > 0,
-    )
-    wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
-    extractor: LocalAttributeExtractor | None = LocalAttributeExtractor(args)
-
     candidate_entity_records: dict[str, dict[str, Any]] = {}
     candidate_wiki_to_entity_id: dict[str, str] = {}
     assets: dict[str, dict[str, Any]] = {}
@@ -3019,6 +3028,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         wikipedia_client=wikipedia_client,
         extraction_cache=cache,
     )
+    extractor: LocalAttributeExtractor | None = None
     evaluation_context = CandidateEvaluationContext(
         entity_records=candidate_entity_records,
         wiki_to_entity_id=candidate_wiki_to_entity_id,
@@ -3032,6 +3042,25 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         registry=registry,
         max_entities=args.max_entities,
     )
+
+    def start_models_after_initial_preparation(
+        initial_batch: list[dict[str, Any]],
+    ) -> None:
+        nonlocal extractor
+        prepare_candidate_batch(initial_batch, evaluation_context, args)
+        write_model_start_marker(
+            clean_text(getattr(args, "model_start_marker", "")),
+            text_task_count=0,
+            image_task_count=0,
+            round_mode=True,
+            round_mode_requires_services=bool(initial_batch),
+        )
+        wait_for_model_ready_marker(
+            clean_text(getattr(args, "model_ready_marker", ""))
+        )
+        extractor = LocalAttributeExtractor(args)
+        evaluation_context.extractor = extractor
+
     cleanup_totals = CacheCleanupStats()
     selection_rng = random.Random(int(stable_hash("replacement", args.seed), 16))
     try:
@@ -3046,6 +3075,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             discard_tables=lambda table_ids: cleanup_totals.add(
                 evaluation_context.registry.discard_many(table_ids)
             ),
+            on_initial_batch=start_models_after_initial_preparation,
         )
         final_source_tables = [
             item.source_table for item in selection.final_evaluations
