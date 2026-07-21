@@ -444,7 +444,17 @@ def prepare_candidate_batch(
     context: CandidateEvaluationContext,
     args: argparse.Namespace,
 ) -> None:
-    for source_table in source_tables:
+    source_table_iterator: Iterable[dict[str, Any]] = source_tables
+    if tqdm is not None:
+        source_table_iterator = tqdm(
+            source_table_iterator,
+            total=len(source_tables),
+            desc="Preparing initial candidate materials",
+            unit="table",
+            dynamic_ncols=True,
+            disable=not args.model_progress,
+        )
+    for source_table in source_table_iterator:
         update_entities_from_table(
             context.entity_records, context.wiki_to_entity_id, source_table
         )
@@ -452,6 +462,10 @@ def prepare_candidate_batch(
             _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
         )
         _ensure_candidate_assets(entity_ids, context, args, set())
+        if tqdm is not None:
+            source_table_iterator.set_postfix(  # type: ignore[attr-defined]
+                eligible_entities=len(context.eligible_entity_ids)
+            )
 
 
 def _candidate_dependencies(
@@ -618,7 +632,17 @@ def iter_random_source_tables(
         key=lambda path: path.relative_to(input_dir).as_posix(),
     )
     rng.shuffle(json_files)
-    for json_file in json_files:
+    json_file_iterator: Iterable[Path] = json_files
+    if tqdm is not None:
+        json_file_iterator = tqdm(
+            json_file_iterator,
+            total=len(json_files),
+            desc="Reading randomized EntiTables JSON",
+            unit="file",
+            dynamic_ncols=True,
+            disable=not args.model_progress,
+        )
+    for json_file in json_file_iterator:
         payload = read_entitables_json(json_file)
         if payload is None:
             counters.skipped_tables += 1

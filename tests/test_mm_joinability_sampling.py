@@ -20,6 +20,24 @@ class StubRandom:
         return next(self.draws)
 
 
+class TqdmSpy:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, iterable, **kwargs: object):
+        call = {"iterable": iterable, "postfixes": [], **kwargs}
+        self.calls.append(call)
+
+        class SpyBar:
+            def __iter__(self):
+                return iter(iterable)
+
+            def set_postfix(self, **postfix: object) -> None:
+                call["postfixes"].append(postfix)
+
+        return SpyBar()
+
+
 def replacement_tables() -> list[dict[str, str]]:
     return [{"source_table_id": f"t{index}"} for index in range(5)]
 
@@ -81,6 +99,90 @@ def candidate_ids(input_dir: Path, seed: int) -> list[str]:
         table["source_table_id"]
         for table in builder.iter_random_source_tables(input_dir, args, counters)
     ]
+
+
+def exercise_preparation_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    no_model_progress: bool,
+) -> TqdmSpy:
+    spy = TqdmSpy()
+    monkeypatch.setattr(builder, "tqdm", spy)
+    args_list = [
+        "--input_dir",
+        str(tmp_path),
+        "--output_dir",
+        str(tmp_path / "out"),
+    ]
+    if no_model_progress:
+        args_list.append("--no_model_progress")
+    args = builder.parse_args(args_list)
+
+    write_entitables_file(tmp_path / "a.json", ["a_table"])
+    write_entitables_file(tmp_path / "b.json", ["b_table"])
+    list(builder.iter_random_source_tables(tmp_path, args, builder.SourceCandidateCounters()))
+
+    source_tables = [
+        {"source_table_id": "first", "entity_ids": {"e1"}},
+        {"source_table_id": "second", "entity_ids": {"e2", "e3"}},
+    ]
+    context = SimpleNamespace(
+        eligible_entity_ids=set(), entity_records={}, max_entities=None
+    )
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+    monkeypatch.setattr(
+        builder,
+        "_candidate_entity_ids",
+        lambda table, _wiki_to_entity_id: table["entity_ids"],
+    )
+    monkeypatch.setattr(builder, "_ensure_candidate_assets", lambda *_args: None)
+    context.wiki_to_entity_id = {}
+    builder.prepare_candidate_batch(source_tables, context, args)
+    return spy
+
+
+def test_preparation_progress_reports_totals_and_eligible_entities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spy = exercise_preparation_progress(
+        tmp_path, monkeypatch, no_model_progress=False
+    )
+
+    assert [
+        {
+            "desc": call["desc"],
+            "total": call["total"],
+            "unit": call["unit"],
+            "disable": call["disable"],
+        }
+        for call in spy.calls
+    ] == [
+        {
+            "desc": "Reading randomized EntiTables JSON",
+            "total": 2,
+            "unit": "file",
+            "disable": False,
+        },
+        {
+            "desc": "Preparing initial candidate materials",
+            "total": 2,
+            "unit": "table",
+            "disable": False,
+        },
+    ]
+    assert spy.calls[1]["postfixes"] == [
+        {"eligible_entities": 1},
+        {"eligible_entities": 3},
+    ]
+
+
+def test_no_model_progress_disables_preparation_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spy = exercise_preparation_progress(tmp_path, monkeypatch, no_model_progress=True)
+
+    assert [call["disable"] for call in spy.calls] == [True, True]
 
 
 def test_replacement_policy_defaults(tmp_path: Path) -> None:
