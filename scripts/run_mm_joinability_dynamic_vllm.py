@@ -416,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if read_pending_model_task_count(model_start_marker) == 0:
+            write_ready_marker(model_ready_marker)
             return int(builder_proc.wait())
 
         text_proc = start_server(text_server)

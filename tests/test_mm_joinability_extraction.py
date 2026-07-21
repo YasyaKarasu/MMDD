@@ -989,6 +989,9 @@ def test_dynamic_vllm_skips_servers_for_zero_runner_startup_count_in_round_mode(
             self._poll = None
             if command[0] == "/usr/bin/python":
                 events.append("builder_started")
+                self.ready_marker = Path(
+                    command[command.index("--model_ready_marker") + 1]
+                )
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
@@ -1009,6 +1012,7 @@ def test_dynamic_vllm_skips_servers_for_zero_runner_startup_count_in_round_mode(
             return self._poll
 
         def wait(self, timeout=None):
+            assert self.ready_marker.exists(), "builder remains blocked without ready marker"
             self._poll = 0
             return 0
 
