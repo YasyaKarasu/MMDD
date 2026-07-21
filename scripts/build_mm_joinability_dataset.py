@@ -453,7 +453,7 @@ def prepare_candidate_batch(
         source_table_iterator = tqdm(
             source_table_iterator,
             total=len(source_tables),
-            desc="Preparing initial candidate materials",
+            desc="Preparing candidate batch materials",
             unit="table",
             dynamic_ncols=True,
             disable=not args.model_progress,
@@ -503,6 +503,7 @@ def prepare_candidate_batch(
                 wikipedia_client=context.wikipedia_client,
                 asset_writer=writer,
                 flush_every_records=args.flush_every_records,
+                show_progress=args.model_progress,
             )
         )
 

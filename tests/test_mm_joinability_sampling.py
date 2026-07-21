@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_mm_joinability_dataset as builder
+import build_mm_table_dataset as table_builder
 
 
 class StubRandom:
@@ -221,7 +222,7 @@ def test_preparation_progress_reports_totals_and_eligible_entities(
             "disable": False,
         },
         {
-            "desc": "Preparing initial candidate materials",
+            "desc": "Preparing candidate batch materials",
             "total": 2,
             "unit": "table",
             "disable": False,
@@ -239,6 +240,113 @@ def test_no_model_progress_disables_preparation_progress(
     spy = exercise_preparation_progress(tmp_path, monkeypatch, no_model_progress=True)
 
     assert [call["disable"] for call in spy.calls] == [True, True, True]
+
+
+def test_no_model_progress_suppresses_batch_helper_internal_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--no_model_progress",
+        ]
+    )
+    monkeypatch.setattr(builder, "tqdm", None)
+    monkeypatch.setattr(
+        table_builder,
+        "tqdm",
+        lambda *_args, **_kwargs: pytest.fail(
+            "batch helper emitted progress with --no_model_progress"
+        ),
+    )
+
+    class FakeWikipediaClient:
+        api_failures = 0
+
+        def __init__(self) -> None:
+            self.page_cache: dict[str, dict[str, object]] = {}
+            self.image_cache: dict[str, dict[str, object]] = {}
+
+        def get_pages(self, wiki_titles: object) -> dict[str, dict[str, object]]:
+            pages = {
+                str(title): {
+                    "wiki_title": str(title),
+                    "images": [{"title": f"File:{title}.jpg"}],
+                }
+                for title in wiki_titles
+            }
+            self.page_cache.update(pages)
+            return pages
+
+        def get_imageinfos(self, file_titles: object) -> dict[str, dict[str, object]]:
+            return {
+                str(title): {
+                    "file_title": str(title),
+                    "url": f"https://images.example/{title}",
+                }
+                for title in file_titles
+            }
+
+        def download_image(
+            self, _imageinfo: object, asset_id: str
+        ) -> dict[str, object]:
+            return {
+                "local_path": str(tmp_path / f"{asset_id}.jpg"),
+                "relative_path": f"{asset_id}.jpg",
+                "file_name": f"{asset_id}.jpg",
+                "bytes": 1,
+                "sha256": "sha",
+                "downloaded": True,
+            }
+
+    wikipedia = FakeWikipediaClient()
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extraction_cache=cache,
+    )
+    context = builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=SimpleNamespace(),
+        registry=registry,
+    )
+    tables = [
+        {
+            "source_table_id": "batch",
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": index,
+                            "column_name": "Entity",
+                            "text": title,
+                            "wiki_title": title,
+                        }
+                        for index, title in enumerate(("Page A", "Page B"))
+                    ],
+                }
+            ],
+        }
+    ]
+
+    builder.prepare_candidate_batch(tables, context, args)
+
+    assert len(assets) == 2
 
 
 def test_replacement_policy_defaults(tmp_path: Path) -> None:
