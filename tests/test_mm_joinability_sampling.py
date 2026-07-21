@@ -24,8 +24,14 @@ class TqdmSpy:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def __call__(self, iterable, **kwargs: object):
-        call = {"iterable": iterable, "postfixes": [], **kwargs}
+    def __call__(self, iterable=None, **kwargs: object):
+        call = {
+            "iterable": iterable,
+            "postfixes": [],
+            "updates": [],
+            "closed": False,
+            **kwargs,
+        }
         self.calls.append(call)
 
         class SpyBar:
@@ -34,6 +40,12 @@ class TqdmSpy:
 
             def set_postfix(self, **postfix: object) -> None:
                 call["postfixes"].append(postfix)
+
+            def update(self, amount: int = 1) -> None:
+                call["updates"].append(amount)
+
+            def close(self) -> None:
+                call["closed"] = True
 
         return SpyBar()
 
@@ -384,6 +396,97 @@ def test_global_sample_is_reproducible_seeded_and_enumeration_invariant(
 
     assert first == reversed_enumeration == repeated
     assert first != alternate_seed
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["file_read", "missing_table", "parse_failure"],
+)
+def test_global_rematerialization_fails_fast_without_changing_scan_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    json_file = tmp_path / "a.json"
+    write_entitables_file(json_file, ["a_table"])
+    real_read = builder.read_entitables_json
+    real_parse = builder.parse_source_table
+    read_count = 0
+    parse_count = 0
+
+    def sabotaged_read(path: Path):
+        nonlocal read_count
+        read_count += 1
+        if read_count == 2:
+            if failure_mode == "file_read":
+                return None
+            if failure_mode == "missing_table":
+                return {}
+        return real_read(path)
+
+    def sabotaged_parse(*args, **kwargs):
+        nonlocal parse_count
+        parse_count += 1
+        if failure_mode == "parse_failure" and parse_count == 2:
+            return SimpleNamespace(source_table=None, skip_reason="too_few_rows")
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(builder, "read_entitables_json", sabotaged_read)
+    monkeypatch.setattr(builder, "parse_source_table", sabotaged_parse)
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "1",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    counters = builder.SourceCandidateCounters()
+
+    with pytest.raises(RuntimeError, match=r"a\.json.*a_table"):
+        list(builder.iter_random_source_tables(tmp_path, args, counters))
+
+    assert counters.processed_tables == 1
+    assert counters.skipped_tables == 0
+    assert counters.skip_reasons == {}
+
+
+def test_global_materialization_progress_updates_before_yield_and_closes_on_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_entitables_file(tmp_path / "a.json", [f"table_{idx}" for idx in range(4)])
+    spy = TqdmSpy()
+    monkeypatch.setattr(builder, "tqdm", spy)
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "2",
+            "--unrecoverable_replacement_rounds",
+            "1",
+        ]
+    )
+    candidates = builder.iter_random_source_tables(
+        tmp_path, args, builder.SourceCandidateCounters()
+    )
+
+    initial_chunk = [next(candidates), next(candidates)]
+
+    assert len(initial_chunk) == 2
+    materialization_call = spy.calls[1]
+    assert materialization_call["updates"] == [1]
+    assert materialization_call["closed"] is False
+
+    candidates.close()
+
+    assert materialization_call["closed"] is True
 
 
 def test_queryable_table_never_draws_or_replaces() -> None:

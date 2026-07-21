@@ -715,46 +715,61 @@ def iter_random_source_tables(
         return
 
     chunk_size = args.max_source_tables or len(selected_refs)
-    chunk_iterator: Iterable[int] = range(0, len(selected_refs), chunk_size)
+    materialization_progress = None
     if tqdm is not None:
-        chunk_iterator = tqdm(
-            chunk_iterator,
+        materialization_progress = tqdm(
             total=(len(selected_refs) + chunk_size - 1) // chunk_size,
             desc="Materializing global EntiTables sample",
             unit="chunk",
             dynamic_ncols=True,
             disable=not args.model_progress,
         )
-    for chunk_start in chunk_iterator:
-        chunk = selected_refs[chunk_start : chunk_start + chunk_size]
-        refs_by_path: dict[str, list[SelectedSourceTableRef]] = defaultdict(list)
-        for ref in chunk:
-            refs_by_path[ref.relative_path].append(ref)
-        materialized: dict[tuple[str, str], dict[str, Any]] = {}
-        for relative_path, file_refs in refs_by_path.items():
-            json_file = input_dir / relative_path
-            payload = read_entitables_json(json_file)
-            if payload is None:
-                continue
-            for ref in file_refs:
-                table_obj = payload.get(ref.table_id)
-                if table_obj is None:
-                    continue
-                result = parse_source_table(
-                    ref.table_id,
-                    table_obj,
-                    json_file,
-                    input_dir,
-                    args.min_rows,
-                    args.min_cols,
-                    args.wiki_link_threshold,
-                )
-                if result.source_table is not None:
+    try:
+        for chunk_start in range(0, len(selected_refs), chunk_size):
+            chunk = selected_refs[chunk_start : chunk_start + chunk_size]
+            refs_by_path: dict[str, list[SelectedSourceTableRef]] = defaultdict(list)
+            for ref in chunk:
+                refs_by_path[ref.relative_path].append(ref)
+            materialized: dict[tuple[str, str], dict[str, Any]] = {}
+            for relative_path, file_refs in refs_by_path.items():
+                json_file = input_dir / relative_path
+                payload = read_entitables_json(json_file)
+                if payload is None:
+                    raise RuntimeError(
+                        "Failed to rematerialize selected source table "
+                        f"{relative_path}#{file_refs[0].table_id}: "
+                        "source file could not be read"
+                    )
+                for ref in file_refs:
+                    table_obj = payload.get(ref.table_id)
+                    if table_obj is None:
+                        raise RuntimeError(
+                            "Failed to rematerialize selected source table "
+                            f"{relative_path}#{ref.table_id}: table is missing"
+                        )
+                    result = parse_source_table(
+                        ref.table_id,
+                        table_obj,
+                        json_file,
+                        input_dir,
+                        args.min_rows,
+                        args.min_cols,
+                        args.wiki_link_threshold,
+                    )
+                    if result.source_table is None:
+                        raise RuntimeError(
+                            "Failed to rematerialize selected source table "
+                            f"{relative_path}#{ref.table_id}: "
+                            f"table is no longer valid ({result.skip_reason or 'unknown'})"
+                        )
                     materialized[(relative_path, ref.table_id)] = result.source_table
-        for ref in chunk:
-            source_table = materialized.get((ref.relative_path, ref.table_id))
-            if source_table is not None:
-                yield source_table
+            if materialization_progress is not None:
+                materialization_progress.update(1)
+            for ref in chunk:
+                yield materialized[(ref.relative_path, ref.table_id)]
+    finally:
+        if materialization_progress is not None:
+            materialization_progress.close()
 
 
 def run_replacement_rounds(
