@@ -168,6 +168,8 @@ class CandidateEvaluationContext:
     max_entities: int | None = None
     eligible_entity_ids: set[str] = dataclass_field(default_factory=set)
     entity_imageinfo_keys: dict[str, set[str]] = dataclass_field(default_factory=dict)
+    text_task_count: int = 0
+    image_task_count: int = 0
 
 
 @dataclass
@@ -490,6 +492,45 @@ def evaluate_candidate_batch(
         )
         imageinfo_keys_accessed: set[str] = set()
         _ensure_candidate_assets(entity_ids, context, args, imageinfo_keys_accessed)
+        if getattr(args, "precompute_model_cache", False) or getattr(
+            args, "precompute_text_model_cache", False
+        ):
+            asset_types = (
+                None if getattr(args, "precompute_model_cache", False) else {"text"}
+            )
+            candidate_tasks = collect_table_extraction_tasks(
+                source_table=source_table,
+                assets=context.assets,
+                entity_to_assets=context.entity_to_assets,
+                wiki_to_entity_id=context.wiki_to_entity_id,
+                args=args,
+                asset_types=asset_types,
+            )
+            pending_tasks = tasks_requiring_model_analysis(
+                candidate_tasks, context.cache, args
+            )
+            tasks_by_kind = {
+                "text": [
+                    task for task in pending_tasks if task.asset.get("asset_type") == "text"
+                ]
+            }
+            if getattr(args, "precompute_model_cache", False):
+                tasks_by_kind["image"] = [
+                    task
+                    for task in pending_tasks
+                    if task.asset.get("asset_type") == "image"
+                ]
+            counts = precompute_extraction_task_groups(
+                extractor=context.extractor,
+                cache=context.cache,
+                tasks_by_kind=tasks_by_kind,
+                args=args,
+                state=context.concurrency_state,
+                progress=context.progress,
+                write_done_markers=False,
+            )
+            context.text_task_count += counts.get("text", 0)
+            context.image_task_count += counts.get("image", 0)
         extraction_writer = ListRecordWriter()
         recovery_writer = ListRecordWriter()
         query_tables, _data_lake_tables, _qrels, decision = build_table_join_records(
@@ -2120,6 +2161,7 @@ def write_model_start_marker(
     text_task_count: int,
     image_task_count: int,
     round_mode: bool = False,
+    round_mode_requires_services: bool = False,
 ) -> None:
     if not clean_text(path_value):
         return
@@ -2132,6 +2174,10 @@ def write_model_start_marker(
                 "text_task_count": text_task_count,
                 "image_task_count": image_task_count,
                 "round_mode": round_mode,
+                "runner_startup_task_count": max(
+                    text_task_count + image_task_count,
+                    int(round_mode_requires_services),
+                ),
                 "timestamp": time.time(),
             },
             ensure_ascii=False,
@@ -2159,6 +2205,23 @@ def model_done_marker_for_kind(args: argparse.Namespace, model_kind: str) -> str
     return clean_text(getattr(args, "model_text_done_marker", ""))
 
 
+def write_done_markers_after_selection(
+    args: argparse.Namespace,
+    text_task_count: int,
+    image_task_count: int,
+) -> None:
+    write_model_done_marker(
+        model_done_marker_for_kind(args, "text"),
+        model_kind="text",
+        task_count=text_task_count,
+    )
+    write_model_done_marker(
+        model_done_marker_for_kind(args, "image"),
+        model_kind="image",
+        task_count=image_task_count,
+    )
+
+
 def precompute_extraction_task_groups(
     *,
     extractor: LocalAttributeExtractor,
@@ -2167,6 +2230,7 @@ def precompute_extraction_task_groups(
     args: argparse.Namespace,
     state: ModelConcurrencyState,
     progress: ModelAnalysisProgress | None = None,
+    write_done_markers: bool = True,
 ) -> dict[str, int]:
     active_groups = {
         kind: tasks
@@ -2175,7 +2239,7 @@ def precompute_extraction_task_groups(
     }
     counts = {kind: len(tasks) for kind, tasks in tasks_by_kind.items() if kind in {"text", "image"}}
     for kind, count in counts.items():
-        if kind not in active_groups:
+        if write_done_markers and kind not in active_groups:
             write_model_done_marker(model_done_marker_for_kind(args, kind), model_kind=kind, task_count=count)
     if not active_groups:
         return counts
@@ -2196,11 +2260,12 @@ def precompute_extraction_task_groups(
         for future in as_completed(futures):
             kind, task_count = futures[future]
             future.result()
-            write_model_done_marker(
-                model_done_marker_for_kind(args, kind),
-                model_kind=kind,
-                task_count=task_count,
-            )
+            if write_done_markers:
+                write_model_done_marker(
+                    model_done_marker_for_kind(args, kind),
+                    model_kind=kind,
+                    task_count=task_count,
+                )
     return counts
 
 
@@ -2875,11 +2940,22 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     )
     concurrency_state = ModelConcurrencyState.from_args(args)
     progress: ModelAnalysisProgress | None = None
+    counters = SourceCandidateCounters()
+    candidate_tables: Iterator[dict[str, Any]] = iter_random_source_tables(
+        input_dir, args, counters
+    )
+    if args.max_source_tables is None:
+        all_candidates = list(candidate_tables)
+        candidate_tables = iter(all_candidates)
+        target_count = len(all_candidates)
+    else:
+        target_count = args.max_source_tables
     write_model_start_marker(
         clean_text(getattr(args, "model_start_marker", "")),
         text_task_count=0,
         image_task_count=0,
         round_mode=True,
+        round_mode_requires_services=target_count > 0,
     )
     wait_for_model_ready_marker(clean_text(getattr(args, "model_ready_marker", "")))
     extractor: LocalAttributeExtractor | None = LocalAttributeExtractor(args)
@@ -2907,16 +2983,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         registry=registry,
         max_entities=args.max_entities,
     )
-    counters = SourceCandidateCounters()
-    candidate_tables: Iterator[dict[str, Any]] = iter_random_source_tables(
-        input_dir, args, counters
-    )
-    if args.max_source_tables is None:
-        all_candidates = list(candidate_tables)
-        candidate_tables = iter(all_candidates)
-        target_count = len(all_candidates)
-    else:
-        target_count = args.max_source_tables
     cleanup_totals = CacheCleanupStats()
     selection_rng = random.Random(int(stable_hash("replacement", args.seed), 16))
     try:
@@ -3015,8 +3081,8 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         }
         progress = ModelAnalysisProgress(total=len(planned_keys), cached_keys=cached_keys, enabled=True)
 
-    precomputed_text_task_count = 0
-    precomputed_image_task_count = 0
+    precomputed_text_task_count = evaluation_context.text_task_count
+    precomputed_image_task_count = evaluation_context.image_task_count
     if getattr(args, "precompute_model_cache", False) or getattr(args, "precompute_text_model_cache", False):
         text_tasks = collect_extraction_tasks_from_tables(
             source_paths=source_writer.paths(),
@@ -3038,38 +3104,32 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             )
         pending_text_tasks = tasks_requiring_model_analysis(text_tasks, cache, args)
         pending_image_tasks = tasks_requiring_model_analysis(image_tasks, cache, args)
-        precomputed_text_task_count = len(pending_text_tasks)
-        precomputed_image_task_count = len(pending_image_tasks)
+        precomputed_text_task_count += len(pending_text_tasks)
+        precomputed_image_task_count += len(pending_image_tasks)
         logging.info(
             "Pending model extraction tasks before table processing: text=%d image=%d",
-            precomputed_text_task_count,
-            precomputed_image_task_count,
+            len(pending_text_tasks),
+            len(pending_image_tasks),
         )
-        if pending_text_tasks or pending_image_tasks:
-            tasks_by_kind = {"text": pending_text_tasks}
-            if getattr(args, "precompute_model_cache", False):
-                tasks_by_kind["image"] = pending_image_tasks
-            precompute_extraction_task_groups(
-                extractor=extractor,
-                cache=cache,
-                tasks_by_kind=tasks_by_kind,
-                args=args,
-                state=concurrency_state,
-                progress=progress,
-            )
-        else:
+        if not pending_text_tasks and not pending_image_tasks:
             logging.info("All model extraction tasks are cached; skipping model analysis")
-            write_model_done_marker(
-                model_done_marker_for_kind(args, "text"),
-                model_kind="text",
-                task_count=0,
-            )
-            if getattr(args, "precompute_model_cache", False):
-                write_model_done_marker(
-                    model_done_marker_for_kind(args, "image"),
-                    model_kind="image",
-                    task_count=0,
-                )
+        tasks_by_kind = {"text": pending_text_tasks}
+        if getattr(args, "precompute_model_cache", False):
+            tasks_by_kind["image"] = pending_image_tasks
+        precompute_extraction_task_groups(
+            extractor=extractor,
+            cache=cache,
+            tasks_by_kind=tasks_by_kind,
+            args=args,
+            state=concurrency_state,
+            progress=progress,
+            write_done_markers=False,
+        )
+        write_done_markers_after_selection(
+            args,
+            text_task_count=precomputed_text_task_count,
+            image_task_count=precomputed_image_task_count,
+        )
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)
     data_lake_writer = ShardedJsonlWriter(data_lake_tables_dir, records_per_shard)
     extraction_writer = ShardedJsonlWriter(extraction_dir, records_per_shard)

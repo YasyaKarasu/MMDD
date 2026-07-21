@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import sys
 import threading
@@ -983,6 +984,88 @@ def test_model_start_marker_can_signal_round_mode(tmp_path):
     )
 
     assert '"round_mode": true' in marker.read_text(encoding="utf-8")
+
+
+def test_round_mode_start_marker_requests_services_without_inflating_actual_counts(
+    tmp_path,
+):
+    marker = tmp_path / "model_start.json"
+
+    joinability_dataset.write_model_start_marker(
+        str(marker),
+        text_task_count=0,
+        image_task_count=0,
+        round_mode=True,
+        round_mode_requires_services=True,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["runner_startup_task_count"] > 0
+    assert payload["text_task_count"] == 0
+    assert payload["image_task_count"] == 0
+
+
+def test_candidate_rounds_defer_done_markers_until_accumulated_work_finishes(
+    tmp_path, monkeypatch
+):
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            return {
+                "attributes": [],
+                "raw_response": '{"attributes":[]}',
+                "error": "",
+            }
+
+    args = _parallel_args(
+        model_text_done_marker=str(tmp_path / "text_done.json"),
+        model_image_done_marker=str(tmp_path / "image_done.json"),
+    )
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    accumulated = {"text": 0, "image": 0}
+    marker_writes = []
+    write_model_done_marker = joinability_dataset.write_model_done_marker
+
+    def record_done_marker(path_value, *, model_kind, task_count):
+        marker_writes.append((model_kind, task_count))
+        write_model_done_marker(
+            path_value, model_kind=model_kind, task_count=task_count
+        )
+
+    monkeypatch.setattr(
+        joinability_dataset, "write_model_done_marker", record_done_marker
+    )
+
+    for round_index in range(2):
+        counts = precompute_extraction_task_groups(
+            extractor=FakeExtractor(),
+            cache=cache,
+            tasks_by_kind={
+                "text": [_task("text", f"round_{round_index}")],
+                "image": [_task("image", f"round_{round_index}")],
+            },
+            args=args,
+            state=state,
+            progress=None,
+            write_done_markers=False,
+        )
+        for kind in accumulated:
+            accumulated[kind] += counts[kind]
+        assert marker_writes == []
+        assert not (tmp_path / "text_done.json").exists()
+        assert not (tmp_path / "image_done.json").exists()
+
+    joinability_dataset.write_done_markers_after_selection(
+        args,
+        text_task_count=accumulated["text"],
+        image_task_count=accumulated["image"],
+    )
+
+    assert marker_writes == [("text", 2), ("image", 2)]
+    text_payload = json.loads((tmp_path / "text_done.json").read_text(encoding="utf-8"))
+    image_payload = json.loads((tmp_path / "image_done.json").read_text(encoding="utf-8"))
+    assert text_payload["task_count"] == 2
+    assert image_payload["task_count"] == 2
 
 
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
