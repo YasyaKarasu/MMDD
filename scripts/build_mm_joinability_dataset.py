@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import heapq
 import io
 import json
 import logging
@@ -128,6 +129,21 @@ class SourceCandidateCounters:
     processed_tables: int = 0
     skipped_tables: int = 0
     skip_reasons: Counter[str] = dataclass_field(default_factory=Counter)
+
+
+@dataclass(frozen=True, order=True)
+class SelectedSourceTableRef:
+    priority: int
+    relative_path: str
+    table_id: str
+
+
+@dataclass(frozen=True)
+class _DescendingSelectedSourceTableRef:
+    ref: SelectedSourceTableRef
+
+    def __lt__(self, other: _DescendingSelectedSourceTableRef) -> bool:
+        return self.ref > other.ref
 
 
 @dataclass(frozen=True)
@@ -626,31 +642,35 @@ def iter_random_source_tables(
     args: argparse.Namespace,
     counters: SourceCandidateCounters,
 ) -> Iterator[dict[str, Any]]:
-    rng = random.Random(args.seed)
     json_files = sorted(
         input_dir.rglob("*.json"),
         key=lambda path: path.relative_to(input_dir).as_posix(),
     )
-    rng.shuffle(json_files)
     json_file_iterator: Iterable[Path] = json_files
     if tqdm is not None:
         json_file_iterator = tqdm(
             json_file_iterator,
             total=len(json_files),
-            desc="Reading randomized EntiTables JSON",
+            desc="Scanning EntiTables for global sample",
             unit="file",
             dynamic_ncols=True,
             disable=not args.model_progress,
         )
+    capacity = (
+        None
+        if args.max_source_tables is None
+        else args.max_source_tables * (args.unrecoverable_replacement_rounds + 1)
+    )
+    selected_heap: list[_DescendingSelectedSourceTableRef] = []
+    selected_refs: list[SelectedSourceTableRef] = []
     for json_file in json_file_iterator:
         payload = read_entitables_json(json_file)
         if payload is None:
             counters.skipped_tables += 1
             counters.skip_reasons["malformed_json_file"] += 1
             continue
-        table_items = list(payload.items())
-        rng.shuffle(table_items)
-        for table_id, table_obj in table_items:
+        relative_path = json_file.relative_to(input_dir).as_posix()
+        for table_id, table_obj in payload.items():
             counters.processed_tables += 1
             result = parse_source_table(
                 str(table_id),
@@ -665,7 +685,76 @@ def iter_random_source_tables(
                 counters.skipped_tables += 1
                 counters.skip_reasons[result.skip_reason or "unknown"] += 1
                 continue
-            yield result.source_table
+            ref = SelectedSourceTableRef(
+                priority=int(
+                    stable_hash(
+                        "global-source-table",
+                        args.seed,
+                        relative_path,
+                        table_id,
+                        length=40,
+                    ),
+                    16,
+                ),
+                relative_path=relative_path,
+                table_id=str(table_id),
+            )
+            if capacity is None:
+                selected_refs.append(ref)
+            elif capacity > 0:
+                entry = _DescendingSelectedSourceTableRef(ref)
+                if len(selected_heap) < capacity:
+                    heapq.heappush(selected_heap, entry)
+                elif ref < selected_heap[0].ref:
+                    heapq.heapreplace(selected_heap, entry)
+
+    if capacity is not None:
+        selected_refs = [entry.ref for entry in selected_heap]
+    selected_refs.sort()
+    if not selected_refs:
+        return
+
+    chunk_size = args.max_source_tables or len(selected_refs)
+    chunk_iterator: Iterable[int] = range(0, len(selected_refs), chunk_size)
+    if tqdm is not None:
+        chunk_iterator = tqdm(
+            chunk_iterator,
+            total=(len(selected_refs) + chunk_size - 1) // chunk_size,
+            desc="Materializing global EntiTables sample",
+            unit="chunk",
+            dynamic_ncols=True,
+            disable=not args.model_progress,
+        )
+    for chunk_start in chunk_iterator:
+        chunk = selected_refs[chunk_start : chunk_start + chunk_size]
+        refs_by_path: dict[str, list[SelectedSourceTableRef]] = defaultdict(list)
+        for ref in chunk:
+            refs_by_path[ref.relative_path].append(ref)
+        materialized: dict[tuple[str, str], dict[str, Any]] = {}
+        for relative_path, file_refs in refs_by_path.items():
+            json_file = input_dir / relative_path
+            payload = read_entitables_json(json_file)
+            if payload is None:
+                continue
+            for ref in file_refs:
+                table_obj = payload.get(ref.table_id)
+                if table_obj is None:
+                    continue
+                result = parse_source_table(
+                    ref.table_id,
+                    table_obj,
+                    json_file,
+                    input_dir,
+                    args.min_rows,
+                    args.min_cols,
+                    args.wiki_link_threshold,
+                )
+                if result.source_table is not None:
+                    materialized[(relative_path, ref.table_id)] = result.source_table
+        for ref in chunk:
+            source_table = materialized.get((ref.relative_path, ref.table_id))
+            if source_table is not None:
+                yield source_table
 
 
 def run_replacement_rounds(

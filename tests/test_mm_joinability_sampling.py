@@ -83,7 +83,16 @@ def entitables_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def candidate_ids(input_dir: Path, seed: int) -> list[str]:
+def candidate_ids(
+    input_dir: Path,
+    seed: int,
+    *,
+    max_source_tables: int | None = None,
+    replacement_rounds: int = 2,
+) -> list[str]:
+    extra_args: list[str] = []
+    if max_source_tables is not None:
+        extra_args.extend(["--max_source_tables", str(max_source_tables)])
     args = builder.parse_args(
         [
             "--input_dir",
@@ -92,12 +101,39 @@ def candidate_ids(input_dir: Path, seed: int) -> list[str]:
             str(input_dir / "out"),
             "--seed",
             str(seed),
+            "--unrecoverable_replacement_rounds",
+            str(replacement_rounds),
+            *extra_args,
         ]
     )
     counters = builder.SourceCandidateCounters()
     return [
         table["source_table_id"]
         for table in builder.iter_random_source_tables(input_dir, args, counters)
+    ]
+
+
+def expected_global_candidate_ids(
+    input_dir: Path,
+    seed: int,
+    *,
+    limit: int,
+) -> list[str]:
+    priorities = []
+    for json_file in sorted(input_dir.glob("*.json")):
+        relative_path = json_file.relative_to(input_dir).as_posix()
+        payload = json.loads(json_file.read_text(encoding="utf-8"))
+        for table_id in payload:
+            priority = int(
+                builder.stable_hash(
+                    "global-source-table", seed, relative_path, table_id, length=40
+                ),
+                16,
+            )
+            priorities.append((priority, relative_path, table_id))
+    return [
+        f"st_{table_id}_{builder.stable_hash(relative_path, table_id, length=10)}"
+        for _priority, relative_path, table_id in sorted(priorities)[:limit]
     ]
 
 
@@ -159,9 +195,15 @@ def test_preparation_progress_reports_totals_and_eligible_entities(
         for call in spy.calls
     ] == [
         {
-            "desc": "Reading randomized EntiTables JSON",
+            "desc": "Scanning EntiTables for global sample",
             "total": 2,
             "unit": "file",
+            "disable": False,
+        },
+        {
+            "desc": "Materializing global EntiTables sample",
+            "total": 1,
+            "unit": "chunk",
             "disable": False,
         },
         {
@@ -171,7 +213,7 @@ def test_preparation_progress_reports_totals_and_eligible_entities(
             "disable": False,
         },
     ]
-    assert spy.calls[1]["postfixes"] == [
+    assert spy.calls[2]["postfixes"] == [
         {"eligible_entities": 1},
         {"eligible_entities": 3},
     ]
@@ -182,7 +224,7 @@ def test_no_model_progress_disables_preparation_progress(
 ) -> None:
     spy = exercise_preparation_progress(tmp_path, monkeypatch, no_model_progress=True)
 
-    assert [call["disable"] for call in spy.calls] == [True, True]
+    assert [call["disable"] for call in spy.calls] == [True, True, True]
 
 
 def test_replacement_policy_defaults(tmp_path: Path) -> None:
@@ -252,6 +294,96 @@ def test_different_seeds_produce_different_candidate_order(
     entitables_dir: Path,
 ) -> None:
     assert candidate_ids(entitables_dir, 13) != candidate_ids(entitables_dir, 29)
+
+
+def test_global_capped_sample_scans_every_file_before_first_yield(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for filename in ("a.json", "b.json", "z.json"):
+        write_entitables_file(tmp_path / filename, [f"{filename[0]}_table"])
+    reads: list[str] = []
+    real_read = builder.read_entitables_json
+
+    def recording_read(path: Path):
+        reads.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(builder, "read_entitables_json", recording_read)
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "1",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+
+    first = next(
+        builder.iter_random_source_tables(
+            tmp_path, args, builder.SourceCandidateCounters()
+        )
+    )
+
+    assert reads[:3] == ["a.json", "b.json", "z.json"]
+    assert first["source_table_id"].startswith(("st_a_table_", "st_b_table_", "st_z_table_"))
+
+
+def test_global_sample_uses_stable_priority_across_all_files(tmp_path: Path) -> None:
+    write_entitables_file(tmp_path / "a.json", [f"a_table_{idx}" for idx in range(5)])
+    write_entitables_file(tmp_path / "z.json", [f"z_table_{idx}" for idx in range(5)])
+
+    actual = candidate_ids(
+        tmp_path, 41, max_source_tables=2, replacement_rounds=0
+    )
+
+    assert actual == expected_global_candidate_ids(tmp_path, 41, limit=2)
+    assert any(table_id.startswith("st_z_") for table_id in actual)
+
+
+def test_global_sample_capacity_covers_all_replacement_rounds(tmp_path: Path) -> None:
+    write_entitables_file(tmp_path / "a.json", [f"a_table_{idx}" for idx in range(4)])
+    write_entitables_file(tmp_path / "z.json", [f"z_table_{idx}" for idx in range(4)])
+
+    actual = candidate_ids(
+        tmp_path, 17, max_source_tables=2, replacement_rounds=2
+    )
+
+    assert len(actual) == 6
+    assert actual == expected_global_candidate_ids(tmp_path, 17, limit=6)
+
+
+def test_global_sample_is_reproducible_seeded_and_enumeration_invariant(
+    entitables_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    discovered = [entitables_dir / "a.json", entitables_dir / "b.json"]
+    enumeration_orders = iter(
+        (discovered, list(reversed(discovered)), discovered, discovered)
+    )
+    monkeypatch.setattr(
+        Path,
+        "rglob",
+        lambda _path, _pattern: iter(next(enumeration_orders)),
+    )
+
+    first = candidate_ids(
+        entitables_dir, 13, max_source_tables=2, replacement_rounds=1
+    )
+    reversed_enumeration = candidate_ids(
+        entitables_dir, 13, max_source_tables=2, replacement_rounds=1
+    )
+    repeated = candidate_ids(
+        entitables_dir, 13, max_source_tables=2, replacement_rounds=1
+    )
+    alternate_seed = candidate_ids(
+        entitables_dir, 29, max_source_tables=2, replacement_rounds=1
+    )
+
+    assert first == reversed_enumeration == repeated
+    assert first != alternate_seed
 
 
 def test_queryable_table_never_draws_or_replaces() -> None:
