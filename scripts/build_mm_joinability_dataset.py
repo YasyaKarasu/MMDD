@@ -637,6 +637,12 @@ def replacement_policy_from_args(args: argparse.Namespace) -> ReplacementPolicy:
     return ReplacementPolicy(rounds, probability)
 
 
+def _close_iterator(iterator: Any) -> None:
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 def iter_random_source_tables(
     input_dir: Path,
     args: argparse.Namespace,
@@ -3192,19 +3198,22 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     cleanup_totals = CacheCleanupStats()
     selection_rng = random.Random(int(stable_hash("replacement", args.seed), 16))
     try:
-        selection = run_replacement_rounds(
-            candidate_tables=candidate_tables,
-            target_count=target_count,
-            policy=policy,
-            rng=selection_rng,
-            evaluate_batch=lambda batch: evaluate_candidate_batch(
-                batch, evaluation_context, args
-            ),
-            discard_tables=lambda table_ids: cleanup_totals.add(
-                evaluation_context.registry.discard_many(table_ids)
-            ),
-            on_initial_batch=start_models_after_initial_preparation,
-        )
+        try:
+            selection = run_replacement_rounds(
+                candidate_tables=candidate_tables,
+                target_count=target_count,
+                policy=policy,
+                rng=selection_rng,
+                evaluate_batch=lambda batch: evaluate_candidate_batch(
+                    batch, evaluation_context, args
+                ),
+                discard_tables=lambda table_ids: cleanup_totals.add(
+                    evaluation_context.registry.discard_many(table_ids)
+                ),
+                on_initial_batch=start_models_after_initial_preparation,
+            )
+        finally:
+            _close_iterator(candidate_tables)
         final_source_tables = [
             item.source_table for item in selection.final_evaluations
         ]

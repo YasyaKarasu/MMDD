@@ -1354,13 +1354,18 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         for table_id in ("t0", "t1", "t2")
     ]
 
+    candidate_iterator_closed: list[bool] = []
+
     def fake_candidates(
         _input_dir: Path,
         _args: object,
         counters: builder.SourceCandidateCounters,
     ):
         counters.processed_tables = 3
-        yield from candidate_tables
+        try:
+            yield from candidate_tables
+        finally:
+            candidate_iterator_closed.append(True)
 
     def fake_evaluate(
         tables: list[dict[str, object]],
@@ -1422,6 +1427,20 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     monkeypatch.setattr(builder, "evaluate_candidate_batch", fake_evaluate)
     monkeypatch.setattr(builder, "build_table_join_records", fake_final_records)
     monkeypatch.setattr(builder, "LocalAttributeExtractor", lambda _args: None)
+    real_sweep = builder.CandidateMaterialRegistry.sweep
+
+    def assert_closed_before_sweep(
+        registry: builder.CandidateMaterialRegistry,
+        final_table_ids: object,
+    ) -> builder.CacheCleanupStats:
+        assert candidate_iterator_closed == [True]
+        return real_sweep(registry, final_table_ids)
+
+    monkeypatch.setattr(
+        builder.CandidateMaterialRegistry,
+        "sweep",
+        assert_closed_before_sweep,
+    )
 
     args = builder.parse_args(
         [
@@ -1443,6 +1462,8 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     )
 
     stats = builder.build_dataset(args)
+
+    assert candidate_iterator_closed == [True]
 
     source_rows = list(
         builder.iter_jsonl_records(sorted((output_dir / "source_tables").glob("*.jsonl")))
@@ -1506,6 +1527,61 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         "unrecoverable_replacement_rounds": 1,
         "unrecoverable_drop_probability": 1.0,
     }
+
+
+@pytest.mark.parametrize("callable_close", [True, False])
+def test_build_dataset_closes_candidates_when_selection_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callable_close: bool,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+
+    class CandidateIterator:
+        def __init__(self) -> None:
+            self.closed = False
+            if not callable_close:
+                self.close = "not-callable"
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self) -> None:
+            self.closed = True
+
+    candidates = CandidateIterator()
+    monkeypatch.setattr(
+        builder,
+        "iter_random_source_tables",
+        lambda _input_dir, _args, _counters: candidates,
+    )
+
+    def fail_selection(**_kwargs: object):
+        raise RuntimeError("selection failed")
+
+    monkeypatch.setattr(builder, "run_replacement_rounds", fail_selection)
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(output_dir),
+            "--max_source_tables",
+            "1",
+            "--no_wikipedia",
+            "--no_model_progress",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="selection failed"):
+        builder.build_dataset(args)
+
+    assert candidates.closed is callable_close
 
 
 def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
