@@ -176,7 +176,11 @@ def exercise_preparation_progress(
         {"source_table_id": "second", "entity_ids": {"e2", "e3"}},
     ]
     context = SimpleNamespace(
-        eligible_entity_ids=set(), entity_records={}, max_entities=None
+        eligible_entity_ids=set(),
+        entity_records={},
+        max_entities=None,
+        entity_to_assets={"e1": [], "e2": [], "e3": []},
+        wiki_to_entity_id={},
     )
     monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
     monkeypatch.setattr(
@@ -184,8 +188,6 @@ def exercise_preparation_progress(
         "_candidate_entity_ids",
         lambda table, _wiki_to_entity_id: table["entity_ids"],
     )
-    monkeypatch.setattr(builder, "_ensure_candidate_assets", lambda *_args: None)
-    context.wiki_to_entity_id = {}
     builder.prepare_candidate_batch(source_tables, context, args)
     return spy
 
@@ -610,6 +612,52 @@ def test_model_start_waits_for_initial_batch_preparation() -> None:
     assert events.count("start") == 1
 
 
+def test_round_preparation_precedes_initial_and_replacement_evaluation() -> None:
+    tables = replacement_tables()[:3]
+    events: list[str] = []
+
+    def table_ids(batch: list[dict[str, str]]) -> str:
+        return ",".join(table["source_table_id"] for table in batch)
+
+    def prepare_batch(batch: list[dict[str, str]]) -> None:
+        events.append(f"prepare:{table_ids(batch)}")
+
+    def start_models(batch: list[dict[str, str]]) -> None:
+        events.append(f"start:{table_ids(batch)}")
+
+    def evaluate_batch(
+        batch: list[dict[str, str]],
+    ) -> list[builder.CandidateEvaluation]:
+        events.append(f"evaluate:{table_ids(batch)}")
+        return [
+            builder.CandidateEvaluation(
+                source_table=table,
+                queryable=table["source_table_id"] != "t0",
+                decision={},
+            )
+            for table in batch
+        ]
+
+    builder.run_replacement_rounds(
+        candidate_tables=iter(tables),
+        target_count=2,
+        policy=builder.ReplacementPolicy(rounds=1, drop_probability=1.0),
+        rng=StubRandom([0.0]),
+        prepare_batch=prepare_batch,
+        evaluate_batch=evaluate_batch,
+        discard_tables=lambda _table_ids: None,
+        on_initial_batch_prepared=start_models,
+    )
+
+    assert events == [
+        "prepare:t0,t1",
+        "start:t0,t1",
+        "evaluate:t0,t1",
+        "prepare:t2",
+        "evaluate:t2",
+    ]
+
+
 def test_replacement_round_flushes_discarded_tables_as_one_batch() -> None:
     discarded_batches: list[list[str]] = []
 
@@ -784,21 +832,26 @@ def test_candidate_evaluation_collects_records_without_final_shard_writes(
         registry=registry,
     )
 
-    def fake_assets_for_entity(**kwargs: object) -> list[dict[str, object]]:
-        entity = kwargs["entity"]
-        assert isinstance(entity, dict)
-        table_id = str(entity["wiki_title"]).removeprefix("Page ")
-        return [
-            {
-                "asset_id": f"asset-{table_id}",
-                "entity_id": entity["entity_id"],
-                "entity_wiki_title": entity["wiki_title"],
-                "asset_type": "image",
-                "local_path": str(tmp_path / f"{table_id}.jpg"),
-                "image_url": f"https://images.example/{table_id}.jpg",
-                "metadata": {"file_title": f"File:{table_id}.jpg"},
-            }
-        ]
+    def fake_batch_assets(**kwargs: object):
+        entities = kwargs["entities"]
+        writer = kwargs["asset_writer"]
+        mapping: dict[str, list[str]] = {}
+        for entity in entities:
+            table_id = str(entity["wiki_title"]).removeprefix("Page ")
+            asset_id = f"asset-{table_id}"
+            writer.write_record(
+                {
+                    "asset_id": asset_id,
+                    "entity_id": entity["entity_id"],
+                    "entity_wiki_title": entity["wiki_title"],
+                    "asset_type": "image",
+                    "local_path": str(tmp_path / f"{table_id}.jpg"),
+                    "image_url": f"https://images.example/{table_id}.jpg",
+                    "metadata": {"file_title": f"File:{table_id}.jpg"},
+                }
+            )
+            mapping[entity["entity_id"]] = [asset_id]
+        return mapping, 0, 0, len(entities)
 
     def fake_build_table_join_records(**kwargs: object):
         source_table = kwargs["source_table"]
@@ -813,9 +866,10 @@ def test_candidate_evaluation_collects_records_without_final_shard_writes(
         query_tables = [{"table_id": f"query-{table_id}"}] if table_id == "recoverable" else []
         return query_tables, [], [], {"reason": "queryable" if query_tables else "failed"}
 
-    monkeypatch.setattr(builder, "build_bridge_assets_for_entity", fake_assets_for_entity)
+    monkeypatch.setattr(builder, "build_bridge_assets", fake_batch_assets)
     monkeypatch.setattr(builder, "build_table_join_records", fake_build_table_join_records)
 
+    builder.prepare_candidate_batch(tables, context, args)
     evaluations = builder.evaluate_candidate_batch(tables, context, args)
 
     assert [evaluation.queryable for evaluation in evaluations] == [True, False]
@@ -836,6 +890,128 @@ def test_candidate_evaluation_collects_records_without_final_shard_writes(
         )
     assert not (output_dir / "attribute_extractions").exists()
     assert not (output_dir / "evidence_recoveries").exists()
+
+
+def test_batch_material_preparation_uses_batch_path_and_never_refetches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "out")]
+    )
+    tables = [
+        {
+            "source_table_id": table_id,
+            "rows": [
+                {
+                    "row_id": 0,
+                    "cells": [
+                        {
+                            "column_index": index,
+                            "column_name": "Entity",
+                            "text": title,
+                            "wiki_title": title,
+                        }
+                        for index, title in enumerate(titles)
+                    ],
+                }
+            ],
+        }
+        for table_id, titles in (
+            ("first", ("Page A", "Shared Page")),
+            ("second", ("Shared Page", "Page B")),
+            ("replacement", ("Shared Page", "Page Empty")),
+        )
+    ]
+    wikipedia = SimpleNamespace(
+        page_cache_path=tmp_path / "wiki_pages.jsonl",
+        image_cache_path=tmp_path / "wiki_images.jsonl",
+        page_cache={},
+        image_cache={},
+        api_failures=0,
+    )
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    registry = builder.CandidateMaterialRegistry(
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extraction_cache=cache,
+    )
+    context = builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=wikipedia,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=SimpleNamespace(),
+        registry=registry,
+    )
+    batches: list[list[str]] = []
+
+    def fake_batch_assets(**kwargs: object):
+        entities = kwargs["entities"]
+        assert isinstance(entities, list)
+        batches.append([str(entity["wiki_title"]) for entity in entities])
+        writer = kwargs["asset_writer"]
+        for entity in entities:
+            title = str(entity["wiki_title"])
+            wikipedia.page_cache[title] = {
+                "wiki_title": title,
+                "images": [{"title": f"File:{title}.jpg"}],
+            }
+            wikipedia.image_cache[f"File:{title}.jpg"] = {
+                "file_title": f"File:{title}.jpg"
+            }
+            if title == "Page Empty":
+                continue
+            writer.write_record(
+                {
+                    "asset_id": f"asset-{title}",
+                    "entity_id": entity["entity_id"],
+                    "asset_type": "text",
+                }
+            )
+        writer.flush()
+        return (
+            {
+                entity["entity_id"]: []
+                if entity["wiki_title"] == "Page Empty"
+                else [f"asset-{entity['wiki_title']}"]
+                for entity in entities
+            },
+            0,
+            len(entities) - 1,
+            0,
+        )
+
+    monkeypatch.setattr(builder, "build_bridge_assets", fake_batch_assets)
+    monkeypatch.setattr(
+        builder,
+        "build_bridge_assets_for_entity",
+        lambda **_kwargs: pytest.fail("per-entity material fallback was called"),
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.prepare_candidate_batch(tables[:2], context, args)
+    builder.prepare_candidate_batch([tables[2]], context, args)
+    builder.prepare_candidate_batch([], context, args)
+    builder.evaluate_candidate_batch(tables, context, args)
+
+    assert batches == [["Page A", "Shared Page", "Page B"], ["Page Empty"]]
+    empty_id = context.wiki_to_entity_id["Page Empty"]
+    assert entity_to_assets[empty_id] == []
+    assert registry.dependencies["replacement"].imageinfo_keys == {
+        "File:Shared Page.jpg",
+        "File:Page Empty.jpg",
+    }
 
 
 def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
@@ -887,6 +1063,7 @@ def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
         image_cache_path=tmp_path / "cache" / "wiki_images.jsonl",
         page_cache=dict(pages),
         image_cache=image_cache,
+        api_failures=0,
         get_page=pages.get,
         get_imageinfo=get_imageinfo,
         download_image=lambda _imageinfo, _asset_id: None,
@@ -918,6 +1095,7 @@ def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
         lambda **_kwargs: ([], [], [], {"reason": "failed"}),
     )
 
+    builder.prepare_candidate_batch(tables, context, args)
     builder.evaluate_candidate_batch(tables, context, args)
 
     assert assets == {}
@@ -980,6 +1158,7 @@ def test_candidate_evaluation_reuses_rejected_imageinfo_for_shared_entity_cleanu
         image_cache_path=tmp_path / "cache" / "wiki_images.jsonl",
         page_cache=dict(pages),
         image_cache=image_cache,
+        api_failures=0,
         get_page=pages.get,
         get_imageinfo=get_imageinfo,
         download_image=lambda _imageinfo, _asset_id: None,
@@ -1011,6 +1190,7 @@ def test_candidate_evaluation_reuses_rejected_imageinfo_for_shared_entity_cleanu
         lambda **_kwargs: ([], [], [], {"reason": "failed"}),
     )
 
+    builder.prepare_candidate_batch(tables, context, args)
     builder.evaluate_candidate_batch(tables, context, args)
 
     assert assets == {}
@@ -1617,24 +1797,23 @@ def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
         lambda _input_dir, _args, _counters: iter(candidate_tables),
     )
 
-    def fake_ensure_assets(
-        entity_ids: set[str],
-        context: builder.CandidateEvaluationContext,
-        _args: object,
-        _imageinfo_keys_accessed: set[str],
-    ) -> None:
-        for entity_id in entity_ids:
+    def fake_batch_assets(**kwargs: object):
+        entities = kwargs["entities"]
+        writer = kwargs["asset_writer"]
+        mapping: dict[str, list[str]] = {}
+        for entity in entities:
+            entity_id = entity["entity_id"]
             asset_id = f"asset-{entity_id}"
-            context.assets.setdefault(
-                asset_id,
+            writer.write_record(
                 {
                     "asset_id": asset_id,
                     "entity_id": entity_id,
-                    "entity_wiki_title": context.entity_records[entity_id]["wiki_title"],
+                    "entity_wiki_title": entity["wiki_title"],
                     "asset_type": "text",
-                },
+                }
             )
-            context.entity_to_assets.setdefault(entity_id, [asset_id])
+            mapping[entity_id] = [asset_id]
+        return mapping, 0, len(entities), 0
 
     def fake_join_records(**kwargs: object):
         source_table = kwargs["source_table"]
@@ -1654,7 +1833,18 @@ def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
             {"source_table_id": table_id, "reason": "queryable" if queryable else "failed"},
         )
 
-    monkeypatch.setattr(builder, "_ensure_candidate_assets", fake_ensure_assets)
+    monkeypatch.setattr(builder, "build_bridge_assets", fake_batch_assets)
+    monkeypatch.setattr(
+        builder,
+        "WikipediaClient",
+        lambda **_kwargs: SimpleNamespace(
+            page_cache_path=tmp_path / "pages.jsonl",
+            image_cache_path=tmp_path / "images.jsonl",
+            page_cache={},
+            image_cache={},
+            api_failures=0,
+        ),
+    )
     monkeypatch.setattr(builder, "build_table_join_records", fake_join_records)
     monkeypatch.setattr(builder, "LocalAttributeExtractor", lambda _args: None)
 
@@ -1668,7 +1858,6 @@ def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
             "2",
             "--max_entities",
             "1",
-            "--no_wikipedia",
             "--no_model_progress",
         ]
     )

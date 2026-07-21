@@ -104,6 +104,9 @@ class ListRecordWriter:
     def write_record(self, record: dict[str, Any]) -> None:
         self.records.append(record)
 
+    def flush(self) -> None:
+        pass
+
 
 @dataclass(frozen=True)
 class ReplacementRoundStats:
@@ -421,38 +424,21 @@ def _eligible_candidate_entity_ids(
     return set(candidate_ids) & context.eligible_entity_ids
 
 
-def _ensure_candidate_assets(
-    entity_ids: set[str],
-    context: CandidateEvaluationContext,
-    args: argparse.Namespace,
-    imageinfo_keys_accessed: set[str],
-) -> None:
-    entities_by_id = {
-        entity["entity_id"]: entity
-        for entity in finalize_entities(context.entity_records)
-        if entity["entity_id"] in entity_ids
+def _attempted_imageinfo_keys(page: dict[str, Any] | None) -> set[str]:
+    if not page or page.get("missing"):
+        return set()
+    image_titles: list[str] = []
+    if page.get("pageimage"):
+        image_titles.append(f"File:{page['pageimage']}")
+    for image in page.get("images") or []:
+        title = image.get("title") if isinstance(image, dict) else None
+        if title:
+            image_titles.append(title)
+    return {
+        normalized_title
+        for image_title in image_titles
+        if is_useful_image(normalized_title := normalize_title(image_title))
     }
-    for entity_id in entity_ids:
-        entity_imageinfo_keys = context.entity_imageinfo_keys.setdefault(entity_id, set())
-        if entity_id in context.entity_to_assets:
-            imageinfo_keys_accessed.update(entity_imageinfo_keys)
-            continue
-        context.entity_to_assets[entity_id] = []
-        if context.wikipedia_client is None:
-            continue
-        for asset in build_bridge_assets_for_entity(
-            entity=entities_by_id[entity_id],
-            max_images_per_entity=args.max_images_per_entity,
-            text_asset_chunk_chars=args.text_asset_chunk_chars,
-            min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
-            max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
-            wikipedia_client=context.wikipedia_client,
-            imageinfo_keys_accessed=entity_imageinfo_keys,
-        ):
-            asset_id = str(asset["asset_id"])
-            context.assets[asset_id] = asset
-            context.entity_to_assets[entity_id].append(asset_id)
-        imageinfo_keys_accessed.update(entity_imageinfo_keys)
 
 
 def prepare_candidate_batch(
@@ -460,6 +446,8 @@ def prepare_candidate_batch(
     context: CandidateEvaluationContext,
     args: argparse.Namespace,
 ) -> None:
+    ordered_entity_ids: list[str] = []
+    seen_entity_ids: set[str] = set()
     source_table_iterator: Iterable[dict[str, Any]] = source_tables
     if tqdm is not None:
         source_table_iterator = tqdm(
@@ -477,11 +465,63 @@ def prepare_candidate_batch(
         entity_ids = _eligible_candidate_entity_ids(
             _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
         )
-        _ensure_candidate_assets(entity_ids, context, args, set())
+        for entity_id in _candidate_entity_ids(
+            source_table, context.wiki_to_entity_id
+        ):
+            if (
+                entity_id in entity_ids
+                and entity_id not in context.entity_to_assets
+                and entity_id not in seen_entity_ids
+            ):
+                ordered_entity_ids.append(entity_id)
+                seen_entity_ids.add(entity_id)
         if tqdm is not None:
             source_table_iterator.set_postfix(  # type: ignore[attr-defined]
                 eligible_entities=len(context.eligible_entity_ids)
             )
+
+    if not ordered_entity_ids:
+        return
+
+    entities_by_id = {
+        entity["entity_id"]: entity
+        for entity in finalize_entities(context.entity_records)
+        if entity["entity_id"] in seen_entity_ids
+    }
+    entities = [entities_by_id[entity_id] for entity_id in ordered_entity_ids]
+    writer = ListRecordWriter()
+    batch_entity_to_assets: dict[str, list[str]] = {}
+    if context.wikipedia_client is not None:
+        batch_entity_to_assets, _api_failures, _text_count, _image_count = (
+            build_bridge_assets(
+                entities=entities,
+                max_entities=None,
+                max_images_per_entity=args.max_images_per_entity,
+                text_asset_chunk_chars=args.text_asset_chunk_chars,
+                min_text_asset_chunk_chars=args.min_text_asset_chunk_chars,
+                max_text_asset_chunks_per_entity=args.max_text_asset_chunks_per_entity,
+                wikipedia_client=context.wikipedia_client,
+                asset_writer=writer,
+                flush_every_records=args.flush_every_records,
+            )
+        )
+
+    for asset in writer.records:
+        context.assets[str(asset["asset_id"])] = asset
+    for entity_id in ordered_entity_ids:
+        context.entity_to_assets[entity_id] = list(
+            batch_entity_to_assets.get(entity_id, [])
+        )
+
+    if context.wikipedia_client is None or args.max_images_per_entity <= 0:
+        return
+    page_cache = getattr(context.wikipedia_client, "page_cache", {})
+    for entity in entities:
+        entity_id = str(entity["entity_id"])
+        page = page_cache.get(normalize_title(str(entity["wiki_title"])))
+        context.entity_imageinfo_keys.setdefault(entity_id, set()).update(
+            _attempted_imageinfo_keys(page)
+        )
 
 
 def _candidate_dependencies(
@@ -549,8 +589,11 @@ def evaluate_candidate_batch(
         entity_ids = _eligible_candidate_entity_ids(
             _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
         )
-        imageinfo_keys_accessed: set[str] = set()
-        _ensure_candidate_assets(entity_ids, context, args, imageinfo_keys_accessed)
+        imageinfo_keys_accessed = {
+            imageinfo_key
+            for entity_id in entity_ids
+            for imageinfo_key in context.entity_imageinfo_keys.get(entity_id, set())
+        }
         if getattr(args, "precompute_model_cache", False) or getattr(
             args, "precompute_text_model_cache", False
         ):
@@ -784,9 +827,11 @@ def run_replacement_rounds(
     target_count: int,
     policy: ReplacementPolicy,
     rng: Any,
+    prepare_batch: Callable[[list[dict[str, Any]]], None] | None = None,
     evaluate_batch: Callable[[list[dict[str, Any]]], list[CandidateEvaluation]],
     discard_tables: Callable[[list[str]], None],
     on_initial_batch: Callable[[list[dict[str, Any]]], None] | None = None,
+    on_initial_batch_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> ReplacementSelection:
     if target_count < 0:
         raise ValueError("target count must be non-negative")
@@ -800,8 +845,11 @@ def run_replacement_rounds(
             candidate_exhausted = True
             break
 
-    if on_initial_batch is not None:
-        on_initial_batch(slot_tables)
+    if prepare_batch is not None:
+        prepare_batch(slot_tables)
+    initial_batch_callback = on_initial_batch_prepared or on_initial_batch
+    if initial_batch_callback is not None:
+        initial_batch_callback(slot_tables)
 
     candidates_consumed = len(slot_tables)
     replacement_counts = [0] * len(slot_tables)
@@ -813,6 +861,8 @@ def run_replacement_rounds(
 
     while pending_slots:
         batch = [slot_tables[slot_index] for slot_index in pending_slots]
+        if round_index > 0 and prepare_batch is not None:
+            prepare_batch(batch)
         evaluations = evaluate_batch(batch)
         if len(evaluations) != len(batch):
             raise ValueError(
@@ -3181,7 +3231,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         initial_batch: list[dict[str, Any]],
     ) -> None:
         nonlocal extractor
-        prepare_candidate_batch(initial_batch, evaluation_context, args)
         write_model_start_marker(
             clean_text(getattr(args, "model_start_marker", "")),
             text_task_count=0,
@@ -3204,13 +3253,16 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 target_count=target_count,
                 policy=policy,
                 rng=selection_rng,
+                prepare_batch=lambda batch: prepare_candidate_batch(
+                    batch, evaluation_context, args
+                ),
                 evaluate_batch=lambda batch: evaluate_candidate_batch(
                     batch, evaluation_context, args
                 ),
                 discard_tables=lambda table_ids: cleanup_totals.add(
                     evaluation_context.registry.discard_many(table_ids)
                 ),
-                on_initial_batch=start_models_after_initial_preparation,
+                on_initial_batch_prepared=start_models_after_initial_preparation,
             )
         finally:
             _close_iterator(candidate_tables)
