@@ -219,7 +219,10 @@ class CandidateMaterialRegistry:
     def register(self, table_id: str, dependencies: CandidateDependencies) -> None:
         self.dependencies[table_id] = dependencies
 
-    def _retained_dependencies(self) -> CandidateDependencies:
+    @staticmethod
+    def _union_dependencies(
+        dependencies: Iterable[CandidateDependencies],
+    ) -> CandidateDependencies:
         unions: dict[str, set[Any]] = {
             "entities": set(),
             "assets": set(),
@@ -229,10 +232,13 @@ class CandidateMaterialRegistry:
             "imageinfo_keys": set(),
             "model_keys": set(),
         }
-        for dependencies in self.dependencies.values():
+        for candidate_dependencies in dependencies:
             for field_name, values in unions.items():
-                values.update(getattr(dependencies, field_name))
+                values.update(getattr(candidate_dependencies, field_name))
         return CandidateDependencies(**unions)
+
+    def _retained_dependencies(self) -> CandidateDependencies:
+        return self._union_dependencies(self.dependencies.values())
 
     @staticmethod
     def _resolved_paths(paths: Iterable[Path]) -> set[Path]:
@@ -301,11 +307,16 @@ class CandidateMaterialRegistry:
                 stats.errors += 1
                 logging.warning("Failed to compact %s cache %s: %s", label, path, exc)
 
-    def discard(self, table_id: str) -> CacheCleanupStats:
-        discarded = self.dependencies.pop(table_id, None)
+    def discard_many(self, table_ids: Iterable[str]) -> CacheCleanupStats:
+        discarded_dependencies = [
+            dependencies
+            for table_id in dict.fromkeys(table_ids)
+            if (dependencies := self.dependencies.pop(table_id, None)) is not None
+        ]
         stats = CacheCleanupStats()
-        if discarded is None:
+        if not discarded_dependencies:
             return stats
+        discarded = self._union_dependencies(discarded_dependencies)
         retained = self._retained_dependencies()
         stats.shared_dependencies_protected = sum(
             len(getattr(discarded, field_name) & getattr(retained, field_name))
@@ -352,13 +363,16 @@ class CandidateMaterialRegistry:
         self._compact_caches(stats)
         return stats
 
+    def discard(self, table_id: str) -> CacheCleanupStats:
+        return self.discard_many([table_id])
+
     def sweep(self, final_table_ids: Iterable[str]) -> CacheCleanupStats:
         retained_ids = set(final_table_ids)
-        total = CacheCleanupStats()
-        for table_id in list(self.dependencies):
-            if table_id not in retained_ids:
-                total.add(self.discard(table_id))
-        return total
+        return self.discard_many(
+            table_id
+            for table_id in list(self.dependencies)
+            if table_id not in retained_ids
+        )
 
 
 def _candidate_entity_ids(
@@ -584,7 +598,10 @@ def iter_random_source_tables(
     counters: SourceCandidateCounters,
 ) -> Iterator[dict[str, Any]]:
     rng = random.Random(args.seed)
-    json_files = list(input_dir.rglob("*.json"))
+    json_files = sorted(
+        input_dir.rglob("*.json"),
+        key=lambda path: path.relative_to(input_dir).as_posix(),
+    )
     rng.shuffle(json_files)
     for json_file in json_files:
         payload = read_entitables_json(json_file)
@@ -619,7 +636,7 @@ def run_replacement_rounds(
     policy: ReplacementPolicy,
     rng: Any,
     evaluate_batch: Callable[[list[dict[str, Any]]], list[CandidateEvaluation]],
-    discard_table: Callable[[str], None],
+    discard_tables: Callable[[list[str]], None],
 ) -> ReplacementSelection:
     if target_count < 0:
         raise ValueError("target count must be non-negative")
@@ -655,9 +672,9 @@ def run_replacement_rounds(
                 raise ValueError(
                     "candidate evaluation source ID does not match the requested batch"
                 )
-        for source_table_id in pending_discards:
-            discard_table(source_table_id)
-        pending_discards.clear()
+        if pending_discards:
+            discard_tables(pending_discards)
+            pending_discards = []
 
         unrecoverable = 0
         discarded = 0
@@ -3026,8 +3043,8 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             evaluate_batch=lambda batch: evaluate_candidate_batch(
                 batch, evaluation_context, args
             ),
-            discard_table=lambda table_id: cleanup_totals.add(
-                evaluation_context.registry.discard(table_id)
+            discard_tables=lambda table_ids: cleanup_totals.add(
+                evaluation_context.registry.discard_many(table_ids)
             ),
         )
         final_source_tables = [
