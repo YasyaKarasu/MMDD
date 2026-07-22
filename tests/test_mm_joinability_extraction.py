@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -1046,6 +1047,127 @@ def test_endpoint_readiness_errors_are_classified_and_do_not_leak_keys(
     assert secret not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (401, {}),
+        (404, {}),
+        (200, {"data": [{"id": "wrong-model"}]}),
+        (200, {"unexpected": []}),
+    ],
+)
+def test_endpoint_readiness_does_not_retry_permanent_errors(
+    monkeypatch, status_code, payload
+):
+    attempts = 0
+    now = 50.0
+
+    class Response:
+        text = ""
+
+        def json(self):
+            return payload
+
+    def fake_get(url, headers, timeout):
+        nonlocal attempts
+        attempts += 1
+        response = Response()
+        response.status_code = status_code
+        return response
+
+    def fake_sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.monotonic", lambda: now)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.sleep", fake_sleep)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_name="served-text")
+    )
+
+    with pytest.raises(RuntimeError):
+        extractor.ensure_endpoints_ready(
+            {"text"}, timeout_seconds=10, poll_seconds=0.25
+        )
+
+    assert attempts == 1
+
+
+def test_readiness_transport_error_drops_sensitive_exception_chain(monkeypatch):
+    secret = "transport-secret-api-key"
+
+    def fake_get(url, headers, timeout):
+        raise joinability_dataset.requests.exceptions.ConnectionError(secret)
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_api_key=secret)
+    )
+
+    with pytest.raises(joinability_dataset.TransientModelEndpointError) as caught:
+        extractor.ensure_endpoints_ready({"text"}, timeout_seconds=0)
+
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert secret not in formatted
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_chat_transport_error_drops_sensitive_exception_text(monkeypatch):
+    secret = "transport-secret-api-key"
+
+    def fake_post(url, headers, json, timeout):
+        raise joinability_dataset.requests.exceptions.Timeout(secret)
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    with pytest.raises(joinability_dataset.TransientModelEndpointError) as caught:
+        extractor.chat(
+            base_url="https://text.test/v1",
+            model="served-text",
+            api_key=secret,
+            messages=[],
+            model_kind="text",
+        )
+
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert secret not in formatted
+
+
+def test_readiness_rejects_success_returned_after_shared_deadline(monkeypatch):
+    now = 20.0
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    def fake_get(url, headers, timeout):
+        nonlocal now
+        now += 1.1
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.monotonic", lambda: now)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_name="served-text")
+    )
+
+    with pytest.raises(
+        joinability_dataset.TransientModelEndpointError,
+        match="readiness deadline expired",
+    ):
+        extractor.ensure_endpoints_ready({"text"}, timeout_seconds=1.0)
+
+
 def test_model_api_key_precedence(monkeypatch):
     monkeypatch.setenv("MMDD_TEXT_MODEL_API_KEY", "text-env")
     monkeypatch.setenv("MMDD_IMAGE_MODEL_API_KEY", "image-env")
@@ -1064,6 +1186,17 @@ def test_model_api_key_precedence(monkeypatch):
     assert (modality_env.text_model_api_key, modality_env.image_model_api_key) == ("text-env", "image-env")
     assert (shared_env.text_model_api_key, shared_env.image_model_api_key) == ("shared-env", "shared-env")
     assert (no_key.text_model_api_key, no_key.image_model_api_key) == (None, None)
+
+
+def test_model_api_keys_strip_only_outer_whitespace(monkeypatch):
+    monkeypatch.setenv("MMDD_IMAGE_MODEL_API_KEY", "  env&amp;\t key  ")
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_api_key="  cli&amp;\t key  ")
+    )
+
+    assert extractor.text_model_api_key == "cli&amp;\t key"
+    assert extractor.image_model_api_key == "env&amp;\t key"
+    assert joinability_dataset.model_api_key(123, "UNSET_API_KEY") == "123"
 
 
 @pytest.mark.parametrize("failure", [429, 503, "connection", "timeout"])

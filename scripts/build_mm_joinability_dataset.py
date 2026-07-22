@@ -313,7 +313,9 @@ def model_api_key(explicit_value: Any, modality_environment_variable: str) -> st
         os.environ.get(modality_environment_variable),
         os.environ.get("VLLM_API_KEY"),
     ):
-        key = clean_text(value)
+        if value is None:
+            continue
+        key = str(value).strip()
         if key:
             return key
     return None
@@ -504,6 +506,7 @@ class LocalAttributeExtractor:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         models_url = f"{base_url.rstrip('/')}/models"
+        transport_error: RuntimeError | None = None
         try:
             response = requests.get(models_url, headers=headers, timeout=request_timeout)
         except Exception as exc:
@@ -512,8 +515,11 @@ class LocalAttributeExtractor:
                 f"({type(exc).__name__})"
             )
             if is_transient_request_exception(exc):
-                raise TransientModelEndpointError(message) from exc
-            raise RuntimeError(message) from exc
+                transport_error = TransientModelEndpointError(message)
+            else:
+                transport_error = RuntimeError(message)
+        if transport_error is not None:
+            raise transport_error from None
 
         status_code = int(getattr(response, "status_code", 200) or 200)
         if status_code == 429 or status_code >= 500:
@@ -592,8 +598,12 @@ class LocalAttributeExtractor:
                             )
                         request_timeout = min(configured_request_timeout, remaining_seconds)
                     self._probe_endpoint(model_kind, url, model, api_key, request_timeout)
+                    if not single_probe and time.monotonic() >= deadline:
+                        raise TransientModelEndpointError(
+                            f"{model_kind} model endpoint {url} readiness deadline expired"
+                        )
                 return
-            except RuntimeError:
+            except TransientModelEndpointError:
                 if single_probe or time.monotonic() >= deadline:
                     raise
                 time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
@@ -646,7 +656,8 @@ class LocalAttributeExtractor:
                 )
                 if is_transient_request_exception(exc):
                     last_error = TransientModelEndpointError(
-                        f"{model_kind} model endpoint {base_url} request failed: {exc}"
+                        f"{model_kind} model endpoint {base_url} request failed "
+                        f"({type(exc).__name__})"
                     )
                 else:
                     last_error = exc
