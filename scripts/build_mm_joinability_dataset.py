@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import threading
 import time
 import warnings
@@ -301,6 +302,37 @@ def normalize_model_base_urls(values: Iterable[str] | str | None) -> list[str]:
     return urls
 
 
+class TransientModelEndpointError(RuntimeError):
+    """A model endpoint failure that may succeed when retried later."""
+
+
+def model_api_key(explicit_value: Any, modality_environment_variable: str) -> str | None:
+    for value in (
+        explicit_value,
+        os.environ.get(modality_environment_variable),
+        os.environ.get("VLLM_API_KEY"),
+    ):
+        key = clean_text(value)
+        if key:
+            return key
+    return None
+
+
+def is_transient_request_exception(exc: Exception) -> bool:
+    if requests is None:
+        return False
+    exceptions = getattr(requests, "exceptions", None)
+    transient_types = tuple(
+        exception_type
+        for exception_type in (
+            getattr(exceptions, "ConnectionError", None),
+            getattr(exceptions, "Timeout", None),
+        )
+        if isinstance(exception_type, type)
+    )
+    return bool(transient_types) and isinstance(exc, transient_types)
+
+
 class ModelCallStats:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -380,7 +412,10 @@ class LocalAttributeExtractor:
         self._text_endpoint_lock = threading.Lock()
         self._text_endpoint_index = 0
         self.text_model_name = args.text_model_name
-        self.text_model_api_key = args.text_model_api_key
+        self.text_model_api_key = model_api_key(
+            getattr(args, "text_model_api_key", None),
+            "MMDD_TEXT_MODEL_API_KEY",
+        )
         configured_image_urls = normalize_model_base_urls(getattr(args, "image_model_base_urls", None))
         fallback_image_url = clean_text(getattr(args, "image_model_base_url", "")).rstrip("/")
         if fallback_image_url:
@@ -392,7 +427,10 @@ class LocalAttributeExtractor:
         self._image_endpoint_lock = threading.Lock()
         self._image_endpoint_index = 0
         self.image_model_name = args.image_model_name
-        self.image_model_api_key = args.image_model_api_key
+        self.image_model_api_key = model_api_key(
+            getattr(args, "image_model_api_key", None),
+            "MMDD_IMAGE_MODEL_API_KEY",
+        )
         self.timeout = args.model_timeout_seconds
         self.temperature = args.model_temperature
         self.max_tokens = args.model_max_tokens
@@ -453,6 +491,74 @@ class LocalAttributeExtractor:
             self._image_endpoint_index += 1
             return urls[index]
 
+    def _probe_endpoint(self, model_kind: str, base_url: str, model: str, api_key: str | None) -> None:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        models_url = f"{base_url.rstrip('/')}/models"
+        try:
+            response = requests.get(models_url, headers=headers, timeout=self.timeout)
+        except Exception as exc:
+            message = (
+                f"{model_kind} model endpoint {base_url} readiness check failed "
+                f"({type(exc).__name__})"
+            )
+            if is_transient_request_exception(exc):
+                raise TransientModelEndpointError(message) from exc
+            raise RuntimeError(message) from exc
+
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code == 429 or status_code >= 500:
+            raise TransientModelEndpointError(
+                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+            )
+        if status_code < 200 or status_code >= 300:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+            )
+        try:
+            payload = response.json()
+            data = payload["data"]
+            served_models = {
+                clean_text(item.get("id"))
+                for item in data
+                if isinstance(item, dict) and clean_text(item.get("id"))
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} returned invalid models JSON"
+            ) from exc
+        if model not in served_models:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} does not serve configured model {model!r}"
+            )
+
+    def ensure_endpoints_ready(self, model_kinds: set[str], timeout_seconds: float) -> None:
+        endpoint_configs: list[tuple[str, str, str, str | None]] = []
+        for model_kind in ("text", "image"):
+            if model_kind not in model_kinds:
+                continue
+            if model_kind == "text":
+                urls = self.current_text_model_base_urls()
+                model = self.text_model_name
+                api_key = self.text_model_api_key
+            else:
+                urls = self.current_image_model_base_urls()
+                model = self.image_model_name
+                api_key = self.image_model_api_key
+            endpoint_configs.extend((model_kind, url, model, api_key) for url in urls)
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            try:
+                for config in endpoint_configs:
+                    self._probe_endpoint(*config)
+                return
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(max(self.retry_sleep, 0.05), max(0.0, deadline - time.monotonic())))
+
     def chat(
         self,
         *,
@@ -486,7 +592,10 @@ class LocalAttributeExtractor:
                 status_code = int(getattr(response, "status_code", 200) or 200)
                 if status_code >= 400:
                     body = clean_text(getattr(response, "text", ""))[:500]
-                    raise RuntimeError(f"HTTP {status_code}: {body}")
+                    error_message = f"HTTP {status_code}: {body}"
+                    if status_code == 429 or status_code >= 500:
+                        raise TransientModelEndpointError(error_message)
+                    raise RuntimeError(error_message)
                 response.raise_for_status()
                 data = response.json()
                 content = clean_text(data["choices"][0]["message"]["content"])
@@ -496,7 +605,12 @@ class LocalAttributeExtractor:
                     elapsed_seconds=time.perf_counter() - started,
                     failed=True,
                 )
-                last_error = exc
+                if is_transient_request_exception(exc):
+                    last_error = TransientModelEndpointError(
+                        f"{model_kind} model endpoint {base_url} request failed: {exc}"
+                    )
+                else:
+                    last_error = exc
                 if attempt < self.max_retries:
                     time.sleep(self.retry_sleep)
             else:
@@ -507,7 +621,10 @@ class LocalAttributeExtractor:
                     usage=usage if isinstance(usage, dict) else None,
                 )
                 return content
-        raise RuntimeError(f"Local model call failed: {last_error}")
+        message = f"Local {model_kind} model call to {base_url} failed: {last_error}"
+        if isinstance(last_error, TransientModelEndpointError):
+            raise TransientModelEndpointError(message) from last_error
+        raise RuntimeError(message) from last_error
 
     def extraction_prompt(
         self,

@@ -769,6 +769,208 @@ def test_endpoint_pools_add_urls_from_runtime_files(tmp_path):
     ]
 
 
+def test_remote_text_and_image_requests_keep_endpoint_model_and_key_separate(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
+
+    def fake_post(url, headers, json, timeout):
+        calls.append((url, headers, json))
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://text.example.test/openai/v1/",
+            text_model_name="served-text",
+            text_model_api_key="text-secret",
+            image_model_base_url="https://image.example.test/openai/v1/",
+            image_model_name="served-image",
+            image_model_api_key="image-secret",
+        )
+    )
+
+    extractor.extract(
+        {"asset_id": "txt", "asset_type": "text", "content": "evidence"},
+        {"cell_text": "Alpha", "wiki_title": "Alpha"},
+        ["State"],
+    )
+    extractor.extract(
+        {"asset_id": "img", "asset_type": "image", "image_url": "https://assets.test/a.jpg"},
+        {"cell_text": "Alpha", "wiki_title": "Alpha"},
+        ["State"],
+    )
+
+    assert [(url, headers["Authorization"], payload["model"]) for url, headers, payload in calls] == [
+        ("https://text.example.test/openai/v1/chat/completions", "Bearer text-secret", "served-text"),
+        ("https://image.example.test/openai/v1/chat/completions", "Bearer image-secret", "served-image"),
+    ]
+
+
+def test_endpoint_readiness_checks_every_configured_url_with_modality_credentials(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            model = "served-text" if "text" in self.url else "served-image"
+            return {"data": [{"id": model}]}
+
+    def fake_get(url, headers, timeout):
+        response = Response()
+        response.url = url
+        calls.append((url, headers.get("Authorization")))
+        return response
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://text-a.test/v1/",
+            text_model_base_urls=["https://text-b.test/v1"],
+            text_model_name="served-text",
+            text_model_api_key="text-key",
+            image_model_base_url="https://image-a.test/v1/",
+            image_model_base_urls=["https://image-b.test/v1"],
+            image_model_name="served-image",
+            image_model_api_key="image-key",
+        )
+    )
+
+    extractor.ensure_endpoints_ready({"text", "image"}, timeout_seconds=0)
+
+    assert calls == [
+        ("https://text-a.test/v1/models", "Bearer text-key"),
+        ("https://text-b.test/v1/models", "Bearer text-key"),
+        ("https://image-a.test/v1/models", "Bearer image-key"),
+        ("https://image-b.test/v1/models", "Bearer image-key"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response_status", "payload", "raised", "expected_type"),
+    [
+        (200, {"data": [{"id": "wrong-model"}]}, None, RuntimeError),
+        (401, {}, None, RuntimeError),
+        (404, {}, None, RuntimeError),
+        (500, {}, None, "transient"),
+        (503, {}, None, "transient"),
+        (200, ValueError("bad json"), None, RuntimeError),
+        (None, None, "connection", "transient"),
+        (None, None, "timeout", "transient"),
+    ],
+)
+def test_endpoint_readiness_errors_are_classified_and_do_not_leak_keys(
+    monkeypatch, response_status, payload, raised, expected_type
+):
+    secret = "never-show-this-key"
+
+    class Response:
+        status_code = response_status
+        text = secret
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+    def fake_get(url, headers, timeout):
+        if raised == "connection":
+            raise joinability_dataset.requests.exceptions.ConnectionError(secret)
+        if raised == "timeout":
+            raise joinability_dataset.requests.exceptions.Timeout(secret)
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://remote.test/v1/",
+            text_model_name="served-text",
+            text_model_api_key=secret,
+        )
+    )
+    if expected_type == "transient":
+        expected_type = joinability_dataset.TransientModelEndpointError
+
+    with pytest.raises(expected_type) as caught:
+        extractor.ensure_endpoints_ready({"text"}, timeout_seconds=0)
+
+    assert type(caught.value) is expected_type
+    assert "text" in str(caught.value)
+    assert "https://remote.test/v1" in str(caught.value)
+    assert secret not in str(caught.value)
+
+
+def test_model_api_key_precedence(monkeypatch):
+    monkeypatch.setenv("MMDD_TEXT_MODEL_API_KEY", "text-env")
+    monkeypatch.setenv("MMDD_IMAGE_MODEL_API_KEY", "image-env")
+    monkeypatch.setenv("VLLM_API_KEY", "shared-env")
+    explicit = LocalAttributeExtractor(
+        _extractor_args(text_model_api_key="text-cli", image_model_api_key="image-cli")
+    )
+    modality_env = LocalAttributeExtractor(_extractor_args())
+    monkeypatch.delenv("MMDD_TEXT_MODEL_API_KEY")
+    monkeypatch.delenv("MMDD_IMAGE_MODEL_API_KEY")
+    shared_env = LocalAttributeExtractor(_extractor_args())
+    monkeypatch.delenv("VLLM_API_KEY")
+    no_key = LocalAttributeExtractor(_extractor_args())
+
+    assert (explicit.text_model_api_key, explicit.image_model_api_key) == ("text-cli", "image-cli")
+    assert (modality_env.text_model_api_key, modality_env.image_model_api_key) == ("text-env", "image-env")
+    assert (shared_env.text_model_api_key, shared_env.image_model_api_key) == ("shared-env", "shared-env")
+    assert (no_key.text_model_api_key, no_key.image_model_api_key) == (None, None)
+
+
+@pytest.mark.parametrize("failure", [429, 503, "connection", "timeout"])
+def test_chat_raises_typed_transient_error_after_retries(monkeypatch, failure):
+    attempts = 0
+
+    class Response:
+        status_code = failure
+        text = "temporarily unavailable"
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, headers, json, timeout):
+        nonlocal attempts
+        attempts += 1
+        if failure == "connection":
+            raise joinability_dataset.requests.exceptions.ConnectionError("offline")
+        if failure == "timeout":
+            raise joinability_dataset.requests.exceptions.Timeout("slow")
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args(model_max_retries=1))
+
+    with pytest.raises(joinability_dataset.TransientModelEndpointError):
+        extractor.chat(
+            base_url="https://text.test/v1",
+            model="served-text",
+            api_key=None,
+            messages=[],
+            model_kind="text",
+        )
+
+    assert attempts == 2
+
+
 def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(tmp_path):
     text_server = VllmServerSpec(
         role="text",
