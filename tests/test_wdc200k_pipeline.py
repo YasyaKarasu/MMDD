@@ -308,6 +308,9 @@ def test_remote_vllm_runbook_pins_resume_state_and_secure_tmux() -> None:
     resume_command = section.split("ordinary `--resume`:", 1)[1].split(
         "```bash", 1
     )[1].split("```", 1)[0]
+    health_command = section.split("`$VLLM_API_KEY` text:", 1)[1].split(
+        "```bash", 1
+    )[1].split("```", 1)[0]
 
     assert "https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/" in section
     assert "tmux -L mmdd-vllm new-session" in section
@@ -331,6 +334,17 @@ def test_remote_vllm_runbook_pins_resume_state_and_secure_tmux() -> None:
     assert "--min_free_disk_bytes 107374182400" in resume_command
     assert "--resume" in resume_command
     assert "--from_stage" not in resume_command
+    assert '-H "Authorization: Bearer $VLLM_API_KEY"' not in health_command
+    assert health_command.count("--config -") == 2
+    assert health_command.count(
+        'header = "Authorization: Bearer $VLLM_API_KEY"'
+    ) == 2
+    subprocess.run(
+        ["bash", "-n"],
+        input=health_command,
+        text=True,
+        check=True,
+    )
 
 
 def test_pipeline_config_requires_separate_roots(tmp_path: Path) -> None:

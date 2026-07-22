@@ -437,17 +437,21 @@ an API key does not protect every server endpoint.
 
 In another local shell, read the same mode-600 key over SSH directly into the
 environment, then verify both served IDs through the tunnel. The key is neither
-a command argument nor printed to the terminal:
+a command argument nor printed to the terminal. Each unquoted heredoc expands
+the variable into curl's stdin config; shell history contains only the literal
+`$VLLM_API_KEY` text:
 
 ```bash
 export VLLM_API_KEY="$(ssh user@REMOTE_HOST \
   'cat "$HOME/.config/mmdd/vllm-api-key"')"
 curl --fail --silent --show-error \
-  -H "Authorization: Bearer $VLLM_API_KEY" \
-  http://127.0.0.1:18001/v1/models | python -m json.tool
+  --config - http://127.0.0.1:18001/v1/models <<EOF | python -m json.tool
+header = "Authorization: Bearer $VLLM_API_KEY"
+EOF
 curl --fail --silent --show-error \
-  -H "Authorization: Bearer $VLLM_API_KEY" \
-  http://127.0.0.1:18000/v1/models | python -m json.tool
+  --config - http://127.0.0.1:18000/v1/models <<EOF | python -m json.tool
+header = "Authorization: Bearer $VLLM_API_KEY"
+EOF
 ```
 
 The first response must contain `Qwen3.5-9B`; the second must contain
