@@ -1674,6 +1674,70 @@ def _fenced_commit_model_record(
     return True
 
 
+def _fenced_retry_model_job(
+    database_path: Path,
+    *,
+    job: Any,
+    expected_kind: str,
+    record: dict[str, Any],
+    write_tracker: GuardedWriteTracker | None = None,
+) -> bool:
+    encoded = _canonical_json(record)
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        row = connection.execute(
+            """
+            SELECT kind, status, owner, lease_id, lease_expires
+            FROM jobs WHERE job_id = ?
+            """,
+            (job.job_id,),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["kind"]) != expected_kind
+            or str(row["status"]) != "leased"
+            or str(row["owner"]) != str(job.owner)
+            or str(row["lease_id"]) != str(job.lease_id)
+            or float(row["lease_expires"] or 0.0) <= now
+        ):
+            connection.rollback()
+            return False
+        if write_tracker is not None:
+            write_tracker.before_write(
+                8192 + 2 * len(encoded.encode("utf-8"))
+            )
+        connection.execute(
+            "DELETE FROM model_results WHERE job_id = ? AND committed = 0",
+            (job.job_id,),
+        )
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'retryable', result_json = ?, owner = NULL,
+                lease_expires = NULL, lease_id = NULL, updated_at = ?
+            WHERE job_id = ? AND kind = ? AND status = 'leased'
+              AND owner = ? AND lease_id = ? AND lease_expires > ?
+            """,
+            (
+                encoded,
+                now,
+                job.job_id,
+                expected_kind,
+                job.owner,
+                job.lease_id,
+                now,
+            ),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
+        connection.commit()
+    return True
+
+
 def _process_claimed_group(
     store: SqliteJobStore,
     extractor: Any,
@@ -1780,14 +1844,14 @@ def _process_claimed_group(
             if record.get("error_class") == "model_endpoint_transient":
                 with state_lock:
                     transient_errors.append(clean_text(record.get("error")))
-                if not heartbeat.is_lost(str(job.job_id)):
-                    store.finish(
-                        job.job_id,
-                        status="retryable",
-                        result=record,
-                        owner=job.owner,
-                        lease_id=job.lease_id,
-                    )
+                retried = _fenced_retry_model_job(
+                    store.path,
+                    job=job,
+                    expected_kind=job.kind,
+                    record=record,
+                    write_tracker=write_tracker,
+                )
+                if retried:
                     with state_lock:
                         handled += 1
                 return
@@ -1825,7 +1889,8 @@ def _process_claimed_group(
             errors = sorted(set(error for error in transient_errors if error))
             detail = f": {'; '.join(errors)}" if errors else ""
             raise RuntimeError(
-                "transient model endpoint failure left model jobs retryable"
+                "transient model endpoint failure encountered; owned jobs "
+                "were left retryable"
                 f"{detail}"
             )
     return handled
@@ -2640,6 +2705,7 @@ def run_model_stage(
         "ensure_endpoints_ready",
         None,
     )
+    preflighted_modalities: set[str] = set()
     if callable(ensure_endpoints_ready):
         modalities = _claimable_modalities(store.path, jobset)
         if modalities:
@@ -2647,6 +2713,7 @@ def run_model_stage(
                 modalities=modalities,
                 timeout_seconds=endpoint_ready_timeout_seconds,
             )
+            preflighted_modalities.update(modalities)
     processed = 0
     for modality in ("text", "image"):
         while stop_after is None or processed < stop_after:
@@ -2657,6 +2724,20 @@ def run_model_stage(
             )
             if allowance <= 0:
                 break
+            if (
+                callable(ensure_endpoints_ready)
+                and modality not in preflighted_modalities
+            ):
+                if modality not in _claimable_modalities(
+                    store.path,
+                    jobset,
+                ):
+                    break
+                ensure_endpoints_ready(
+                    modalities={modality},
+                    timeout_seconds=endpoint_ready_timeout_seconds,
+                )
+                preflighted_modalities.add(modality)
             claimed = store.claim(
                 jobset.kind_for(modality),
                 limit=allowance,

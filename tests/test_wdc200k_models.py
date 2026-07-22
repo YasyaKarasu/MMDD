@@ -410,6 +410,43 @@ def _claim_order(store: SqliteJobStore) -> list[tuple[str, str]]:
     ]
 
 
+def _insert_model_result(
+    store: SqliteJobStore,
+    job_id: str,
+    *,
+    committed: int,
+) -> None:
+    with sqlite3.connect(store.path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+        )
+        record_json = json.dumps({"stale": True})
+        connection.execute(
+            """
+            INSERT INTO model_results (
+                job_id, jobset_fingerprint, modality, status,
+                record_json, record_sha256, commit_owner,
+                commit_lease_id, commit_lease_expires,
+                committed, updated_at
+            ) VALUES (?, ?, ?, 'success', ?, ?, 'old-owner',
+                      'old-lease', ?, ?, ?)
+            """,
+            (
+                job_id,
+                payload["jobset_fingerprint"],
+                payload["modality"],
+                record_json,
+                hashlib.sha256(record_json.encode()).hexdigest(),
+                time.time() - 10,
+                committed,
+                time.time() - 20,
+            ),
+        )
+
+
 def test_model_endpoint_preflight_fails_before_claim(tmp_path: Path) -> None:
     store = SqliteJobStore(tmp_path / "models.sqlite3")
     jobset = enqueue_model_tasks(
@@ -559,6 +596,57 @@ def test_model_endpoint_preflight_skips_unexpired_foreign_lease(
         )
 
 
+def test_model_endpoint_preflight_rechecks_modality_that_becomes_claimable(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("text", "text"), asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    image_job = next(job for job in jobset.jobs if job.modality == "image")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'leased', owner = 'other-worker',
+                lease_id = 'active-image', lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (time.time() + 60, image_job.job_id),
+        )
+
+    expired = False
+
+    def expire_image_after_text(_job_id: str, record: dict) -> None:
+        nonlocal expired
+        if record["modality"] != "text" or expired:
+            return
+        expired = True
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                "UPDATE jobs SET lease_expires = ? WHERE job_id = ?",
+                (time.time() - 1, image_job.job_id),
+            )
+
+    extractor = EndpointAwareExtractor()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        after_result_write=expire_image_after_text,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert extractor.readiness_calls == [
+        ({"text"}, 0.0),
+        ({"image"}, 0.0),
+    ]
+    assert extractor.asset_ids == ["text", "image"]
+
+
 def test_transient_model_error_is_retryable_without_durable_result(
     tmp_path: Path,
 ) -> None:
@@ -598,6 +686,166 @@ def test_transient_model_error_is_retryable_without_durable_result(
         assert connection.execute(
             "SELECT COUNT(*) FROM model_call_cache"
         ).fetchone() == (0,)
+
+
+def test_transient_retry_clears_only_stale_uncommitted_prepared_result(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("stale"), asset("committed")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    jobs_by_asset = {
+        asset_id: job_id for job_id, asset_id in _claim_order(store)
+    }
+    _insert_model_result(
+        store,
+        jobs_by_asset["stale"],
+        committed=0,
+    )
+    _insert_model_result(
+        store,
+        jobs_by_asset["committed"],
+        committed=1,
+    )
+    extractor = EndpointAwareExtractor(
+        transient_asset_ids={"stale", "committed"}
+    )
+
+    with pytest.raises(RuntimeError, match="transient model endpoint"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            group_size=2,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert all(status == "retryable" for _, status in _job_rows(store))
+    with sqlite3.connect(store.path) as connection:
+        rows = connection.execute(
+            "SELECT job_id, committed FROM model_results ORDER BY job_id"
+        ).fetchall()
+    assert rows == [(jobs_by_asset["committed"], 1)]
+
+
+def test_transient_lease_loss_does_not_abort_other_group_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import wdc200k_models
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("transient"), asset("success")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    jobs_by_asset = {
+        asset_id: job_id for job_id, asset_id in _claim_order(store)
+    }
+
+    def lose_transient_then_deliver_success(**kwargs):
+        tasks = sorted(
+            kwargs["tasks"],
+            key=lambda task: task.asset["asset_id"] != "transient",
+        )
+        records = {}
+        for task in tasks:
+            if task.asset["asset_id"] == "transient":
+                with sqlite3.connect(store.path) as connection:
+                    connection.execute(
+                        """
+                        UPDATE jobs SET owner = 'new-owner',
+                            lease_id = 'new-lease', lease_expires = ?
+                        WHERE job_id = ?
+                        """,
+                        (time.time() + 60, jobs_by_asset["transient"]),
+                    )
+                record = {
+                    "attributes": [],
+                    "raw_response": "",
+                    "error": "model endpoint temporarily unavailable",
+                    "error_class": "model_endpoint_transient",
+                }
+            else:
+                record = {
+                    "attributes": [],
+                    "raw_response": '{"attributes":[]}',
+                    "error": "",
+                }
+            records[task.cache_key] = record
+            kwargs["on_record"](task.cache_key, record)
+        return records
+
+    monkeypatch.setattr(
+        wdc200k_models,
+        "run_extraction_task_group",
+        lose_transient_then_deliver_success,
+    )
+
+    with pytest.raises(RuntimeError, match="transient model endpoint"):
+        run_model_stage(
+            store,
+            CountingExtractor(),
+            jobset=jobset,
+            group_size=2,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert dict(_job_rows(store)) == {
+        jobs_by_asset["transient"]: "leased",
+        jobs_by_asset["success"]: "success",
+    }
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results WHERE committed = 1"
+        ).fetchone() == (1,)
+
+
+def test_fenced_retry_mismatch_returns_false_before_write_guard(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("stale")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    claimed = store.claim(
+        jobset.text_kind,
+        limit=1,
+        owner="old-owner",
+        lease_seconds=60,
+    )[0]
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET owner = 'new-owner', lease_id = 'new-lease'
+            WHERE job_id = ?
+            """,
+            (claimed.job_id,),
+        )
+
+    class RejectWrites:
+        def before_write(self, _estimated_bytes: int) -> None:
+            raise AssertionError("stale fence must not reserve a write")
+
+        def before_commit(self, _estimated_bytes: int) -> None:
+            raise AssertionError("stale fence must not commit")
+
+    assert models._fenced_retry_model_job(
+        store.path,
+        job=claimed,
+        expected_kind=claimed.kind,
+        record={"error_class": "model_endpoint_transient"},
+        write_tracker=RejectWrites(),
+    ) is False
 
 
 def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
