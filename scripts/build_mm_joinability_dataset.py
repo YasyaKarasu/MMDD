@@ -954,7 +954,7 @@ def is_oom_error(message: Any) -> bool:
 
 
 def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) -> dict[str, Any]:
-    return {
+    record = {
         "cache_key": task.cache_key,
         "prompt_version": PROMPT_VERSION,
         "entity_id": task.entity["entity_id"],
@@ -967,11 +967,21 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
         "raw_response": result.get("raw_response", ""),
         "error": clean_text(result.get("error")),
     }
+    if "error_class" in result:
+        record["error_class"] = clean_text(result.get("error_class"))
+    return record
 
 
 def run_extraction_task(extractor: LocalAttributeExtractor, task: ExtractionTask) -> dict[str, Any]:
     try:
         result = extractor.extract(task.asset, task.entity, task.candidate_attribute_names)
+    except TransientModelEndpointError as exc:
+        result = {
+            "attributes": [],
+            "raw_response": "",
+            "error": str(exc),
+            "error_class": "model_endpoint_transient",
+        }
     except Exception as exc:
         result = {"attributes": [], "raw_response": "", "error": str(exc)}
     return extraction_record_from_result(task, result)

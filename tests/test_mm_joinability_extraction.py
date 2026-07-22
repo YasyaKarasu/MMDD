@@ -695,6 +695,23 @@ def _task(asset_type: str, suffix: str = "1") -> ExtractionTask:
     )
 
 
+def test_run_extraction_task_classifies_sanitized_transient_endpoint_error():
+    class TransientExtractor:
+        def extract(self, _asset, _entity, _candidate_attributes):
+            raise joinability_dataset.TransientModelEndpointError(
+                "model endpoint request failed: HTTP 503"
+            )
+
+    record = joinability_dataset.run_extraction_task(
+        TransientExtractor(),
+        _task("text"),
+    )
+
+    assert record["error_class"] == "model_endpoint_transient"
+    assert record["error"] == "model endpoint request failed: HTTP 503"
+    assert "secret" not in record["error"].casefold()
+
+
 def _parallel_args(**overrides):
     values = {
         "text_model_workers": 1,

@@ -14,7 +14,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from build_mm_joinability_dataset import ExtractionCache
+from build_mm_joinability_dataset import (
+    ExtractionCache,
+    TransientModelEndpointError,
+)
 from wdc200k_io import AtomicJsonlShard, SqliteJobStore
 import wdc200k_models as models
 from wdc200k_models import (
@@ -357,6 +360,234 @@ class CountingExtractor:
             "raw_response": '{"attributes":[]}',
             "error": "",
         }
+
+
+class EndpointAwareExtractor(CountingExtractor):
+    def __init__(
+        self,
+        *,
+        readiness_error: BaseException | None = None,
+        transient_asset_ids: set[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.readiness_error = readiness_error
+        self.transient_asset_ids = transient_asset_ids or set()
+        self.readiness_calls: list[tuple[set[str], float]] = []
+
+    def ensure_endpoints_ready(self, *, modalities, timeout_seconds):
+        self.readiness_calls.append((set(modalities), timeout_seconds))
+        if self.readiness_error is not None:
+            raise self.readiness_error
+
+    def extract(self, current_asset, entity, candidate_attributes):
+        if current_asset["asset_id"] in self.transient_asset_ids:
+            with self.lock:
+                self.asset_ids.append(current_asset["asset_id"])
+            raise TransientModelEndpointError(
+                "model endpoint request failed: HTTP 503"
+            )
+        return super().extract(current_asset, entity, candidate_attributes)
+
+
+def _job_rows(store: SqliteJobStore) -> list[tuple[str, str]]:
+    with sqlite3.connect(store.path) as connection:
+        return connection.execute(
+            "SELECT job_id, status FROM jobs ORDER BY job_id"
+        ).fetchall()
+
+
+def _claim_order(store: SqliteJobStore) -> list[tuple[str, str]]:
+    with sqlite3.connect(store.path) as connection:
+        rows = connection.execute(
+            "SELECT job_id, payload_json FROM jobs ORDER BY updated_at, job_id"
+        ).fetchall()
+    return [
+        (job_id, json.loads(payload)["asset"]["asset_id"])
+        for job_id, payload in rows
+    ]
+
+
+def test_model_endpoint_preflight_fails_before_claim(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    extractor = EndpointAwareExtractor(
+        readiness_error=TransientModelEndpointError(
+            "model endpoint readiness failed: HTTP 503"
+        )
+    )
+
+    with pytest.raises(TransientModelEndpointError, match="HTTP 503"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            endpoint_ready_timeout_seconds=2.5,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert extractor.readiness_calls == [({"text"}, 2.5)]
+    assert extractor.asset_ids == []
+    assert _job_rows(store) == [(jobset.jobs[0].job_id, "pending")]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone() == (0,)
+
+
+def test_model_endpoint_preflight_only_probes_claimable_modalities(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("text", "text"), asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    first = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        stop_after=1,
+        output_root=tmp_path / "outputs",
+    )
+    assert first.complete is False
+
+    extractor = EndpointAwareExtractor()
+    run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        endpoint_ready_timeout_seconds=1.0,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert extractor.readiness_calls == [({"image"}, 1.0)]
+    assert extractor.asset_ids == ["image"]
+
+
+def test_model_endpoint_preflight_includes_expired_leased_modality(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'leased', owner = 'dead',
+                lease_id = 'expired', lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (time.time() - 1, jobset.jobs[0].job_id),
+        )
+    extractor = EndpointAwareExtractor(
+        readiness_error=TransientModelEndpointError("image unavailable")
+    )
+
+    with pytest.raises(TransientModelEndpointError, match="unavailable"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert extractor.readiness_calls == [({"image"}, 0.0)]
+    assert _job_rows(store) == [(jobset.jobs[0].job_id, "leased")]
+
+
+def test_transient_model_error_is_retryable_without_durable_result(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    extractor = EndpointAwareExtractor(transient_asset_ids={"a"})
+
+    with pytest.raises(RuntimeError, match="transient model endpoint"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert _job_rows(store) == [(jobset.jobs[0].job_id, "retryable")]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_call_cache"
+        ).fetchone() == (0,)
+
+
+def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a"), asset("b"), asset("c")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    claim_order = _claim_order(store)
+    first_success = claim_order[0]
+    transient = claim_order[1]
+    not_claimed = claim_order[2]
+    failing = EndpointAwareExtractor(transient_asset_ids={transient[1]})
+
+    with pytest.raises(RuntimeError, match="transient model endpoint"):
+        run_model_stage(
+            store,
+            failing,
+            jobset=jobset,
+            group_size=2,
+            workers=2,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert set(failing.asset_ids) == {first_success[1], transient[1]}
+    assert dict(_job_rows(store)) == {
+        first_success[0]: "success",
+        transient[0]: "retryable",
+        not_claimed[0]: "pending",
+    }
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_results"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_call_cache"
+        ).fetchone() == (1,)
+
+    healthy = EndpointAwareExtractor()
+    result = run_model_stage(
+        store,
+        healthy,
+        jobset=jobset,
+        group_size=2,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert set(healthy.asset_ids) == {transient[1], not_claimed[1]}
+    assert all(status == "success" for _job_id, status in _job_rows(store))
 
 
 def test_enqueue_staging_database_uses_guarded_controlled_directory(

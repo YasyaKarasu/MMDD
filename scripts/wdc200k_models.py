@@ -1697,6 +1697,8 @@ def _process_claimed_group(
     task_by_key: dict[str, Any] = {}
     job_by_key: dict[str, Any] = {}
     handled = 0
+    state_lock = threading.Lock()
+    transient_errors: list[str] = []
     with _LeaseHeartbeat(
         store.path,
         claimed,
@@ -1775,12 +1777,26 @@ def _process_claimed_group(
             nonlocal handled
             job = job_by_key[model_call_key]
             payload = job.payload
+            if record.get("error_class") == "model_endpoint_transient":
+                with state_lock:
+                    transient_errors.append(clean_text(record.get("error")))
+                if not heartbeat.is_lost(str(job.job_id)):
+                    store.finish(
+                        job.job_id,
+                        status="retryable",
+                        result=record,
+                        owner=job.owner,
+                        lease_id=job.lease_id,
+                    )
+                    with state_lock:
+                        handled += 1
+                return
             status = (
                 "terminal"
                 if clean_text(record.get("error"))
                 else "success"
             )
-            if _fenced_commit_model_record(
+            committed = _fenced_commit_model_record(
                 store.path,
                 job=job,
                 expected_kind=job.kind,
@@ -1791,8 +1807,10 @@ def _process_claimed_group(
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
                 write_tracker=write_tracker,
-            ):
-                handled += 1
+            )
+            if committed:
+                with state_lock:
+                    handled += 1
 
         run_extraction_task_group(
             extractor=extractor,
@@ -1803,7 +1821,40 @@ def _process_claimed_group(
             workers=workers,
             on_record=commit_record,
         )
+        if transient_errors:
+            errors = sorted(set(error for error in transient_errors if error))
+            detail = f": {'; '.join(errors)}" if errors else ""
+            raise RuntimeError(
+                "transient model endpoint failure left model jobs retryable"
+                f"{detail}"
+            )
     return handled
+
+
+def _claimable_modalities(
+    database_path: Path,
+    jobset: ModelJobSet,
+) -> set[str]:
+    now = time.time()
+    claimable: set[str] = set()
+    with _connect(database_path) as connection:
+        for modality in ("text", "image"):
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM jobs
+                WHERE kind = ?
+                  AND (
+                    status IN ('pending', 'retryable')
+                    OR (status = 'leased' AND lease_expires <= ?)
+                  )
+                LIMIT 1
+                """,
+                (jobset.kind_for(modality), now),
+            ).fetchone()
+            if row is not None:
+                claimable.add(modality)
+    return claimable
 
 
 def _job_snapshot(
@@ -2497,6 +2548,7 @@ def run_model_stage(
     assets_manifest: Path | None = None,
     assets_barrier: AssetStageBarrier | None = None,
     ready_timeout_seconds: float | None = None,
+    endpoint_ready_timeout_seconds: float = 0.0,
     text_done_marker: Path | None = None,
     image_done_marker: Path | None = None,
     run_fingerprint: str = "",
@@ -2583,6 +2635,18 @@ def run_model_stage(
         jobset,
         write_tracker=result_write_tracker,
     )
+    ensure_endpoints_ready = getattr(
+        extractor,
+        "ensure_endpoints_ready",
+        None,
+    )
+    if callable(ensure_endpoints_ready):
+        modalities = _claimable_modalities(store.path, jobset)
+        if modalities:
+            ensure_endpoints_ready(
+                modalities=modalities,
+                timeout_seconds=endpoint_ready_timeout_seconds,
+            )
     processed = 0
     for modality in ("text", "image"):
         while stop_after is None or processed < stop_after:
