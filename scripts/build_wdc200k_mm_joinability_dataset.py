@@ -4158,16 +4158,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--text_model_base_urls", nargs="*", default=None)
     parser.add_argument("--text_model_base_urls_file")
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
-    parser.add_argument(
-        "--text_model_api_key", default=os.environ.get("VLLM_API_KEY")
-    )
+    parser.add_argument("--text_model_api_key")
     parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
     parser.add_argument("--image_model_base_urls", nargs="*", default=None)
     parser.add_argument("--image_model_base_urls_file")
     parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
-    parser.add_argument(
-        "--image_model_api_key", default=os.environ.get("VLLM_API_KEY")
-    )
+    parser.add_argument("--image_model_api_key")
     parser.add_argument("--precompute_model_cache", action="store_true")
     parser.add_argument("--precompute_text_model_cache", action="store_true")
     parser.add_argument("--text_model_workers", type=int, default=1)
@@ -4189,13 +4185,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("text asset chunk limits must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
-    if not args.model_endpoint_ready_timeout_seconds >= 0:
+    if (
+        not math.isfinite(args.model_endpoint_ready_timeout_seconds)
+        or args.model_endpoint_ready_timeout_seconds < 0
+    ):
         parser.error("--model_endpoint_ready_timeout_seconds must be non-negative")
-    if not args.model_timeout_seconds > 0:
+    if (
+        not math.isfinite(args.model_timeout_seconds)
+        or args.model_timeout_seconds <= 0
+    ):
         parser.error("--model_timeout_seconds must be positive")
     if args.model_max_retries < 0:
         parser.error("--model_max_retries must be non-negative")
-    if not args.model_retry_sleep_seconds >= 0:
+    if (
+        not math.isfinite(args.model_retry_sleep_seconds)
+        or args.model_retry_sleep_seconds < 0
+    ):
         parser.error("--model_retry_sleep_seconds must be non-negative")
     return args
 

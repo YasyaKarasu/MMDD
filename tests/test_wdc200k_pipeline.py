@@ -216,11 +216,17 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
     (
         ("--model_endpoint_ready_timeout_seconds", "-0.1"),
         ("--model_endpoint_ready_timeout_seconds", "nan"),
+        ("--model_endpoint_ready_timeout_seconds", "inf"),
+        ("--model_endpoint_ready_timeout_seconds", "-inf"),
         ("--model_timeout_seconds", "0"),
         ("--model_timeout_seconds", "nan"),
+        ("--model_timeout_seconds", "inf"),
+        ("--model_timeout_seconds", "-inf"),
         ("--model_max_retries", "-1"),
         ("--model_retry_sleep_seconds", "-0.1"),
         ("--model_retry_sleep_seconds", "nan"),
+        ("--model_retry_sleep_seconds", "inf"),
+        ("--model_retry_sleep_seconds", "-inf"),
     ),
 )
 def test_remote_model_cli_options_reject_invalid_values(
@@ -265,13 +271,15 @@ def test_model_api_keys_do_not_change_stage_config_fingerprint(
     ) == pipeline_module._stage_config_fingerprint(with_secrets, "models")
 
 
-def test_vllm_api_key_environment_is_the_remote_endpoint_default(
+def test_runtime_args_leave_api_key_environment_precedence_to_extractor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("VLLM_API_KEY", "environment-only-secret")
+    monkeypatch.setenv("VLLM_API_KEY", "common-secret")
+    monkeypatch.setenv("MMDD_TEXT_MODEL_API_KEY", "text-secret")
+    monkeypatch.setenv("MMDD_IMAGE_MODEL_API_KEY", "image-secret")
 
-    args = parse_args(
+    parsed = parse_args(
         [
             "--input_dir",
             str(tmp_path / "input"),
@@ -279,9 +287,50 @@ def test_vllm_api_key_environment_is_the_remote_endpoint_default(
             str(tmp_path / "output"),
         ]
     )
+    runtime_args = pipeline_module._runtime_args(
+        PipelineConfig.from_args(parsed)
+    )
+    extractor = pipeline_module.join_builder.LocalAttributeExtractor(runtime_args)
 
-    assert args.text_model_api_key == "environment-only-secret"
-    assert args.image_model_api_key == "environment-only-secret"
+    assert parsed.text_model_api_key is None
+    assert parsed.image_model_api_key is None
+    assert runtime_args.text_model_api_key is None
+    assert runtime_args.image_model_api_key is None
+    assert extractor.text_model_api_key == "text-secret"
+    assert extractor.image_model_api_key == "image-secret"
+
+
+def test_remote_vllm_runbook_pins_resume_state_and_secure_tmux() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split("### Remote vLLM on one A100 80GB", 1)[1].split(
+        "### ", 1
+    )[0]
+    resume_command = section.split("ordinary `--resume`:", 1)[1].split(
+        "```bash", 1
+    )[1].split("```", 1)[0]
+
+    assert "https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/" in section
+    assert "tmux -L mmdd-vllm new-session" in section
+    assert "tmux -L mmdd-vllm new-window" in section
+    assert "chmod 600" in section
+    assert "--input_dir /home/oycy/MMDD/wdc_schemaorg_2023" in resume_command
+    assert (
+        "--output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720"
+        in resume_command
+    )
+    assert (
+        "--work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719"
+        in resume_command
+    )
+    assert (
+        "--cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720"
+        in resume_command
+    )
+    assert "--sampled_entities_per_table 8" in resume_command
+    assert "--entity_sampling_seed 20260720" in resume_command
+    assert "--min_free_disk_bytes 107374182400" in resume_command
+    assert "--resume" in resume_command
+    assert "--from_stage" not in resume_command
 
 
 def test_pipeline_config_requires_separate_roots(tmp_path: Path) -> None:

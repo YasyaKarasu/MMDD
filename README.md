@@ -359,7 +359,7 @@ python -m pip --version
 Confirm from `nvidia-smi` and the NVIDIA compatibility documentation that the
 installed driver supports the CUDA 12.9 PyTorch wheel, then install the same
 pinned vLLM release used locally. The command follows the
-[official vLLM GPU installation guidance](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/):
+[official vLLM 0.23 GPU installation guidance](https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/):
 
 ```bash
 python -m pip install 'vllm==0.23.0' \
@@ -384,24 +384,31 @@ Hugging Face repositories instead requires remote network access and any model
 authorization required by their publishers. Do not silently substitute a
 different revision or model.
 
-Back on the remote host, generate one API key without writing it into a command
-line or log. Start each server in its own tmux session; tmux output stays in the
-pane and there is no log redirection:
+Back on the remote host, generate one API key in a mode-600 file without putting
+the secret in a command argument or log. Use a dedicated tmux socket with one
+session and two windows, so both windows inherit the same controlled setup and
+their output stays in the panes without log redirection. Before running these
+commands, stop an existing `mmdd-vllm` dedicated server with
+`tmux -L mmdd-vllm kill-server` (an absent server only produces a harmless
+"no server running" error), or choose a unique socket name instead:
 
 ```bash
 conda activate vllm-023
-export VLLM_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models
+umask 077
+mkdir -p "$HOME/.config/mmdd"
+python -c 'import secrets; print(secrets.token_urlsafe(32))' \
+  > "$HOME/.config/mmdd/vllm-api-key"
+chmod 600 "$HOME/.config/mmdd/vllm-api-key"
 
-tmux new-session -d -s vllm-text \
-  "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate vllm-023 && CUDA_VISIBLE_DEVICES=0 vllm serve \"$REMOTE_MODEL_ROOT/Qwen3.5-9B\" --host 127.0.0.1 --port 8001 --served-model-name Qwen3.5-9B --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --language-model-only"
+tmux -L mmdd-vllm kill-server
+tmux -L mmdd-vllm new-session -d -s serve -n text \
+  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3.5-9B" --host 127.0.0.1 --port 8001 --served-model-name Qwen3.5-9B --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --language-model-only'
 
-tmux new-session -d -s vllm-image \
-  "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate vllm-023 && CUDA_VISIBLE_DEVICES=0 vllm serve \"$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Thinking\" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Thinking --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt '{\"image\":1,\"video\":0}' --mm-processor-cache-gb 1"
+tmux -L mmdd-vllm new-window -d -t serve -n image \
+  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Thinking" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Thinking --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt "{\"image\":1,\"video\":0}" --mm-processor-cache-gb 1'
 
-tmux attach-session -t vllm-text
-# Detach with Ctrl-b d, then inspect the other server:
-tmux attach-session -t vllm-image
+tmux -L mmdd-vllm attach-session -t serve:text
+# Detach with Ctrl-b d; switch to the image window with Ctrl-b n.
 ```
 
 vLLM 0.23 documents `--language-model-only`; confirm it with
@@ -428,11 +435,13 @@ expose the vLLM ports to the public internet; vLLM's
 [security guidance](https://docs.vllm.ai/en/latest/usage/security/) notes that
 an API key does not protect every server endpoint.
 
-In another local shell, use the same secret value as the remote export and
-verify both served IDs through the tunnel:
+In another local shell, read the same mode-600 key over SSH directly into the
+environment, then verify both served IDs through the tunnel. The key is neither
+a command argument nor printed to the terminal:
 
 ```bash
-export VLLM_API_KEY='copy-the-remotely-generated-value-here'
+export VLLM_API_KEY="$(ssh user@REMOTE_HOST \
+  'cat "$HOME/.config/mmdd/vllm-api-key"')"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $VLLM_API_KEY" \
   http://127.0.0.1:18001/v1/models | python -m json.tool
@@ -448,12 +457,15 @@ builder with the formal roots and ordinary `--resume`:
 ```bash
 conda run --no-capture-output -n MMDD python \
   scripts/build_wdc200k_mm_joinability_dataset.py \
-  --input_dir wdc_schemaorg_2023 \
-  --output_dir output_wdc_200k \
-  --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --input_dir /home/oycy/MMDD/wdc_schemaorg_2023 \
+  --output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720 \
+  --work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719 \
+  --cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720 \
   --max_source_tables 200000 \
   --selection_seed 13 \
+  --sampled_entities_per_table 8 \
+  --entity_sampling_seed 20260720 \
+  --min_free_disk_bytes 107374182400 \
   --resume \
   --text_model_base_url http://127.0.0.1:18001/v1 \
   --text_model_name Qwen3.5-9B \
@@ -467,12 +479,14 @@ conda run --no-capture-output -n MMDD python \
   --model_retry_sleep_seconds 2
 ```
 
-The builder reads `VLLM_API_KEY` for both endpoint clients, so the secret is not
-placed on its command line and is excluded from run fingerprints, registries,
-progress, and logs. Do not add `--from_stage models`: a plain resume preserves
-the 408 outcomes already recovered and does not re-fetch completed network
-work. The three expired durable leases are reclaimed automatically when their
-workers resume.
+The endpoint client uses its existing precedence of explicit modality CLI key,
+modality-specific environment key, then common `VLLM_API_KEY`. Thus the common
+export above authenticates both endpoints without placing the secret on the
+builder command line; keys remain excluded from run fingerprints, registries,
+progress, and logs. Do not add `--from_stage models`: this is a plain resume and
+does not re-fetch completed network work. The 408 connection failures have
+already been restored to `pending` and will be retried. The three expired
+`leased` jobs are reclaimed automatically when workers resume.
 
 For a structural tmux preflight, keep process output attached directly to the
 tmux pane and use a second pane for the atomic progress snapshot:
