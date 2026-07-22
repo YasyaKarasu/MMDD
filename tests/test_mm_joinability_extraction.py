@@ -859,6 +859,25 @@ def test_endpoint_readiness_checks_every_configured_url_with_modality_credential
     ]
 
 
+def test_endpoint_readiness_accepts_modalities_as_public_keyword(monkeypatch):
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    monkeypatch.setattr(
+        "build_mm_joinability_dataset.requests.get",
+        lambda url, headers, timeout: Response(),
+    )
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_name="served-text")
+    )
+
+    extractor.ensure_endpoints_ready(modalities={"text"}, timeout_seconds=0)
+
+
 def test_endpoint_readiness_uses_explicit_poll_interval_not_chat_retry_sleep(monkeypatch):
     attempts = 0
     sleeps = []

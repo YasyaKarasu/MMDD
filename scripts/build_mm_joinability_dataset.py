@@ -543,7 +543,7 @@ class LocalAttributeExtractor:
 
     def ensure_endpoints_ready(
         self,
-        model_kinds: set[str],
+        modalities: set[str],
         timeout_seconds: float,
         poll_seconds: float = 2.0,
     ) -> None:
@@ -562,7 +562,7 @@ class LocalAttributeExtractor:
 
         endpoint_configs: list[tuple[str, str, str, str | None]] = []
         for model_kind in ("text", "image"):
-            if model_kind not in model_kinds:
+            if model_kind not in modalities:
                 continue
             if model_kind == "text":
                 urls = self.current_text_model_base_urls()
