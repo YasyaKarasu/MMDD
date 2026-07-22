@@ -859,6 +859,117 @@ def test_endpoint_readiness_checks_every_configured_url_with_modality_credential
     ]
 
 
+def test_endpoint_readiness_uses_explicit_poll_interval_not_chat_retry_sleep(monkeypatch):
+    attempts = 0
+    sleeps = []
+    now = 100.0
+
+    class Response:
+        text = ""
+
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    def fake_get(url, headers, timeout):
+        nonlocal attempts
+        attempts += 1
+        return Response(503 if attempts == 1 else 200)
+
+    def fake_sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.monotonic", lambda: now)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.sleep", fake_sleep)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://text.test/v1",
+            text_model_name="served-text",
+            model_retry_sleep_seconds=99.0,
+        )
+    )
+
+    extractor.ensure_endpoints_ready({"text"}, timeout_seconds=10.0, poll_seconds=0.25)
+
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+@pytest.mark.parametrize("poll_seconds", [-0.1, float("inf"), float("nan")])
+def test_endpoint_readiness_rejects_invalid_poll_seconds(poll_seconds):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    with pytest.raises(ValueError, match="poll_seconds"):
+        extractor.ensure_endpoints_ready({"text"}, timeout_seconds=0, poll_seconds=poll_seconds)
+
+
+def test_endpoint_readiness_bounds_each_get_by_remaining_deadline(monkeypatch):
+    request_timeouts = []
+    now = 10.0
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    def fake_get(url, headers, timeout):
+        nonlocal now
+        request_timeouts.append(timeout)
+        now += 0.4
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    monkeypatch.setattr("build_mm_joinability_dataset.time.monotonic", lambda: now)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://text-a.test/v1",
+            text_model_base_urls=["https://text-b.test/v1"],
+            text_model_name="served-text",
+            model_timeout_seconds=120.0,
+        )
+    )
+
+    extractor.ensure_endpoints_ready({"text"}, timeout_seconds=1.0)
+
+    assert request_timeouts == pytest.approx([1.0, 0.6])
+
+
+def test_zero_readiness_timeout_still_uses_finite_positive_get_timeout(monkeypatch):
+    request_timeouts = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    def fake_get(url, headers, timeout):
+        request_timeouts.append(timeout)
+        return Response()
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.get", fake_get)
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://text.test/v1",
+            text_model_name="served-text",
+            model_timeout_seconds=120.0,
+        )
+    )
+
+    extractor.ensure_endpoints_ready({"text"}, timeout_seconds=0)
+
+    assert len(request_timeouts) == 1
+    assert 0 < request_timeouts[0] <= 1.0
+
+
 @pytest.mark.parametrize(
     ("response_status", "payload", "raised", "expected_type"),
     [

@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import threading
@@ -491,13 +492,20 @@ class LocalAttributeExtractor:
             self._image_endpoint_index += 1
             return urls[index]
 
-    def _probe_endpoint(self, model_kind: str, base_url: str, model: str, api_key: str | None) -> None:
+    def _probe_endpoint(
+        self,
+        model_kind: str,
+        base_url: str,
+        model: str,
+        api_key: str | None,
+        request_timeout: float,
+    ) -> None:
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         models_url = f"{base_url.rstrip('/')}/models"
         try:
-            response = requests.get(models_url, headers=headers, timeout=self.timeout)
+            response = requests.get(models_url, headers=headers, timeout=request_timeout)
         except Exception as exc:
             message = (
                 f"{model_kind} model endpoint {base_url} readiness check failed "
@@ -533,7 +541,25 @@ class LocalAttributeExtractor:
                 f"{model_kind} model endpoint {base_url} does not serve configured model {model!r}"
             )
 
-    def ensure_endpoints_ready(self, model_kinds: set[str], timeout_seconds: float) -> None:
+    def ensure_endpoints_ready(
+        self,
+        model_kinds: set[str],
+        timeout_seconds: float,
+        poll_seconds: float = 2.0,
+    ) -> None:
+        """Poll every selected endpoint within one shared readiness deadline.
+
+        A zero timeout performs one probe per endpoint, with each HTTP request capped
+        at one second. Positive timeouts cap every request by the deadline remaining
+        immediately before that request.
+        """
+        timeout_seconds = float(timeout_seconds)
+        poll_seconds = float(poll_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be a finite non-negative number")
+        if not math.isfinite(poll_seconds) or poll_seconds < 0:
+            raise ValueError("poll_seconds must be a finite non-negative number")
+
         endpoint_configs: list[tuple[str, str, str, str | None]] = []
         for model_kind in ("text", "image"):
             if model_kind not in model_kinds:
@@ -548,16 +574,29 @@ class LocalAttributeExtractor:
                 api_key = self.image_model_api_key
             endpoint_configs.extend((model_kind, url, model, api_key) for url in urls)
 
-        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        configured_request_timeout = float(self.timeout)
+        if not math.isfinite(configured_request_timeout) or configured_request_timeout <= 0:
+            configured_request_timeout = 1.0
+        single_probe = timeout_seconds == 0
+        deadline = time.monotonic() + timeout_seconds
         while True:
             try:
-                for config in endpoint_configs:
-                    self._probe_endpoint(*config)
+                for model_kind, url, model, api_key in endpoint_configs:
+                    if single_probe:
+                        request_timeout = min(configured_request_timeout, 1.0)
+                    else:
+                        remaining_seconds = deadline - time.monotonic()
+                        if remaining_seconds <= 0:
+                            raise TransientModelEndpointError(
+                                f"{model_kind} model endpoint {url} readiness deadline expired"
+                            )
+                        request_timeout = min(configured_request_timeout, remaining_seconds)
+                    self._probe_endpoint(model_kind, url, model, api_key, request_timeout)
                 return
             except RuntimeError:
-                if time.monotonic() >= deadline:
+                if single_probe or time.monotonic() >= deadline:
                     raise
-                time.sleep(min(max(self.retry_sleep, 0.05), max(0.0, deadline - time.monotonic())))
+                time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
     def chat(
         self,
