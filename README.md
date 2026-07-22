@@ -337,6 +337,143 @@ conda run --no-capture-output -n MMDD python \
 The dynamic runner owns endpoint files, model identity, and staged
 start/ready/done markers under `work_wdc_200k/runtime`.
 
+### Remote vLLM on one A100 80GB
+
+This runbook serves both models on one remote A100 and lets the local builder
+reach them through an SSH tunnel. The settings below are an operating starting
+point, not a claim that this exact GPU allocation has been benchmarked. Keep the
+builder stopped until both endpoint checks at the end of this section succeed.
+
+On the remote host, first inspect the GPU and create a fresh Python 3.12
+environment with `pip`:
+
+```bash
+ssh user@REMOTE_HOST
+nvidia-smi
+conda create -n vllm-023 python=3.12 pip -y
+conda activate vllm-023
+python --version
+python -m pip --version
+```
+
+Confirm from `nvidia-smi` and the NVIDIA compatibility documentation that the
+installed driver supports the CUDA 12.9 PyTorch wheel, then install the same
+pinned vLLM release used locally. The command follows the
+[official vLLM GPU installation guidance](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/):
+
+```bash
+python -m pip install 'vllm==0.23.0' \
+  --extra-index-url https://download.pytorch.org/whl/cu129
+python -c 'import torch, vllm; print("vllm", vllm.__version__, "torch", torch.__version__, "cuda", torch.version.cuda)'
+```
+
+Do not subsequently install `torch` with conda: that can replace the matching
+wheel selected for vLLM. Prepare the exact local model directories on the
+remote host before serving. From the local repository, `rsync` is preferred:
+
+```bash
+ssh user@REMOTE_HOST 'mkdir -p /srv/mmdd/hf_models'
+rsync -a --info=progress2 hf_models/Qwen3.5-9B/ \
+  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3.5-9B/
+rsync -a --info=progress2 hf_models/Qwen3-VL-8B-Thinking/ \
+  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3-VL-8B-Thinking/
+```
+
+If those local directories are unavailable, downloading the corresponding
+Hugging Face repositories instead requires remote network access and any model
+authorization required by their publishers. Do not silently substitute a
+different revision or model.
+
+Back on the remote host, generate one API key without writing it into a command
+line or log. Start each server in its own tmux session; tmux output stays in the
+pane and there is no log redirection:
+
+```bash
+conda activate vllm-023
+export VLLM_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models
+
+tmux new-session -d -s vllm-text \
+  "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate vllm-023 && CUDA_VISIBLE_DEVICES=0 vllm serve \"$REMOTE_MODEL_ROOT/Qwen3.5-9B\" --host 127.0.0.1 --port 8001 --served-model-name Qwen3.5-9B --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --language-model-only"
+
+tmux new-session -d -s vllm-image \
+  "source \"$(conda info --base)/etc/profile.d/conda.sh\" && conda activate vllm-023 && CUDA_VISIBLE_DEVICES=0 vllm serve \"$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Thinking\" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Thinking --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt '{\"image\":1,\"video\":0}' --mm-processor-cache-gb 1"
+
+tmux attach-session -t vllm-text
+# Detach with Ctrl-b d, then inspect the other server:
+tmux attach-session -t vllm-image
+```
+
+vLLM 0.23 documents `--language-model-only`; confirm it with
+`vllm serve --help`. If a locally patched 0.23 build omits that option, replace
+it on the text command with
+`--limit-mm-per-prompt '{"image":0,"video":0}'`. The image command keeps one
+image, disables video, and reduces the multimodal processor cache to 1 GiB;
+vLLM documents that this cache is duplicated across API and engine processes.
+See the [v0.23 serve option reference](https://docs.vllm.ai/en/v0.23.0/cli/serve/).
+
+Keep vLLM bound to `127.0.0.1` and, on the builder host, open the recommended
+tunnel:
+
+```bash
+ssh -N \
+  -L 18001:127.0.0.1:8001 \
+  -L 18000:127.0.0.1:8000 \
+  user@REMOTE_HOST
+```
+
+For a trusted private LAN only, an alternative is `--host 0.0.0.0` plus a
+firewall rule that permits these two ports solely from the builder's IP. Never
+expose the vLLM ports to the public internet; vLLM's
+[security guidance](https://docs.vllm.ai/en/latest/usage/security/) notes that
+an API key does not protect every server endpoint.
+
+In another local shell, use the same secret value as the remote export and
+verify both served IDs through the tunnel:
+
+```bash
+export VLLM_API_KEY='copy-the-remotely-generated-value-here'
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
+  http://127.0.0.1:18001/v1/models | python -m json.tool
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
+  http://127.0.0.1:18000/v1/models | python -m json.tool
+```
+
+The first response must contain `Qwen3.5-9B`; the second must contain
+`Qwen3-VL-8B-Thinking`. Only after both are healthy, resume the stopped local
+builder with the formal roots and ordinary `--resume`:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --resume \
+  --text_model_base_url http://127.0.0.1:18001/v1 \
+  --text_model_name Qwen3.5-9B \
+  --image_model_base_url http://127.0.0.1:18000/v1 \
+  --image_model_name Qwen3-VL-8B-Thinking \
+  --text_model_workers 1 \
+  --image_model_workers 1 \
+  --model_endpoint_ready_timeout_seconds 180 \
+  --model_timeout_seconds 300 \
+  --model_max_retries 4 \
+  --model_retry_sleep_seconds 2
+```
+
+The builder reads `VLLM_API_KEY` for both endpoint clients, so the secret is not
+placed on its command line and is excluded from run fingerprints, registries,
+progress, and logs. Do not add `--from_stage models`: a plain resume preserves
+the 408 outcomes already recovered and does not re-fetch completed network
+work. The three expired durable leases are reclaimed automatically when their
+workers resume.
+
 For a structural tmux preflight, keep process output attached directly to the
 tmux pane and use a second pane for the atomic progress snapshot:
 

@@ -218,6 +218,10 @@ class PipelineConfig:
     model_start_marker: Path | None = None
     model_ready_marker: Path | None = None
     model_ready_timeout_seconds: float | None = None
+    model_endpoint_ready_timeout_seconds: float = 30.0
+    model_timeout_seconds: float = 120.0
+    model_max_retries: int = 2
+    model_retry_sleep_seconds: float = 2.0
     model_text_done_marker: Path | None = None
     model_image_done_marker: Path | None = None
     refresh_page_cache: bool = False
@@ -330,6 +334,12 @@ class PipelineConfig:
                 else None
             ),
             model_ready_timeout_seconds=args.model_ready_timeout_seconds,
+            model_endpoint_ready_timeout_seconds=(
+                args.model_endpoint_ready_timeout_seconds
+            ),
+            model_timeout_seconds=args.model_timeout_seconds,
+            model_max_retries=args.model_max_retries,
+            model_retry_sleep_seconds=args.model_retry_sleep_seconds,
             model_text_done_marker=(
                 Path(args.model_text_done_marker).resolve()
                 if args.model_text_done_marker
@@ -2581,6 +2591,12 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         str(config.text_model_workers),
         "--image_model_workers",
         str(config.image_model_workers),
+        "--model_timeout_seconds",
+        str(config.model_timeout_seconds),
+        "--model_max_retries",
+        str(config.model_max_retries),
+        "--model_retry_sleep_seconds",
+        str(config.model_retry_sleep_seconds),
         "--web_max_retries",
         "0",
         "--web_max_response_seconds",
@@ -2606,6 +2622,9 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         argv.extend(["--image_model_api_key", config.image_model_api_key])
     args = legacy_wdc_builder.parse_args(argv)
     args.max_rows_per_source_table = None
+    args.model_endpoint_ready_timeout_seconds = (
+        config.model_endpoint_ready_timeout_seconds
+    )
     return args
 
 
@@ -3658,6 +3677,9 @@ def _run_models(
         assets_manifest=materialized_assets.manifest_path,
         assets_barrier=assets_barrier,
         ready_timeout_seconds=config.model_ready_timeout_seconds,
+        endpoint_ready_timeout_seconds=(
+            config.model_endpoint_ready_timeout_seconds
+        ),
         text_done_marker=config.model_text_done_marker,
         image_done_marker=config.model_image_done_marker,
         run_fingerprint=run_fingerprint,
@@ -4122,18 +4144,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_start_marker")
     parser.add_argument("--model_ready_marker")
     parser.add_argument("--model_ready_timeout_seconds", type=float)
+    parser.add_argument(
+        "--model_endpoint_ready_timeout_seconds", type=float, default=30.0
+    )
+    parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
+    parser.add_argument("--model_max_retries", type=int, default=2)
+    parser.add_argument(
+        "--model_retry_sleep_seconds", type=float, default=2.0
+    )
     parser.add_argument("--model_text_done_marker")
     parser.add_argument("--model_image_done_marker")
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None)
     parser.add_argument("--text_model_base_urls_file")
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
-    parser.add_argument("--text_model_api_key")
+    parser.add_argument(
+        "--text_model_api_key", default=os.environ.get("VLLM_API_KEY")
+    )
     parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
     parser.add_argument("--image_model_base_urls", nargs="*", default=None)
     parser.add_argument("--image_model_base_urls_file")
     parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
-    parser.add_argument("--image_model_api_key")
+    parser.add_argument(
+        "--image_model_api_key", default=os.environ.get("VLLM_API_KEY")
+    )
     parser.add_argument("--precompute_model_cache", action="store_true")
     parser.add_argument("--precompute_text_model_cache", action="store_true")
     parser.add_argument("--text_model_workers", type=int, default=1)
@@ -4155,6 +4189,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("text asset chunk limits must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
+    if not args.model_endpoint_ready_timeout_seconds >= 0:
+        parser.error("--model_endpoint_ready_timeout_seconds must be non-negative")
+    if not args.model_timeout_seconds > 0:
+        parser.error("--model_timeout_seconds must be positive")
+    if args.model_max_retries < 0:
+        parser.error("--model_max_retries must be non-negative")
+    if not args.model_retry_sleep_seconds >= 0:
+        parser.error("--model_retry_sleep_seconds must be non-negative")
     return args
 
 

@@ -145,6 +145,10 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.resume is True
     assert args.refresh_page_cache is False
     assert args.refresh_image_cache is False
+    assert args.model_endpoint_ready_timeout_seconds == 30.0
+    assert args.model_timeout_seconds == 120.0
+    assert args.model_max_retries == 2
+    assert args.model_retry_sleep_seconds == 2.0
     config = PipelineConfig.from_args(args)
     assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
@@ -157,6 +161,127 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
         "models",
         "materialize",
     )
+
+
+def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> None:
+    secret = "explicit-secret-must-not-be-persisted"
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--text_model_base_url",
+                "http://127.0.0.1:18001/v1",
+                "--text_model_name",
+                "remote-text",
+                "--text_model_api_key",
+                secret,
+                "--image_model_base_url",
+                "http://127.0.0.1:18000/v1",
+                "--image_model_name",
+                "remote-image",
+                "--image_model_api_key",
+                secret,
+                "--model_endpoint_ready_timeout_seconds",
+                "45.5",
+                "--model_timeout_seconds",
+                "300",
+                "--model_max_retries",
+                "4",
+                "--model_retry_sleep_seconds",
+                "0.25",
+            ]
+        )
+    )
+
+    runtime_args = pipeline_module._runtime_args(config)
+
+    assert runtime_args.text_model_base_url == "http://127.0.0.1:18001/v1"
+    assert runtime_args.text_model_name == "remote-text"
+    assert runtime_args.text_model_api_key == secret
+    assert runtime_args.image_model_base_url == "http://127.0.0.1:18000/v1"
+    assert runtime_args.image_model_name == "remote-image"
+    assert runtime_args.image_model_api_key == secret
+    assert runtime_args.model_endpoint_ready_timeout_seconds == 45.5
+    assert runtime_args.model_timeout_seconds == 300.0
+    assert runtime_args.model_max_retries == 4
+    assert runtime_args.model_retry_sleep_seconds == 0.25
+    assert config.model_endpoint_ready_timeout_seconds == 45.5
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    (
+        ("--model_endpoint_ready_timeout_seconds", "-0.1"),
+        ("--model_endpoint_ready_timeout_seconds", "nan"),
+        ("--model_timeout_seconds", "0"),
+        ("--model_timeout_seconds", "nan"),
+        ("--model_max_retries", "-1"),
+        ("--model_retry_sleep_seconds", "-0.1"),
+        ("--model_retry_sleep_seconds", "nan"),
+    ),
+)
+def test_remote_model_cli_options_reject_invalid_values(
+    tmp_path: Path,
+    option: str,
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                option,
+                value,
+            ]
+        )
+
+
+def test_model_api_keys_do_not_change_stage_config_fingerprint(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    )
+    with_secrets = replace(
+        config,
+        text_model_api_key="explicit-text-secret",
+        image_model_api_key="explicit-image-secret",
+    )
+
+    assert pipeline_module._stage_config_fingerprint(
+        config, "models"
+    ) == pipeline_module._stage_config_fingerprint(with_secrets, "models")
+
+
+def test_vllm_api_key_environment_is_the_remote_endpoint_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_API_KEY", "environment-only-secret")
+
+    args = parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert args.text_model_api_key == "environment-only-secret"
+    assert args.image_model_api_key == "environment-only-secret"
 
 
 def test_pipeline_config_requires_separate_roots(tmp_path: Path) -> None:
@@ -3422,8 +3547,10 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
         run_fingerprint="dynamic-run-v1",
         model_start_marker=runtime / "start.json",
         model_ready_marker=runtime / "ready.json",
+        model_ready_timeout_seconds=7.0,
         model_text_done_marker=runtime / "text-done.json",
         model_image_done_marker=runtime / "image-done.json",
+        model_endpoint_ready_timeout_seconds=45.5,
     )
     captured: dict[str, Any] = {}
     real_runner = pipeline_module.run_model_stage
@@ -3453,6 +3580,8 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
     assert captured["text_done_marker"] == config.model_text_done_marker
     assert captured["image_done_marker"] == config.model_image_done_marker
     assert captured["run_fingerprint"] == "dynamic-run-v1"
+    assert captured["ready_timeout_seconds"] == 7.0
+    assert captured["endpoint_ready_timeout_seconds"] == 45.5
     assert callable(captured["pre_write_guard"])
     assert len(tuple(captured["network_manifests"])) == 2
     assert captured["assets_manifest"].is_file()
