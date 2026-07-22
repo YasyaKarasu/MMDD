@@ -975,11 +975,11 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
 def run_extraction_task(extractor: LocalAttributeExtractor, task: ExtractionTask) -> dict[str, Any]:
     try:
         result = extractor.extract(task.asset, task.entity, task.candidate_attribute_names)
-    except TransientModelEndpointError as exc:
+    except TransientModelEndpointError:
         result = {
             "attributes": [],
             "raw_response": "",
-            "error": str(exc),
+            "error": "model endpoint temporarily unavailable",
             "error_class": "model_endpoint_transient",
         }
     except Exception as exc:

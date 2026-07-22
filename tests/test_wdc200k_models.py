@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -368,10 +369,12 @@ class EndpointAwareExtractor(CountingExtractor):
         *,
         readiness_error: BaseException | None = None,
         transient_asset_ids: set[str] | None = None,
+        transient_error: str = "model endpoint request failed: HTTP 503",
     ) -> None:
         super().__init__()
         self.readiness_error = readiness_error
         self.transient_asset_ids = transient_asset_ids or set()
+        self.transient_error = transient_error
         self.readiness_calls: list[tuple[set[str], float]] = []
 
     def ensure_endpoints_ready(self, *, modalities, timeout_seconds):
@@ -384,7 +387,7 @@ class EndpointAwareExtractor(CountingExtractor):
             with self.lock:
                 self.asset_ids.append(current_asset["asset_id"])
             raise TransientModelEndpointError(
-                "model endpoint request failed: HTTP 503"
+                self.transient_error
             )
         return super().extract(current_asset, entity, candidate_attributes)
 
@@ -506,6 +509,56 @@ def test_model_endpoint_preflight_includes_expired_leased_modality(
     assert _job_rows(store) == [(jobset.jobs[0].job_id, "leased")]
 
 
+def test_model_endpoint_preflight_skips_unexpired_foreign_lease(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    lease_expires = time.time() + 60
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'leased', owner = 'other-worker',
+                lease_id = 'active-lease', lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (lease_expires, jobset.jobs[0].job_id),
+        )
+    extractor = EndpointAwareExtractor(
+        readiness_error=AssertionError("readiness must not run")
+    )
+
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is False
+    assert result.leased == 1
+    assert extractor.readiness_calls == []
+    assert extractor.asset_ids == []
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT status, owner, lease_id, lease_expires
+            FROM jobs WHERE job_id = ?
+            """,
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == (
+            "leased",
+            "other-worker",
+            "active-lease",
+            lease_expires,
+        )
+
+
 def test_transient_model_error_is_retryable_without_durable_result(
     tmp_path: Path,
 ) -> None:
@@ -516,9 +569,12 @@ def test_transient_model_error_is_retryable_without_durable_result(
         args=model_args(),
         input_fingerprint="assets-v1",
     )
-    extractor = EndpointAwareExtractor(transient_asset_ids={"a"})
+    extractor = EndpointAwareExtractor(
+        transient_asset_ids={"a"},
+        transient_error="request used Authorization: Bearer SUPERSECRET",
+    )
 
-    with pytest.raises(RuntimeError, match="transient model endpoint"):
+    with pytest.raises(RuntimeError, match="transient model endpoint") as caught:
         run_model_stage(
             store,
             extractor,
@@ -526,6 +582,14 @@ def test_transient_model_error_is_retryable_without_durable_result(
             output_root=tmp_path / "outputs",
         )
 
+    assert "SUPERSECRET" not in str(caught.value)
+    assert "SUPERSECRET" not in "".join(
+        traceback.format_exception(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        )
+    )
     assert _job_rows(store) == [(jobset.jobs[0].job_id, "retryable")]
     with sqlite3.connect(store.path) as connection:
         assert connection.execute(

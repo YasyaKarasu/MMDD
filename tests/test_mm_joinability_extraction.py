@@ -699,7 +699,7 @@ def test_run_extraction_task_classifies_sanitized_transient_endpoint_error():
     class TransientExtractor:
         def extract(self, _asset, _entity, _candidate_attributes):
             raise joinability_dataset.TransientModelEndpointError(
-                "model endpoint request failed: HTTP 503"
+                "request failed with Authorization: Bearer SUPERSECRET"
             )
 
     record = joinability_dataset.run_extraction_task(
@@ -708,8 +708,8 @@ def test_run_extraction_task_classifies_sanitized_transient_endpoint_error():
     )
 
     assert record["error_class"] == "model_endpoint_transient"
-    assert record["error"] == "model endpoint request failed: HTTP 503"
-    assert "secret" not in record["error"].casefold()
+    assert record["error"] == "model endpoint temporarily unavailable"
+    assert "SUPERSECRET" not in json.dumps(record)
 
 
 def _parallel_args(**overrides):
