@@ -1022,6 +1022,70 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
             "registry_bytes": registry_path.read_bytes(),
         }
 
+    adapter_manifest_path = (
+        config.work_dir
+        / "adapted_model_tasks"
+        / "model-task-adapter-manifest.json"
+    )
+    original_adapter_manifest = adapter_manifest_path.read_bytes()
+    legacy_adapter_manifest = json.loads(
+        original_adapter_manifest
+    )
+    assert isinstance(
+        legacy_adapter_manifest.pop("parameter_fingerprint"),
+        str,
+    )
+    adapter_manifest_path.write_text(
+        json.dumps(legacy_adapter_manifest),
+        encoding="utf-8",
+    )
+    import wdc200k_models as model_module
+
+    sampling_manifest = config.work_dir / "sampling" / "manifest.json"
+    sampled_paths = model_module._sampling_manifest_entity_paths(
+        sampling_manifest
+    )
+    expected_parameters, legacy_safe = (
+        model_module._model_adapter_parameter_fingerprint(
+            pipeline_module._runtime_args(config),
+            sampled_entity_paths=sampled_paths,
+            sampling_manifest=sampling_manifest,
+        )
+    )
+    assert legacy_safe is True
+    assert model_module._load_completed_adapted_model_tasks(
+        output_root=adapter_manifest_path.parent,
+        manifest_path=adapter_manifest_path,
+        expected_input_fingerprint=legacy_adapter_manifest[
+            "input_fingerprint"
+        ],
+        expected_parameter_fingerprint=expected_parameters,
+        allow_legacy_parameter=legacy_safe,
+    ).manifest_path == adapter_manifest_path
+    with pytest.raises(ValueError, match="sampled entity path identity"):
+        model_module._model_adapter_parameter_fingerprint(
+            pipeline_module._runtime_args(config),
+            sampled_entity_paths=(tmp_path / "foreign-sampled.jsonl",),
+            sampling_manifest=sampling_manifest,
+        )
+    with pytest.raises(ValueError, match="sampled entity paths are required"):
+        model_module._model_adapter_parameter_fingerprint(
+            pipeline_module._runtime_args(config),
+            sampled_entity_paths=None,
+            sampling_manifest=sampling_manifest,
+        )
+    whitespace_args = pipeline_module._runtime_args(config)
+    whitespace_args.text_model_name = f" {whitespace_args.text_model_name} "
+    _whitespace_fingerprint, whitespace_legacy_safe = (
+        model_module._model_adapter_parameter_fingerprint(
+            whitespace_args,
+            sampled_entity_paths=sampled_paths,
+            sampling_manifest=sampling_manifest,
+        )
+    )
+    assert whitespace_legacy_safe is False
+    adapter_manifest_path.write_bytes(original_adapter_manifest)
+
     resumed = run_pipeline(
         config,
         page_transport=page_transport,

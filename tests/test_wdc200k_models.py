@@ -3427,6 +3427,7 @@ def test_task5_image_bytes_are_fingerprinted_and_rechecked_before_model_call(
 
 def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from dataclasses import asdict
     from stage1_io import stable_hash
@@ -3658,6 +3659,521 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         records[0]["extraction_task"]["entity"]["entity_id"]
         == "entity-alpha"
     )
+
+    index_path = adapted.output_root / "model-task-adapter.sqlite3"
+    stale_tmp = adapted.output_root / ".stale-adapter.tmp"
+    undeclared = adapted.output_root / "operator-note.txt"
+    stale_tmp.write_text("stale", encoding="utf-8")
+    undeclared.write_text("keep", encoding="utf-8")
+    declared_paths = (
+        adapted.manifest_path,
+        index_path,
+        *adapted.task_paths,
+        *adapted.error_paths,
+    )
+    before = {
+        path: (
+            path.stat().st_mtime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in declared_paths
+    }
+    forbidden_streams = {
+        (structural_root / "source_tables/part-00000.jsonl").resolve(),
+        (structural_root / "entities/part-00000.jsonl").resolve(),
+        (assets_root / asset_completed["path"]).resolve(),
+        (assets_root / link_completed["path"]).resolve(),
+    }
+    real_iter_jsonl_paths = models._iter_jsonl_paths
+
+    def reject_model_input_streams(paths: object) -> object:
+        materialized = tuple(Path(path) for path in paths)
+        if any(path.resolve() in forbidden_streams for path in materialized):
+            raise AssertionError("completed adapter consumed a model input stream")
+        return real_iter_jsonl_paths(materialized)
+
+    monkeypatch.setattr(models, "_iter_jsonl_paths", reject_model_input_streams)
+    import wdc200k_structural as structural_module
+
+    real_model_validate_shard = models.validate_completed_shard
+    real_structural_validate_shard = structural_module.validate_completed_shard
+
+    def reject_upstream_model_shard_validation(
+        shard: object,
+        root: Path,
+    ) -> bool:
+        if Path(root).resolve() != adapted.output_root.resolve():
+            raise AssertionError("completed adapter validated an upstream shard")
+        return real_model_validate_shard(shard, root)
+
+    def reject_structural_shard_validation(
+        _shard: object,
+        _root: Path,
+    ) -> bool:
+        raise AssertionError("completed adapter validated a structural shard")
+
+    monkeypatch.setattr(
+        models,
+        "validate_completed_shard",
+        reject_upstream_model_shard_validation,
+    )
+    monkeypatch.setattr(
+        structural_module,
+        "validate_completed_shard",
+        reject_structural_shard_validation,
+    )
+    guard_calls: list[tuple[Path, int]] = []
+    resumed = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=adapted.output_root,
+        args=model_args(),
+        records_per_shard=1,
+        pre_write_guard=lambda path, size=0: guard_calls.append(
+            (Path(path), size)
+        ),
+    )
+
+    assert resumed == adapted
+    assert guard_calls == []
+    assert {
+        path: (
+            path.stat().st_mtime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in declared_paths
+    } == before
+    assert stale_tmp.read_text(encoding="utf-8") == "stale"
+    assert undeclared.read_text(encoding="utf-8") == "keep"
+    for changed_args in (
+        argparse.Namespace(
+            **vars(model_args()),
+            min_column_non_empty_ratio=0.7,
+        ),
+        model_args(text_model_name="text-v2"),
+        model_args(text_model_name=" text-v1 "),
+        model_args(image_model_name="image-v2"),
+    ):
+        with pytest.raises(ValueError, match="parameter identity"):
+            adapt_model_tasks_from_manifests(
+                structural_output_root=structural_root,
+                structural_manifests=[structural_manifest],
+                finalized_selection_manifest=final_manifest,
+                structural_barrier=structural_barrier,
+                assets_manifest=assets_manifest,
+                assets_barrier=task5_barrier(),
+                output_root=adapted.output_root,
+                args=changed_args,
+            )
+    alternate_entities = tmp_path / "alternate-sampled-entities.jsonl"
+    alternate_entities.write_bytes(
+        (structural_root / "entities/part-00000.jsonl").read_bytes()
+    )
+    with pytest.raises(ValueError, match="parameter identity"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=adapted.output_root,
+            args=model_args(),
+            sampled_entity_paths=[alternate_entities],
+        )
+    structural_entity_path = (
+        structural_root / "entities/part-00000.jsonl"
+    )
+    original_entity_bytes = structural_entity_path.read_bytes()
+    structural_entity_path.write_bytes(original_entity_bytes + b"\n")
+    with pytest.raises(ValueError, match="parameter identity"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=adapted.output_root,
+            args=model_args(),
+            sampled_entity_paths=[structural_entity_path],
+        )
+    structural_entity_path.write_bytes(original_entity_bytes)
+    assert isinstance(
+        json.loads(adapted.manifest_path.read_text(encoding="utf-8")).get(
+            "parameter_fingerprint"
+        ),
+        str,
+    )
+    first_jobset = enqueue_model_tasks(
+        real_iter_jsonl_paths(adapted.task_paths),
+        SqliteJobStore(tmp_path / "first-resume-jobs.sqlite3"),
+        args=model_args(),
+        input_fingerprint=adapted.input_fingerprint,
+    )
+    resumed_jobset = enqueue_model_tasks(
+        real_iter_jsonl_paths(resumed.task_paths),
+        SqliteJobStore(tmp_path / "second-resume-jobs.sqlite3"),
+        args=model_args(),
+        input_fingerprint=resumed.input_fingerprint,
+    )
+    assert (
+        resumed_jobset.text_fingerprint,
+        resumed_jobset.image_fingerprint,
+        resumed_jobset.text_tasks,
+        resumed_jobset.image_tasks,
+    ) == (
+        first_jobset.text_fingerprint,
+        first_jobset.image_fingerprint,
+        first_jobset.text_tasks,
+        first_jobset.image_tasks,
+    )
+    monkeypatch.setattr(models, "_iter_jsonl_paths", real_iter_jsonl_paths)
+    original_manifest = adapted.manifest_path.read_bytes()
+    mismatched = json.loads(original_manifest)
+    mismatched["input_fingerprint"] = "foreign-adapter-input"
+    adapted.manifest_path.write_text(json.dumps(mismatched), encoding="utf-8")
+    with pytest.raises(ValueError, match="input identity"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=adapted.output_root,
+            args=model_args(),
+        )
+    assert json.loads(adapted.manifest_path.read_text(encoding="utf-8")) == mismatched
+    adapted.manifest_path.write_bytes(original_manifest)
+
+    task_path = adapted.task_paths[0]
+    original_task = task_path.read_bytes()
+    task_path.write_bytes(original_task + b"corrupt\n")
+    with pytest.raises(ValueError, match="shard validation"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=adapted.output_root,
+            args=model_args(),
+        )
+    assert task_path.read_bytes() == original_task + b"corrupt\n"
+    task_path.write_bytes(original_task)
+
+    for invalid_complete in (None, 0, "false"):
+        invalid = json.loads(original_manifest)
+        invalid["complete"] = invalid_complete
+        adapted.manifest_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="completion"):
+            adapt_model_tasks_from_manifests(
+                structural_output_root=structural_root,
+                structural_manifests=[structural_manifest],
+                finalized_selection_manifest=final_manifest,
+                structural_barrier=structural_barrier,
+                assets_manifest=assets_manifest,
+                assets_barrier=task5_barrier(),
+                output_root=adapted.output_root,
+                args=model_args(),
+            )
+    missing_complete = json.loads(original_manifest)
+    missing_complete.pop("complete")
+    adapted.manifest_path.write_text(
+        json.dumps(missing_complete),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="completion"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=adapted.output_root,
+            args=model_args(),
+        )
+    for field, value in (
+        ("stage", "foreign-adapter-stage"),
+        ("schema_version", "foreign-adapter-schema"),
+        ("input_fingerprint", "foreign-incomplete-input"),
+    ):
+        incomplete_foreign = json.loads(original_manifest)
+        incomplete_foreign["complete"] = False
+        incomplete_foreign[field] = value
+        adapted.manifest_path.write_text(
+            json.dumps(incomplete_foreign),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="input identity"):
+            adapt_model_tasks_from_manifests(
+                structural_output_root=structural_root,
+                structural_manifests=[structural_manifest],
+                finalized_selection_manifest=final_manifest,
+                structural_barrier=structural_barrier,
+                assets_manifest=assets_manifest,
+                assets_barrier=task5_barrier(),
+                output_root=adapted.output_root,
+                args=model_args(),
+            )
+
+    original_payload = json.loads(original_manifest)
+    task_item = original_payload["task_shards"][0]
+    path_variants: list[dict[str, object]] = []
+    duplicate = json.loads(original_manifest)
+    duplicate["task_shards"] = [task_item, dict(task_item)]
+    duplicate["counts"]["tasks"] = 2
+    path_variants.append(duplicate)
+    alias = json.loads(original_manifest)
+    alias["task_shards"][0]["path"] = (
+        f"tasks/../{alias['task_shards'][0]['path']}"
+    )
+    path_variants.append(alias)
+    swapped = json.loads(original_manifest)
+    swapped["task_shards"] = []
+    swapped["error_shards"] = [task_item]
+    swapped["counts"] = {"tasks": 0, "errors": 1}
+    path_variants.append(swapped)
+    for invalid_paths in path_variants:
+        adapted.manifest_path.write_text(
+            json.dumps(invalid_paths),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="path"):
+            adapt_model_tasks_from_manifests(
+                structural_output_root=structural_root,
+                structural_manifests=[structural_manifest],
+                finalized_selection_manifest=final_manifest,
+                structural_barrier=structural_barrier,
+                assets_manifest=assets_manifest,
+                assets_barrier=task5_barrier(),
+                output_root=adapted.output_root,
+                args=model_args(),
+            )
+
+    metadata_variants: list[dict[str, object]] = []
+    for invalid_count in (1.9, "1", True, -1, 0):
+        invalid = json.loads(original_manifest)
+        invalid["counts"]["tasks"] = invalid_count
+        metadata_variants.append(invalid)
+    for field, invalid_values in (
+        ("records", (1.9, "1", True, -1)),
+        (
+            "bytes",
+            (
+                float(task_item["bytes"]),
+                str(task_item["bytes"]),
+                True,
+                -1,
+            ),
+        ),
+        (
+            "sha256",
+            (
+                str(task_item["sha256"]).upper(),
+                str(task_item["sha256"])[:-1],
+            ),
+        ),
+    ):
+        for invalid_value in invalid_values:
+            invalid = json.loads(original_manifest)
+            invalid["task_shards"][0][field] = invalid_value
+            metadata_variants.append(invalid)
+    immutable_outputs = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (index_path, *adapted.task_paths, *adapted.error_paths)
+    }
+    for invalid_metadata in metadata_variants:
+        encoded_invalid = json.dumps(invalid_metadata).encode("utf-8")
+        adapted.manifest_path.write_bytes(encoded_invalid)
+        invalid_guard_calls: list[Path] = []
+        with pytest.raises(ValueError, match="(metadata|shard)"):
+            adapt_model_tasks_from_manifests(
+                structural_output_root=structural_root,
+                structural_manifests=[structural_manifest],
+                finalized_selection_manifest=final_manifest,
+                structural_barrier=structural_barrier,
+                assets_manifest=assets_manifest,
+                assets_barrier=task5_barrier(),
+                output_root=adapted.output_root,
+                args=model_args(),
+                pre_write_guard=lambda path, _size=0: invalid_guard_calls.append(
+                    Path(path)
+                ),
+            )
+        assert invalid_guard_calls == []
+        assert adapted.manifest_path.read_bytes() == encoded_invalid
+        assert {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in immutable_outputs
+        } == immutable_outputs
+
+    monkeypatch.setattr(
+        models,
+        "validate_completed_shard",
+        real_model_validate_shard,
+    )
+    monkeypatch.setattr(
+        structural_module,
+        "validate_completed_shard",
+        real_structural_validate_shard,
+    )
+    incomplete = json.loads(original_manifest)
+    incomplete["complete"] = False
+    adapted.manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    rebuild_guards: list[Path] = []
+    rebuilt = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=adapted.output_root,
+        args=model_args(),
+        pre_write_guard=lambda path, _size=0: rebuild_guards.append(Path(path)),
+    )
+    assert rebuild_guards
+    assert validate_adapted_model_tasks(
+        rebuilt,
+        expected_input_fingerprint=adapted.input_fingerprint,
+    ) == rebuilt
+
+    first_task = json.loads(
+        rebuilt.task_paths[0].read_text(encoding="utf-8").splitlines()[0]
+    )
+    second_task = json.loads(json.dumps(first_task))
+    second_task["extraction_task"]["asset"]["asset_id"] = "asset-beta"
+    second_task["extraction_task"]["asset"]["content"] = (
+        "asset-beta is in Alabama."
+    )
+    encoded_tasks = (
+        json.dumps(first_task, ensure_ascii=False, sort_keys=True)
+        + "\n"
+        + json.dumps(second_task, ensure_ascii=False, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    rebuilt.task_paths[0].write_bytes(encoded_tasks)
+    two_task_manifest = json.loads(
+        rebuilt.manifest_path.read_text(encoding="utf-8")
+    )
+    two_task_manifest["counts"]["tasks"] = 2
+    two_task_manifest["task_shards"][0].update(
+        records=2,
+        bytes=len(encoded_tasks),
+        sha256=hashlib.sha256(encoded_tasks).hexdigest(),
+    )
+    rebuilt.manifest_path.write_text(
+        json.dumps(two_task_manifest),
+        encoding="utf-8",
+    )
+    two_task_adapter = validate_adapted_model_tasks(
+        models.AdaptedModelTasks(
+            output_root=rebuilt.output_root,
+            task_paths=rebuilt.task_paths,
+            error_paths=rebuilt.error_paths,
+            manifest_path=rebuilt.manifest_path,
+            input_fingerprint=rebuilt.input_fingerprint,
+            tasks=2,
+            errors=0,
+        ),
+        expected_input_fingerprint=rebuilt.input_fingerprint,
+    )
+    reused_two_task_adapter = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=rebuilt.output_root,
+        args=model_args(),
+    )
+    assert reused_two_task_adapter == two_task_adapter
+
+    shared_store = SqliteJobStore(tmp_path / "shared-resume-jobs.sqlite3")
+    partial_jobset = enqueue_model_tasks(
+        real_iter_jsonl_paths(two_task_adapter.task_paths),
+        shared_store,
+        args=model_args(),
+        input_fingerprint=two_task_adapter.input_fingerprint,
+    )
+    extractor = CountingExtractor()
+    partial_result = run_model_stage(
+        shared_store,
+        extractor,
+        jobset=partial_jobset,
+        stop_after=1,
+        group_size=1,
+        output_root=tmp_path / "partial-model-output",
+    )
+    assert partial_result.complete is False
+    assert len(extractor.asset_ids) == 1
+    with sqlite3.connect(shared_store.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'retryable' WHERE status = 'pending'"
+        )
+
+    def durable_queue_snapshot() -> dict[str, tuple[tuple[object, ...], ...]]:
+        table_keys = {
+            "jobs": "job_id",
+            "model_results": "job_id",
+            "model_jobsets": "fingerprint",
+            "model_job_members": "jobset_fingerprint, job_id",
+            "model_jobset_pairs": "identity",
+        }
+        snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
+        with sqlite3.connect(shared_store.path) as connection:
+            for table, order_by in table_keys.items():
+                columns = [
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                    if str(row[1]) != "updated_at"
+                ]
+                selected = ", ".join(f'"{column}"' for column in columns)
+                snapshot[table] = tuple(
+                    connection.execute(
+                        f"SELECT {selected} FROM {table} ORDER BY {order_by}"
+                    ).fetchall()
+                )
+        return snapshot
+
+    before_reenqueue = durable_queue_snapshot()
+    assert sorted(status for _job_id, status in _job_rows(shared_store)) == [
+        "retryable",
+        "success",
+    ]
+    with sqlite3.connect(shared_store.path) as connection:
+        assert connection.execute(
+            "SELECT status, committed FROM model_results"
+        ).fetchall() == [("success", 1)]
+    resumed_again = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=rebuilt.output_root,
+        args=model_args(),
+    )
+    same_jobset = enqueue_model_tasks(
+        real_iter_jsonl_paths(resumed_again.task_paths),
+        shared_store,
+        args=model_args(),
+        input_fingerprint=resumed_again.input_fingerprint,
+    )
+    assert same_jobset.text_fingerprint == partial_jobset.text_fingerprint
+    assert same_jobset.image_fingerprint == partial_jobset.image_fingerprint
+    assert durable_queue_snapshot() == before_reenqueue
+    assert len(extractor.asset_ids) == 1
 
     from dataclasses import replace
 

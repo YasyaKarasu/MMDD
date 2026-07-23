@@ -3363,6 +3363,7 @@ def _strict_asset_manifest(
     manifest_path: Path,
     *,
     barrier: AssetStageBarrier,
+    validate_shards: bool = True,
 ) -> tuple[dict[str, Any], list[Path], list[Path]]:
     payload = _validated_complete_manifest(manifest_path)
     if (
@@ -3467,7 +3468,7 @@ def _strict_asset_manifest(
         raise ValueError("Task-5 manifest is missing required shards")
     if not asset_shards and barrier.bridge_assets != 0:
         raise ValueError("Task-5 manifest is missing required shards")
-    if not all(
+    if validate_shards and not all(
         validate_completed_shard(shard, root)
         for shard in (*asset_shards, *link_shards)
     ):
@@ -3484,6 +3485,84 @@ def _strict_asset_manifest(
         [root / shard.path for shard in asset_shards],
         [root / shard.path for shard in link_shards],
     )
+
+
+def _sampling_manifest_entity_paths(manifest_path: Path) -> tuple[Path, ...]:
+    from wdc200k_sampling import SAMPLING_SCHEMA_VERSION
+
+    payload = _validated_complete_manifest(manifest_path)
+    if (
+        payload.get("stage") != "wdc200k_entity_sampling"
+        or payload.get("schema_version") != SAMPLING_SCHEMA_VERSION
+    ):
+        raise ValueError("sampling artifact manifest identity mismatch")
+    root = manifest_path.parent
+    paths = tuple(
+        sorted(
+            root / str(item["path"])
+            for item in payload.get("completed_shards", [])
+            if str(item.get("path", "")).startswith("sampled_entities/")
+        )
+    )
+    if not paths:
+        raise ValueError("sampling manifest has no sampled entity paths")
+    return paths
+
+
+def _model_adapter_parameter_fingerprint(
+    args: argparse.Namespace,
+    *,
+    sampled_entity_paths: tuple[Path, ...] | None,
+    sampling_manifest: Path | None,
+) -> tuple[str, bool]:
+    ratio = float(getattr(args, "min_column_non_empty_ratio", 0.5))
+    text_model_name = str(getattr(args, "text_model_name", ""))
+    image_model_name = str(getattr(args, "image_model_name", ""))
+    if sampling_manifest is not None:
+        if sampled_entity_paths is None:
+            raise ValueError(
+                "sampled entity paths are required with sampling manifest"
+            )
+        declared_paths = _sampling_manifest_entity_paths(sampling_manifest)
+        if tuple(
+            path.resolve() for path in sampled_entity_paths
+        ) != tuple(path.resolve() for path in declared_paths):
+            raise ValueError("sampled entity path identity mismatch")
+        sampled_identity: Any = {
+            "authority": "sampling_manifest",
+            "paths": [path.resolve().as_posix() for path in declared_paths],
+        }
+    elif sampled_entity_paths is None:
+        sampled_identity = {"authority": "structural_entities"}
+    else:
+        sampled_identity = {
+            "authority": "explicit_paths",
+            "paths": [
+                {
+                    "path": path.resolve().as_posix(),
+                    "sha256": _sha256_path(path),
+                }
+                for path in sampled_entity_paths
+            ],
+        }
+    payload = {
+        "min_column_non_empty_ratio": ratio,
+        "text_model_name": text_model_name,
+        "image_model_name": image_model_name,
+        "sampled_entities": sampled_identity,
+    }
+    fingerprint = stable_hash(
+        "wdc200k-model-task-adapter-parameters-v1",
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        length=40,
+    )
+    legacy_safe = (
+        sampling_manifest is not None
+        and ratio == 0.5
+        and text_model_name == "Qwen3.5-9B"
+        and image_model_name == "Qwen3-VL-8B-Thinking"
+    )
+    return fingerprint, legacy_safe
 
 
 def adapt_model_tasks_from_manifests(
@@ -3512,6 +3591,13 @@ def adapt_model_tasks_from_manifests(
 
     structural_output_root = Path(structural_output_root)
     structural_paths = sorted(Path(path) for path in structural_manifests)
+    sampled_paths = (
+        None
+        if sampled_entity_paths is None
+        else tuple(
+            sorted(Path(path).resolve() for path in sampled_entity_paths)
+        )
+    )
     if not structural_paths:
         raise ValueError("structural manifests are required")
     if (
@@ -3530,26 +3616,11 @@ def adapt_model_tasks_from_manifests(
         or structural_keys != set(structural_barrier.manifest_sha256)
     ):
         raise ValueError("structural barrier manifest set/count mismatch")
-    source_paths: list[Path] = []
-    entity_paths: list[Path] = []
-    validated_selection_paths: list[Path] = []
-    table_count = 0
     manifest_hashes: list[tuple[Path, str]] = []
-    compact_authority = (
-        validate_sampling_source_authority(
-            Path(sampling_manifest),
-            structural_output_root=structural_output_root,
-        )
-        if sampling_manifest is not None
-        else None
-    )
-    sampled_authority = (
-        validate_sampling_artifacts(Path(sampling_manifest))
-        if sampling_manifest is not None
-        else None
-    )
+    structural_payloads: dict[Path, dict[str, Any]] = {}
     for manifest_path in structural_paths:
-        manifest_key = manifest_path.resolve().as_posix()
+        resolved = manifest_path.resolve()
+        manifest_key = resolved.as_posix()
         actual_manifest_sha256 = _sha256_path(manifest_path)
         if (
             actual_manifest_sha256
@@ -3567,57 +3638,8 @@ def adapt_model_tasks_from_manifests(
             != structural_barrier.parameter_fingerprints[manifest_key]
         ):
             raise ValueError("structural barrier fingerprint mismatch")
-        if compact_authority is None:
-            validated, records, manifest_hash = (
-                structural._validated_shard_from_manifest(
-                    manifest_path,
-                    output_root=structural_output_root,
-                )
-            )
-            validated_selection_paths.append(validated)
-            table_count += records
-        else:
-            manifest_hash = actual_manifest_sha256
-            source_shards = [
-                item
-                for item in manifest_payload["completed_shards"]
-                if str(item["path"]).startswith("source_tables/")
-            ]
-            if len(source_shards) != 1:
-                raise ValueError("compact structural source set mismatch")
-            table_count += int(source_shards[0]["records"])
-        manifest_hashes.append(
-            (manifest_path.resolve(), manifest_hash)
-        )
-        payload = manifest_payload
-        completed = [
-            _completed_from_payload(item)
-            for item in payload["completed_shards"]
-        ]
-        source_paths.extend(
-            structural_output_root / shard.path
-            for shard in completed
-            if shard.path.startswith("source_tables/")
-        )
-        entity_paths.extend(
-            structural_output_root / shard.path
-            for shard in completed
-            if shard.path.startswith("entities/")
-        )
-
-    if sampled_entity_paths is not None:
-        entity_paths = sorted(Path(path) for path in sampled_entity_paths)
-        if not entity_paths or any(not path.is_file() for path in entity_paths):
-            raise ValueError("sampled entity paths are missing")
-        if sampled_authority is not None and tuple(
-            path.resolve() for path in entity_paths
-        ) != tuple(
-            path.resolve()
-            for path in sampled_authority.artifact_paths["sampled_entities"]
-        ):
-            raise ValueError("sampled entity paths do not match manifest authority")
-    if compact_authority is not None:
-        source_paths = list(compact_authority.source_tables)
+        manifest_hashes.append((resolved, actual_manifest_sha256))
+        structural_payloads[resolved] = manifest_payload
 
     final_path = Path(finalized_selection_manifest)
     final_payload = _validated_complete_manifest(final_path)
@@ -3650,14 +3672,131 @@ def adapt_model_tasks_from_manifests(
     )
     expected_final_parameters = stable_hash(
         "validated-selection-global-v1",
-        table_count,
+        final_shard.records,
         length=40,
     )
     if (
         final_payload.get("input_fingerprint") != expected_final_input
         or final_payload.get("parameter_fingerprint")
         != expected_final_parameters
-        or final_shard.records != table_count
+    ):
+        raise ValueError(
+            "Task-3 finalized-selection fingerprint/validation failed"
+        )
+    _strict_asset_manifest(
+        Path(assets_manifest),
+        barrier=assets_barrier,
+        validate_shards=False,
+    )
+    input_fingerprint = model_adapter_input_fingerprint(
+        (digest for _path, digest in manifest_hashes),
+        finalized_selection_manifest=final_path,
+        assets_manifest=Path(assets_manifest),
+    )
+    if sampling_manifest is not None:
+        input_fingerprint = stable_hash(
+            input_fingerprint,
+            _sha256_path(Path(sampling_manifest)),
+            length=40,
+        )
+    parameter_fingerprint, legacy_parameter_safe = (
+        _model_adapter_parameter_fingerprint(
+            args,
+            sampled_entity_paths=sampled_paths,
+            sampling_manifest=(
+                Path(sampling_manifest)
+                if sampling_manifest is not None
+                else None
+            ),
+        )
+    )
+    output_root = Path(output_root)
+    adapter_manifest_path = (
+        output_root / "model-task-adapter-manifest.json"
+    )
+    resumed = _load_completed_adapted_model_tasks(
+        output_root=output_root,
+        manifest_path=adapter_manifest_path,
+        expected_input_fingerprint=input_fingerprint,
+        expected_parameter_fingerprint=parameter_fingerprint,
+        allow_legacy_parameter=legacy_parameter_safe,
+    )
+    if resumed is not None:
+        return resumed
+
+    source_paths: list[Path] = []
+    entity_paths: list[Path] = []
+    validated_selection_paths: list[Path] = []
+    table_count = 0
+    compact_authority = (
+        validate_sampling_source_authority(
+            Path(sampling_manifest),
+            structural_output_root=structural_output_root,
+        )
+        if sampling_manifest is not None
+        else None
+    )
+    sampled_authority = (
+        validate_sampling_artifacts(Path(sampling_manifest))
+        if sampling_manifest is not None
+        else None
+    )
+    for manifest_path in structural_paths:
+        actual_manifest_sha256 = structural_barrier.manifest_sha256[
+            manifest_path.resolve().as_posix()
+        ]
+        manifest_payload = structural_payloads[manifest_path.resolve()]
+        if compact_authority is None:
+            validated, records, _manifest_hash = (
+                structural._validated_shard_from_manifest(
+                    manifest_path,
+                    output_root=structural_output_root,
+                )
+            )
+            validated_selection_paths.append(validated)
+            table_count += records
+        else:
+            manifest_hash = actual_manifest_sha256
+            source_shards = [
+                item
+                for item in manifest_payload["completed_shards"]
+                if str(item["path"]).startswith("source_tables/")
+            ]
+            if len(source_shards) != 1:
+                raise ValueError("compact structural source set mismatch")
+            table_count += int(source_shards[0]["records"])
+        payload = manifest_payload
+        completed = [
+            _completed_from_payload(item)
+            for item in payload["completed_shards"]
+        ]
+        source_paths.extend(
+            structural_output_root / shard.path
+            for shard in completed
+            if shard.path.startswith("source_tables/")
+        )
+        entity_paths.extend(
+            structural_output_root / shard.path
+            for shard in completed
+            if shard.path.startswith("entities/")
+        )
+
+    if sampled_paths is not None:
+        entity_paths = list(sampled_paths)
+        if not entity_paths or any(not path.is_file() for path in entity_paths):
+            raise ValueError("sampled entity paths are missing")
+        if sampled_authority is not None and tuple(
+            path.resolve() for path in entity_paths
+        ) != tuple(
+            path.resolve()
+            for path in sampled_authority.artifact_paths["sampled_entities"]
+        ):
+            raise ValueError("sampled entity paths do not match manifest authority")
+    if compact_authority is not None:
+        source_paths = list(compact_authority.source_tables)
+
+    if (
+        final_shard.records != table_count
         or not validate_completed_shard(
             final_shard,
             structural_output_root,
@@ -3690,18 +3829,6 @@ def adapt_model_tasks_from_manifests(
         Path(assets_manifest),
         barrier=assets_barrier,
     )
-    input_fingerprint = model_adapter_input_fingerprint(
-        (digest for _path, digest in manifest_hashes),
-        finalized_selection_manifest=final_path,
-        assets_manifest=Path(assets_manifest),
-    )
-    if sampling_manifest is not None:
-        input_fingerprint = stable_hash(
-            input_fingerprint,
-            _sha256_path(Path(sampling_manifest)),
-            length=40,
-        )
-    output_root = Path(output_root)
     if pre_write_guard is not None:
         pre_write_guard(output_root, 0)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -3880,15 +4007,15 @@ def adapt_model_tasks_from_manifests(
         )
         for shard in error_shards
     ]
-    manifest_path = output_root / "model-task-adapter-manifest.json"
     if pre_write_guard is not None:
-        pre_write_guard(manifest_path, 0)
+        pre_write_guard(adapter_manifest_path, 0)
     _atomic_json(
-        manifest_path,
+        adapter_manifest_path,
         {
             "stage": "wdc200k_model_task_adapter",
             "schema_version": MODEL_QUEUE_SCHEMA_VERSION,
             "input_fingerprint": input_fingerprint,
+            "parameter_fingerprint": parameter_fingerprint,
             "task_shards": [_shard_payload(item) for item in task_shards],
             "error_shards": [_shard_payload(item) for item in error_shards],
             "counts": {"tasks": task_count, "errors": error_count},
@@ -3900,7 +4027,7 @@ def adapt_model_tasks_from_manifests(
         output_root=output_root,
         task_paths=tuple(output_root / item.path for item in task_shards),
         error_paths=tuple(output_root / item.path for item in error_shards),
-        manifest_path=manifest_path,
+        manifest_path=adapter_manifest_path,
         input_fingerprint=input_fingerprint,
         tasks=task_count,
         errors=error_count,
@@ -3936,29 +4063,75 @@ def validate_adapted_model_tasks(
     expected_input_fingerprint: str,
 ) -> AdaptedModelTasks:
     """Validate the adapter manifest and every declared task/error shard."""
-    payload = _validated_complete_manifest(Path(adapted.manifest_path))
-    if (
-        payload.get("stage") != "wdc200k_model_task_adapter"
-        or payload.get("schema_version") != MODEL_QUEUE_SCHEMA_VERSION
-        or payload.get("input_fingerprint")
-        != expected_input_fingerprint
-    ):
-        raise ValueError("model adapter input identity mismatch")
-    try:
-        task_shards = tuple(
-            _completed_from_payload(item)
-            for item in payload.get("task_shards", [])
+    reconstructed = _validated_adapted_model_tasks_from_manifest(
+        output_root=Path(adapted.output_root),
+        manifest_path=Path(adapted.manifest_path),
+        expected_input_fingerprint=expected_input_fingerprint,
+    )
+    if reconstructed != adapted:
+        raise ValueError("model adapter result does not match manifest")
+    return reconstructed
+
+
+def _validated_adapted_model_tasks_from_manifest(
+    *,
+    output_root: Path,
+    manifest_path: Path,
+    expected_input_fingerprint: str,
+    expected_parameter_fingerprint: str | None = None,
+    allow_legacy_parameter: bool = False,
+) -> AdaptedModelTasks:
+    """Return the exact adapter result declared by one complete manifest."""
+    payload = _validated_complete_manifest(manifest_path)
+    _validate_adapter_manifest_identity(
+        payload,
+        expected_input_fingerprint=expected_input_fingerprint,
+    )
+    declared_parameters = payload.get("parameter_fingerprint")
+    if declared_parameters is not None and (
+        not isinstance(declared_parameters, str)
+        or len(declared_parameters) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in declared_parameters
         )
-        error_shards = tuple(
-            _completed_from_payload(item)
-            for item in payload.get("error_shards", [])
+    ):
+        raise ValueError("model adapter parameter identity is invalid")
+    if expected_parameter_fingerprint is not None and (
+        (
+            declared_parameters is None
+            and not allow_legacy_parameter
+        )
+        or (
+            declared_parameters is not None
+            and declared_parameters != expected_parameter_fingerprint
+        )
+    ):
+        raise ValueError("model adapter parameter identity mismatch")
+    _validate_adapter_shard_paths(payload)
+    try:
+        task_shards = _parse_adapter_shards(
+            payload,
+            field="task_shards",
+        )
+        error_shards = _parse_adapter_shards(
+            payload,
+            field="error_shards",
         )
         counts = payload["counts"]
-        expected_tasks = int(counts["tasks"])
-        expected_errors = int(counts["errors"])
+        if not isinstance(counts, dict):
+            raise ValueError("counts must be an object")
+        expected_tasks = _strict_adapter_nonnegative_int(
+            counts["tasks"],
+            field="counts.tasks",
+        )
+        expected_errors = _strict_adapter_nonnegative_int(
+            counts["errors"],
+            field="counts.errors",
+        )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("model adapter manifest is invalid") from error
-    root = Path(adapted.output_root)
+        raise ValueError("model adapter metadata is invalid") from error
+    root = Path(output_root)
     if (
         expected_tasks < 0
         or expected_errors < 0
@@ -3974,14 +4147,139 @@ def validate_adapted_model_tasks(
         output_root=root,
         task_paths=tuple(root / item.path for item in task_shards),
         error_paths=tuple(root / item.path for item in error_shards),
-        manifest_path=Path(adapted.manifest_path),
+        manifest_path=Path(manifest_path),
         input_fingerprint=expected_input_fingerprint,
         tasks=expected_tasks,
         errors=expected_errors,
     )
-    if reconstructed != adapted:
-        raise ValueError("model adapter result does not match manifest")
     return reconstructed
+
+
+def _validate_adapter_manifest_identity(
+    payload: dict[str, Any],
+    *,
+    expected_input_fingerprint: str,
+) -> None:
+    if (
+        payload.get("stage") != "wdc200k_model_task_adapter"
+        or payload.get("schema_version") != MODEL_QUEUE_SCHEMA_VERSION
+        or payload.get("input_fingerprint")
+        != expected_input_fingerprint
+    ):
+        raise ValueError("model adapter input identity mismatch")
+
+
+def _validate_adapter_shard_paths(payload: dict[str, Any]) -> None:
+    all_paths: list[str] = []
+    for field, directory in (
+        ("task_shards", "tasks"),
+        ("error_shards", "planning_errors"),
+    ):
+        declared = payload.get(field)
+        if not isinstance(declared, list):
+            raise ValueError("model adapter shard path declaration is invalid")
+        for item in declared:
+            if not isinstance(item, dict) or not isinstance(
+                item.get("path"), str
+            ):
+                raise ValueError("model adapter shard path declaration is invalid")
+            value = item["path"]
+            normalized = Path(value)
+            if (
+                not value
+                or "\\" in value
+                or normalized.is_absolute()
+                or normalized.as_posix() != value
+                or len(normalized.parts) < 2
+                or normalized.parts[0] != directory
+                or any(part in {"", ".", ".."} for part in normalized.parts)
+            ):
+                raise ValueError(
+                    "model adapter shard path declaration is invalid"
+                )
+            all_paths.append(value)
+    if len(all_paths) != len(set(all_paths)):
+        raise ValueError("model adapter shard paths must be unique")
+
+
+def _strict_adapter_nonnegative_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative JSON integer")
+    return value
+
+
+def _parse_adapter_shards(
+    payload: dict[str, Any],
+    *,
+    field: str,
+) -> tuple[CompletedShard, ...]:
+    declared = payload.get(field)
+    if not isinstance(declared, list):
+        raise ValueError(f"{field} must be a list")
+    parsed: list[CompletedShard] = []
+    for item in declared:
+        if not isinstance(item, dict):
+            raise ValueError(f"{field} item must be an object")
+        path = item.get("path")
+        digest = item.get("sha256")
+        if not isinstance(path, str):
+            raise ValueError(f"{field}.path must be a string")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or digest != digest.lower()
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"{field}.sha256 must be lowercase hexadecimal")
+        parsed.append(
+            CompletedShard(
+                path=path,
+                records=_strict_adapter_nonnegative_int(
+                    item.get("records"),
+                    field=f"{field}.records",
+                ),
+                bytes=_strict_adapter_nonnegative_int(
+                    item.get("bytes"),
+                    field=f"{field}.bytes",
+                ),
+                sha256=digest,
+            )
+        )
+    return tuple(parsed)
+
+
+def _load_completed_adapted_model_tasks(
+    *,
+    output_root: Path,
+    manifest_path: Path,
+    expected_input_fingerprint: str,
+    expected_parameter_fingerprint: str,
+    allow_legacy_parameter: bool,
+) -> AdaptedModelTasks | None:
+    """Reuse a valid complete adapter; incomplete manifests remain rebuildable."""
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("model adapter manifest is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError("model adapter manifest is invalid")
+    _validate_adapter_manifest_identity(
+        payload,
+        expected_input_fingerprint=expected_input_fingerprint,
+    )
+    if not isinstance(payload.get("complete"), bool):
+        raise ValueError("model adapter completion flag is invalid")
+    if payload["complete"] is False:
+        return None
+    return _validated_adapted_model_tasks_from_manifest(
+        output_root=output_root,
+        manifest_path=manifest_path,
+        expected_input_fingerprint=expected_input_fingerprint,
+        expected_parameter_fingerprint=expected_parameter_fingerprint,
+        allow_legacy_parameter=allow_legacy_parameter,
+    )
 
 
 def validate_model_stage_for_adapter(
