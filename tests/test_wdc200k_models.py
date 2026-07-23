@@ -479,6 +479,196 @@ def test_model_endpoint_preflight_fails_before_claim(tmp_path: Path) -> None:
         ).fetchone() == (0,)
 
 
+def test_model_progress_callback_tracks_durable_status_transitions(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    snapshots: list[object] = []
+
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+        model_progress_callback=snapshots.append,
+    )
+
+    assert result.complete is True
+    assert snapshots
+    assert all(
+        snapshot.total
+        == snapshot.success
+        + snapshot.terminal
+        + snapshot.leased
+        + snapshot.pending
+        for snapshot in snapshots
+    )
+    assert any(
+        snapshot.modality == "text"
+        and snapshot.leased == 1
+        and snapshot.pending == 0
+        for snapshot in snapshots
+    )
+    assert any(
+        snapshot.modality == "text"
+        and snapshot.success == 1
+        and snapshot.leased == 0
+        for snapshot in snapshots
+    )
+    assert snapshots[-1] == models.ModelProgressSnapshot(
+        modality="image",
+        total=0,
+        success=0,
+        terminal=0,
+        leased=0,
+        pending=0,
+    )
+
+
+def test_model_progress_counts_are_isolated_by_modality(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("text-a", "text"), asset("text-b", "text"), asset("image-a", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    snapshots: list[models.ModelProgressSnapshot] = []
+
+    run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+        model_progress_callback=snapshots.append,
+    )
+
+    text = [snapshot for snapshot in snapshots if snapshot.modality == "text"]
+    image = [snapshot for snapshot in snapshots if snapshot.modality == "image"]
+    assert text and image
+    assert {snapshot.total for snapshot in text} == {2}
+    assert {snapshot.total for snapshot in image} == {1}
+    assert text[-1].success == 2
+    assert image[0].success == 0
+    assert image[-1].success == 1
+
+
+def test_model_progress_callback_failure_is_non_fatal(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("a")], store, args=model_args(), input_fingerprint="assets-v1"
+    )
+
+    def fail(_snapshot: models.ModelProgressSnapshot) -> None:
+        raise RuntimeError("console callback failed")
+
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+        model_progress_callback=fail,
+    )
+
+    assert result.complete is True
+    assert _job_rows(store) == [(jobset.jobs[0].job_id, "success")]
+
+
+def test_model_progress_treats_expired_leases_as_pending(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET status = 'leased', owner = 'dead',
+                lease_id = 'expired', lease_expires = ?
+            WHERE job_id = ?
+            """,
+            (time.time() - 1, jobset.jobs[0].job_id),
+        )
+    snapshots: list[object] = []
+
+    with pytest.raises(TransientModelEndpointError):
+        run_model_stage(
+            store,
+            EndpointAwareExtractor(
+                readiness_error=TransientModelEndpointError("unavailable")
+            ),
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+            model_progress_callback=snapshots.append,
+        )
+
+    assert snapshots == []
+
+
+def test_initial_model_progress_counts_active_and_expired_leases_by_kind(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [
+            asset("text-a", "text"),
+            asset("image-a", "image"),
+            asset("image-b", "image"),
+        ],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    now = time.time()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'leased', lease_expires = ? WHERE kind = ?",
+            (now + 60, jobset.text_kind),
+        )
+        image_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT job_id FROM jobs WHERE kind = ? ORDER BY job_id",
+                (jobset.image_kind,),
+            )
+        ]
+        connection.execute(
+            "UPDATE jobs SET status = 'leased', lease_expires = ? WHERE job_id = ?",
+            (now - 60, image_ids[0]),
+        )
+        connection.execute(
+            "UPDATE jobs SET status = 'retryable' WHERE job_id = ?",
+            (image_ids[1],),
+        )
+
+    assert models._initial_model_progress_counts(store.path, jobset) == {
+        "text": {
+            "total": 1,
+            "success": 0,
+            "terminal": 0,
+            "leased": 1,
+            "pending": 0,
+        },
+        "image": {
+            "total": 2,
+            "success": 0,
+            "terminal": 0,
+            "leased": 0,
+            "pending": 2,
+        },
+    }
+
+
 def test_model_endpoint_preflight_only_probes_claimable_modalities(
     tmp_path: Path,
 ) -> None:
@@ -1480,6 +1670,7 @@ def test_result_written_before_finish_repairs_without_model_call(
         input_fingerprint="assets-v1",
     )
     crashed = False
+    progress: list[models.ModelProgressSnapshot] = []
 
     def crash_once(_job_id: str, _record: dict) -> None:
         nonlocal crashed
@@ -1494,9 +1685,13 @@ def test_result_written_before_finish_repairs_without_model_call(
             jobset=jobset,
             output_root=tmp_path / "outputs",
             after_result_write=crash_once,
+            model_progress_callback=progress.append,
             lease_seconds=0.08,
             heartbeat_seconds=0.02,
         )
+
+    assert progress
+    assert all(snapshot.completed == 0 for snapshot in progress)
 
     time.sleep(0.1)
     resumed = run_model_stage(

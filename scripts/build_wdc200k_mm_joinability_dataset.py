@@ -78,6 +78,7 @@ from wdc200k_materialize import (
 from wdc200k_models import (
     AdaptedModelTasks,
     AssetStageBarrier,
+    ModelProgressSnapshot,
     ModelStageAuthority,
     ModelStageResult,
     StructuralStageBarrier,
@@ -390,6 +391,7 @@ class ProgressReporter:
     """Publish bounded-cost progress to JSON and direct stdout."""
 
     _ROLLING_WINDOW_SECONDS = 60.0
+    _NON_TTY_CONSOLE_INTERVAL_SECONDS = 60.0
     _MAX_STAGE_SAMPLES = MAX_URL_STAGE_SAMPLES
     _MAX_LEGACY_STAGE_SAMPLES = 256
     _MAX_MIXED_STAGE_SAMPLES = _MAX_LEGACY_STAGE_SAMPLES + _MAX_STAGE_SAMPLES
@@ -406,6 +408,11 @@ class ProgressReporter:
         self.path = config.work_dir / "progress.json"
         self._state = _ProgressState()
         self._rolling_samples: deque[tuple[float, int]] = deque()
+        self._model_progress: ModelProgressSnapshot | None = None
+        self._model_samples: deque[tuple[float, int]] = deque()
+        self._tty_line_length = 0
+        self._last_console_at: float | None = None
+        self._force_console = True
         self._stage_telemetry: dict[str, dict[str, Any]] = {}
         self._disk_roots: dict[str, dict[str, int]] = {}
         self._active_epochs: dict[str, tuple[str, float]] = {}
@@ -964,6 +971,10 @@ class ProgressReporter:
                 self._state.completed_units = 0
                 self._state.total_units = 0
                 self._state.rate_basis = None
+                if stage == "models":
+                    self._model_progress = None
+                    self._model_samples.clear()
+                self._force_console = True
             if completed_shards is not None:
                 self._state.completed_shards = completed_shards
             if total_shards is not None:
@@ -980,6 +991,48 @@ class ProgressReporter:
                 self._state.known_output_bytes = int(known_output_bytes)
             if url_snapshot is not None:
                 self._update_url_locked(url_snapshot)
+
+    def update_model_progress(self, snapshot: ModelProgressSnapshot) -> None:
+        """Record transient console-only model progress from durable events."""
+        if not isinstance(snapshot, ModelProgressSnapshot):
+            raise ValueError("model progress snapshot has an invalid type")
+        if snapshot.modality not in {"text", "image"}:
+            raise ValueError("model progress modality is invalid")
+        values = (
+            snapshot.total,
+            snapshot.success,
+            snapshot.terminal,
+            snapshot.leased,
+            snapshot.pending,
+        )
+        if any(isinstance(value, bool) or value < 0 for value in values):
+            raise ValueError("model progress counts must be non-negative")
+        if snapshot.total != sum(values[1:]):
+            raise ValueError("model progress counts do not sum to total")
+        with self._lock:
+            previous = self._model_progress
+            modality_changed = (
+                previous is None or snapshot.modality != previous.modality
+            )
+            if not modality_changed and previous is not None and (
+                snapshot.total != previous.total
+                or snapshot.completed < previous.completed
+            ):
+                raise ValueError("model progress is not monotonic")
+            if modality_changed:
+                self._model_samples.clear()
+                self._force_console = True
+            self._model_progress = snapshot
+            now = time.monotonic()
+            self._model_samples.append((now, snapshot.completed))
+            if snapshot.completed == snapshot.total:
+                self._force_console = True
+            cutoff = now - self._ROLLING_WINDOW_SECONDS
+            while (
+                len(self._model_samples) > 1
+                and self._model_samples[1][0] <= cutoff
+            ):
+                self._model_samples.popleft()
 
     def _current_stage_samples_locked(self) -> list[dict[str, Any]]:
         telemetry = self._stage_telemetry.get(self._state.stage)
@@ -1426,6 +1479,92 @@ class ProgressReporter:
             )
         return summary
 
+    @staticmethod
+    def _format_console_eta(seconds: float | None) -> str:
+        if seconds is None or not math.isfinite(seconds) or seconds < 0:
+            return "--:--"
+        rounded = int(seconds + 0.5)
+        hours, remainder = divmod(rounded, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _model_console_metrics(
+        self,
+        now: float,
+    ) -> tuple[ModelProgressSnapshot | None, float, float | None]:
+        with self._lock:
+            progress = self._model_progress
+            if progress is None:
+                return None, 0.0, None
+            if (
+                not self._model_samples
+                or self._model_samples[-1] != (now, progress.completed)
+            ):
+                self._model_samples.append((now, progress.completed))
+            cutoff = now - self._ROLLING_WINDOW_SECONDS
+            while (
+                len(self._model_samples) > 1
+                and self._model_samples[1][0] <= cutoff
+            ):
+                self._model_samples.popleft()
+            first_at, first_completed = self._model_samples[0]
+            elapsed = now - first_at
+            rate = (
+                max(0.0, (progress.completed - first_completed) / elapsed)
+                if elapsed > 0
+                else 0.0
+            )
+            remaining = max(0, progress.total - progress.completed)
+            eta = remaining / rate if rate > 0 else None
+            return progress, rate, eta
+
+    def _console_line(self, snapshot: dict[str, Any], *, is_tty: bool) -> str:
+        if snapshot["stage"] == "models":
+            progress, rate, eta = self._model_console_metrics(
+                time.monotonic()
+            )
+            if progress is not None:
+                bar = ""
+                if is_tty:
+                    width = 20
+                    filled = (
+                        width * progress.completed // progress.total
+                        if progress.total
+                        else width
+                    )
+                    bar = f" |{'#' * filled}{'-' * (width - filled)}|"
+                return (
+                    f"[wdc200k] models:{progress.modality}{bar} "
+                    f"{progress.completed}/{progress.total} "
+                    f"[{rate:.2f} job/s, ETA "
+                    f"{self._format_console_eta(eta)}] "
+                    f"success={progress.success} "
+                    f"terminal={progress.terminal} "
+                    f"leased={progress.leased} "
+                    f"pending={progress.pending}"
+                )
+        eta = self._format_console_eta(snapshot["eta_seconds"])
+        return (
+            f"[wdc200k] stage={snapshot['stage']} "
+            f"shards={snapshot['completed_shards']}/"
+            f"{snapshot['total_shards']} "
+            f"units={snapshot['completed_units']}/"
+            f"{snapshot['total_units']} ETA={eta} "
+            f"work={snapshot['disk']['work_bytes']} "
+            f"cache={snapshot['disk']['cache_bytes']} "
+            f"output={snapshot['disk']['output_bytes']} "
+            f"free={snapshot['disk']['free_bytes']} "
+            "free_work="
+            f"{snapshot['disk']['free_bytes_by_root']['work']} "
+            "free_cache="
+            f"{snapshot['disk']['free_bytes_by_root']['cache']} "
+            "free_output="
+            f"{snapshot['disk']['free_bytes_by_root']['output']} "
+            f"reserve={snapshot['disk']['reserve_bytes']}"
+        )
+
     def publish(self) -> None:
         with self._publish_lock:
             snapshot = self._snapshot()
@@ -1434,42 +1573,39 @@ class ProgressReporter:
                 snapshot,
                 pre_write_guard=self._pre_write_guard,
             )
-            print(
-                "[wdc200k] "
-                f"stage={snapshot['stage']} "
-                f"shards={snapshot['completed_shards']}/"
-                f"{snapshot['total_shards']} "
-                f"units={snapshot['completed_units']}/"
-                f"{snapshot['total_units']} "
-                f"rate_basis={snapshot['rate_basis']} "
-                f"rate={snapshot['rates']['shards_per_second']:.3f}/s "
-                "rolling="
-                f"{snapshot['rates']['rolling_shards_per_second']:.3f}/s "
-                "unit_rate="
-                f"{snapshot['rates']['units_per_second']:.3f}/s "
-                "unit_rolling="
-                f"{snapshot['rates']['rolling_units_per_second']:.3f}/s "
-                f"eta={snapshot['eta_seconds']} "
-                f"work={snapshot['disk']['work_bytes']} "
-                f"cache={snapshot['disk']['cache_bytes']} "
-                f"output={snapshot['disk']['output_bytes']} "
-                f"free={snapshot['disk']['free_bytes']} "
-                "free_work="
-                f"{snapshot['disk']['free_bytes_by_root']['work']} "
-                "free_cache="
-                f"{snapshot['disk']['free_bytes_by_root']['cache']} "
-                "free_output="
-                f"{snapshot['disk']['free_bytes_by_root']['output']} "
-                f"reserve={snapshot['disk']['reserve_bytes']} "
-                f"counters={json.dumps(snapshot['counters'], sort_keys=True)}",
-                flush=True,
-            )
+            is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+            console_now = time.monotonic()
+            with self._lock:
+                should_print = (
+                    is_tty
+                    or self._force_console
+                    or self._last_console_at is None
+                    or console_now - self._last_console_at
+                    >= self._NON_TTY_CONSOLE_INTERVAL_SECONDS
+                )
+                if should_print:
+                    self._force_console = False
+                    self._last_console_at = console_now
+            if not should_print:
+                return
+            line = self._console_line(snapshot, is_tty=is_tty)
+            if is_tty:
+                padding = " " * max(0, self._tty_line_length - len(line))
+                print(f"\r{line}{padding}", end="", flush=True)
+                self._tty_line_length = len(line)
+            else:
+                print(line, flush=True)
 
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.config.progress_interval_seconds))
+        with self._lock:
+            self._force_console = True
         self.publish()
+        if self._tty_line_length:
+            print(flush=True)
+            self._tty_line_length = 0
 
 
 def _atomic_json(
@@ -3653,13 +3789,6 @@ def _run_models(
         jobset.image_fingerprint,
         length=40,
     )
-    model_completed = 0
-
-    def after_model_result(_job_id: str, _record: dict[str, Any]) -> None:
-        nonlocal model_completed
-        model_completed += 1
-        reporter.update(counters={"model_completed_live": model_completed})
-
     result = run_model_stage(
         store,
         extractor,
@@ -3670,7 +3799,7 @@ def _run_models(
         },
         output_root=config.work_dir / "model_outputs",
         records_per_shard=config.records_per_shard,
-        after_result_write=after_model_result,
+        model_progress_callback=reporter.update_model_progress,
         start_marker=config.model_start_marker,
         ready_marker=config.model_ready_marker,
         network_manifests=network_manifests,

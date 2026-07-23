@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import gzip
 import hashlib
+import io
 import os
 import base64
 import shutil
@@ -1720,6 +1721,159 @@ def test_progress_stdout_is_bounded_between_periodic_snapshots(
         if line.startswith("[wdc200k]")
     ]
     assert len(progress_lines) <= 3
+
+
+def test_model_progress_non_tty_is_compact_and_does_not_change_json_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.time, "time", lambda: clock[0])
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock[0])
+    reporter.update(
+        stage="models",
+        counters={"enormous_unrelated_counter_name": 123456789},
+    )
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot(
+            modality="text",
+            total=100,
+            success=10,
+            terminal=5,
+            leased=2,
+            pending=83,
+        )
+    )
+    clock[0] = 5.0
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot(
+            modality="text",
+            total=100,
+            success=18,
+            terminal=7,
+            leased=2,
+            pending=73,
+        )
+    )
+
+    reporter.publish()
+
+    output = capsys.readouterr().out
+    assert "models:text" in output
+    assert "25/100" in output
+    assert "success=18" in output
+    assert "terminal=7" in output
+    assert "leased=2" in output
+    assert "pending=73" in output
+    assert "2.00 job/s" in output
+    assert "ETA 00:38" in output
+    assert "counters=" not in output
+    assert "enormous_unrelated_counter_name" not in output
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    assert "model_progress" not in payload
+    assert payload["counters"]["enormous_unrelated_counter_name"] == 123456789
+
+
+def test_model_progress_tty_rewrites_one_tqdm_style_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = TtyBuffer()
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(stage="models")
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot(
+            modality="image",
+            total=10,
+            success=3,
+            terminal=1,
+            leased=2,
+            pending=4,
+        )
+    )
+
+    reporter.publish()
+    reporter.publish()
+
+    rendered = stream.getvalue()
+    assert rendered.count("\r") == 2
+    assert "\n" not in rendered
+    assert "models:image" in rendered
+    assert "4/10" in rendered
+    assert "|" in rendered
+
+
+def test_model_progress_non_tty_throttles_console_but_not_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = io.StringIO()
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock[0])
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(stage="models")
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot("text", 10, 0, 0, 0, 10)
+    )
+    reporter.publish()
+    first_mtime = reporter.path.stat().st_mtime_ns
+    clock[0] = 5.0
+    reporter.publish()
+    second_mtime = reporter.path.stat().st_mtime_ns
+    clock[0] = 10.0
+    reporter.publish()
+
+    assert len(stream.getvalue().splitlines()) == 1
+    assert second_mtime >= first_mtime
+    assert "\r" not in stream.getvalue()
+    assert "\x1b" not in stream.getvalue()
+
+
+def test_model_progress_modality_switch_resets_rate_and_stall_hides_eta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = io.StringIO()
+    clock = [0.0]
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock[0])
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(stage="models")
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot("text", 100, 10, 0, 0, 90)
+    )
+    clock[0] = 5.0
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot("text", 100, 20, 0, 0, 80)
+    )
+    reporter.publish()
+    assert "2.00 job/s" in stream.getvalue()
+
+    clock[0] = 6.0
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot("image", 20, 0, 0, 0, 20)
+    )
+    reporter.publish()
+    assert stream.getvalue().splitlines()[-1].startswith("[wdc200k] models:image")
+    assert "0.00 job/s" in stream.getvalue().splitlines()[-1]
+    assert "ETA --:--" in stream.getvalue().splitlines()[-1]
+
+    clock[0] = 11.0
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot("image", 20, 5, 0, 0, 15)
+    )
+    reporter.publish()
+    clock[0] = 72.0
+    reporter.publish()
+    assert "ETA --:--" in stream.getvalue().splitlines()[-1]
 
 
 def test_progress_rolling_rate_uses_a_fixed_time_window(
@@ -3645,6 +3799,8 @@ def test_dynamic_model_markers_are_forwarded_to_authoritative_runner(
     assert captured["run_fingerprint"] == "dynamic-run-v1"
     assert captured["ready_timeout_seconds"] == 7.0
     assert captured["endpoint_ready_timeout_seconds"] == 45.5
+    assert callable(captured["model_progress_callback"])
+    assert "after_result_write" not in captured
     assert callable(captured["pre_write_guard"])
     assert len(tuple(captured["network_manifests"])) == 2
     assert captured["assets_manifest"].is_file()

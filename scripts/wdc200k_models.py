@@ -148,6 +148,22 @@ class ModelStageResult:
 
 
 @dataclass(frozen=True)
+class ModelProgressSnapshot:
+    """In-memory model queue progress; not part of persisted stage state."""
+
+    modality: str
+    total: int
+    success: int
+    terminal: int
+    leased: int
+    pending: int
+
+    @property
+    def completed(self) -> int:
+        return self.success + self.terminal
+
+
+@dataclass(frozen=True)
 class ModelStageAuthority:
     """Expected Task-6 configuration supplied by the stage orchestrator."""
 
@@ -1755,6 +1771,7 @@ def _process_claimed_group(
     after_cache_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
+    progress_tracker: _ModelProgressTracker | None = None,
     write_tracker: GuardedWriteTracker | None = None,
 ) -> int:
     model_jobs: list[Any] = []
@@ -1792,6 +1809,8 @@ def _process_claimed_group(
                     write_tracker=write_tracker,
                 ):
                     handled += 1
+                    if progress_tracker is not None:
+                        progress_tracker.finished("terminal")
                 continue
             cached = cache.get(payload)
             if cached is None:
@@ -1800,23 +1819,26 @@ def _process_claimed_group(
                 task_by_key[task.cache_key] = task
                 job_by_key[task.cache_key] = job
                 continue
+            cached_status = (
+                "terminal"
+                if clean_text(cached.get("error"))
+                else "success"
+            )
             if _fenced_commit_model_record(
                 store.path,
                 job=job,
                 expected_kind=job.kind,
                 payload=payload,
                 record=cached,
-                status=(
-                    "terminal"
-                    if clean_text(cached.get("error"))
-                    else "success"
-                ),
+                status=cached_status,
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
                 write_tracker=write_tracker,
             ):
                 handled += 1
+                if progress_tracker is not None:
+                    progress_tracker.finished(cached_status)
         if not model_jobs:
             return handled
         if extractor is None:
@@ -1830,6 +1852,8 @@ def _process_claimed_group(
                     owner=job.owner,
                     lease_id=job.lease_id,
                 )
+                if progress_tracker is not None:
+                    progress_tracker.finished("retryable")
             raise RuntimeError(
                 "model analysis is required but no extractor was provided"
             )
@@ -1854,6 +1878,8 @@ def _process_claimed_group(
                 if retried:
                     with state_lock:
                         handled += 1
+                    if progress_tracker is not None:
+                        progress_tracker.finished("retryable")
                 return
             status = (
                 "terminal"
@@ -1875,6 +1901,8 @@ def _process_claimed_group(
             if committed:
                 with state_lock:
                     handled += 1
+                if progress_tracker is not None:
+                    progress_tracker.finished(status)
 
         run_extraction_task_group(
             extractor=extractor,
@@ -1951,6 +1979,131 @@ def _job_snapshot(
                 snapshot["total"] += count
                 snapshot[status] = snapshot.get(status, 0) + count
     return snapshot
+
+
+def _initial_model_progress_counts(
+    database_path: Path,
+    jobset: ModelJobSet,
+) -> dict[str, dict[str, int]]:
+    """Read one indexed queue snapshot and treat expired leases as pending."""
+    counts = {
+        modality: {
+            "total": 0,
+            "success": 0,
+            "terminal": 0,
+            "leased": 0,
+            "pending": 0,
+        }
+        for modality in ("text", "image")
+    }
+    modality_by_kind = {
+        jobset.text_kind: "text",
+        jobset.image_kind: "image",
+    }
+    now = time.time()
+    with _connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT kind, status, COUNT(*) AS count,
+                   SUM(
+                       CASE WHEN status = 'leased'
+                                  AND COALESCE(lease_expires, 0) <= ?
+                            THEN 1 ELSE 0 END
+                   ) AS expired
+            FROM jobs
+            WHERE kind IN (?, ?)
+            GROUP BY kind, status
+            """,
+            (now, jobset.text_kind, jobset.image_kind),
+        ).fetchall()
+    for row in rows:
+        current = counts[modality_by_kind[str(row["kind"])]]
+        status = str(row["status"])
+        count = int(row["count"])
+        expired = int(row["expired"] or 0)
+        current["total"] += count
+        if status in {"success", "terminal"}:
+            current[status] += count
+        elif status in {"pending", "retryable"}:
+            current["pending"] += count
+        elif status == "leased":
+            current["pending"] += expired
+            current["leased"] += count - expired
+        else:
+            raise ValueError(f"unsupported model job status: {status}")
+    expected = {"text": jobset.text_tasks, "image": jobset.image_tasks}
+    if any(counts[key]["total"] != expected[key] for key in expected):
+        raise ValueError("model progress totals do not match job set")
+    return counts
+
+
+class _ModelProgressTracker:
+    """Maintain exact local queue counts after one indexed initial snapshot."""
+
+    def __init__(
+        self,
+        counts: dict[str, dict[str, int]],
+        callback: Callable[[ModelProgressSnapshot], None],
+    ) -> None:
+        self._counts = counts
+        self._callback = callback
+        self._modality: str | None = None
+        self._lock = threading.Lock()
+
+    def _snapshot_locked(self) -> ModelProgressSnapshot:
+        if self._modality is None:
+            raise RuntimeError("model progress modality is not active")
+        counts = self._counts[self._modality]
+        return ModelProgressSnapshot(
+            modality=self._modality,
+            total=counts["total"],
+            success=counts["success"],
+            terminal=counts["terminal"],
+            leased=counts["leased"],
+            pending=counts["pending"],
+        )
+
+    def _emit(self, snapshot: ModelProgressSnapshot) -> None:
+        try:
+            self._callback(snapshot)
+        except Exception:
+            pass
+
+    def set_modality(self, modality: str) -> None:
+        with self._lock:
+            self._modality = modality
+            snapshot = self._snapshot_locked()
+        self._emit(snapshot)
+
+    def claimed(self, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            if self._modality is None:
+                raise RuntimeError("model progress modality is not active")
+            counts = self._counts[self._modality]
+            from_pending = min(count, counts["pending"])
+            counts["pending"] -= from_pending
+            counts["leased"] += from_pending
+            snapshot = self._snapshot_locked()
+        self._emit(snapshot)
+
+    def finished(self, status: str) -> None:
+        with self._lock:
+            if self._modality is None:
+                raise RuntimeError("model progress modality is not active")
+            counts = self._counts[self._modality]
+            if counts["leased"] <= 0:
+                raise ValueError("model progress finished without a lease")
+            counts["leased"] -= 1
+            if status in {"success", "terminal"}:
+                counts[status] += 1
+            elif status in {"pending", "retryable"}:
+                counts["pending"] += 1
+            else:
+                raise ValueError(f"unsupported model progress status: {status}")
+            snapshot = self._snapshot_locked()
+        self._emit(snapshot)
 
 
 def _relative_shard(
@@ -2607,6 +2760,9 @@ def run_model_stage(
     after_cache_write: (
         Callable[[str, dict[str, Any]], None] | None
     ) = None,
+    model_progress_callback: (
+        Callable[[ModelProgressSnapshot], None] | None
+    ) = None,
     start_marker: Path | None = None,
     ready_marker: Path | None = None,
     network_manifests: Iterable[Path] = (),
@@ -2700,6 +2856,14 @@ def run_model_stage(
         jobset,
         write_tracker=result_write_tracker,
     )
+    progress_tracker = (
+        _ModelProgressTracker(
+            _initial_model_progress_counts(store.path, jobset),
+            model_progress_callback,
+        )
+        if model_progress_callback is not None
+        else None
+    )
     ensure_endpoints_ready = getattr(
         extractor,
         "ensure_endpoints_ready",
@@ -2716,6 +2880,8 @@ def run_model_stage(
             preflighted_modalities.update(modalities)
     processed = 0
     for modality in ("text", "image"):
+        if progress_tracker is not None:
+            progress_tracker.set_modality(modality)
         while stop_after is None or processed < stop_after:
             allowance = (
                 group_size
@@ -2746,6 +2912,8 @@ def run_model_stage(
             )
             if not claimed:
                 break
+            if progress_tracker is not None:
+                progress_tracker.claimed(len(claimed))
             processed += _process_claimed_group(
                 store,
                 extractor,
@@ -2763,6 +2931,7 @@ def run_model_stage(
                 heartbeat_seconds=heartbeat_seconds,
                 after_result_write=after_result_write,
                 after_cache_write=after_cache_write,
+                progress_tracker=progress_tracker,
                 write_tracker=result_write_tracker,
             )
         snapshot = _job_snapshot(store.path, jobset)
