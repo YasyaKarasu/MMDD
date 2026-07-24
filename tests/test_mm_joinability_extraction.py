@@ -159,7 +159,7 @@ def test_recovery_profile_counts_empty_attribute_rows_as_failures():
     }
 
 
-def test_select_query_rows_uses_recovery_quota_then_failures():
+def test_select_query_rows_uses_recoveries_then_failures():
     assert select_query_source_rows(
         source_row_order=[0, 1, 2, 3, 4, 5],
         recovered_source_rows={0, 2, 4},
@@ -168,13 +168,13 @@ def test_select_query_rows_uses_recovery_quota_then_failures():
     ) == [0, 2, 4, 1, 3]
 
 
-def test_select_query_rows_uses_extra_recoveries_when_failures_are_exhausted():
+def test_select_query_rows_prefers_extra_recoveries_over_failures():
     assert select_query_source_rows(
         source_row_order=[0, 1, 2, 3, 4, 5],
         recovered_source_rows={0, 1, 2, 3, 4},
         query_rows_per_table=5,
         required_recovered_rows=3,
-    ) == [0, 1, 2, 5, 3]
+    ) == [0, 1, 2, 3, 4]
 
 
 def test_query_rows_per_table_defaults_to_five(tmp_path):

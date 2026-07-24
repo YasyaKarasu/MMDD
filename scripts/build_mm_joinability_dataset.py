@@ -2255,16 +2255,8 @@ def select_query_source_rows(
     unrecovered = [row for row in source_row_order if row not in recovered_source_rows]
     if len(source_row_order) < query_rows_per_table or len(recovered) < required_recovered_rows:
         return []
-    selected = recovered[:required_recovered_rows]
+    selected = recovered[:query_rows_per_table]
     selected.extend(unrecovered[: query_rows_per_table - len(selected)])
-    if len(selected) < query_rows_per_table:
-        selected.extend(
-            recovered[
-                required_recovered_rows : required_recovered_rows
-                + query_rows_per_table
-                - len(selected)
-            ]
-        )
     return selected
 
 
@@ -2976,19 +2968,24 @@ def build_table_join_records(
             selected_source_row_set,
             min_required_cols=1,
         )
+        all_source_row_ids = {
+            row_id(source_row, fallback)
+            for fallback, source_row in enumerate(source_table.get("rows", []))
+        }
         target_rows, target_source_rows = project_selected_rows(
             source_table,
             target_cols,
-            selected_source_row_set,
+            all_source_row_ids,
             min_required_cols=0,
         )
-        if query_source_rows != target_source_rows:
+        if not set(query_source_rows).issubset(target_source_rows):
             continue
-        if len(query_rows) != query_rows_per_table or len(target_rows) != query_rows_per_table:
+        if len(query_rows) != query_rows_per_table:
             continue
-        if min(len(query_rows), len(target_rows)) < args.min_rows_per_output_table:
+        if len(target_rows) < args.min_rows_per_output_table:
             continue
         qualified["selected_rows"] = query_rows_per_table
+        qualified["target_rows"] = len(target_rows)
         chain_id = f"chain_{stable_hash(source_table['source_table_id'], entity_col, join_col)}"
         query_table_id = f"query_{stable_hash(chain_id, 'query')}"
         target_table_id = f"target_{stable_hash(chain_id, 'target')}"
@@ -3002,6 +2999,7 @@ def build_table_join_records(
             "required_recovered_rows": qualified["required_recovered_rows"],
             "recovered_value_ratio": qualified["recovered_value_ratio"],
             "selected_rows": qualified["selected_rows"],
+            "target_rows": qualified["target_rows"],
         }
         query_tables.append(
             table_record(
@@ -3702,8 +3700,8 @@ def _build_dataset(
         "cleanup": asdict(cleanup_totals),
         "notes": [
             "source_tables are the fixed data-lake base pool",
-            "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table aligned rows",
-            "data_lake_tables contain generated targets for queryable source tables and raw source tables for rejected source tables",
+            "query_tables use a capped recovery threshold over valid entity rows, prefer recoverable rows, and contain exactly query_rows_per_table sampled rows",
+            "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
         ],
@@ -3731,6 +3729,8 @@ def _build_dataset(
         },
         "query_construction": {
             "query_rows_per_table": args.query_rows_per_table,
+            "query_row_selection": "recoverable_first",
+            "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
@@ -3817,7 +3817,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--query_rows_per_table",
         type=int,
         default=5,
-        help="Exact number of aligned source rows in each generated query/target pair.",
+        help="Exact number of recoverable-first source rows sampled into each query; generated targets retain all source rows.",
     )
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Action API requests; does not control media downloads.")
     parser.add_argument(

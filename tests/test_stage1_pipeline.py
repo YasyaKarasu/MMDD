@@ -2420,13 +2420,17 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert query["hidden_attributes"][0]["required_recovered_rows"] == 3
     assert query["hidden_attributes"][0]["recovered_value_ratio"] == 0.5
     assert query["hidden_attributes"][0]["selected_rows"] == 5
+    assert query["hidden_attributes"][0]["target_rows"] == 6
     assert len(query["rows"]) == 5
-    assert len(target["rows"]) == 5
-    assert query["source_row_indices"] == target["source_row_indices"] == [0, 1, 2, 3, 4]
+    assert len(target["rows"]) == 6
+    assert query["source_row_indices"] == [0, 1, 2, 3, 4]
+    assert target["source_row_indices"] == [0, 1, 2, 3, 4, 5]
     assert [target["rows"][row_id]["cells"][0]["text"] for row_id in (1, 3)] == ["", ""]
     assert [column["column_name"] for column in target["columns"]] == ["City", "Team"]
     assert rejected["queryable"] is False
     assert manifest["query_construction"]["query_rows_per_table"] == 5
+    assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
+    assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]
     assert any(item["attributes"] for item in extractions)
