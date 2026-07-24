@@ -577,16 +577,94 @@ def _candidate_dependencies(
     )
 
 
+def _precompute_candidate_batch_tasks(
+    source_tables: list[dict[str, Any]],
+    context: CandidateEvaluationContext,
+    args: argparse.Namespace,
+) -> dict[str, int]:
+    full_precompute = getattr(args, "precompute_model_cache", False)
+    text_precompute = getattr(args, "precompute_text_model_cache", False)
+    precompute_enabled = full_precompute or text_precompute
+    visible_progress = context.progress is not None and context.progress.enabled
+    if not precompute_enabled and not visible_progress:
+        return {}
+
+    batch_tasks_by_key: dict[str, ExtractionTask] = {}
+    asset_types = None if visible_progress or full_precompute else {"text"}
+    for source_table in source_tables:
+        for task in collect_table_extraction_tasks(
+            source_table=source_table,
+            assets=context.assets,
+            entity_to_assets=context.entity_to_assets,
+            wiki_to_entity_id=context.wiki_to_entity_id,
+            args=args,
+            asset_types=asset_types,
+        ):
+            batch_tasks_by_key.setdefault(task.cache_key, task)
+
+    if visible_progress:
+        context.progress.register(batch_tasks_by_key)
+
+    if not precompute_enabled:
+        tasks_requiring_model_analysis(
+            list(batch_tasks_by_key.values()),
+            context.cache,
+            args,
+            progress=context.progress,
+        )
+        return {}
+
+    precompute_tasks = list(batch_tasks_by_key.values())
+    if not full_precompute:
+        precompute_tasks = [
+            task
+            for task in precompute_tasks
+            if task.asset.get("asset_type") == "text"
+        ]
+    pending_tasks = tasks_requiring_model_analysis(
+        precompute_tasks,
+        context.cache,
+        args,
+        progress=context.progress,
+    )
+    tasks_by_kind = {
+        "text": [
+            task for task in pending_tasks if task.asset.get("asset_type") == "text"
+        ]
+    }
+    if full_precompute:
+        tasks_by_kind["image"] = [
+            task
+            for task in pending_tasks
+            if task.asset.get("asset_type") == "image"
+        ]
+    return precompute_extraction_task_groups(
+        extractor=context.extractor,
+        cache=context.cache,
+        tasks_by_kind=tasks_by_kind,
+        args=args,
+        state=context.concurrency_state,
+        progress=context.progress,
+        write_done_markers=False,
+    )
+
+
 def evaluate_candidate_batch(
     source_tables: list[dict[str, Any]],
     context: CandidateEvaluationContext,
     args: argparse.Namespace,
 ) -> list[CandidateEvaluation]:
-    evaluations: list[CandidateEvaluation] = []
     for source_table in source_tables:
         update_entities_from_table(
             context.entity_records, context.wiki_to_entity_id, source_table
         )
+
+    counts = _precompute_candidate_batch_tasks(source_tables, context, args)
+    context.text_task_count += counts.get("text", 0)
+    context.image_task_count += counts.get("image", 0)
+
+    evaluations: list[CandidateEvaluation] = []
+    for source_table in source_tables:
         entity_ids = _eligible_candidate_entity_ids(
             _candidate_entity_ids(source_table, context.wiki_to_entity_id), context
         )
@@ -595,45 +673,6 @@ def evaluate_candidate_batch(
             for entity_id in entity_ids
             for imageinfo_key in context.entity_imageinfo_keys.get(entity_id, set())
         }
-        if getattr(args, "precompute_model_cache", False) or getattr(
-            args, "precompute_text_model_cache", False
-        ):
-            asset_types = (
-                None if getattr(args, "precompute_model_cache", False) else {"text"}
-            )
-            candidate_tasks = collect_table_extraction_tasks(
-                source_table=source_table,
-                assets=context.assets,
-                entity_to_assets=context.entity_to_assets,
-                wiki_to_entity_id=context.wiki_to_entity_id,
-                args=args,
-                asset_types=asset_types,
-            )
-            pending_tasks = tasks_requiring_model_analysis(
-                candidate_tasks, context.cache, args
-            )
-            tasks_by_kind = {
-                "text": [
-                    task for task in pending_tasks if task.asset.get("asset_type") == "text"
-                ]
-            }
-            if getattr(args, "precompute_model_cache", False):
-                tasks_by_kind["image"] = [
-                    task
-                    for task in pending_tasks
-                    if task.asset.get("asset_type") == "image"
-                ]
-            counts = precompute_extraction_task_groups(
-                extractor=context.extractor,
-                cache=context.cache,
-                tasks_by_kind=tasks_by_kind,
-                args=args,
-                state=context.concurrency_state,
-                progress=context.progress,
-                write_done_markers=False,
-            )
-            context.text_task_count += counts.get("text", 0)
-            context.image_task_count += counts.get("image", 0)
         extraction_writer = ListRecordWriter()
         recovery_writer = ListRecordWriter()
         query_tables, _data_lake_tables, _qrels, decision = build_table_join_records(
@@ -1278,15 +1317,17 @@ class LocalAttributeExtractor:
         self.model_call_stats = ModelCallStats()
 
     def current_text_model_base_urls(self) -> list[str]:
-        urls = list(self.text_model_base_urls)
         if self.text_model_base_urls_file:
             path = Path(self.text_model_base_urls_file)
             if path.exists():
                 try:
-                    urls.extend(normalize_model_base_urls(path.read_text(encoding="utf-8")))
+                    return normalize_model_base_urls(
+                        path.read_text(encoding="utf-8")
+                    )
                 except OSError as exc:
                     logging.warning("Failed to read text endpoint file %s: %s", path, exc)
-        return normalize_model_base_urls(urls)
+                    return []
+        return list(self.text_model_base_urls)
 
     def next_text_model_base_url(self) -> str:
         with self._text_endpoint_lock:
@@ -1298,15 +1339,17 @@ class LocalAttributeExtractor:
             return urls[index]
 
     def current_image_model_base_urls(self) -> list[str]:
-        urls = list(self.image_model_base_urls)
         if self.image_model_base_urls_file:
             path = Path(self.image_model_base_urls_file)
             if path.exists():
                 try:
-                    urls.extend(normalize_model_base_urls(path.read_text(encoding="utf-8")))
+                    return normalize_model_base_urls(
+                        path.read_text(encoding="utf-8")
+                    )
                 except OSError as exc:
                     logging.warning("Failed to read image endpoint file %s: %s", path, exc)
-        return normalize_model_base_urls(urls)
+                    return []
+        return list(self.image_model_base_urls)
 
     def next_image_model_base_url(self) -> str:
         with self._image_endpoint_lock:
@@ -1515,15 +1558,19 @@ class ExtractionCache:
 class ModelAnalysisProgress:
     def __init__(self, *, total: int, cached_keys: set[str], enabled: bool) -> None:
         self.enabled = enabled and tqdm is not None
+        self.total = max(total, len(cached_keys))
+        self.planned_keys: set[str] = set()
+        self._unassigned_total = self.total - len(cached_keys)
         self.completed_keys: set[str] = set(cached_keys)
         self.cached = len(cached_keys)
         self.model = 0
         self.errors = 0
         self.bar = None
+        self._closed = False
         self._lock = threading.Lock()
         if self.enabled:
             self.bar = tqdm(
-                total=total,
+                total=self.total,
                 initial=len(cached_keys),
                 desc="Local model analysis",
                 unit="asset",
@@ -1531,14 +1578,36 @@ class ModelAnalysisProgress:
             )
             self._postfix()
 
-    def _postfix(self) -> None:
+    def register(self, cache_keys: Iterable[str]) -> int:
+        keys = {key for key in cache_keys if key}
+        with self._lock:
+            new_keys = keys - self.planned_keys - self.completed_keys
+            if not new_keys:
+                return 0
+            self.planned_keys.update(new_keys)
+            growth = max(0, len(new_keys) - self._unassigned_total)
+            self._unassigned_total = max(0, self._unassigned_total - len(new_keys))
+            self.total += growth
+            if self.bar is not None:
+                self.bar.total = self.total
+                self._postfix(refresh=False)
+                self.bar.refresh()
+            return len(new_keys)
+
+    def _postfix(self, *, refresh: bool = True) -> None:
         if self.bar is not None:
-            self.bar.set_postfix(cached=self.cached, model=self.model, errors=self.errors)
+            self.bar.set_postfix(
+                cached=self.cached,
+                model=self.model,
+                errors=self.errors,
+                refresh=refresh,
+            )
 
     def mark(self, cache_key: str, status: str) -> None:
         with self._lock:
             if cache_key in self.completed_keys:
                 return
+            self.planned_keys.discard(cache_key)
             self.completed_keys.add(cache_key)
             if status == "cached":
                 self.cached += 1
@@ -1553,6 +1622,9 @@ class ModelAnalysisProgress:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             if self.bar is not None:
                 self.bar.close()
 
@@ -1827,6 +1899,7 @@ def tasks_requiring_model_analysis(
     tasks: list[ExtractionTask],
     cache: ExtractionCache,
     args: argparse.Namespace,
+    progress: ModelAnalysisProgress | None = None,
 ) -> list[ExtractionTask]:
     pending: list[ExtractionTask] = []
     seen: set[str] = set()
@@ -1834,7 +1907,13 @@ def tasks_requiring_model_analysis(
         if task.cache_key in seen:
             continue
         seen.add(task.cache_key)
-        if cache.get_transient(task.cache_key) is not None:
+        transient = cache.get_transient(task.cache_key)
+        if transient is not None:
+            if progress is not None:
+                progress.mark(
+                    task.cache_key,
+                    "error" if clean_text(transient.get("error")) else "model",
+                )
             continue
         cached = cache.get(task.cache_key)
         if cached:
@@ -1848,6 +1927,8 @@ def tasks_requiring_model_analysis(
                 if changed:
                     cache.put(task.cache_key, cached_record)
             if cached_extraction_is_reusable(cached_record, args):
+                if progress is not None:
+                    progress.mark(task.cache_key, "cached")
                 continue
         pending.append(task)
     return pending
@@ -2398,6 +2479,78 @@ def write_model_done_marker(path_value: str, *, model_kind: str, task_count: int
     )
 
 
+def _write_atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _model_round_event_path(
+    control_dir: Path, round_id: int, event: str
+) -> Path:
+    return control_dir / f"round-{round_id:06d}.{event}.json"
+
+
+def _begin_model_task_round(
+    args: argparse.Namespace, counts: dict[str, int]
+) -> tuple[Path, int, str] | None:
+    path_value = clean_text(getattr(args, "model_round_control_dir", ""))
+    if not path_value:
+        return None
+    control_dir = Path(path_value)
+    run_id = clean_text(getattr(args, "model_round_run_id", ""))
+    round_id = int(getattr(args, "_model_round_sequence", 0))
+    setattr(args, "_model_round_sequence", round_id + 1)
+    _write_atomic_json(
+        _model_round_event_path(control_dir, round_id, "start"),
+        {
+            "status": "model_round_start",
+            "run_id": run_id,
+            "round_id": round_id,
+            "text_task_count": counts.get("text", 0),
+            "image_task_count": counts.get("image", 0),
+            "timestamp": time.time(),
+        },
+    )
+    ready_path = _model_round_event_path(control_dir, round_id, "ready")
+    while True:
+        try:
+            payload = json.loads(ready_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            time.sleep(0.05)
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "model_round_services_ready"
+            and payload.get("round_id") == round_id
+            and payload.get("run_id", "") == run_id
+        ):
+            return control_dir, round_id, run_id
+        time.sleep(0.05)
+
+
+def _write_model_round_event(
+    model_round: tuple[Path, int, str] | None,
+    event: str,
+    **payload: Any,
+) -> None:
+    if model_round is None:
+        return
+    control_dir, round_id, run_id = model_round
+    _write_atomic_json(
+        _model_round_event_path(control_dir, round_id, event),
+        {
+            "round_id": round_id,
+            "run_id": run_id,
+            "timestamp": time.time(),
+            **payload,
+        },
+    )
+
+
 def write_model_start_marker(
     path_value: str,
     *,
@@ -2487,28 +2640,45 @@ def precompute_extraction_task_groups(
     if not active_groups:
         return counts
 
-    with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
-        futures = {
-            pool.submit(
-                resolve_extraction_tasks,
-                extractor=extractor,
-                cache=cache,
-                tasks=tasks,
-                args=args,
-                state=state,
-                progress=progress,
-            ): (kind, len(tasks))
-            for kind, tasks in active_groups.items()
-        }
-        for future in as_completed(futures):
-            kind, task_count = futures[future]
-            future.result()
-            if write_done_markers:
-                write_model_done_marker(
-                    model_done_marker_for_kind(args, kind),
+    model_round = _begin_model_task_round(args, counts)
+    round_status = "completed"
+    try:
+        with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
+            futures = {
+                pool.submit(
+                    resolve_extraction_tasks,
+                    extractor=extractor,
+                    cache=cache,
+                    tasks=tasks,
+                    args=args,
+                    state=state,
+                    progress=progress,
+                ): (kind, len(tasks))
+                for kind, tasks in active_groups.items()
+            }
+            for future in as_completed(futures):
+                kind, task_count = futures[future]
+                future.result()
+                _write_model_round_event(
+                    model_round,
+                    f"{kind}.done",
+                    status=f"{kind}_round_tasks_completed",
                     model_kind=kind,
                     task_count=task_count,
                 )
+                if write_done_markers:
+                    write_model_done_marker(
+                        model_done_marker_for_kind(args, kind),
+                        model_kind=kind,
+                        task_count=task_count,
+                    )
+    except BaseException:
+        round_status = "failed"
+        raise
+    finally:
+        _write_model_round_event(
+            model_round, "done", status=f"model_round_{round_status}"
+        )
     return counts
 
 
@@ -3139,7 +3309,10 @@ def build_bridge_assets_parallel(
     return entity_to_assets, sum(int(getattr(client, "api_failures", 0)) for client in clients), text_asset_count, image_asset_count
 
 
-def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+def _build_dataset(
+    args: argparse.Namespace,
+    owned_progress: list[ModelAnalysisProgress],
+) -> dict[str, Any]:
     args.query_rows_per_table = configured_query_rows_per_table(args)
     policy = replacement_policy_from_args(args)
     if args.max_source_tables is not None and args.max_source_tables < 0:
@@ -3231,7 +3404,15 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     def start_models_after_initial_preparation(
         initial_batch: list[dict[str, Any]],
     ) -> None:
-        nonlocal extractor
+        nonlocal extractor, progress
+        if getattr(args, "model_progress", True):
+            progress = ModelAnalysisProgress(
+                total=0,
+                cached_keys=set(),
+                enabled=True,
+            )
+            owned_progress.append(progress)
+            evaluation_context.progress = progress
         write_model_start_marker(
             clean_text(getattr(args, "model_start_marker", "")),
             text_task_count=0,
@@ -3267,6 +3448,14 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             )
         finally:
             _close_iterator(candidate_tables)
+        if progress is None and getattr(args, "model_progress", True):
+            progress = ModelAnalysisProgress(
+                total=0,
+                cached_keys=set(),
+                enabled=True,
+            )
+            owned_progress.append(progress)
+            evaluation_context.progress = progress
         final_source_tables = [
             item.source_table for item in selection.final_evaluations
         ]
@@ -3348,7 +3537,9 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             for key in planned_keys
             if key in cache.items and cached_extraction_is_reusable(cache.items[key], args)
         }
-        progress = ModelAnalysisProgress(total=len(planned_keys), cached_keys=cached_keys, enabled=True)
+        progress.register(planned_keys)
+        for cache_key in cached_keys:
+            progress.mark(cache_key, "cached")
 
     precomputed_text_task_count = evaluation_context.text_task_count
     precomputed_image_task_count = evaluation_context.image_task_count
@@ -3371,8 +3562,12 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 asset_types={"image"},
             )
-        pending_text_tasks = tasks_requiring_model_analysis(text_tasks, cache, args)
-        pending_image_tasks = tasks_requiring_model_analysis(image_tasks, cache, args)
+        pending_text_tasks = tasks_requiring_model_analysis(
+            text_tasks, cache, args, progress=progress
+        )
+        pending_image_tasks = tasks_requiring_model_analysis(
+            image_tasks, cache, args, progress=progress
+        )
         precomputed_text_task_count += len(pending_text_tasks)
         precomputed_image_task_count += len(pending_image_tasks)
         logging.info(
@@ -3588,6 +3783,16 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     return stats
 
 
+def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    owned_progress: list[ModelAnalysisProgress] = []
+    try:
+        return _build_dataset(args, owned_progress)
+    finally:
+        for progress in owned_progress:
+            if not getattr(progress, "_closed", False):
+                progress.close()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -3727,6 +3932,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_ready_marker", default=None, help="Wait for this JSON marker before issuing model requests. Dynamic vLLM runners write it after servers are healthy.")
     parser.add_argument("--model_text_done_marker", default=None, help="Write this JSON marker after --precompute_text_model_cache completes.")
     parser.add_argument("--model_image_done_marker", default=None, help="Write this JSON marker after image model cache precompute completes.")
+    parser.add_argument("--model_round_control_dir", default=None, help="Optional generation-scoped handshake directory used by a dynamic model runner between batched inference rounds.")
+    parser.add_argument("--model_round_run_id", default=None, help="Opaque dynamic-run identifier used to reject stale model round markers.")
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)
     parser.set_defaults(model_progress=True)
     return parser.parse_args(argv)

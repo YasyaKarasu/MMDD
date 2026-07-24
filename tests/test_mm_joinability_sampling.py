@@ -1,5 +1,7 @@
+import gc
 import json
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1000,6 +1002,419 @@ def test_candidate_evaluation_collects_records_without_final_shard_writes(
     assert not (output_dir / "evidence_recoveries").exists()
 
 
+def _candidate_batch_task(
+    *, cache_key: str, table_id: str, asset_type: str
+) -> builder.ExtractionTask:
+    return builder.ExtractionTask(
+        order=0,
+        cache_key=cache_key,
+        source_table_id=table_id,
+        source_row_id=0,
+        entity_column_index=0,
+        entity_column_name="Entity",
+        entity={"entity_id": f"entity-{table_id}"},
+        asset={"asset_id": f"asset-{cache_key}", "asset_type": asset_type},
+        candidate_attribute_names=["State"],
+    )
+
+
+def _candidate_batch_context(
+    tmp_path: Path, *, progress: object | None
+) -> builder.CandidateEvaluationContext:
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    return builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=None,
+        extractor=None,
+        cache=cache,
+        progress=progress,  # type: ignore[arg-type]
+        concurrency_state=SimpleNamespace(),
+        registry=builder.CandidateMaterialRegistry(
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wikipedia_client=None,
+            extraction_cache=cache,
+        ),
+    )
+
+
+def test_candidate_evaluation_registers_and_precomputes_whole_batch_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--precompute_model_cache",
+        ]
+    )
+    tables = [{"source_table_id": table_id, "rows": []} for table_id in ("a", "b")]
+    events: list[str] = []
+    registered: list[list[str]] = []
+
+    class ProgressSpy:
+        enabled = True
+
+        def register(self, keys: object) -> None:
+            registered.append(list(keys))  # type: ignore[arg-type]
+            events.append("register")
+
+    context = _candidate_batch_context(tmp_path, progress=ProgressSpy())
+    task_map = {
+        "a": [
+            _candidate_batch_task(cache_key="shared-text", table_id="a", asset_type="text"),
+            _candidate_batch_task(cache_key="image-a", table_id="a", asset_type="image"),
+        ],
+        "b": [
+            _candidate_batch_task(cache_key="shared-text", table_id="b", asset_type="text"),
+            _candidate_batch_task(cache_key="image-b", table_id="b", asset_type="image"),
+        ],
+    }
+
+    monkeypatch.setattr(
+        builder,
+        "update_entities_from_table",
+        lambda _records, _mapping, table: events.append(
+            f"update:{table['source_table_id']}"
+        ),
+    )
+
+    def collect_tasks(**kwargs: object) -> list[builder.ExtractionTask]:
+        table = kwargs["source_table"]
+        assert isinstance(table, dict)
+        table_id = str(table["source_table_id"])
+        events.append(f"collect:{table_id}")
+        return task_map[table_id]
+
+    calls: list[dict[str, list[builder.ExtractionTask]]] = []
+
+    def precompute(**kwargs: object) -> dict[str, int]:
+        tasks_by_kind = kwargs["tasks_by_kind"]
+        assert isinstance(tasks_by_kind, dict)
+        calls.append(tasks_by_kind)
+        events.append("precompute")
+        return {kind: len(tasks) for kind, tasks in tasks_by_kind.items()}
+
+    def build_records(**kwargs: object):
+        table = kwargs["source_table"]
+        assert isinstance(table, dict)
+        events.append(f"build:{table['source_table_id']}")
+        return [], [], [], {"reason": "failed"}
+
+    monkeypatch.setattr(builder, "collect_table_extraction_tasks", collect_tasks)
+    monkeypatch.setattr(builder, "precompute_extraction_task_groups", precompute)
+    monkeypatch.setattr(builder, "build_table_join_records", build_records)
+
+    builder.evaluate_candidate_batch(tables, context, args)
+
+    assert registered == [["shared-text", "image-a", "image-b"]]
+    assert len(calls) == 1
+    assert [task.cache_key for task in calls[0]["text"]] == ["shared-text"]
+    assert [task.cache_key for task in calls[0]["image"]] == ["image-a", "image-b"]
+    assert context.text_task_count == 1
+    assert context.image_task_count == 2
+    assert events == [
+        "update:a",
+        "update:b",
+        "collect:a",
+        "collect:b",
+        "register",
+        "precompute",
+        "build:a",
+        "build:b",
+    ]
+
+
+def test_candidate_evaluation_text_precompute_collects_only_batch_text_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--precompute_text_model_cache",
+            "--no_model_progress",
+        ]
+    )
+    tables = [{"source_table_id": table_id, "rows": []} for table_id in ("a", "b")]
+    context = _candidate_batch_context(tmp_path, progress=None)
+    asset_type_filters: list[set[str] | None] = []
+    calls: list[dict[str, list[builder.ExtractionTask]]] = []
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+
+    def collect_tasks(**kwargs: object) -> list[builder.ExtractionTask]:
+        asset_types = kwargs["asset_types"]
+        asset_type_filters.append(asset_types)  # type: ignore[arg-type]
+        table = kwargs["source_table"]
+        assert isinstance(table, dict)
+        table_id = str(table["source_table_id"])
+        return [
+            _candidate_batch_task(
+                cache_key="shared-text", table_id=table_id, asset_type="text"
+            )
+        ]
+
+    def precompute(**kwargs: object) -> dict[str, int]:
+        tasks_by_kind = kwargs["tasks_by_kind"]
+        assert isinstance(tasks_by_kind, dict)
+        calls.append(tasks_by_kind)
+        return {kind: len(tasks) for kind, tasks in tasks_by_kind.items()}
+
+    monkeypatch.setattr(builder, "collect_table_extraction_tasks", collect_tasks)
+    monkeypatch.setattr(builder, "precompute_extraction_task_groups", precompute)
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch(tables, context, args)
+
+    assert asset_type_filters == [{"text"}, {"text"}]
+    assert len(calls) == 1
+    assert set(calls[0]) == {"text"}
+    assert [task.cache_key for task in calls[0]["text"]] == ["shared-text"]
+    assert context.text_task_count == 1
+    assert context.image_task_count == 0
+
+
+def test_candidate_text_precompute_marks_cache_hits_before_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--precompute_text_model_cache",
+        ]
+    )
+    cached = _candidate_batch_task(
+        cache_key="cached", table_id="table", asset_type="text"
+    )
+    pending = _candidate_batch_task(
+        cache_key="pending", table_id="table", asset_type="text"
+    )
+    progress = builder.ModelAnalysisProgress(
+        total=0, cached_keys=set(), enabled=False
+    )
+    progress.enabled = True
+    context = _candidate_batch_context(tmp_path, progress=progress)
+    context.cache.put(
+        cached.cache_key,
+        {
+            "cache_key": cached.cache_key,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "raw_response": '{"attributes":[]}',
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+    monkeypatch.setattr(
+        builder,
+        "collect_table_extraction_tasks",
+        lambda **_kwargs: [cached, cached, pending],
+    )
+
+    def precompute(**kwargs: object) -> dict[str, int]:
+        tasks_by_kind = kwargs["tasks_by_kind"]
+        assert isinstance(tasks_by_kind, dict)
+        assert progress.cached == 1
+        assert progress.completed_keys == {cached.cache_key}
+        assert [task.cache_key for task in tasks_by_kind["text"]] == [
+            pending.cache_key
+        ]
+        return {"text": 1}
+
+    monkeypatch.setattr(builder, "precompute_extraction_task_groups", precompute)
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch(
+        [{"source_table_id": "table", "rows": []}], context, args
+    )
+
+    assert progress.total == 2
+    assert progress.cached == 1
+    assert progress.planned_keys == {pending.cache_key}
+
+
+def test_all_transient_candidate_batch_does_not_start_model_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control_dir = tmp_path / "rounds"
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--precompute_model_cache",
+            "--model_round_control_dir",
+            str(control_dir),
+        ]
+    )
+    text_task = _candidate_batch_task(
+        cache_key="transient-text", table_id="table", asset_type="text"
+    )
+    image_task = _candidate_batch_task(
+        cache_key="transient-image", table_id="table", asset_type="image"
+    )
+    progress = builder.ModelAnalysisProgress(
+        total=0, cached_keys=set(), enabled=False
+    )
+    progress.enabled = True
+    context = _candidate_batch_context(tmp_path, progress=progress)
+    context.cache.put_transient(
+        text_task.cache_key,
+        {"cache_key": text_task.cache_key, "attributes": [], "error": "failed"},
+    )
+    context.cache.put_transient(
+        image_task.cache_key,
+        {
+            "cache_key": image_task.cache_key,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+    monkeypatch.setattr(
+        builder,
+        "collect_table_extraction_tasks",
+        lambda **_kwargs: [text_task, image_task],
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch(
+        [{"source_table_id": "table", "rows": []}], context, args
+    )
+
+    assert not control_dir.exists()
+    assert context.text_task_count == 0
+    assert context.image_task_count == 0
+    assert progress.model == 2
+    assert progress.errors == 1
+    assert progress.completed_keys == {
+        text_task.cache_key,
+        image_task.cache_key,
+    }
+
+
+def test_candidate_evaluation_without_precompute_or_progress_skips_task_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--no_model_progress",
+        ]
+    )
+    tables = [{"source_table_id": table_id, "rows": []} for table_id in ("a", "b")]
+    context = _candidate_batch_context(tmp_path, progress=None)
+    build_calls: list[str] = []
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+    monkeypatch.setattr(
+        builder,
+        "collect_table_extraction_tasks",
+        lambda **_kwargs: pytest.fail("unexpected extraction task scan"),
+    )
+    monkeypatch.setattr(
+        builder,
+        "precompute_extraction_task_groups",
+        lambda **_kwargs: pytest.fail("unexpected model precompute"),
+    )
+
+    def build_records(**kwargs: object):
+        table = kwargs["source_table"]
+        assert isinstance(table, dict)
+        build_calls.append(str(table["source_table_id"]))
+        return [], [], [], {"reason": "failed"}
+
+    monkeypatch.setattr(builder, "build_table_join_records", build_records)
+
+    builder.evaluate_candidate_batch(tables, context, args)
+
+    assert build_calls == ["a", "b"]
+
+
+def test_candidate_batch_tasks_are_released_before_table_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--precompute_model_cache",
+            "--no_model_progress",
+        ]
+    )
+    context = _candidate_batch_context(tmp_path, progress=None)
+    task_refs: list[weakref.ReferenceType[builder.ExtractionTask]] = []
+    monkeypatch.setattr(builder, "update_entities_from_table", lambda *_args: None)
+
+    def collect_tasks(**kwargs: object) -> list[builder.ExtractionTask]:
+        table = kwargs["source_table"]
+        assert isinstance(table, dict)
+        task = _candidate_batch_task(
+            cache_key=f"key-{table['source_table_id']}",
+            table_id=str(table["source_table_id"]),
+            asset_type="text",
+        )
+        task_refs.append(weakref.ref(task))
+        return [task]
+
+    def precompute(**kwargs: object) -> dict[str, int]:
+        tasks_by_kind = kwargs["tasks_by_kind"]
+        assert isinstance(tasks_by_kind, dict)
+        return {kind: len(tasks) for kind, tasks in tasks_by_kind.items()}
+
+    first_build = True
+
+    def build_records(**_kwargs: object):
+        nonlocal first_build
+        if first_build:
+            first_build = False
+            gc.collect()
+            assert task_refs
+            assert all(task_ref() is None for task_ref in task_refs)
+        return [], [], [], {"reason": "failed"}
+
+    monkeypatch.setattr(builder, "collect_table_extraction_tasks", collect_tasks)
+    monkeypatch.setattr(builder, "precompute_extraction_task_groups", precompute)
+    monkeypatch.setattr(builder, "build_table_join_records", build_records)
+
+    builder.evaluate_candidate_batch(
+        [
+            {"source_table_id": "a", "rows": []},
+            {"source_table_id": "b", "rows": []},
+        ],
+        context,
+        args,
+    )
+
+
 def test_batch_material_preparation_uses_batch_path_and_never_refetches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1643,6 +2058,8 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     ]
 
     candidate_iterator_closed: list[bool] = []
+    candidate_progresses: list[builder.ModelAnalysisProgress | None] = []
+    materialization_progresses: list[builder.ModelAnalysisProgress | None] = []
 
     def fake_candidates(
         _input_dir: Path,
@@ -1660,6 +2077,7 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         context: builder.CandidateEvaluationContext,
         _args: object,
     ) -> list[builder.CandidateEvaluation]:
+        candidate_progresses.append(context.progress)
         for table in tables:
             builder.update_entities_from_table(
                 context.entity_records, context.wiki_to_entity_id, table
@@ -1689,6 +2107,7 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         ]
 
     def fake_final_records(**kwargs: object):
+        materialization_progresses.append(kwargs["progress"])
         source_table = kwargs["source_table"]
         assert isinstance(source_table, dict)
         table_id = str(source_table["source_table_id"])
@@ -1752,6 +2171,10 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     stats = builder.build_dataset(args)
 
     assert candidate_iterator_closed == [True]
+    assert candidate_progresses
+    assert all(progress is None for progress in candidate_progresses)
+    assert materialization_progresses
+    assert all(progress is None for progress in materialization_progresses)
 
     source_rows = list(
         builder.iter_jsonl_records(sorted((output_dir / "source_tables").glob("*.jsonl")))
@@ -1815,6 +2238,232 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
         "unrecoverable_replacement_rounds": 1,
         "unrecoverable_drop_probability": 1.0,
     }
+
+
+def test_build_dataset_closes_model_progress_when_intermediate_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    progress_instances: list[object] = []
+
+    class ProgressSpy:
+        enabled = False
+
+        def __init__(self, **_kwargs: object) -> None:
+            self.close_calls = 0
+            progress_instances.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def fake_selection(**kwargs: object) -> builder.ReplacementSelection:
+        callback = kwargs["on_initial_batch_prepared"]
+        assert callable(callback)
+        callback([])
+        return builder.ReplacementSelection([], [], 0, True, 0)
+
+    monkeypatch.setattr(builder, "ModelAnalysisProgress", ProgressSpy)
+    monkeypatch.setattr(builder, "run_replacement_rounds", fake_selection)
+    monkeypatch.setattr(builder, "LocalAttributeExtractor", lambda _args: None)
+    monkeypatch.setattr(
+        builder,
+        "write_sharded_jsonl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("write failed")),
+    )
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(input_dir),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--max_source_tables",
+            "0",
+            "--no_wikipedia",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        builder.build_dataset(args)
+
+    assert len(progress_instances) == 1
+    assert progress_instances[0].close_calls == 1
+
+
+def test_candidate_evaluation_skips_extra_task_scan_when_progress_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--no_model_progress",
+        ]
+    )
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    context = builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=None,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=SimpleNamespace(),
+        registry=builder.CandidateMaterialRegistry(
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wikipedia_client=None,
+            extraction_cache=cache,
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "collect_table_extraction_tasks",
+        lambda **_kwargs: pytest.fail("unexpected duplicate extraction task scan"),
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    evaluations = builder.evaluate_candidate_batch(
+        [{"source_table_id": "table", "rows": []}], context, args
+    )
+
+    assert len(evaluations) == 1
+
+
+def test_hidden_text_precompute_collects_only_text_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--no_model_progress",
+            "--precompute_text_model_cache",
+        ]
+    )
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    assets: dict[str, dict[str, object]] = {}
+    entity_to_assets: dict[str, list[str]] = {}
+    context = builder.CandidateEvaluationContext(
+        entity_records={},
+        wiki_to_entity_id={},
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=None,
+        extractor=None,
+        cache=cache,
+        progress=None,
+        concurrency_state=builder.ModelConcurrencyState(1, 1),
+        registry=builder.CandidateMaterialRegistry(
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wikipedia_client=None,
+            extraction_cache=cache,
+        ),
+    )
+    collected_asset_types: list[set[str] | None] = []
+
+    def fake_collect(**kwargs: object) -> list[builder.ExtractionTask]:
+        collected_asset_types.append(kwargs.get("asset_types"))
+        return []
+
+    monkeypatch.setattr(builder, "collect_table_extraction_tasks", fake_collect)
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch(
+        [{"source_table_id": "table", "rows": []}], context, args
+    )
+
+    assert collected_asset_types == [{"text"}]
+
+
+def test_candidate_evaluation_registers_real_extraction_tasks_for_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = builder.parse_args(
+        ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "output")]
+    )
+    source_table = {
+        "source_table_id": "table",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "State"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": "Alpha",
+                        "wiki_title": "Alpha",
+                    },
+                    {"column_index": 1, "column_name": "State", "text": "Alabama"},
+                ],
+            }
+        ],
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    entity_records: dict[str, dict[str, object]] = {}
+    wiki_to_entity_id: dict[str, str] = {}
+    builder.update_entities_from_table(entity_records, wiki_to_entity_id, source_table)
+    entity_id = wiki_to_entity_id["Alpha"]
+    assets = {
+        "asset": {
+            "asset_id": "asset",
+            "asset_type": "text",
+            "entity_id": entity_id,
+            "content": "Alpha is in Alabama.",
+        }
+    }
+    entity_to_assets = {entity_id: ["asset"]}
+    cache = builder.ExtractionCache(tmp_path / "model.jsonl")
+    progress = builder.ModelAnalysisProgress(total=0, cached_keys=set(), enabled=False)
+    progress.enabled = True
+    context = builder.CandidateEvaluationContext(
+        entity_records=entity_records,
+        wiki_to_entity_id=wiki_to_entity_id,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wikipedia_client=None,
+        extractor=None,
+        cache=cache,
+        progress=progress,
+        concurrency_state=SimpleNamespace(),
+        registry=builder.CandidateMaterialRegistry(
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wikipedia_client=None,
+            extraction_cache=cache,
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "build_table_join_records",
+        lambda **_kwargs: ([], [], [], {"reason": "failed"}),
+    )
+
+    builder.evaluate_candidate_batch([source_table], context, args)
+
+    assert progress.total == 1
+    assert len(progress.planned_keys) == 1
 
 
 @pytest.mark.parametrize("callable_close", [True, False])
