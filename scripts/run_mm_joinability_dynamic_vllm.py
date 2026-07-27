@@ -1,12 +1,11 @@
 #!/usr/bin/env python
-"""Run multimodal joinability construction with dynamic vLLM GPU reallocation.
+"""Run EntiTables construction with dynamic, priority-owned local vLLM.
 
-The runner starts one text vLLM server and one image/VL vLLM server. The builder
-precomputes both model caches concurrently and writes one done marker per
-modality. Whichever modality finishes first releases its GPU; this runner then
-starts a second server for the remaining modality on that freed GPU. The builder
-re-reads per-modality endpoint files before model requests, so the remaining
-queue can use the new server without restarting.
+In round mode the runner starts services only at a model-round handshake and
+stops every service before the next network-only phase. An optional filesystem
+protocol lets a preemptible WDC sidecar borrow both GPUs between those rounds.
+Within a round, the first completed modality can still donate its GPU to a
+second server for the remaining modality.
 """
 
 from __future__ import annotations
@@ -22,6 +21,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+from gpu_priority_protocol import PriorityGpuOwner
 
 try:
     import requests
@@ -172,65 +173,71 @@ def _cleanup_warning(proc: subprocess.Popen[str], message: str) -> None:
     )
 
 
+def process_group_alive(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def wait_for_process_group_exit(
+    pid: int,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 0.05,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while process_group_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_seconds, remaining))
+    return True
+
+
 def stop_process(proc: subprocess.Popen[str] | None, *, timeout_seconds: float = 30.0) -> None:
     if proc is None:
         return
-    leader_exited = proc.poll() is not None
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     except Exception as exc:  # pragma: no cover - defensive cleanup path.
-        _cleanup_warning(proc, f"SIGTERM failed: {exc}")
-
-    if leader_exited:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as exc:  # pragma: no cover - defensive cleanup path.
-            _cleanup_warning(proc, f"SIGKILL after leader exit failed: {exc}")
-        try:
-            proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _cleanup_warning(proc, "leader could not be reaped before timeout")
-        except Exception as exc:  # pragma: no cover - defensive cleanup path.
-            _cleanup_warning(proc, f"leader reap failed: {exc}")
-        return
+        raise RuntimeError(f"SIGTERM failed for process group {proc.pid}") from exc
 
     try:
         proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as exc:  # pragma: no cover - defensive cleanup path.
-            _cleanup_warning(proc, f"SIGKILL failed: {exc}")
-        try:
-            proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _cleanup_warning(proc, "leader still alive after SIGKILL timeout")
-        except Exception as exc:  # pragma: no cover - defensive cleanup path.
-            _cleanup_warning(proc, f"leader reap after SIGKILL failed: {exc}")
-        return
+        pass
     except Exception as exc:  # pragma: no cover - defensive cleanup path.
-        _cleanup_warning(proc, f"leader wait failed: {exc}")
-        return
+        raise RuntimeError(f"failed waiting for process leader {proc.pid}") from exc
 
-    try:
-        os.killpg(proc.pid, 0)
-    except ProcessLookupError:
-        return
-    except Exception as exc:  # pragma: no cover - defensive cleanup path.
-        _cleanup_warning(proc, f"process-group liveness check failed: {exc}")
+    if not process_group_alive(proc.pid):
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
+        return
+    except Exception as exc:  # pragma: no cover - defensive cleanup path.
+        raise RuntimeError(
+            f"SIGKILL failed for process group {proc.pid}"
+        ) from exc
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
         pass
     except Exception as exc:  # pragma: no cover - defensive cleanup path.
-        _cleanup_warning(proc, f"descendant SIGKILL failed: {exc}")
+        raise RuntimeError(
+            f"failed reaping process leader {proc.pid}"
+        ) from exc
+    if not wait_for_process_group_exit(
+        proc.pid,
+        timeout_seconds=timeout_seconds,
+    ):
+        raise RuntimeError(
+            f"process group {proc.pid} remained alive after SIGKILL"
+        )
 
 
 def cleanup_processes(processes: Iterable[subprocess.Popen[str] | None]) -> None:
@@ -390,7 +397,109 @@ def round_event_path(control_dir: Path, round_id: int, event: str) -> Path:
 @dataclass
 class RoundServiceProcesses:
     text: subprocess.Popen[str] | None
+    primary_image: subprocess.Popen[str] | None
     secondary_image: subprocess.Popen[str] | None
+
+
+def stop_round_services(
+    processes: RoundServiceProcesses,
+    *,
+    text_endpoints_file: Path,
+    image_endpoints_file: Path,
+) -> None:
+    """Withdraw every EntiTables endpoint before returning the local GPUs."""
+    endpoint_error: BaseException | None = None
+    try:
+        write_endpoint_file(text_endpoints_file, [])
+        write_endpoint_file(image_endpoints_file, [])
+    except BaseException as error:
+        endpoint_error = error
+    finally:
+        process_errors: list[BaseException] = []
+        for process in (
+            processes.text,
+            processes.primary_image,
+            processes.secondary_image,
+        ):
+            try:
+                stop_process(process)
+            except BaseException as error:
+                process_errors.append(error)
+        processes.text = None
+        processes.primary_image = None
+        processes.secondary_image = None
+    if endpoint_error is not None:
+        raise endpoint_error
+    if process_errors:
+        raise RuntimeError(
+            "failed to stop every EntiTables vLLM process group"
+        ) from process_errors[0]
+
+
+def start_round_services(
+    *,
+    round_id: int,
+    text_task_count: int,
+    image_task_count: int,
+    runtime_dir: Path,
+    text_server: VllmServerSpec,
+    primary_image_server: VllmServerSpec,
+    secondary_image_server: VllmServerSpec,
+    text_endpoints_file: Path,
+    image_endpoints_file: Path,
+    processes: RoundServiceProcesses,
+    server_start_timeout_seconds: float,
+    gpu_priority_owner: PriorityGpuOwner | None,
+) -> None:
+    """Reclaim GPUs and start only services needed by one model round."""
+    if processes.text or processes.primary_image or processes.secondary_image:
+        raise RuntimeError("prior EntiTables model services were not released")
+    write_endpoint_file(text_endpoints_file, [])
+    write_endpoint_file(image_endpoints_file, [])
+    if text_task_count <= 0 and image_task_count <= 0:
+        return
+    if gpu_priority_owner is not None:
+        gpu_priority_owner.request_gpus(reason=f"model_round_{round_id}")
+    try:
+        if image_task_count > 0:
+            processes.primary_image = start_and_wait_server(
+                primary_image_server,
+                runtime_dir=runtime_dir,
+                timeout_seconds=server_start_timeout_seconds,
+            )
+        if text_task_count > 0:
+            processes.text = start_and_wait_server(
+                text_server,
+                runtime_dir=runtime_dir,
+                timeout_seconds=server_start_timeout_seconds,
+            )
+        elif image_task_count > 0:
+            processes.secondary_image = start_and_wait_server(
+                secondary_image_server,
+                runtime_dir=runtime_dir,
+                timeout_seconds=server_start_timeout_seconds,
+            )
+        write_endpoint_file(
+            text_endpoints_file,
+            [text_server.base_url] if processes.text is not None else [],
+        )
+        image_urls = []
+        if processes.primary_image is not None:
+            image_urls.append(primary_image_server.base_url)
+        if processes.secondary_image is not None:
+            image_urls.append(secondary_image_server.base_url)
+        write_endpoint_file(image_endpoints_file, image_urls)
+    except BaseException:
+        stop_round_services(
+            processes,
+            text_endpoints_file=text_endpoints_file,
+            image_endpoints_file=image_endpoints_file,
+        )
+        if gpu_priority_owner is not None:
+            gpu_priority_owner.release_gpus(
+                reason=f"model_round_{round_id}_startup_failed"
+            )
+        raise
 
 
 def _run_round_service_loop_owned(
@@ -407,6 +516,7 @@ def _run_round_service_loop_owned(
     processes: RoundServiceProcesses,
     server_start_timeout_seconds: float,
     round_timeout_seconds: float | None,
+    gpu_priority_owner: PriorityGpuOwner | None,
     poll_seconds: float = 0.2,
 ) -> int:
     round_id = 0
@@ -437,18 +547,24 @@ def _run_round_service_loop_owned(
             active_start = payload
             last_activity = time.time()
             text_task_count = max(0, int(payload.get("text_task_count", 0)))
-            if text_task_count > 0 and processes.text is None:
-                # The prior round is complete before the builder can announce this
-                # start, so no image request can still target the secondary server.
-                write_endpoint_file(image_endpoints_file, [primary_image_server.base_url])
-                stop_process(processes.secondary_image)
-                processes.secondary_image = None
-                processes.text = start_and_wait_server(
-                    text_server,
-                    runtime_dir=runtime_dir,
-                    timeout_seconds=server_start_timeout_seconds,
-                )
-                write_endpoint_file(text_endpoints_file, [text_server.base_url])
+            image_task_count = max(
+                0,
+                int(payload.get("image_task_count", 0)),
+            )
+            start_round_services(
+                round_id=round_id,
+                text_task_count=text_task_count,
+                image_task_count=image_task_count,
+                runtime_dir=runtime_dir,
+                text_server=text_server,
+                primary_image_server=primary_image_server,
+                secondary_image_server=secondary_image_server,
+                text_endpoints_file=text_endpoints_file,
+                image_endpoints_file=image_endpoints_file,
+                processes=processes,
+                server_start_timeout_seconds=server_start_timeout_seconds,
+                gpu_priority_owner=gpu_priority_owner,
+            )
             write_atomic_json(
                 round_event_path(control_dir, round_id, "ready"),
                 {
@@ -469,6 +585,15 @@ def _run_round_service_loop_owned(
             in {"model_round_completed", "model_round_failed"}
         )
         if round_done:
+            stop_round_services(
+                processes,
+                text_endpoints_file=text_endpoints_file,
+                image_endpoints_file=image_endpoints_file,
+            )
+            if gpu_priority_owner is not None:
+                gpu_priority_owner.release_gpus(
+                    reason=f"after_model_round_{round_id}"
+                )
             active_start = None
             round_id += 1
             last_activity = time.time()
@@ -544,17 +669,20 @@ def run_round_service_loop(
     text_endpoints_file: Path,
     image_endpoints_file: Path,
     text_process: subprocess.Popen[str] | None,
+    primary_image_process: subprocess.Popen[str] | None,
     secondary_image_process: subprocess.Popen[str] | None,
     server_start_timeout_seconds: float,
     round_timeout_seconds: float | None,
+    gpu_priority_owner: PriorityGpuOwner | None = None,
     poll_seconds: float = 0.2,
-) -> tuple[int, subprocess.Popen[str] | None, subprocess.Popen[str] | None]:
+) -> int:
     processes = RoundServiceProcesses(
         text=text_process,
+        primary_image=primary_image_process,
         secondary_image=secondary_image_process,
     )
     try:
-        exit_code = _run_round_service_loop_owned(
+        return _run_round_service_loop_owned(
             builder=builder,
             control_dir=control_dir,
             run_id=run_id,
@@ -567,14 +695,17 @@ def run_round_service_loop(
             processes=processes,
             server_start_timeout_seconds=server_start_timeout_seconds,
             round_timeout_seconds=round_timeout_seconds,
+            gpu_priority_owner=gpu_priority_owner,
             poll_seconds=poll_seconds,
         )
-    except BaseException:
-        cleanup_processes([processes.text, processes.secondary_image])
-        processes.text = None
-        processes.secondary_image = None
-        raise
-    return exit_code, processes.text, processes.secondary_image
+    finally:
+        stop_round_services(
+            processes,
+            text_endpoints_file=text_endpoints_file,
+            image_endpoints_file=image_endpoints_file,
+        )
+        if gpu_priority_owner is not None:
+            gpu_priority_owner.release_gpus(reason="round_service_loop_stopped")
 
 
 def read_pending_model_task_count(path: Path) -> int | None:
@@ -679,6 +810,34 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
     parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
+    parser.add_argument(
+        "--gpu_coordination_dir",
+        default=None,
+        help=(
+            "Optional shared directory for lending both local GPUs to a WDC "
+            "borrower during EntiTables network-only phases."
+        ),
+    )
+    parser.add_argument(
+        "--gpu_reclaim_timeout_seconds",
+        type=float,
+        default=90.0,
+    )
+    parser.add_argument(
+        "--gpu_borrower_stale_seconds",
+        type=float,
+        default=10.0,
+    )
+    parser.add_argument(
+        "--gpu_unregistered_grace_seconds",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--gpu_coordination_poll_seconds",
+        type=float,
+        default=0.2,
+    )
     parser.add_argument("--builder_script", default=str(Path(__file__).with_name("build_mm_joinability_dataset.py")))
     parser.add_argument("--python_executable", default=sys.executable)
     parser.add_argument("--vllm_dtype", default="bfloat16")
@@ -691,7 +850,15 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--vllm_extra_arg", action="append", default=[], help="Extra argument applied to all vLLM serve commands. Repeat for multiple tokens.")
     parser.add_argument("--text_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to the text vLLM server.")
     parser.add_argument("--image_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to both image vLLM servers.")
-    return parser.parse_known_args(argv)
+    args, passthrough = parser.parse_known_args(argv)
+    if args.gpu_coordination_dir and (
+        args.gpu_reclaim_timeout_seconds <= 0
+        or args.gpu_borrower_stale_seconds <= 0
+        or args.gpu_unregistered_grace_seconds < 0
+        or args.gpu_coordination_poll_seconds <= 0
+    ):
+        parser.error("GPU coordination timeouts must be positive")
+    return args, passthrough
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -751,12 +918,31 @@ def main(argv: list[str] | None = None) -> int:
         vllm_bin=args.vllm_bin,
         extra_args=[*common_extra, *args.text_vllm_extra_arg],
     )
+    gpu_priority_owner = (
+        PriorityGpuOwner(
+            Path(args.gpu_coordination_dir),
+            gpu_ids=(
+                args.primary_image_gpu,
+                args.text_gpu,
+                args.secondary_image_gpu,
+            ),
+            reclaim_timeout_seconds=args.gpu_reclaim_timeout_seconds,
+            borrower_stale_seconds=args.gpu_borrower_stale_seconds,
+            unregistered_grace_seconds=(
+                args.gpu_unregistered_grace_seconds
+            ),
+            poll_seconds=args.gpu_coordination_poll_seconds,
+        )
+        if args.gpu_coordination_dir
+        else None
+    )
 
     text_proc: subprocess.Popen[str] | None = None
     primary_image_proc: subprocess.Popen[str] | None = None
     secondary_text_proc: subprocess.Popen[str] | None = None
     secondary_image_proc: subprocess.Popen[str] | None = None
     builder_proc: subprocess.Popen[str] | None = None
+    round_loop_manages_priority = False
     try:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         for marker in (model_start_marker, model_ready_marker, text_done_marker, image_done_marker):
@@ -765,8 +951,12 @@ def main(argv: list[str] | None = None) -> int:
         model_round_control_dir.mkdir(parents=True, exist_ok=True)
         for marker in model_round_control_dir.glob("round-*.json*"):
             marker.unlink()
-        write_endpoint_file(text_endpoints_file, [text_server.base_url])
-        write_endpoint_file(image_endpoints_file, [primary_image_server.base_url])
+        write_endpoint_file(text_endpoints_file, [])
+        write_endpoint_file(image_endpoints_file, [])
+        if gpu_priority_owner is not None:
+            gpu_priority_owner.release_gpus(
+                reason="entitables_network_preparation"
+            )
 
         builder_passthrough_args = with_default_model_workers(passthrough_args, args.dynamic_model_workers)
         builder_command = build_builder_command(
@@ -793,10 +983,42 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.model_start_timeout_seconds,
         )
 
+        start_payload = read_json_marker(model_start_marker) or {}
+        if start_payload.get("round_mode") is True:
+            write_ready_marker(model_ready_marker)
+            if (
+                read_pending_model_task_count(model_start_marker) == 0
+                or (
+                    text_done_marker.exists()
+                    and image_done_marker.exists()
+                )
+            ):
+                return int(builder_proc.wait())
+            round_loop_manages_priority = True
+            return run_round_service_loop(
+                builder=builder_proc,
+                control_dir=model_round_control_dir,
+                run_id=model_round_run_id,
+                runtime_dir=runtime_dir,
+                text_server=text_server,
+                primary_image_server=primary_image_server,
+                secondary_image_server=secondary_image_server,
+                text_endpoints_file=text_endpoints_file,
+                image_endpoints_file=image_endpoints_file,
+                text_process=None,
+                primary_image_process=None,
+                secondary_image_process=None,
+                server_start_timeout_seconds=args.server_start_timeout_seconds,
+                round_timeout_seconds=first_done_timeout,
+                gpu_priority_owner=gpu_priority_owner,
+            )
+
         if read_pending_model_task_count(model_start_marker) == 0:
             write_ready_marker(model_ready_marker)
             return int(builder_proc.wait())
 
+        if gpu_priority_owner is not None:
+            gpu_priority_owner.request_gpus(reason="single_model_phase")
         text_proc = start_and_wait_server(
             text_server,
             runtime_dir=runtime_dir,
@@ -807,32 +1029,12 @@ def main(argv: list[str] | None = None) -> int:
             runtime_dir=runtime_dir,
             timeout_seconds=args.server_start_timeout_seconds,
         )
+        write_endpoint_file(text_endpoints_file, [text_server.base_url])
+        write_endpoint_file(
+            image_endpoints_file,
+            [primary_image_server.base_url],
+        )
         write_ready_marker(model_ready_marker)
-
-        start_payload = read_json_marker(model_start_marker) or {}
-        if start_payload.get("round_mode") is True:
-            if text_done_marker.exists() and image_done_marker.exists():
-                return int(builder_proc.wait())
-            round_text_proc = text_proc
-            round_secondary_image_proc = secondary_image_proc
-            text_proc = None
-            secondary_image_proc = None
-            exit_code, text_proc, secondary_image_proc = run_round_service_loop(
-                builder=builder_proc,
-                control_dir=model_round_control_dir,
-                run_id=model_round_run_id,
-                runtime_dir=runtime_dir,
-                text_server=text_server,
-                primary_image_server=primary_image_server,
-                secondary_image_server=secondary_image_server,
-                text_endpoints_file=text_endpoints_file,
-                image_endpoints_file=image_endpoints_file,
-                text_process=round_text_proc,
-                secondary_image_process=round_secondary_image_proc,
-                server_start_timeout_seconds=args.server_start_timeout_seconds,
-                round_timeout_seconds=first_done_timeout,
-            )
-            return exit_code
 
         completed = wait_for_any_marker_or_builder_exit(
             markers={"text": text_done_marker, "image": image_done_marker},
@@ -852,15 +1054,32 @@ def main(argv: list[str] | None = None) -> int:
 
         return int(builder_proc.wait())
     finally:
-        cleanup_processes(
-            [
-                builder_proc,
-                text_proc,
-                primary_image_proc,
-                secondary_text_proc,
-                secondary_image_proc,
-            ]
-        )
+        cleanup_processes([builder_proc, secondary_text_proc])
+        cleanup_succeeded = True
+        try:
+            stop_round_services(
+                RoundServiceProcesses(
+                    text=text_proc,
+                    primary_image=primary_image_proc,
+                    secondary_image=secondary_image_proc,
+                ),
+                text_endpoints_file=text_endpoints_file,
+                image_endpoints_file=image_endpoints_file,
+            )
+        except BaseException as error:
+            cleanup_succeeded = False
+            print(
+                f"Warning: EntiTables model cleanup was incomplete: {error}",
+                file=sys.stderr,
+            )
+        if (
+            gpu_priority_owner is not None
+            and not round_loop_manages_priority
+            and cleanup_succeeded
+        ):
+            gpu_priority_owner.release_gpus(
+                reason="entitables_runner_stopped"
+            )
 
 
 if __name__ == "__main__":

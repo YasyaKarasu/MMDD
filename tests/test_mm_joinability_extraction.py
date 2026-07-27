@@ -853,18 +853,14 @@ def test_round_runner_reallocates_text_gpu_then_restores_it_next_round(
     secondary_image = VllmServerSpec(
         "image-secondary", "/image", "image", "1", 8002, []
     )
-    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
-    dynamic_vllm_runner.write_endpoint_file(
-        image_endpoints, [primary_image.base_url]
-    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [])
+    dynamic_vllm_runner.write_endpoint_file(image_endpoints, [])
     events: list[str] = []
     run_id = "test-run"
 
     class Process:
         def __init__(self, role: str):
             self.role = role
-
-    initial_text = Process("text-initial")
 
     def start(spec, **_kwargs):
         events.append(f"start:{spec.role}")
@@ -877,6 +873,15 @@ def test_round_runner_reallocates_text_gpu_then_restores_it_next_round(
     monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
     monkeypatch.setattr(dynamic_vllm_runner, "stop_process", stop)
     monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", lambda _seconds: None)
+
+    class Owner:
+        def request_gpus(self, *, reason):
+            events.append(f"request:{reason}")
+
+        def release_gpus(self, *, reason):
+            events.append(f"release:{reason}")
+
+    owner = Owner()
 
     class Builder:
         def poll(self):
@@ -963,35 +968,44 @@ def test_round_runner_reallocates_text_gpu_then_restores_it_next_round(
                 return 0
             return None
 
-    code, text_process, secondary_process = (
-        dynamic_vllm_runner.run_round_service_loop(
-            builder=Builder(),
-            control_dir=control_dir,
-            run_id=run_id,
-            runtime_dir=tmp_path,
-            text_server=text_server,
-            primary_image_server=primary_image,
-            secondary_image_server=secondary_image,
-            text_endpoints_file=text_endpoints,
-            image_endpoints_file=image_endpoints,
-            text_process=initial_text,
-            secondary_image_process=None,
-            server_start_timeout_seconds=10,
-            round_timeout_seconds=10,
-            poll_seconds=0,
-        )
+    code = dynamic_vllm_runner.run_round_service_loop(
+        builder=Builder(),
+        control_dir=control_dir,
+        run_id=run_id,
+        runtime_dir=tmp_path,
+        text_server=text_server,
+        primary_image_server=primary_image,
+        secondary_image_server=secondary_image,
+        text_endpoints_file=text_endpoints,
+        image_endpoints_file=image_endpoints,
+        text_process=None,
+        primary_image_process=None,
+        secondary_image_process=None,
+        server_start_timeout_seconds=10,
+        round_timeout_seconds=10,
+        gpu_priority_owner=owner,
+        poll_seconds=0,
     )
 
     assert code == 0
-    assert text_process.role == "text"
-    assert secondary_process is None
     assert events == [
-        "stop:text-initial",
-        "start:image-secondary",
-        "stop:image-secondary",
+        "request:model_round_0",
+        "start:image-primary",
         "start:text",
+        "stop:text",
+        "start:image-secondary",
+        "stop:image-primary",
+        "stop:image-secondary",
+        "release:after_model_round_0",
+        "request:model_round_1",
+        "start:image-primary",
+        "start:text",
+        "stop:text",
+        "stop:image-primary",
+        "release:round_service_loop_stopped",
     ]
-    assert all("image-primary" not in event for event in events)
+    assert text_endpoints.read_text() == "\n"
+    assert image_endpoints.read_text() == "\n"
 
 
 def test_round_runner_treats_zero_text_as_done_and_avoids_late_endpoint_publish(
@@ -1009,10 +1023,8 @@ def test_round_runner_treats_zero_text_as_done_and_avoids_late_endpoint_publish(
     secondary_image = VllmServerSpec(
         "image-secondary", "/image", "image", "1", 8002, []
     )
-    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
-    dynamic_vllm_runner.write_endpoint_file(
-        image_endpoints, [primary_image.base_url]
-    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [])
+    dynamic_vllm_runner.write_endpoint_file(image_endpoints, [])
     events: list[str] = []
 
     class Process:
@@ -1074,34 +1086,32 @@ def test_round_runner_treats_zero_text_as_done_and_avoids_late_endpoint_publish(
                 )
             return None
 
-    code, text_process, secondary_process = (
-        dynamic_vllm_runner.run_round_service_loop(
-            builder=Builder(),
-            control_dir=control_dir,
-            run_id=run_id,
-            runtime_dir=tmp_path,
-            text_server=text_server,
-            primary_image_server=primary_image,
-            secondary_image_server=secondary_image,
-            text_endpoints_file=text_endpoints,
-            image_endpoints_file=image_endpoints,
-            text_process=Process("text-initial"),
-            secondary_image_process=None,
-            server_start_timeout_seconds=10,
-            round_timeout_seconds=10,
-            poll_seconds=0,
-        )
+    code = dynamic_vllm_runner.run_round_service_loop(
+        builder=Builder(),
+        control_dir=control_dir,
+        run_id=run_id,
+        runtime_dir=tmp_path,
+        text_server=text_server,
+        primary_image_server=primary_image,
+        secondary_image_server=secondary_image,
+        text_endpoints_file=text_endpoints,
+        image_endpoints_file=image_endpoints,
+        text_process=None,
+        primary_image_process=None,
+        secondary_image_process=None,
+        server_start_timeout_seconds=10,
+        round_timeout_seconds=10,
+        poll_seconds=0,
     )
 
     assert code == 0
-    assert text_process is None
-    assert secondary_process is None
     assert events == [
-        "stop:text-initial",
+        "start:image-primary",
         "start:image-secondary",
+        "stop:image-primary",
         "stop:image-secondary",
     ]
-    assert image_endpoints.read_text().strip() == primary_image.base_url
+    assert image_endpoints.read_text() == "\n"
 
 
 @pytest.mark.parametrize("failure_mode", ["endpoint", "timeout"])
@@ -1120,10 +1130,8 @@ def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
     secondary_image = VllmServerSpec(
         "image-secondary", "/image", "image", "1", 8002, []
     )
-    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
-    dynamic_vllm_runner.write_endpoint_file(
-        image_endpoints, [primary_image.base_url]
-    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [])
+    dynamic_vllm_runner.write_endpoint_file(image_endpoints, [])
     events: list[str] = []
     secondary_started = False
 
@@ -1133,7 +1141,8 @@ def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
 
     def start(spec, **_kwargs):
         nonlocal secondary_started
-        secondary_started = True
+        if spec.role == "image-secondary":
+            secondary_started = True
         events.append(f"start:{spec.role}")
         return Process(spec.role)
 
@@ -1210,7 +1219,8 @@ def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
             secondary_image_server=secondary_image,
             text_endpoints_file=text_endpoints,
             image_endpoints_file=image_endpoints,
-            text_process=Process("text-initial"),
+            text_process=None,
+            primary_image_process=None,
             secondary_image_process=None,
             server_start_timeout_seconds=10,
             round_timeout_seconds=5,
@@ -1218,14 +1228,71 @@ def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
         )
 
     assert events == [
-        "stop:text-initial",
+        "start:image-primary",
+        "start:text",
+        "stop:text",
         "start:image-secondary",
+        "stop:image-primary",
         "stop:image-secondary",
     ]
-    assert all("image-primary" not in event for event in events)
 
 
-def test_dynamic_vllm_main_transfers_round_process_ownership_before_loop(
+def test_round_runner_does_not_release_priority_after_incomplete_gpu_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    text_endpoints = tmp_path / "text_endpoints.txt"
+    image_endpoints = tmp_path / "image_endpoints.txt"
+    releases = []
+
+    class Process:
+        role = "text"
+
+    class Builder:
+        def poll(self):
+            return 0
+
+    class Owner:
+        def release_gpus(self, *, reason):
+            releases.append(reason)
+
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "stop_process",
+        lambda _process: (_ for _ in ()).throw(
+            RuntimeError("process group remains alive")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to stop every"):
+        dynamic_vllm_runner.run_round_service_loop(
+            builder=Builder(),
+            control_dir=tmp_path / "rounds",
+            run_id="cleanup-failure",
+            runtime_dir=tmp_path,
+            text_server=VllmServerSpec(
+                "text", "/text", "text", "1", 8001, []
+            ),
+            primary_image_server=VllmServerSpec(
+                "image-primary", "/image", "image", "0", 8000, []
+            ),
+            secondary_image_server=VllmServerSpec(
+                "image-secondary", "/image", "image", "1", 8002, []
+            ),
+            text_endpoints_file=text_endpoints,
+            image_endpoints_file=image_endpoints,
+            text_process=Process(),
+            primary_image_process=None,
+            secondary_image_process=None,
+            server_start_timeout_seconds=10,
+            round_timeout_seconds=10,
+            gpu_priority_owner=Owner(),
+        )
+
+    assert releases == []
+
+
+def test_dynamic_vllm_main_defers_round_process_ownership_to_loop(
     tmp_path, monkeypatch
 ):
     stopped: list[str] = []
@@ -1242,9 +1309,6 @@ def test_dynamic_vllm_main_transfers_round_process_ownership_before_loop(
             return 0
 
     builder_process = Process("builder")
-    text_process = Process("text")
-    primary_process = Process("image-primary")
-
     def popen(command, **_kwargs):
         marker = Path(command[command.index("--model_start_marker") + 1])
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1260,10 +1324,12 @@ def test_dynamic_vllm_main_transfers_round_process_ownership_before_loop(
         return builder_process
 
     def start(spec, **_kwargs):
-        return text_process if spec.role == "text" else primary_process
+        pytest.fail(f"main must defer {spec.role} startup to the round loop")
 
     def fail_round_loop(**kwargs):
-        dynamic_vllm_runner.stop_process(kwargs["text_process"])
+        assert kwargs["text_process"] is None
+        assert kwargs["primary_image_process"] is None
+        assert kwargs["secondary_image_process"] is None
         raise RuntimeError("injected round loop failure")
 
     monkeypatch.setattr(dynamic_vllm_runner.subprocess, "Popen", popen)
@@ -1289,8 +1355,6 @@ def test_dynamic_vllm_main_transfers_round_process_ownership_before_loop(
             ]
         )
 
-    assert stopped.count("text") == 1
-    assert stopped.count("image-primary") == 1
     assert stopped.count("builder") == 1
 
 
@@ -1581,6 +1645,7 @@ def test_wait_for_server_rejects_non_200_or_wrong_model(
 def test_stop_process_cleans_group_when_leader_already_exited(monkeypatch):
     signals = []
     waits = []
+    group_alive = True
 
     class Process:
         pid = 123
@@ -1592,11 +1657,17 @@ def test_stop_process_cleans_group_when_leader_already_exited(monkeypatch):
             waits.append(timeout)
             return 7
 
-    monkeypatch.setattr(
-        dynamic_vllm_runner.os,
-        "killpg",
-        lambda pid, sig: signals.append((pid, sig)),
-    )
+    def kill_group(pid, sig):
+        nonlocal group_alive
+        if sig == 0:
+            if group_alive:
+                return
+            raise ProcessLookupError()
+        signals.append((pid, sig))
+        if sig == signal.SIGKILL:
+            group_alive = False
+
+    monkeypatch.setattr(dynamic_vllm_runner.os, "killpg", kill_group)
 
     dynamic_vllm_runner.stop_process(Process(), timeout_seconds=0.01)
 
@@ -1824,10 +1895,11 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
     assert events == ["builder_started"]
 
 
-def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
+def test_dynamic_vllm_defers_round_mode_servers_to_round_handshake(
     monkeypatch, tmp_path
 ):
     events = []
+    round_loops = []
 
     class FakePopen:
         def __init__(self, command, **kwargs):
@@ -1839,14 +1911,15 @@ def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
                 marker = Path(command[command.index("--model_start_marker") + 1])
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(
-                    '{"text_task_count": 0, "image_task_count": 0, "round_mode": true}',
+                    json.dumps(
+                        {
+                            "text_task_count": 0,
+                            "image_task_count": 0,
+                            "round_mode": True,
+                            "runner_startup_task_count": 1,
+                        }
+                    ),
                     encoding="utf-8",
-                )
-                Path(command[command.index("--model_text_done_marker") + 1]).write_text(
-                    "{}", encoding="utf-8"
-                )
-                Path(command[command.index("--model_image_done_marker") + 1]).write_text(
-                    "{}", encoding="utf-8"
                 )
             else:
                 events.append("server_started")
@@ -1860,6 +1933,10 @@ def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
 
     monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
     monkeypatch.setattr("run_mm_joinability_dynamic_vllm.wait_for_server", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.run_round_service_loop",
+        lambda **kwargs: round_loops.append(kwargs) or 0,
+    )
 
     code = dynamic_vllm_main(
         [
@@ -1877,8 +1954,10 @@ def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
     )
 
     assert code == 0
-    assert events[0] == "builder_started"
-    assert events.count("server_started") == 2
+    assert events == ["builder_started"]
+    assert len(round_loops) == 1
+    assert round_loops[0]["text_process"] is None
+    assert round_loops[0]["primary_image_process"] is None
 
 
 def test_dynamic_vllm_skips_servers_for_zero_runner_startup_count_in_round_mode(
