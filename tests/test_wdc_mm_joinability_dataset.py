@@ -1607,8 +1607,9 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert recoveries
     query = queries[0]
     target = targets[0]
-    assert len(query["rows"]) == len(target["rows"]) == 5
-    assert query["source_row_indices"] == target["source_row_indices"]
+    assert len(query["rows"]) == 5
+    assert len(target["rows"]) == 6
+    assert set(query["source_row_indices"]).issubset(target["source_row_indices"])
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["target_table_id"] == target["table_id"]
     assert query["provenance"]["builder"] == "build_wdc_mm_joinability_dataset.py"
@@ -1622,6 +1623,8 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert stats["source_tables"] == stats["query_tables"] == stats["qrels"] == 1
     assert persisted_stats == stats
     assert manifest["source_corpus"] == "WDC Schema.org Table Corpus 2023"
+    assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
+    assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
     assert manifest["web_cache"]["database"].endswith("wdc_web.sqlite3")
     assert manifest["artifacts"]["bridge_assets"]["total_records"] == 30
 

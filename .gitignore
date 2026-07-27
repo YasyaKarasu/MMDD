@@ -52,3 +52,4 @@ human_labels_filled_round_*.jsonl
 
 # Local agent instructions
 AGENTS.md
+/.superpowers/

@@ -1813,6 +1813,7 @@ def build_bridge_assets(
     wikipedia_client: WikipediaClient | None,
     asset_writer: ShardedJsonlWriter,
     flush_every_records: int,
+    show_progress: bool = True,
 ) -> tuple[dict[str, list[str]], int, int, int]:
     if wikipedia_client is None:
         return defaultdict(list), 0, 0, 0
@@ -1833,7 +1834,12 @@ def build_bridge_assets(
             for entity in selected_entities
         }
 
-    for entity in iter_with_progress(selected_entities, "Fetching Wikipedia assets"):
+    entity_iterator = (
+        iter_with_progress(selected_entities, "Fetching Wikipedia assets")
+        if show_progress
+        else selected_entities
+    )
+    for entity in entity_iterator:
         page = pages.get(normalize_title(entity["wiki_title"]))
         if not page or page.get("missing"):
             continue
@@ -1944,7 +1950,7 @@ def build_bridge_assets(
             pending_iterator: Iterable[
                 tuple[Any, dict[str, Any], str, dict[str, Any]]
             ] = pending_image_downloads
-            if tqdm is not None:
+            if show_progress and tqdm is not None:
                 pending_iterator = tqdm(
                     pending_image_downloads,
                     total=len(pending_image_downloads),

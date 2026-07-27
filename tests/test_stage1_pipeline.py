@@ -1987,8 +1987,8 @@ def test_build_bridge_assets_does_not_block_imageinfo_on_prior_image_download(tm
     } in progress_events
 
 
-def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatch):
-    calls = {"serial": 0, "parallel": 0}
+def test_joinability_wikipedia_workers_report_serial_without_parallel_builder(tmp_path, monkeypatch):
+    parallel_calls = 0
     output_dir = tmp_path / "out"
 
     monkeypatch.setattr(join_dataset, "read_entitables_json", lambda _input_dir: [])
@@ -1999,15 +1999,11 @@ def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatc
         lambda output_path, *_args, **_kwargs: ShardedJsonlWriter(output_path, 10),
     )
 
-    def fake_build_bridge_assets(*_args, **_kwargs):
-        calls["serial"] += 1
-        return {}, 0, 0, 0
-
     def fake_build_bridge_assets_parallel(*_args, **_kwargs):
-        calls["parallel"] += 1
+        nonlocal parallel_calls
+        parallel_calls += 1
         return {}, 0, 0, 0
 
-    monkeypatch.setattr(join_dataset, "build_bridge_assets", fake_build_bridge_assets)
     monkeypatch.setattr(join_dataset, "build_bridge_assets_parallel", fake_build_bridge_assets_parallel)
 
     class FakeWikipediaClient:
@@ -2036,7 +2032,7 @@ def test_joinability_wikipedia_workers_are_forced_to_serial(tmp_path, monkeypatc
 
     manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
     stats = json.loads((output_dir / "stats.json").read_text(encoding="utf-8"))
-    assert calls == {"serial": 1, "parallel": 0}
+    assert parallel_calls == 0
     assert stats["wikipedia_workers"] == 1
     assert manifest["wikipedia_cache"]["workers"] == 1
 
@@ -2337,7 +2333,14 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
             attrs = []
             for city in ("Paris", "Oslo", "Madrid", "Berlin", "Lisbon", "Dublin"):
                 if city in content:
-                    attrs.append({"name": "City", "value": city, "evidence": f"City: {city}"})
+                    attrs.append(
+                        {
+                            "name": "City",
+                            "value": city,
+                            "evidence": f"City: {city}",
+                            "connection_evidence": f"{entity['cell_text']} is the subject of this Wikipedia article.",
+                        }
+                    )
             return {"attributes": attrs, "raw_response": json.dumps({"attributes": attrs}), "error": ""}
 
     monkeypatch.setattr(join_dataset, "WikipediaClient", FakeWikipediaClient)
@@ -2417,13 +2420,17 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert query["hidden_attributes"][0]["required_recovered_rows"] == 3
     assert query["hidden_attributes"][0]["recovered_value_ratio"] == 0.5
     assert query["hidden_attributes"][0]["selected_rows"] == 5
+    assert query["hidden_attributes"][0]["target_rows"] == 6
     assert len(query["rows"]) == 5
-    assert len(target["rows"]) == 5
-    assert query["source_row_indices"] == target["source_row_indices"] == [0, 1, 2, 3, 4]
+    assert len(target["rows"]) == 6
+    assert query["source_row_indices"] == [0, 1, 2, 3, 4]
+    assert target["source_row_indices"] == [0, 1, 2, 3, 4, 5]
     assert [target["rows"][row_id]["cells"][0]["text"] for row_id in (1, 3)] == ["", ""]
     assert [column["column_name"] for column in target["columns"]] == ["City", "Team"]
     assert rejected["queryable"] is False
     assert manifest["query_construction"]["query_rows_per_table"] == 5
+    assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
+    assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]
     assert any(item["attributes"] for item in extractions)

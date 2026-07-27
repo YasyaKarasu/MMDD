@@ -2477,6 +2477,7 @@ def build_dataset(
             "WDC page_url is fetched for every selected entity even when direct images succeed",
             "direct image-column URLs and webpage images share one per-entity quota",
             "the source image attribute is excluded from every emitted table",
+            "query sampling prefers recoverable rows while projected targets retain every source row",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
         ],
     }
@@ -2509,6 +2510,8 @@ def build_dataset(
         },
         "query_construction": {
             "query_rows_per_table": args.query_rows_per_table,
+            "query_row_selection": "recoverable_first",
+            "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,

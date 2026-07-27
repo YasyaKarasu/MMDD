@@ -1,7 +1,10 @@
 import argparse
+import json
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_mm_joinability_dataset as joinability_dataset
+import run_mm_joinability_dynamic_vllm as dynamic_vllm_runner
 from build_mm_joinability_dataset import (
     ExtractionCache,
     ExtractionTask,
@@ -37,7 +41,9 @@ from run_mm_joinability_dynamic_vllm import (
     default_vllm_extra_args,
     main as dynamic_vllm_main,
     parse_args as parse_dynamic_vllm_args,
+    read_pending_model_task_count,
     start_server,
+    wait_for_server,
 )
 
 
@@ -45,6 +51,77 @@ def test_prompt_version_invalidates_cache_after_image_prompt_changes():
     import build_mm_joinability_dataset as joinability_dataset
 
     assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v3_short_empty_precompressed_image"
+
+
+def test_model_analysis_progress_registers_new_keys_once() -> None:
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=0, cached_keys=set(), enabled=False
+    )
+
+    assert progress.register({"cached", "model"}) == 2
+    assert progress.register({"model", "later"}) == 1
+    progress.mark("cached", "cached")
+    progress.mark("model", "model")
+
+    assert progress.total == 3
+    assert progress.cached == 1
+    assert progress.model == 1
+    assert progress.planned_keys == {"later"}
+    assert progress.completed_keys == {"cached", "model"}
+    assert progress.register({"cached", "model"}) == 0
+    assert progress.total == 3
+
+    preallocated = joinability_dataset.ModelAnalysisProgress(
+        total=3, cached_keys={"cached"}, enabled=False
+    )
+    assert preallocated.register({"first", "second"}) == 2
+    assert preallocated.total == 3
+    assert preallocated.planned_keys == {"first", "second"}
+    assert preallocated.completed_keys == {"cached"}
+
+
+def test_model_analysis_progress_refreshes_dynamic_tqdm_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProgressBar:
+        def __init__(self, total: int) -> None:
+            self.total = total
+            self.refreshes = 0
+            self.closes = 0
+
+        def set_postfix(self, *, refresh: bool = True, **_postfix: int) -> None:
+            if refresh:
+                self.refresh()
+
+        def refresh(self) -> None:
+            self.refreshes += 1
+
+        def update(self, _amount: int = 1) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closes += 1
+
+    bars: list[ProgressBar] = []
+
+    def fake_tqdm(*, total: int, **_kwargs: object) -> ProgressBar:
+        bar = ProgressBar(total)
+        bars.append(bar)
+        return bar
+
+    monkeypatch.setattr(joinability_dataset, "tqdm", fake_tqdm)
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=0, cached_keys=set(), enabled=True
+    )
+
+    refreshes_before_register = bars[0].refreshes
+    progress.register({"first", "second"})
+    progress.close()
+    progress.close()
+
+    assert bars[0].total == 2
+    assert bars[0].refreshes - refreshes_before_register == 1
+    assert bars[0].closes == 1
 
 
 def test_select_best_qualified_column_uses_highest_recovery_ratio():
@@ -82,7 +159,7 @@ def test_recovery_profile_counts_empty_attribute_rows_as_failures():
     }
 
 
-def test_select_query_rows_uses_recovery_quota_then_failures():
+def test_select_query_rows_uses_recoveries_then_failures():
     assert select_query_source_rows(
         source_row_order=[0, 1, 2, 3, 4, 5],
         recovered_source_rows={0, 2, 4},
@@ -91,13 +168,13 @@ def test_select_query_rows_uses_recovery_quota_then_failures():
     ) == [0, 2, 4, 1, 3]
 
 
-def test_select_query_rows_uses_extra_recoveries_when_failures_are_exhausted():
+def test_select_query_rows_prefers_extra_recoveries_over_failures():
     assert select_query_source_rows(
         source_row_order=[0, 1, 2, 3, 4, 5],
         recovered_source_rows={0, 1, 2, 3, 4},
         query_rows_per_table=5,
         required_recovered_rows=3,
-    ) == [0, 1, 2, 5, 3]
+    ) == [0, 1, 2, 3, 4]
 
 
 def test_query_rows_per_table_defaults_to_five(tmp_path):
@@ -699,6 +776,20 @@ def test_endpoint_pools_add_urls_from_runtime_files(tmp_path):
     ]
 
 
+def test_runtime_endpoint_file_is_authoritative_when_service_is_removed(tmp_path):
+    text_endpoint_file = tmp_path / "text_endpoints.txt"
+    text_endpoint_file.write_text("http://localhost:8003/v1\n", encoding="utf-8")
+    extractor = LocalAttributeExtractor(
+        _extractor_args(text_model_base_urls_file=str(text_endpoint_file))
+    )
+
+    assert [extractor.next_text_model_base_url() for _ in range(3)] == [
+        "http://localhost:8003/v1",
+        "http://localhost:8003/v1",
+        "http://localhost:8003/v1",
+    ]
+
+
 def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(tmp_path):
     text_server = VllmServerSpec(
         role="text",
@@ -730,6 +821,8 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
         model_ready_marker=tmp_path / "model_ready.json",
         text_done_marker=tmp_path / "text_done.json",
         image_done_marker=tmp_path / "image_done.json",
+        model_round_control_dir=tmp_path / "round-control",
+        model_round_run_id="test-run",
         passthrough_args=["--max_source_tables", "10"],
     )
 
@@ -738,11 +831,467 @@ def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(
     assert "--model_ready_marker" in command
     assert "--model_text_done_marker" in command
     assert "--model_image_done_marker" in command
+    assert "--model_round_control_dir" in command
     assert "--text_model_base_urls_file" in command
     assert "--image_model_base_urls_file" in command
     assert "http://127.0.0.1:8001/v1" in command
     assert "http://127.0.0.1:8000/v1" in command
     assert command[-2:] == ["--max_source_tables", "10"]
+
+
+def test_round_runner_reallocates_text_gpu_then_restores_it_next_round(
+    tmp_path, monkeypatch
+):
+    control_dir = tmp_path / "rounds"
+    control_dir.mkdir()
+    text_endpoints = tmp_path / "text_endpoints.txt"
+    image_endpoints = tmp_path / "image_endpoints.txt"
+    text_server = VllmServerSpec("text", "/text", "text", "1", 8001, [])
+    primary_image = VllmServerSpec(
+        "image-primary", "/image", "image", "0", 8000, []
+    )
+    secondary_image = VllmServerSpec(
+        "image-secondary", "/image", "image", "1", 8002, []
+    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
+    dynamic_vllm_runner.write_endpoint_file(
+        image_endpoints, [primary_image.base_url]
+    )
+    events: list[str] = []
+    run_id = "test-run"
+
+    class Process:
+        def __init__(self, role: str):
+            self.role = role
+
+    initial_text = Process("text-initial")
+
+    def start(spec, **_kwargs):
+        events.append(f"start:{spec.role}")
+        return Process(spec.role)
+
+    def stop(process):
+        if process is not None:
+            events.append(f"stop:{process.role}")
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
+    monkeypatch.setattr(dynamic_vllm_runner, "stop_process", stop)
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", lambda _seconds: None)
+
+    class Builder:
+        def poll(self):
+            start0 = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "start"
+            )
+            ready0 = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "ready"
+            )
+            text_done0 = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "text.done"
+            )
+            done0 = dynamic_vllm_runner.round_event_path(control_dir, 0, "done")
+            start1 = dynamic_vllm_runner.round_event_path(
+                control_dir, 1, "start"
+            )
+            ready1 = dynamic_vllm_runner.round_event_path(
+                control_dir, 1, "ready"
+            )
+            done1 = dynamic_vllm_runner.round_event_path(control_dir, 1, "done")
+            if not start0.exists():
+                dynamic_vllm_runner.write_atomic_json(
+                    start0,
+                    {
+                        "status": "model_round_start",
+                        "round_id": 0,
+                        "run_id": run_id,
+                        "text_task_count": 1,
+                        "image_task_count": 10,
+                    },
+                )
+            elif ready0.exists() and not text_done0.exists():
+                dynamic_vllm_runner.write_atomic_json(
+                    text_done0,
+                    {
+                        "status": "text_round_tasks_completed",
+                        "round_id": 0,
+                        "run_id": run_id,
+                    },
+                )
+            elif (
+                secondary_image.base_url in image_endpoints.read_text()
+                and not done0.exists()
+            ):
+                dynamic_vllm_runner.write_atomic_json(
+                    dynamic_vllm_runner.round_event_path(
+                        control_dir, 0, "image.done"
+                    ),
+                    {
+                        "status": "image_round_tasks_completed",
+                        "round_id": 0,
+                        "run_id": run_id,
+                    },
+                )
+                dynamic_vllm_runner.write_atomic_json(
+                    done0,
+                    {
+                        "status": "model_round_completed",
+                        "round_id": 0,
+                        "run_id": run_id,
+                    },
+                )
+                dynamic_vllm_runner.write_atomic_json(
+                    start1,
+                    {
+                        "status": "model_round_start",
+                        "round_id": 1,
+                        "run_id": run_id,
+                        "text_task_count": 1,
+                        "image_task_count": 1,
+                    },
+                )
+            elif ready1.exists() and not done1.exists():
+                assert text_endpoints.read_text().strip() == text_server.base_url
+                assert image_endpoints.read_text().strip() == primary_image.base_url
+                dynamic_vllm_runner.write_atomic_json(
+                    done1,
+                    {
+                        "status": "model_round_completed",
+                        "round_id": 1,
+                        "run_id": run_id,
+                    },
+                )
+                return 0
+            return None
+
+    code, text_process, secondary_process = (
+        dynamic_vllm_runner.run_round_service_loop(
+            builder=Builder(),
+            control_dir=control_dir,
+            run_id=run_id,
+            runtime_dir=tmp_path,
+            text_server=text_server,
+            primary_image_server=primary_image,
+            secondary_image_server=secondary_image,
+            text_endpoints_file=text_endpoints,
+            image_endpoints_file=image_endpoints,
+            text_process=initial_text,
+            secondary_image_process=None,
+            server_start_timeout_seconds=10,
+            round_timeout_seconds=10,
+            poll_seconds=0,
+        )
+    )
+
+    assert code == 0
+    assert text_process.role == "text"
+    assert secondary_process is None
+    assert events == [
+        "stop:text-initial",
+        "start:image-secondary",
+        "stop:image-secondary",
+        "start:text",
+    ]
+    assert all("image-primary" not in event for event in events)
+
+
+def test_round_runner_treats_zero_text_as_done_and_avoids_late_endpoint_publish(
+    tmp_path, monkeypatch
+):
+    control_dir = tmp_path / "rounds"
+    control_dir.mkdir()
+    run_id = "zero-text-run"
+    text_endpoints = tmp_path / "text_endpoints.txt"
+    image_endpoints = tmp_path / "image_endpoints.txt"
+    text_server = VllmServerSpec("text", "/text", "text", "1", 8001, [])
+    primary_image = VllmServerSpec(
+        "image-primary", "/image", "image", "0", 8000, []
+    )
+    secondary_image = VllmServerSpec(
+        "image-secondary", "/image", "image", "1", 8002, []
+    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
+    dynamic_vllm_runner.write_endpoint_file(
+        image_endpoints, [primary_image.base_url]
+    )
+    events: list[str] = []
+
+    class Process:
+        def __init__(self, role):
+            self.role = role
+
+    def start(spec, **_kwargs):
+        events.append(f"start:{spec.role}")
+        dynamic_vllm_runner.write_atomic_json(
+            dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "image.done"
+            ),
+            {
+                "status": "image_round_tasks_completed",
+                "round_id": 0,
+                "run_id": run_id,
+            },
+        )
+        dynamic_vllm_runner.write_atomic_json(
+            dynamic_vllm_runner.round_event_path(control_dir, 0, "done"),
+            {
+                "status": "model_round_completed",
+                "round_id": 0,
+                "run_id": run_id,
+            },
+        )
+        return Process(spec.role)
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "stop_process",
+        lambda process: events.append(f"stop:{process.role}")
+        if process is not None
+        else None,
+    )
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", lambda _seconds: None)
+
+    class Builder:
+        def poll(self):
+            start_path = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "start"
+            )
+            done_path = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "done"
+            )
+            if done_path.exists():
+                return 0
+            if not start_path.exists():
+                dynamic_vllm_runner.write_atomic_json(
+                    start_path,
+                    {
+                        "status": "model_round_start",
+                        "round_id": 0,
+                        "run_id": run_id,
+                        "text_task_count": 0,
+                        "image_task_count": 5,
+                    },
+                )
+            return None
+
+    code, text_process, secondary_process = (
+        dynamic_vllm_runner.run_round_service_loop(
+            builder=Builder(),
+            control_dir=control_dir,
+            run_id=run_id,
+            runtime_dir=tmp_path,
+            text_server=text_server,
+            primary_image_server=primary_image,
+            secondary_image_server=secondary_image,
+            text_endpoints_file=text_endpoints,
+            image_endpoints_file=image_endpoints,
+            text_process=Process("text-initial"),
+            secondary_image_process=None,
+            server_start_timeout_seconds=10,
+            round_timeout_seconds=10,
+            poll_seconds=0,
+        )
+    )
+
+    assert code == 0
+    assert text_process is None
+    assert secondary_process is None
+    assert events == [
+        "stop:text-initial",
+        "start:image-secondary",
+        "stop:image-secondary",
+    ]
+    assert image_endpoints.read_text().strip() == primary_image.base_url
+
+
+@pytest.mark.parametrize("failure_mode", ["endpoint", "timeout"])
+def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
+    tmp_path, monkeypatch, failure_mode
+):
+    control_dir = tmp_path / "rounds"
+    control_dir.mkdir()
+    run_id = f"failure-{failure_mode}"
+    text_endpoints = tmp_path / "text_endpoints.txt"
+    image_endpoints = tmp_path / "image_endpoints.txt"
+    text_server = VllmServerSpec("text", "/text", "text", "1", 8001, [])
+    primary_image = VllmServerSpec(
+        "image-primary", "/image", "image", "0", 8000, []
+    )
+    secondary_image = VllmServerSpec(
+        "image-secondary", "/image", "image", "1", 8002, []
+    )
+    dynamic_vllm_runner.write_endpoint_file(text_endpoints, [text_server.base_url])
+    dynamic_vllm_runner.write_endpoint_file(
+        image_endpoints, [primary_image.base_url]
+    )
+    events: list[str] = []
+    secondary_started = False
+
+    class Process:
+        def __init__(self, role):
+            self.role = role
+
+    def start(spec, **_kwargs):
+        nonlocal secondary_started
+        secondary_started = True
+        events.append(f"start:{spec.role}")
+        return Process(spec.role)
+
+    original_write_endpoints = dynamic_vllm_runner.write_endpoint_file
+
+    def write_endpoints(path, urls):
+        values = list(urls)
+        if failure_mode == "endpoint" and secondary_image.base_url in values:
+            raise OSError("injected endpoint replace failure")
+        original_write_endpoints(path, values)
+
+    clock = 0.0
+
+    def fake_time():
+        nonlocal clock
+        if secondary_started and failure_mode == "timeout":
+            clock += 10.0
+        return clock
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
+    monkeypatch.setattr(dynamic_vllm_runner, "write_endpoint_file", write_endpoints)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "stop_process",
+        lambda process: events.append(f"stop:{process.role}")
+        if process is not None
+        else None,
+    )
+    monkeypatch.setattr(dynamic_vllm_runner.time, "time", fake_time)
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", lambda _seconds: None)
+
+    class Builder:
+        def poll(self):
+            start_path = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "start"
+            )
+            ready_path = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "ready"
+            )
+            text_done_path = dynamic_vllm_runner.round_event_path(
+                control_dir, 0, "text.done"
+            )
+            if not start_path.exists():
+                dynamic_vllm_runner.write_atomic_json(
+                    start_path,
+                    {
+                        "status": "model_round_start",
+                        "round_id": 0,
+                        "run_id": run_id,
+                        "text_task_count": 1,
+                        "image_task_count": 5,
+                    },
+                )
+            elif ready_path.exists() and not text_done_path.exists():
+                dynamic_vllm_runner.write_atomic_json(
+                    text_done_path,
+                    {
+                        "status": "text_round_tasks_completed",
+                        "round_id": 0,
+                        "run_id": run_id,
+                    },
+                )
+            return None
+
+    expected_error = OSError if failure_mode == "endpoint" else RuntimeError
+    with pytest.raises(expected_error):
+        dynamic_vllm_runner.run_round_service_loop(
+            builder=Builder(),
+            control_dir=control_dir,
+            run_id=run_id,
+            runtime_dir=tmp_path,
+            text_server=text_server,
+            primary_image_server=primary_image,
+            secondary_image_server=secondary_image,
+            text_endpoints_file=text_endpoints,
+            image_endpoints_file=image_endpoints,
+            text_process=Process("text-initial"),
+            secondary_image_process=None,
+            server_start_timeout_seconds=10,
+            round_timeout_seconds=5,
+            poll_seconds=0,
+        )
+
+    assert events == [
+        "stop:text-initial",
+        "start:image-secondary",
+        "stop:image-secondary",
+    ]
+    assert all("image-primary" not in event for event in events)
+
+
+def test_dynamic_vllm_main_transfers_round_process_ownership_before_loop(
+    tmp_path, monkeypatch
+):
+    stopped: list[str] = []
+
+    class Process:
+        def __init__(self, role):
+            self.role = role
+            self.pid = 12345
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    builder_process = Process("builder")
+    text_process = Process("text")
+    primary_process = Process("image-primary")
+
+    def popen(command, **_kwargs):
+        marker = Path(command[command.index("--model_start_marker") + 1])
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "round_mode": True,
+                    "runner_startup_task_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return builder_process
+
+    def start(spec, **_kwargs):
+        return text_process if spec.role == "text" else primary_process
+
+    def fail_round_loop(**kwargs):
+        dynamic_vllm_runner.stop_process(kwargs["text_process"])
+        raise RuntimeError("injected round loop failure")
+
+    monkeypatch.setattr(dynamic_vllm_runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
+    monkeypatch.setattr(dynamic_vllm_runner, "run_round_service_loop", fail_round_loop)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "stop_process",
+        lambda process: stopped.append(process.role) if process is not None else None,
+    )
+
+    with pytest.raises(RuntimeError, match="injected round loop failure"):
+        dynamic_vllm_main(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/image",
+            ]
+        )
+
+    assert stopped.count("text") == 1
+    assert stopped.count("image-primary") == 1
+    assert stopped.count("builder") == 1
 
 
 def test_dynamic_vllm_defaults_limit_startup_kv_cache_memory():
@@ -793,7 +1342,7 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     assert args.model_start_timeout_seconds is None
 
 
-def test_start_server_discards_vllm_output_by_default(monkeypatch):
+def test_start_server_persists_vllm_output_and_closes_parent_handle(monkeypatch, tmp_path):
     captured = {}
 
     class FakePopen:
@@ -814,13 +1363,365 @@ def test_start_server_discards_vllm_output_by_default(monkeypatch):
         extra_args=[],
     )
 
-    start_server(spec)
+    log_path = tmp_path / "runtime" / "text.log"
+    start_server(spec, log_path=log_path)
 
     assert captured["command"] == spec.command()
-    assert captured["stdout"] == subprocess.DEVNULL
-    assert captured["stderr"] == subprocess.DEVNULL
+    assert Path(captured["stdout"].name) == log_path
+    assert captured["stdout"].closed
+    assert captured["stderr"] == subprocess.STDOUT
     assert captured["text"] is True
     assert captured["start_new_session"] is True
+
+
+def test_wait_for_server_fails_immediately_when_process_exits(monkeypatch, tmp_path):
+    log_path = tmp_path / "image-primary.log"
+    log_path.write_text("first line\nfatal: CUDA initialization failed\n", encoding="utf-8")
+
+    class ExitedProcess:
+        def poll(self):
+            return 7
+
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.requests.get",
+        lambda *_args, **_kwargs: pytest.fail("health endpoint must not be polled after process exit"),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        wait_for_server(
+            "http://127.0.0.1:8000/v1",
+            process=ExitedProcess(),
+            role="image-primary",
+            log_path=log_path,
+            expected_model_name="Qwen3-VL",
+            timeout_seconds=900,
+            poll_seconds=0,
+        )
+
+    message = str(exc_info.value)
+    assert "image-primary" in message
+    assert "exit code 7" in message
+    assert str(log_path) in message
+    assert "fatal: CUDA initialization failed" in message
+
+
+def test_start_and_wait_server_retries_one_early_exit(monkeypatch, tmp_path):
+    processes = [object(), object()]
+    started_log_paths = []
+    waited = []
+    stopped = []
+
+    def fake_start_server(_spec, *, log_path):
+        started_log_paths.append(log_path)
+        return processes[len(started_log_paths) - 1]
+
+    def fake_wait_for_server(_base_url, *, process, log_path, **_kwargs):
+        waited.append((process, log_path))
+        if process is processes[0]:
+            raise dynamic_vllm_runner.ServerExitedBeforeHealthy(
+                "first attempt exited"
+            )
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_server", fake_start_server)
+    monkeypatch.setattr(dynamic_vllm_runner, "wait_for_server", fake_wait_for_server)
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "stop_process", lambda process: stopped.append(process)
+    )
+    spec = VllmServerSpec(
+        role="image-primary",
+        model_path="/models/vl",
+        served_model_name="Qwen3-VL",
+        gpu="0",
+        port=8000,
+        extra_args=[],
+    )
+
+    process = dynamic_vllm_runner.start_and_wait_server(
+        spec,
+        runtime_dir=tmp_path,
+        timeout_seconds=900,
+    )
+
+    assert process is processes[1]
+    assert started_log_paths == [
+        tmp_path / "image-primary.attempt-1.log",
+        tmp_path / "image-primary.attempt-2.log",
+    ]
+    assert waited == list(zip(processes, started_log_paths))
+    assert stopped == [processes[0]]
+
+
+def test_start_and_wait_server_cleans_second_failed_attempt(monkeypatch, tmp_path):
+    processes = [object(), object()]
+    stopped = []
+
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "start_server",
+        lambda _spec, *, log_path: processes[0]
+        if log_path.name.endswith("attempt-1.log")
+        else processes[1],
+    )
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "wait_for_server",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            dynamic_vllm_runner.ServerExitedBeforeHealthy("exited")
+        ),
+    )
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "stop_process", lambda process: stopped.append(process)
+    )
+    spec = VllmServerSpec(
+        role="image-primary",
+        model_path="/models/vl",
+        served_model_name="Qwen3-VL",
+        gpu="0",
+        port=8000,
+        extra_args=[],
+    )
+
+    with pytest.raises(dynamic_vllm_runner.ServerExitedBeforeHealthy):
+        dynamic_vllm_runner.start_and_wait_server(
+            spec, runtime_dir=tmp_path, timeout_seconds=900
+        )
+
+    assert stopped == processes
+
+
+def test_wait_for_server_checks_process_once_more_at_deadline(tmp_path):
+    log_path = tmp_path / "text.log"
+    log_path.write_text("leader exited", encoding="utf-8")
+
+    class ExitedProcess:
+        def poll(self):
+            return 11
+
+    with pytest.raises(
+        dynamic_vllm_runner.ServerExitedBeforeHealthy, match="exit code 11"
+    ):
+        wait_for_server(
+            "http://127.0.0.1:8001/v1",
+            process=ExitedProcess(),
+            role="text",
+            log_path=log_path,
+            expected_model_name="Qwen3.5-9B",
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+
+def test_wait_for_server_rechecks_process_after_http_success(monkeypatch, tmp_path):
+    log_path = tmp_path / "text.log"
+    log_path.write_text("exited after response", encoding="utf-8")
+    polls = iter([None, 12])
+
+    class Process:
+        def poll(self):
+            return next(polls)
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "Qwen3.5-9B"}]}
+
+    monkeypatch.setattr(dynamic_vllm_runner.requests, "get", lambda *_a, **_k: Response())
+
+    with pytest.raises(
+        dynamic_vllm_runner.ServerExitedBeforeHealthy, match="exit code 12"
+    ):
+        wait_for_server(
+            "http://127.0.0.1:8001/v1",
+            process=Process(),
+            role="text",
+            log_path=log_path,
+            expected_model_name="Qwen3.5-9B",
+            timeout_seconds=10,
+            poll_seconds=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "model_id"),
+    [(204, "Qwen3.5-9B"), (200, "stale-model")],
+)
+def test_wait_for_server_rejects_non_200_or_wrong_model(
+    monkeypatch, tmp_path, status_code, model_id
+):
+    times = iter([0.0, 0.0, 2.0])
+
+    class Process:
+        def poll(self):
+            return None
+
+    class Response:
+        def __init__(self):
+            self.status_code = status_code
+
+        def json(self):
+            return {"data": [{"id": model_id}]}
+
+    monkeypatch.setattr(dynamic_vllm_runner.time, "time", lambda: next(times))
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(dynamic_vllm_runner.requests, "get", lambda *_a, **_k: Response())
+
+    with pytest.raises(RuntimeError, match="Timed out waiting"):
+        wait_for_server(
+            "http://127.0.0.1:8001/v1",
+            process=Process(),
+            role="text",
+            log_path=tmp_path / "text.log",
+            expected_model_name="Qwen3.5-9B",
+            timeout_seconds=1,
+            poll_seconds=0,
+        )
+
+
+def test_stop_process_cleans_group_when_leader_already_exited(monkeypatch):
+    signals = []
+    waits = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return 7
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 7
+
+    monkeypatch.setattr(
+        dynamic_vllm_runner.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    dynamic_vllm_runner.stop_process(Process(), timeout_seconds=0.01)
+
+    assert signals == [(123, signal.SIGTERM), (123, signal.SIGKILL)]
+    assert waits
+
+
+def test_stop_process_reaps_leader_after_killpg_race(monkeypatch):
+    waits = []
+
+    class Process:
+        pid = 456
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+    monkeypatch.setattr(
+        dynamic_vllm_runner.os,
+        "killpg",
+        lambda _pid, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    dynamic_vllm_runner.stop_process(Process(), timeout_seconds=0.01)
+
+    assert waits == [0.01]
+
+
+def test_cleanup_processes_continues_after_one_stop_failure(monkeypatch):
+    processes = [object(), object(), object()]
+    stopped = []
+
+    def fake_stop(process):
+        stopped.append(process)
+        if process is processes[0]:
+            raise RuntimeError("first cleanup failed")
+
+    monkeypatch.setattr(dynamic_vllm_runner, "stop_process", fake_stop)
+
+    dynamic_vllm_runner.cleanup_processes(processes)
+
+    assert stopped == processes
+
+
+def test_start_and_wait_server_does_not_retry_health_timeout(monkeypatch, tmp_path):
+    starts = []
+    stopped = []
+    process = object()
+
+    def fake_start_server(_spec, *, log_path):
+        starts.append(log_path)
+        return process
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_server", fake_start_server)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "wait_for_server",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("Timed out waiting for health endpoint")
+        ),
+    )
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "stop_process", lambda proc: stopped.append(proc)
+    )
+    spec = VllmServerSpec(
+        role="text",
+        model_path="/models/text",
+        served_model_name="Qwen3.5-9B",
+        gpu="1",
+        port=8001,
+        extra_args=[],
+    )
+
+    with pytest.raises(RuntimeError, match="Timed out waiting"):
+        dynamic_vllm_runner.start_and_wait_server(
+            spec,
+            runtime_dir=tmp_path,
+            timeout_seconds=0,
+        )
+
+    assert starts == [tmp_path / "text.attempt-1.log"]
+    assert stopped == [process]
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(23)])
+def test_start_and_wait_server_cleans_process_and_reraises_base_exception(
+    monkeypatch, tmp_path, interruption
+):
+    process = object()
+    starts = []
+    stopped = []
+
+    def fake_start_server(_spec, *, log_path):
+        starts.append(log_path)
+        return process
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_server", fake_start_server)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "wait_for_server",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(interruption),
+    )
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "stop_process", lambda proc: stopped.append(proc)
+    )
+    spec = VllmServerSpec(
+        role="text",
+        model_path="/models/text",
+        served_model_name="Qwen3.5-9B",
+        gpu="1",
+        port=8001,
+        extra_args=[],
+    )
+
+    with pytest.raises(type(interruption)) as exc_info:
+        dynamic_vllm_runner.start_and_wait_server(
+            spec, runtime_dir=tmp_path, timeout_seconds=900
+        )
+
+    assert exc_info.value is interruption
+    assert starts == [tmp_path / "text.attempt-1.log"]
+    assert stopped == [process]
 
 
 def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypatch, tmp_path):
@@ -867,8 +1768,13 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
     )
 
     assert code == 0
-    assert events[0] == "builder_started"
-    assert events[1].startswith("server_started:")
+    assert events[:5] == [
+        "builder_started",
+        "server_started:Qwen3.5-9B",
+        "server_ready",
+        "server_started:Qwen3-VL-8B-Thinking",
+        "server_ready",
+    ]
 
 
 def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks(monkeypatch, tmp_path):
@@ -916,6 +1822,220 @@ def test_dynamic_vllm_skips_server_start_when_builder_has_no_pending_model_tasks
 
     assert code == 0
     assert events == ["builder_started"]
+
+
+def test_dynamic_vllm_starts_servers_for_round_mode_with_unknown_task_counts(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    '{"text_task_count": 0, "image_task_count": 0, "round_mode": true}',
+                    encoding="utf-8",
+                )
+                Path(command[command.index("--model_text_done_marker") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+                Path(command[command.index("--model_image_done_marker") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+            else:
+                events.append("server_started")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.wait_for_server", lambda *_args, **_kwargs: None)
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events[0] == "builder_started"
+    assert events.count("server_started") == 2
+
+
+def test_dynamic_vllm_skips_servers_for_zero_runner_startup_count_in_round_mode(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.pid = 12345
+            self._poll = None
+            if command[0] == "/usr/bin/python":
+                events.append("builder_started")
+                self.ready_marker = Path(
+                    command[command.index("--model_ready_marker") + 1]
+                )
+                marker = Path(command[command.index("--model_start_marker") + 1])
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "text_task_count": 0,
+                            "image_task_count": 0,
+                            "round_mode": True,
+                            "runner_startup_task_count": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                events.append("server_started")
+
+        def poll(self):
+            return self._poll
+
+        def wait(self, timeout=None):
+            assert self.ready_marker.exists(), "builder remains blocked without ready marker"
+            self._poll = 0
+            return 0
+
+    monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.start_server",
+        lambda _server: pytest.fail("zero-target round must not start model servers"),
+    )
+
+    code = dynamic_vllm_main(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--python_executable",
+            "/usr/bin/python",
+        ]
+    )
+
+    assert code == 0
+    assert events == ["builder_started"]
+
+
+def test_model_start_marker_can_signal_round_mode(tmp_path):
+    marker = tmp_path / "model_start.json"
+
+    joinability_dataset.write_model_start_marker(
+        str(marker), text_task_count=0, image_task_count=0, round_mode=True
+    )
+
+    assert '"round_mode": true' in marker.read_text(encoding="utf-8")
+
+
+def test_round_mode_start_marker_requests_services_without_inflating_actual_counts(
+    tmp_path,
+):
+    marker = tmp_path / "model_start.json"
+
+    joinability_dataset.write_model_start_marker(
+        str(marker),
+        text_task_count=0,
+        image_task_count=0,
+        round_mode=True,
+        round_mode_requires_services=True,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["runner_startup_task_count"] > 0
+    assert payload["text_task_count"] == 0
+    assert payload["image_task_count"] == 0
+    assert read_pending_model_task_count(marker) == payload["runner_startup_task_count"]
+
+
+def test_candidate_rounds_defer_done_markers_until_accumulated_work_finishes(
+    tmp_path, monkeypatch
+):
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            return {
+                "attributes": [],
+                "raw_response": '{"attributes":[]}',
+                "error": "",
+            }
+
+    args = _parallel_args(
+        model_text_done_marker=str(tmp_path / "text_done.json"),
+        model_image_done_marker=str(tmp_path / "image_done.json"),
+    )
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    accumulated = {"text": 0, "image": 0}
+    marker_writes = []
+    write_model_done_marker = joinability_dataset.write_model_done_marker
+
+    def record_done_marker(path_value, *, model_kind, task_count):
+        marker_writes.append((model_kind, task_count))
+        write_model_done_marker(
+            path_value, model_kind=model_kind, task_count=task_count
+        )
+
+    monkeypatch.setattr(
+        joinability_dataset, "write_model_done_marker", record_done_marker
+    )
+
+    for round_index in range(2):
+        counts = precompute_extraction_task_groups(
+            extractor=FakeExtractor(),
+            cache=cache,
+            tasks_by_kind={
+                "text": [_task("text", f"round_{round_index}")],
+                "image": [_task("image", f"round_{round_index}")],
+            },
+            args=args,
+            state=state,
+            progress=None,
+            write_done_markers=False,
+        )
+        for kind in accumulated:
+            accumulated[kind] += counts[kind]
+        assert marker_writes == []
+        assert not (tmp_path / "text_done.json").exists()
+        assert not (tmp_path / "image_done.json").exists()
+
+    joinability_dataset.write_done_markers_after_selection(
+        args,
+        text_task_count=accumulated["text"],
+        image_task_count=accumulated["image"],
+    )
+
+    assert marker_writes == [("text", 2), ("image", 2)]
+    text_payload = json.loads((tmp_path / "text_done.json").read_text(encoding="utf-8"))
+    image_payload = json.loads((tmp_path / "image_done.json").read_text(encoding="utf-8"))
+    assert text_payload["task_count"] == 2
+    assert image_payload["task_count"] == 2
 
 
 def test_precompute_task_groups_write_each_modality_done_marker_independently(tmp_path):
@@ -972,6 +2092,74 @@ def test_precompute_task_groups_write_each_modality_done_marker_independently(tm
     assert (tmp_path / "text_done.json").exists()
 
 
+def test_precompute_task_groups_use_generation_scoped_round_handshake(
+    tmp_path, monkeypatch
+):
+    control_dir = tmp_path / "round-control"
+    args = _parallel_args()
+    args.model_round_control_dir = str(control_dir)
+    text_finished = threading.Event()
+    responder_errors: list[str] = []
+
+    def acknowledge_round() -> None:
+        deadline = time.time() + 2
+        start_path = control_dir / "round-000000.start.json"
+        while not start_path.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        if not start_path.exists():
+            responder_errors.append("round start was not written")
+            return
+        payload = json.loads(start_path.read_text(encoding="utf-8"))
+        assert payload["round_id"] == 0
+        assert payload["text_task_count"] == 1
+        assert payload["image_task_count"] == 1
+        (control_dir / "round-000000.ready.json").write_text(
+            json.dumps(
+                {
+                    "status": "model_round_services_ready",
+                    "round_id": 0,
+                    "run_id": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    responder = threading.Thread(target=acknowledge_round)
+    responder.start()
+
+    def fake_resolve(**kwargs):
+        tasks = kwargs["tasks"]
+        kind = tasks[0].asset["asset_type"]
+        if kind == "text":
+            text_finished.set()
+            return []
+        assert text_finished.wait(timeout=1)
+        deadline = time.time() + 2
+        text_done = control_dir / "round-000000.text.done.json"
+        while not text_done.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        assert text_done.exists()
+        return []
+
+    monkeypatch.setattr(joinability_dataset, "resolve_extraction_tasks", fake_resolve)
+
+    counts = precompute_extraction_task_groups(
+        extractor=object(),
+        cache=object(),
+        tasks_by_kind={"text": [_task("text", "1")], "image": [_task("image", "1")]},
+        args=args,
+        state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        write_done_markers=False,
+    )
+    responder.join(timeout=2)
+
+    assert responder_errors == []
+    assert counts == {"text": 1, "image": 1}
+    assert (control_dir / "round-000000.text.done.json").exists()
+    assert (control_dir / "round-000000.image.done.json").exists()
+    assert (control_dir / "round-000000.done.json").exists()
+
+
 def test_precompute_task_groups_immediately_marks_empty_modality_done(tmp_path):
     image_started = threading.Event()
     release_image = threading.Event()
@@ -1024,6 +2212,121 @@ def test_tasks_requiring_model_analysis_excludes_reusable_cached_tasks(tmp_path)
     pending = tasks_requiring_model_analysis(tasks, cache, _parallel_args())
 
     assert pending == [tasks[1]]
+
+
+def test_tasks_requiring_model_analysis_immediately_marks_only_reusable_records(
+    tmp_path,
+):
+    cached = _task("text", "cached")
+    transient = _task("image", "transient")
+    transient_error = _task("text", "transient-error")
+    retry_error = _task("text", "retry-error")
+    refresh_invalid = _task("image", "refresh-invalid")
+    missing = _task("text", "missing")
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    cache.put(
+        cached.cache_key,
+        {
+            "cache_key": cached.cache_key,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "raw_response": '{"attributes":[]}',
+            "error": "",
+        },
+    )
+    cache.put_transient(
+        transient.cache_key,
+        {
+            "cache_key": transient.cache_key,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "error": "",
+        },
+    )
+    cache.put_transient(
+        transient_error.cache_key,
+        {
+            "cache_key": transient_error.cache_key,
+            "attributes": [],
+            "error": "already failed this run",
+        },
+    )
+    cache.put(
+        retry_error.cache_key,
+        {
+            "cache_key": retry_error.cache_key,
+            "attributes": [],
+            "raw_response": "",
+            "error": "retry me",
+        },
+    )
+    cache.put(
+        refresh_invalid.cache_key,
+        {
+            "cache_key": refresh_invalid.cache_key,
+            "attributes": [],
+            "raw_response": '{"attributes":[]}',
+            "error": "",
+        },
+    )
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=6,
+        cached_keys=set(),
+        enabled=False,
+    )
+    progress.register(
+        task.cache_key
+        for task in (
+            cached,
+            transient,
+            transient_error,
+            retry_error,
+            refresh_invalid,
+            missing,
+        )
+    )
+    args = _parallel_args(
+        reparse_cached_model_outputs=False,
+        refresh_invalid_model_cache=True,
+    )
+
+    pending = tasks_requiring_model_analysis(
+        [
+            cached,
+            cached,
+            transient,
+            transient_error,
+            retry_error,
+            refresh_invalid,
+            missing,
+        ],
+        cache,
+        args,
+        progress=progress,
+    )
+
+    assert pending == [retry_error, refresh_invalid, missing]
+    assert progress.cached == 1
+    assert progress.model == 2
+    assert progress.errors == 1
+    assert progress.completed_keys == {
+        cached.cache_key,
+        transient.cache_key,
+        transient_error.cache_key,
+    }
+    assert retry_error.cache_key in progress.planned_keys
+    assert refresh_invalid.cache_key in progress.planned_keys
+    assert missing.cache_key in progress.planned_keys
+
+    resolve_extraction_tasks(
+        extractor=None,
+        cache=cache,
+        tasks=[cached, transient, transient_error],
+        args=args,
+        state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        progress=progress,
+    )
+    assert progress.cached == 1
+    assert progress.model == 2
+    assert progress.errors == 1
 
 
 def test_resolve_extraction_tasks_runs_text_and_image_pools_concurrently(tmp_path):
@@ -1236,6 +2539,108 @@ def test_resolve_extraction_tasks_does_not_cache_failed_model_outputs(tmp_path):
     assert records[0][1]["error"]
     assert cache.get(task.cache_key) is None
     assert not (tmp_path / "model_cache.jsonl").exists() or not (tmp_path / "model_cache.jsonl").read_text(encoding="utf-8").strip()
+
+
+def test_failed_precompute_result_is_reused_during_table_evaluation_only(tmp_path):
+    calls = 0
+
+    class FakeExtractor:
+        def extract(self, asset, entity, candidate_attribute_names):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("model unavailable")
+
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    args.model_attribute_errors_path = str(tmp_path / "model_attribute_errors.jsonl")
+    source_table = {
+        "source_table_id": "src",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "State"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": "Alpha",
+                        "wiki_title": "Alpha",
+                    },
+                    {"column_index": 1, "column_name": "State", "text": "Alabama"},
+                ],
+            }
+        ],
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    assets = {
+        "asset_text": {
+            "asset_id": "asset_text",
+            "asset_type": "text",
+            "content": "Alpha is in Alabama.",
+        }
+    }
+    entity_to_assets = {"entity_alpha": ["asset_text"]}
+    wiki_to_entity_id = {"Alpha": "entity_alpha"}
+    tasks = joinability_dataset.collect_table_extraction_tasks(
+        source_table=source_table,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        args=args,
+    )
+    cache_path = tmp_path / "model_attribute_extractions.jsonl"
+    cache = ExtractionCache(cache_path)
+    state = ModelConcurrencyState(text_workers=1, image_workers=1)
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=1, cached_keys=set(), enabled=False
+    )
+
+    counts = precompute_extraction_task_groups(
+        extractor=FakeExtractor(),
+        cache=cache,
+        tasks_by_kind={"text": tasks},
+        args=args,
+        state=state,
+        progress=progress,
+        write_done_markers=False,
+    )
+    joinability_dataset.build_table_join_records(
+        source_table=source_table,
+        split="candidate",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=FakeExtractor(),
+        cache=cache,
+        progress=progress,
+        concurrency_state=state,
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=joinability_dataset.ListRecordWriter(),
+        args=args,
+    )
+
+    assert counts == {"text": 1}
+    assert calls == 1
+    assert progress.model == 1
+    assert progress.errors == 1
+    assert not cache_path.exists() or not cache_path.read_text(encoding="utf-8").strip()
+    assert len(
+        (tmp_path / "model_attribute_errors.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ) == 1
+    assert tasks_requiring_model_analysis(
+        tasks, ExtractionCache(cache_path), args
+    ) == tasks
 
 
 def test_resolve_extraction_tasks_writes_failed_model_outputs_to_error_log(tmp_path):
