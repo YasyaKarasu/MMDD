@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import shutil
@@ -73,6 +74,7 @@ from wdc200k_eta import (
 from wdc200k_materialize import (
     MaterializationInputs,
     MaterializationResult,
+    load_certified_materialization_inputs,
     materialize_dataset,
 )
 from wdc200k_models import (
@@ -220,6 +222,7 @@ class PipelineConfig:
     text_model_workers: int = 1
     image_model_workers: int = 1
     materialization_workers: int = 1
+    materialization_validation_workers: int = 3
     run_fingerprint: str = ""
     runtime_dir: Path | None = None
     model_start_marker: Path | None = None
@@ -325,6 +328,9 @@ class PipelineConfig:
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
             materialization_workers=args.materialization_workers,
+            materialization_validation_workers=(
+                args.materialization_validation_workers
+            ),
             run_fingerprint=args.run_fingerprint,
             runtime_dir=(
                 Path(args.runtime_dir).resolve()
@@ -2763,6 +2769,20 @@ def _fast_model_resume_candidate(config: PipelineConfig) -> bool:
     )
 
 
+def _fast_materialization_resume_candidate(
+    config: PipelineConfig,
+) -> bool:
+    """Return whether a partial materialization may use its certificate."""
+    return (
+        config.resume
+        and config.from_stage is None
+        and config.stop_after in {None, "materialize"}
+        and _producer_registry_path(config, "models").is_file()
+        and not _producer_registry_path(config, "materialize").exists()
+        and (config.work_dir / "materialization").is_dir()
+    )
+
+
 def _validate_fast_producer_manifest(
     stage: str,
     path: Path,
@@ -2786,6 +2806,10 @@ def _validate_fast_producer_manifest(
             "wdc200k_asset_materialization",
             "wdc200k_network_fetch",
         },
+        "models": {
+            "wdc200k_model_task_adapter",
+            "wdc200k_model_outputs",
+        },
     }[stage]
     if producer_stage not in expected:
         raise ValueError(
@@ -2802,6 +2826,9 @@ def _validate_fast_producer_manifest(
         "image_mapping_shards",
         "bridge_asset_shards",
         "table_asset_link_shards",
+        "task_shards",
+        "error_shards",
+        "extraction_shards",
     ):
         declared = payload.get(field_name)
         if declared is None:
@@ -2885,6 +2912,41 @@ def _validate_fast_model_resume_chain(
         raise ValueError("model task adapter manifest is incomplete")
 
 
+def _validate_fast_materialization_resume_chain(
+    config: PipelineConfig,
+    archives: Iterable[Path],
+) -> None:
+    """Validate the registry envelope without replaying shard contents."""
+    _validate_fast_model_resume_chain(config, archives)
+    stage = "models"
+    path = _producer_registry_path(config, stage)
+    registry = _load_stage_registry(path)
+    if (
+        not registry.complete
+        or registry.stage != stage
+        or registry.producer_type != _PRODUCER_TYPES[stage]
+        or registry.upstream_identity
+        != _registry_identity(config, "images")
+        or registry.config_fingerprint
+        != _stage_config_fingerprint(config, stage)
+        or not registry.producer_manifests
+    ):
+        raise ValueError(f"pipeline registry identity mismatch: {path}")
+    for reference in registry.producer_manifests:
+        if (
+            not reference.path.is_file()
+            or _sha256_path(reference.path) != reference.sha256
+        ):
+            raise ValueError(
+                f"producer manifest checksum mismatch: {reference.path}"
+            )
+        _validate_fast_producer_manifest(
+            stage,
+            reference.path,
+            compact_replacements=False,
+        )
+
+
 def _run_fast_model_resume(
     config: PipelineConfig,
     *,
@@ -2943,6 +3005,80 @@ def _run_fast_model_resume(
         extractor=extractor,
         _allow_fast_model_resume=False,
     )
+
+
+def _run_fast_materialization_resume(
+    config: PipelineConfig,
+    *,
+    archives: tuple[Path, ...],
+    inputs: MaterializationInputs,
+    args: argparse.Namespace,
+) -> PipelineResult:
+    """Resume Task 7 directly from a verified materialization certificate."""
+    disk_guard = DiskGuard(config.min_free_disk_bytes)
+    reporter = ProgressReporter(config, pre_write_guard=disk_guard)
+    reporter.start()
+    try:
+        reporter.update(
+            stage="materialize",
+            completed_shards=0,
+            total_shards=1,
+        )
+
+        def report_validation(event: dict[str, Any]) -> None:
+            counters = {
+                "materialization_fast_resume": int(
+                    event.get("mode") == "fast_resume"
+                ),
+                "materialization_upstream_validation_completed": int(
+                    event.get("completed", 0)
+                ),
+                "materialization_upstream_validation_total": int(
+                    event.get("total", 0)
+                ),
+            }
+            if event.get("resumed_source_units") is not None:
+                counters["materialization_resumed_source_units"] = int(
+                    event["resumed_source_units"]
+                )
+            reporter.update(counters=counters)
+
+        result = materialize_dataset(
+            inputs,
+            output_root=config.output_dir,
+            args=args,
+            records_per_shard=config.records_per_shard,
+            pre_write_guard=disk_guard,
+            validation_progress_callback=report_validation,
+        )
+        counters = {
+            str(key): int(value)
+            for key, value in result.stats.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        _write_stage_registry(
+            config,
+            "materialize",
+            producer_manifests=(result.manifest_path,),
+            counters=counters,
+            upstream_identity=_registry_identity(config, "models"),
+            pre_write_guard=disk_guard,
+        )
+        reporter.update(
+            completed_shards=1,
+            total_shards=1,
+            counters=counters,
+        )
+        _refresh_known_disk(reporter, config, output=True)
+        return PipelineResult(
+            status="complete",
+            stage="materialize",
+            statistics_archives=len(archives),
+            counters=counters,
+            output_manifest=result.manifest_path,
+        )
+    finally:
+        reporter.close()
 
 
 def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
@@ -3043,6 +3179,9 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         config.model_endpoint_ready_timeout_seconds
     )
     args.materialization_workers = config.materialization_workers
+    args.materialization_validation_workers = (
+        config.materialization_validation_workers
+    )
     return args
 
 
@@ -4152,6 +4291,30 @@ def _run_materialize(
     pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializationResult:
     reporter.update(stage="materialize", completed_shards=0, total_shards=1)
+
+    def report_validation(event: dict[str, Any]) -> None:
+        scope = str(
+            event.get("validation_scope") or "upstream_validation"
+        )
+        mode = str(event.get("mode") or "strict")
+        counters = {
+            f"materialization_{scope}_completed": int(
+                event.get("completed", 0)
+            ),
+            f"materialization_{scope}_total": int(
+                event.get("total", 0)
+            ),
+            "materialization_fast_resume": int(
+                mode == "fast_resume"
+            ),
+        }
+        resumed_units = event.get("resumed_source_units")
+        if resumed_units is not None:
+            counters["materialization_resumed_source_units"] = int(
+                resumed_units
+            )
+        reporter.update(counters=counters)
+
     result = materialize_dataset(
         MaterializationInputs(
             structural_output_root=config.work_dir / "structural",
@@ -4170,11 +4333,16 @@ def _run_materialize(
             sampling_manifest=sampling.manifest_path,
             sampled_entity_paths=sampling.artifact_paths["sampled_entities"],
             sampled_page_ref_paths=sampling.artifact_paths["sampled_page_refs"],
+            upstream_stage_registry=_producer_registry_path(
+                config,
+                "models",
+            ),
         ),
         output_root=config.output_dir,
         args=args,
         records_per_shard=config.records_per_shard,
         pre_write_guard=pre_write_guard,
+        validation_progress_callback=report_validation,
     )
     counters = {
         str(key): int(value)
@@ -4226,6 +4394,31 @@ def run_pipeline(
             pre_write_guard=disk_guard,
         )
     elif config.resume:
+        if _fast_materialization_resume_candidate(config):
+            try:
+                _validate_fast_materialization_resume_chain(
+                    config,
+                    archives,
+                )
+                fast_args = _runtime_args(config)
+                fast_inputs = load_certified_materialization_inputs(
+                    config.work_dir,
+                    args=fast_args,
+                    records_per_shard=config.records_per_shard,
+                )
+            except (OSError, ValueError) as error:
+                logging.info(
+                    "pipeline materialization fast resume unavailable "
+                    "(%s); falling back to strict registry validation",
+                    error,
+                )
+            else:
+                return _run_fast_materialization_resume(
+                    config,
+                    archives=archives,
+                    inputs=fast_inputs,
+                    args=fast_args,
+                )
         if (
             _allow_fast_model_resume
             and _fast_model_resume_candidate(config)
@@ -4593,6 +4786,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--text_model_workers", type=int, default=1)
     parser.add_argument("--image_model_workers", type=int, default=1)
     parser.add_argument("--materialization_workers", type=int, default=1)
+    parser.add_argument(
+        "--materialization_validation_workers",
+        type=int,
+        default=3,
+        help=(
+            "Concurrent strict materialization validators (1-4); "
+            "each SQLite writer uses an independent validation database."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.max_rows_per_source_table is not None:
         parser.error("source-table rows are unbounded; omit --max_rows_per_source_table")
@@ -4612,6 +4814,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("model worker counts must be positive")
     if args.materialization_workers <= 0:
         parser.error("--materialization_workers must be positive")
+    if not 1 <= args.materialization_validation_workers <= 4:
+        parser.error(
+            "--materialization_validation_workers must be between 1 and 4"
+        )
     if (
         not math.isfinite(args.model_endpoint_ready_timeout_seconds)
         or args.model_endpoint_ready_timeout_seconds < 0

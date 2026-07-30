@@ -4,8 +4,10 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 import sys
+import threading
 import tracemalloc
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -42,6 +44,7 @@ from wdc200k_fetch import (
 from wdc200k_materialize import (
     MaterializationInputs,
     MaterializationShardInputs,
+    load_certified_materialization_inputs,
     materialize_dataset,
     materialize_dataset_shard,
 )
@@ -1996,6 +1999,279 @@ def test_interruption_after_table_commit_resumes_without_reprocessing(
 
     assert resumed.complete is True
     assert committed == ["source-1"]
+
+
+def test_partial_materialization_resume_uses_verified_upstream_certificate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    args.materialization_validation_workers = 1
+    output_root = tmp_path / "output"
+
+    def interrupt(_source_table_id: str) -> None:
+        raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        materialize_dataset(
+            inputs,
+            output_root=output_root,
+            args=args,
+            after_table_commit=interrupt,
+        )
+
+    certificates = list(
+        (inputs.work_root / "materialization").glob(
+            "upstream-certificate-*.json"
+        )
+    )
+    assert len(certificates) == 1
+    certificate = json.loads(certificates[0].read_text(encoding="utf-8"))
+    assert certificate["complete"] is True
+    assert certificate["certificate_sha256"]
+    with sqlite3.connect(
+        next(
+            (inputs.work_root / "materialization").glob("index-*.sqlite3")
+        )
+    ) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_units WHERE complete = 1"
+        ).fetchone() == (1,)
+    assert load_certified_materialization_inputs(
+        inputs.work_root,
+        args=args,
+        records_per_shard=50_000,
+    ) == inputs
+
+    monkeypatch.setattr(
+        materializer,
+        "_validate_upstream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict upstream validation was repeated")
+        ),
+    )
+    progress: list[dict[str, Any]] = []
+    resumed = materialize_dataset(
+        inputs,
+        output_root=output_root,
+        args=args,
+        validation_progress_callback=progress.append,
+    )
+
+    assert resumed.complete is True
+    assert any(
+        event.get("mode") == "fast_resume"
+        and event.get("resumed_source_units") == 1
+        for event in progress
+    )
+
+
+@pytest.mark.parametrize(
+    "invalidate",
+    [
+        "missing",
+        "input_identity",
+        "certificate_digest",
+        "config_fingerprint",
+    ],
+)
+def test_upstream_certificate_miss_falls_back_to_strict_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalidate: str,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    args.materialization_validation_workers = 1
+    output_root = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        materialize_dataset(
+            inputs,
+            output_root=output_root,
+            args=args,
+            after_table_commit=lambda _source_table_id: (
+                (_ for _ in ()).throw(
+                    RuntimeError("simulated interruption")
+                )
+            ),
+        )
+
+    certificate = next(
+        (inputs.work_root / "materialization").glob(
+            "upstream-certificate-*.json"
+        )
+    )
+    if invalidate == "missing":
+        certificate.unlink()
+    elif invalidate == "certificate_digest":
+        payload = json.loads(certificate.read_text(encoding="utf-8"))
+        payload["certificate_sha256"] = "0" * 64
+        certificate.write_text(
+            json.dumps(payload, sort_keys=True),
+            encoding="utf-8",
+        )
+    elif invalidate == "input_identity":
+        input_path = inputs.materialized_assets.table_asset_link_paths[0]
+        stat = input_path.stat()
+        os.utime(
+            input_path,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+        )
+
+    strict_calls = 0
+    real_validate = materializer._validate_upstream
+
+    def counting_validate(*call_args: Any, **call_kwargs: Any) -> Any:
+        nonlocal strict_calls
+        strict_calls += 1
+        return real_validate(*call_args, **call_kwargs)
+
+    monkeypatch.setattr(
+        materializer,
+        "_validate_upstream",
+        counting_validate,
+    )
+    progress: list[dict[str, Any]] = []
+    resumed = materialize_dataset(
+        inputs,
+        output_root=output_root,
+        args=args,
+        records_per_shard=(
+            1 if invalidate == "config_fingerprint" else 50_000
+        ),
+        validation_progress_callback=progress.append,
+    )
+
+    assert resumed.complete is True
+    assert strict_calls == 1
+    assert any(event.get("mode") == "fallback" for event in progress)
+    assert any(event.get("mode") == "strict" for event in progress)
+
+
+def test_upstream_certificate_cannot_hide_corrupt_input(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    output_root = tmp_path / "output"
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        materialize_dataset(
+            inputs,
+            output_root=output_root,
+            args=args,
+            after_table_commit=lambda _source_table_id: (
+                (_ for _ in ()).throw(
+                    RuntimeError("simulated interruption")
+                )
+            ),
+        )
+    link_path = inputs.materialized_assets.table_asset_link_paths[0]
+    link_path.write_text('{"corrupt":true}\n', encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="asset materialization shard checksum validation",
+    ):
+        materialize_dataset(
+            inputs,
+            output_root=output_root,
+            args=args,
+        )
+
+
+def test_parallel_and_serial_upstream_validation_are_equivalent(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        page_image_url="https://images.test/equivalent.jpg",
+        extractor=_FailingExtractor(),
+    )
+    args.materialization_validation_workers = 1
+    serial = materializer._validate_upstream(inputs, args=args)
+
+    args.materialization_validation_workers = 4
+    parallel = materializer._validate_upstream(inputs, args=args)
+
+    assert parallel == serial
+
+
+def test_parallel_and_serial_upstream_validation_raise_same_corruption(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        page_image_url="https://images.test/corrupt.jpg",
+        extractor=_FailingExtractor(),
+    )
+    inputs.unique_image_jobs.output_path.write_text(
+        '{"corrupt":true}\n',
+        encoding="utf-8",
+    )
+    errors: list[tuple[type[BaseException], str]] = []
+
+    for workers in (1, 4):
+        args.materialization_validation_workers = workers
+        with pytest.raises(ValueError) as captured:
+            materializer._validate_upstream(inputs, args=args)
+        errors.append((type(captured.value), str(captured.value)))
+
+    assert errors[1] == errors[0]
+
+
+def test_relation_and_source_closures_run_on_independent_connections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        materialize_dataset(
+            inputs,
+            output_root=tmp_path / "output",
+            args=args,
+            after_table_commit=lambda _source_table_id: (
+                (_ for _ in ()).throw(
+                    RuntimeError("simulated interruption")
+                )
+            ),
+        )
+    database_path = next(
+        (inputs.work_root / "materialization").glob("index-*.sqlite3")
+    )
+    barrier = threading.Barrier(2)
+    real_relations = materializer._validate_relation_closure
+    real_sources = materializer._validate_source_catalog_closure
+
+    def synchronized_relations(connection: sqlite3.Connection) -> None:
+        barrier.wait(timeout=5)
+        real_relations(connection)
+
+    def synchronized_sources(
+        connection: sqlite3.Connection,
+        *,
+        write_tracker: Any = None,
+    ) -> None:
+        barrier.wait(timeout=5)
+        real_sources(connection, write_tracker=write_tracker)
+
+    monkeypatch.setattr(
+        materializer,
+        "_validate_relation_closure",
+        synchronized_relations,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_validate_source_catalog_closure",
+        synchronized_sources,
+    )
+
+    materializer._validate_materialization_index_closures(
+        database_path,
+        validation_workers=2,
+    )
 
 
 def test_nonempty_task6_outputs_materialize_query_qrel_and_evidence(

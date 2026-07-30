@@ -12,7 +12,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -55,6 +55,8 @@ try:
     )
     from wdc200k_models import (
         AdaptedModelTasks,
+        ModelJobInfo,
+        ModelJobSet,
         ModelStageAuthority,
         ModelStageResult,
         StructuralStageBarrier,
@@ -109,6 +111,8 @@ except ModuleNotFoundError as error:
         )
         from wdc200k_models import (
             AdaptedModelTasks,
+            ModelJobInfo,
+            ModelJobSet,
             ModelStageAuthority,
             ModelStageResult,
             StructuralStageBarrier,
@@ -121,6 +125,10 @@ except ModuleNotFoundError as error:
 
 
 MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v1"
+UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
+    "wdc200k-upstream-certificate-v1"
+)
+MAX_MATERIALIZATION_VALIDATION_WORKERS = 4
 DATASET_REFERENCE_FORMAT = "source-table-reference-v1"
 _MATERIALIZED_REFERENCE_STORAGE_VERSION = (
     "materialized-source-references-v1"
@@ -173,6 +181,7 @@ class MaterializationInputs:
     sampling_manifest: Path | None = None
     sampled_entity_paths: tuple[Path, ...] = ()
     sampled_page_ref_paths: tuple[Path, ...] = ()
+    upstream_stage_registry: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +238,17 @@ class _ValidatedUpstream:
     expected_extractions: int
     identity: str
     provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _FastResumeState:
+    upstream: _ValidatedUpstream
+    database_path: Path
+    resumed_source_units: int
+
+
+class _CertificateMismatch(ValueError):
+    """A fast-resume certificate cannot authorize the current inputs."""
 
 
 class _RecordSink:
@@ -736,11 +756,63 @@ def _structural_inputs(
     )
 
 
+def _materialization_validation_workers(args: argparse.Namespace) -> int:
+    workers = int(
+        getattr(args, "materialization_validation_workers", 1)
+    )
+    if not 1 <= workers <= MAX_MATERIALIZATION_VALIDATION_WORKERS:
+        raise ValueError(
+            "materialization validation worker count must be between "
+            f"1 and {MAX_MATERIALIZATION_VALIDATION_WORKERS}"
+        )
+    return workers
+
+
+def _report_validation_progress(
+    callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    mode: str,
+    completed: int,
+    total: int,
+    **details: Any,
+) -> None:
+    if callback is not None:
+        callback(
+            {
+                "phase": "upstream_validation",
+                "mode": mode,
+                "completed": completed,
+                "total": total,
+                **details,
+            }
+        )
+
+
+def _truncate_validation_wals(paths: Iterable[Path]) -> None:
+    for path in paths:
+        database_path = Path(path)
+        if not database_path.is_file():
+            continue
+        try:
+            with sqlite3.connect(database_path, timeout=30.0) as connection:
+                connection.execute("PRAGMA busy_timeout=30000")
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as error:
+            logging.warning(
+                "could not truncate validation WAL for %s: %s",
+                database_path,
+                error,
+            )
+
+
 def _validate_upstream(
     inputs: MaterializationInputs,
     *,
     args: argparse.Namespace,
     pre_write_guard: PreWriteGuard | None = None,
+    validation_progress_callback: (
+        Callable[[dict[str, Any]], None] | None
+    ) = None,
 ) -> _ValidatedUpstream:
     (
         source_paths,
@@ -753,32 +825,12 @@ def _validate_upstream(
     ) = _structural_inputs(inputs)
     from wdc200k_sampling import validate_sampling_artifacts
 
-    sampled_authority = (
-        validate_sampling_artifacts(Path(inputs.sampling_manifest))
-        if inputs.sampling_manifest is not None
-        else None
-    )
     effective_page_ref_paths = (
         list(inputs.sampled_page_ref_paths)
         if inputs.sampled_page_ref_paths
         else page_ref_paths
     )
-    if sampled_authority is not None:
-        expected_entities = sampled_authority.artifact_paths["sampled_entities"]
-        expected_pages = sampled_authority.artifact_paths["sampled_page_refs"]
-        if tuple(path.resolve() for path in inputs.sampled_entity_paths) != tuple(
-            path.resolve() for path in expected_entities
-        ) or tuple(path.resolve() for path in effective_page_ref_paths) != tuple(
-            path.resolve() for path in expected_pages
-        ):
-            raise ValueError("sampled materialization paths do not match manifest authority")
     validation_root = Path(inputs.work_root) / "upstream-validation"
-    page_snapshot = validate_complete_page_fetch(
-        inputs.page_fetch_result,
-        _iter_jsonl(effective_page_ref_paths),
-        validation_database=validation_root / "page-fetch.sqlite3",
-        pre_write_guard=pre_write_guard,
-    )
     structural_identity = (
         _sha256_path(Path(inputs.sampling_manifest))
         if inputs.sampling_manifest is not None
@@ -787,48 +839,12 @@ def _validate_upstream(
             inputs.structural_barrier.final_manifest_sha256,
         )
     )
-    expected_planning_input = asset_planning_input_fingerprint(
-        structural_identity,
-        str(page_snapshot["identity"]),
-    )
-    planned = validate_asset_plan_shards(
-        inputs.asset_plan_result,
-        expected_input_fingerprint=expected_planning_input,
-    )
-    unique_jobs = validate_unique_image_jobs(
-        inputs.unique_image_jobs,
-        planned=planned,
-        validation_database=(
-            validation_root / "unique-image-membership.sqlite3"
-        ),
-        pre_write_guard=pre_write_guard,
-    )
-    if inputs.image_fetch_result.unique_jobs != unique_jobs:
-        raise ValueError("Task-5 image fetch unique-job substitution")
-    validate_complete_image_fetch(
-        inputs.image_fetch_result,
-        unique_jobs=unique_jobs,
-        pre_write_guard=pre_write_guard,
-    )
-    expected_asset_input = asset_materialization_input_fingerprint(
-        planned.manifest_path,
-        inputs.image_fetch_result.fetch_manifest_path,
-    )
-    materialized_assets, assets_barrier = (
-        validate_materialized_asset_shards(
-            inputs.materialized_assets,
-            planned=planned,
-            image_fetch_result=inputs.image_fetch_result,
-            expected_input_fingerprint=expected_asset_input,
-            pre_write_guard=pre_write_guard,
-        )
-    )
     expected_adapter_input = model_adapter_input_fingerprint(
         (digest for _path, digest in structural_hashes),
         finalized_selection_manifest=(
             inputs.finalized_selection_manifest
         ),
-        assets_manifest=materialized_assets.manifest_path,
+        assets_manifest=inputs.materialized_assets.manifest_path,
     )
     if inputs.sampling_manifest is not None:
         expected_adapter_input = stable_hash(
@@ -836,16 +852,179 @@ def _validate_upstream(
             _sha256_path(Path(inputs.sampling_manifest)),
             length=40,
         )
-    adapted = validate_adapted_model_tasks(
-        inputs.adapted_model_tasks,
-        expected_input_fingerprint=expected_adapter_input,
+    total_validation_tasks = 6
+    completed_validation_tasks = 0
+    workers = _materialization_validation_workers(args)
+    _report_validation_progress(
+        validation_progress_callback,
+        mode="strict",
+        completed=0,
+        total=total_validation_tasks,
+        workers=workers,
     )
-    validate_model_stage_for_adapter(
-        inputs.model_result,
-        adapted,
-        args=args,
-        authority=inputs.model_authority,
-        validation_store_path=validation_root / "model-membership.sqlite3",
+    logging.info(
+        "materialization upstream validation: strict path with %d worker(s)",
+        workers,
+    )
+
+    def validate_sampling() -> Any:
+        return (
+            validate_sampling_artifacts(Path(inputs.sampling_manifest))
+            if inputs.sampling_manifest is not None
+            else None
+        )
+
+    def validate_page_and_plan() -> tuple[dict[str, Any], AssetPlanShards]:
+        snapshot = validate_complete_page_fetch(
+            inputs.page_fetch_result,
+            _iter_jsonl(effective_page_ref_paths),
+            validation_database=validation_root / "page-fetch.sqlite3",
+            pre_write_guard=pre_write_guard,
+        )
+        expected_planning_input = asset_planning_input_fingerprint(
+            structural_identity,
+            str(snapshot["identity"]),
+        )
+        return (
+            snapshot,
+            validate_asset_plan_shards(
+                inputs.asset_plan_result,
+                expected_input_fingerprint=expected_planning_input,
+            ),
+        )
+
+    def validate_unique() -> UniqueImageJobs:
+        return validate_unique_image_jobs(
+            inputs.unique_image_jobs,
+            planned=inputs.asset_plan_result,
+            validation_database=(
+                validation_root / "unique-image-membership.sqlite3"
+            ),
+            pre_write_guard=pre_write_guard,
+        )
+
+    def validate_image() -> dict[str, Any]:
+        if (
+            inputs.image_fetch_result.unique_jobs
+            != inputs.unique_image_jobs
+        ):
+            raise ValueError("Task-5 image fetch unique-job substitution")
+        return validate_complete_image_fetch(
+            inputs.image_fetch_result,
+            unique_jobs=inputs.unique_image_jobs,
+            pre_write_guard=pre_write_guard,
+        )
+
+    def validate_models() -> AdaptedModelTasks:
+        current = validate_adapted_model_tasks(
+            inputs.adapted_model_tasks,
+            expected_input_fingerprint=expected_adapter_input,
+        )
+        validate_model_stage_for_adapter(
+            inputs.model_result,
+            current,
+            args=args,
+            authority=inputs.model_authority,
+            validation_store_path=(
+                validation_root / "model-membership.sqlite3"
+            ),
+        )
+        return current
+
+    def task_finished(name: str) -> None:
+        nonlocal completed_validation_tasks
+        completed_validation_tasks += 1
+        logging.info(
+            "materialization upstream validation completed %s (%d/%d)",
+            name,
+            completed_validation_tasks,
+            total_validation_tasks,
+        )
+        _report_validation_progress(
+            validation_progress_callback,
+            mode="strict",
+            completed=completed_validation_tasks,
+            total=total_validation_tasks,
+            workers=workers,
+            task=name,
+        )
+
+    def check_sampled_authority(sampled_authority: Any) -> None:
+        if sampled_authority is None:
+            return
+        expected_entities = sampled_authority.artifact_paths[
+            "sampled_entities"
+        ]
+        expected_pages = sampled_authority.artifact_paths[
+            "sampled_page_refs"
+        ]
+        if tuple(
+            path.resolve() for path in inputs.sampled_entity_paths
+        ) != tuple(path.resolve() for path in expected_entities) or tuple(
+            path.resolve() for path in effective_page_ref_paths
+        ) != tuple(path.resolve() for path in expected_pages):
+            raise ValueError(
+                "sampled materialization paths do not match manifest authority"
+            )
+
+    if workers == 1:
+        sampled_authority = validate_sampling()
+        task_finished("sampling")
+        check_sampled_authority(sampled_authority)
+        page_snapshot, planned = validate_page_and_plan()
+        task_finished("page_and_planning")
+        unique_jobs = validate_unique()
+        task_finished("unique_image_membership")
+        validate_image()
+        task_finished("image_membership")
+        adapted = None
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="wdc-upstream-validation",
+        ) as executor:
+            sampling_future = executor.submit(validate_sampling)
+            page_future = executor.submit(validate_page_and_plan)
+            model_future = executor.submit(validate_models)
+            unique_future = executor.submit(validate_unique)
+            image_future = executor.submit(validate_image)
+
+            sampled_authority = sampling_future.result()
+            task_finished("sampling")
+            check_sampled_authority(sampled_authority)
+            page_snapshot, planned = page_future.result()
+            task_finished("page_and_planning")
+            unique_jobs = unique_future.result()
+            task_finished("unique_image_membership")
+            image_future.result()
+            task_finished("image_membership")
+            adapted = model_future
+
+    if inputs.image_fetch_result.unique_jobs != unique_jobs:
+        raise ValueError("Task-5 image fetch unique-job substitution")
+    expected_asset_input = asset_materialization_input_fingerprint(
+        planned.manifest_path,
+        inputs.image_fetch_result.fetch_manifest_path,
+    )
+    materialized_assets, assets_barrier = validate_materialized_asset_shards(
+        inputs.materialized_assets,
+        planned=planned,
+        image_fetch_result=inputs.image_fetch_result,
+        expected_input_fingerprint=expected_asset_input,
+        pre_write_guard=pre_write_guard,
+    )
+    task_finished("asset_closure")
+    if workers == 1:
+        adapted = validate_models()
+    else:
+        adapted = adapted.result()
+    task_finished("model_membership")
+    _truncate_validation_wals(
+        (
+            validation_root / "page-fetch.sqlite3",
+            validation_root / "unique-image-membership.sqlite3",
+            validation_root / "model-membership.sqlite3",
+        )
     )
     asset_paths = materialized_assets.bridge_asset_paths
     link_paths = materialized_assets.table_asset_link_paths
@@ -1910,6 +2089,7 @@ def _prepare_authoritative_index(
     upstream: _ValidatedUpstream,
     *,
     pre_write_guard: PreWriteGuard | None = None,
+    validate_relation_closure: bool = True,
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     write_tracker.before_write(64 * 1024)
@@ -1965,9 +2145,86 @@ def _prepare_authoritative_index(
             commit_every=1_000,
             write_tracker=write_tracker,
         )
-        _validate_relation_closure(connection)
+        if validate_relation_closure:
+            _validate_relation_closure(connection)
         write_tracker.before_commit(0)
         connection.commit()
+
+
+def _validate_materialization_index_closures(
+    database_path: Path,
+    *,
+    validation_workers: int,
+    pre_write_guard: PreWriteGuard | None = None,
+    validation_progress_callback: (
+        Callable[[dict[str, Any]], None] | None
+    ) = None,
+) -> None:
+    workers = min(2, validation_workers)
+
+    def validate_relations() -> None:
+        with _connect(database_path) as connection:
+            _validate_relation_closure(connection)
+
+    def validate_sources() -> None:
+        tracker = GuardedWriteTracker(
+            database_path,
+            pre_write_guard,
+        )
+        with _connect(database_path) as connection:
+            _validate_source_catalog_closure(
+                connection,
+                write_tracker=tracker,
+            )
+            tracker.before_commit(0)
+
+    _report_validation_progress(
+        validation_progress_callback,
+        mode="strict",
+        completed=0,
+        total=2,
+        validation_scope="materialization_index_closure",
+        workers=workers,
+    )
+    if workers == 1:
+        validate_relations()
+        _report_validation_progress(
+            validation_progress_callback,
+            mode="strict",
+            completed=1,
+            total=2,
+            validation_scope="materialization_index_closure",
+            workers=workers,
+            task="relation_closure",
+        )
+        validate_sources()
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="wdc-index-validation",
+        ) as executor:
+            relation_future = executor.submit(validate_relations)
+            source_future = executor.submit(validate_sources)
+            relation_future.result()
+            _report_validation_progress(
+                validation_progress_callback,
+                mode="strict",
+                completed=1,
+                total=2,
+                validation_scope="materialization_index_closure",
+                workers=workers,
+                task="relation_closure",
+            )
+            source_future.result()
+    _report_validation_progress(
+        validation_progress_callback,
+        mode="strict",
+        completed=2,
+        total=2,
+        validation_scope="materialization_index_closure",
+        workers=workers,
+        task="source_catalog_closure",
+    )
 
 
 def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -2012,6 +2269,904 @@ def _parameter_fingerprint(args: argparse.Namespace) -> str:
         _canonical_json(_parameter_payload(args)),
         length=40,
     )
+
+
+def _certificate_config_fingerprint(
+    args: argparse.Namespace,
+    records_per_shard: int,
+) -> str:
+    return stable_hash(
+        UPSTREAM_CERTIFICATE_SCHEMA_VERSION,
+        _parameter_fingerprint(args),
+        int(records_per_shard),
+        length=40,
+    )
+
+
+def _certificate_path(
+    work_root: Path,
+    config_fingerprint: str,
+) -> Path:
+    return (
+        Path(work_root)
+        / "materialization"
+        / f"upstream-certificate-{config_fingerprint}.json"
+    )
+
+
+def _materialization_database_path(
+    work_root: Path,
+    upstream_identity: str,
+    parameter_fingerprint: str,
+) -> Path:
+    return (
+        Path(work_root)
+        / "materialization"
+        / (
+            f"index-{upstream_identity}-"
+            f"{parameter_fingerprint}.sqlite3"
+        )
+    )
+
+
+def _certificate_jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return value.resolve().as_posix()
+    if isinstance(value, dict):
+        return {
+            str(key): _certificate_jsonable(item)
+            for key, item in sorted(
+                value.items(),
+                key=lambda pair: str(pair[0]),
+            )
+        }
+    if isinstance(value, (list, tuple)):
+        return [_certificate_jsonable(item) for item in value]
+    return value
+
+
+def _materialization_input_descriptor(
+    inputs: MaterializationInputs,
+) -> str:
+    return stable_hash(
+        UPSTREAM_CERTIFICATE_SCHEMA_VERSION,
+        _canonical_json(_certificate_jsonable(asdict(inputs))),
+        length=40,
+    )
+
+
+def _certificate_manifest_paths(
+    inputs: MaterializationInputs,
+) -> tuple[Path, ...]:
+    paths = {
+        *(Path(path).resolve() for path in inputs.structural_manifests),
+        Path(inputs.finalized_selection_manifest).resolve(),
+        Path(inputs.asset_plan_result.manifest_path).resolve(),
+        Path(inputs.unique_image_jobs.manifest_path).resolve(),
+        Path(inputs.image_fetch_result.fetch_manifest_path).resolve(),
+        Path(inputs.materialized_assets.manifest_path).resolve(),
+        Path(inputs.adapted_model_tasks.manifest_path).resolve(),
+        Path(inputs.model_result.manifest_path).resolve(),
+    }
+    if inputs.sampling_manifest is not None:
+        paths.add(Path(inputs.sampling_manifest).resolve())
+    if inputs.upstream_stage_registry is not None:
+        paths.add(Path(inputs.upstream_stage_registry).resolve())
+    return tuple(sorted(paths, key=lambda path: path.as_posix()))
+
+
+def _certificate_declared_shard_paths(
+    inputs: MaterializationInputs,
+) -> tuple[Path, ...]:
+    declared: set[Path] = set()
+    manifests_and_roots: list[tuple[Path, Path, bool]] = [
+        *(
+            (
+                Path(path),
+                Path(inputs.structural_output_root).resolve(),
+                inputs.sampling_manifest is not None,
+            )
+            for path in inputs.structural_manifests
+        ),
+        (
+            Path(inputs.finalized_selection_manifest),
+            Path(inputs.structural_output_root).resolve(),
+            False,
+        ),
+    ]
+    if inputs.sampling_manifest is not None:
+        sampling_manifest = Path(inputs.sampling_manifest)
+        manifests_and_roots.append(
+            (
+                sampling_manifest,
+                sampling_manifest.parent.resolve(),
+                False,
+            )
+        )
+    for manifest_path, root, compact_structural in manifests_and_roots:
+        payload = _manifest_payload(manifest_path)
+        for item in payload.get("completed_shards") or []:
+            try:
+                relative = Path(str(item["path"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise _CertificateMismatch(
+                    "certificate manifest shard declaration is invalid"
+                ) from error
+            if compact_structural and relative.parts[0] in {
+                "entities",
+                "page_refs",
+                "direct_image_refs",
+                "selection",
+            }:
+                continue
+            path = (root / relative).resolve()
+            if not path.is_relative_to(root):
+                raise _CertificateMismatch(
+                    "certificate manifest shard escapes its root"
+                )
+            declared.add(path)
+    return tuple(sorted(declared, key=lambda path: path.as_posix()))
+
+
+def _certificate_input_paths(
+    inputs: MaterializationInputs,
+    upstream: _ValidatedUpstream | None = None,
+) -> tuple[Path, ...]:
+    page_result = inputs.page_fetch_result
+    image_result = inputs.image_fetch_result
+    paths = {
+        *_certificate_manifest_paths(inputs),
+        *(Path(path).resolve() for path in inputs.sampled_entity_paths),
+        *(Path(path).resolve() for path in inputs.sampled_page_ref_paths),
+        *(
+            Path(path).resolve()
+            for path in inputs.asset_plan_result.entity_plan_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.asset_plan_result.image_mapping_paths
+        ),
+        Path(inputs.unique_image_jobs.output_path).resolve(),
+        Path(page_result.outcomes_path).resolve(),
+        Path(page_result.failure_path).resolve(),
+        Path(page_result.progress_path).resolve(),
+        Path(page_result.job_store_path).resolve(),
+        Path(image_result.outcomes_path).resolve(),
+        Path(image_result.job_store_path).resolve(),
+        *(
+            Path(path).resolve()
+            for path in inputs.materialized_assets.bridge_asset_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.materialized_assets.table_asset_link_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.adapted_model_tasks.task_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.adapted_model_tasks.error_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.model_result.extraction_paths
+        ),
+        *(
+            Path(path).resolve()
+            for path in inputs.model_result.error_paths
+        ),
+        Path(inputs.model_result.jobset.database_path).resolve(),
+    }
+    if upstream is not None:
+        paths.update(_certificate_declared_shard_paths(inputs))
+        paths.update(
+            Path(path).resolve()
+            for path in (
+                *upstream.source_paths,
+                *upstream.entity_paths,
+                *upstream.page_ref_paths,
+                *upstream.structural_failure_paths,
+                upstream.page_failure_path,
+                *upstream.asset_paths,
+                *upstream.link_paths,
+                *upstream.extraction_paths,
+                *upstream.model_error_paths,
+                *upstream.adapter_error_paths,
+            )
+        )
+    for candidate in tuple(paths):
+        if candidate.suffix not in {".db", ".sqlite", ".sqlite3"}:
+            continue
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{candidate}{suffix}")
+            if sidecar.is_file():
+                paths.add(sidecar.resolve())
+    return tuple(sorted(paths, key=lambda path: path.as_posix()))
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    resolved = Path(path).resolve(strict=True)
+    if not resolved.is_file():
+        raise _CertificateMismatch(
+            f"certificate input is not a file: {resolved}"
+        )
+    stat = resolved.stat()
+    return {
+        "path": resolved.as_posix(),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+    }
+
+
+def _file_identities(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    try:
+        return [_file_identity(path) for path in paths]
+    except OSError as error:
+        raise _CertificateMismatch(
+            f"certificate input identity is unavailable: {error}"
+        ) from error
+
+
+def _manifest_hashes(paths: Iterable[Path]) -> list[dict[str, str]]:
+    try:
+        return [
+            {
+                "path": Path(path).resolve(strict=True).as_posix(),
+                "sha256": _sha256_path(Path(path).resolve(strict=True)),
+            }
+            for path in paths
+        ]
+    except OSError as error:
+        raise _CertificateMismatch(
+            f"certificate manifest is unavailable: {error}"
+        ) from error
+
+
+def _serialized_upstream(
+    upstream: _ValidatedUpstream,
+) -> dict[str, Any]:
+    return {
+        "source_paths": [
+            path.resolve().as_posix() for path in upstream.source_paths
+        ],
+        "entity_paths": [
+            path.resolve().as_posix() for path in upstream.entity_paths
+        ],
+        "page_ref_paths": [
+            path.resolve().as_posix() for path in upstream.page_ref_paths
+        ],
+        "structural_failure_paths": [
+            path.resolve().as_posix()
+            for path in upstream.structural_failure_paths
+        ],
+        "page_failure_path": upstream.page_failure_path.resolve().as_posix(),
+        "asset_paths": [
+            path.resolve().as_posix() for path in upstream.asset_paths
+        ],
+        "link_paths": [
+            path.resolve().as_posix() for path in upstream.link_paths
+        ],
+        "extraction_paths": [
+            path.resolve().as_posix() for path in upstream.extraction_paths
+        ],
+        "model_error_paths": [
+            path.resolve().as_posix() for path in upstream.model_error_paths
+        ],
+        "adapter_error_paths": [
+            path.resolve().as_posix()
+            for path in upstream.adapter_error_paths
+        ],
+        "image_failure_aggregation_database": (
+            upstream.image_failure_aggregation_database.resolve().as_posix()
+        ),
+        "expected_tables": upstream.expected_tables,
+        "expected_entities": upstream.expected_entities,
+        "expected_assets": upstream.expected_assets,
+        "expected_links": upstream.expected_links,
+        "expected_extractions": upstream.expected_extractions,
+        "identity": upstream.identity,
+        "provenance": upstream.provenance,
+    }
+
+
+def _upstream_from_certificate(
+    payload: dict[str, Any],
+    inputs: MaterializationInputs,
+) -> _ValidatedUpstream:
+    try:
+        upstream = payload["upstream"]
+        if not isinstance(upstream, dict):
+            raise TypeError("upstream payload is not an object")
+
+        def paths(name: str) -> tuple[Path, ...]:
+            values = upstream[name]
+            if not isinstance(values, list):
+                raise TypeError(f"{name} is not a list")
+            return tuple(Path(str(value)) for value in values)
+
+        provenance = upstream["provenance"]
+        if not isinstance(provenance, dict):
+            raise TypeError("provenance is not an object")
+        return _ValidatedUpstream(
+            source_paths=paths("source_paths"),
+            entity_paths=paths("entity_paths"),
+            page_ref_paths=paths("page_ref_paths"),
+            structural_failure_paths=paths(
+                "structural_failure_paths"
+            ),
+            page_failure_path=Path(
+                str(upstream["page_failure_path"])
+            ),
+            asset_paths=paths("asset_paths"),
+            link_paths=paths("link_paths"),
+            extraction_paths=paths("extraction_paths"),
+            model_error_paths=paths("model_error_paths"),
+            adapter_error_paths=paths("adapter_error_paths"),
+            asset_plan_result=inputs.asset_plan_result,
+            image_fetch_result=inputs.image_fetch_result,
+            image_failure_aggregation_database=Path(
+                str(upstream["image_failure_aggregation_database"])
+            ),
+            expected_tables=int(upstream["expected_tables"]),
+            expected_entities=int(upstream["expected_entities"]),
+            expected_assets=int(upstream["expected_assets"]),
+            expected_links=int(upstream["expected_links"]),
+            expected_extractions=int(upstream["expected_extractions"]),
+            identity=str(upstream["identity"]),
+            provenance=provenance,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise _CertificateMismatch(
+            "upstream certificate payload is invalid"
+        ) from error
+
+
+def _certificate_digest(payload: dict[str, Any]) -> str:
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key != "certificate_sha256"
+    }
+    return hashlib.sha256(
+        _canonical_json(unsigned).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_resume_index_units(
+    connection: sqlite3.Connection,
+    *,
+    expected_tables: int,
+) -> int:
+    catalog = connection.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COUNT(DISTINCT ordinal) AS ordinals,
+               SUM(CASE WHEN split IN ('train', 'dev', 'test')
+                        THEN 0 ELSE 1 END) AS invalid_splits
+        FROM source_catalog
+        """
+    ).fetchone()
+    if (
+        int(catalog["total"]) != expected_tables
+        or int(catalog["ordinals"]) != expected_tables
+        or int(catalog["invalid_splits"] or 0) != 0
+    ):
+        raise _CertificateMismatch(
+            "materialization source catalog resume mismatch"
+        )
+    invalid_units = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM source_units AS units
+            LEFT JOIN source_catalog AS catalog
+              ON catalog.source_table_id = units.source_table_id
+            WHERE units.complete != 1
+               OR catalog.source_table_id IS NULL
+               OR units.source_sha256 != catalog.record_sha256
+               OR units.split != catalog.split
+            """
+        ).fetchone()[0]
+    )
+    completed = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM source_units"
+        ).fetchone()[0]
+    )
+    invalid_count_json = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM source_units
+            WHERE CASE
+                WHEN json_valid(counts_json)
+                THEN json_type(counts_json) != 'object'
+                ELSE 1
+            END
+            """
+        ).fetchone()[0]
+    )
+    if (
+        invalid_units
+        or invalid_count_json
+        or completed > expected_tables
+    ):
+        raise _CertificateMismatch(
+            "materialization source unit resume mismatch"
+        )
+    return completed
+
+
+def _resume_index_source_units(
+    database_path: Path,
+    *,
+    upstream: _ValidatedUpstream,
+    certificate_sha256: str,
+    config_fingerprint: str,
+) -> int:
+    if not database_path.is_file():
+        raise _CertificateMismatch(
+            "materialization resume index is missing"
+        )
+    try:
+        with _connect(database_path) as connection:
+            metadata = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute(
+                    """
+                    SELECT key, value FROM metadata
+                    WHERE key IN (
+                        'upstream_identity',
+                        'upstream_certificate_sha256',
+                        'upstream_certificate_config',
+                        'upstream_certificate_ready'
+                    )
+                    """
+                )
+            }
+            if metadata != {
+                "upstream_identity": upstream.identity,
+                "upstream_certificate_sha256": certificate_sha256,
+                "upstream_certificate_config": config_fingerprint,
+                "upstream_certificate_ready": "1",
+            }:
+                raise _CertificateMismatch(
+                    "materialization resume index certificate mismatch"
+                )
+            completed = _validate_resume_index_units(
+                connection,
+                expected_tables=upstream.expected_tables,
+            )
+    except sqlite3.Error as error:
+        raise _CertificateMismatch(
+            f"materialization resume index is unreadable: {error}"
+        ) from error
+    return completed
+
+
+def _load_fast_resume_state(
+    inputs: MaterializationInputs,
+    *,
+    args: argparse.Namespace,
+    records_per_shard: int,
+) -> _FastResumeState:
+    parameter_fingerprint = _parameter_fingerprint(args)
+    config_fingerprint = _certificate_config_fingerprint(
+        args,
+        records_per_shard,
+    )
+    path = _certificate_path(inputs.work_root, config_fingerprint)
+    if not path.is_file():
+        raise _CertificateMismatch("upstream certificate is missing")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as error:
+        raise _CertificateMismatch(
+            "upstream certificate is unreadable"
+        ) from error
+    if not isinstance(payload, dict):
+        raise _CertificateMismatch(
+            "upstream certificate is not an object"
+        )
+    actual_digest = _certificate_digest(payload)
+    if (
+        payload.get("schema_version")
+        != UPSTREAM_CERTIFICATE_SCHEMA_VERSION
+        or payload.get("complete") is not True
+        or payload.get("config_fingerprint") != config_fingerprint
+        or payload.get("input_descriptor_fingerprint")
+        != _materialization_input_descriptor(inputs)
+        or payload.get("certificate_sha256") != actual_digest
+    ):
+        raise _CertificateMismatch(
+            "upstream certificate identity mismatch"
+        )
+    current_manifests = _manifest_hashes(
+        _certificate_manifest_paths(inputs)
+    )
+    if payload.get("manifest_hashes") != current_manifests:
+        raise _CertificateMismatch(
+            "upstream certificate manifest hash mismatch"
+        )
+    upstream = _upstream_from_certificate(payload, inputs)
+    current_files = _file_identities(
+        _certificate_input_paths(inputs, upstream)
+    )
+    if payload.get("input_files") != current_files:
+        raise _CertificateMismatch(
+            "upstream certificate input file identity mismatch"
+        )
+    database_path = _materialization_database_path(
+        inputs.work_root,
+        upstream.identity,
+        parameter_fingerprint,
+    )
+    completed = _resume_index_source_units(
+        database_path,
+        upstream=upstream,
+        certificate_sha256=actual_digest,
+        config_fingerprint=config_fingerprint,
+    )
+    return _FastResumeState(
+        upstream=upstream,
+        database_path=database_path,
+        resumed_source_units=completed,
+    )
+
+
+def _persist_upstream_certificate(
+    inputs: MaterializationInputs,
+    upstream: _ValidatedUpstream,
+    *,
+    args: argparse.Namespace,
+    records_per_shard: int,
+    database_path: Path,
+    manifest_hashes: list[dict[str, str]],
+    input_files: list[dict[str, Any]],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> Path:
+    config_fingerprint = _certificate_config_fingerprint(
+        args,
+        records_per_shard,
+    )
+    payload = {
+        "schema_version": UPSTREAM_CERTIFICATE_SCHEMA_VERSION,
+        "config_fingerprint": config_fingerprint,
+        "input_descriptor_fingerprint": (
+            _materialization_input_descriptor(inputs)
+        ),
+        "inputs": _certificate_jsonable(asdict(inputs)),
+        "manifest_hashes": manifest_hashes,
+        "input_files": input_files,
+        "upstream": _serialized_upstream(upstream),
+        "complete": True,
+    }
+    payload["certificate_sha256"] = _certificate_digest(payload)
+    path = _certificate_path(inputs.work_root, config_fingerprint)
+    _atomic_json(
+        path,
+        payload,
+        pre_write_guard=pre_write_guard,
+    )
+    tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    tracker.before_write(16 * 1024)
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO metadata (key, value)
+            VALUES (?, ?)
+            """,
+            (
+                (
+                    "upstream_certificate_sha256",
+                    payload["certificate_sha256"],
+                ),
+                ("upstream_certificate_config", config_fingerprint),
+                ("upstream_certificate_ready", "1"),
+            ),
+        )
+        tracker.before_commit(0)
+        connection.commit()
+    return path
+
+
+def _inputs_from_certificate_payload(
+    payload: dict[str, Any],
+) -> MaterializationInputs:
+    try:
+        raw = payload["inputs"]
+        if not isinstance(raw, dict):
+            raise TypeError("inputs snapshot is not an object")
+
+        def path(value: Any) -> Path:
+            return Path(str(value))
+
+        def path_tuple(values: Any) -> tuple[Path, ...]:
+            if not isinstance(values, list):
+                raise TypeError("path collection is not a list")
+            return tuple(path(value) for value in values)
+
+        barrier_raw = raw["structural_barrier"]
+        barrier = StructuralStageBarrier(
+            schema_version=str(barrier_raw["schema_version"]),
+            manifest_count=int(barrier_raw["manifest_count"]),
+            manifest_sha256=dict(barrier_raw["manifest_sha256"]),
+            input_fingerprints=dict(
+                barrier_raw["input_fingerprints"]
+            ),
+            parameter_fingerprints=dict(
+                barrier_raw["parameter_fingerprints"]
+            ),
+            final_manifest_sha256=str(
+                barrier_raw["final_manifest_sha256"]
+            ),
+            final_selection=dict(barrier_raw["final_selection"]),
+        )
+        page_raw = raw["page_fetch_result"]
+        page_result = FetchResult(
+            unique=int(page_raw["unique"]),
+            success=int(page_raw["success"]),
+            terminal=int(page_raw["terminal"]),
+            inflight=int(page_raw["inflight"]),
+            leased=int(page_raw["leased"]),
+            remaining=int(page_raw["remaining"]),
+            complete=page_raw["complete"] is True,
+            maximum_inflight=int(page_raw["maximum_inflight"]),
+            maximum_claimed=int(page_raw["maximum_claimed"]),
+            maximum_host_limiters=int(
+                page_raw["maximum_host_limiters"]
+            ),
+            outcomes_path=path(page_raw["outcomes_path"]),
+            failure_path=path(page_raw["failure_path"]),
+            progress_path=path(page_raw["progress_path"]),
+            policy_fingerprint=str(page_raw["policy_fingerprint"]),
+            job_store_path=path(page_raw["job_store_path"]),
+            job_kind=str(page_raw["job_kind"]),
+            transport_attempt_summary=dict(
+                page_raw["transport_attempt_summary"]
+            ),
+        )
+        plan_raw = raw["asset_plan_result"]
+        planned = AssetPlanShards(
+            output_root=path(plan_raw["output_root"]),
+            entity_plan_paths=path_tuple(
+                plan_raw["entity_plan_paths"]
+            ),
+            image_mapping_paths=path_tuple(
+                plan_raw["image_mapping_paths"]
+            ),
+            manifest_path=path(plan_raw["manifest_path"]),
+            entities=int(plan_raw["entities"]),
+            image_mappings=int(plan_raw["image_mappings"]),
+        )
+        jobs_raw = raw["unique_image_jobs"]
+        shard_raw = jobs_raw["completed_shard"]
+        unique_jobs = UniqueImageJobs(
+            output_path=path(jobs_raw["output_path"]),
+            manifest_path=path(jobs_raw["manifest_path"]),
+            completed_shard=CompletedShard(
+                path=str(shard_raw["path"]),
+                records=int(shard_raw["records"]),
+                bytes=int(shard_raw["bytes"]),
+                sha256=str(shard_raw["sha256"]),
+            ),
+            input_fingerprint=str(jobs_raw["input_fingerprint"]),
+            parameter_fingerprint=str(
+                jobs_raw["parameter_fingerprint"]
+            ),
+            complete=jobs_raw["complete"] is True,
+        )
+        image_raw = raw["image_fetch_result"]
+        if image_raw["unique_jobs"] != _certificate_jsonable(
+            asdict(unique_jobs)
+        ):
+            raise ValueError("image unique jobs snapshot mismatch")
+        image_result = ImageFetchResult(
+            unique=int(image_raw["unique"]),
+            success=int(image_raw["success"]),
+            terminal=int(image_raw["terminal"]),
+            complete=image_raw["complete"] is True,
+            outcomes_path=path(image_raw["outcomes_path"]),
+            policy_fingerprint=str(image_raw["policy_fingerprint"]),
+            maximum_inflight=int(image_raw["maximum_inflight"]),
+            maximum_claimed=int(image_raw["maximum_claimed"]),
+            maximum_host_states=int(image_raw["maximum_host_states"]),
+            unique_jobs=unique_jobs,
+            job_store_path=path(image_raw["job_store_path"]),
+            job_kind=str(image_raw["job_kind"]),
+            fetch_manifest_path=path(
+                image_raw["fetch_manifest_path"]
+            ),
+            fetch_manifest_sha256=str(
+                image_raw["fetch_manifest_sha256"]
+            ),
+            outcome_digest=str(image_raw["outcome_digest"]),
+            outcomes_count=int(image_raw["outcomes_count"]),
+            outcome_url_key_digest=str(
+                image_raw["outcome_url_key_digest"]
+            ),
+            leased=int(image_raw["leased"]),
+            remaining=int(image_raw["remaining"]),
+            transport_attempt_summary=dict(
+                image_raw["transport_attempt_summary"]
+            ),
+        )
+        assets_raw = raw["materialized_assets"]
+        materialized_assets = MaterializedAssetShards(
+            output_root=path(assets_raw["output_root"]),
+            bridge_asset_paths=path_tuple(
+                assets_raw["bridge_asset_paths"]
+            ),
+            table_asset_link_paths=path_tuple(
+                assets_raw["table_asset_link_paths"]
+            ),
+            manifest_path=path(assets_raw["manifest_path"]),
+            bridge_assets=int(assets_raw["bridge_assets"]),
+            table_asset_links=int(
+                assets_raw["table_asset_links"]
+            ),
+        )
+        adapted_raw = raw["adapted_model_tasks"]
+        adapted = AdaptedModelTasks(
+            output_root=path(adapted_raw["output_root"]),
+            task_paths=path_tuple(adapted_raw["task_paths"]),
+            error_paths=path_tuple(adapted_raw["error_paths"]),
+            manifest_path=path(adapted_raw["manifest_path"]),
+            input_fingerprint=str(
+                adapted_raw["input_fingerprint"]
+            ),
+            tasks=int(adapted_raw["tasks"]),
+            errors=int(adapted_raw["errors"]),
+        )
+        model_raw = raw["model_result"]
+        jobset_raw = model_raw["jobset"]
+        jobs = tuple(
+            ModelJobInfo(
+                job_id=str(item["job_id"]),
+                cache_key=str(item["cache_key"]),
+                model_call_key=str(item["model_call_key"]),
+                modality=str(item["modality"]),
+                asset_fingerprint=str(item["asset_fingerprint"]),
+                entity_prompt_fingerprint=str(
+                    item["entity_prompt_fingerprint"]
+                ),
+            )
+            for item in jobset_raw.get("jobs") or []
+        )
+        jobset = ModelJobSet(
+            database_path=path(jobset_raw["database_path"]),
+            input_fingerprint=str(jobset_raw["input_fingerprint"]),
+            prompt_version=str(jobset_raw["prompt_version"]),
+            text_fingerprint=str(jobset_raw["text_fingerprint"]),
+            image_fingerprint=str(jobset_raw["image_fingerprint"]),
+            text_kind=str(jobset_raw["text_kind"]),
+            image_kind=str(jobset_raw["image_kind"]),
+            text_tasks=int(jobset_raw["text_tasks"]),
+            image_tasks=int(jobset_raw["image_tasks"]),
+            jobs=jobs,
+        )
+        model_result = ModelStageResult(
+            output_root=path(model_raw["output_root"]),
+            manifest_path=path(model_raw["manifest_path"]),
+            extraction_paths=path_tuple(
+                model_raw["extraction_paths"]
+            ),
+            error_paths=path_tuple(model_raw["error_paths"]),
+            text_total=int(model_raw["text_total"]),
+            image_total=int(model_raw["image_total"]),
+            success=int(model_raw["success"]),
+            terminal=int(model_raw["terminal"]),
+            pending=int(model_raw["pending"]),
+            leased=int(model_raw["leased"]),
+            complete=model_raw["complete"] is True,
+            jobset=jobset,
+        )
+        authority_raw = raw["model_authority"]
+        authority = ModelStageAuthority(
+            text_model_identity=str(
+                authority_raw["text_model_identity"]
+            ),
+            image_model_identity=str(
+                authority_raw["image_model_identity"]
+            ),
+            prompt_version=str(authority_raw["prompt_version"]),
+            policy_fingerprint=str(
+                authority_raw["policy_fingerprint"]
+            ),
+            parser_schema_version=str(
+                authority_raw["parser_schema_version"]
+            ),
+        )
+        return MaterializationInputs(
+            structural_output_root=path(
+                raw["structural_output_root"]
+            ),
+            structural_manifests=path_tuple(
+                raw["structural_manifests"]
+            ),
+            finalized_selection_manifest=path(
+                raw["finalized_selection_manifest"]
+            ),
+            structural_barrier=barrier,
+            page_fetch_result=page_result,
+            asset_plan_result=planned,
+            unique_image_jobs=unique_jobs,
+            image_fetch_result=image_result,
+            materialized_assets=materialized_assets,
+            adapted_model_tasks=adapted,
+            model_result=model_result,
+            model_authority=authority,
+            work_root=path(raw["work_root"]),
+            sampling_manifest=(
+                path(raw["sampling_manifest"])
+                if raw.get("sampling_manifest") is not None
+                else None
+            ),
+            sampled_entity_paths=path_tuple(
+                raw.get("sampled_entity_paths") or []
+            ),
+            sampled_page_ref_paths=path_tuple(
+                raw.get("sampled_page_ref_paths") or []
+            ),
+            upstream_stage_registry=(
+                path(raw["upstream_stage_registry"])
+                if raw.get("upstream_stage_registry") is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise _CertificateMismatch(
+            "upstream certificate input snapshot is invalid"
+        ) from error
+
+
+def load_certified_materialization_inputs(
+    work_root: Path,
+    *,
+    args: argparse.Namespace,
+    records_per_shard: int,
+) -> MaterializationInputs:
+    """Load inputs only after the certificate and resume index verify."""
+    config_fingerprint = _certificate_config_fingerprint(
+        args,
+        records_per_shard,
+    )
+    certificate = _certificate_path(work_root, config_fingerprint)
+    try:
+        payload = json.loads(certificate.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as error:
+        raise _CertificateMismatch(
+            "upstream certificate is unavailable"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("certificate_sha256")
+        != _certificate_digest(payload)
+        or payload.get("config_fingerprint") != config_fingerprint
+    ):
+        raise _CertificateMismatch(
+            "upstream certificate identity mismatch"
+        )
+    inputs = _inputs_from_certificate_payload(payload)
+    if Path(inputs.work_root).resolve() != Path(work_root).resolve():
+        raise _CertificateMismatch(
+            "upstream certificate work root mismatch"
+        )
+    if inputs.model_authority != ModelStageAuthority.current(args):
+        raise _CertificateMismatch(
+            "upstream certificate model authority mismatch"
+        )
+    _load_fast_resume_state(
+        inputs,
+        args=args,
+        records_per_shard=records_per_shard,
+    )
+    return inputs
 
 
 def _split_group(
@@ -4021,6 +5176,9 @@ def materialize_dataset(
     after_table_commit: Callable[[str], None] | None = None,
     after_finalize_commit: Callable[[str], None] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
+    validation_progress_callback: (
+        Callable[[dict[str, Any]], None] | None
+    ) = None,
 ) -> MaterializationResult:
     """Validate upstream barriers and stream the canonical final dataset."""
     if records_per_shard <= 0:
@@ -4035,12 +5193,96 @@ def materialize_dataset(
         raise ValueError("work_root and output_root must be separate")
     if pre_write_guard is not None:
         pre_write_guard(work_root / "upstream-validation", 0)
-    upstream = _validate_upstream(
-        inputs,
-        args=args,
-        pre_write_guard=pre_write_guard,
-    )
     parameter_fingerprint = _parameter_fingerprint(args)
+    validation_workers = _materialization_validation_workers(args)
+    fast_resume: _FastResumeState | None = None
+    try:
+        fast_resume = _load_fast_resume_state(
+            inputs,
+            args=args,
+            records_per_shard=records_per_shard,
+        )
+    except _CertificateMismatch as error:
+        logging.info(
+            "materialization upstream validation: fast resume unavailable "
+            "(%s); falling back to strict validation",
+            error,
+        )
+        _report_validation_progress(
+            validation_progress_callback,
+            mode="fallback",
+            completed=0,
+            total=1,
+            reason=str(error),
+        )
+
+    strict_manifest_hashes: list[dict[str, str]] | None = None
+    strict_input_files: list[dict[str, Any]] | None = None
+    if fast_resume is None:
+        manifest_paths = _certificate_manifest_paths(inputs)
+        try:
+            initial_manifest_hashes = _manifest_hashes(manifest_paths)
+            initial_input_files = _file_identities(
+                _certificate_input_paths(inputs)
+            )
+        except _CertificateMismatch:
+            # Preserve the strict validators as the authority for corrupt
+            # or missing input errors and their established messages.
+            initial_manifest_hashes = None
+            initial_input_files = None
+        upstream = _validate_upstream(
+            inputs,
+            args=args,
+            pre_write_guard=pre_write_guard,
+            validation_progress_callback=(
+                validation_progress_callback
+            ),
+        )
+        current_manifest_hashes = _manifest_hashes(manifest_paths)
+        current_input_files = _file_identities(
+            _certificate_input_paths(inputs)
+        )
+        if (
+            initial_manifest_hashes is not None
+            and initial_manifest_hashes != current_manifest_hashes
+        ):
+            raise ValueError(
+                "upstream manifests changed during strict validation"
+            )
+        if (
+            initial_input_files is not None
+            and initial_input_files != current_input_files
+        ):
+            raise ValueError(
+                "upstream input identity changed during strict validation"
+            )
+        strict_manifest_hashes = current_manifest_hashes
+        strict_input_files = _file_identities(
+            _certificate_input_paths(inputs, upstream)
+        )
+        database_path = _materialization_database_path(
+            work_root,
+            upstream.identity,
+            parameter_fingerprint,
+        )
+    else:
+        upstream = fast_resume.upstream
+        database_path = fast_resume.database_path
+        logging.info(
+            "materialization upstream validation: fast resume certificate "
+            "accepted; continuing after %d/%d source units",
+            fast_resume.resumed_source_units,
+            upstream.expected_tables,
+        )
+        _report_validation_progress(
+            validation_progress_callback,
+            mode="fast_resume",
+            completed=1,
+            total=1,
+            resumed_source_units=fast_resume.resumed_source_units,
+            expected_source_units=upstream.expected_tables,
+        )
+
     resumed = _load_published_result(
         output_root,
         upstream=upstream,
@@ -4053,55 +5295,72 @@ def materialize_dataset(
     if pre_write_guard is not None:
         pre_write_guard(work_root, 0)
     work_root.mkdir(parents=True, exist_ok=True)
-    database_path = (
-        work_root
-        / "materialization"
-        / (
-            f"index-{upstream.identity}-"
-            f"{parameter_fingerprint}.sqlite3"
+    if fast_resume is None:
+        if pre_write_guard is not None:
+            pre_write_guard(database_path, 0)
+        _prepare_authoritative_index(
+            database_path,
+            upstream,
+            pre_write_guard=pre_write_guard,
         )
-    )
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, 0)
-    _prepare_authoritative_index(
-        database_path,
-        upstream,
-        pre_write_guard=pre_write_guard,
-    )
-    _migrate_legacy_external_json_paths(
-        database_path,
-        pre_write_guard=pre_write_guard,
-    )
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, 0)
-    _catalog_sources(
-        database_path,
-        upstream.source_paths,
-        args=args,
-        expected_tables=upstream.expected_tables,
-        pre_write_guard=pre_write_guard,
-    )
-    closure_tracker = GuardedWriteTracker(
-        database_path,
-        pre_write_guard,
-    )
-    with _connect(database_path) as connection:
-        _validate_source_catalog_closure(
-            connection,
-            write_tracker=closure_tracker,
+        _migrate_legacy_external_json_paths(
+            database_path,
+            pre_write_guard=pre_write_guard,
         )
-        closure_tracker.before_commit(0)
-    if pre_write_guard is not None:
-        pre_write_guard(database_path, 0)
-    _assign_splits(
-        database_path,
-        args,
-        pre_write_guard=pre_write_guard,
-    )
-    _compact_materialized_table_copies(
-        database_path,
-        pre_write_guard=pre_write_guard,
-    )
+        if pre_write_guard is not None:
+            pre_write_guard(database_path, 0)
+        _catalog_sources(
+            database_path,
+            upstream.source_paths,
+            args=args,
+            expected_tables=upstream.expected_tables,
+            pre_write_guard=pre_write_guard,
+        )
+        _validate_materialization_index_closures(
+            database_path,
+            validation_workers=validation_workers,
+            pre_write_guard=pre_write_guard,
+            validation_progress_callback=(
+                validation_progress_callback
+            ),
+        )
+        if pre_write_guard is not None:
+            pre_write_guard(database_path, 0)
+        _assign_splits(
+            database_path,
+            args,
+            pre_write_guard=pre_write_guard,
+        )
+        _compact_materialized_table_copies(
+            database_path,
+            pre_write_guard=pre_write_guard,
+        )
+        with _connect(database_path) as connection:
+            _validate_resume_index_units(
+                connection,
+                expected_tables=upstream.expected_tables,
+            )
+        if (
+            strict_manifest_hashes
+            != _manifest_hashes(_certificate_manifest_paths(inputs))
+            or strict_input_files
+            != _file_identities(
+                _certificate_input_paths(inputs, upstream)
+            )
+        ):
+            raise ValueError(
+                "upstream identity changed before certificate persistence"
+            )
+        _persist_upstream_certificate(
+            inputs,
+            upstream,
+            args=args,
+            records_per_shard=records_per_shard,
+            database_path=database_path,
+            manifest_hashes=strict_manifest_hashes,
+            input_files=strict_input_files,
+            pre_write_guard=pre_write_guard,
+        )
     _materialize_all_tables(
         database_path,
         args=args,

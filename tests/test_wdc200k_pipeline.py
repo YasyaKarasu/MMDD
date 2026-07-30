@@ -43,6 +43,7 @@ from wdc200k_fetch import (  # noqa: E402
     fetch_unique_pages,
 )
 from wdc200k_io import SqliteJobStore  # noqa: E402
+from wdc200k_materialize import MaterializationInputs  # noqa: E402
 from wdc200k_eta import (  # noqa: E402
     DurableUrlCounts,
     UrlProgressSnapshot,
@@ -151,7 +152,9 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.model_max_retries == 2
     assert args.model_retry_sleep_seconds == 2.0
     assert args.materialization_workers == 1
+    assert args.materialization_validation_workers == 3
     config = PipelineConfig.from_args(args)
+    assert config.materialization_validation_workers == 3
     assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
         "selection",
@@ -196,6 +199,8 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
                 "0.25",
                 "--materialization_workers",
                 "8",
+                "--materialization_validation_workers",
+                "4",
             ]
         )
     )
@@ -213,8 +218,10 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
     assert runtime_args.model_max_retries == 4
     assert runtime_args.model_retry_sleep_seconds == 0.25
     assert runtime_args.materialization_workers == 8
+    assert runtime_args.materialization_validation_workers == 4
     assert config.model_endpoint_ready_timeout_seconds == 45.5
     assert config.materialization_workers == 8
+    assert config.materialization_validation_workers == 4
 
 
 @pytest.mark.parametrize(
@@ -233,6 +240,8 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
         ("--model_retry_sleep_seconds", "nan"),
         ("--model_retry_sleep_seconds", "inf"),
         ("--model_retry_sleep_seconds", "-inf"),
+        ("--materialization_validation_workers", "0"),
+        ("--materialization_validation_workers", "5"),
     ),
 )
 def test_remote_model_cli_options_reject_invalid_values(
@@ -1210,6 +1219,63 @@ def test_incomplete_models_fast_resume_skips_completed_upstream_stages(
     assert resumed.stage == "models"
     assert len(fast_calls) == 1
     assert (page_transport.calls, image_transport.calls) == first_calls
+
+
+def test_materialization_certificate_bypasses_strict_stage_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    first = run_pipeline(
+        config,
+        page_transport=_PipelinePageTransport(),
+        image_transport=_PipelineImageTransport(),
+        extractor=_PipelineExtractor(),
+    )
+    assert first.status == "complete"
+    (
+        config.work_dir
+        / "stage_manifests"
+        / "pipeline-materialize.json"
+    ).unlink()
+    fast_calls: list[MaterializationInputs] = []
+
+    def reject_strict_replay(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("strict registry replay was repeated")
+
+    def fake_fast_resume(
+        _config: PipelineConfig,
+        *,
+        inputs: MaterializationInputs,
+        **_kwargs: Any,
+    ) -> pipeline_module.PipelineResult:
+        fast_calls.append(inputs)
+        return pipeline_module.PipelineResult(
+            status="complete",
+            stage="materialize",
+            statistics_archives=1,
+            counters={},
+            output_manifest=config.output_dir / "dataset_manifest.json",
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_validate_existing_registry_chain",
+        reject_strict_replay,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_fast_materialization_resume",
+        fake_fast_resume,
+    )
+
+    resumed = run_pipeline(config)
+
+    assert resumed.status == "complete"
+    assert len(fast_calls) == 1
+    assert fast_calls[0].upstream_stage_registry == (
+        config.work_dir / "stage_manifests" / "pipeline-models.json"
+    )
 
 
 def test_pipeline_resume_after_sampling_does_not_require_replaced_full_shards(
