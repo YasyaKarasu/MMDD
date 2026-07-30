@@ -2,18 +2,19 @@
 
 ## Goal
 
-Change `scripts/build_mm_joinability_dataset.py` so source tables are sampled in a reproducibly random order instead of path/table order. When a selected table cannot produce a query table, discard it with 50% probability and replace it with another random candidate. Allow at most two replacements per target slot; retain the final failed table after those two replacements. Remove cache material owned only by discarded tables while preserving material shared with retained tables.
+Change `scripts/build_mm_joinability_dataset.py` so source tables are sampled in a reproducibly random order instead of path/table order. On every replacement pass, consider all source-table slots that currently cannot produce a query table, discard each with 50% probability, and replace selected slots with another random candidate. Allow at most two global replacement passes. Prune discarded candidates from the active output material while retaining their persistent download and analysis caches for future runs.
 
 ## User-Visible Behavior
 
 - `--seed` controls both candidate ordering and discard decisions. The same input and arguments produce the same candidate and replacement choices.
 - Input JSON files are shuffled, and table IDs within each file are shuffled, before structural parsing selects candidates.
-- The builder aims to retain `max_source_tables` source tables. A slot starts with one table and may consume at most two replacement tables.
+- The builder aims to retain `max_source_tables` source tables. A slot starts with one table and may consume at most one replacement table per global replacement pass.
 - A table that produces at least one query table is always retained.
 - A table that produces no query table is discarded only when the seeded probability draw is below the configured probability.
-- A failed table is retained when the probability draw says not to discard it.
-- A failed table occupying a slot after two prior replacements is retained without another discard draw.
+- A failed table not selected by one probability draw remains eligible in every later configured replacement pass.
+- After the final replacement pass, any failed table still occupying a slot is retained.
 - If the candidate stream is exhausted, the builder retains the tables already assigned and records the unfilled slot count rather than looping indefinitely.
+- Candidate replacement never deletes downloaded images, Wikipedia response records, or model-extraction cache records; reruns can reuse all completed work.
 
 Add these command-line arguments:
 
@@ -34,15 +35,15 @@ The candidate stream owns structural counters such as processed and malformed ta
 
 ### Slot and round controller
 
-Represent each target slot with its current source table and replacement count. Fill up to `max_source_tables` slots from the candidate stream, then evaluate only newly assigned tables in a batch. After each batch:
+Represent each target slot with its current source table and latest evaluation. Fill up to `max_source_tables` slots from the candidate stream, then evaluate newly assigned tables in a batch. On each global replacement pass:
 
-1. Retain queryable tables.
-2. For failed tables below the replacement limit, draw from the seeded RNG.
-3. Retain failed tables when the draw is greater than or equal to the drop probability.
-4. Discard failed tables when the draw is below the probability, clean their exclusive material, increment the slot replacement count, and assign the next candidate.
-5. Once a slot reaches two replacements, retain its current table even when it remains unrecoverable.
+1. Store the evaluations for newly assigned candidates.
+2. Build the eligible pool from every slot whose current table is failed, including tables not selected on earlier passes.
+3. Draw once for every eligible failed slot in stable slot order.
+4. Keep an unselected failure in place so it participates in the next pass.
+5. Replace selected failures when another candidate is available.
 
-Only replacement slots enter the next evaluation round. With the defaults, a slot sees at most the original table plus two replacements.
+Only newly assigned replacements require another expensive evaluation, but the next replacement decision again uses the complete current failed pool. With the defaults, a slot still sees at most the original table plus two replacements.
 
 ### Candidate evaluation
 
@@ -66,7 +67,7 @@ After all slots settle, rebuild aggregate entity references for only the final s
 
 Final model extraction calls should hit the candidate-evaluation cache and must not repeat successful inference. A retained but unrecoverable table is emitted through the existing raw data-lake path.
 
-## Dependency Tracking and Cache Cleanup
+## Dependency Tracking and Cache Retention
 
 Track these dependencies per evaluated table:
 
@@ -77,20 +78,19 @@ Track these dependencies per evaluated table:
 - Wikipedia imageinfo-cache keys;
 - model extraction cache keys.
 
-Maintain active reference counts across current and retained slots. When a table is discarded, decrement its dependencies and physically clean only dependencies whose active count reaches zero.
+Maintain active dependency ownership across current and retained slots. When a table is discarded, remove dependencies that no active slot references from the in-memory entity-to-asset and asset maps so final artifacts contain only the settled pool.
 
 At a round boundary, after all concurrent model tasks have completed:
 
 - remove exclusive text/image assets from the in-memory asset maps;
-- unlink exclusive downloaded images;
-- retain a downloaded image when another active asset references the same resolved path or source URL;
-- remove exclusive page and imageinfo records from the clients' in-memory cache maps;
-- remove exclusive model records from `ExtractionCache.items`;
-- compact `wiki_pages.jsonl`, `wiki_images.jsonl`, and `model_attribute_extractions.jsonl` by writing a sibling temporary file and atomically replacing the original.
+- retain all downloaded images, including images used only by replaced candidates;
+- retain all page and imageinfo records in the clients' in-memory cache maps and JSONL files;
+- retain all model records in `ExtractionCache.items` and `model_attribute_extractions.jsonl`;
+- do not compact persistent caches as part of candidate selection.
 
-Cleanup never runs concurrently with cache append operations. File deletion and compaction errors are logged and counted, then dataset construction continues. Final output-write errors retain their current fail-fast behavior.
+Active-material pruning runs only after a replacement batch has registered its dependencies. Final output-write errors retain their current fail-fast behavior.
 
-After slot selection completes, perform an orphan sweep using the final dependency graph. This removes evaluated candidate material that has no final-table reference while preserving every entity, image, metadata record, and model cache record shared with the final pool.
+After slot selection completes, perform an orphan sweep using the final dependency graph. This removes evaluated candidate assets that have no final-table reference from the generated dataset, without removing reusable persistent cache records or files.
 
 ## Dynamic vLLM Compatibility
 
@@ -112,13 +112,36 @@ Add enough information to reproduce and audit selection:
 - configured replacement rounds and drop probability;
 - total random candidates structurally accepted;
 - initial slots filled;
-- per-round evaluated, unrecoverable, discarded, retained-failed, and replacement counts;
+- per-round newly evaluated, all-current unrecoverable, discarded, retained-failed, and replacement counts;
 - candidate exhaustion and unfilled slot counts;
 - final recoverable and unrecoverable source-table counts;
-- removed page records, imageinfo records, model records, image files, and image bytes;
-- shared dependencies protected from cleanup.
+- explicit `all_current_failed_slots` replacement scope;
+- explicit persistent-cache retention policy;
+- active entities and assets pruned from final material.
 
 Include the new policy values in stats, provenance, and the dataset manifest configuration block. Table queryability decisions remain present only for final tables.
+
+In per-round statistics, `evaluated` counts only newly assigned candidates that required analysis during that pass. `unrecoverable` counts the complete current failed pool considered for replacement. Before the terminal pass, `retained_failed` means deferred to a later pass rather than permanently settled.
+
+## Entity Filtering and Multi-Query Construction
+
+Filter structurally valid tables without any `candidate_entity_columns` before
+they enter the seeded global sample. Candidate recognition continues to use the
+configured wiki-link threshold plus the existing non-empty, numeric, uniqueness,
+and header heuristics. Record filtered tables under
+`no_candidate_entity_column`.
+
+For a source table with multiple model-recoverable attributes, emit one variant
+per qualifying bridge attribute when the table has enough ordinary context
+columns. Treat every qualifying bridge attribute as target-only for the entire
+source table, partition ordinary context columns once into query-only and
+target-only sides, and never allow a sibling query and target to share a source
+column. If the table is too narrow for both sides, fall back to the single
+highest-recovery attribute.
+
+When variants have identical visible column names and row values, write one
+query table and attach all hidden attributes, target table IDs, chain IDs, and
+qrels to it. Targets and recovery evidence remain attribute-specific.
 
 ## Testing
 
@@ -131,14 +154,18 @@ Add focused tests covering:
 3. Candidate selection does not truncate by lexicographic file and table order.
 4. Queryable tables are retained without a probability draw.
 5. Failed tables are replaced only when the seeded draw falls below 0.5.
-6. Each slot evaluates at most the original table and two replacements.
-7. A failed table after the second replacement is retained.
-8. Candidate exhaustion terminates and reports any unfilled slots.
-9. Discarding a table removes its exclusive image and all three relevant JSONL cache record types.
-10. Shared entities, local image paths or URLs, and model cache keys survive cleanup.
-11. Final source/query/data-lake artifacts, qrels, splits, decisions, stats, and manifest reference only the settled final pool.
-12. Dynamic vLLM done markers are not written between candidate rounds and are written after the complete analysis phase.
-13. CLI defaults and validation enforce two rounds and probability 0.5.
+6. A failure not selected on one pass remains eligible on the next pass.
+7. Each slot evaluates at most the original table and two replacements.
+8. A failed table after the second replacement is retained.
+9. Candidate exhaustion terminates and reports any unfilled slots.
+10. Discarding a table prunes exclusive active assets but preserves its image and all three relevant JSONL cache record types.
+11. Persistent model records load successfully after constructing a new cache instance.
+12. Final source/query/data-lake artifacts, qrels, splits, decisions, stats, and manifest reference only the settled final pool.
+13. Dynamic vLLM done markers are not written between candidate rounds and are written after the complete analysis phase.
+14. CLI defaults and validation enforce two rounds and probability 0.5.
+15. Tables without an entity-column candidate are excluded before global sampling.
+16. Multi-attribute variants keep all sibling query/target source columns disjoint.
+17. Identical visible variants merge into one query with multiple qrels.
 
 Follow test-driven development: add one failing behavior test, verify its expected failure, implement the smallest supporting change, and rerun the focused test before proceeding.
 
@@ -154,6 +181,6 @@ Run any new focused test module separately during development, run the dynamic-r
 
 - Do not change the recovery threshold or attribute matching rules.
 - Do not prefetch or infer over a fixed three-times-larger candidate pool.
-- Do not delete material that remains referenced by any final or currently active table.
+- Do not delete downloaded or analyzed cache material merely because its source table was replaced.
 - Do not hand-edit generated datasets in `output_medium/` or `output_stage1_logic/`.
 - Do not add network-dependent test fixtures.

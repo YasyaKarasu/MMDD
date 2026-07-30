@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field as dataclass_field
 from decimal import ROUND_CEILING, Decimal
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
@@ -259,74 +260,13 @@ class CandidateMaterialRegistry:
     def _retained_dependencies(self) -> CandidateDependencies:
         return self._union_dependencies(self.dependencies.values())
 
-    @staticmethod
-    def _resolved_paths(paths: Iterable[Path]) -> set[Path]:
-        return {Path(path).expanduser().resolve() for path in paths}
-
-    def _unlink_exclusive_images(
-        self,
-        discarded: CandidateDependencies,
-        retained: CandidateDependencies,
-        removed_assets: Iterable[dict[str, Any]],
-        stats: CacheCleanupStats,
-    ) -> None:
-        retained_paths = self._resolved_paths(retained.paths)
-        retained_urls = set(retained.urls)
-        urls_by_path: dict[Path, set[str]] = defaultdict(set)
-        for asset in removed_assets:
-            local_path = clean_text(asset.get("local_path"))
-            source_url = clean_text(asset.get("image_url"))
-            if local_path:
-                urls_by_path[Path(local_path).expanduser().resolve()].add(source_url)
-
-        for path in sorted(self._resolved_paths(discarded.paths)):
-            source_urls = urls_by_path.get(path, set())
-            if path in retained_paths or any(url in retained_urls for url in source_urls if url):
-                continue
-            try:
-                byte_count = path.stat().st_size
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                stats.errors += 1
-                logging.warning("Failed to remove discarded candidate image %s: %s", path, exc)
-            else:
-                stats.image_files_removed += 1
-                stats.image_bytes_removed += byte_count
-
-    def _compact_caches(self, stats: CacheCleanupStats) -> None:
-        compactions = []
-        if self.wikipedia_client is not None:
-            compactions.extend(
-                [
-                    (
-                        self.wikipedia_client.page_cache_path,
-                        self.wikipedia_client.page_cache.values(),
-                        "Wikipedia page",
-                    ),
-                    (
-                        self.wikipedia_client.image_cache_path,
-                        self.wikipedia_client.image_cache.values(),
-                        "Wikipedia imageinfo",
-                    ),
-                ]
-            )
-        compactions.append(
-            (
-                self.extraction_cache.path,
-                self.extraction_cache.items.values(),
-                "model extraction",
-            )
-        )
-        for path, records, label in compactions:
-            try:
-                compact_keyed_jsonl(path, records)
-            except OSError as exc:
-                stats.errors += 1
-                logging.warning("Failed to compact %s cache %s: %s", label, path, exc)
-
     def discard_many(self, table_ids: Iterable[str]) -> CacheCleanupStats:
+        """Remove discarded candidates from active output material only.
+
+        Downloaded images and Wikipedia/model cache entries are deliberately
+        retained so a later run can reuse work performed for a candidate that
+        was replaced during this run.
+        """
         discarded_dependencies = [
             dependencies
             for table_id in dict.fromkeys(table_ids)
@@ -355,31 +295,14 @@ class CandidateMaterialRegistry:
                 stats.entities_removed += 1
 
         exclusive_asset_ids = discarded.assets - retained.assets
-        removed_assets = []
         for asset_id in exclusive_asset_ids:
             asset = self.assets.pop(asset_id, None)
             if asset is not None:
-                removed_assets.append(asset)
                 stats.assets_removed += 1
         for entity_id, asset_ids in self.entity_to_assets.items():
             self.entity_to_assets[entity_id] = [
                 asset_id for asset_id in asset_ids if asset_id not in exclusive_asset_ids
             ]
-        self._unlink_exclusive_images(discarded, retained, removed_assets, stats)
-
-        if self.wikipedia_client is not None:
-            for key in discarded.page_keys - retained.page_keys:
-                if self.wikipedia_client.page_cache.pop(key, None) is not None:
-                    stats.page_records_removed += 1
-            for key in discarded.imageinfo_keys - retained.imageinfo_keys:
-                if self.wikipedia_client.image_cache.pop(key, None) is not None:
-                    stats.imageinfo_records_removed += 1
-        with self.extraction_cache._lock:
-            for key in discarded.model_keys - retained.model_keys:
-                if self.extraction_cache.items.pop(key, None) is not None:
-                    stats.model_records_removed += 1
-
-        self._compact_caches(stats)
         return stats
 
     def discard(self, table_id: str) -> CacheCleanupStats:
@@ -774,6 +697,12 @@ def iter_random_source_tables(
                 counters.skipped_tables += 1
                 counters.skip_reasons[result.skip_reason or "unknown"] += 1
                 continue
+            if not result.source_table.get("metadata", {}).get(
+                "candidate_entity_columns"
+            ):
+                counters.skipped_tables += 1
+                counters.skip_reasons["no_candidate_entity_column"] += 1
+                continue
             ref = SelectedSourceTableRef(
                 priority=int(
                     stable_hash(
@@ -873,6 +802,11 @@ def run_replacement_rounds(
     on_initial_batch: Callable[[list[dict[str, Any]]], None] | None = None,
     on_initial_batch_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> ReplacementSelection:
+    """Evaluate candidates and resample every current failure on each pass.
+
+    Only newly assigned replacements are evaluated again, while the replacement
+    draw pool includes failures deferred by every earlier pass.
+    """
     if target_count < 0:
         raise ValueError("target count must be non-negative")
 
@@ -892,92 +826,100 @@ def run_replacement_rounds(
         initial_batch_callback(slot_tables)
 
     candidates_consumed = len(slot_tables)
-    replacement_counts = [0] * len(slot_tables)
-    final_evaluations: list[CandidateEvaluation | None] = [None] * len(slot_tables)
+    current_evaluations: list[CandidateEvaluation | None] = [None] * len(slot_tables)
     pending_slots = list(range(len(slot_tables)))
     pending_discards: list[str] = []
     round_stats: list[ReplacementRoundStats] = []
-    round_index = 0
 
-    while pending_slots:
-        batch = [slot_tables[slot_index] for slot_index in pending_slots]
-        if round_index > 0 and prepare_batch is not None:
-            prepare_batch(batch)
-        evaluations = evaluate_batch(batch)
-        if len(evaluations) != len(batch):
-            raise ValueError(
-                "candidate evaluation count does not match the requested batch"
-            )
-        for source_table, evaluation in zip(batch, evaluations):
-            expected_id = source_table.get("source_table_id")
-            actual_id = evaluation.source_table.get("source_table_id")
-            if actual_id != expected_id:
-                raise ValueError(
-                    "candidate evaluation source ID does not match the requested batch"
+    if pending_slots:
+        for round_index in range(policy.rounds + 1):
+            evaluations: list[CandidateEvaluation] = []
+            if pending_slots:
+                batch = [slot_tables[slot_index] for slot_index in pending_slots]
+                if round_index > 0 and prepare_batch is not None:
+                    prepare_batch(batch)
+                evaluations = evaluate_batch(batch)
+                if len(evaluations) != len(batch):
+                    raise ValueError(
+                        "candidate evaluation count does not match the requested batch"
+                    )
+                for slot_index, source_table, evaluation in zip(
+                    pending_slots, batch, evaluations
+                ):
+                    expected_id = source_table.get("source_table_id")
+                    actual_id = evaluation.source_table.get("source_table_id")
+                    if actual_id != expected_id:
+                        raise ValueError(
+                            "candidate evaluation source ID does not match the "
+                            "requested batch"
+                        )
+                    current_evaluations[slot_index] = evaluation
+
+            if pending_discards:
+                discard_tables(pending_discards)
+                pending_discards = []
+
+            failed_slots = [
+                slot_index
+                for slot_index, evaluation in enumerate(current_evaluations)
+                if evaluation is not None and not evaluation.queryable
+            ]
+            discarded = 0
+            replacements = 0
+            next_pending_slots: list[int] = []
+            retained_failed = len(failed_slots)
+
+            if round_index < policy.rounds:
+                for slot_index in failed_slots:
+                    if rng.random() >= policy.drop_probability:
+                        continue
+                    if candidate_exhausted:
+                        continue
+                    try:
+                        replacement_table = next(candidate_tables)
+                    except StopIteration:
+                        candidate_exhausted = True
+                        continue
+
+                    evaluation = current_evaluations[slot_index]
+                    if evaluation is None:
+                        raise RuntimeError(
+                            "failed replacement slot is missing its evaluation"
+                        )
+                    source_table_id = str(
+                        evaluation.source_table["source_table_id"]
+                    )
+                    pending_discards.append(source_table_id)
+                    slot_tables[slot_index] = replacement_table
+                    current_evaluations[slot_index] = None
+                    candidates_consumed += 1
+                    discarded += 1
+                    replacements += 1
+                    retained_failed -= 1
+                    next_pending_slots.append(slot_index)
+
+            round_stats.append(
+                ReplacementRoundStats(
+                    round_index=round_index,
+                    evaluated=len(evaluations),
+                    unrecoverable=len(failed_slots),
+                    discarded=discarded,
+                    retained_failed=retained_failed,
+                    replacements=replacements,
                 )
-        if pending_discards:
-            discard_tables(pending_discards)
-            pending_discards = []
-
-        unrecoverable = 0
-        discarded = 0
-        retained_failed = 0
-        replacements = 0
-        next_pending_slots: list[int] = []
-        for slot_index, evaluation in zip(pending_slots, evaluations):
-            if evaluation.queryable:
-                final_evaluations[slot_index] = evaluation
-                continue
-
-            unrecoverable += 1
-            if replacement_counts[slot_index] >= policy.rounds:
-                retained_failed += 1
-                final_evaluations[slot_index] = evaluation
-                continue
-
-            if rng.random() >= policy.drop_probability:
-                retained_failed += 1
-                final_evaluations[slot_index] = evaluation
-                continue
-
-            if candidate_exhausted:
-                retained_failed += 1
-                final_evaluations[slot_index] = evaluation
-                continue
-            try:
-                replacement_table = next(candidate_tables)
-            except StopIteration:
-                candidate_exhausted = True
-                retained_failed += 1
-                final_evaluations[slot_index] = evaluation
-                continue
-
-            source_table_id = str(evaluation.source_table["source_table_id"])
-            pending_discards.append(source_table_id)
-            slot_tables[slot_index] = replacement_table
-            replacement_counts[slot_index] += 1
-            candidates_consumed += 1
-            discarded += 1
-            replacements += 1
-            next_pending_slots.append(slot_index)
-
-        round_stats.append(
-            ReplacementRoundStats(
-                round_index=round_index,
-                evaluated=len(evaluations),
-                unrecoverable=unrecoverable,
-                discarded=discarded,
-                retained_failed=retained_failed,
-                replacements=replacements,
             )
-        )
-        pending_slots = next_pending_slots
-        round_index += 1
+            if (
+                not failed_slots
+                or round_index >= policy.rounds
+                or (candidate_exhausted and not replacements)
+            ):
+                break
+            pending_slots = next_pending_slots
 
     return ReplacementSelection(
         final_evaluations=[
             evaluation
-            for evaluation in final_evaluations
+            for evaluation in current_evaluations
             if evaluation is not None
         ],
         rounds=round_stats,
@@ -2208,6 +2150,125 @@ def select_best_qualified_column(qualified_cols: list[dict[str, Any]]) -> list[d
     return [max(qualified_cols, key=lambda item: float(item["recovered_value_ratio"]))]
 
 
+def multi_attribute_context_layout(
+    *,
+    source_table: dict[str, Any],
+    entity_col: int,
+    qualified_cols: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[tuple[dict[str, Any], list[int], list[int]]]:
+    """Assign safe query/target contexts for all qualified bridge columns.
+
+    Every qualified bridge column is target-only. Ordinary context columns are
+    partitioned once per source table so no sibling query and target share a
+    source column. Narrow tables fall back to the single best bridge column.
+    """
+    if not qualified_cols:
+        return []
+
+    ordered_qualified = sorted(
+        qualified_cols,
+        key=lambda item: (
+            -float(item["recovered_value_ratio"]),
+            int(item["column_index"]),
+        ),
+    )
+    all_qualified_indices = {
+        int(qualified["column_index"]) for qualified in ordered_qualified
+    }
+    max_variants = int(getattr(args, "max_query_tables_per_source_table", 0))
+    if max_variants > 0:
+        ordered_qualified = ordered_qualified[:max_variants]
+
+    ordinary_contexts = context_columns(
+        source_table,
+        {entity_col, *all_qualified_indices},
+        0,
+    )
+    query_context_width = max(
+        1, int(getattr(args, "max_query_context_attrs", 1))
+    )
+    if (
+        len(ordered_qualified) > 1
+        and len(ordinary_contexts) >= query_context_width + 1
+    ):
+        seed = int(getattr(args, "seed", 13))
+        source_table_id = str(source_table["source_table_id"])
+        ordered_contexts = sorted(
+            ordinary_contexts,
+            key=lambda column_index: (
+                stable_hash(
+                    "multi-attribute-context",
+                    seed,
+                    source_table_id,
+                    column_index,
+                    length=40,
+                ),
+                column_index,
+            ),
+        )
+        target_context = [ordered_contexts[0]]
+        query_context_pool = ordered_contexts[1:]
+        query_contexts = [
+            list(context)
+            for context in combinations(
+                query_context_pool,
+                query_context_width,
+            )
+        ]
+        if query_contexts:
+            return [
+                (
+                    qualified,
+                    query_contexts[index % len(query_contexts)],
+                    target_context,
+                )
+                for index, qualified in enumerate(ordered_qualified)
+            ]
+
+    best = select_best_qualified_column(ordered_qualified)[0]
+    join_col = int(best["column_index"])
+    other_cols = context_columns(source_table, {entity_col, join_col}, 0)
+    if not other_cols:
+        return []
+    query_context = other_cols[:query_context_width]
+    target_context_pool = [
+        column_index
+        for column_index in other_cols
+        if column_index not in query_context
+    ]
+    if not target_context_pool:
+        return []
+    target_context = target_context_pool[:1]
+    return [(best, query_context, target_context)]
+
+
+def visible_query_fingerprint(
+    *,
+    source_table: dict[str, Any],
+    query_cols: list[int],
+    query_rows: list[dict[str, Any]],
+) -> str:
+    visible_payload = {
+        "column_names": [
+            get_column_name(source_table, column_index)
+            for column_index in query_cols
+        ],
+        "rows": [
+            [
+                clean_text(cell.get("text"))
+                for cell in row.get("cells", [])
+            ]
+            for row in query_rows
+        ],
+    }
+    return stable_hash(
+        "visible-query",
+        json.dumps(visible_payload, ensure_ascii=False, sort_keys=True),
+        length=40,
+    )
+
+
 def required_recovered_row_count(
     valid_entity_rows: int,
     query_rows_per_table: int,
@@ -2933,12 +2994,19 @@ def build_table_join_records(
             "qualified_columns": [],
         }
 
-    qualified_cols = select_best_qualified_column(qualified_cols)
+    variant_layouts = multi_attribute_context_layout(
+        source_table=source_table,
+        entity_col=entity_col,
+        qualified_cols=qualified_cols,
+        args=args,
+    )
 
     query_tables: list[dict[str, Any]] = []
+    query_by_fingerprint: dict[str, dict[str, Any]] = {}
     data_lake_tables: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
-    for qualified in qualified_cols:
+    emitted_qualified_cols: list[dict[str, Any]] = []
+    for qualified, query_context, target_context in variant_layouts:
         join_col = int(qualified["column_index"])
         selected_source_rows = select_query_source_rows(
             source_row_order=valid_entity_source_row_order,
@@ -2949,15 +3017,6 @@ def build_table_join_records(
         if len(selected_source_rows) != query_rows_per_table:
             continue
         selected_source_row_set = set(selected_source_rows)
-        excluded = {entity_col, join_col}
-        other_cols = context_columns(source_table, excluded, 0)
-        if not other_cols:
-            continue
-        query_context = other_cols[: max(1, args.max_query_context_attrs)]
-        target_context_pool = [col for col in other_cols if col not in query_context]
-        target_context = target_context_pool[: args.max_target_context_attrs]
-        if not target_context:
-            target_context = other_cols[:1]
         query_cols = [entity_col] + query_context
         target_cols = [join_col] + target_context
         if len(query_cols) < 2 or len(target_cols) < 2:
@@ -2987,7 +3046,6 @@ def build_table_join_records(
         qualified["selected_rows"] = query_rows_per_table
         qualified["target_rows"] = len(target_rows)
         chain_id = f"chain_{stable_hash(source_table['source_table_id'], entity_col, join_col)}"
-        query_table_id = f"query_{stable_hash(chain_id, 'query')}"
         target_table_id = f"target_{stable_hash(chain_id, 'target')}"
         hidden_attribute = {
             "source_column_index": join_col,
@@ -3001,8 +3059,17 @@ def build_table_join_records(
             "selected_rows": qualified["selected_rows"],
             "target_rows": qualified["target_rows"],
         }
-        query_tables.append(
-            table_record(
+        query_fingerprint = visible_query_fingerprint(
+            source_table=source_table,
+            query_cols=query_cols,
+            query_rows=query_rows,
+        )
+        query_table = query_by_fingerprint.get(query_fingerprint)
+        if query_table is None:
+            query_table_id = (
+                f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
+            )
+            query_table = table_record(
                 table_id=query_table_id,
                 role="query",
                 split=split,
@@ -3012,13 +3079,22 @@ def build_table_join_records(
                 source_row_indices=query_source_rows,
                 extra={
                     "chain_id": chain_id,
+                    "chain_ids": [chain_id],
                     "query_entity_col": entity_col,
                     "query_entity_col_name": get_column_name(source_table, entity_col),
                     "hidden_attributes": [hidden_attribute],
+                    "target_table_ids": [target_table_id],
                     "query_context_col_names": [get_column_name(source_table, col) for col in query_context],
                 },
             )
-        )
+            query_by_fingerprint[query_fingerprint] = query_table
+            query_tables.append(query_table)
+        else:
+            query_table_id = str(query_table["table_id"])
+            query_table["chain_ids"].append(chain_id)
+            query_table["hidden_attributes"].append(hidden_attribute)
+            query_table["target_table_ids"].append(target_table_id)
+
         data_lake_tables.append(
             table_record(
                 table_id=target_table_id,
@@ -3037,6 +3113,7 @@ def build_table_join_records(
                 },
             )
         )
+        emitted_qualified_cols.append(qualified)
         qrels.append(
             {
                 "query_table_id": query_table_id,
@@ -3088,13 +3165,15 @@ def build_table_join_records(
         return [], [raw], [], {
             "reason": "qualified_columns_failed_query_target_split",
             "entity_column_index": entity_col,
-            "qualified_columns": qualified_cols,
+            "qualified_columns": [
+                qualified for qualified, _query_context, _target_context in variant_layouts
+            ],
         }
     return query_tables, data_lake_tables, qrels, {
         "reason": "queryable",
         "entity_column_index": entity_col,
         "attribute_extractions": extraction_count,
-        "qualified_columns": qualified_cols,
+        "qualified_columns": emitted_qualified_cols,
     }
 
 
@@ -3662,8 +3741,11 @@ def _build_dataset(
     source_sampling = {
         "mode": "seeded_random_file_and_table_order",
         "seed": args.seed,
+        "entity_column_policy": "require_candidate_before_global_sampling",
         "unrecoverable_replacement_rounds": policy.rounds,
         "unrecoverable_drop_probability": policy.drop_probability,
+        "replacement_scope": "all_current_failed_slots",
+        "discarded_candidate_cache_policy": "retain_persistent_cache",
     }
     stats = {
         "processed_tables": counters.processed_tables,
@@ -3692,18 +3774,28 @@ def _build_dataset(
         "skipped_reasons": dict(counters.skip_reasons),
         "sampling_mode": source_sampling["mode"],
         "sampling_seed": args.seed,
+        "entity_column_policy": source_sampling["entity_column_policy"],
         "unrecoverable_replacement_rounds": policy.rounds,
         "unrecoverable_drop_probability": policy.drop_probability,
+        "unrecoverable_replacement_scope": source_sampling["replacement_scope"],
+        "discarded_candidate_cache_policy": source_sampling[
+            "discarded_candidate_cache_policy"
+        ],
         "random_candidates_structurally_accepted": selection.candidates_consumed,
         "initial_slots_filled": target_count - selection.unfilled_slots,
         "replacement_selection": replacement_selection,
         "cleanup": asdict(cleanup_totals),
         "notes": [
             "source_tables are the fixed data-lake base pool",
+            "tables without a candidate entity column are filtered before the seeded global source-table sample",
             "query_tables use a capped recovery threshold over valid entity rows, prefer recoverable rows, and contain exactly query_rows_per_table sampled rows",
+            "wide source tables emit one variant per qualifying bridge attribute; all qualifying bridge columns stay out of every sibling query, and ordinary context columns are partitioned into source-level query-only and target-only sides",
+            "identical visible queries from one source table are merged and retain every hidden attribute, target table ID, chain ID, and qrel",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
+            "each replacement pass draws from every currently failed slot; retained_failed slots are deferred to the next pass unless the pass is terminal",
+            "discarded candidates are pruned from active output material while downloaded images and persistent Wikipedia/model caches are retained for later runs",
         ],
     }
     write_json(output_dir / "stats.json", stats)
@@ -3734,6 +3826,11 @@ def _build_dataset(
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
+            "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
+            "max_query_context_attrs": args.max_query_context_attrs,
+            "qualified_attribute_policy": "all_safe_variants",
+            "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
+            "identical_visible_query_policy": "merge_with_multiple_qrels",
         },
         "source_sampling": source_sampling,
         "model_endpoints": {

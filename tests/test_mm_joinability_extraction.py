@@ -134,6 +134,216 @@ def test_select_best_qualified_column_uses_highest_recovery_ratio():
     assert select_best_qualified_column(qualified) == [qualified[1]]
 
 
+def build_multi_attribute_join_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    context_column_names: list[str],
+):
+    column_names = ["Entity", "Bridge B", "Bridge C", *context_column_names]
+    rows = []
+    expected_values: dict[int, dict[str, str]] = {}
+    assets = {}
+    entity_to_assets = {}
+    wiki_to_entity_id = {}
+    for row_index in range(5):
+        wiki_title = f"Entity {row_index}"
+        entity_id = f"entity-{row_index}"
+        asset_id = f"asset-{row_index}"
+        values = {
+            column_name: f"{column_name} value {row_index}"
+            for column_name in column_names[1:]
+        }
+        expected_values[row_index] = values
+        rows.append(
+            {
+                "row_id": row_index,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": wiki_title,
+                        "wiki_title": wiki_title,
+                    },
+                    *[
+                        {
+                            "column_index": column_index,
+                            "column_name": column_name,
+                            "text": values[column_name],
+                            "wiki_title": None,
+                        }
+                        for column_index, column_name in enumerate(
+                            column_names[1:], start=1
+                        )
+                    ],
+                ],
+            }
+        )
+        assets[asset_id] = {
+            "asset_id": asset_id,
+            "asset_type": "text",
+            "entity_id": entity_id,
+            "content": f"{wiki_title} bridge evidence",
+        }
+        entity_to_assets[entity_id] = [asset_id]
+        wiki_to_entity_id[wiki_title] = entity_id
+
+    source_table = {
+        "source_table_id": "multi-attribute-source",
+        "page_title": "Multi attribute source",
+        "columns": [
+            {"column_index": index, "column_name": column_name}
+            for index, column_name in enumerate(column_names)
+        ],
+        "rows": rows,
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "5",
+            "--min_rows_per_output_table",
+            "5",
+            "--min_recovered_value_ratio",
+            "0.5",
+            "--max_query_tables_per_source_table",
+            "0",
+        ]
+    )
+
+    def fake_resolve_extraction_tasks(**kwargs: object):
+        tasks = kwargs["tasks"]
+        return [
+            (
+                task,
+                {
+                    "cache_key": task.cache_key,
+                    "attributes": [
+                        {
+                            "name": column_name,
+                            "value": expected_values[task.source_row_id][column_name],
+                            "evidence": "synthetic",
+                            "connection_evidence": "synthetic",
+                        }
+                        for column_name in ("Bridge B", "Bridge C")
+                    ],
+                    "raw_response": "",
+                    "error": "",
+                },
+            )
+            for task in tasks
+        ]
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "resolve_extraction_tasks",
+        fake_resolve_extraction_tasks,
+    )
+    extraction_writer = joinability_dataset.ListRecordWriter()
+    recovery_writer = joinability_dataset.ListRecordWriter()
+    query_tables, target_tables, qrels, decision = (
+        joinability_dataset.build_table_join_records(
+            source_table=source_table,
+            split="train",
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wiki_to_entity_id=wiki_to_entity_id,
+            extractor=None,
+            cache=ExtractionCache(tmp_path / "model-cache.jsonl"),
+            progress=None,
+            concurrency_state=ModelConcurrencyState(
+                text_workers=1, image_workers=1
+            ),
+            extraction_writer=extraction_writer,
+            recovery_writer=recovery_writer,
+            args=args,
+        )
+    )
+    return query_tables, target_tables, qrels, decision, recovery_writer.records
+
+
+def test_multi_attribute_queries_use_globally_disjoint_context_sides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query_tables, target_tables, qrels, decision, recovery_records = (
+        build_multi_attribute_join_records(
+            tmp_path,
+            monkeypatch,
+            context_column_names=["Query X", "Query Y", "Target Z"],
+        )
+    )
+
+    assert decision["reason"] == "queryable"
+    assert len(query_tables) == 2
+    assert len(target_tables) == 2
+    assert len(qrels) == 2
+    assert {target["join_col_name"] for target in target_tables} == {
+        "Bridge B",
+        "Bridge C",
+    }
+    assert all(
+        not ({1, 2} & set(query["source_column_indices"]))
+        for query in query_tables
+    )
+    assert all(
+        not (
+            set(query["source_column_indices"])
+            & set(target["source_column_indices"])
+        )
+        for query in query_tables
+        for target in target_tables
+    )
+    assert {record["target_table_id"] for record in recovery_records} == {
+        target["table_id"] for target in target_tables
+    }
+
+
+def test_identical_visible_multi_attribute_queries_merge_with_multiple_qrels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query_tables, target_tables, qrels, decision, _recovery_records = (
+        build_multi_attribute_join_records(
+            tmp_path,
+            monkeypatch,
+            context_column_names=["Query X", "Target Z"],
+        )
+    )
+
+    assert decision["reason"] == "queryable"
+    assert len(query_tables) == 1
+    assert len(target_tables) == 2
+    assert len(qrels) == 2
+    assert {qrel["query_table_id"] for qrel in qrels} == {
+        query_tables[0]["table_id"]
+    }
+    assert {item["column_name"] for item in query_tables[0]["hidden_attributes"]} == {
+        "Bridge B",
+        "Bridge C",
+    }
+    assert set(query_tables[0]["target_table_ids"]) == {
+        target["table_id"] for target in target_tables
+    }
+
+
+def test_multi_attribute_split_falls_back_to_best_column_when_context_is_too_narrow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query_tables, target_tables, qrels, decision, _recovery_records = (
+        build_multi_attribute_join_records(
+            tmp_path,
+            monkeypatch,
+            context_column_names=["Only Context"],
+        )
+    )
+
+    assert decision["reason"] == "queryable"
+    assert len(query_tables) == len(target_tables) == len(qrels) == 1
+
+
 def test_required_recovered_rows_caps_denominator_at_query_size():
     assert required_recovered_row_count(4, 5, 0.6) == 3
     assert required_recovered_row_count(5, 5, 0.6) == 3

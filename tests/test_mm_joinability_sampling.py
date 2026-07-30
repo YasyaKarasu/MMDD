@@ -80,8 +80,8 @@ def write_entitables_file(path: Path, table_ids: list[str]) -> None:
         table_id: {
             "title": ["Entity", "Value"],
             "data": [
-                [f"{table_id} entity 1", "alpha"],
-                [f"{table_id} entity 2", "beta"],
+                [f"[{table_id}_entity_1|{table_id} entity 1]", "alpha"],
+                [f"[{table_id}_entity_2|{table_id} entity 2]", "beta"],
             ],
             "numCols": 2,
             "numDataRows": 2,
@@ -420,6 +420,50 @@ def test_different_seeds_produce_different_candidate_order(
     assert candidate_ids(entitables_dir, 13) != candidate_ids(entitables_dir, 29)
 
 
+def test_global_sample_filters_tables_without_candidate_entity_column(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "without_entity": {
+            "title": ["Name", "Value"],
+            "data": [["Alpha", "one"], ["Beta", "two"]],
+            "numCols": 2,
+            "numDataRows": 2,
+        },
+        "with_entity": {
+            "title": ["Entity", "Value"],
+            "data": [
+                ["[Alpha|Alpha]", "one"],
+                ["[Beta|Beta]", "two"],
+            ],
+            "numCols": 2,
+            "numDataRows": 2,
+        },
+    }
+    (tmp_path / "tables.json").write_text(json.dumps(payload), encoding="utf-8")
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "2",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    counters = builder.SourceCandidateCounters()
+
+    selected = list(builder.iter_random_source_tables(tmp_path, args, counters))
+
+    assert [table["source_table_id"] for table in selected] == [
+        f"st_with_entity_{builder.stable_hash('tables.json', 'with_entity', length=10)}"
+    ]
+    assert counters.skipped_tables == 1
+    assert counters.skip_reasons == {"no_candidate_entity_column": 1}
+
+
 def test_global_capped_sample_scans_every_file_before_first_yield(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -624,7 +668,7 @@ def test_queryable_table_never_draws_or_replaces() -> None:
     assert discarded == []
 
 
-def test_failed_table_is_retained_when_draw_equals_probability() -> None:
+def test_failed_table_not_selected_in_one_pass_remains_eligible_later() -> None:
     tables = replacement_tables()
     discarded: list[str] = []
 
@@ -632,17 +676,48 @@ def test_failed_table_is_retained_when_draw_equals_probability() -> None:
         candidate_tables=iter(tables),
         target_count=1,
         policy=builder.ReplacementPolicy(rounds=2, drop_probability=0.5),
-        rng=StubRandom([0.5]),
-        evaluate_batch=evaluator_for({"t0": False}),
+        rng=StubRandom([0.5, 0.1]),
+        evaluate_batch=evaluator_for({"t0": False, "t1": True}),
         discard_tables=lambda table_ids: discarded.extend(table_ids),
     )
 
     assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
-        "t0"
+        "t1"
     ]
-    assert selection.rounds == [builder.ReplacementRoundStats(0, 1, 1, 0, 1, 0)]
-    assert selection.candidates_consumed == 1
-    assert discarded == []
+    assert selection.rounds == [
+        builder.ReplacementRoundStats(0, 1, 1, 0, 1, 0),
+        builder.ReplacementRoundStats(1, 0, 1, 1, 0, 1),
+        builder.ReplacementRoundStats(2, 1, 0, 0, 0, 0),
+    ]
+    assert selection.candidates_consumed == 2
+    assert discarded == ["t0"]
+
+
+def test_each_pass_samples_from_complete_current_failed_pool() -> None:
+    discarded: list[str] = []
+
+    selection = builder.run_replacement_rounds(
+        candidate_tables=iter(replacement_tables()),
+        target_count=2,
+        policy=builder.ReplacementPolicy(rounds=2, drop_probability=0.5),
+        rng=StubRandom([0.9, 0.1, 0.1, 0.9]),
+        evaluate_batch=evaluator_for(
+            {"t0": False, "t1": False, "t2": False, "t3": True}
+        ),
+        discard_tables=lambda table_ids: discarded.extend(table_ids),
+    )
+
+    assert [item.source_table["source_table_id"] for item in selection.final_evaluations] == [
+        "t3",
+        "t2",
+    ]
+    assert selection.rounds == [
+        builder.ReplacementRoundStats(0, 2, 2, 1, 1, 1),
+        builder.ReplacementRoundStats(1, 1, 2, 1, 1, 1),
+        builder.ReplacementRoundStats(2, 1, 1, 0, 1, 0),
+    ]
+    assert selection.candidates_consumed == 4
+    assert discarded == ["t1", "t0"]
 
 
 def test_failed_slot_replaces_twice_then_retains_at_limit() -> None:
@@ -1537,7 +1612,7 @@ def test_batch_material_preparation_uses_batch_path_and_never_refetches(
     }
 
 
-def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
+def test_candidate_evaluation_retains_rejected_imageinfo_after_active_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     args = builder.parse_args(
@@ -1630,13 +1705,9 @@ def test_candidate_evaluation_tracks_rejected_imageinfo_for_shared_cleanup(
 
     stats = registry.sweep({"retained"})
 
-    assert stats.imageinfo_records_removed == 1
+    assert stats.imageinfo_records_removed == 0
     assert stats.shared_dependencies_protected >= 1
-    assert image_cache.keys() == {"File:Shared.jpg"}
-    assert [
-        record["file_title"]
-        for record in builder.iter_jsonl_records([wikipedia.image_cache_path])
-    ] == ["File:Shared.jpg"]
+    assert image_cache.keys() == {"File:Exclusive.jpg", "File:Shared.jpg"}
 
 
 def test_candidate_evaluation_reuses_rejected_imageinfo_for_shared_entity_cleanup(
@@ -1830,7 +1901,7 @@ def cleanup_registry(tmp_path: Path) -> tuple[
     )
 
 
-def test_discard_removes_exclusive_material_and_preserves_shared_dependencies(
+def test_discard_prunes_active_material_but_retains_persistent_caches(
     tmp_path: Path,
 ) -> None:
     (
@@ -1842,39 +1913,37 @@ def test_discard_removes_exclusive_material_and_preserves_shared_dependencies(
         exclusive_image,
         shared_image,
     ) = cleanup_registry(tmp_path)
-    exclusive_bytes = exclusive_image.stat().st_size
-
     stats = registry.discard("A")
 
     assert assets == {"asset-shared": assets["asset-shared"]}
     assert entity_to_assets == {"entity-shared": ["asset-shared"]}
-    assert wikipedia.page_cache.keys() == {"Page shared"}
-    assert wikipedia.image_cache.keys() == {"File:Shared.jpg"}
-    assert model_cache.items.keys() == {"model-shared"}
-    assert not exclusive_image.exists()
+    assert wikipedia.page_cache.keys() == {"Page A", "Page shared"}
+    assert wikipedia.image_cache.keys() == {"File:A.jpg", "File:Shared.jpg"}
+    assert model_cache.items.keys() == {"model-a", "model-shared"}
+    assert exclusive_image.exists()
     assert shared_image.exists()
     assert stats == builder.CacheCleanupStats(
         entities_removed=1,
         assets_removed=1,
-        page_records_removed=1,
-        imageinfo_records_removed=1,
-        model_records_removed=1,
-        image_files_removed=1,
-        image_bytes_removed=exclusive_bytes,
         shared_dependencies_protected=7,
     )
     assert [record["wiki_title"] for record in builder.iter_jsonl_records([wikipedia.page_cache_path])] == [
-        "Page shared"
+        "Page A",
+        "Page shared",
     ]
     assert [record["file_title"] for record in builder.iter_jsonl_records([wikipedia.image_cache_path])] == [
-        "File:Shared.jpg"
+        "File:A.jpg",
+        "File:Shared.jpg",
     ]
     assert [record["cache_key"] for record in builder.iter_jsonl_records([model_cache.path])] == [
-        "model-shared"
+        "model-a",
+        "model-shared",
     ]
+    restarted_cache = builder.ExtractionCache(model_cache.path)
+    assert restarted_cache.items.keys() == {"model-a", "model-shared"}
 
 
-def test_sweep_batches_orphans_compacts_once_and_aggregates_cleanup(
+def test_sweep_prunes_orphans_without_compacting_persistent_caches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (
@@ -1912,121 +1981,39 @@ def test_sweep_batches_orphans_compacts_once_and_aggregates_cleanup(
             model_keys={"model-c", "model-shared"},
         ),
     )
-    calls: list[Path] = []
-    original_compact = builder.compact_keyed_jsonl
+    cache_contents = {
+        wikipedia.page_cache_path: wikipedia.page_cache_path.read_bytes(),
+        wikipedia.image_cache_path: wikipedia.image_cache_path.read_bytes(),
+        model_cache.path: model_cache.path.read_bytes(),
+    }
 
-    def count_compaction(path: Path, records: object) -> None:
-        calls.append(path)
-        original_compact(path, records)
+    def fail_compaction(_path: Path, _records: object) -> None:
+        raise AssertionError("persistent caches must not be compacted during selection")
 
-    monkeypatch.setattr(builder, "compact_keyed_jsonl", count_compaction)
-    removed_bytes = exclusive_image.stat().st_size + second_image.stat().st_size
+    monkeypatch.setattr(builder, "compact_keyed_jsonl", fail_compaction)
 
     stats = registry.sweep({"B"})
 
-    assert calls == [
-        wikipedia.page_cache_path,
-        wikipedia.image_cache_path,
-        model_cache.path,
-    ]
     assert stats == builder.CacheCleanupStats(
         entities_removed=2,
         assets_removed=2,
-        page_records_removed=2,
-        imageinfo_records_removed=2,
-        model_records_removed=2,
-        image_files_removed=2,
-        image_bytes_removed=removed_bytes,
         shared_dependencies_protected=7,
     )
     assert set(registry.dependencies) == {"B"}
     assert set(assets) == {"asset-shared"}
     assert entity_to_assets == {"entity-shared": ["asset-shared"]}
-    assert wikipedia.page_cache.keys() == {"Page shared"}
-    assert wikipedia.image_cache.keys() == {"File:Shared.jpg"}
-    assert model_cache.items.keys() == {"model-shared"}
-    assert not exclusive_image.exists()
-    assert not second_image.exists()
-    assert shared_image.exists()
-
-
-def test_discard_many_continues_after_one_cache_compaction_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registry, _, _, wikipedia, model_cache, _, _ = cleanup_registry(tmp_path)
-    calls: list[Path] = []
-    original_compact = builder.compact_keyed_jsonl
-
-    def fail_page_compaction(path: Path, records: object) -> None:
-        calls.append(path)
-        if path == wikipedia.page_cache_path:
-            raise OSError("injected page compaction failure")
-        original_compact(path, records)
-
-    monkeypatch.setattr(builder, "compact_keyed_jsonl", fail_page_compaction)
-
-    stats = registry.discard_many(["A"])
-
-    assert calls == [
-        wikipedia.page_cache_path,
-        wikipedia.image_cache_path,
-        model_cache.path,
-    ]
-    assert stats.errors == 1
-    assert [
-        record["file_title"]
-        for record in builder.iter_jsonl_records([wikipedia.image_cache_path])
-    ] == ["File:Shared.jpg"]
-    assert [
-        record["cache_key"]
-        for record in builder.iter_jsonl_records([model_cache.path])
-    ] == ["model-shared"]
-
-
-def test_sweep_counts_unlink_error_and_continues_cache_compactions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (
-        registry,
-        _assets,
-        _entity_to_assets,
-        wikipedia,
-        model_cache,
-        exclusive_image,
-        shared_image,
-    ) = cleanup_registry(tmp_path)
-    original_unlink = Path.unlink
-
-    def fail_exclusive_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        if path == exclusive_image:
-            raise OSError("injected unlink failure")
-        original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", fail_exclusive_unlink)
-
-    stats = registry.sweep({"B"})
-
-    assert stats.page_records_removed == 1
-    assert stats.imageinfo_records_removed == 1
-    assert stats.model_records_removed == 1
-    assert stats.image_files_removed == 0
-    assert stats.image_bytes_removed == 0
-    assert stats.shared_dependencies_protected == 7
-    assert stats.errors == 1
+    assert wikipedia.page_cache.keys() == {"Page A", "Page C", "Page shared"}
+    assert wikipedia.image_cache.keys() == {
+        "File:A.jpg",
+        "File:C.jpg",
+        "File:Shared.jpg",
+    }
+    assert model_cache.items.keys() == {"model-a", "model-c", "model-shared"}
     assert exclusive_image.exists()
+    assert second_image.exists()
     assert shared_image.exists()
-    assert wikipedia.page_cache.keys() == {"Page shared"}
-    assert wikipedia.image_cache.keys() == {"File:Shared.jpg"}
-    assert model_cache.items.keys() == {"model-shared"}
-    assert [record["wiki_title"] for record in builder.iter_jsonl_records([wikipedia.page_cache_path])] == [
-        "Page shared"
-    ]
-    assert [record["file_title"] for record in builder.iter_jsonl_records([wikipedia.image_cache_path])] == [
-        "File:Shared.jpg"
-    ]
-    assert [record["cache_key"] for record in builder.iter_jsonl_records([model_cache.path])] == [
-        "model-shared"
-    ]
+    for path, original_contents in cache_contents.items():
+        assert path.read_bytes() == original_contents
 
 
 def test_build_dataset_materializes_only_settled_replacement_tables(
@@ -2208,6 +2195,8 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     assert stats["sampling_seed"] == args.seed
     assert stats["unrecoverable_replacement_rounds"] == 1
     assert stats["unrecoverable_drop_probability"] == 1.0
+    assert stats["unrecoverable_replacement_scope"] == "all_current_failed_slots"
+    assert stats["discarded_candidate_cache_policy"] == "retain_persistent_cache"
     assert stats["replacement_selection"] == {
         "rounds": [
             {
@@ -2235,8 +2224,11 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     assert manifest["source_sampling"] == {
         "mode": "seeded_random_file_and_table_order",
         "seed": args.seed,
+        "entity_column_policy": "require_candidate_before_global_sampling",
         "unrecoverable_replacement_rounds": 1,
         "unrecoverable_drop_probability": 1.0,
+        "replacement_scope": "all_current_failed_slots",
+        "discarded_candidate_cache_policy": "retain_persistent_cache",
     }
 
 
