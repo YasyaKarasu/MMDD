@@ -876,6 +876,45 @@ def test_model_endpoint_preflight_rechecks_modality_that_becomes_claimable(
     assert extractor.asset_ids == ["text", "image"]
 
 
+def test_post_claim_endpoint_preflight_failure_releases_new_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    monkeypatch.setattr(
+        models,
+        "_claimable_modalities",
+        lambda *_args, **_kwargs: set(),
+    )
+    extractor = EndpointAwareExtractor(
+        readiness_error=TransientModelEndpointError("image unavailable")
+    )
+
+    with pytest.raises(TransientModelEndpointError, match="unavailable"):
+        run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            output_root=tmp_path / "outputs",
+        )
+
+    assert extractor.readiness_calls == [({"image"}, 0.0)]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT status, owner, lease_id, lease_expires
+            FROM jobs WHERE job_id = ?
+            """,
+            (jobset.jobs[0].job_id,),
+        ).fetchone() == ("retryable", None, None, None)
+
+
 def test_transient_model_error_is_retryable_without_durable_result(
     tmp_path: Path,
 ) -> None:

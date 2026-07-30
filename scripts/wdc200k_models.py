@@ -2944,6 +2944,24 @@ def run_model_stage(
                     # and claim path instead of racing that transition.
                     continue
                 break
+            if (
+                callable(ensure_endpoints_ready)
+                and modality not in preflighted_modalities
+            ):
+                # Claimability can change after the preflight check and
+                # before claim() acquires its transaction.
+                try:
+                    ensure_endpoints_ready(
+                        modalities={modality},
+                        timeout_seconds=endpoint_ready_timeout_seconds,
+                    )
+                except BaseException:
+                    store.release_owner_leases(
+                        jobset.kind_for(modality),
+                        owner=modality_owner,
+                    )
+                    raise
+                preflighted_modalities.add(modality)
             with idle_lock:
                 idle_modalities.discard(modality)
             if progress_tracker is not None:
