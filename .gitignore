@@ -34,6 +34,9 @@ output_medium/
 dataset/
 webtable/
 hf_models/
+/ImageAttribute.zip
+/gate_inputs/
+/wdc_schemaorg_2023/
 
 # Large model / index / tensor artifacts
 *.pt
@@ -49,6 +52,11 @@ hf_models/
 # Human annotation working files
 human_labels_filled_round_*.jsonl
 *.filled.jsonl
+
+# Local WDC pipeline runtime and generated evidence
+/evidence_wdc_*/
+/runtime_gpu_share/
+/work_wdc_*/
 
 # Local agent instructions
 AGENTS.md
