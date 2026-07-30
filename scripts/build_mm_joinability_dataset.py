@@ -13,16 +13,20 @@ from __future__ import annotations
 import argparse
 import base64
 import heapq
+import hashlib
 import io
 import json
 import logging
+import math
 import mimetypes
+import os
 import random
 import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field as dataclass_field
 from decimal import ROUND_CEILING, Decimal
 from itertools import combinations
@@ -61,6 +65,7 @@ from build_mm_table_dataset import (
     write_table_asset_links_from_jsonl,
 )
 from image_preprocessing import target_size
+import model_marker_protocol as model_markers
 from stage1_io import (
     clean_text,
     column_profiles,
@@ -1146,6 +1151,39 @@ def normalize_model_base_urls(values: Iterable[str] | str | None) -> list[str]:
     return urls
 
 
+class TransientModelEndpointError(RuntimeError):
+    """A model endpoint failure that may succeed when retried later."""
+
+
+def model_api_key(explicit_value: Any, modality_environment_variable: str) -> str | None:
+    for value in (
+        explicit_value,
+        os.environ.get(modality_environment_variable),
+        os.environ.get("VLLM_API_KEY"),
+    ):
+        if value is None:
+            continue
+        key = str(value).strip()
+        if key:
+            return key
+    return None
+
+
+def is_transient_request_exception(exc: Exception) -> bool:
+    if requests is None:
+        return False
+    exceptions = getattr(requests, "exceptions", None)
+    transient_types = tuple(
+        exception_type
+        for exception_type in (
+            getattr(exceptions, "ConnectionError", None),
+            getattr(exceptions, "Timeout", None),
+        )
+        if isinstance(exception_type, type)
+    )
+    return bool(transient_types) and isinstance(exc, transient_types)
+
+
 class ModelCallStats:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1224,8 +1262,12 @@ class LocalAttributeExtractor:
         self.text_model_base_urls_file = clean_text(getattr(args, "text_model_base_urls_file", ""))
         self._text_endpoint_lock = threading.Lock()
         self._text_endpoint_index = 0
+        self._text_endpoint_inflight: dict[str, int] = {}
         self.text_model_name = args.text_model_name
-        self.text_model_api_key = args.text_model_api_key
+        self.text_model_api_key = model_api_key(
+            getattr(args, "text_model_api_key", None),
+            "MMDD_TEXT_MODEL_API_KEY",
+        )
         configured_image_urls = normalize_model_base_urls(getattr(args, "image_model_base_urls", None))
         fallback_image_url = clean_text(getattr(args, "image_model_base_url", "")).rstrip("/")
         if fallback_image_url:
@@ -1236,8 +1278,12 @@ class LocalAttributeExtractor:
         self.image_model_base_urls_file = clean_text(getattr(args, "image_model_base_urls_file", ""))
         self._image_endpoint_lock = threading.Lock()
         self._image_endpoint_index = 0
+        self._image_endpoint_inflight: dict[str, int] = {}
         self.image_model_name = args.image_model_name
-        self.image_model_api_key = args.image_model_api_key
+        self.image_model_api_key = model_api_key(
+            getattr(args, "image_model_api_key", None),
+            "MMDD_IMAGE_MODEL_API_KEY",
+        )
         self.timeout = args.model_timeout_seconds
         self.temperature = args.model_temperature
         self.max_tokens = args.model_max_tokens
@@ -1302,6 +1348,208 @@ class LocalAttributeExtractor:
             self._image_endpoint_index += 1
             return urls[index]
 
+    def _acquire_model_base_url(self, model_kind: str) -> str:
+        if model_kind == "text":
+            lock = self._text_endpoint_lock
+            urls_getter = self.current_text_model_base_urls
+            inflight = self._text_endpoint_inflight
+            index_name = "_text_endpoint_index"
+        elif model_kind == "image":
+            lock = self._image_endpoint_lock
+            urls_getter = self.current_image_model_base_urls
+            inflight = self._image_endpoint_inflight
+            index_name = "_image_endpoint_index"
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+
+        with lock:
+            urls = urls_getter()
+            if not urls:
+                raise RuntimeError(f"no {model_kind} model endpoints are configured")
+            minimum_inflight = min(inflight.get(url, 0) for url in urls)
+            candidates = [
+                url
+                for url in urls
+                if inflight.get(url, 0) == minimum_inflight
+            ]
+            index = getattr(self, index_name)
+            base_url = candidates[index % len(candidates)]
+            setattr(self, index_name, index + 1)
+            inflight[base_url] = inflight.get(base_url, 0) + 1
+            return base_url
+
+    def _release_model_base_url(self, model_kind: str, base_url: str) -> None:
+        if model_kind == "text":
+            lock = self._text_endpoint_lock
+            inflight = self._text_endpoint_inflight
+        elif model_kind == "image":
+            lock = self._image_endpoint_lock
+            inflight = self._image_endpoint_inflight
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+
+        with lock:
+            count = inflight.get(base_url, 0)
+            if count <= 1:
+                inflight.pop(base_url, None)
+            else:
+                inflight[base_url] = count - 1
+
+    @contextmanager
+    def lease_model_base_url(self, model_kind: str) -> Iterator[str]:
+        """Lease the least-loaded current endpoint for one complete model call."""
+
+        base_url = self._acquire_model_base_url(model_kind)
+        try:
+            yield base_url
+        finally:
+            self._release_model_base_url(model_kind, base_url)
+
+    def _endpoint_is_current(self, model_kind: str, base_url: str) -> bool:
+        if model_kind == "text":
+            urls = self.current_text_model_base_urls()
+        elif model_kind == "image":
+            urls = self.current_image_model_base_urls()
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+        return base_url in urls
+
+    def _probe_endpoint(
+        self,
+        model_kind: str,
+        base_url: str,
+        model: str,
+        api_key: str | None,
+        request_timeout: float,
+    ) -> None:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        models_url = f"{base_url.rstrip('/')}/models"
+        transport_error: RuntimeError | None = None
+        try:
+            response = requests.get(models_url, headers=headers, timeout=request_timeout)
+        except Exception as exc:
+            message = (
+                f"{model_kind} model endpoint {base_url} readiness check failed "
+                f"({type(exc).__name__})"
+            )
+            if is_transient_request_exception(exc):
+                transport_error = TransientModelEndpointError(message)
+            else:
+                transport_error = RuntimeError(message)
+        if transport_error is not None:
+            raise transport_error from None
+
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code == 429 or status_code >= 500:
+            raise TransientModelEndpointError(
+                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+            )
+        if status_code < 200 or status_code >= 300:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+            )
+        try:
+            payload = response.json()
+            data = payload["data"]
+            served_models = {
+                clean_text(item.get("id"))
+                for item in data
+                if isinstance(item, dict) and clean_text(item.get("id"))
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} returned invalid models JSON"
+            ) from exc
+        if model not in served_models:
+            raise RuntimeError(
+                f"{model_kind} model endpoint {base_url} does not serve configured model {model!r}"
+            )
+
+    def ensure_endpoints_ready(
+        self,
+        modalities: set[str],
+        timeout_seconds: float,
+        poll_seconds: float = 2.0,
+    ) -> None:
+        """Poll every selected endpoint within one shared readiness deadline.
+
+        A zero timeout performs one probe per endpoint, with each HTTP request capped
+        at one second. Positive timeouts cap every request by the deadline remaining
+        immediately before that request.
+        """
+        timeout_seconds = float(timeout_seconds)
+        poll_seconds = float(poll_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be a finite non-negative number")
+        if not math.isfinite(poll_seconds) or poll_seconds < 0:
+            raise ValueError("poll_seconds must be a finite non-negative number")
+
+        endpoint_configs: list[tuple[str, str, str, str | None]] = []
+        for model_kind in ("text", "image"):
+            if model_kind not in modalities:
+                continue
+            if model_kind == "text":
+                urls = self.current_text_model_base_urls()
+                model = self.text_model_name
+                api_key = self.text_model_api_key
+            else:
+                urls = self.current_image_model_base_urls()
+                model = self.image_model_name
+                api_key = self.image_model_api_key
+            endpoint_configs.extend((model_kind, url, model, api_key) for url in urls)
+
+        configured_request_timeout = float(self.timeout)
+        if not math.isfinite(configured_request_timeout) or configured_request_timeout <= 0:
+            configured_request_timeout = 1.0
+        single_probe = timeout_seconds == 0
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            retry_error: TransientModelEndpointError | None = None
+            for model_kind, url, model, api_key in endpoint_configs:
+                if not self._endpoint_is_current(model_kind, url):
+                    continue
+                if single_probe:
+                    request_timeout = min(configured_request_timeout, 1.0)
+                else:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TransientModelEndpointError(
+                            f"{model_kind} model endpoint {url} readiness deadline expired"
+                        )
+                    request_timeout = min(configured_request_timeout, remaining_seconds)
+                try:
+                    self._probe_endpoint(model_kind, url, model, api_key, request_timeout)
+                    if not single_probe and time.monotonic() >= deadline:
+                        raise TransientModelEndpointError(
+                            f"{model_kind} model endpoint {url} readiness deadline expired"
+                        )
+                except TransientModelEndpointError as error:
+                    if not self._endpoint_is_current(model_kind, url):
+                        logging.info(
+                            "Ignoring readiness failure for withdrawn %s endpoint %s",
+                            model_kind,
+                            url,
+                        )
+                        continue
+                    retry_error = error
+                    break
+                except RuntimeError:
+                    if not self._endpoint_is_current(model_kind, url):
+                        logging.info(
+                            "Ignoring readiness failure for withdrawn %s endpoint %s",
+                            model_kind,
+                            url,
+                        )
+                        continue
+                    raise
+            if retry_error is None:
+                return
+            if single_probe or time.monotonic() >= deadline:
+                raise retry_error
+            time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
     def chat(
         self,
         *,
@@ -1335,7 +1583,10 @@ class LocalAttributeExtractor:
                 status_code = int(getattr(response, "status_code", 200) or 200)
                 if status_code >= 400:
                     body = clean_text(getattr(response, "text", ""))[:500]
-                    raise RuntimeError(f"HTTP {status_code}: {body}")
+                    error_message = f"HTTP {status_code}: {body}"
+                    if status_code == 429 or status_code >= 500:
+                        raise TransientModelEndpointError(error_message)
+                    raise RuntimeError(error_message)
                 response.raise_for_status()
                 data = response.json()
                 content = clean_text(data["choices"][0]["message"]["content"])
@@ -1345,7 +1596,13 @@ class LocalAttributeExtractor:
                     elapsed_seconds=time.perf_counter() - started,
                     failed=True,
                 )
-                last_error = exc
+                if is_transient_request_exception(exc):
+                    last_error = TransientModelEndpointError(
+                        f"{model_kind} model endpoint {base_url} request failed "
+                        f"({type(exc).__name__})"
+                    )
+                else:
+                    last_error = exc
                 if attempt < self.max_retries:
                     time.sleep(self.retry_sleep)
             else:
@@ -1356,7 +1613,10 @@ class LocalAttributeExtractor:
                     usage=usage if isinstance(usage, dict) else None,
                 )
                 return content
-        raise RuntimeError(f"Local model call failed: {last_error}")
+        message = f"Local {model_kind} model call to {base_url} failed: {last_error}"
+        if isinstance(last_error, TransientModelEndpointError):
+            raise TransientModelEndpointError(message) from last_error
+        raise RuntimeError(message) from last_error
 
     def extraction_prompt(
         self,
@@ -1393,13 +1653,14 @@ class LocalAttributeExtractor:
                 {"role": "system", "content": "You are a precise information extraction engine."},
                 {"role": "user", "content": f"{prompt}\n\nText evidence:\n{content}"},
             ]
-            raw = self.chat(
-                base_url=self.next_text_model_base_url(),
-                model=self.text_model_name,
-                api_key=self.text_model_api_key,
-                messages=messages,
-                model_kind="text",
-            )
+            with self.lease_model_base_url("text") as base_url:
+                raw = self.chat(
+                    base_url=base_url,
+                    model=self.text_model_name,
+                    api_key=self.text_model_api_key,
+                    messages=messages,
+                    model_kind="text",
+                )
         elif asset.get("asset_type") == "image":
             image_url = clean_text(asset.get("image_url"))
             local_path = clean_text(asset.get("local_path"))
@@ -1419,13 +1680,14 @@ class LocalAttributeExtractor:
                 },
             ]
             try:
-                raw = self.chat(
-                    base_url=self.next_image_model_base_url(),
-                    model=self.image_model_name,
-                    api_key=self.image_model_api_key,
-                    messages=messages,
-                    model_kind="image",
-                )
+                with self.lease_model_base_url("image") as base_url:
+                    raw = self.chat(
+                        base_url=base_url,
+                        model=self.image_model_name,
+                        api_key=self.image_model_api_key,
+                        messages=messages,
+                        model_kind="image",
+                    )
             except Exception as exc:
                 if local_image_path is None or not is_context_length_error(exc):
                     raise
@@ -1444,13 +1706,14 @@ class LocalAttributeExtractor:
                     },
                 }
                 retry_messages[1]["content"] = retry_content
-                raw = self.chat(
-                    base_url=self.next_image_model_base_url(),
-                    model=self.image_model_name,
-                    api_key=self.image_model_api_key,
-                    messages=retry_messages,
-                    model_kind="image",
-                )
+                with self.lease_model_base_url("image") as base_url:
+                    raw = self.chat(
+                        base_url=base_url,
+                        model=self.image_model_name,
+                        api_key=self.image_model_api_key,
+                        messages=retry_messages,
+                        model_kind="image",
+                    )
         else:
             return {"attributes": [], "raw_response": "", "error": f"unsupported_asset_type:{asset.get('asset_type')}"}
         payload = safe_json_object(raw)
@@ -1495,6 +1758,23 @@ class ExtractionCache:
     def put_transient(self, key: str, record: dict[str, Any]) -> None:
         with self._lock:
             self.transient_items[key] = record
+
+
+def cache_get_transient(cache: Any, key: str) -> dict[str, Any] | None:
+    getter = getattr(cache, "get_transient", None)
+    return getter(key) if callable(getter) else None
+
+
+def cache_put_transient(
+    cache: Any,
+    key: str,
+    record: dict[str, Any],
+) -> None:
+    putter = getattr(cache, "put_transient", None)
+    if callable(putter):
+        putter(key, record)
+    else:
+        cache.put(key, record)
 
 
 class ModelAnalysisProgress:
@@ -1674,7 +1954,7 @@ def is_oom_error(message: Any) -> bool:
 
 
 def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) -> dict[str, Any]:
-    return {
+    record = {
         "cache_key": task.cache_key,
         "prompt_version": PROMPT_VERSION,
         "entity_id": task.entity["entity_id"],
@@ -1687,11 +1967,21 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
         "raw_response": result.get("raw_response", ""),
         "error": clean_text(result.get("error")),
     }
+    if "error_class" in result:
+        record["error_class"] = clean_text(result.get("error_class"))
+    return record
 
 
 def run_extraction_task(extractor: LocalAttributeExtractor, task: ExtractionTask) -> dict[str, Any]:
     try:
         result = extractor.extract(task.asset, task.entity, task.candidate_attribute_names)
+    except TransientModelEndpointError:
+        result = {
+            "attributes": [],
+            "raw_response": "",
+            "error": "model endpoint temporarily unavailable",
+            "error_class": "model_endpoint_transient",
+        }
     except Exception as exc:
         result = {"attributes": [], "raw_response": "", "error": str(exc)}
     return extraction_record_from_result(task, result)
@@ -1849,7 +2139,7 @@ def tasks_requiring_model_analysis(
         if task.cache_key in seen:
             continue
         seen.add(task.cache_key)
-        transient = cache.get_transient(task.cache_key)
+        transient = cache_get_transient(cache, task.cache_key)
         if transient is not None:
             if progress is not None:
                 progress.mark(
@@ -1900,7 +2190,7 @@ def resolve_extraction_tasks(
     for task in tasks:
         if task.cache_key in resolved_by_key or task.cache_key in uncached_by_key:
             continue
-        transient = cache.get_transient(task.cache_key)
+        transient = cache_get_transient(cache, task.cache_key)
         if transient is not None:
             resolved_by_key[task.cache_key] = transient
             if progress is not None:
@@ -1933,7 +2223,7 @@ def resolve_extraction_tasks(
         if not has_error or getattr(args, "cache_failed_model_outputs", False):
             cache.put(cache_key, record)
         else:
-            cache.put_transient(cache_key, record)
+            cache_put_transient(cache, cache_key, record)
         if has_error:
             append_model_error_record(getattr(args, "model_attribute_errors_path", ""), record)
         if progress is not None:
@@ -1989,7 +2279,10 @@ def source_splits(source_records: list[dict[str, str]], args: argparse.Namespace
             "data_lake_table_ids": [],
         }
     splits["split_key"] = "page_title_or_source_table_id" if args.split_by == "page_title" else "source_table_id"
-    splits["note"] = "source-level split; data_lake contains generated targets for queryable tables and raw tables for rejected tables"
+    splits["note"] = (
+        "source-level split; data_lake contains generated targets for "
+        "queryable tables and source-table references for rejected tables"
+    )
     return splits
 
 
@@ -2103,24 +2396,24 @@ def table_record(
 
 
 def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, Any]:
-    cols = [int(col["column_index"]) for col in source_table.get("columns", [])]
-    source_rows = [row_id(row, fallback) for fallback, row in enumerate(source_table.get("rows", []))]
-    rows, projected_source_rows = project_selected_rows(
-        source_table,
-        cols,
-        set(source_rows),
-        min_required_cols=0,
-    )
-    return table_record(
-        table_id=f"dl_raw_{source_table['source_table_id']}",
-        role="raw_data_lake_table",
-        split=split,
-        source_table=source_table,
-        column_indices=cols,
-        rows=rows,
-        source_row_indices=projected_source_rows,
-        extra={"queryable": False, "reason": "no_column_met_recovered_value_ratio"},
-    )
+    source_table_id = clean_text(source_table.get("source_table_id"))
+    if not source_table_id:
+        raise ValueError("source table is missing source_table_id")
+    table_id = f"dl_raw_{source_table_id}"
+    return {
+        "table_id": table_id,
+        "object_id": table_id,
+        "object_type": "table",
+        "role": "raw_data_lake_table",
+        "split": split,
+        "source_table_id": source_table_id,
+        "source_table_ref": {
+            "artifact": "source_tables",
+            "source_table_id": source_table_id,
+        },
+        "queryable": False,
+        "reason": "no_column_met_recovered_value_ratio",
+    }
 
 
 def context_columns(table: dict[str, Any], excluded: set[int], limit: int) -> list[int]:
@@ -2237,8 +2530,6 @@ def multi_attribute_context_layout(
         for column_index in other_cols
         if column_index not in query_context
     ]
-    if not target_context_pool:
-        return []
     target_context = target_context_pool[:1]
     return [(best, query_context, target_context)]
 
@@ -2511,24 +2802,96 @@ def collect_extraction_tasks_from_tables(
     return tasks
 
 
-def write_model_done_marker(path_value: str, *, model_kind: str, task_count: int) -> None:
-    if not clean_text(path_value):
-        return
-    path = Path(path_value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "status": f"{model_kind}_model_cache_precomputed",
-                "model_kind": model_kind,
-                "task_count": task_count,
-                f"{model_kind}_task_count": task_count,
-                "timestamp": time.time(),
-            },
-            ensure_ascii=False,
-            indent=2,
+def model_jobset_policy_identity(
+    args: argparse.Namespace,
+    model_kind: str,
+) -> dict[str, Any]:
+    identity = {
+        "disable_thinking": bool(getattr(args, "disable_thinking", True)),
+        "model_temperature": float(
+            getattr(args, "model_temperature", 0.0)
         ),
-        encoding="utf-8",
+        "reparse_cached_model_outputs": bool(
+            getattr(args, "reparse_cached_model_outputs", True)
+        ),
+        "refresh_invalid_model_cache": bool(
+            getattr(args, "refresh_invalid_model_cache", False)
+        ),
+        "cache_failed_model_outputs": bool(
+            getattr(args, "cache_failed_model_outputs", False)
+        ),
+        "no_reuse_model_cache": bool(
+            getattr(args, "no_reuse_model_cache", False)
+        ),
+    }
+    if model_kind == "image":
+        identity.update(
+            {
+                "max_tokens": int(
+                    getattr(
+                        args,
+                        "image_model_max_tokens",
+                        DEFAULT_IMAGE_MODEL_MAX_TOKENS,
+                    )
+                ),
+                "request_max_pixels": int(
+                    getattr(
+                        args,
+                        "image_request_max_pixels",
+                        DEFAULT_IMAGE_REQUEST_MAX_PIXELS,
+                    )
+                ),
+                "context_retry_max_pixels": int(
+                    getattr(
+                        args,
+                        "context_retry_image_max_pixels",
+                        DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS,
+                    )
+                ),
+            }
+        )
+    else:
+        identity["max_tokens"] = int(
+            getattr(args, "model_max_tokens", 1024)
+        )
+    return identity
+
+
+def build_model_marker_context(
+    *,
+    args: argparse.Namespace,
+    tasks_by_kind: dict[str, list[ExtractionTask]],
+    upstream_identities: Iterable[dict[str, Any]],
+) -> model_markers.ModelMarkerContext:
+    tasks = {
+        kind: list(tasks_by_kind.get(kind, []))
+        for kind in ("text", "image")
+    }
+    fingerprints = {
+        kind: model_markers.task_jobset_fingerprint(
+            tasks[kind],
+            model_kind=kind,
+            model_identity=str(
+                getattr(
+                    args,
+                    f"{kind}_model_name",
+                    "Qwen3.5-9B"
+                    if kind == "text"
+                    else "Qwen3-VL-8B-Thinking",
+                )
+            ),
+            prompt_version=PROMPT_VERSION,
+            policy_identity=model_jobset_policy_identity(args, kind),
+        )
+        for kind in ("text", "image")
+    }
+    return model_markers.build_marker_context(
+        run_fingerprint=str(getattr(args, "run_fingerprint", "")),
+        text_jobset_fingerprint=fingerprints["text"],
+        image_jobset_fingerprint=fingerprints["image"],
+        text_task_count=len(tasks["text"]),
+        image_task_count=len(tasks["image"]),
+        upstream_identities=upstream_identities,
     )
 
 
@@ -2604,48 +2967,143 @@ def _write_model_round_event(
     )
 
 
+def source_shard_identities(
+    source_paths: Iterable[Path],
+) -> list[dict[str, str]]:
+    identities: list[dict[str, str]] = []
+    for value in source_paths:
+        path = Path(value).expanduser().resolve()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identities.append(
+            {
+                "path": str(path),
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return identities
+
+
+def write_model_done_marker(
+    path_value: str,
+    *,
+    model_kind: str,
+    task_count: int,
+    context: model_markers.ModelMarkerContext | None = None,
+) -> None:
+    if not clean_text(path_value):
+        return
+    if context is not None:
+        payload = model_markers.done_marker_payload(
+            context,
+            model_kind=model_kind,
+            task_count=task_count,
+            timestamp=time.time(),
+        )
+    else:
+        payload = {
+            "status": f"{model_kind}_model_cache_precomputed",
+            "model_kind": model_kind,
+            "task_count": task_count,
+            f"{model_kind}_task_count": task_count,
+            "timestamp": time.time(),
+        }
+    model_markers.atomic_write_json(
+        Path(path_value),
+        payload,
+    )
+
+
 def write_model_start_marker(
     path_value: str,
     *,
-    text_task_count: int,
-    image_task_count: int,
+    context: model_markers.ModelMarkerContext | None = None,
+    text_task_count: int = 0,
+    image_task_count: int = 0,
     round_mode: bool = False,
     round_mode_requires_services: bool = False,
 ) -> None:
     if not clean_text(path_value):
         return
-    path = Path(path_value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "status": "model_cache_ready_to_start",
-                "text_task_count": text_task_count,
-                "image_task_count": image_task_count,
-                "round_mode": round_mode,
-                "runner_startup_task_count": max(
-                    text_task_count + image_task_count,
-                    int(round_mode_requires_services),
-                ),
-                "timestamp": time.time(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    if context is None:
+        payload = {
+            "status": "model_cache_ready_to_start",
+            "text_task_count": text_task_count,
+            "image_task_count": image_task_count,
+            "round_mode": round_mode,
+            "runner_startup_task_count": max(
+                text_task_count + image_task_count,
+                int(round_mode_requires_services),
+            ),
+            "timestamp": time.time(),
+        }
+    else:
+        payload = model_markers.start_marker_payload(
+            context,
+            timestamp=time.time(),
+        )
+    model_markers.atomic_write_json(
+        Path(path_value),
+        payload,
     )
 
 
-def wait_for_model_ready_marker(path_value: str, *, poll_seconds: float = 2.0) -> None:
+def model_ready_marker_matches(
+    path_value: str,
+    *,
+    context: model_markers.ModelMarkerContext,
+) -> bool:
+    if not clean_text(path_value):
+        return False
+    return model_markers.marker_matches(
+        Path(path_value),
+        expected_stage=model_markers.MODEL_READY_STAGE,
+        expected_status="vllm_servers_ready",
+        context=context,
+        model_kind=model_markers.READY_MODEL_KIND,
+    )
+
+
+def wait_for_model_ready_marker(
+    path_value: str,
+    *,
+    context: model_markers.ModelMarkerContext | None = None,
+    timeout_seconds: float | None = None,
+    poll_seconds: float = 2.0,
+) -> None:
     if not clean_text(path_value):
         return
+    started = time.monotonic()
     path = Path(path_value)
-    while not path.exists():
+    while not (
+        model_ready_marker_matches(path_value, context=context)
+        if context is not None
+        else path.exists()
+    ):
+        if (
+            timeout_seconds is not None
+            and time.monotonic() - started > timeout_seconds
+        ):
+            raise RuntimeError(
+                f"timed out waiting for ready marker: {path_value}"
+            )
         time.sleep(poll_seconds)
 
 
-def write_text_done_marker(path_value: str, *, task_count: int) -> None:
-    write_model_done_marker(path_value, model_kind="text", task_count=task_count)
+def write_text_done_marker(
+    path_value: str,
+    *,
+    task_count: int,
+    context: model_markers.ModelMarkerContext | None = None,
+) -> None:
+    write_model_done_marker(
+        path_value,
+        model_kind="text",
+        task_count=task_count,
+        context=context,
+    )
 
 
 def model_done_marker_for_kind(args: argparse.Namespace, model_kind: str) -> str:
@@ -2658,17 +3116,26 @@ def write_done_markers_after_selection(
     args: argparse.Namespace,
     text_task_count: int,
     image_task_count: int,
+    context: model_markers.ModelMarkerContext | None = None,
 ) -> None:
-    write_model_done_marker(
-        model_done_marker_for_kind(args, "text"),
-        model_kind="text",
-        task_count=text_task_count,
-    )
-    write_model_done_marker(
-        model_done_marker_for_kind(args, "image"),
-        model_kind="image",
-        task_count=image_task_count,
-    )
+    for model_kind, task_count in (
+        ("text", text_task_count),
+        ("image", image_task_count),
+    ):
+        marker_path = model_done_marker_for_kind(args, model_kind)
+        if context is None:
+            write_model_done_marker(
+                marker_path,
+                model_kind=model_kind,
+                task_count=task_count,
+            )
+        else:
+            write_model_done_marker(
+                marker_path,
+                model_kind=model_kind,
+                task_count=task_count,
+                context=context,
+            )
 
 
 def precompute_extraction_task_groups(
@@ -2680,6 +3147,7 @@ def precompute_extraction_task_groups(
     state: ModelConcurrencyState,
     progress: ModelAnalysisProgress | None = None,
     write_done_markers: bool = True,
+    marker_context: model_markers.ModelMarkerContext | None = None,
 ) -> dict[str, int]:
     active_groups = {
         kind: tasks
@@ -2689,7 +3157,12 @@ def precompute_extraction_task_groups(
     counts = {kind: len(tasks) for kind, tasks in tasks_by_kind.items() if kind in {"text", "image"}}
     for kind, count in counts.items():
         if write_done_markers and kind not in active_groups:
-            write_model_done_marker(model_done_marker_for_kind(args, kind), model_kind=kind, task_count=count)
+            write_model_done_marker(
+                model_done_marker_for_kind(args, kind),
+                model_kind=kind,
+                task_count=count,
+                context=marker_context,
+            )
     if not active_groups:
         return counts
 
@@ -2724,6 +3197,7 @@ def precompute_extraction_task_groups(
                         model_done_marker_for_kind(args, kind),
                         model_kind=kind,
                         task_count=task_count,
+                        context=marker_context,
                     )
     except BaseException:
         round_status = "failed"
@@ -2752,7 +3226,7 @@ def extract_asset_attributes(
         asset_type=str(asset.get("asset_type")),
         args=args,
     )
-    transient = cache.get_transient(cache_key)
+    transient = cache_get_transient(cache, cache_key)
     if transient is not None:
         if progress is not None:
             progress.mark(
@@ -2795,7 +3269,7 @@ def extract_asset_attributes(
     if not record["error"] or getattr(args, "cache_failed_model_outputs", False):
         cache.put(cache_key, record)
     else:
-        cache.put_transient(cache_key, record)
+        cache_put_transient(cache, cache_key, record)
     if progress is not None:
         progress.mark(cache_key, "error" if record["error"] else "model")
     return record
@@ -3019,7 +3493,7 @@ def build_table_join_records(
         selected_source_row_set = set(selected_source_rows)
         query_cols = [entity_col] + query_context
         target_cols = [join_col] + target_context
-        if len(query_cols) < 2 or len(target_cols) < 2:
+        if len(query_cols) < 2 or not target_cols:
             continue
         query_rows, query_source_rows = project_selected_rows(
             source_table,
@@ -3803,6 +4277,13 @@ def _build_dataset(
     manifest = {
         "format": "sharded_jsonl",
         "records_per_shard": records_per_shard,
+        "artifact_references": {
+            "data_lake_tables": {
+                "field": "source_table_ref",
+                "target_artifact": "source_tables",
+                "resolution": "stream_by_source_table_id",
+            }
+        },
         "artifacts": {
             "source_tables": source_writer.manifest(output_dir),
             "query_tables": query_writer.manifest(output_dir),
@@ -4027,10 +4508,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--precompute_text_model_cache", action="store_true", help="Run all text extraction tasks into the shared model cache before image-heavy table processing.")
     parser.add_argument("--model_start_marker", default=None, help="Write this JSON marker after Wikipedia/material preparation is complete and model requests are about to start.")
     parser.add_argument("--model_ready_marker", default=None, help="Wait for this JSON marker before issuing model requests. Dynamic vLLM runners write it after servers are healthy.")
+    parser.add_argument("--model_ready_timeout_seconds", type=float, default=None, help="Optional timeout while waiting for a matching strict model-ready marker.")
     parser.add_argument("--model_text_done_marker", default=None, help="Write this JSON marker after --precompute_text_model_cache completes.")
     parser.add_argument("--model_image_done_marker", default=None, help="Write this JSON marker after image model cache precompute completes.")
     parser.add_argument("--model_round_control_dir", default=None, help="Optional generation-scoped handshake directory used by a dynamic model runner between batched inference rounds.")
     parser.add_argument("--model_round_run_id", default=None, help="Opaque dynamic-run identifier used to reject stale model round markers.")
+    parser.add_argument("--run_fingerprint", default="", help="Staged-run identity used to fence stale model markers.")
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)
     parser.set_defaults(model_progress=True)
     return parser.parse_args(argv)

@@ -148,8 +148,117 @@ def manifest_artifact_paths(input_dir: Path, artifact: str) -> list[Path]:
     return paths
 
 
-def iter_manifest_records(input_dir: Path, artifact: str, log_every: int = 50000) -> Iterator[dict[str, Any]]:
-    return iter_jsonl_paths(manifest_artifact_paths(input_dir, artifact), log_every=log_every)
+def is_source_table_reference(record: dict[str, Any]) -> bool:
+    reference = record.get("source_table_ref")
+    return (
+        isinstance(reference, dict)
+        and reference.get("artifact") == "source_tables"
+        and bool(clean_text(reference.get("source_table_id")))
+    )
+
+
+def resolve_source_table_reference(
+    record: dict[str, Any],
+    source_table: dict[str, Any],
+) -> dict[str, Any]:
+    """Expand one lightweight data-lake alias into its logical table."""
+
+    reference = record.get("source_table_ref")
+    if not isinstance(reference, dict):
+        return record
+    referenced_id = clean_text(reference.get("source_table_id"))
+    source_table_id = clean_text(source_table.get("source_table_id"))
+    if (
+        reference.get("artifact") != "source_tables"
+        or not referenced_id
+        or referenced_id != source_table_id
+        or referenced_id != clean_text(record.get("source_table_id"))
+    ):
+        raise ValueError(
+            "data-lake source-table reference identity mismatch: "
+            f"{referenced_id or '<missing>'}"
+        )
+
+    column_indices = [
+        int(column["column_index"])
+        for column in source_table.get("columns", [])
+    ]
+    rows, source_row_indices = project_rows(
+        source_table,
+        column_indices,
+        min_required_cols=0,
+    )
+    table_id = clean_text(record.get("table_id"))
+    expanded = {
+        "table_id": table_id,
+        "object_id": clean_text(record.get("object_id")) or table_id,
+        "object_type": "table",
+        "role": clean_text(record.get("role")),
+        "split": clean_text(record.get("split")),
+        "source_table_id": source_table_id,
+        "page_title": clean_text(source_table.get("page_title")),
+        "caption": clean_text(source_table.get("caption")),
+        "section_title": clean_text(source_table.get("section_title")),
+        "columns": make_columns(source_table, column_indices),
+        "rows": rows,
+        "source_column_indices": column_indices,
+        "source_row_indices": source_row_indices,
+        "provenance": {
+            "builder": (
+                clean_text(source_table.get("provenance_builder"))
+                or "build_mm_joinability_dataset.py"
+            ),
+            "source_file": source_table.get("source_file"),
+        },
+    }
+    expanded.update(
+        {
+            key: value
+            for key, value in record.items()
+            if key != "source_table_ref"
+        }
+    )
+    return expanded
+
+
+def iter_manifest_records(
+    input_dir: Path,
+    artifact: str,
+    log_every: int = 50000,
+) -> Iterator[dict[str, Any]]:
+    records = iter_jsonl_paths(
+        manifest_artifact_paths(input_dir, artifact),
+        log_every=log_every,
+    )
+    if artifact != "data_lake_tables":
+        yield from records
+        return
+
+    source_records: Iterator[dict[str, Any]] | None = None
+    current_source: dict[str, Any] | None = None
+    for record in records:
+        if not is_source_table_reference(record):
+            yield record
+            continue
+        source_table_id = clean_text(record.get("source_table_id"))
+        if source_records is None:
+            source_records = iter_jsonl_paths(
+                manifest_artifact_paths(input_dir, "source_tables"),
+                log_every=log_every,
+            )
+        while (
+            current_source is None
+            or clean_text(current_source.get("source_table_id"))
+            != source_table_id
+        ):
+            try:
+                current_source = next(source_records)
+            except StopIteration as error:
+                raise ValueError(
+                    "source table referenced by data_lake_tables is "
+                    f"missing: {source_table_id}"
+                ) from error
+        yield resolve_source_table_reference(record, current_source)
 
 
 def load_split_map(input_dir: Path) -> dict[str, str]:

@@ -551,6 +551,153 @@ def test_fetch_page_reuses_sqlite_cache_across_clients(tmp_path):
     assert (tmp_path / "wdc_web.sqlite3").is_file()
 
 
+def test_web_client_initialization_commit_uses_live_disk_guard(tmp_path):
+    zero_checks = 0
+
+    def reject_initial_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("web cache init reserve exhausted")
+
+    with pytest.raises(OSError, match="cache init reserve"):
+        WdcWebClient(
+            tmp_path,
+            session=FakeSession([]),
+            host_delay=0,
+            pre_write_guard=reject_initial_commit,
+        )
+
+    database_path = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        ).fetchone() == (0,)
+
+
+def test_web_client_migration_commit_guard_rolls_back_legacy_schema(
+    tmp_path,
+):
+    database_path = tmp_path / "wdc_web.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE page_cache (
+                page_url TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                final_url TEXT,
+                text TEXT,
+                image_urls_json TEXT,
+                http_status INTEGER,
+                error TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+    zero_checks = 0
+
+    def reject_migration_commit(
+        _path: Path,
+        estimated_bytes: int = 0,
+    ) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 2:
+                raise OSError("migration commit reserve exhausted")
+
+    with pytest.raises(OSError, match="migration commit reserve"):
+        WdcWebClient(
+            tmp_path,
+            session=FakeSession([]),
+            host_delay=0,
+            pre_write_guard=reject_migration_commit,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(page_cache)")
+        }
+        assert "policy_fingerprint" not in columns
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name = 'page_cache_legacy'"
+        ).fetchone() == (0,)
+
+
+def test_web_client_page_commit_guard_rolls_back_with_window_remaining(
+    tmp_path,
+):
+    zero_checks = 0
+
+    def reject_page_commit(_path: Path, estimated_bytes: int = 0) -> None:
+        nonlocal zero_checks
+        if estimated_bytes == 0:
+            zero_checks += 1
+            if zero_checks == 4:
+                raise OSError("page cache commit reserve exhausted")
+
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        pre_write_guard=reject_page_commit,
+    )
+    with pytest.raises(OSError, match="page cache commit reserve"):
+        client._store_page(
+            {
+                "page_url": "https://example.test/a",
+                "final_url": "https://example.test/a",
+                "text": "cached",
+                "image_urls": [],
+                "body_bytes": 6,
+            }
+        )
+
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM page_cache"
+        ).fetchone() == (0,)
+
+
+def test_web_client_image_writes_use_actual_target_trackers(tmp_path):
+    guarded_paths: list[Path] = []
+    body = png_bytes()
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    body,
+                    headers={"Content-Type": "image/png"},
+                )
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+        pre_write_guard=lambda path, _size=0: guarded_paths.append(
+            Path(path)
+        ),
+    )
+
+    record = client.download_image(
+        "https://cdn.test/guarded.png",
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="entity-guarded",
+    )
+
+    assert record is not None
+    assert any(path.name.endswith(".download.tmp") for path in guarded_paths)
+    assert any(
+        path.name.startswith("image_") and path.suffix == ".png"
+        for path in guarded_paths
+    )
+    assert any(path == client.image_dir for path in guarded_paths)
+
+
 def test_web_client_requests_identity_content_encoding(tmp_path):
     session = FakeSession([])
 
@@ -1120,7 +1267,7 @@ def test_download_image_retries_with_injected_sleep(tmp_path):
     assert clock.sleeps == [0.5]
 
 
-def test_download_image_rejects_duplicate_content_from_different_urls(tmp_path):
+def test_download_image_shares_duplicate_content_from_different_urls(tmp_path):
     body = png_bytes()
     client = WdcWebClient(
         tmp_path,
@@ -1148,8 +1295,28 @@ def test_download_image_rejects_duplicate_content_from_different_urls(tmp_path):
     )
 
     assert first is not None
-    assert duplicate is None
+    assert duplicate is not None
+    assert first["local_path"] == duplicate["local_path"]
+    assert first["sha256"] == duplicate["sha256"]
+    assert first["original_url"] == "https://cdn.test/first.png"
+    assert duplicate["original_url"] == "https://cdn.test/second.png"
+    assert duplicate["final_url"] == "https://example.test/final"
     assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT original_url, file_name, sha256
+            FROM image_cache
+            ORDER BY original_url
+            """
+        ).fetchall()
+        failures = connection.execute(
+            "SELECT COUNT(*) FROM image_failure_cache"
+        ).fetchone()[0]
+    assert len(rows) == 2
+    assert len({row[1] for row in rows}) == 1
+    assert len({row[2] for row in rows}) == 1
+    assert failures == 0
 
 
 def test_download_image_orphan_sha_conflict_is_cleaned_without_raising(tmp_path):
@@ -1185,14 +1352,288 @@ def test_download_image_orphan_sha_conflict_is_cleaned_without_raising(tmp_path)
         max_retries=0,
     )
 
-    assert recovering_client.download_image(
+    recovered = recovering_client.download_image(
         orphan_url,
         page_url="https://example.test/page",
         source="wdc_page_image",
         entity_id="ent_orphan",
-    ) is None
+    )
+    assert recovered is not None
+    assert recovered["original_url"] == orphan_url
+    assert recovered["local_path"] == str(
+        tmp_path
+        / "wdc_images"
+        / client.cached_image_outcome(first_url)["file_name"]
+    )
     assert not orphan_path.exists()
     assert offline_session.calls == []
+
+
+def test_duplicate_content_is_shared_across_policy_namespaces(tmp_path):
+    body = png_bytes()
+    records = []
+    for policy, image_url in (
+        ("image-v1", "https://cdn.test/one.png"),
+        ("image-v2", "https://cdn.test/two.png"),
+    ):
+        client = WdcWebClient(
+            tmp_path,
+            session=FakeSession(
+                [
+                    FakeResponse(
+                        body,
+                        headers={"Content-Type": "image/png"},
+                    )
+                ]
+            ),
+            host_delay=0,
+            max_retries=0,
+            network_policy_version=policy,
+        )
+        records.append(
+            client.download_image(
+                image_url,
+                page_url="https://example.test/page",
+                source="wdc_page_image",
+                entity_id=policy,
+            )
+        )
+
+    assert all(record is not None for record in records)
+    assert records[0]["local_path"] == records[1]["local_path"]
+    assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache"
+        ).fetchone() == (2,)
+
+
+def test_concurrent_different_urls_with_same_content_share_one_file(
+    tmp_path,
+):
+    body = png_bytes()
+    barrier = threading.Barrier(2)
+
+    class BarrierResponse(FakeResponse):
+        def iter_content(self, chunk_size: int):
+            barrier.wait(timeout=5)
+            yield from super().iter_content(chunk_size)
+
+    class ConcurrentSession(FakeSession):
+        def __init__(self):
+            super().__init__([])
+            self.lock = threading.Lock()
+
+        def get(self, url: str, **kwargs):
+            with self.lock:
+                self.calls.append((url, kwargs))
+            return BarrierResponse(
+                body,
+                url=url + "?final=1",
+                headers={"Content-Type": "image/png"},
+            )
+
+    client = WdcWebClient(
+        tmp_path,
+        session=ConcurrentSession(),
+        host_delay=0,
+        max_retries=0,
+    )
+    start = threading.Barrier(2)
+
+    def download(image_url: str):
+        start.wait(timeout=5)
+        return client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=image_url,
+        )
+
+    urls = [
+        "https://cdn.test/concurrent-a.png",
+        "https://cdn.test/concurrent-b.png",
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(download, urls))
+
+    assert all(record is not None for record in records)
+    assert records[0]["local_path"] == records[1]["local_path"]
+    assert len(list((tmp_path / "wdc_images").glob("image_*"))) == 1
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM image_cache"
+        ).fetchone() == (2,)
+
+
+def test_bad_alias_sha_does_not_remove_valid_shared_content_reference(
+    tmp_path,
+):
+    shared_body = png_bytes(color=(10, 20, 30))
+    replacement_body = png_bytes(color=(200, 30, 40))
+    first_url = "https://cdn.test/alias-a.png"
+    second_url = "https://cdn.test/alias-b.png"
+    for policy, image_url in (
+        ("image-v1", first_url),
+        ("image-v2", second_url),
+    ):
+        client = WdcWebClient(
+            tmp_path,
+            session=FakeSession(
+                [
+                    FakeResponse(
+                        shared_body,
+                        headers={"Content-Type": "image/png"},
+                    )
+                ]
+            ),
+            host_delay=0,
+            max_retries=0,
+            network_policy_version=policy,
+        )
+        assert client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=policy,
+        ) is not None
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        connection.execute(
+            """
+            UPDATE image_cache SET sha256 = ?
+            WHERE original_url = ? AND policy_fingerprint = 'image-v1'
+            """,
+            ("0" * 64, first_url),
+        )
+
+    repairing = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                )
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+        network_policy_version="image-v1",
+    )
+    repaired = repairing.download_image(
+        first_url,
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="repaired",
+    )
+    valid_alias = WdcWebClient(
+        tmp_path,
+        session=FakeSession([]),
+        host_delay=0,
+        max_retries=0,
+        network_policy_version="image-v2",
+    ).cached_image_outcome(second_url)
+
+    assert repaired is not None
+    assert repaired["sha256"] == hashlib.sha256(
+        replacement_body
+    ).hexdigest()
+    assert valid_alias is not None
+    assert valid_alias["sha256"] == hashlib.sha256(shared_body).hexdigest()
+    assert Path(valid_alias["file_name"]).name != repaired["file_name"]
+    assert repairing._image_bytes_total == (
+        len(shared_body) + len(replacement_body)
+    )
+
+
+def test_corrupt_shared_file_invalidates_all_aliases_and_debits_once(
+    tmp_path,
+):
+    shared_body = png_bytes(color=(10, 20, 30))
+    unique_body = png_bytes(color=(40, 50, 60))
+    replacement_body = png_bytes(color=(70, 80, 90))
+    urls = [
+        "https://cdn.test/shared-a.png",
+        "https://cdn.test/shared-b.png",
+        "https://cdn.test/unique.png",
+    ]
+    client = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    shared_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    shared_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    unique_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+    )
+    records = [
+        client.download_image(
+            image_url,
+            page_url="https://example.test/page",
+            source="wdc_page_image",
+            entity_id=image_url,
+        )
+        for image_url in urls
+    ]
+    assert all(record is not None for record in records)
+    Path(records[0]["local_path"]).write_bytes(b"corrupt")
+
+    repairing = WdcWebClient(
+        tmp_path,
+        session=FakeSession(
+            [
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+                FakeResponse(
+                    replacement_body,
+                    headers={"Content-Type": "image/png"},
+                ),
+            ]
+        ),
+        host_delay=0,
+        max_retries=0,
+    )
+    first = repairing.download_image(
+        urls[0],
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="a",
+    )
+    second = repairing.download_image(
+        urls[1],
+        page_url="https://example.test/page",
+        source="wdc_page_image",
+        entity_id="b",
+    )
+
+    assert first is not None and second is not None
+    assert first["local_path"] == second["local_path"]
+    assert repairing._image_bytes_total == (
+        len(unique_body) + len(replacement_body)
+    )
+    with sqlite3.connect(tmp_path / "wdc_web.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT original_url, file_name
+            FROM image_cache ORDER BY original_url
+            """
+        ).fetchall()
+    assert len(rows) == 3
+    assert len({row[1] for row in rows}) == 2
 
 
 def test_download_image_same_url_singleflight_keeps_file_index_and_records_consistent(
@@ -1781,6 +2222,8 @@ def test_dynamic_runner_flags_parse_and_zero_pending_tasks_write_markers(tmp_pat
             str(text_done_marker),
             "--model_image_done_marker",
             str(image_done_marker),
+            "--run_fingerprint",
+            "wdc-zero-v1",
             "--text_model_workers",
             "2",
             "--image_model_workers",
@@ -1803,18 +2246,26 @@ def test_dynamic_runner_flags_parse_and_zero_pending_tasks_write_markers(tmp_pat
     assert stats["source_tables"] == 0
     assert extractor_calls == []
     assert not ready_marker.exists()
-    assert json.loads(start_marker.read_text(encoding="utf-8"))[
-        "text_task_count"
-    ] == 0
-    assert json.loads(start_marker.read_text(encoding="utf-8"))[
-        "image_task_count"
-    ] == 0
-    assert json.loads(text_done_marker.read_text(encoding="utf-8"))[
-        "model_kind"
-    ] == "text"
-    assert json.loads(image_done_marker.read_text(encoding="utf-8"))[
-        "model_kind"
-    ] == "image"
+    start_payload = json.loads(start_marker.read_text(encoding="utf-8"))
+    assert start_payload["stage"] == "wdc200k_model_start"
+    assert start_payload["schema_version"] == "wdc200k-model-markers-v1"
+    assert start_payload["run_fingerprint"] == "wdc-zero-v1"
+    assert start_payload["text_task_count"] == 0
+    assert start_payload["image_task_count"] == 0
+    assert len(start_payload["text_jobset_fingerprint"]) == 64
+    assert len(start_payload["image_jobset_fingerprint"]) == 64
+    for model_kind, marker in (
+        ("text", text_done_marker),
+        ("image", image_done_marker),
+    ):
+        done_payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert done_payload["model_kind"] == model_kind
+        assert done_payload["run_fingerprint"] == "wdc-zero-v1"
+        assert (
+            done_payload["start_fingerprint"]
+            == start_payload["start_fingerprint"]
+        )
+    assert not list(start_marker.parent.glob("*.tmp"))
 
 
 def test_media_failure_callback_is_best_effort_and_structured(tmp_path):

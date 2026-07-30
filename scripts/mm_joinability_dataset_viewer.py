@@ -13,7 +13,12 @@ from typing import Any, Iterable, Iterator
 from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
 
 from stage1_gui import format_gui_urls, resolve_gui_host
-from stage1_io import clean_text, iter_jsonl, load_json
+from stage1_io import (
+    clean_text,
+    iter_jsonl,
+    iter_manifest_records,
+    load_json,
+)
 
 PAGE_TEMPLATE = """
 <!doctype html>
@@ -379,6 +384,13 @@ def artifact_paths(output_dir: Path, artifact: str, manifest: dict[str, Any] | N
 
 
 def iter_artifact_records(output_dir: Path, artifact: str, manifest: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+    if (output_dir / "dataset_manifest.json").exists():
+        yield from iter_manifest_records(
+            output_dir,
+            artifact,
+            log_every=0,
+        )
+        return
     for path in artifact_paths(output_dir, artifact, manifest):
         if path.exists():
             yield from iter_jsonl(path)

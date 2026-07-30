@@ -171,88 +171,343 @@ This builder intentionally does not generate:
 
 The output is a multimodal table dataset plus query workload, not a joinability benchmark label generator.
 
-## WDC Schema.org Joinability Builder
+## WDC Schema.org 200K Joinability Pipeline
 
-`build_wdc_mm_joinability_dataset.py` adapts the local WDC Schema.org Table
-Corpus 2023 gzip host tables and delegates query/target, qrel, and evidence-path
-construction to the existing joinability core. A conservative bounded run is:
+`build_wdc200k_mm_joinability_dataset.py` is the staged, resumable entry point
+for the 200K-scale WDC Schema.org Table Corpus 2023 build.
+`build_wdc_mm_joinability_dataset.py` remains the legacy bounded builder; its
+row-limited examples and in-memory behavior are not the 200K operating model.
+
+The staged pipeline keeps three roots separate:
+
+```text
+output_wdc_200k/   canonical dataset artifacts only
+work_wdc_200k/     selections, shards, durable job stores, checkpoints,
+                   stage manifests, runtime markers, and progress.json
+cache/wdc_200k/    reusable positive and negative network/media/model outcomes
+```
+
+Never nest or reuse these roots as one another. Only `output_dir` has the
+canonical source/query/data-lake tables, entities, assets, links, extractions,
+qrels, splits, errors, stats, and `dataset_manifest.json`. Source-table rows
+are unbounded and every selected row is preserved. Do not pass
+`--max_rows_per_source_table`: the compatibility option deliberately rejects
+every value, including zero. The WDC `image` column is used only to discover
+assets and is removed from table artifacts.
+
+### Preflight, staged execution, and recovery
+
+A read-only configuration preflight validates the input statistics archives,
+path separation, runtime paths, disk reserve, and arguments without running a
+stage:
 
 ```bash
-conda run -n MMDD python scripts/build_wdc_mm_joinability_dataset.py \
+conda run -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
-  --output_dir output_wdc_mm_joinability_run_001 \
-  --cache_dir cache/wdc_mm_joinability_run_001 \
-  --max_source_tables 100 \
-  --max_scanned_files 1000 \
-  --max_rows_per_source_table 100 \
-  --max_images_per_entity 2 \
-  --web_workers 4 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --dry_run
+```
+
+The structural preflight writes deterministic selection and structural state
+under `work_dir`, but performs no network or model work:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --web_max_retries 0 \
+  --web_max_response_seconds 8 \
+  --web_global_concurrency 128 \
+  --web_per_host_concurrency 2 \
+  --max_image_attempts_per_entity 3 \
+  --max_images_per_entity 3 \
+  --stop_after structural
+```
+
+Inspect `work_wdc_200k/progress.json` and the structural manifests before
+continuing. Resume with the same four roots and parameters; completed,
+checksummed shards and terminal URL outcomes are not replayed:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --resume \
   --text_model_base_url http://127.0.0.1:8001/v1 \
   --image_model_base_url http://127.0.0.1:8000/v1
 ```
 
-The text and image OpenAI-compatible endpoints must be running before this
-direct command reaches model extraction. The builder lazily rotates across WDC
-class directories, bounds the number of in-flight web jobs, and writes sharded
-source tables, entities, bridge assets, table-asset links, queries, targets,
-attribute extractions, and evidence recoveries. Safe defaults are 100 accepted
-source tables, 1,000 attempted gzip files, 100 rows per source table, and 2
-images per entity. `--max_scanned_files` counts every attempted gzip, including
-malformed or rejected tables, independently of `--max_source_tables`. A zero
-row cap or non-positive scan/table cap is rejected unless `--allow_unbounded`
-is also set. Startup/final logs and `stats.json` record the active safety
-configuration and whether scan, source-table, or row truncation occurred;
-prefer staged, capped builds because later query construction intentionally
-keeps entity/asset indexes in memory. The source WDC
-`image` attribute is used only to discover assets and is excluded from all
-source/query/target/raw tables.
-
-For every selected entity the builder always fetches `page_url` for visible
-text and page-image candidates, even if a direct URL from the WDC `image`
-attribute already downloaded successfully. Direct image URLs are attempted
-first, and direct plus webpage images share the single
-`--max_images_per_entity` quota. Page metadata is cached in
-`<cache_dir>/wdc_web.sqlite3`, images in `<cache_dir>/wdc_images`, and model
-extractions in `<cache_dir>/model_attribute_extractions.jsonl`. Network and
-media errors are isolated in `web_fetch_failures.jsonl` and
-`media_download_failures.jsonl` under the output directory.
-
-Web requests reject URL userinfo and non-public resolved addresses. Each
-redirect hop is resolved and validated once, then the actual TCP connection is
-pinned to that vetted IP; HTTPS still uses the original hostname for SNI and
-certificate verification. A/AAAA and CNAME resolution uses the declared
-`dnspython` dependency with the remaining absolute response deadline; there is
-no unbounded stdlib resolver fallback. Untrusted SVG is deliberately rejected. Raster
-pixel count, per-response bytes, image-cache bytes, combined page-body plus
-image-cache bytes, minimum free disk, and total response wall-clock time are
-bounded by `--web_max_image_pixels`, `--web_max_image_bytes`,
-`--web_max_total_image_bytes`, `--web_max_total_cache_bytes`,
-`--min_free_disk_bytes`, and `--web_max_response_seconds` respectively. Cache
-reservations and free-space checks are repeated while responses stream.
-
-The dynamic two-vLLM runner can start and reallocate the model servers while
-the WDC builder prepares web assets. Point it at the WDC builder; arguments it
-does not own are passed through:
+Use `--stop_after` to establish a stage barrier. To intentionally rebuild a
+named stage and everything downstream, use `--from_stage`, which validates
+upstream state and archives replaced state rather than deleting it:
 
 ```bash
-conda run -n MMDD python scripts/run_mm_joinability_dynamic_vllm.py \
-  --builder_script scripts/build_wdc_mm_joinability_dataset.py \
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
-  --output_dir output_wdc_mm_joinability_run_001 \
-  --text_model_path /path/to/text-model \
-  --image_model_path /path/to/vision-model \
-  --cache_dir cache/wdc_mm_joinability_run_001 \
-  --max_source_tables 100 \
-  --max_scanned_files 1000 \
-  --max_rows_per_source_table 100 \
-  --max_images_per_entity 2 \
-  --web_workers 4
+  --output_dir output_wdc_200k \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --from_stage pages \
+  --stop_after pages
 ```
 
-The runner supplies `--precompute_model_cache`, per-modality endpoint files,
-and model start/ready/done markers automatically. For manually managed endpoint
-pools, use `--text_model_base_urls_file` and
-`--image_model_base_urls_file`; the builder re-reads them before requests.
+Add `--refresh_page_cache` only with `--from_stage pages` or earlier, and
+`--refresh_image_cache` only with `--from_stage images` or earlier. A plain
+resume reuses both successes and terminal failures.
+
+### Real-table 100/1,000 scale gates
+
+The full corpus contains more mandatory `top100` candidates than a 100- or
+1,000-table target, so those gates must not run by merely lowering
+`--max_source_tables` on the full input. Create isolated, exact-size
+real-table gate inputs instead:
+
+```bash
+conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
+  --source_dir wdc_schemaorg_2023 \
+  --target_dir gate_inputs/wdc_100 \
+  --table_count 100 \
+  --selection_mode global_lowest \
+  --seed 13
+
+conda run -n MMDD python scripts/create_wdc200k_scale_gate_input.py \
+  --source_dir wdc_schemaorg_2023 \
+  --target_dir gate_inputs/wdc_1000 \
+  --table_count 1000 \
+  --selection_mode global_lowest \
+  --seed 13
+```
+
+These quick gates globally minimize source row counts by
+`(rows, stable_hash(seed, relative_path), relative_path)`. They validate
+pipeline plumbing, interruption/resume, request deduplication, checksums,
+resource bounds, and canonical output. They are not representative samples of
+WDC category balance, table quality, or row-count distribution, and they do
+not change the formal stratified 200K selection. The helper creates filtered
+production-format statistics ZIPs plus absolute source-data symlinks; it does
+not copy, delete, fetch, or modify corpus data. The target must be absent or
+strictly empty, and its resolved path must be outside the corpus tree (neither
+root may contain the other). `scale_gate_manifest.jsonl` records absolute
+sources, relative targets, and source gzip hashes;
+`scale_gate_checksums.json` covers the manifest and filtered ZIPs. These are
+all built and verified in a unique sibling staging directory before one atomic
+no-clobber publish; malformed or duplicate catalog paths fail closed without a
+partial target. These are operational scale-gate subcorpora, not the formal
+200K sampling result. Use each gate input with the matching
+`--max_source_tables` and fresh output/work/cache roots. The 10K structural
+gate uses the full corpus directly.
+
+### Direct endpoints, dynamic vLLM, and tmux
+
+The resume command above is the direct runner: the operator supplies already
+running OpenAI-compatible text and image endpoints. The dynamic runner instead
+starts and reallocates both vLLM modalities, and its unowned options pass
+through to the staged WDC 200K builder:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir wdc_schemaorg_2023 \
+  --output_dir output_wdc_200k \
+  --text_model_path /path/to/text-model \
+  --image_model_path /path/to/vision-model \
+  --work_dir work_wdc_200k \
+  --cache_dir cache/wdc_200k \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --resume
+```
+
+The dynamic runner owns endpoint files, model identity, and staged
+start/ready/done markers under `work_wdc_200k/runtime`.
+
+### Remote vLLM on one A100 80GB
+
+This runbook serves both models on one remote A100 and lets the local builder
+reach them through an SSH tunnel. The settings below are an operating starting
+point, not a claim that this exact GPU allocation has been benchmarked. Keep the
+builder stopped until both endpoint checks at the end of this section succeed.
+
+On the remote host, first inspect the GPU and create a fresh Python 3.12
+environment with `pip`:
+
+```bash
+ssh user@REMOTE_HOST
+nvidia-smi
+conda create -n vllm-023 python=3.12 pip -y
+conda activate vllm-023
+python --version
+python -m pip --version
+```
+
+Confirm from `nvidia-smi` and the NVIDIA compatibility documentation that the
+installed driver supports the CUDA 12.9 PyTorch wheel, then install the same
+pinned vLLM release used locally. The command follows the
+[official vLLM 0.23 GPU installation guidance](https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/):
+
+```bash
+python -m pip install 'vllm==0.23.0' \
+  --extra-index-url https://download.pytorch.org/whl/cu129
+python -c 'import torch, vllm; print("vllm", vllm.__version__, "torch", torch.__version__, "cuda", torch.version.cuda)'
+```
+
+Do not subsequently install `torch` with conda: that can replace the matching
+wheel selected for vLLM. Prepare the exact local model directories on the
+remote host before serving. From the local repository, `rsync` is preferred:
+
+```bash
+ssh user@REMOTE_HOST 'mkdir -p /srv/mmdd/hf_models'
+rsync -a --info=progress2 hf_models/Qwen3.5-9B/ \
+  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3.5-9B/
+rsync -a --info=progress2 hf_models/Qwen3-VL-8B-Thinking/ \
+  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3-VL-8B-Thinking/
+```
+
+If those local directories are unavailable, downloading the corresponding
+Hugging Face repositories instead requires remote network access and any model
+authorization required by their publishers. Do not silently substitute a
+different revision or model.
+
+Back on the remote host, generate one API key in a mode-600 file without putting
+the secret in a command argument or log. Use a dedicated tmux socket with one
+session and two windows, so both windows inherit the same controlled setup and
+their output stays in the panes without log redirection. Before running these
+commands, stop an existing `mmdd-vllm` dedicated server with
+`tmux -L mmdd-vllm kill-server` (an absent server only produces a harmless
+"no server running" error), or choose a unique socket name instead:
+
+```bash
+conda activate vllm-023
+umask 077
+mkdir -p "$HOME/.config/mmdd"
+python -c 'import secrets; print(secrets.token_urlsafe(32))' \
+  > "$HOME/.config/mmdd/vllm-api-key"
+chmod 600 "$HOME/.config/mmdd/vllm-api-key"
+
+tmux -L mmdd-vllm kill-server
+tmux -L mmdd-vllm new-session -d -s serve -n text \
+  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3.5-9B" --host 127.0.0.1 --port 8001 --served-model-name Qwen3.5-9B --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --language-model-only'
+
+tmux -L mmdd-vllm new-window -d -t serve -n image \
+  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Thinking" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Thinking --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt "{\"image\":1,\"video\":0}" --mm-processor-cache-gb 1'
+
+tmux -L mmdd-vllm attach-session -t serve:text
+# Detach with Ctrl-b d; switch to the image window with Ctrl-b n.
+```
+
+vLLM 0.23 documents `--language-model-only`; confirm it with
+`vllm serve --help`. If a locally patched 0.23 build omits that option, replace
+it on the text command with
+`--limit-mm-per-prompt '{"image":0,"video":0}'`. The image command keeps one
+image, disables video, and reduces the multimodal processor cache to 1 GiB;
+vLLM documents that this cache is duplicated across API and engine processes.
+See the [v0.23 serve option reference](https://docs.vllm.ai/en/v0.23.0/cli/serve/).
+
+Keep vLLM bound to `127.0.0.1` and, on the builder host, open the recommended
+tunnel:
+
+```bash
+ssh -N \
+  -L 18001:127.0.0.1:8001 \
+  -L 18000:127.0.0.1:8000 \
+  user@REMOTE_HOST
+```
+
+For a trusted private LAN only, an alternative is `--host 0.0.0.0` plus a
+firewall rule that permits these two ports solely from the builder's IP. Never
+expose the vLLM ports to the public internet; vLLM's
+[security guidance](https://docs.vllm.ai/en/latest/usage/security/) notes that
+an API key does not protect every server endpoint.
+
+In another local shell, read the same mode-600 key over SSH directly into the
+environment, then verify both served IDs through the tunnel. The key is neither
+a command argument nor printed to the terminal. Each unquoted heredoc expands
+the variable into curl's stdin config; shell history contains only the literal
+`$VLLM_API_KEY` text:
+
+```bash
+export VLLM_API_KEY="$(ssh user@REMOTE_HOST \
+  'cat "$HOME/.config/mmdd/vllm-api-key"')"
+curl --fail --silent --show-error \
+  --config - http://127.0.0.1:18001/v1/models <<EOF | python -m json.tool
+header = "Authorization: Bearer $VLLM_API_KEY"
+EOF
+curl --fail --silent --show-error \
+  --config - http://127.0.0.1:18000/v1/models <<EOF | python -m json.tool
+header = "Authorization: Bearer $VLLM_API_KEY"
+EOF
+```
+
+The first response must contain `Qwen3.5-9B`; the second must contain
+`Qwen3-VL-8B-Thinking`. Only after both are healthy, resume the stopped local
+builder with the formal roots and ordinary `--resume`:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/build_wdc200k_mm_joinability_dataset.py \
+  --input_dir /home/oycy/MMDD/wdc_schemaorg_2023 \
+  --output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720 \
+  --work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719 \
+  --cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720 \
+  --max_source_tables 200000 \
+  --selection_seed 13 \
+  --sampled_entities_per_table 8 \
+  --entity_sampling_seed 20260720 \
+  --min_free_disk_bytes 107374182400 \
+  --resume \
+  --text_model_base_url http://127.0.0.1:18001/v1 \
+  --text_model_name Qwen3.5-9B \
+  --image_model_base_url http://127.0.0.1:18000/v1 \
+  --image_model_name Qwen3-VL-8B-Thinking \
+  --text_model_workers 1 \
+  --image_model_workers 1 \
+  --model_endpoint_ready_timeout_seconds 180 \
+  --model_timeout_seconds 300 \
+  --model_max_retries 4 \
+  --model_retry_sleep_seconds 2
+```
+
+The endpoint client uses its existing precedence of explicit modality CLI key,
+modality-specific environment key, then common `VLLM_API_KEY`. Thus the common
+export above authenticates both endpoints without placing the secret on the
+builder command line; keys remain excluded from run fingerprints, registries,
+progress, and logs. Do not add `--from_stage models`: this is a plain resume and
+does not re-fetch completed network work. The 408 connection failures have
+already been restored to `pending` and will be retried. The three expired
+`leased` jobs are reclaimed automatically when workers resume.
+
+For a structural tmux preflight, keep process output attached directly to the
+tmux pane and use a second pane for the atomic progress snapshot:
+
+```bash
+tmux new-session -d -s wdc_200k \
+  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_200k --max_source_tables 200000 --selection_seed 13 --stop_after structural'
+tmux new-window -t wdc_200k -n progress \
+  "watch -n 5 'conda run -n MMDD python -m json.tool work_wdc_200k/progress.json'"
+tmux attach-session -t wdc_200k
+```
+
+Do not redirect stdout/stderr to a log file: the runner emits bounded periodic
+progress directly, while durable progress lives in
+`work_wdc_200k/progress.json`. Scale-gate measurements and acceptance criteria
+are recorded in
+`docs/superpowers/reports/2026-07-17-wdc-200k-scale-validation.md`.
 
 ## Stage-1 Logic Connectivity Pipeline
 

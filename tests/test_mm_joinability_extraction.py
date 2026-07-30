@@ -1614,6 +1614,78 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
 
     assert args.vllm_max_model_len == 8192
     assert args.model_start_timeout_seconds is None
+    assert args.forwarded_signal_grace_seconds == 30.0
+
+
+def test_dynamic_vllm_forwards_signal_to_every_live_process_group(
+    monkeypatch,
+):
+    class FakeProcess:
+        def __init__(self, pid, return_code):
+            self.pid = pid
+            self.return_code = return_code
+
+        def poll(self):
+            return self.return_code
+
+    forwarded = []
+    monkeypatch.setattr(
+        dynamic_vllm_runner.os,
+        "killpg",
+        lambda pid, signum: forwarded.append((pid, signum)),
+    )
+
+    dynamic_vllm_runner.forward_signal_to_live_process_groups(
+        signal.SIGTERM,
+        [
+            FakeProcess(101, None),
+            FakeProcess(102, 0),
+            None,
+            FakeProcess(103, None),
+        ],
+    )
+
+    assert forwarded == [
+        (101, signal.SIGTERM),
+        (103, signal.SIGTERM),
+    ]
+
+
+def test_dynamic_vllm_forwarded_signal_grace_skips_absent_or_exited_process():
+    class ExitedProcess:
+        def poll(self):
+            return 0
+
+        def wait(self, **_kwargs):
+            pytest.fail("already-exited processes must not be waited again")
+
+    assert dynamic_vllm_runner.wait_for_forwarded_process_exit(
+        None,
+        timeout_seconds=30.0,
+    )
+    assert dynamic_vllm_runner.wait_for_forwarded_process_exit(
+        ExitedProcess(),
+        timeout_seconds=30.0,
+    )
+
+
+def test_dynamic_vllm_cleanup_continues_after_one_stop_failure(monkeypatch):
+    processes = [object(), object(), object()]
+    attempted = []
+
+    def fake_stop(process):
+        attempted.append(process)
+        if process is processes[0]:
+            raise RuntimeError("first process would not stop")
+
+    monkeypatch.setattr(dynamic_vllm_runner, "stop_process", fake_stop)
+
+    errors = dynamic_vllm_runner.stop_processes_best_effort(processes)
+
+    assert attempted == processes
+    assert len(errors) == 1
+    assert errors[0][0] is processes[0]
+    assert str(errors[0][1]) == "first process would not stop"
 
 
 def test_start_server_persists_vllm_output_and_closes_parent_handle(monkeypatch, tmp_path):

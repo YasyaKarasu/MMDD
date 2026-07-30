@@ -11,16 +11,17 @@ second server for the remaining modality.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
-import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from gpu_priority_protocol import PriorityGpuOwner
 
@@ -247,6 +248,99 @@ def cleanup_processes(processes: Iterable[subprocess.Popen[str] | None]) -> None
         except Exception as exc:  # pragma: no cover - last-resort cleanup isolation.
             if process is not None:
                 _cleanup_warning(process, str(exc))
+
+
+def forward_signal_to_live_process_groups(
+    signum: int,
+    processes: Iterable[subprocess.Popen[str] | None],
+) -> None:
+    for process in processes:
+        if process is None or process.poll() is not None:
+            continue
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            continue
+
+
+def wait_for_forwarded_process_exit(
+    process: subprocess.Popen[str] | None,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    if process is None or process.poll() is not None:
+        return True
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+class ForwardedSignal(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def install_process_group_signal_handlers(
+    processes: Callable[[], Iterable[subprocess.Popen[str] | None]],
+) -> dict[int, object]:
+    previous_handlers: dict[int, object] = {}
+    shutdown_initiated = False
+    handler_active = False
+    followup_forwarded = False
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        nonlocal shutdown_initiated, handler_active, followup_forwarded
+        if handler_active or followup_forwarded:
+            return
+        is_followup = shutdown_initiated
+        shutdown_initiated = True
+        handler_active = True
+        try:
+            if is_followup:
+                followup_forwarded = True
+                mask_process_group_signals_for_cleanup()
+            forward_signal_to_live_process_groups(signum, processes())
+        finally:
+            handler_active = False
+        raise ForwardedSignal(signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous_handlers[signum] = signal.signal(signum, handle_signal)
+    return previous_handlers
+
+
+def restore_signal_handlers(previous_handlers: dict[int, object]) -> None:
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous = previous_handlers.get(signum)
+        if previous is not None:
+            signal.signal(signum, previous)
+
+
+def mask_process_group_signals_for_cleanup() -> None:
+    managed_signals = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, signal.SIG_IGN)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def stop_processes_best_effort(
+    processes: Iterable[subprocess.Popen[str] | None],
+) -> list[tuple[subprocess.Popen[str], Exception]]:
+    errors: list[tuple[subprocess.Popen[str], Exception]] = []
+    for process in processes:
+        if process is None:
+            continue
+        try:
+            stop_process(process)
+        except Exception as exc:
+            errors.append((process, exc))
+    return errors
 
 
 def read_log_tail(log_path: Path, *, max_bytes: int = 16_384) -> str:
@@ -806,6 +900,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--vllm_bin", default="vllm")
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
+    parser.add_argument(
+        "--forwarded_signal_grace_seconds",
+        type=float,
+        default=30.0,
+    )
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
@@ -863,6 +962,13 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 
 def main(argv: list[str] | None = None) -> int:
     args, passthrough_args = parse_args(argv)
+    if not (
+        math.isfinite(args.forwarded_signal_grace_seconds)
+        and args.forwarded_signal_grace_seconds >= 0
+    ):
+        raise ValueError(
+            "--forwarded_signal_grace_seconds must be finite and non-negative"
+        )
     output_dir = Path(args.output_dir)
     runtime_dir = output_dir / "_dynamic_vllm"
     text_endpoints_file = runtime_dir / "text_endpoints.txt"
@@ -943,6 +1049,15 @@ def main(argv: list[str] | None = None) -> int:
     secondary_image_proc: subprocess.Popen[str] | None = None
     builder_proc: subprocess.Popen[str] | None = None
     round_loop_manages_priority = False
+    previous_signal_handlers = install_process_group_signal_handlers(
+        lambda: (
+            builder_proc,
+            text_proc,
+            primary_image_proc,
+            secondary_text_proc,
+            secondary_image_proc,
+        )
+    )
     try:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         for marker in (model_start_marker, model_ready_marker, text_done_marker, image_done_marker):
@@ -1053,33 +1168,49 @@ def main(argv: list[str] | None = None) -> int:
             write_endpoint_file(image_endpoints_file, [primary_image_server.base_url, secondary_image_server.base_url])
 
         return int(builder_proc.wait())
-    finally:
-        cleanup_processes([builder_proc, secondary_text_proc])
-        cleanup_succeeded = True
+    except ForwardedSignal as exc:
         try:
-            stop_round_services(
-                RoundServiceProcesses(
-                    text=text_proc,
-                    primary_image=primary_image_proc,
-                    secondary_image=secondary_image_proc,
-                ),
-                text_endpoints_file=text_endpoints_file,
-                image_endpoints_file=image_endpoints_file,
-            )
-        except BaseException as error:
-            cleanup_succeeded = False
-            print(
-                f"Warning: EntiTables model cleanup was incomplete: {error}",
-                file=sys.stderr,
-            )
-        if (
-            gpu_priority_owner is not None
-            and not round_loop_manages_priority
-            and cleanup_succeeded
-        ):
-            gpu_priority_owner.release_gpus(
-                reason="entitables_runner_stopped"
-            )
+            try:
+                wait_for_forwarded_process_exit(
+                    builder_proc,
+                    timeout_seconds=args.forwarded_signal_grace_seconds,
+                )
+            except ForwardedSignal:
+                pass
+        finally:
+            mask_process_group_signals_for_cleanup()
+        return 128 + exc.signum
+    finally:
+        mask_process_group_signals_for_cleanup()
+        try:
+            cleanup_processes([builder_proc, secondary_text_proc])
+            cleanup_succeeded = True
+            try:
+                stop_round_services(
+                    RoundServiceProcesses(
+                        text=text_proc,
+                        primary_image=primary_image_proc,
+                        secondary_image=secondary_image_proc,
+                    ),
+                    text_endpoints_file=text_endpoints_file,
+                    image_endpoints_file=image_endpoints_file,
+                )
+            except BaseException as error:
+                cleanup_succeeded = False
+                print(
+                    f"Warning: EntiTables model cleanup was incomplete: {error}",
+                    file=sys.stderr,
+                )
+            if (
+                gpu_priority_owner is not None
+                and not round_loop_manages_priority
+                and cleanup_succeeded
+            ):
+                gpu_priority_owner.release_gpus(
+                    reason="entitables_runner_stopped"
+                )
+        finally:
+            restore_signal_handlers(previous_signal_handlers)
 
 
 if __name__ == "__main__":
