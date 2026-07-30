@@ -65,7 +65,11 @@ from wdc200k_structural import (
     expand_selected_shard,
     finalize_validated_selection,
 )
-from stage1_io import iter_manifest_records, load_split_map
+from stage1_io import (
+    iter_manifest_records,
+    load_split_map,
+    resolve_source_table_reference,
+)
 from stage1_io import stable_hash
 
 
@@ -140,6 +144,30 @@ def test_unsampled_source_rows_receive_stable_derived_entity_identity(
     assert wiki_to_entity[unsampled_title] == (
         "ent_" + stable_hash(unsampled_title, length=16)
     )
+
+
+def test_extraction_lookup_has_asset_leading_index(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.sqlite3"
+    materializer._initialize_index(database)
+
+    with materializer._connect(database) as connection:
+        plan = [
+            str(row["detail"])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT cache_key, record_json
+                FROM extractions
+                WHERE asset_id = ?
+                ORDER BY cache_key
+                """,
+                ("asset-1",),
+            )
+        ]
+
+    assert any("extractions_asset" in detail for detail in plan)
 
 
 def _args(tmp_path: Path) -> argparse.Namespace:
@@ -1284,7 +1312,7 @@ def test_failure_deduplication_recovers_after_mid_batch_guard_interrupt(
     assert resumed == records
 
 
-def test_empty_assets_keep_full_source_and_raw_data_lake_table(
+def test_empty_assets_keep_source_reference_in_raw_data_lake_table(
     tmp_path: Path,
 ) -> None:
     args = _args(tmp_path)
@@ -1299,8 +1327,41 @@ def test_empty_assets_keep_full_source_and_raw_data_lake_table(
     assert actual.attribute_extractions == []
     assert actual.evidence_recoveries == []
     assert actual.data_lake_tables[0]["role"] == "raw_data_lake_table"
-    assert actual.data_lake_tables[0]["source_row_indices"] == [0, 1]
-    assert len(actual.data_lake_tables[0]["rows"]) == 2
+    assert actual.data_lake_tables[0]["source_table_ref"] == {
+        "artifact": "source_tables",
+        "source_table_id": "source-1",
+    }
+    assert "rows" not in actual.data_lake_tables[0]
+    assert "columns" not in actual.data_lake_tables[0]
+    columns = [
+        int(column["column_index"])
+        for column in actual.source_table["columns"]
+    ]
+    legacy_rows, legacy_source_rows = (
+        join_builder.project_selected_rows(
+            actual.source_table,
+            columns,
+            {0, 1},
+            min_required_cols=0,
+        )
+    )
+    legacy_record = join_builder.table_record(
+        table_id="dl_raw_source-1",
+        role="raw_data_lake_table",
+        split="test",
+        source_table=actual.source_table,
+        column_indices=columns,
+        rows=legacy_rows,
+        source_row_indices=legacy_source_rows,
+        extra={
+            "queryable": False,
+            "reason": "no_column_met_recovered_value_ratio",
+        },
+    )
+    assert resolve_source_table_reference(
+        actual.data_lake_tables[0],
+        actual.source_table,
+    ) == legacy_record
     assert actual.decision["reason"] == "no_column_met_recovered_value_ratio"
 
 
@@ -1592,8 +1653,22 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
         iter_manifest_records(output_root, "source_tables", log_every=0)
     ) == [_source_table()]
     assert load_split_map(output_root) == {"source-1": "test"}
-    assert len(data_lake_records[0]["rows"]) == 2
+    assert "rows" not in data_lake_records[0]
+    assert data_lake_records[0]["source_table_ref"] == {
+        "artifact": "source_tables",
+        "source_table_id": "source-1",
+    }
     assert data_lake_records[0]["role"] == "raw_data_lake_table"
+    resolved_data_lake = list(
+        iter_manifest_records(
+            output_root,
+            "data_lake_tables",
+            log_every=0,
+        )
+    )
+    assert len(resolved_data_lake[0]["rows"]) == 2
+    assert resolved_data_lake[0]["source_row_indices"] == [0, 1]
+    assert "source_table_ref" not in resolved_data_lake[0]
 
     published = [
         path
@@ -2010,3 +2085,412 @@ def test_partial_source_catalog_import_resumes_after_committed_batch(
         assert connection.execute(
             "SELECT COUNT(*) FROM source_catalog"
         ).fetchone() == (11,)
+
+
+def test_materialization_checkpoints_between_bounded_source_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "materialized.sqlite3"
+    args = _args(tmp_path)
+    sources = [
+        _source_table(f"source-{index:02d}") for index in range(5)
+    ]
+    materializer._initialize_index(database_path)
+    materializer._catalog_source_records(
+        database_path,
+        sources,
+        args=args,
+        expected_tables=len(sources),
+    )
+    materializer._assign_splits(database_path, args)
+
+    checkpoints: list[Path] = []
+    checkpoint_wal = materializer._checkpoint_wal
+
+    def recording_checkpoint(path: Path) -> None:
+        checkpoints.append(path)
+        checkpoint_wal(path)
+
+    monkeypatch.setattr(
+        materializer,
+        "_MATERIALIZATION_READ_BATCH_RECORDS",
+        2,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_checkpoint_wal",
+        recording_checkpoint,
+    )
+    materializer._materialize_all_tables(
+        database_path,
+        args=args,
+        expected_tables=len(sources),
+    )
+
+    assert checkpoints == [database_path] * 3
+    with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_units WHERE complete = 1"
+        ).fetchone()[0] == len(sources)
+
+
+def test_parallel_materialization_commits_in_source_order_and_resumes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialized.sqlite3"
+    args = _args(tmp_path)
+    args.materialization_workers = 2
+    sources = [
+        _source_table(f"source-{index:02d}") for index in range(5)
+    ]
+    materializer._initialize_index(database_path)
+    materializer._catalog_source_records(
+        database_path,
+        sources,
+        args=args,
+        expected_tables=len(sources),
+    )
+    materializer._assign_splits(database_path, args)
+
+    committed: list[str] = []
+    materializer._materialize_all_tables(
+        database_path,
+        args=args,
+        expected_tables=len(sources),
+        after_table_commit=committed.append,
+    )
+
+    expected_ids = [
+        str(source["source_table_id"]) for source in sources
+    ]
+    assert committed == expected_ids
+    with materializer._connect(database_path) as connection:
+        stored_ids = [
+            str(row["source_table_id"])
+            for row in connection.execute(
+                "SELECT source_table_id FROM source_units ORDER BY rowid"
+            )
+        ]
+    assert stored_ids == expected_ids
+
+    resumed_commits: list[str] = []
+    materializer._materialize_all_tables(
+        database_path,
+        args=args,
+        expected_tables=len(sources),
+        after_table_commit=resumed_commits.append,
+    )
+    assert resumed_commits == []
+
+
+def test_existing_full_table_copies_migrate_to_references(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialized.sqlite3"
+    args = _args(tmp_path)
+    source_table = _source_table()
+    source_table_id = source_table["source_table_id"]
+    materializer._initialize_index(database_path)
+    materializer._catalog_source_records(
+        database_path,
+        [source_table],
+        args=args,
+        expected_tables=1,
+    )
+    materializer._assign_splits(database_path, args)
+    columns = [
+        int(column["column_index"])
+        for column in source_table["columns"]
+    ]
+    rows, source_rows = join_builder.project_selected_rows(
+        source_table,
+        columns,
+        {0, 1},
+        min_required_cols=0,
+    )
+    legacy_raw = join_builder.table_record(
+        table_id=f"dl_raw_{source_table_id}",
+        role="raw_data_lake_table",
+        split="test",
+        source_table=source_table,
+        column_indices=columns,
+        rows=rows,
+        source_row_indices=source_rows,
+        extra={
+            "queryable": False,
+            "reason": "no_column_met_recovered_value_ratio",
+        },
+    )
+    with materializer._connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        materializer._insert_materialized_records(
+            connection,
+            database_path=database_path,
+            artifact="source_tables",
+            records=[source_table],
+            source_table_id=source_table_id,
+            source_ordinal=0,
+        )
+        materializer._insert_materialized_records(
+            connection,
+            database_path=database_path,
+            artifact="data_lake_tables",
+            records=[legacy_raw],
+            source_table_id=source_table_id,
+            source_ordinal=0,
+        )
+        connection.commit()
+
+    materializer._compact_materialized_table_copies(database_path)
+
+    with materializer._connect(database_path) as connection:
+        stored_source = json.loads(
+            connection.execute(
+                """
+                SELECT record_json FROM materialized_records
+                WHERE artifact = 'source_tables'
+                """
+            ).fetchone()["record_json"]
+        )
+        stored_raw = json.loads(
+            connection.execute(
+                """
+                SELECT record_json FROM materialized_records
+                WHERE artifact = 'data_lake_tables'
+                """
+            ).fetchone()["record_json"]
+        )
+    assert stored_source == materializer._source_catalog_reference(
+        source_table_id
+    )
+    assert stored_raw == materializer._raw_data_lake_reference(
+        source_table_id,
+        "test",
+    )
+    assert list(
+        materializer._iter_materialized(
+            database_path,
+            "source_tables",
+        )
+    ) == [source_table]
+
+
+def test_source_catalog_insert_retries_one_interface_error() -> None:
+    class FlakyConnection:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, sql: str, values: tuple[Any, ...]) -> None:
+            assert sql == materializer._SOURCE_CATALOG_INSERT_SQL
+            assert values[0] == "source-1"
+            self.calls += 1
+            if self.calls == 1:
+                raise sqlite3.InterfaceError("temporary binding failure")
+
+    connection = FlakyConnection()
+    materializer._insert_source_catalog_record(
+        connection,
+        ("source-1", 7, "Title", "group", "a" * 64, "{}", ""),
+        ordinal=7,
+        source_table_id="source-1",
+    )
+
+    assert connection.calls == 2
+
+
+def test_source_catalog_insert_reports_safe_binding_diagnostics() -> None:
+    class FailingConnection:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, sql: str, values: tuple[Any, ...]) -> None:
+            self.calls += 1
+            raise sqlite3.InterfaceError("binding failure")
+
+    connection = FailingConnection()
+    record_json = '{"secret":"token"}'
+    with pytest.raises(sqlite3.InterfaceError) as caught:
+        materializer._insert_source_catalog_record(
+            connection,
+            (
+                "source-8",
+                71060,
+                "CreativeWork",
+                "split-group",
+                "b" * 64,
+                record_json,
+                "",
+            ),
+            ordinal=71060,
+            source_table_id="source-8",
+        )
+
+    message = str(caught.value)
+    assert connection.calls == 2
+    assert "ordinal=71060" in message
+    assert "source_table_id=source-8" in message
+    assert f"5:builtins.str[{len(record_json)}]" in message
+    assert record_json not in message
+
+
+def test_large_source_catalog_record_uses_external_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "catalog.sqlite3"
+    source_table = _source_table()
+    source_table["rows"][0]["cells"][0]["raw"] = "x" * 2048
+    source_table["rows"][0]["cells"][0]["text"] = "x" * 2048
+    materializer._initialize_index(database_path)
+
+    monkeypatch.setattr(
+        materializer,
+        "_INLINE_JSON_MAX_UTF8_BYTES",
+        1024 * 1024,
+    )
+    materializer._catalog_source_records(
+        database_path,
+        [source_table],
+        args=_args(tmp_path),
+        expected_tables=1,
+    )
+    with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT record_path FROM source_catalog
+            WHERE source_table_id = 'source-1'
+            """
+        ).fetchone()["record_path"] == ""
+
+    monkeypatch.setattr(
+        materializer,
+        "_INLINE_JSON_MAX_UTF8_BYTES",
+        128,
+    )
+    materializer._catalog_source_records(
+        database_path,
+        [source_table],
+        args=_args(tmp_path),
+        expected_tables=1,
+    )
+    with materializer._connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT record_json, record_path
+            FROM source_catalog
+            WHERE source_table_id = 'source-1'
+            """
+        ).fetchone()
+        assert row is not None
+        assert row["record_path"]
+        assert str(row["record_path"]).startswith(
+            "large-json/sha256/"
+        )
+        assert "x" * 128 not in str(row["record_json"])
+        assert materializer._load_stored_json(
+            database_path,
+            row["record_json"],
+            row["record_path"],
+        ) == source_table
+        materializer._validate_source_catalog_closure(connection)
+
+    canonical_relative = Path(str(row["record_path"]))
+    legacy_relative = (
+        Path("large-json")
+        / "source-catalog"
+        / canonical_relative.name
+    )
+    legacy_path = database_path.parent / legacy_relative
+    legacy_path.parent.mkdir(parents=True)
+    (database_path.parent / canonical_relative).replace(legacy_path)
+    with materializer._connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE source_catalog SET record_path = ?
+            WHERE source_table_id = 'source-1'
+            """,
+            (legacy_relative.as_posix(),),
+        )
+        connection.commit()
+
+    assert materializer._migrate_legacy_external_json_paths(
+        database_path
+    ) == 1
+    assert not legacy_path.exists()
+    materializer._catalog_source_records(
+        database_path,
+        [source_table],
+        args=_args(tmp_path),
+        expected_tables=1,
+    )
+    with materializer._connect(database_path) as connection:
+        migrated_path = connection.execute(
+            """
+            SELECT record_path FROM source_catalog
+            WHERE source_table_id = 'source-1'
+            """
+        ).fetchone()["record_path"]
+    assert migrated_path == canonical_relative.as_posix()
+    assert (database_path.parent / canonical_relative).is_file()
+    assert materializer._migrate_legacy_external_json_paths(
+        database_path
+    ) == 0
+
+
+def test_external_json_uses_global_content_addressed_path() -> None:
+    digest = "a" * 64
+    assert materializer._external_json_relative_path(
+        "source-catalog",
+        "source-1",
+        digest,
+    ) == materializer._external_json_relative_path(
+        "materialized-records/source_tables",
+        "different-identity",
+        digest,
+    )
+
+
+def test_large_materialized_record_uses_external_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        materializer,
+        "_INLINE_JSON_MAX_UTF8_BYTES",
+        128,
+    )
+    database_path = tmp_path / "materialized.sqlite3"
+    source_table = _source_table()
+    source_table["rows"][0]["cells"][0]["raw"] = "y" * 2048
+    source_table["rows"][0]["cells"][0]["text"] = "y" * 2048
+    materializer._initialize_index(database_path)
+
+    with materializer._connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        assert materializer._insert_materialized_records(
+            connection,
+            database_path=database_path,
+            artifact="source_tables",
+            records=[source_table],
+            source_table_id="source-1",
+            source_ordinal=0,
+        ) == 1
+        connection.commit()
+        row = connection.execute(
+            """
+            SELECT record_json, record_path
+            FROM materialized_records
+            WHERE artifact = 'source_tables'
+            """
+        ).fetchone()
+        assert row is not None
+        assert row["record_path"]
+        assert "y" * 128 not in str(row["record_json"])
+
+    assert list(
+        materializer._iter_materialized(
+            database_path,
+            "source_tables",
+        )
+    ) == [source_table]

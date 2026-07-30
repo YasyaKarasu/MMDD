@@ -24,10 +24,11 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
 
 try:
@@ -414,6 +415,7 @@ class LocalAttributeExtractor:
         self.text_model_base_urls_file = clean_text(getattr(args, "text_model_base_urls_file", ""))
         self._text_endpoint_lock = threading.Lock()
         self._text_endpoint_index = 0
+        self._text_endpoint_inflight: dict[str, int] = {}
         self.text_model_name = args.text_model_name
         self.text_model_api_key = model_api_key(
             getattr(args, "text_model_api_key", None),
@@ -429,6 +431,7 @@ class LocalAttributeExtractor:
         self.image_model_base_urls_file = clean_text(getattr(args, "image_model_base_urls_file", ""))
         self._image_endpoint_lock = threading.Lock()
         self._image_endpoint_index = 0
+        self._image_endpoint_inflight: dict[str, int] = {}
         self.image_model_name = args.image_model_name
         self.image_model_api_key = model_api_key(
             getattr(args, "image_model_api_key", None),
@@ -493,6 +496,72 @@ class LocalAttributeExtractor:
             index = self._image_endpoint_index % len(urls)
             self._image_endpoint_index += 1
             return urls[index]
+
+    def _acquire_model_base_url(self, model_kind: str) -> str:
+        if model_kind == "text":
+            lock = self._text_endpoint_lock
+            urls_getter = self.current_text_model_base_urls
+            inflight = self._text_endpoint_inflight
+            index_name = "_text_endpoint_index"
+        elif model_kind == "image":
+            lock = self._image_endpoint_lock
+            urls_getter = self.current_image_model_base_urls
+            inflight = self._image_endpoint_inflight
+            index_name = "_image_endpoint_index"
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+
+        with lock:
+            urls = urls_getter()
+            if not urls:
+                raise RuntimeError(f"no {model_kind} model endpoints are configured")
+            minimum_inflight = min(inflight.get(url, 0) for url in urls)
+            candidates = [
+                url
+                for url in urls
+                if inflight.get(url, 0) == minimum_inflight
+            ]
+            index = getattr(self, index_name)
+            base_url = candidates[index % len(candidates)]
+            setattr(self, index_name, index + 1)
+            inflight[base_url] = inflight.get(base_url, 0) + 1
+            return base_url
+
+    def _release_model_base_url(self, model_kind: str, base_url: str) -> None:
+        if model_kind == "text":
+            lock = self._text_endpoint_lock
+            inflight = self._text_endpoint_inflight
+        elif model_kind == "image":
+            lock = self._image_endpoint_lock
+            inflight = self._image_endpoint_inflight
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+
+        with lock:
+            count = inflight.get(base_url, 0)
+            if count <= 1:
+                inflight.pop(base_url, None)
+            else:
+                inflight[base_url] = count - 1
+
+    @contextmanager
+    def lease_model_base_url(self, model_kind: str) -> Iterator[str]:
+        """Lease the least-loaded current endpoint for one complete model call."""
+
+        base_url = self._acquire_model_base_url(model_kind)
+        try:
+            yield base_url
+        finally:
+            self._release_model_base_url(model_kind, base_url)
+
+    def _endpoint_is_current(self, model_kind: str, base_url: str) -> bool:
+        if model_kind == "text":
+            urls = self.current_text_model_base_urls()
+        elif model_kind == "image":
+            urls = self.current_image_model_base_urls()
+        else:
+            raise ValueError(f"unsupported model kind: {model_kind}")
+        return base_url in urls
 
     def _probe_endpoint(
         self,
@@ -586,27 +655,49 @@ class LocalAttributeExtractor:
         single_probe = timeout_seconds == 0
         deadline = time.monotonic() + timeout_seconds
         while True:
-            try:
-                for model_kind, url, model, api_key in endpoint_configs:
-                    if single_probe:
-                        request_timeout = min(configured_request_timeout, 1.0)
-                    else:
-                        remaining_seconds = deadline - time.monotonic()
-                        if remaining_seconds <= 0:
-                            raise TransientModelEndpointError(
-                                f"{model_kind} model endpoint {url} readiness deadline expired"
-                            )
-                        request_timeout = min(configured_request_timeout, remaining_seconds)
+            retry_error: TransientModelEndpointError | None = None
+            for model_kind, url, model, api_key in endpoint_configs:
+                if not self._endpoint_is_current(model_kind, url):
+                    continue
+                if single_probe:
+                    request_timeout = min(configured_request_timeout, 1.0)
+                else:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TransientModelEndpointError(
+                            f"{model_kind} model endpoint {url} readiness deadline expired"
+                        )
+                    request_timeout = min(configured_request_timeout, remaining_seconds)
+                try:
                     self._probe_endpoint(model_kind, url, model, api_key, request_timeout)
                     if not single_probe and time.monotonic() >= deadline:
                         raise TransientModelEndpointError(
                             f"{model_kind} model endpoint {url} readiness deadline expired"
                         )
-                return
-            except TransientModelEndpointError:
-                if single_probe or time.monotonic() >= deadline:
+                except TransientModelEndpointError as error:
+                    if not self._endpoint_is_current(model_kind, url):
+                        logging.info(
+                            "Ignoring readiness failure for withdrawn %s endpoint %s",
+                            model_kind,
+                            url,
+                        )
+                        continue
+                    retry_error = error
+                    break
+                except RuntimeError:
+                    if not self._endpoint_is_current(model_kind, url):
+                        logging.info(
+                            "Ignoring readiness failure for withdrawn %s endpoint %s",
+                            model_kind,
+                            url,
+                        )
+                        continue
                     raise
-                time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+            if retry_error is None:
+                return
+            if single_probe or time.monotonic() >= deadline:
+                raise retry_error
+            time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
     def chat(
         self,
@@ -711,13 +802,14 @@ class LocalAttributeExtractor:
                 {"role": "system", "content": "You are a precise information extraction engine."},
                 {"role": "user", "content": f"{prompt}\n\nText evidence:\n{content}"},
             ]
-            raw = self.chat(
-                base_url=self.next_text_model_base_url(),
-                model=self.text_model_name,
-                api_key=self.text_model_api_key,
-                messages=messages,
-                model_kind="text",
-            )
+            with self.lease_model_base_url("text") as base_url:
+                raw = self.chat(
+                    base_url=base_url,
+                    model=self.text_model_name,
+                    api_key=self.text_model_api_key,
+                    messages=messages,
+                    model_kind="text",
+                )
         elif asset.get("asset_type") == "image":
             image_url = clean_text(asset.get("image_url"))
             local_path = clean_text(asset.get("local_path"))
@@ -737,13 +829,14 @@ class LocalAttributeExtractor:
                 },
             ]
             try:
-                raw = self.chat(
-                    base_url=self.next_image_model_base_url(),
-                    model=self.image_model_name,
-                    api_key=self.image_model_api_key,
-                    messages=messages,
-                    model_kind="image",
-                )
+                with self.lease_model_base_url("image") as base_url:
+                    raw = self.chat(
+                        base_url=base_url,
+                        model=self.image_model_name,
+                        api_key=self.image_model_api_key,
+                        messages=messages,
+                        model_kind="image",
+                    )
             except Exception as exc:
                 if local_image_path is None or not is_context_length_error(exc):
                     raise
@@ -762,13 +855,14 @@ class LocalAttributeExtractor:
                     },
                 }
                 retry_messages[1]["content"] = retry_content
-                raw = self.chat(
-                    base_url=self.next_image_model_base_url(),
-                    model=self.image_model_name,
-                    api_key=self.image_model_api_key,
-                    messages=retry_messages,
-                    model_kind="image",
-                )
+                with self.lease_model_base_url("image") as base_url:
+                    raw = self.chat(
+                        base_url=base_url,
+                        model=self.image_model_name,
+                        api_key=self.image_model_api_key,
+                        messages=retry_messages,
+                        model_kind="image",
+                    )
         else:
             return {"attributes": [], "raw_response": "", "error": f"unsupported_asset_type:{asset.get('asset_type')}"}
         payload = safe_json_object(raw)
@@ -1257,7 +1351,10 @@ def source_splits(source_records: list[dict[str, str]], args: argparse.Namespace
             "data_lake_table_ids": [],
         }
     splits["split_key"] = "page_title_or_source_table_id" if args.split_by == "page_title" else "source_table_id"
-    splits["note"] = "source-level split; data_lake contains generated targets for queryable tables and raw tables for rejected tables"
+    splits["note"] = (
+        "source-level split; data_lake contains generated targets for "
+        "queryable tables and source-table references for rejected tables"
+    )
     return splits
 
 
@@ -1371,24 +1468,24 @@ def table_record(
 
 
 def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, Any]:
-    cols = [int(col["column_index"]) for col in source_table.get("columns", [])]
-    source_rows = [row_id(row, fallback) for fallback, row in enumerate(source_table.get("rows", []))]
-    rows, projected_source_rows = project_selected_rows(
-        source_table,
-        cols,
-        set(source_rows),
-        min_required_cols=0,
-    )
-    return table_record(
-        table_id=f"dl_raw_{source_table['source_table_id']}",
-        role="raw_data_lake_table",
-        split=split,
-        source_table=source_table,
-        column_indices=cols,
-        rows=rows,
-        source_row_indices=projected_source_rows,
-        extra={"queryable": False, "reason": "no_column_met_recovered_value_ratio"},
-    )
+    source_table_id = clean_text(source_table.get("source_table_id"))
+    if not source_table_id:
+        raise ValueError("source table is missing source_table_id")
+    table_id = f"dl_raw_{source_table_id}"
+    return {
+        "table_id": table_id,
+        "object_id": table_id,
+        "object_type": "table",
+        "role": "raw_data_lake_table",
+        "split": split,
+        "source_table_id": source_table_id,
+        "source_table_ref": {
+            "artifact": "source_tables",
+            "source_table_id": source_table_id,
+        },
+        "queryable": False,
+        "reason": "no_column_met_recovered_value_ratio",
+    }
 
 
 def context_columns(table: dict[str, Any], excluded: set[int], limit: int) -> list[int]:
@@ -2871,7 +2968,8 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "notes": [
             "source_tables are the fixed data-lake base pool",
             "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table aligned rows",
-            "data_lake_tables contain generated targets for queryable source tables and raw source tables for rejected source tables",
+            "data_lake_tables contain generated targets for queryable source "
+            "tables and source-table references for rejected source tables",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
         ],
@@ -2881,6 +2979,13 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     manifest = {
         "format": "sharded_jsonl",
         "records_per_shard": records_per_shard,
+        "artifact_references": {
+            "data_lake_tables": {
+                "field": "source_table_ref",
+                "target_artifact": "source_tables",
+                "resolution": "stream_by_source_table_id",
+            }
+        },
         "artifacts": {
             "source_tables": source_writer.manifest(output_dir),
             "query_tables": query_writer.manifest(output_dir),

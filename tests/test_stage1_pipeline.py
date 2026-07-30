@@ -29,7 +29,12 @@ from merge_human_labels import run as merge_human_labels
 from select_hitl_batch import run as select_hitl_batch
 from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_exception, resize_batch_images_for_limit
 from stage1_gui import format_gui_urls, resolve_gui_host
-from stage1_io import fd_purity, project_rows, write_jsonl
+from stage1_io import (
+    fd_purity,
+    iter_manifest_records,
+    project_rows,
+    write_jsonl,
+)
 from stage1_serialization import serialize_table_for_embedding
 from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
@@ -2423,6 +2428,25 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert [target["rows"][row_id]["cells"][0]["text"] for row_id in (1, 3)] == ["", ""]
     assert [column["column_name"] for column in target["columns"]] == ["City", "Team"]
     assert rejected["queryable"] is False
+    assert rejected["source_table_ref"] == {
+        "artifact": "source_tables",
+        "source_table_id": rejected["source_table_id"],
+    }
+    assert "rows" not in rejected
+    resolved_data_lake = list(
+        iter_manifest_records(
+            output_dir,
+            "data_lake_tables",
+            log_every=0,
+        )
+    )
+    resolved_rejected = next(
+        item
+        for item in resolved_data_lake
+        if item["role"] == "raw_data_lake_table"
+    )
+    assert len(resolved_rejected["rows"]) == 4
+    assert "source_table_ref" not in resolved_rejected
     assert manifest["query_construction"]["query_rows_per_table"] == 5
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]

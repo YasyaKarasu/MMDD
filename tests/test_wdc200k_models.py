@@ -521,14 +521,53 @@ def test_model_progress_callback_tracks_durable_status_transitions(
         and snapshot.leased == 0
         for snapshot in snapshots
     )
-    assert snapshots[-1] == models.ModelProgressSnapshot(
+    assert models.ModelProgressSnapshot(
         modality="image",
         total=0,
         success=0,
         terminal=0,
         leased=0,
         pending=0,
+    ) in snapshots
+
+
+def test_model_modalities_run_concurrently(tmp_path: Path) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("text", "text"), asset("image", "image")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
     )
+
+    class BarrierExtractor(CountingExtractor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.barrier = threading.Barrier(2)
+
+        def extract(self, current_asset, entity, candidate_attributes):
+            self.barrier.wait(timeout=2.0)
+            return super().extract(
+                current_asset,
+                entity,
+                candidate_attributes,
+            )
+
+    result = run_model_stage(
+        store,
+        BarrierExtractor(),
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+        workers_by_kind={"text": 1, "image": 1},
+    )
+
+    assert result.complete is True
+    assert _job_rows(store) == [
+        (job.job_id, "success") for job in sorted(
+            jobset.jobs,
+            key=lambda item: item.job_id,
+        )
+    ]
 
 
 def test_model_progress_counts_are_isolated_by_modality(tmp_path: Path) -> None:

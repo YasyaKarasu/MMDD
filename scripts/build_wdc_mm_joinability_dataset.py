@@ -3177,6 +3177,13 @@ def build_dataset(
         "format": "sharded_jsonl",
         "source_corpus": "WDC Schema.org Table Corpus 2023",
         "records_per_shard": records_per_shard,
+        "artifact_references": {
+            "data_lake_tables": {
+                "field": "source_table_ref",
+                "target_artifact": "source_tables",
+                "resolution": "stream_by_source_table_id",
+            }
+        },
         "artifacts": {
             "source_tables": source_writer.manifest(output_dir),
             "query_tables": query_writer.manifest(output_dir),

@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gzip
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import replace
 from itertools import zip_longest
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -116,6 +121,10 @@ except ModuleNotFoundError as error:
 
 
 MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v1"
+DATASET_REFERENCE_FORMAT = "source-table-reference-v1"
+_MATERIALIZED_REFERENCE_STORAGE_VERSION = (
+    "materialized-source-references-v1"
+)
 _CORE_ARTIFACTS = (
     "source_tables",
     "query_tables",
@@ -178,6 +187,14 @@ class MaterializedTable:
     decision: dict[str, Any]
     attribute_extractions: list[dict[str, Any]]
     evidence_recoveries: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _MaterializationWorkItem:
+    source_table_id: str
+    source_ordinal: int
+    source_sha256: str
+    split: str
 
 
 @dataclass(frozen=True)
@@ -245,6 +262,283 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+_INLINE_JSON_MAX_UTF8_BYTES = 4 * 1024 * 1024
+_JSON_TEXT_CHUNK_CHARACTERS = 1024 * 1024
+_MATERIALIZATION_READ_BATCH_RECORDS = 32
+_SQLITE_IN_BATCH_RECORDS = 900
+
+
+def _json_text_identity(value: str) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    for offset in range(0, len(value), _JSON_TEXT_CHUNK_CHARACTERS):
+        block = value[
+            offset : offset + _JSON_TEXT_CHUNK_CHARACTERS
+        ].encode("utf-8")
+        size += len(block)
+        digest.update(block)
+    return size, digest.hexdigest()
+
+
+def _external_json_relative_path(
+    namespace: str,
+    identity: str,
+    digest: str,
+) -> Path:
+    safe_namespace = Path(*Path(namespace).parts)
+    if (
+        safe_namespace.is_absolute()
+        or ".." in safe_namespace.parts
+        or not safe_namespace.parts
+    ):
+        raise ValueError(f"invalid external JSON namespace: {namespace}")
+    if not identity:
+        raise ValueError("external JSON identity must not be empty")
+    return (
+        Path("large-json")
+        / "sha256"
+        / digest[:2]
+        / f"{digest}.json.gz"
+    )
+
+
+def _external_json_stub(
+    record: dict[str, Any],
+    *,
+    digest: str,
+    size: int,
+) -> str:
+    external = {
+        "sha256": digest,
+        "utf8_bytes": size,
+    }
+    rows = record.get("rows")
+    if isinstance(rows, list):
+        external["row_count"] = len(rows)
+    stub: dict[str, Any] = {"_external_record": external}
+    for key in (
+        "split",
+        "source_table_id",
+        "table_id",
+        "query_table_id",
+        "role",
+        "asset_type",
+        "reason",
+    ):
+        if key in record:
+            stub[key] = record[key]
+    return _canonical_json(stub)
+
+
+def _write_external_json(
+    database_path: Path,
+    relative_path: Path,
+    encoded: str,
+) -> None:
+    root = database_path.parent.resolve()
+    path = (root / relative_path).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"external JSON path escapes index root: {path}")
+    if path.is_file():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("wb") as raw_handle:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                fileobj=raw_handle,
+                mtime=0,
+            ) as compressed:
+                for offset in range(
+                    0,
+                    len(encoded),
+                    _JSON_TEXT_CHUNK_CHARACTERS,
+                ):
+                    compressed.write(
+                        encoded[
+                            offset : offset
+                            + _JSON_TEXT_CHUNK_CHARACTERS
+                        ].encode("utf-8")
+                    )
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _stored_json_values(
+    database_path: Path,
+    *,
+    namespace: str,
+    identity: str,
+    record: dict[str, Any],
+    encoded: str,
+    encoded_size: int,
+    digest: str,
+) -> tuple[str, str]:
+    if encoded_size <= _INLINE_JSON_MAX_UTF8_BYTES:
+        return encoded, ""
+    relative_path = _external_json_relative_path(
+        namespace,
+        identity,
+        digest,
+    )
+    _write_external_json(database_path, relative_path, encoded)
+    return (
+        _external_json_stub(
+            record,
+            digest=digest,
+            size=encoded_size,
+        ),
+        relative_path.as_posix(),
+    )
+
+
+def _load_stored_json(
+    database_path: Path,
+    record_json: Any,
+    record_path: Any,
+) -> dict[str, Any]:
+    relative = clean_text(record_path)
+    if not relative:
+        record = json.loads(str(record_json))
+    else:
+        root = database_path.parent.resolve()
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError(
+                f"external JSON record is missing or unsafe: {relative}"
+            )
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            record = json.load(handle)
+    if not isinstance(record, dict):
+        raise ValueError("stored JSON record is not an object")
+    return record
+
+
+def _migrate_legacy_external_json_paths(
+    database_path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> int:
+    """Atomically relink referenced legacy blobs into the shared CAS."""
+
+    root = database_path.parent.resolve()
+    write_tracker = GuardedWriteTracker(
+        database_path,
+        pre_write_guard,
+    )
+    with _connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT record_path, MIN(record_json) AS record_json
+            FROM (
+                SELECT record_path, record_json
+                FROM source_catalog
+                WHERE record_path <> ''
+                  AND record_path NOT LIKE 'large-json/sha256/%'
+                UNION ALL
+                SELECT record_path, record_json
+                FROM materialized_records
+                WHERE record_path <> ''
+                  AND record_path NOT LIKE 'large-json/sha256/%'
+            )
+            GROUP BY record_path
+            ORDER BY record_path
+            """
+        ).fetchall()
+    migrated = 0
+    for row in rows:
+        legacy_relative = Path(str(row["record_path"]))
+        legacy_path = (root / legacy_relative).resolve()
+        if (
+            not legacy_path.is_relative_to(root)
+            or not legacy_path.is_file()
+        ):
+            raise ValueError(
+                "legacy external JSON record is missing or unsafe: "
+                f"{legacy_relative.as_posix()}"
+            )
+        stub = json.loads(str(row["record_json"]))
+        external = stub.get("_external_record")
+        if not isinstance(external, dict):
+            raise ValueError(
+                "legacy external JSON record has no identity: "
+                f"{legacy_relative.as_posix()}"
+            )
+        digest = clean_text(external.get("sha256"))
+        if len(digest) != 64:
+            raise ValueError(
+                "legacy external JSON digest is invalid: "
+                f"{legacy_relative.as_posix()}"
+            )
+        canonical_relative = _external_json_relative_path(
+            "legacy-migration",
+            legacy_relative.as_posix(),
+            digest,
+        )
+        canonical_path = (root / canonical_relative).resolve()
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        if not canonical_path.exists():
+            os.link(legacy_path, canonical_path)
+            _fsync_directory(canonical_path.parent)
+
+        write_tracker.before_write(16 * 1024)
+        with _connect(database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE source_catalog SET record_path = ?
+                WHERE record_path = ?
+                """,
+                (
+                    canonical_relative.as_posix(),
+                    legacy_relative.as_posix(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE materialized_records SET record_path = ?
+                WHERE record_path = ?
+                """,
+                (
+                    canonical_relative.as_posix(),
+                    legacy_relative.as_posix(),
+                ),
+            )
+            write_tracker.before_commit(0)
+            connection.commit()
+        legacy_path.unlink()
+        migrated += 1
+
+    legacy_root = root / "large-json"
+    for directory in sorted(
+        {
+            (root / Path(str(row["record_path"]))).resolve().parent
+            for row in rows
+        },
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        while (
+            directory != legacy_root
+            and directory.is_relative_to(legacy_root)
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+            directory = directory.parent
+    if migrated:
+        _checkpoint_wal(database_path)
+    return migrated
 
 
 def _sha256_path(path: Path) -> str:
@@ -695,7 +989,20 @@ def _iter_jsonl(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30.0)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA wal_autocheckpoint=1000")
     return connection
+
+
+def _checkpoint_wal(path: Path) -> None:
+    with _connect(path) as connection:
+        result = connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+    if result is not None and int(result[0]) != 0:
+        raise RuntimeError(
+            f"materialization WAL checkpoint remained busy: {path}"
+        )
 
 
 def _initialize_index(
@@ -774,6 +1081,8 @@ def _initialize_index(
             );
             CREATE INDEX IF NOT EXISTS extractions_entity_asset
                 ON extractions(entity_id, asset_id, cache_key);
+            CREATE INDEX IF NOT EXISTS extractions_asset
+                ON extractions(asset_id, cache_key);
             CREATE INDEX IF NOT EXISTS extractions_source
                 ON extractions(source_table_id, cache_key);
             CREATE UNIQUE INDEX IF NOT EXISTS extractions_full_call
@@ -807,7 +1116,8 @@ def _initialize_index(
                 split_group TEXT NOT NULL,
                 split TEXT,
                 record_sha256 TEXT NOT NULL,
-                record_json TEXT NOT NULL
+                record_json TEXT NOT NULL,
+                record_path TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS source_catalog_group
                 ON source_catalog(split_group, source_table_id);
@@ -834,6 +1144,7 @@ def _initialize_index(
                 source_ordinal INTEGER NOT NULL,
                 record_ordinal INTEGER NOT NULL,
                 record_json TEXT NOT NULL,
+                record_path TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (artifact, record_id)
             );
             CREATE INDEX IF NOT EXISTS materialized_order
@@ -861,6 +1172,20 @@ def _initialize_index(
                 ADD COLUMN source_row_id INTEGER NOT NULL DEFAULT 0
                 """
             )
+        for table in ("source_catalog", "materialized_records"):
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            }
+            if "record_path" not in columns:
+                connection.execute(
+                    f"""
+                    ALTER TABLE {table}
+                    ADD COLUMN record_path TEXT NOT NULL DEFAULT ''
+                    """
+                )
         tracker.before_commit(0)
         connection.commit()
     except BaseException:
@@ -1339,7 +1664,16 @@ def _validate_source_catalog_closure(
         connection.execute(
             """
             SELECT COALESCE(
-                SUM(json_array_length(record_json, '$.rows')),
+                SUM(
+                    CASE
+                        WHEN record_path = ''
+                        THEN json_array_length(record_json, '$.rows')
+                        ELSE json_extract(
+                            record_json,
+                            '$._external_record.row_count'
+                        )
+                    END
+                ),
                 0
             )
             FROM source_catalog
@@ -1400,8 +1734,50 @@ def _validate_source_catalog_closure(
                     source_row.value,
                     '$.row_id'
                 ) IN ('integer', 'text')
+                  AND source_catalog.record_path = ''
                 """
             )
+            external_sources = connection.execute(
+                """
+                SELECT source_table_id, record_json, record_path
+                FROM source_catalog
+                WHERE record_path <> ''
+                ORDER BY ordinal
+                """
+            ).fetchall()
+            for catalog_row in external_sources:
+                source_table_id = str(
+                    catalog_row["source_table_id"]
+                )
+                source_table = _load_stored_json(
+                    database_path,
+                    catalog_row["record_json"],
+                    catalog_row["record_path"],
+                )
+
+                def external_rows() -> Iterator[tuple[str, Any]]:
+                    for source_row in source_table.get("rows", []):
+                        if not isinstance(source_row, dict):
+                            continue
+                        row_id = source_row.get("row_id")
+                        if (
+                            isinstance(row_id, bool)
+                            or not isinstance(row_id, (int, str))
+                        ):
+                            continue
+                        yield source_table_id, row_id
+
+                connection.executemany(
+                    """
+                    INSERT INTO
+                        validation_db.source_row_validation (
+                            source_table_id,
+                            source_row_id
+                        )
+                    VALUES (?, CAST(? AS INTEGER))
+                    """,
+                    external_rows(),
+                )
             connection.execute(
                 """
                 CREATE INDEX
@@ -1648,6 +2024,60 @@ def _split_group(
     return source_table_id
 
 
+_SOURCE_CATALOG_INSERT_SQL = """
+    INSERT INTO source_catalog (
+        source_table_id, ordinal, page_title,
+        split_group, record_sha256, record_json, record_path
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _sqlite_parameter_summary(values: tuple[Any, ...]) -> str:
+    parts = []
+    for index, value in enumerate(values):
+        value_type = f"{type(value).__module__}.{type(value).__name__}"
+        try:
+            size = len(value)
+        except TypeError:
+            parts.append(f"{index}:{value_type}")
+        else:
+            parts.append(f"{index}:{value_type}[{size}]")
+    return ",".join(parts)
+
+
+def _insert_source_catalog_record(
+    connection: sqlite3.Connection,
+    values: tuple[Any, ...],
+    *,
+    ordinal: int,
+    source_table_id: str,
+) -> None:
+    try:
+        connection.execute(_SOURCE_CATALOG_INSERT_SQL, values)
+        return
+    except sqlite3.InterfaceError as error:
+        logging.warning(
+            "Transient source catalog SQLite binding failure; retrying once: "
+            "ordinal=%d source_table_id=%s parameters=%s error=%s",
+            ordinal,
+            source_table_id,
+            _sqlite_parameter_summary(values),
+            error,
+        )
+    try:
+        connection.execute(_SOURCE_CATALOG_INSERT_SQL, values)
+    except sqlite3.InterfaceError as error:
+        error_code = getattr(error, "sqlite_errorcode", None)
+        error_name = getattr(error, "sqlite_errorname", None)
+        raise sqlite3.InterfaceError(
+            "source catalog SQLite binding failed after one retry: "
+            f"ordinal={ordinal} source_table_id={source_table_id} "
+            f"parameters={_sqlite_parameter_summary(values)} "
+            f"sqlite_errorcode={error_code!r} "
+            f"sqlite_errorname={error_name!r}"
+        ) from error
+
+
 def _catalog_source_records(
     database_path: Path,
     source_tables: Iterable[dict[str, Any]],
@@ -1667,15 +2097,24 @@ def _catalog_source_records(
             if not source_table_id:
                 raise ValueError("source table is missing source_table_id")
             encoded = _canonical_json(source_table)
+            encoded_size, digest = _json_text_identity(encoded)
             if write_tracker is not None:
                 write_tracker.before_write(
-                    4096 + 2 * len(encoded.encode("utf-8"))
+                    4096 + 2 * encoded_size
                 )
-            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            stored_json, record_path = _stored_json_values(
+                database_path,
+                namespace="source-catalog",
+                identity=source_table_id,
+                record=source_table,
+                encoded=encoded,
+                encoded_size=encoded_size,
+                digest=digest,
+            )
             existing = connection.execute(
                 """
                 SELECT ordinal, page_title, split_group,
-                       record_sha256, record_json
+                       record_sha256, record_json, record_path
                 FROM source_catalog WHERE source_table_id = ?
                 """,
                 (source_table_id,),
@@ -1685,30 +2124,75 @@ def _catalog_source_records(
                 clean_text(source_table.get("page_title")),
                 _split_group(source_table, args),
                 digest,
-                encoded,
+                stored_json,
+                record_path,
             )
             if existing is not None:
-                actual_values = (
+                actual_identity = (
                     int(existing["ordinal"]),
                     str(existing["page_title"]),
                     str(existing["split_group"]),
                     str(existing["record_sha256"]),
-                    str(existing["record_json"]),
                 )
-                if actual_values != expected_values:
+                if actual_identity != expected_values[:4]:
+                    raise ValueError(
+                        f"conflicting source table ID: {source_table_id}"
+                    )
+                existing_json = str(existing["record_json"])
+                existing_path = str(existing["record_path"])
+                if not existing_path and record_path:
+                    if existing_json != encoded:
+                        raise ValueError(
+                            "conflicting source table ID: "
+                            f"{source_table_id}"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE source_catalog
+                        SET record_json = ?, record_path = ?
+                        WHERE source_table_id = ?
+                        """,
+                        (
+                            stored_json,
+                            record_path,
+                            source_table_id,
+                        ),
+                    )
+                elif existing_path and record_path:
+                    if (
+                        existing_json != stored_json
+                        or existing_path != record_path
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE source_catalog
+                            SET record_json = ?, record_path = ?
+                            WHERE source_table_id = ?
+                            """,
+                            (
+                                stored_json,
+                                record_path,
+                                source_table_id,
+                            ),
+                        )
+                elif existing_path:
+                    # Keep a valid external representation when a later
+                    # storage policy would otherwise inline the same digest.
+                    pass
+                elif (
+                    existing_json != stored_json
+                    or existing_path != record_path
+                ):
                     raise ValueError(
                         f"conflicting source table ID: {source_table_id}"
                     )
             else:
                 try:
-                    connection.execute(
-                        """
-                        INSERT INTO source_catalog (
-                            source_table_id, ordinal, page_title,
-                            split_group, record_sha256, record_json
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
+                    _insert_source_catalog_record(
+                        connection,
                         (source_table_id, *expected_values),
+                        ordinal=ordinal,
+                        source_table_id=source_table_id,
                     )
                 except sqlite3.IntegrityError as error:
                     raise ValueError(
@@ -1916,56 +2400,116 @@ def _table_inputs(
             for asset_id in (link.get("asset_ids") or [])
             if clean_text(asset_id)
         ]
-        assets = []
-        extractions = []
-        seen_assets: set[str] = set()
-        seen_extractions: set[str] = set()
-        for asset_id in asset_ids:
-            if asset_id in seen_assets:
-                continue
-            seen_assets.add(asset_id)
-            asset_row = connection.execute(
-                "SELECT record_json FROM assets WHERE asset_id = ?",
-                (asset_id,),
-            ).fetchone()
-            if asset_row is None:
-                continue
-            assets.append(json.loads(str(asset_row["record_json"])))
-            for extraction_row in connection.execute(
-                """
-                SELECT cache_key, record_json
-                FROM extractions
-                WHERE asset_id = ?
-                ORDER BY cache_key
+        ordered_asset_ids = list(dict.fromkeys(asset_ids))
+        assets_by_id: dict[str, dict[str, Any]] = {}
+        extractions_by_asset: dict[
+            str, list[tuple[str, dict[str, Any]]]
+        ] = {}
+        for offset in range(
+            0,
+            len(ordered_asset_ids),
+            _SQLITE_IN_BATCH_RECORDS,
+        ):
+            asset_batch = ordered_asset_ids[
+                offset : offset + _SQLITE_IN_BATCH_RECORDS
+            ]
+            placeholders = ",".join("?" for _ in asset_batch)
+            for asset_row in connection.execute(
+                f"""
+                SELECT asset_id, record_json
+                FROM assets
+                WHERE asset_id IN ({placeholders})
                 """,
-                (asset_id,),
+                tuple(asset_batch),
             ):
-                cache_key = str(extraction_row["cache_key"])
+                assets_by_id[str(asset_row["asset_id"])] = json.loads(
+                    str(asset_row["record_json"])
+                )
+            for extraction_row in connection.execute(
+                f"""
+                SELECT asset_id, cache_key, record_json
+                FROM extractions
+                WHERE asset_id IN ({placeholders})
+                ORDER BY asset_id, cache_key
+                """,
+                tuple(asset_batch),
+            ):
+                asset_id = str(extraction_row["asset_id"])
+                extractions_by_asset.setdefault(asset_id, []).append(
+                    (
+                        str(extraction_row["cache_key"]),
+                        json.loads(str(extraction_row["record_json"])),
+                    )
+                )
+
+        assets = [
+            assets_by_id[asset_id]
+            for asset_id in ordered_asset_ids
+            if asset_id in assets_by_id
+        ]
+        extractions = []
+        seen_extractions: set[str] = set()
+        for asset_id in ordered_asset_ids:
+            if asset_id not in assets_by_id:
+                continue
+            for cache_key, extraction in extractions_by_asset.get(
+                asset_id, []
+            ):
                 if cache_key in seen_extractions:
                     continue
                 seen_extractions.add(cache_key)
-                extractions.append(
-                    json.loads(str(extraction_row["record_json"]))
-                )
+                extractions.append(extraction)
 
         wiki_to_entity_id = {
             clean_text(entity.get("wiki_title")): str(entity["entity_id"])
             for entity in entities
             if clean_text(entity.get("wiki_title"))
         }
-        for title in _source_wiki_titles(source_table):
-            for alias in (
+        source_titles = _source_wiki_titles(source_table)
+        aliases_by_title = {
+            title: (
                 title,
                 normalize_title(title),
                 title.casefold(),
                 normalize_title(title).casefold(),
-            ):
-                row = connection.execute(
-                    "SELECT entity_id FROM entity_aliases WHERE alias = ?",
-                    (alias,),
-                ).fetchone()
-                if row is not None:
-                    wiki_to_entity_id[title] = str(row["entity_id"])
+            )
+            for title in source_titles
+        }
+        ordered_aliases = list(
+            dict.fromkeys(
+                alias
+                for aliases in aliases_by_title.values()
+                for alias in aliases
+            )
+        )
+        entity_id_by_alias: dict[str, str] = {}
+        for offset in range(
+            0,
+            len(ordered_aliases),
+            _SQLITE_IN_BATCH_RECORDS,
+        ):
+            alias_batch = ordered_aliases[
+                offset : offset + _SQLITE_IN_BATCH_RECORDS
+            ]
+            placeholders = ",".join("?" for _ in alias_batch)
+            entity_id_by_alias.update(
+                {
+                    str(row["alias"]): str(row["entity_id"])
+                    for row in connection.execute(
+                        f"""
+                        SELECT alias, entity_id
+                        FROM entity_aliases
+                        WHERE alias IN ({placeholders})
+                        """,
+                        tuple(alias_batch),
+                    )
+                }
+            )
+        for title in source_titles:
+            for alias in aliases_by_title[title]:
+                entity_id = entity_id_by_alias.get(alias)
+                if entity_id is not None:
+                    wiki_to_entity_id[title] = entity_id
                     break
             else:
                 wiki_to_entity_id[title] = (
@@ -2039,6 +2583,85 @@ def _materialize_from_index(
         decision=decision,
         attribute_extractions=extraction_sink.records,
         evidence_recoveries=recovery_sink.records,
+    )
+
+
+def _materialize_work_item(
+    database_path: Path,
+    args: argparse.Namespace,
+    item: _MaterializationWorkItem,
+) -> MaterializedTable:
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT record_sha256, record_json, record_path
+            FROM source_catalog
+            WHERE source_table_id = ?
+            """,
+            (item.source_table_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"materialization source is missing: {item.source_table_id}"
+        )
+    if str(row["record_sha256"]) != item.source_sha256:
+        raise ValueError(
+            f"materialization source identity mismatch: "
+            f"{item.source_table_id}"
+        )
+    source_table = _load_stored_json(
+        database_path,
+        row["record_json"],
+        row["record_path"],
+    )
+    if clean_text(source_table.get("source_table_id")) != item.source_table_id:
+        raise ValueError(
+            f"materialization source ID mismatch: {item.source_table_id}"
+        )
+    if any(
+        clean_text(column.get("column_name")).casefold() == "image"
+        for column in source_table.get("columns", [])
+    ):
+        raise ValueError(
+            f"source table retains forbidden image column: "
+            f"{item.source_table_id}"
+        )
+    materialized = _materialize_from_index(
+        source_table,
+        database_path,
+        args=args,
+        split=item.split,
+    )
+    # The writer only needs the stable ID. Avoid sending a potentially very
+    # large source table back through the process-pool result pipe.
+    return replace(
+        materialized,
+        source_table={"source_table_id": item.source_table_id},
+    )
+
+
+_WORKER_DATABASE_PATH: Path | None = None
+_WORKER_ARGS: argparse.Namespace | None = None
+
+
+def _initialize_materialization_worker(
+    database_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    global _WORKER_DATABASE_PATH, _WORKER_ARGS
+    _WORKER_DATABASE_PATH = database_path
+    _WORKER_ARGS = args
+
+
+def _run_materialization_worker(
+    item: _MaterializationWorkItem,
+) -> MaterializedTable:
+    if _WORKER_DATABASE_PATH is None or _WORKER_ARGS is None:
+        raise RuntimeError("materialization worker is not initialized")
+    return _materialize_work_item(
+        _WORKER_DATABASE_PATH,
+        _WORKER_ARGS,
+        item,
     )
 
 
@@ -2121,9 +2744,153 @@ def _record_id(
     )
 
 
+def _source_catalog_reference(source_table_id: str) -> dict[str, Any]:
+    return {
+        "source_table_id": source_table_id,
+        "_materialized_record_ref": {
+            "table": "source_catalog",
+            "source_table_id": source_table_id,
+        },
+    }
+
+
+def _raw_data_lake_reference(
+    source_table_id: str,
+    split: str,
+) -> dict[str, Any]:
+    table_id = f"dl_raw_{source_table_id}"
+    return {
+        "table_id": table_id,
+        "object_id": table_id,
+        "object_type": "table",
+        "role": "raw_data_lake_table",
+        "split": split,
+        "source_table_id": source_table_id,
+        "source_table_ref": {
+            "artifact": "source_tables",
+            "source_table_id": source_table_id,
+        },
+        "queryable": False,
+        "reason": "no_column_met_recovered_value_ratio",
+    }
+
+
+def _compact_materialized_table_copies(
+    database_path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    """Replace resumable full-table copies with deterministic references."""
+
+    write_tracker = GuardedWriteTracker(
+        database_path,
+        pre_write_guard,
+    )
+    with _connect(database_path) as connection:
+        stored = connection.execute(
+            """
+            SELECT value FROM metadata
+            WHERE key = 'materialized_reference_storage'
+            """
+        ).fetchone()
+    if (
+        stored is not None
+        and str(stored["value"])
+        == _MATERIALIZED_REFERENCE_STORAGE_VERSION
+    ):
+        return
+
+    for artifact in ("source_tables", "data_lake_tables"):
+        last_ordinal = -1
+        while True:
+            condition = (
+                ""
+                if artifact == "source_tables"
+                else (
+                    "AND materialized.record_id = "
+                    "'dl_raw_' || materialized.source_table_id"
+                )
+            )
+            with _connect(database_path) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT materialized.record_id,
+                           materialized.source_table_id,
+                           materialized.source_ordinal,
+                           LENGTH(materialized.record_json)
+                               AS inline_bytes,
+                           source_catalog.split
+                    FROM materialized_records AS materialized
+                    JOIN source_catalog
+                      ON source_catalog.source_table_id =
+                         materialized.source_table_id
+                    WHERE materialized.artifact = ?
+                      AND materialized.source_ordinal > ?
+                      {condition}
+                    ORDER BY materialized.source_ordinal
+                    LIMIT ?
+                    """,
+                    (
+                        artifact,
+                        last_ordinal,
+                        _MATERIALIZATION_READ_BATCH_RECORDS,
+                    ),
+                ).fetchall()
+            if not rows:
+                break
+            write_tracker.before_write(
+                4096
+                + 2
+                * sum(int(row["inline_bytes"] or 0) for row in rows)
+            )
+            with _connect(database_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for row in rows:
+                    source_table_id = str(row["source_table_id"])
+                    record = (
+                        _source_catalog_reference(source_table_id)
+                        if artifact == "source_tables"
+                        else _raw_data_lake_reference(
+                            source_table_id,
+                            clean_text(row["split"]),
+                        )
+                    )
+                    connection.execute(
+                        """
+                        UPDATE materialized_records
+                        SET record_json = ?, record_path = ''
+                        WHERE artifact = ? AND record_id = ?
+                        """,
+                        (
+                            _canonical_json(record),
+                            artifact,
+                            str(row["record_id"]),
+                        ),
+                    )
+                write_tracker.before_commit(0)
+                connection.commit()
+            last_ordinal = int(rows[-1]["source_ordinal"])
+            _checkpoint_wal(database_path)
+
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO metadata (key, value)
+            VALUES ('materialized_reference_storage', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_MATERIALIZED_REFERENCE_STORAGE_VERSION,),
+        )
+        write_tracker.before_commit(0)
+        connection.commit()
+    _checkpoint_wal(database_path)
+
+
 def _insert_materialized_records(
     connection: sqlite3.Connection,
     *,
+    database_path: Path,
     artifact: str,
     records: Iterable[dict[str, Any]],
     source_table_id: str,
@@ -2137,13 +2904,25 @@ def _insert_materialized_records(
             source_table_id,
             ordinal,
         )
+        encoded = _canonical_json(record)
+        encoded_size, digest = _json_text_identity(encoded)
+        stored_json, record_path = _stored_json_values(
+            database_path,
+            namespace=f"materialized-records/{artifact}",
+            identity=record_id,
+            record=record,
+            encoded=encoded,
+            encoded_size=encoded_size,
+            digest=digest,
+        )
         try:
             connection.execute(
                 """
                 INSERT INTO materialized_records (
                     artifact, record_id, source_table_id,
-                    source_ordinal, record_ordinal, record_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    source_ordinal, record_ordinal,
+                    record_json, record_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact,
@@ -2151,7 +2930,8 @@ def _insert_materialized_records(
                     source_table_id,
                     source_ordinal,
                     ordinal,
-                    _canonical_json(record),
+                    stored_json,
+                    record_path,
                 ),
             )
             if artifact in {
@@ -2213,7 +2993,9 @@ def _store_table_unit(
             "split": split,
         }
         artifact_records: dict[str, Iterable[dict[str, Any]]] = {
-            "source_tables": [materialized.source_table],
+            "source_tables": [
+                _source_catalog_reference(source_table_id)
+            ],
             "query_tables": materialized.query_tables,
             "data_lake_tables": materialized.data_lake_tables,
             "entities": materialized.entities,
@@ -2237,6 +3019,7 @@ def _store_table_unit(
         counts = {
             artifact: _insert_materialized_records(
                 connection,
+                database_path=database_path,
                 artifact=artifact,
                 records=records,
                 source_table_id=source_table_id,
@@ -2288,85 +3071,126 @@ def _materialize_all_tables(
     pre_write_guard: PreWriteGuard | None = None,
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
-    with _connect(database_path) as connection:
-        cursor = connection.execute(
-            """
-            SELECT source_table_id, ordinal, split,
-                   record_sha256, record_json
-            FROM source_catalog
-            ORDER BY ordinal
-            """
-        )
-        observed = 0
-        for row in cursor:
-            observed += 1
-            source_table_id = str(row["source_table_id"])
-            split = clean_text(row["split"])
-            if split not in {"train", "dev", "test"}:
-                raise ValueError(
-                    f"source table has invalid split: {source_table_id}"
-                )
-            completed = connection.execute(
-                """
-                SELECT source_sha256, split, complete
-                FROM source_units WHERE source_table_id = ?
-                """,
-                (source_table_id,),
-            ).fetchone()
-            if completed is not None:
-                if (
-                    str(completed["source_sha256"])
-                    != str(row["record_sha256"])
-                    or str(completed["split"]) != split
-                    or int(completed["complete"]) != 1
-                ):
-                    raise ValueError(
-                        f"source unit resume mismatch: {source_table_id}"
+    worker_count = int(getattr(args, "materialization_workers", 1))
+    if worker_count <= 0:
+        raise ValueError("materialization worker count must be positive")
+    observed = 0
+    last_ordinal = -1
+    executor: ProcessPoolExecutor | None = None
+    with ExitStack() as stack:
+        while True:
+            with _connect(database_path) as connection:
+                batch = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT source_catalog.source_table_id,
+                               source_catalog.ordinal,
+                               source_catalog.split,
+                               source_catalog.record_sha256,
+                               source_units.source_sha256
+                                   AS completed_sha256,
+                               source_units.split AS completed_split,
+                               source_units.complete AS completed
+                        FROM source_catalog
+                        LEFT JOIN source_units
+                          ON source_units.source_table_id =
+                             source_catalog.source_table_id
+                        WHERE source_catalog.ordinal > ?
+                        ORDER BY source_catalog.ordinal
+                        LIMIT ?
+                        """,
+                        (
+                            last_ordinal,
+                            _MATERIALIZATION_READ_BATCH_RECORDS,
+                        ),
                     )
-                continue
-            source_table = json.loads(str(row["record_json"]))
-            if any(
-                clean_text(column.get("column_name")).casefold()
-                == "image"
-                for column in source_table.get("columns", [])
-            ):
-                raise ValueError(
-                    f"source table retains forbidden image column: "
-                    f"{source_table_id}"
+                ]
+            if not batch:
+                break
+            observed += len(batch)
+            work_items: list[_MaterializationWorkItem] = []
+            for row in batch:
+                source_table_id = str(row["source_table_id"])
+                split = clean_text(row["split"])
+                if split not in {"train", "dev", "test"}:
+                    raise ValueError(
+                        f"source table has invalid split: {source_table_id}"
+                    )
+                if row["completed"] is not None:
+                    if (
+                        str(row["completed_sha256"])
+                        != str(row["record_sha256"])
+                        or str(row["completed_split"]) != split
+                        or int(row["completed"]) != 1
+                    ):
+                        raise ValueError(
+                            f"source unit resume mismatch: {source_table_id}"
+                        )
+                    continue
+                work_items.append(
+                    _MaterializationWorkItem(
+                        source_table_id=source_table_id,
+                        source_ordinal=int(row["ordinal"]),
+                        source_sha256=str(row["record_sha256"]),
+                        split=split,
+                    )
                 )
-            materialized = _materialize_from_index(
-                source_table,
-                database_path,
-                args=args,
-                split=split,
-            )
-            estimated_bytes = 4096
-            for record in (
-                materialized.source_table,
-                materialized.decision,
-                *materialized.entities,
-                *materialized.bridge_assets,
-                *materialized.table_asset_links,
-                *materialized.query_tables,
-                *materialized.data_lake_tables,
-                *materialized.qrels,
-                *materialized.attribute_extractions,
-                *materialized.evidence_recoveries,
-            ):
-                estimated_bytes += 2 * len(
-                    _canonical_json(record).encode("utf-8")
+            if executor is None and worker_count > 1 and work_items:
+                executor = stack.enter_context(
+                    ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        mp_context=get_context("spawn"),
+                        initializer=_initialize_materialization_worker,
+                        initargs=(database_path, args),
+                    )
                 )
-            write_tracker.before_write(estimated_bytes)
-            _store_table_unit(
-                database_path,
-                materialized,
-                source_ordinal=int(row["ordinal"]),
-                source_sha256=str(row["record_sha256"]),
-                split=split,
-                write_tracker=write_tracker,
-            )
-            if after_table_commit is not None:
-                after_table_commit(source_table_id)
+            materialized_tables: Iterable[MaterializedTable]
+            if executor is None:
+                materialized_tables = (
+                    _materialize_work_item(database_path, args, item)
+                    for item in work_items
+                )
+            else:
+                materialized_tables = executor.map(
+                    _run_materialization_worker,
+                    work_items,
+                    chunksize=1,
+                )
+            for item, materialized in zip(
+                work_items,
+                materialized_tables,
+                strict=True,
+            ):
+                estimated_bytes = 4096
+                for record in (
+                    _source_catalog_reference(item.source_table_id),
+                    materialized.decision,
+                    *materialized.entities,
+                    *materialized.bridge_assets,
+                    *materialized.table_asset_links,
+                    *materialized.query_tables,
+                    *materialized.data_lake_tables,
+                    *materialized.qrels,
+                    *materialized.attribute_extractions,
+                    *materialized.evidence_recoveries,
+                ):
+                    estimated_bytes += 2 * len(
+                        _canonical_json(record).encode("utf-8")
+                    )
+                write_tracker.before_write(estimated_bytes)
+                _store_table_unit(
+                    database_path,
+                    materialized,
+                    source_ordinal=item.source_ordinal,
+                    source_sha256=item.source_sha256,
+                    split=item.split,
+                    write_tracker=write_tracker,
+                )
+                if after_table_commit is not None:
+                    after_table_commit(item.source_table_id)
+            last_ordinal = int(batch[-1]["ordinal"])
+            _checkpoint_wal(database_path)
     if observed != expected_tables:
         raise ValueError("materialization source iteration count mismatch")
     with _connect(database_path) as connection:
@@ -2486,14 +3310,44 @@ def _iter_materialized(
     with _connect(database_path) as connection:
         for row in connection.execute(
             """
-            SELECT record_json
+            SELECT record_json, record_path
             FROM materialized_records
             WHERE artifact = ?
             ORDER BY source_ordinal, record_ordinal, record_id
             """,
             (artifact,),
         ):
-            yield json.loads(str(row["record_json"]))
+            record = _load_stored_json(
+                database_path,
+                row["record_json"],
+                row["record_path"],
+            )
+            reference = record.get("_materialized_record_ref")
+            if artifact == "source_tables" and isinstance(
+                reference, dict
+            ):
+                source_table_id = clean_text(
+                    reference.get("source_table_id")
+                )
+                source_row = connection.execute(
+                    """
+                    SELECT record_json, record_path
+                    FROM source_catalog
+                    WHERE source_table_id = ?
+                    """,
+                    (source_table_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise ValueError(
+                        "materialized source-table reference is missing: "
+                        f"{source_table_id}"
+                    )
+                record = _load_stored_json(
+                    database_path,
+                    source_row["record_json"],
+                    source_row["record_path"],
+                )
+            yield record
 
 
 def _artifact_count(database_path: Path, artifact: str) -> int:
@@ -2645,8 +3499,8 @@ def _write_splits(
             handle.write(
                 json.dumps(
                     "source-level split; data_lake contains generated "
-                    "targets for queryable tables and raw tables for "
-                    "rejected tables"
+                    "targets for queryable tables and source-table "
+                    "references for rejected tables"
                 )
             )
             handle.write("}\n")
@@ -2856,6 +3710,8 @@ def _load_published_result(
         raise ValueError(
             "published dataset manifest identity validation failed"
         )
+    if payload.get("reference_format") != DATASET_REFERENCE_FORMAT:
+        return None
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(
         _CORE_ARTIFACTS
@@ -3080,11 +3936,19 @@ def _finalize_dataset(
     manifest = {
         "stage": "wdc200k_materialization",
         "schema_version": MATERIALIZATION_SCHEMA_VERSION,
+        "reference_format": DATASET_REFERENCE_FORMAT,
         "format": "sharded_jsonl",
         "records_per_shard": records_per_shard,
         "input_identity": upstream.identity,
         "parameter_fingerprint": parameter_fingerprint,
         "upstream": upstream.provenance,
+        "artifact_references": {
+            "data_lake_tables": {
+                "field": "source_table_ref",
+                "target_artifact": "source_tables",
+                "resolution": "stream_by_source_table_id",
+            }
+        },
         "artifacts": {
             artifact: _artifact_manifest(
                 artifact,
@@ -3204,6 +4068,10 @@ def materialize_dataset(
         upstream,
         pre_write_guard=pre_write_guard,
     )
+    _migrate_legacy_external_json_paths(
+        database_path,
+        pre_write_guard=pre_write_guard,
+    )
     if pre_write_guard is not None:
         pre_write_guard(database_path, 0)
     _catalog_sources(
@@ -3228,6 +4096,10 @@ def materialize_dataset(
     _assign_splits(
         database_path,
         args,
+        pre_write_guard=pre_write_guard,
+    )
+    _compact_materialized_table_copies(
+        database_path,
         pre_write_guard=pre_write_guard,
     )
     _materialize_all_tables(

@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -1810,7 +1811,7 @@ def _process_claimed_group(
                 ):
                     handled += 1
                     if progress_tracker is not None:
-                        progress_tracker.finished("terminal")
+                        progress_tracker.finished(modality, "terminal")
                 continue
             cached = cache.get(payload)
             if cached is None:
@@ -1838,7 +1839,7 @@ def _process_claimed_group(
             ):
                 handled += 1
                 if progress_tracker is not None:
-                    progress_tracker.finished(cached_status)
+                    progress_tracker.finished(modality, cached_status)
         if not model_jobs:
             return handled
         if extractor is None:
@@ -1853,7 +1854,7 @@ def _process_claimed_group(
                     lease_id=job.lease_id,
                 )
                 if progress_tracker is not None:
-                    progress_tracker.finished("retryable")
+                    progress_tracker.finished(modality, "retryable")
             raise RuntimeError(
                 "model analysis is required but no extractor was provided"
             )
@@ -1879,7 +1880,7 @@ def _process_claimed_group(
                     with state_lock:
                         handled += 1
                     if progress_tracker is not None:
-                        progress_tracker.finished("retryable")
+                        progress_tracker.finished(modality, "retryable")
                 return
             status = (
                 "terminal"
@@ -1902,7 +1903,7 @@ def _process_claimed_group(
                 with state_lock:
                     handled += 1
                 if progress_tracker is not None:
-                    progress_tracker.finished(status)
+                    progress_tracker.finished(modality, status)
 
         run_extraction_task_group(
             extractor=extractor,
@@ -2047,15 +2048,14 @@ class _ModelProgressTracker:
     ) -> None:
         self._counts = counts
         self._callback = callback
-        self._modality: str | None = None
         self._lock = threading.Lock()
 
-    def _snapshot_locked(self) -> ModelProgressSnapshot:
-        if self._modality is None:
-            raise RuntimeError("model progress modality is not active")
-        counts = self._counts[self._modality]
+    def _snapshot_locked(self, modality: str) -> ModelProgressSnapshot:
+        if modality not in self._counts:
+            raise ValueError(f"unsupported model progress modality: {modality}")
+        counts = self._counts[modality]
         return ModelProgressSnapshot(
-            modality=self._modality,
+            modality=modality,
             total=counts["total"],
             success=counts["success"],
             terminal=counts["terminal"],
@@ -2071,28 +2071,23 @@ class _ModelProgressTracker:
 
     def set_modality(self, modality: str) -> None:
         with self._lock:
-            self._modality = modality
-            snapshot = self._snapshot_locked()
+            snapshot = self._snapshot_locked(modality)
         self._emit(snapshot)
 
-    def claimed(self, count: int) -> None:
+    def claimed(self, modality: str, count: int) -> None:
         if count <= 0:
             return
         with self._lock:
-            if self._modality is None:
-                raise RuntimeError("model progress modality is not active")
-            counts = self._counts[self._modality]
+            counts = self._counts[modality]
             from_pending = min(count, counts["pending"])
             counts["pending"] -= from_pending
             counts["leased"] += from_pending
-            snapshot = self._snapshot_locked()
+            snapshot = self._snapshot_locked(modality)
         self._emit(snapshot)
 
-    def finished(self, status: str) -> None:
+    def finished(self, modality: str, status: str) -> None:
         with self._lock:
-            if self._modality is None:
-                raise RuntimeError("model progress modality is not active")
-            counts = self._counts[self._modality]
+            counts = self._counts[modality]
             if counts["leased"] <= 0:
                 raise ValueError("model progress finished without a lease")
             counts["leased"] -= 1
@@ -2102,7 +2097,7 @@ class _ModelProgressTracker:
                 counts["pending"] += 1
             else:
                 raise ValueError(f"unsupported model progress status: {status}")
-            snapshot = self._snapshot_locked()
+            snapshot = self._snapshot_locked(modality)
         self._emit(snapshot)
 
 
@@ -2745,7 +2740,7 @@ def run_model_stage(
     *,
     jobset: ModelJobSet | None = None,
     stop_after: int | None = None,
-    group_size: int = 32,
+    group_size: int = 256,
     workers: int = 1,
     workers_by_kind: dict[str, int] | None = None,
     owner: str | None = None,
@@ -2878,15 +2873,31 @@ def run_model_stage(
                 timeout_seconds=endpoint_ready_timeout_seconds,
             )
             preflighted_modalities.update(modalities)
-    processed = 0
-    for modality in ("text", "image"):
+    stop_modalities = threading.Event()
+    finished_modalities = {
+        modality: threading.Event() for modality in ("text", "image")
+    }
+    idle_modalities: set[str] = set()
+    idle_lock = threading.Lock()
+
+    def process_modality(
+        modality: str,
+        *,
+        limit: int | None = None,
+        wait_for_peer: bool = False,
+    ) -> int:
         if progress_tracker is not None:
             progress_tracker.set_modality(modality)
-        while stop_after is None or processed < stop_after:
+        processed = 0
+        modality_owner = f"{owner}:{modality}"
+        while (
+            not stop_modalities.is_set()
+            and (limit is None or processed < limit)
+        ):
             allowance = (
                 group_size
-                if stop_after is None
-                else min(group_size, stop_after - processed)
+                if limit is None
+                else min(group_size, limit - processed)
             )
             if allowance <= 0:
                 break
@@ -2894,26 +2905,49 @@ def run_model_stage(
                 callable(ensure_endpoints_ready)
                 and modality not in preflighted_modalities
             ):
-                if modality not in _claimable_modalities(
+                modality_is_claimable = modality in _claimable_modalities(
                     store.path,
                     jobset,
-                ):
-                    break
-                ensure_endpoints_ready(
-                    modalities={modality},
-                    timeout_seconds=endpoint_ready_timeout_seconds,
                 )
-                preflighted_modalities.add(modality)
+                if modality_is_claimable:
+                    ensure_endpoints_ready(
+                        modalities={modality},
+                        timeout_seconds=endpoint_ready_timeout_seconds,
+                    )
+                    preflighted_modalities.add(modality)
             claimed = store.claim(
                 jobset.kind_for(modality),
                 limit=allowance,
-                owner=owner,
+                owner=modality_owner,
                 lease_seconds=lease_seconds,
             )
             if not claimed:
+                peer = "image" if modality == "text" else "text"
+                with idle_lock:
+                    idle_modalities.add(modality)
+                    peer_is_idle = peer in idle_modalities
+                if (
+                    wait_for_peer
+                    and not peer_is_idle
+                    and not finished_modalities[peer].is_set()
+                ):
+                    finished_modalities[peer].wait(timeout=0.05)
+                    continue
+                if (
+                    wait_for_peer
+                    and modality
+                    in _claimable_modalities(store.path, jobset)
+                ):
+                    # The peer can make a previously leased job claimable in
+                    # its final result callback immediately before signalling
+                    # completion. Recheck once through the normal readiness
+                    # and claim path instead of racing that transition.
+                    continue
                 break
+            with idle_lock:
+                idle_modalities.discard(modality)
             if progress_tracker is not None:
-                progress_tracker.claimed(len(claimed))
+                progress_tracker.claimed(modality, len(claimed))
             processed += _process_claimed_group(
                 store,
                 extractor,
@@ -2926,7 +2960,7 @@ def run_model_stage(
                         (workers_by_kind or {}).get(modality, workers)
                     ),
                 ),
-                owner=owner,
+                owner=modality_owner,
                 lease_seconds=lease_seconds,
                 heartbeat_seconds=heartbeat_seconds,
                 after_result_write=after_result_write,
@@ -2959,6 +2993,45 @@ def run_model_stage(
                 image_task_count=jobset.image_tasks,
                 start_fingerprint=start_fingerprint,
                 pre_write_guard=pre_write_guard,
+            )
+        return processed
+
+    def process_modality_and_signal(modality: str) -> int:
+        try:
+            return process_modality(modality, wait_for_peer=True)
+        finally:
+            finished_modalities[modality].set()
+
+    processed = 0
+    if stop_after is None:
+        first_error: BaseException | None = None
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="wdc-model-modality",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    process_modality_and_signal,
+                    modality,
+                ): modality
+                for modality in ("text", "image")
+            }
+            for future in as_completed(futures):
+                try:
+                    processed += future.result()
+                except BaseException as error:
+                    stop_modalities.set()
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
+    else:
+        for modality in ("text", "image"):
+            if processed >= stop_after:
+                break
+            processed += process_modality(
+                modality,
+                limit=stop_after - processed,
             )
     snapshot = _job_snapshot(store.path, jobset)
     complete = (

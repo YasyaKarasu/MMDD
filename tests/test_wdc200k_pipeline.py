@@ -150,6 +150,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.model_timeout_seconds == 120.0
     assert args.model_max_retries == 2
     assert args.model_retry_sleep_seconds == 2.0
+    assert args.materialization_workers == 1
     config = PipelineConfig.from_args(args)
     assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
@@ -193,6 +194,8 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
                 "4",
                 "--model_retry_sleep_seconds",
                 "0.25",
+                "--materialization_workers",
+                "8",
             ]
         )
     )
@@ -209,7 +212,9 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
     assert runtime_args.model_timeout_seconds == 300.0
     assert runtime_args.model_max_retries == 4
     assert runtime_args.model_retry_sleep_seconds == 0.25
+    assert runtime_args.materialization_workers == 8
     assert config.model_endpoint_ready_timeout_seconds == 45.5
+    assert config.materialization_workers == 8
 
 
 @pytest.mark.parametrize(
@@ -1143,6 +1148,70 @@ def test_full_pipeline_uses_real_stage_contracts_and_resume_does_not_refetch(
             }
 
 
+def test_incomplete_models_fast_resume_skips_completed_upstream_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="images")
+    page_transport = _PipelinePageTransport()
+    image_transport = _PipelineImageTransport()
+    first = run_pipeline(
+        config,
+        page_transport=page_transport,
+        image_transport=image_transport,
+    )
+    assert first.stage == "images"
+    first_calls = (page_transport.calls, image_transport.calls)
+
+    adapter_manifest = (
+        config.work_dir
+        / "adapted_model_tasks"
+        / "model-task-adapter-manifest.json"
+    )
+    adapter_manifest.parent.mkdir(parents=True)
+    adapter_manifest.write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_model_task_adapter",
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_database = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    model_database.parent.mkdir(parents=True)
+    sqlite3.connect(model_database).close()
+
+    fast_calls: list[PipelineConfig] = []
+
+    def fake_fast_resume(
+        resumed_config: PipelineConfig,
+        **_kwargs: Any,
+    ) -> pipeline_module.PipelineResult:
+        fast_calls.append(resumed_config)
+        return pipeline_module.PipelineResult(
+            status="stopped",
+            stage="models",
+            statistics_archives=1,
+            counters={},
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_fast_model_resume",
+        fake_fast_resume,
+    )
+    resumed = run_pipeline(
+        replace(config, stop_after=None),
+        page_transport=page_transport,
+        image_transport=image_transport,
+    )
+
+    assert resumed.stage == "models"
+    assert len(fast_calls) == 1
+    assert (page_transport.calls, image_transport.calls) == first_calls
+
+
 def test_pipeline_resume_after_sampling_does_not_require_replaced_full_shards(
     tmp_path: Path,
 ) -> None:
@@ -1840,7 +1909,7 @@ def test_model_progress_non_tty_is_compact_and_does_not_change_json_schema(
     assert payload["counters"]["enormous_unrelated_counter_name"] == 123456789
 
 
-def test_model_progress_tty_rewrites_one_tqdm_style_line(
+def test_model_progress_tty_uses_two_native_tqdm_bars(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1848,10 +1917,49 @@ def test_model_progress_tty_rewrites_one_tqdm_style_line(
         def isatty(self) -> bool:
             return True
 
+    bars: list[Any] = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs: Any) -> None:
+            self.total = kwargs["total"]
+            self.n = kwargs["initial"]
+            self.desc = kwargs["desc"]
+            self.position = kwargs["position"]
+            self.postfix: dict[str, int] = {}
+            self.refreshes = 0
+            self.closed = False
+            bars.append(self)
+
+        def set_postfix(
+            self,
+            *,
+            refresh: bool,
+            **values: int,
+        ) -> None:
+            assert refresh is False
+            self.postfix = values
+
+        def refresh(self) -> None:
+            self.refreshes += 1
+
+        def close(self) -> None:
+            self.closed = True
+
     stream = TtyBuffer()
     monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    monkeypatch.setattr(pipeline_module, "tqdm", FakeTqdm)
     reporter = ProgressReporter(_full_pipeline_config(tmp_path))
     reporter.update(stage="models")
+    reporter.update_model_progress(
+        pipeline_module.ModelProgressSnapshot(
+            modality="text",
+            total=100,
+            success=20,
+            terminal=1,
+            leased=3,
+            pending=76,
+        )
+    )
     reporter.update_model_progress(
         pipeline_module.ModelProgressSnapshot(
             modality="image",
@@ -1866,12 +1974,25 @@ def test_model_progress_tty_rewrites_one_tqdm_style_line(
     reporter.publish()
     reporter.publish()
 
-    rendered = stream.getvalue()
-    assert rendered.count("\r") == 2
-    assert "\n" not in rendered
-    assert "models:image" in rendered
-    assert "4/10" in rendered
-    assert "|" in rendered
+    assert len(bars) == 2
+    assert [(bar.desc, bar.position) for bar in bars] == [
+        ("WDC text", 0),
+        ("WDC image", 1),
+    ]
+    assert [(bar.n, bar.total) for bar in bars] == [(21, 100), (4, 10)]
+    assert bars[0].postfix == {
+        "success": 20,
+        "terminal": 1,
+        "leased": 3,
+        "pending": 76,
+    }
+    assert bars[1].postfix == {
+        "success": 3,
+        "terminal": 1,
+        "leased": 2,
+        "pending": 4,
+    }
+    assert all(bar.refreshes == 2 for bar in bars)
 
 
 def test_model_progress_non_tty_throttles_console_but_not_json(
@@ -1901,7 +2022,7 @@ def test_model_progress_non_tty_throttles_console_but_not_json(
     assert "\x1b" not in stream.getvalue()
 
 
-def test_model_progress_modality_switch_resets_rate_and_stall_hides_eta(
+def test_model_progress_tracks_modalities_independently_and_stall_hides_eta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1926,9 +2047,10 @@ def test_model_progress_modality_switch_resets_rate_and_stall_hides_eta(
         pipeline_module.ModelProgressSnapshot("image", 20, 0, 0, 0, 20)
     )
     reporter.publish()
-    assert stream.getvalue().splitlines()[-1].startswith("[wdc200k] models:image")
-    assert "0.00 job/s" in stream.getvalue().splitlines()[-1]
-    assert "ETA --:--" in stream.getvalue().splitlines()[-1]
+    line = stream.getvalue().splitlines()[-1]
+    assert "models:text" in line
+    assert "models:image" in line
+    assert "models:image 0/20 [0.00 job/s, ETA --:--]" in line
 
     clock[0] = 11.0
     reporter.update_model_progress(
@@ -1937,7 +2059,8 @@ def test_model_progress_modality_switch_resets_rate_and_stall_hides_eta(
     reporter.publish()
     clock[0] = 72.0
     reporter.publish()
-    assert "ETA --:--" in stream.getvalue().splitlines()[-1]
+    line = stream.getvalue().splitlines()[-1]
+    assert "models:image 5/20 [0.00 job/s, ETA --:--]" in line
 
 
 def test_progress_rolling_rate_uses_a_fixed_time_window(

@@ -107,6 +107,11 @@ from wdc200k_structural import (
     finalize_validated_selection,
 )
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional console enhancement.
+    tqdm = None  # type: ignore[assignment]
+
 
 STAGES = (
     "selection",
@@ -214,6 +219,7 @@ class PipelineConfig:
     image_model_api_key: str | None = None
     text_model_workers: int = 1
     image_model_workers: int = 1
+    materialization_workers: int = 1
     run_fingerprint: str = ""
     runtime_dir: Path | None = None
     model_start_marker: Path | None = None
@@ -318,6 +324,7 @@ class PipelineConfig:
             image_model_api_key=args.image_model_api_key,
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
+            materialization_workers=args.materialization_workers,
             run_fingerprint=args.run_fingerprint,
             runtime_dir=(
                 Path(args.runtime_dir).resolve()
@@ -408,8 +415,11 @@ class ProgressReporter:
         self.path = config.work_dir / "progress.json"
         self._state = _ProgressState()
         self._rolling_samples: deque[tuple[float, int]] = deque()
-        self._model_progress: ModelProgressSnapshot | None = None
-        self._model_samples: deque[tuple[float, int]] = deque()
+        self._model_progress: dict[str, ModelProgressSnapshot] = {}
+        self._model_samples: dict[
+            str, deque[tuple[float, int]]
+        ] = {}
+        self._model_bars: dict[str, Any] = {}
         self._tty_line_length = 0
         self._last_console_at: float | None = None
         self._force_console = True
@@ -964,6 +974,8 @@ class ProgressReporter:
     ) -> None:
         with self._lock:
             if stage is not None and stage != self._state.stage:
+                if self._state.stage == "models":
+                    self._close_model_bars()
                 self._complete_unit_stage_locked()
                 self._state.stage = stage
                 self._state.stage_started_at = time.time()
@@ -972,7 +984,7 @@ class ProgressReporter:
                 self._state.total_units = 0
                 self._state.rate_basis = None
                 if stage == "models":
-                    self._model_progress = None
+                    self._model_progress.clear()
                     self._model_samples.clear()
                 self._force_console = True
             if completed_shards is not None:
@@ -1010,29 +1022,24 @@ class ProgressReporter:
         if snapshot.total != sum(values[1:]):
             raise ValueError("model progress counts do not sum to total")
         with self._lock:
-            previous = self._model_progress
-            modality_changed = (
-                previous is None or snapshot.modality != previous.modality
-            )
-            if not modality_changed and previous is not None and (
+            previous = self._model_progress.get(snapshot.modality)
+            if previous is not None and (
                 snapshot.total != previous.total
                 or snapshot.completed < previous.completed
             ):
                 raise ValueError("model progress is not monotonic")
-            if modality_changed:
-                self._model_samples.clear()
+            if previous is None:
+                self._model_samples[snapshot.modality] = deque()
                 self._force_console = True
-            self._model_progress = snapshot
+            self._model_progress[snapshot.modality] = snapshot
             now = time.monotonic()
-            self._model_samples.append((now, snapshot.completed))
+            samples = self._model_samples[snapshot.modality]
+            samples.append((now, snapshot.completed))
             if snapshot.completed == snapshot.total:
                 self._force_console = True
             cutoff = now - self._ROLLING_WINDOW_SECONDS
-            while (
-                len(self._model_samples) > 1
-                and self._model_samples[1][0] <= cutoff
-            ):
-                self._model_samples.popleft()
+            while len(samples) > 1 and samples[1][0] <= cutoff:
+                samples.popleft()
 
     def _current_stage_samples_locked(self) -> list[dict[str, Any]]:
         telemetry = self._stage_telemetry.get(self._state.stage)
@@ -1493,58 +1500,63 @@ class ProgressReporter:
     def _model_console_metrics(
         self,
         now: float,
-    ) -> tuple[ModelProgressSnapshot | None, float, float | None]:
+    ) -> list[tuple[ModelProgressSnapshot, float, float | None]]:
         with self._lock:
-            progress = self._model_progress
-            if progress is None:
-                return None, 0.0, None
-            if (
-                not self._model_samples
-                or self._model_samples[-1] != (now, progress.completed)
-            ):
-                self._model_samples.append((now, progress.completed))
-            cutoff = now - self._ROLLING_WINDOW_SECONDS
-            while (
-                len(self._model_samples) > 1
-                and self._model_samples[1][0] <= cutoff
-            ):
-                self._model_samples.popleft()
-            first_at, first_completed = self._model_samples[0]
-            elapsed = now - first_at
-            rate = (
-                max(0.0, (progress.completed - first_completed) / elapsed)
-                if elapsed > 0
-                else 0.0
-            )
-            remaining = max(0, progress.total - progress.completed)
-            eta = remaining / rate if rate > 0 else None
-            return progress, rate, eta
+            metrics = []
+            for modality in ("text", "image"):
+                progress = self._model_progress.get(modality)
+                if progress is None:
+                    continue
+                samples = self._model_samples.setdefault(modality, deque())
+                if not samples or samples[-1] != (now, progress.completed):
+                    samples.append((now, progress.completed))
+                cutoff = now - self._ROLLING_WINDOW_SECONDS
+                while len(samples) > 1 and samples[1][0] <= cutoff:
+                    samples.popleft()
+                first_at, first_completed = samples[0]
+                elapsed = now - first_at
+                rate = (
+                    max(
+                        0.0,
+                        (progress.completed - first_completed) / elapsed,
+                    )
+                    if elapsed > 0
+                    else 0.0
+                )
+                remaining = max(0, progress.total - progress.completed)
+                eta = remaining / rate if rate > 0 else None
+                metrics.append((progress, rate, eta))
+            return metrics
 
     def _console_line(self, snapshot: dict[str, Any], *, is_tty: bool) -> str:
         if snapshot["stage"] == "models":
-            progress, rate, eta = self._model_console_metrics(
-                time.monotonic()
-            )
-            if progress is not None:
-                bar = ""
-                if is_tty:
-                    width = 20
-                    filled = (
-                        width * progress.completed // progress.total
-                        if progress.total
-                        else width
+            model_metrics = self._model_console_metrics(time.monotonic())
+            if model_metrics:
+                rendered = []
+                for progress, rate, eta in model_metrics:
+                    bar = ""
+                    if is_tty:
+                        width = 10
+                        filled = (
+                            width * progress.completed // progress.total
+                            if progress.total
+                            else width
+                        )
+                        bar = (
+                            f" |{'#' * filled}"
+                            f"{'-' * (width - filled)}|"
+                        )
+                    rendered.append(
+                        f"models:{progress.modality}{bar} "
+                        f"{progress.completed}/{progress.total} "
+                        f"[{rate:.2f} job/s, ETA "
+                        f"{self._format_console_eta(eta)}] "
+                        f"success={progress.success} "
+                        f"terminal={progress.terminal} "
+                        f"leased={progress.leased} "
+                        f"pending={progress.pending}"
                     )
-                    bar = f" |{'#' * filled}{'-' * (width - filled)}|"
-                return (
-                    f"[wdc200k] models:{progress.modality}{bar} "
-                    f"{progress.completed}/{progress.total} "
-                    f"[{rate:.2f} job/s, ETA "
-                    f"{self._format_console_eta(eta)}] "
-                    f"success={progress.success} "
-                    f"terminal={progress.terminal} "
-                    f"leased={progress.leased} "
-                    f"pending={progress.pending}"
-                )
+                return f"[wdc200k] {' || '.join(rendered)}"
         eta = self._format_console_eta(snapshot["eta_seconds"])
         return (
             f"[wdc200k] stage={snapshot['stage']} "
@@ -1564,6 +1576,53 @@ class ProgressReporter:
             f"{snapshot['disk']['free_bytes_by_root']['output']} "
             f"reserve={snapshot['disk']['reserve_bytes']}"
         )
+
+    def _refresh_model_bars(
+        self,
+        metrics: Sequence[
+            tuple[ModelProgressSnapshot, float, float | None]
+        ],
+    ) -> None:
+        if tqdm is None:
+            return
+        if self._tty_line_length:
+            print(flush=True)
+            self._tty_line_length = 0
+        positions = {"text": 0, "image": 1}
+        for progress, _rate, _eta in metrics:
+            bar = self._model_bars.get(progress.modality)
+            if bar is None:
+                bar = tqdm(
+                    total=progress.total,
+                    initial=progress.completed,
+                    desc=f"WDC {progress.modality}",
+                    unit="job",
+                    position=positions[progress.modality],
+                    dynamic_ncols=True,
+                    leave=True,
+                    file=sys.stdout,
+                    mininterval=max(
+                        0.1,
+                        self.config.progress_interval_seconds,
+                    ),
+                )
+                self._model_bars[progress.modality] = bar
+            bar.total = progress.total
+            bar.n = progress.completed
+            bar.set_postfix(
+                success=progress.success,
+                terminal=progress.terminal,
+                leased=progress.leased,
+                pending=progress.pending,
+                refresh=False,
+            )
+            bar.refresh()
+
+    def _close_model_bars(self) -> None:
+        for modality in ("text", "image"):
+            bar = self._model_bars.pop(modality, None)
+            if bar is not None:
+                bar.close()
 
     def publish(self) -> None:
         with self._publish_lock:
@@ -1588,6 +1647,15 @@ class ProgressReporter:
                     self._last_console_at = console_now
             if not should_print:
                 return
+            if (
+                is_tty
+                and snapshot["stage"] == "models"
+                and tqdm is not None
+            ):
+                self._refresh_model_bars(
+                    self._model_console_metrics(console_now)
+                )
+                return
             line = self._console_line(snapshot, is_tty=is_tty)
             if is_tty:
                 padding = " " * max(0, self._tty_line_length - len(line))
@@ -1603,6 +1671,7 @@ class ProgressReporter:
         with self._lock:
             self._force_console = True
         self.publish()
+        self._close_model_bars()
         if self._tty_line_length:
             print(flush=True)
             self._tty_line_length = 0
@@ -2664,6 +2733,218 @@ def _validate_existing_registry_chain(
         upstream = _registry_identity(config, stage)
 
 
+def _fast_model_resume_candidate(config: PipelineConfig) -> bool:
+    """Return whether an interrupted model run can skip upstream replay."""
+    if (
+        not config.resume
+        or config.from_stage is not None
+        or config.stop_after not in {None, "models"}
+        or any(
+            (
+                config.model_start_marker,
+                config.model_ready_marker,
+                config.model_text_done_marker,
+                config.model_image_done_marker,
+            )
+        )
+    ):
+        return False
+    return (
+        _producer_registry_path(config, "images").is_file()
+        and not _producer_registry_path(config, "models").exists()
+        and (
+            config.work_dir
+            / "adapted_model_tasks"
+            / "model-task-adapter-manifest.json"
+        ).is_file()
+        and (
+            config.work_dir / "model_outputs" / "jobs.sqlite3"
+        ).is_file()
+    )
+
+
+def _validate_fast_producer_manifest(
+    stage: str,
+    path: Path,
+    *,
+    compact_replacements: bool,
+) -> None:
+    """Validate completed upstream artifacts using metadata and file sizes."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("complete") is not True:
+        raise ValueError(f"{stage} producer manifest is incomplete: {path}")
+    producer_stage = str(payload.get("stage") or "")
+    expected = {
+        "selection": {"wdc200k_selection"},
+        "structural": {"wdc200k_structural", "wdc200k_validated_selection"},
+        "sampling": {"wdc200k_entity_sampling"},
+        "pages": {"wdc200k_network_fetch"},
+        "asset_planning": {"wdc200k_asset_planning"},
+        "images": {
+            "wdc200k-unique-image-jobs-v1",
+            "wdc200k-image-fetch-v1",
+            "wdc200k_asset_materialization",
+            "wdc200k_network_fetch",
+        },
+    }[stage]
+    if producer_stage not in expected:
+        raise ValueError(
+            f"unexpected {stage} producer type {producer_stage!r}: {path}"
+        )
+    root = (
+        path.parent.parent
+        if producer_stage in {"wdc200k_structural", "wdc200k_validated_selection"}
+        else path.parent
+    ).resolve()
+    for field_name in (
+        "completed_shards",
+        "entity_plan_shards",
+        "image_mapping_shards",
+        "bridge_asset_shards",
+        "table_asset_link_shards",
+    ):
+        declared = payload.get(field_name)
+        if declared is None:
+            continue
+        if not isinstance(declared, list):
+            raise ValueError(
+                f"{stage} producer manifest has invalid {field_name}: {path}"
+            )
+        for item in declared:
+            try:
+                relative = str(item["path"])
+                expected_bytes = int(item["bytes"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{stage} producer manifest has invalid shard: {path}"
+                ) from error
+            if compact_replacements and relative.startswith(
+                ("entities/", "page_refs/", "direct_image_refs/")
+            ):
+                continue
+            artifact = (root / relative).resolve()
+            if (
+                not artifact.is_relative_to(root)
+                or not artifact.is_file()
+                or artifact.stat().st_size != expected_bytes
+            ):
+                raise ValueError(
+                    f"{stage} producer shard metadata mismatch: {artifact}"
+                )
+
+
+def _validate_fast_model_resume_chain(
+    config: PipelineConfig,
+    archives: Iterable[Path],
+) -> None:
+    """Check immutable upstream identities without rescanning their contents."""
+    upstream = _input_identity(archives)
+    compact_replacements = _has_complete_sampling_authority(
+        config.work_dir / "sampling" / "manifest.json"
+    )
+    for stage in STAGES[: STAGES.index("models")]:
+        path = _producer_registry_path(config, stage)
+        registry = _load_stage_registry(path)
+        if (
+            not registry.complete
+            or registry.stage != stage
+            or registry.producer_type != _PRODUCER_TYPES[stage]
+            or registry.upstream_identity != upstream
+            or registry.config_fingerprint
+            != _stage_config_fingerprint(config, stage)
+            or not registry.producer_manifests
+        ):
+            raise ValueError(f"pipeline registry identity mismatch: {path}")
+        for reference in registry.producer_manifests:
+            if (
+                not reference.path.is_file()
+                or _sha256_path(reference.path) != reference.sha256
+            ):
+                raise ValueError(
+                    f"producer manifest checksum mismatch: {reference.path}"
+                )
+            _validate_fast_producer_manifest(
+                stage,
+                reference.path,
+                compact_replacements=(
+                    stage == "structural" and compact_replacements
+                ),
+            )
+        upstream = _registry_identity(config, stage)
+    adapter_manifest = (
+        config.work_dir
+        / "adapted_model_tasks"
+        / "model-task-adapter-manifest.json"
+    )
+    adapter_payload = json.loads(adapter_manifest.read_text(encoding="utf-8"))
+    if (
+        not isinstance(adapter_payload, dict)
+        or adapter_payload.get("complete") is not True
+        or adapter_payload.get("stage") != "wdc200k_model_task_adapter"
+    ):
+        raise ValueError("model task adapter manifest is incomplete")
+
+
+def _run_fast_model_resume(
+    config: PipelineConfig,
+    *,
+    archives: tuple[Path, ...],
+    page_transport: Any | None,
+    image_transport: Any | None,
+    extractor: Any | None,
+) -> PipelineResult:
+    """Resume durable model queues directly, then do one strict final pass."""
+    disk_guard = DiskGuard(config.min_free_disk_bytes)
+    reporter = ProgressReporter(config, pre_write_guard=disk_guard)
+    reporter.start()
+    try:
+        reporter.update(stage="models", completed_shards=1, total_shards=2)
+        args = _runtime_args(config)
+        if extractor is None:
+            extractor = join_builder.LocalAttributeExtractor(args)
+        store = SqliteJobStore(
+            config.work_dir / "model_outputs" / "jobs.sqlite3",
+            pre_write_guard=disk_guard,
+        )
+        result = run_model_stage(
+            store,
+            extractor,
+            workers_by_kind={
+                "text": config.text_model_workers,
+                "image": config.image_model_workers,
+            },
+            output_root=config.work_dir / "model_outputs",
+            records_per_shard=config.records_per_shard,
+            model_progress_callback=reporter.update_model_progress,
+            endpoint_ready_timeout_seconds=(
+                config.model_endpoint_ready_timeout_seconds
+            ),
+            pre_write_guard=disk_guard,
+        )
+        counters = {
+            "model_text_tasks": result.text_total,
+            "model_image_tasks": result.image_total,
+            "model_success": result.success,
+            "model_terminal": result.terminal,
+        }
+        if not result.complete or config.stop_after == "models":
+            return PipelineResult(
+                status="stopped",
+                stage="models",
+                statistics_archives=len(archives),
+                counters=counters,
+            )
+    finally:
+        reporter.close()
+    return run_pipeline(
+        config,
+        page_transport=page_transport,
+        image_transport=image_transport,
+        extractor=extractor,
+        _allow_fast_model_resume=False,
+    )
+
+
 def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
     argv = [
         "--input_dir",
@@ -2761,6 +3042,7 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
     args.model_endpoint_ready_timeout_seconds = (
         config.model_endpoint_ready_timeout_seconds
     )
+    args.materialization_workers = config.materialization_workers
     return args
 
 
@@ -3923,6 +4205,7 @@ def run_pipeline(
     image_transport: Any | None = None,
     extractor: Any | None = None,
     after_page_cache_write: Any | None = None,
+    _allow_fast_model_resume: bool = True,
 ) -> PipelineResult:
     """Run the validated staged pipeline without replaying durable outcomes."""
     disk_guard = DiskGuard(config.min_free_disk_bytes)
@@ -3943,6 +4226,18 @@ def run_pipeline(
             pre_write_guard=disk_guard,
         )
     elif config.resume:
+        if (
+            _allow_fast_model_resume
+            and _fast_model_resume_candidate(config)
+        ):
+            _validate_fast_model_resume_chain(config, archives)
+            return _run_fast_model_resume(
+                config,
+                archives=archives,
+                page_transport=page_transport,
+                image_transport=image_transport,
+                extractor=extractor,
+            )
         _validate_existing_registry_chain(config, archives)
     elif any(_producer_registry_path(config, stage).exists() for stage in STAGES):
         raise ValueError(
@@ -4297,6 +4592,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--precompute_text_model_cache", action="store_true")
     parser.add_argument("--text_model_workers", type=int, default=1)
     parser.add_argument("--image_model_workers", type=int, default=1)
+    parser.add_argument("--materialization_workers", type=int, default=1)
     args = parser.parse_args(argv)
     if args.max_rows_per_source_table is not None:
         parser.error("source-table rows are unbounded; omit --max_rows_per_source_table")
@@ -4314,6 +4610,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("text asset chunk limits must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
+    if args.materialization_workers <= 0:
+        parser.error("--materialization_workers must be positive")
     if (
         not math.isfinite(args.model_endpoint_ready_timeout_seconds)
         or args.model_endpoint_ready_timeout_seconds < 0

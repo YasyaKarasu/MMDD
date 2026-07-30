@@ -787,6 +787,50 @@ def test_endpoint_pools_add_urls_from_runtime_files(tmp_path):
     ]
 
 
+def test_endpoint_leases_refill_the_endpoint_that_finishes_first(tmp_path):
+    endpoint_file = tmp_path / "text_endpoints.txt"
+    endpoint_file.write_text(
+        "http://localhost:8003/v1\n",
+        encoding="utf-8",
+    )
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="http://localhost:8001/v1",
+            text_model_base_urls_file=str(endpoint_file),
+        )
+    )
+
+    with extractor.lease_model_base_url("text") as first:
+        with extractor.lease_model_base_url("text") as second:
+            pass
+        with extractor.lease_model_base_url("text") as third:
+            assert first == "http://localhost:8001/v1"
+            assert second == "http://localhost:8003/v1"
+            assert third == second
+
+
+def test_endpoint_lease_release_survives_dynamic_withdrawal(tmp_path):
+    endpoint_file = tmp_path / "text_endpoints.txt"
+    endpoint_file.write_text(
+        "http://localhost:8003/v1\n",
+        encoding="utf-8",
+    )
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="http://localhost:8001/v1",
+            text_model_base_urls_file=str(endpoint_file),
+        )
+    )
+
+    with extractor.lease_model_base_url("text"):
+        with extractor.lease_model_base_url("text") as borrowed:
+            endpoint_file.write_text("", encoding="utf-8")
+            assert borrowed == "http://localhost:8003/v1"
+
+    with extractor.lease_model_base_url("text") as remaining:
+        assert remaining == "http://localhost:8001/v1"
+
+
 def test_remote_text_and_image_requests_keep_endpoint_model_and_key_separate(monkeypatch):
     calls = []
 
@@ -874,6 +918,52 @@ def test_endpoint_readiness_checks_every_configured_url_with_modality_credential
         ("https://text-b.test/v1/models", "Bearer text-key"),
         ("https://image-a.test/v1/models", "Bearer image-key"),
         ("https://image-b.test/v1/models", "Bearer image-key"),
+    ]
+
+
+def test_endpoint_readiness_ignores_a_dynamic_endpoint_withdrawn_mid_probe(
+    tmp_path,
+    monkeypatch,
+):
+    endpoint_file = tmp_path / "borrowed-text-endpoints.txt"
+    endpoint_file.write_text(
+        "http://127.0.0.1:18101/v1\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "served-text"}]}
+
+    def fake_get(url, headers, timeout):
+        calls.append(url)
+        if url.startswith("http://127.0.0.1:18101"):
+            endpoint_file.write_text("", encoding="utf-8")
+            raise joinability_dataset.requests.ConnectionError(
+                "borrowed server was preempted"
+            )
+        return Response()
+
+    monkeypatch.setattr(
+        "build_mm_joinability_dataset.requests.get",
+        fake_get,
+    )
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="https://remote-text.test/v1",
+            text_model_base_urls_file=str(endpoint_file),
+            text_model_name="served-text",
+        )
+    )
+
+    extractor.ensure_endpoints_ready({"text"}, timeout_seconds=2.0)
+
+    assert calls == [
+        "https://remote-text.test/v1/models",
+        "http://127.0.0.1:18101/v1/models",
     ]
 
 
