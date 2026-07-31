@@ -27,16 +27,26 @@ tmp/
 cache/
 output/
 output_*/
+/.output_*/
 output_stage1_logic/
 output_medium/
 
 # Local input datasets and downloaded assets
-dataset/
-webtable/
+/data/
+/data_*/
+/data-*/
+/dataset/
+/datasets/
+/dataset_*/
+/dataset-*/
+/webtable/
+/webtables/
+/webtable_*/
+/webtable-*/
 hf_models/
 /ImageAttribute.zip
 /gate_inputs/
-/wdc_schemaorg_2023/
+/wdc_schemaorg_*/
 
 # Large model / index / tensor artifacts
 *.pt
@@ -57,7 +67,10 @@ human_labels_filled_round_*.jsonl
 /evidence_wdc_*/
 /runtime_gpu_share/
 /work_wdc_*/
+/.work_*/
+/*.wdc200k-stale/
 
 # Local agent instructions
 AGENTS.md
+/.codex/
 /.superpowers/
