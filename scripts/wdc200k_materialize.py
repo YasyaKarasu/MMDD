@@ -124,7 +124,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v1"
+MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v2"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -2254,6 +2254,15 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "max_query_context_attrs": int(args.max_query_context_attrs),
         "max_target_context_attrs": int(args.max_target_context_attrs),
+        "query_row_selection": "recoverable_first",
+        "target_row_scope": "all_source_rows",
+        "qualified_attribute_policy": "all_safe_variants",
+        "sibling_source_column_policy": (
+            "globally_disjoint_query_and_target_sides"
+        ),
+        "identical_visible_query_policy": (
+            "merge_with_multiple_qrels"
+        ),
         "reparse_cached_model_outputs": bool(
             args.reparse_cached_model_outputs
         ),
@@ -4546,24 +4555,53 @@ def _validate_global_counts(
             )
     if counts["data_lake_tables"] < upstream.expected_tables:
         raise ValueError("global data-lake table coverage is incomplete")
-    if counts["query_tables"] != counts["qrels"]:
-        raise ValueError("global query/qrel count mismatch")
     with _connect(database_path) as connection:
-        duplicate_qrels = int(
+        queries_without_qrels = int(
             connection.execute(
                 """
-                SELECT COUNT(*) FROM (
-                    SELECT json_extract(record_json, '$.query_table_id')
-                           AS query_id, COUNT(*) AS count
-                    FROM materialized_records
-                    WHERE artifact = 'qrels'
-                    GROUP BY query_id HAVING count > 1
-                )
+                SELECT COUNT(*)
+                FROM materialized_records AS queries
+                WHERE queries.artifact = 'query_tables'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM materialized_records AS qrels
+                      WHERE qrels.artifact = 'qrels'
+                        AND json_extract(
+                            qrels.record_json, '$.query_table_id'
+                        ) = queries.record_id
+                  )
                 """
             ).fetchone()[0]
         )
-    if duplicate_qrels:
-        raise ValueError("duplicate qrel/query ID")
+        invalid_qrel_references = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM materialized_records AS qrels
+                LEFT JOIN materialized_records AS queries
+                  ON queries.artifact = 'query_tables'
+                 AND queries.record_id = json_extract(
+                     qrels.record_json, '$.query_table_id'
+                 )
+                LEFT JOIN materialized_records AS targets
+                  ON targets.artifact = 'data_lake_tables'
+                 AND targets.record_id = json_extract(
+                     qrels.record_json, '$.target_table_id'
+                 )
+                WHERE qrels.artifact = 'qrels'
+                  AND (
+                      queries.record_id IS NULL
+                      OR targets.record_id IS NULL
+                      OR queries.source_table_id != qrels.source_table_id
+                      OR targets.source_table_id != qrels.source_table_id
+                  )
+                """
+            ).fetchone()[0]
+        )
+    if queries_without_qrels:
+        raise ValueError("global query table without qrel")
+    if invalid_qrel_references:
+        raise ValueError("global qrel reference closure is invalid")
     return counts
 
 
@@ -4801,6 +4839,9 @@ def _stats_payload(
         "notes": [
             "source_tables are the fixed data-lake base pool",
             "source-table rows are never capped",
+            "wide source tables may emit multiple query variants, one per "
+            "qualifying bridge attribute",
+            "identical visible queries are merged and may own multiple qrels",
             "query construction is delegated to "
             "build_mm_joinability_dataset.py",
         ],
@@ -4850,6 +4891,13 @@ def _load_published_result(
         raise ValueError(
             "published dataset manifest validation failed"
         ) from error
+    if (
+        isinstance(payload, dict)
+        and payload.get("stage") == "wdc200k_materialization"
+        and payload.get("schema_version")
+        == "wdc200k-materialization-v1"
+    ):
+        return None
     if (
         not isinstance(payload, dict)
         or payload.get("stage") != "wdc200k_materialization"

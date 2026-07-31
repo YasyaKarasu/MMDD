@@ -280,6 +280,80 @@ def _source_table(
     }
 
 
+def _multi_attribute_source_table(
+    context_column_names: list[str],
+) -> dict[str, Any]:
+    column_names = [
+        "Name",
+        "Bridge B",
+        "Bridge C",
+        *context_column_names,
+    ]
+    columns = [
+        {
+            "column_index": index,
+            "column_name": column_name,
+            "is_numeric_column": False,
+        }
+        for index, column_name in enumerate(column_names)
+    ]
+    rows = []
+    for row_id, name in enumerate(("Alpha", "Beta")):
+        rows.append(
+            {
+                "row_id": row_id,
+                "cells": [
+                    {
+                        "column_index": index,
+                        "column_name": column_name,
+                        "raw": (
+                            name
+                            if index == 0
+                            else f"{column_name} value {name}"
+                        ),
+                        "text": (
+                            name
+                            if index == 0
+                            else f"{column_name} value {name}"
+                        ),
+                        "wiki_title": (
+                            f"wdc_{name.casefold()}"
+                            if index == 0
+                            else None
+                        ),
+                        "has_wiki_link": index == 0,
+                    }
+                    for index, column_name in enumerate(column_names)
+                ],
+            }
+        )
+    return {
+        "source_table_id": "source-1",
+        "source_file": "Thing/source-1.json.gz",
+        "page_title": "Thing",
+        "caption": "",
+        "section_title": "",
+        "num_rows": len(rows),
+        "num_cols": len(columns),
+        "columns": columns,
+        "rows": rows,
+        "provenance_builder": "build_wdc_mm_joinability_dataset.py",
+        "metadata": {
+            "candidate_entity_columns": [0],
+            "column_profiles": [
+                {
+                    "column_index": index,
+                    "column_name": column["column_name"],
+                    "non_empty_ratio": 1.0,
+                    "unique_ratio": 1.0,
+                    "numeric_ratio": 0.0,
+                }
+                for index, column in enumerate(columns)
+            ],
+        },
+    }
+
+
 def _entities() -> list[dict[str, Any]]:
     return [
         {
@@ -381,6 +455,52 @@ def _extractions(
                         "evidence": "page statement",
                         "connection_evidence": "same named entity",
                     }
+                ],
+                "raw_response": "",
+                "error": "",
+            }
+        )
+    return records
+
+
+def _multi_attribute_extractions(
+    args: argparse.Namespace,
+    assets: list[dict[str, Any]],
+    context_column_names: list[str],
+) -> list[dict[str, Any]]:
+    candidate_attribute_names = [
+        "Bridge B",
+        "Bridge C",
+        *context_column_names,
+    ]
+    records = []
+    for asset in assets:
+        entity_id = str(asset["entity_id"])
+        entity_name = entity_id.removeprefix("entity-").title()
+        cache_key = join_builder.extraction_cache_key(
+            asset_id=str(asset["asset_id"]),
+            entity_id=entity_id,
+            candidate_attribute_names=candidate_attribute_names,
+            asset_type="text",
+            args=args,
+        )
+        records.append(
+            {
+                "cache_key": cache_key,
+                "entity_id": entity_id,
+                "entity_text": entity_name,
+                "entity_wiki_title": str(asset["entity_wiki_title"]),
+                "asset_id": asset["asset_id"],
+                "asset_type": "text",
+                "candidate_attribute_names": candidate_attribute_names,
+                "attributes": [
+                    {
+                        "name": column_name,
+                        "value": f"{column_name} value {entity_name}",
+                        "evidence": "page statement",
+                        "connection_evidence": "same named entity",
+                    }
+                    for column_name in ("Bridge B", "Bridge C")
                 ],
                 "raw_response": "",
                 "error": "",
@@ -1003,6 +1123,7 @@ def _model_tasks(
 def _shard_inputs(
     tmp_path: Path,
     *,
+    source_table: dict[str, Any] | None = None,
     entities: list[dict[str, Any]] | None = None,
     assets: list[dict[str, Any]] | None = None,
     links: list[dict[str, Any]] | None = None,
@@ -1010,7 +1131,11 @@ def _shard_inputs(
     errors: list[dict[str, Any]] | None = None,
 ) -> MaterializationShardInputs:
     return MaterializationShardInputs(
-        source_table=_source_table(),
+        source_table=(
+            source_table
+            if source_table is not None
+            else _source_table()
+        ),
         entity_paths=(
             _write_jsonl(
                 tmp_path / "inputs" / "entities.jsonl",
@@ -1098,6 +1223,110 @@ def test_materializer_matches_existing_query_builder_field_for_field(
     assert actual.evidence_recoveries == recovery_sink.records
     assert len(actual.query_tables) == 1
     assert len(actual.evidence_recoveries) == 4
+
+
+def test_wdc_materializer_emits_multiple_queries_from_one_wide_table(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    context_columns = ["Query X", "Query Y", "Target Z"]
+    source_table = _multi_attribute_source_table(context_columns)
+    assets = _assets()
+
+    actual = materialize_dataset_shard(
+        _shard_inputs(
+            tmp_path,
+            source_table=source_table,
+            entities=_entities(),
+            assets=assets,
+            links=_links(),
+            extractions=_multi_attribute_extractions(
+                args,
+                assets,
+                context_columns,
+            ),
+        ),
+        args=args,
+        split="train",
+    )
+
+    assert actual.decision["reason"] == "queryable"
+    assert len(actual.query_tables) == 2
+    assert len(actual.data_lake_tables) == 2
+    assert len(actual.qrels) == 2
+    assert {
+        qrel["query_table_id"] for qrel in actual.qrels
+    } == {
+        query["table_id"] for query in actual.query_tables
+    }
+    assert {
+        target["join_col_name"] for target in actual.data_lake_tables
+    } == {"Bridge B", "Bridge C"}
+    assert all(
+        not ({1, 2} & set(query["source_column_indices"]))
+        for query in actual.query_tables
+    )
+    assert all(
+        not (
+            set(query["source_column_indices"])
+            & set(target["source_column_indices"])
+        )
+        for query in actual.query_tables
+        for target in actual.data_lake_tables
+    )
+
+
+def test_wdc_global_validation_allows_merged_query_with_multiple_qrels(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    context_columns = ["Query X", "Target Z"]
+    source_table = _multi_attribute_source_table(context_columns)
+    assets = _assets()
+    inputs = _shard_inputs(
+        tmp_path,
+        source_table=source_table,
+        entities=_entities(),
+        assets=assets,
+        links=_links(),
+        extractions=_multi_attribute_extractions(
+            args,
+            assets,
+            context_columns,
+        ),
+    )
+    actual = materialize_dataset_shard(
+        inputs,
+        args=args,
+        split="train",
+    )
+
+    assert len(actual.query_tables) == 1
+    assert len(actual.data_lake_tables) == 2
+    assert len(actual.qrels) == 2
+    assert {
+        qrel["query_table_id"] for qrel in actual.qrels
+    } == {actual.query_tables[0]["table_id"]}
+    assert materializer._store_table_unit(
+        inputs.lookup_database,
+        actual,
+        source_ordinal=0,
+        source_sha256="source-sha",
+        split="train",
+    )
+    counts = materializer._validate_global_counts(
+        inputs.lookup_database,
+        argparse.Namespace(
+            expected_tables=1,
+            expected_entities=len(actual.entities),
+            expected_assets=len(actual.bridge_assets),
+            expected_links=len(actual.table_asset_links),
+            expected_extractions=len(actual.attribute_extractions),
+        ),
+    )
+
+    assert counts["query_tables"] == 1
+    assert counts["qrels"] == 2
 
 
 def test_public_shard_materializer_guards_actual_index_and_cleans_validation(
@@ -1622,7 +1851,19 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
         )
     )
     assert manifest["format"] == "sharded_jsonl"
+    assert (
+        manifest["schema_version"]
+        == materializer.MATERIALIZATION_SCHEMA_VERSION
+    )
     assert manifest["complete"] is True
+    assert (
+        manifest["query_construction"]["qualified_attribute_policy"]
+        == "all_safe_variants"
+    )
+    assert (
+        manifest["query_construction"]["identical_visible_query_policy"]
+        == "merge_with_multiple_qrels"
+    )
     assert set(manifest["artifacts"]) == expected_directories
     assert all(
         "mtime_ns" in shard
@@ -1688,6 +1929,30 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
 
     assert resumed == result
     assert {path: path.stat().st_mtime_ns for path in published} == mtimes
+
+
+def test_legacy_published_materialization_schema_is_rebuilt(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "stage": "wdc200k_materialization",
+                "schema_version": "wdc200k-materialization-v1",
+                "complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert materializer._load_published_result(
+        output_root,
+        upstream=argparse.Namespace(identity="upstream"),
+        parameter_fingerprint="parameters",
+        records_per_shard=1,
+    ) is None
 
 
 def test_real_fetch_and_model_failures_reach_canonical_diagnostics(

@@ -2066,6 +2066,11 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert manifest["source_corpus"] == "WDC Schema.org Table Corpus 2023"
     assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
     assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
+    assert manifest["query_construction"]["qualified_attribute_policy"] == "all_safe_variants"
+    assert (
+        manifest["query_construction"]["identical_visible_query_policy"]
+        == "merge_with_multiple_qrels"
+    )
     assert manifest["web_cache"]["database"].endswith("wdc_web.sqlite3")
     assert manifest["artifacts"]["bridge_assets"]["total_records"] == 30
 

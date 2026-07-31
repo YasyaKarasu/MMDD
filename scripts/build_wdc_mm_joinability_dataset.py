@@ -3169,6 +3169,8 @@ def build_dataset(
             "direct image-column URLs and webpage images share one per-entity quota",
             "the source image attribute is excluded from every emitted table",
             "query sampling prefers recoverable rows while projected targets retain every source row",
+            "wide source tables may emit one query variant per qualifying bridge attribute",
+            "identical visible queries are merged and may own multiple qrels",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
         ],
     }
@@ -3213,6 +3215,11 @@ def build_dataset(
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
+            "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
+            "max_query_context_attrs": args.max_query_context_attrs,
+            "qualified_attribute_policy": "all_safe_variants",
+            "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
+            "identical_visible_query_policy": "merge_with_multiple_qrels",
         },
         "model_endpoints": {
             "text_model_base_url": args.text_model_base_url,
