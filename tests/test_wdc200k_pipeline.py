@@ -2005,6 +2005,9 @@ def test_model_progress_tty_uses_two_native_tqdm_bars(
             assert refresh is False
             self.postfix = values
 
+        def update(self, amount: int) -> None:
+            self.n += amount
+
         def refresh(self) -> None:
             self.refreshes += 1
 
@@ -2059,6 +2062,119 @@ def test_model_progress_tty_uses_two_native_tqdm_bars(
         "pending": 4,
     }
     assert all(bar.refreshes == 2 for bar in bars)
+
+
+def test_non_model_progress_tty_uses_native_tqdm_bar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    bars: list[Any] = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs: Any) -> None:
+            self.total = kwargs["total"]
+            self.n = kwargs["initial"]
+            self.desc = kwargs["desc"]
+            self.unit = kwargs["unit"]
+            self.refreshes = 0
+            self.closed = False
+            bars.append(self)
+
+        def refresh(self) -> None:
+            self.refreshes += 1
+
+        def update(self, amount: int) -> None:
+            self.n += amount
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = TtyBuffer()
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    monkeypatch.setattr(pipeline_module, "tqdm", FakeTqdm)
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(
+        stage="structural",
+        completed_shards=2,
+        total_shards=10,
+    )
+
+    reporter.publish()
+    reporter.update(completed_shards=3)
+    reporter.publish()
+
+    assert len(bars) == 1
+    assert bars[0].desc == "WDC structural"
+    assert bars[0].unit == "shard"
+    assert (bars[0].n, bars[0].total) == (3, 10)
+    assert bars[0].refreshes == 2
+    assert "[wdc200k]" not in stream.getvalue()
+
+
+def test_url_progress_tty_replaces_shard_bar_with_url_bar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    bars: list[Any] = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs: Any) -> None:
+            self.total = kwargs["total"]
+            self.n = kwargs["initial"]
+            self.desc = kwargs["desc"]
+            self.unit = kwargs["unit"]
+            self.closed = False
+            bars.append(self)
+
+        def refresh(self) -> None:
+            pass
+
+        def update(self, amount: int) -> None:
+            self.n += amount
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = TtyBuffer()
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    monkeypatch.setattr(pipeline_module, "tqdm", FakeTqdm)
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(stage="pages", completed_shards=0, total_shards=1)
+    reporter.publish()
+    reporter.update(
+        url_snapshot=_url_snapshot(
+            epoch="test",
+            baseline=0,
+            completed=0,
+            total=20,
+            elapsed=0.0,
+        )
+    )
+    reporter.publish()
+    reporter.update(
+        url_snapshot=_url_snapshot(
+            epoch="test",
+            baseline=0,
+            completed=6,
+            total=20,
+            elapsed=1.0,
+        )
+    )
+    reporter.publish()
+
+    assert len(bars) == 2
+    assert bars[0].closed is True
+    assert bars[1].desc == "WDC pages"
+    assert bars[1].unit == "url"
+    assert (bars[1].n, bars[1].total) == (6, 20)
 
 
 def test_model_progress_non_tty_throttles_console_but_not_json(

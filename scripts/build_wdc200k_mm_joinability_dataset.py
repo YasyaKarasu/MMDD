@@ -401,7 +401,7 @@ class _ProgressState:
 
 
 class ProgressReporter:
-    """Publish bounded-cost progress to JSON and direct stdout."""
+    """Publish detailed JSON telemetry and readable console progress."""
 
     _ROLLING_WINDOW_SECONDS = 60.0
     _NON_TTY_CONSOLE_INTERVAL_SECONDS = 60.0
@@ -425,6 +425,8 @@ class ProgressReporter:
         self._model_samples: dict[
             str, deque[tuple[float, int]]
         ] = {}
+        self._stage_bar: Any | None = None
+        self._stage_bar_key: tuple[str, str] | None = None
         self._model_bars: dict[str, Any] = {}
         self._tty_line_length = 0
         self._last_console_at: float | None = None
@@ -1614,7 +1616,8 @@ class ProgressReporter:
                 )
                 self._model_bars[progress.modality] = bar
             bar.total = progress.total
-            bar.n = progress.completed
+            if progress.completed > bar.n:
+                bar.update(progress.completed - bar.n)
             bar.set_postfix(
                 success=progress.success,
                 terminal=progress.terminal,
@@ -1623,6 +1626,61 @@ class ProgressReporter:
                 refresh=False,
             )
             bar.refresh()
+
+    @staticmethod
+    def _stage_bar_values(
+        snapshot: dict[str, Any],
+    ) -> tuple[tuple[str, str], int, int, str]:
+        rate_basis = snapshot.get("rate_basis")
+        if rate_basis is not None:
+            unit = {
+                "page_urls": "url",
+                "image_urls": "url",
+            }.get(str(rate_basis), str(rate_basis).removesuffix("s"))
+            return (
+                (str(snapshot["stage"]), str(rate_basis)),
+                int(snapshot["completed_units"]),
+                int(snapshot["total_units"]),
+                unit,
+            )
+        return (
+            (str(snapshot["stage"]), "shards"),
+            int(snapshot["completed_shards"]),
+            int(snapshot["total_shards"]),
+            "shard",
+        )
+
+    def _refresh_stage_bar(self, snapshot: dict[str, Any]) -> None:
+        if tqdm is None:
+            return
+        key, completed, total, unit = self._stage_bar_values(snapshot)
+        if self._stage_bar is not None and self._stage_bar_key != key:
+            self._close_stage_bar()
+        if self._stage_bar is None:
+            self._stage_bar = tqdm(
+                total=total,
+                initial=completed,
+                desc=f"WDC {key[0].replace('_', ' ')}",
+                unit=unit,
+                dynamic_ncols=True,
+                leave=True,
+                file=sys.stdout,
+                mininterval=max(
+                    0.1,
+                    self.config.progress_interval_seconds,
+                ),
+            )
+            self._stage_bar_key = key
+        self._stage_bar.total = total
+        if completed > self._stage_bar.n:
+            self._stage_bar.update(completed - self._stage_bar.n)
+        self._stage_bar.refresh()
+
+    def _close_stage_bar(self) -> None:
+        if self._stage_bar is not None:
+            self._stage_bar.close()
+            self._stage_bar = None
+        self._stage_bar_key = None
 
     def _close_model_bars(self) -> None:
         for modality in ("text", "image"):
@@ -1658,9 +1716,14 @@ class ProgressReporter:
                 and snapshot["stage"] == "models"
                 and tqdm is not None
             ):
+                self._close_stage_bar()
                 self._refresh_model_bars(
                     self._model_console_metrics(console_now)
                 )
+                return
+            if is_tty and tqdm is not None:
+                self._close_model_bars()
+                self._refresh_stage_bar(snapshot)
                 return
             line = self._console_line(snapshot, is_tty=is_tty)
             if is_tty:
@@ -1677,6 +1740,7 @@ class ProgressReporter:
         with self._lock:
             self._force_console = True
         self.publish()
+        self._close_stage_bar()
         self._close_model_bars()
         if self._tty_line_length:
             print(flush=True)
