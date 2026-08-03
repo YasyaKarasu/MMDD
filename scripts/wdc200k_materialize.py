@@ -124,7 +124,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v2"
+MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v3"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -2237,6 +2237,9 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
         "query_rows_per_table": int(
             join_builder.configured_query_rows_per_table(args)
         ),
+        "max_train_query_row_views_per_join": int(
+            join_builder.configured_max_train_query_row_views_per_join(args)
+        ),
         "min_rows_per_output_table": int(
             args.min_rows_per_output_table
         ),
@@ -2254,7 +2257,8 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "max_query_context_attrs": int(args.max_query_context_attrs),
         "max_target_context_attrs": int(args.max_target_context_attrs),
-        "query_row_selection": "recoverable_first",
+        "query_row_selection": "recovery_balanced_disjoint_train_views",
+        "evaluation_query_row_views_per_join": 1,
         "target_row_scope": "all_source_rows",
         "qualified_attribute_policy": "all_safe_variants",
         "sibling_source_column_policy": (
@@ -2488,10 +2492,13 @@ def _certificate_input_paths(
     for candidate in tuple(paths):
         if candidate.suffix not in {".db", ".sqlite", ".sqlite3"}:
             continue
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{candidate}{suffix}")
-            if sidecar.is_file():
-                paths.add(sidecar.resolve())
+        # A WAL can contain durable, uncheckpointed records and therefore is
+        # part of the authoritative input.  SQLite's SHM sidecar only carries
+        # transient locking/index state; even a read-only connection may
+        # rewrite it without changing the database contents.
+        wal_path = Path(f"{candidate}-wal")
+        if wal_path.is_file():
+            paths.add(wal_path.resolve())
     return tuple(sorted(paths, key=lambda path: path.as_posix()))
 
 
@@ -4836,9 +4843,14 @@ def _stats_payload(
         "query_rows_per_table": (
             join_builder.configured_query_rows_per_table(args)
         ),
+        "max_train_query_row_views_per_join": (
+            join_builder.configured_max_train_query_row_views_per_join(args)
+        ),
         "notes": [
             "source_tables are the fixed data-lake base pool",
             "source-table rows are never capped",
+            "sampling rejects source tables that cannot fill one query row view",
+            "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "wide source tables may emit multiple query variants, one per "
             "qualifying bridge attribute",
             "identical visible queries are merged and may own multiple qrels",
@@ -4895,7 +4907,10 @@ def _load_published_result(
         isinstance(payload, dict)
         and payload.get("stage") == "wdc200k_materialization"
         and payload.get("schema_version")
-        == "wdc200k-materialization-v1"
+        in {
+            "wdc200k-materialization-v1",
+            "wdc200k-materialization-v2",
+        }
     ):
         return None
     if (

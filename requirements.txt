@@ -8,5 +8,6 @@ tqdm
 requests
 dnspython>=2.4.0
 Flask>=3.1.0
+ijson>=3.3.0
 cairosvg>=2.7.0
 Pillow

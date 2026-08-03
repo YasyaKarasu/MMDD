@@ -673,6 +673,7 @@ def _task_payload(
         candidate_attribute_names=candidates,
         asset_type=modality,
         args=args,
+        row_attributes=entity.get("row_attributes"),
     )
     asset_fingerprint = _digest_json(asset)
     entity_prompt_fingerprint = _digest_json(

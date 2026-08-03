@@ -286,6 +286,57 @@ python scripts/build_mm_table_dataset.py `
 
 本脚本的目标是构造 multimodal table dataset + query workload，而不是构造 joinability benchmark labels。
 
+## 使用 OpenAI 构造 EntiTables Joinability 数据集
+
+`build_mm_joinability_dataset_openai.py` 使用同一个非流式 OpenAI Chat Completions
+模型完成文本和图片的属性抽取，其余部分完全复用现有
+`build_mm_joinability_dataset.py` 的抽取 prompt、解析器、采样、恢复判定、缓存和
+canonical 输出格式。
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"  # 可选
+conda run --no-capture-output -n MMDD python \
+  scripts/build_mm_joinability_dataset_openai.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability_openai \
+  --cache_dir cache/mm_joinability \
+  --openai_model gpt-5.6 \
+  --openai_reasoning_effort none \
+  --text_model_workers 4 \
+  --image_model_workers 4 \
+  --openai_max_inflight 4
+```
+
+也可以不在交互式 shell 中直接 export 密钥，而是创建一个已被本仓库
+`.gitignore` 排除的 dotenv 文件：
+
+```dotenv
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+把文件权限设为 `0600`。两个 OpenAI 构造脚本会在 `./.env.openai` 存在时自动读取；
+如需使用其他文件，可传入 `--openai_env_file /path/to/another.env`。加载器只接受上述
+两个变量，不会把文件当作 shell 执行。文件中的值会覆盖 shell 遗留的旧值；显式
+传入的 `--openai_base_url` 仍具有最高优先级。
+
+API key 只从 `--openai_api_key_env` 指定的环境变量读取，默认变量名是
+`OPENAI_API_KEY`，不会写入任何运行元数据。API base URL 会读取
+`OPENAI_BASE_URL`，并可通过 `--openai_base_url` 覆盖。Wikipedia 下载和共享的模型抽取缓存
+仍放在 `--cache_dir`。模型、reasoning effort、输出 token 上限、图片 detail 和
+图片像素预算等所有会改变推理结果的配置都会进入 provider model identity，因此
+不同配置不会误用彼此的抽取缓存。默认情况下，带指纹的运行配置和累计 token 用量
+写入 `<output 父目录>/work_mm_joinability_openai/openai_model_runs/`；可通过
+`--openai_work_root` 修改该根目录。
+
+`--text_model_workers` 和 `--image_model_workers` 继续控制两个模态各自的任务池；
+`--openai_max_inflight`（默认 `4`）是两个任务池共享的请求上限。可选的
+`--openai_requests_per_minute` 与 `--openai_tokens_per_minute` 会主动平滑共享请求流，
+值为 `0` 时关闭对应限制。临时错误采用指数退避，遵守服务端 `Retry-After`，并让两个
+模态共享冷却窗口。EntiTables 在临时错误耗尽重试后会停止，但保留已经成功的缓存；
+重新运行即可恢复，不会把限流造成的空结果当成负样本。
+
 ## 流式写入
 
 为了降低完整 EntiTables 构建时的内存和单文件压力，脚本现在会对大体量 JSONL artifact 进行增量写入、定期 flush，并按记录数切分成多个 shard 文件，而不是等整个数据集全部处理完后再一次性写成一个巨大 JSONL。
@@ -326,6 +377,9 @@ python scripts/build_mm_table_dataset.py `
 ## WDC Schema.org 200K Joinability Pipeline
 
 `build_wdc200k_mm_joinability_dataset.py` 是面向 20 万表规模的分阶段、可恢复入口。
+`build_wdc200k_mm_joinability_dataset_openai.py` 在同一分阶段流水线上使用 OpenAI
+推理，并支持上文的共享并发与速率限制参数；耗尽重试的临时模型任务会保持为
+`retryable`，重新运行后继续处理。
 `build_wdc_mm_joinability_dataset.py` 仍是旧的有界 builder；它的逐表行数上限与
 内存模型不适用于正式 200K 运行。
 
@@ -556,7 +610,7 @@ conda run -n MMDD python scripts/stage1_connection_viewer.py --stage1_dir output
 conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir output_mm_joinability --port 7863
 ```
 
-这个 viewer 会按 `qrels.jsonl` 里的 `query_table_id -> target_table_id` 组合分页展示，每页包含 query table、target table、evidence recovery paths，以及路径上引用到的文本/图片素材。
+这个 viewer 会按 `qrels.jsonl` 里的 `query_table_id -> target_table_id` 组合分页展示，每页包含 query table、target table、evidence recovery paths，以及路径上引用到的文本/图片素材。训练集里的不相交 row view 会按 `chain_id` 和 `row_view_index` 分组，可以通过 row-view 筛选器分别查看 canonical 或 augmented view。viewer 首次使用时会构建 `<output_dir>/.mm_joinability_viewer.sqlite3`，相关数据 shard 未变化时会直接复用，因此浏览 WDC 规模的数据集时不需要把所有 table 和 asset 常驻内存；可用 `--index_path` 把这个生成索引放到其他位置。
 
 默认情况下，Flask GUI 绑定 `127.0.0.1`，只能在本机访问。给 `stage1_train_models.py`、`stage1_run_all.py`、`run_hitl_training_rounds.py`、`hitl_annotation_app.py`、`stage1_connection_viewer.py` 或 `mm_joinability_dataset_viewer.py` 加上 `--lan` 后会绑定到 `0.0.0.0`，启动日志会同时打印本机 URL 和内网设备可访问的 URL。如果内网 URL 仍然打不开，检查主机防火墙是否放行对应端口，并确认设备在同一个网络里。
 

@@ -10,19 +10,11 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from stage1_io import clean_text, iter_jsonl, setup_logging, update_stage1_manifest, write_jsonl
 
 
 ROUND_RE = re.compile(r"hitl_selected_round_(\d+)\.jsonl$")
-
-
-def wikipedia_page_url(title: str | None) -> str:
-    title = clean_text(title)
-    if not title:
-        return ""
-    return f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
 
 
 def load_teacher_scores(path: Path | None) -> dict[str, float]:
@@ -105,26 +97,14 @@ def preview_table_like(
     focus_id = id(focus_row) if focus_row is not None else None
     for row in selected_rows:
         preview_row = {}
-        links = {}
         for i, cell in enumerate(row.get("cells", [])):
             if i >= len(cols):
                 continue
             preview_row[cols[i]] = cell.get("text")
-            url = wikipedia_page_url(cell.get("wiki_title"))
-            if url:
-                links[cols[i]] = url
-        if links:
-            preview_row["_links"] = links
         if id(row) == focus_id:
             preview_row["_focus"] = True
         rows.append(preview_row)
     return {
-        "fragment_id": table.get("fragment_id"),
-        "source_table_id": table.get("source_table_id"),
-        "page_title": table.get("page_title"),
-        "page_url": wikipedia_page_url(table.get("page_title")),
-        "caption": table.get("caption"),
-        "section_title": table.get("section_title"),
         "columns": cols,
         "rows": rows,
     }
@@ -210,15 +190,13 @@ def run(args: argparse.Namespace) -> None:
     pool.sort(key=lambda item: (item["_uncertainty"], item.get("weak_label") is None), reverse=True)
     candidates = pool[: args.candidate_top_n]
 
-    strata: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    strata: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     fragments = {rec["fragment_id"]: rec for rec in iter_jsonl(stage1_dir / "logic_fragments.jsonl")}
     for item in candidates:
-        frag = fragments.get(item.get("query_fragment_id"), {})
         key = (
             clean_text(item.get("bridge_col_name")),
             clean_text(item.get("asset_type")),
             clean_text(item.get("split")),
-            clean_text(frag.get("page_title")),
         )
         strata[key].append(item)
     selected: list[dict[str, Any]] = []
@@ -249,7 +227,6 @@ def run(args: argparse.Namespace) -> None:
             snippet = clean_text(asset.get("content"))[:1200]
         else:
             image_path = clean_text(asset.get("local_path") or asset.get("relative_path"))
-            snippet = clean_text(asset.get("file_name"))
         templates.append(
             {
                 "path_id": item["path_id"],

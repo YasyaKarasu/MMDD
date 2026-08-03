@@ -23,9 +23,9 @@ from stage1_serialization import (
 
 EMBEDDING_INSTRUCTIONS = {
     "connectivity": {
-        "table": "Represent this table for retrieval. Focus on how its fields, column profiles, and values can connect to related table or multimodal evidence.",
-        "text": "Represent this text as evidence for recovering hidden table attributes and logical connections.",
-        "image": "Represent this image as evidence for multimodal table discovery. Focus on what factual attributes about the entity can be inferred from the image.",
+        "table": "Represent only this table's intrinsic schema, values, and factual meaning for retrieval. Do not assume any relationship to another object.",
+        "text": "Represent only this independent text's intrinsic content and factual meaning for retrieval. Do not assume it belongs to any table or entity.",
+        "image": "Represent only this independent image's intrinsic visual content and factual meaning for retrieval. Do not assume it belongs to any table or entity.",
     },
     "content_only": {
         "table": "Represent the intrinsic content, schema, values, and factual meaning of this table for retrieval.",
@@ -35,7 +35,7 @@ EMBEDDING_INSTRUCTIONS = {
 }
 DEFAULT_EMBEDDING_PROMPT_MODE = "connectivity"
 EMBEDDING_PROMPT_MODE_CHOICES = tuple(EMBEDDING_INSTRUCTIONS)
-TABLE_SERIALIZATION_VERSION = "table_content_no_shared_context_v1"
+TABLE_SERIALIZATION_VERSION = "intrinsic_table_and_asset_content_v2"
 
 
 def embedding_prompt_mode(args: argparse.Namespace) -> str:

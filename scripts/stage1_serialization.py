@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -148,41 +147,13 @@ def serialize_table_for_embedding(
 
 
 def serialize_text_asset_for_embedding(asset: dict[str, Any], max_text_chars: int = 2048) -> str:
-    title = clean_text(asset.get("entity_wiki_title"))
     content = clean_text(asset.get("content"))[:max_text_chars]
-    parts = ["Entity evidence text."]
-    if title:
-        parts.append(f"Entity: {title}")
-    source = clean_text(asset.get("source"))
-    if source:
-        parts.append(f"Source: {source}")
-    if content:
-        parts.append(f"Text: {content}")
-    return "\n".join(parts)
+    return f"[Text Material]\n{content}" if content else "[Text Material]"
 
 
 def serialize_image_asset_prompt(asset: dict[str, Any]) -> str:
-    title = clean_text(asset.get("entity_wiki_title"))
-    metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
-    ext = metadata.get("extmetadata") if isinstance(metadata.get("extmetadata"), dict) else {}
-    snippets: list[str] = []
-    for key in ("ObjectName", "ImageDescription", "Categories", "Credit"):
-        value = ext.get(key)
-        if isinstance(value, dict):
-            value = value.get("value")
-        value = re.sub(r"<[^>]+>", " ", clean_text(value))
-        if value:
-            snippets.append(f"{key}: {value}")
-    file_name = clean_text(asset.get("file_name"))
-    lines = [
-        "Represent this image as evidence for multimodal table discovery. Focus on what factual attributes about the entity can be inferred from the image."
-    ]
-    if title:
-        lines.append(f"Entity: {title}")
-    if file_name:
-        lines.append(f"File: {file_name}")
-    lines.extend(snippets[:4])
-    return "\n".join(lines)
+    del asset
+    return "Represent only the intrinsic visual content of this independent image."
 
 
 def image_local_path(input_dir: Path, asset: dict[str, Any]) -> Path | None:

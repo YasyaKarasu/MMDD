@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 from pathlib import Path
@@ -5,7 +6,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from mm_joinability_dataset_viewer import create_app, load_pairs
+from mm_joinability_dataset_viewer import (
+    DEFAULT_INDEX_FILENAME,
+    ViewerDataset,
+    create_app,
+    load_pairs,
+    stream_table_preview_record,
+)
 from stage1_io import write_jsonl
 
 
@@ -125,6 +132,9 @@ def test_mm_joinability_viewer_loads_query_target_paths(tmp_path):
     assert len(pairs) == 1
     assert pairs[0]["query_table_id"] == "query_q"
     assert pairs[0]["target_table_id"] == "target_t"
+    assert pairs[0]["row_view_index"] == 0
+    assert pairs[0]["row_view_kind"] == "canonical"
+    assert pairs[0]["row_view_count"] == 1
     assert pairs[0]["query_highlight_rows"] == [0]
     assert pairs[0]["target_highlight_rows"] == [0]
     assert pairs[0]["paths"][0]["asset_content"] == "Argentina is visible in the referenced text chunk."
@@ -136,3 +146,184 @@ def test_mm_joinability_viewer_loads_query_target_paths(tmp_path):
     assert b"query_q" in response.data
     assert b"target_t" in response.data
     assert b"Argentina is visible in the referenced text chunk." in response.data
+    assert b"canonical" in response.data
+    assert (tmp_path / DEFAULT_INDEX_FILENAME).exists()
+
+
+def test_viewer_groups_and_filters_disjoint_train_row_views(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    for name in (
+        "query_tables",
+        "data_lake_tables",
+        "bridge_assets",
+        "evidence_recoveries",
+    ):
+        (tmp_path / name).mkdir()
+    write_manifest(tmp_path)
+    (tmp_path / "stats.json").write_text(
+        json.dumps({"query_tables": 2, "qrels": 2}), encoding="utf-8"
+    )
+    write_jsonl(
+        tmp_path / "query_tables" / "part-00000.jsonl",
+        [
+            table_record(
+                "query_z_canonical",
+                "query",
+                ["Entity", "Club"],
+                [["Canonical Entity", "CanonicalNeedle"]],
+            ),
+            table_record(
+                "query_a_augmented",
+                "query",
+                ["Entity", "Club"],
+                [["Augmented Entity", "AugmentedNeedle"]],
+            ),
+        ],
+    )
+    unrelated_alias = {
+        "table_id": "dl_raw_unreferenced",
+        "role": "raw_data_lake_table",
+        "source_table_id": "source_unreferenced",
+        "source_table_ref": {
+            "artifact": "source_tables",
+            "source_table_id": "source_unreferenced",
+        },
+    }
+    write_jsonl(
+        tmp_path / "data_lake_tables" / "part-00000.jsonl",
+        [
+            unrelated_alias,
+            table_record(
+                "target_shared",
+                "target_data_lake_table",
+                ["Country"],
+                [["Argentina"], ["France"]],
+            ),
+        ],
+    )
+    write_jsonl(
+        tmp_path / "bridge_assets" / "part-00000.jsonl",
+        [
+            {
+                "asset_id": "asset_shared",
+                "asset_type": "text",
+                "title": "Shared evidence",
+                "content": "Evidence shared by both row views.",
+            }
+        ],
+    )
+    write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [
+            {
+                "query_table_id": "query_a_augmented",
+                "target_table_id": "target_shared",
+                "rel": 3,
+                "split": "train",
+                "chain_id": "chain_shared",
+                "row_view_index": 1,
+                "source_table_id": "source_1",
+                "join_attribute": {"column_name": "Country"},
+            },
+            {
+                "query_table_id": "query_z_canonical",
+                "target_table_id": "target_shared",
+                "rel": 3,
+                "split": "train",
+                "chain_id": "chain_shared",
+                "row_view_index": 0,
+                "source_table_id": "source_1",
+                "join_attribute": {"column_name": "Country"},
+            },
+        ],
+    )
+    write_jsonl(
+        tmp_path / "evidence_recoveries" / "part-00000.jsonl",
+        [
+            {
+                "recovery_id": f"rec_{view}",
+                "path_id": f"path_{view}",
+                "query_table_id": query_id,
+                "target_table_id": "target_shared",
+                "query_row_id": 0,
+                "target_row_ids": [view],
+                "source_table_id": "source_1",
+                "source_row_id": view,
+                "split": "train",
+                "query_entity": {"cell_text": f"Entity {view}"},
+                "recovered_attribute": {
+                    "column_name": "Country",
+                    "value": "Argentina" if view == 0 else "France",
+                },
+                "evidence": {
+                    "asset_id": "asset_shared",
+                    "asset_type": "text",
+                },
+            }
+            for view, query_id in enumerate(
+                ["query_z_canonical", "query_a_augmented"]
+            )
+        ],
+    )
+
+    pairs, _stats, _assets = load_pairs(
+        tmp_path, max_rows=5, max_paths=5, max_asset_chars=2000
+    )
+
+    assert [pair["query_table_id"] for pair in pairs] == [
+        "query_z_canonical",
+        "query_a_augmented",
+    ]
+    assert [pair["row_view_index"] for pair in pairs] == [0, 1]
+    assert {pair["row_view_count"] for pair in pairs} == {2}
+
+    app = create_app(
+        tmp_path, max_rows=5, max_paths=5, max_asset_chars=2000
+    )
+    client = app.test_client()
+    canonical = client.get("/?row_view=canonical")
+    augmented = client.get("/?row_view=augmented")
+    searched = client.get("/?q=AugmentedNeedle")
+
+    assert canonical.status_code == 200
+    assert b"query_z_canonical" in canonical.data
+    assert b"query_a_augmented" not in canonical.data
+    assert b"canonical" in canonical.data
+    assert b"1 of 2" in canonical.data
+    assert b"query_a_augmented" in augmented.data
+    assert b"query_z_canonical" not in augmented.data
+    assert b"augmented" in augmented.data
+    assert b"2 of 2" in augmented.data
+    assert b"query_a_augmented" in searched.data
+    assert b"Multi-view chains" in searched.data
+
+    def fail_rebuild(*_args, **_kwargs):
+        raise AssertionError("current viewer index should be reused")
+
+    monkeypatch.setattr(ViewerDataset, "_build_index", fail_rebuild)
+    reused_pairs, _stats, _assets = load_pairs(
+        tmp_path, max_rows=5, max_paths=5, max_asset_chars=2000
+    )
+    assert len(reused_pairs) == 2
+
+
+def test_streaming_table_preview_keeps_first_and_highlighted_rows() -> None:
+    record = table_record(
+        "target_large",
+        "target_data_lake_table",
+        ["Country"],
+        [[f"value {row}"] for row in range(20)],
+    )
+    handle = io.BytesIO(json.dumps(record).encode("utf-8"))
+
+    preview = stream_table_preview_record(
+        handle,
+        max_rows=2,
+        include_rows={17},
+    )
+
+    assert preview["table_id"] == "target_large"
+    assert [row["row_id"] for row in preview["rows"]] == [0, 1, 17]
+    assert preview["_viewer_truncated"] is True

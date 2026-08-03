@@ -206,6 +206,7 @@ class PipelineConfig:
     min_recovery_denominator: int = 2
     min_rows_per_output_table: int = 2
     query_rows_per_table: int = 5
+    max_train_query_row_views_per_join: int = 5
     max_query_tables_per_source_table: int = 0
     max_query_context_attrs: int = 1
     max_target_context_attrs: int = 2
@@ -302,6 +303,9 @@ class PipelineConfig:
             min_recovery_denominator=args.min_recovery_denominator,
             min_rows_per_output_table=args.min_rows_per_output_table,
             query_rows_per_table=args.query_rows_per_table,
+            max_train_query_row_views_per_join=(
+                args.max_train_query_row_views_per_join
+            ),
             max_query_tables_per_source_table=(
                 args.max_query_tables_per_source_table
             ),
@@ -1892,6 +1896,7 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "min_recovery_denominator",
         "min_rows_per_output_table",
         "query_rows_per_table",
+        "max_train_query_row_views_per_join",
         "max_query_tables_per_source_table",
         "max_query_context_attrs",
         "max_target_context_attrs",
@@ -2648,6 +2653,10 @@ def _preflight(
         raise ValueError("max_image_attempts_per_entity must be non-negative")
     if config.max_images_per_entity < 0:
         raise ValueError("max_images_per_entity must be non-negative")
+    if config.max_train_query_row_views_per_join < 0:
+        raise ValueError(
+            "max_train_query_row_views_per_join must be non-negative"
+        )
     SamplingPolicy(
         sampled_entities_per_table=config.sampled_entities_per_table,
         entity_sampling_seed=config.entity_sampling_seed,
@@ -3190,6 +3199,8 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         str(config.min_rows_per_output_table),
         "--query_rows_per_table",
         str(config.query_rows_per_table),
+        "--max_train_query_row_views_per_join",
+        str(config.max_train_query_row_views_per_join),
         "--max_query_tables_per_source_table",
         str(config.max_query_tables_per_source_table),
         "--max_query_context_attrs",
@@ -4751,7 +4762,13 @@ def run_pipeline(
         reporter.close()
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: Sequence[str] | None = None,
+    *,
+    configure_parser: (
+        Callable[[argparse.ArgumentParser], None] | None
+    ) = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build the staged 200K-table multimodal joinability dataset "
@@ -4809,6 +4826,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_recovery_denominator", type=int, default=2)
     parser.add_argument("--min_rows_per_output_table", type=int, default=2)
     parser.add_argument("--query_rows_per_table", type=int, default=5)
+    parser.add_argument(
+        "--max_train_query_row_views_per_join",
+        type=int,
+        default=5,
+        help=(
+            "Maximum deterministic disjoint query row views per train join chain; "
+            "0 means use every feasible view. Dev/test always use one."
+        ),
+    )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)
@@ -4859,6 +4885,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "each SQLite writer uses an independent validation database."
         ),
     )
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parser.parse_args(argv)
     if args.max_rows_per_source_table is not None:
         parser.error("source-table rows are unbounded; omit --max_rows_per_source_table")

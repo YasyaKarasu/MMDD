@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -17,19 +16,6 @@ def text_contains(haystack: str, needle: str) -> bool:
     hay = clean_text(haystack).casefold()
     nee = clean_text(needle).casefold()
     return bool(nee) and nee in hay
-
-
-def image_metadata_text(asset: dict[str, Any]) -> str:
-    metadata = asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {}
-    ext = metadata.get("extmetadata") if isinstance(metadata.get("extmetadata"), dict) else {}
-    parts = [asset.get("file_name"), asset.get("entity_wiki_title")]
-    for value in ext.values():
-        if isinstance(value, dict):
-            parts.append(value.get("value"))
-        else:
-            parts.append(value)
-    text = " ".join(clean_text(part) for part in parts if part)
-    return re.sub(r"<[^>]+>", " ", text)
 
 
 def load_assets_from_manifest(stage1_dir: Path) -> dict[str, dict[str, Any]]:
@@ -47,7 +33,7 @@ def label_path(path: dict[str, Any], asset: dict[str, Any] | None) -> dict[str, 
     bridge_col = clean_text(path.get("bridge_col_name"))
     if asset.get("asset_type") == "text":
         content = clean_text(asset.get("content"))
-        has_entity = text_contains(content, entity_text) or text_contains(content, asset.get("entity_wiki_title"))
+        has_entity = text_contains(content, entity_text)
         has_bridge = text_contains(content, bridge_value)
         has_col = text_contains(content, bridge_col)
         if has_bridge and has_entity and has_col:
@@ -56,10 +42,6 @@ def label_path(path: dict[str, Any], asset: dict[str, Any] | None) -> dict[str, 
             out.update({"weak_label": "weak_direct", "weak_score": 0.8})
         elif has_bridge:
             out.update({"weak_label": "weak_indirect", "weak_score": 0.5})
-    elif asset.get("asset_type") == "image":
-        meta_text = image_metadata_text(asset)
-        if text_contains(meta_text, bridge_value):
-            out.update({"weak_label": "weak_indirect", "weak_score": 0.5})
     return out
 
 
@@ -67,7 +49,7 @@ def make_corrupted_negatives(paths: list[dict[str, Any]]) -> list[dict[str, Any]
     by_entity: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for path in paths:
         if path.get("weak_label") == "weak_direct":
-            by_entity[str(path.get("entity_id"))].append(path)
+            by_entity[clean_text(path.get("entity_text")).casefold()].append(path)
     negatives: list[dict[str, Any]] = []
     for entity_id, items in by_entity.items():
         bridge_values = sorted({clean_text(item.get("bridge_value")) for item in items if item.get("bridge_value")})

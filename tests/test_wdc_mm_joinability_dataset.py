@@ -2064,7 +2064,12 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert stats["source_tables"] == stats["query_tables"] == stats["qrels"] == 1
     assert persisted_stats == stats
     assert manifest["source_corpus"] == "WDC Schema.org Table Corpus 2023"
-    assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
+    assert (
+        manifest["query_construction"]["query_row_selection"]
+        == "recovery_balanced_disjoint_train_views"
+    )
+    assert manifest["query_construction"]["max_train_query_row_views_per_join"] == 5
+    assert manifest["query_construction"]["evaluation_query_row_views_per_join"] == 1
     assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
     assert manifest["query_construction"]["qualified_attribute_policy"] == "all_safe_variants"
     assert (
@@ -2391,6 +2396,10 @@ def test_build_writes_swallowed_client_exceptions_to_failure_jsonl(tmp_path):
             str(tmp_path / "cache"),
             "--max_source_tables",
             "1",
+            "--query_rows_per_table",
+            "2",
+            "--min_rows_per_output_table",
+            "2",
             "--web_workers",
             "1",
             "--no_model_progress",

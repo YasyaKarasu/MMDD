@@ -4,21 +4,35 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import logging
 import math
+import os
 import re
+import sqlite3
+import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, BinaryIO, Iterable, Iterator
 
+import ijson
 from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
+from ijson.common import ObjectBuilder
 
 from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import (
     clean_text,
     iter_jsonl,
-    iter_manifest_records,
     load_json,
 )
+
+
+LOG = logging.getLogger(__name__)
+VIEWER_INDEX_SCHEMA_VERSION = "mm-joinability-viewer-index-v2"
+DEFAULT_INDEX_FILENAME = ".mm_joinability_viewer.sqlite3"
+JSONL_SCAN_CHUNK_BYTES = 1024 * 1024
+JSONL_ID_PREFIX_BYTES = 64 * 1024
 
 PAGE_TEMPLATE = """
 <!doctype html>
@@ -189,6 +203,11 @@ PAGE_TEMPLATE = """
         <option value="{{ s }}" {{ "selected" if split == s else "" }}>{{ s }}</option>
         {% endfor %}
       </select>
+      <select name="row_view">
+        <option value="all" {{ "selected" if row_view == "all" else "" }}>all row views</option>
+        <option value="canonical" {{ "selected" if row_view == "canonical" else "" }}>canonical views</option>
+        <option value="augmented" {{ "selected" if row_view == "augmented" else "" }}>augmented views</option>
+      </select>
       <select name="asset_type">
         <option value="">all assets</option>
         {% for t in asset_types %}
@@ -211,6 +230,7 @@ PAGE_TEMPLATE = """
         <div><span class="label">Source Table</span><span class="value">{{ pair.source_table_id }}</span></div>
         <div><span class="label">Split</span><span class="value">{{ pair.split }}</span></div>
         <div><span class="label">Chain</span><span class="value">{{ pair.chain_id }}</span></div>
+        <div><span class="label">Row View</span><span class="value">{{ pair.row_view_kind }} · {{ pair.row_view_number }} of {{ pair.row_view_count }}</span></div>
         <div><span class="label">Relevance</span><span class="value">{{ pair.rel }}</span></div>
         <div><span class="label">Join Attribute</span><span class="value">{{ pair.join_attribute.column_name or pair.join_col_name }}</span></div>
         <div><span class="label">Evidence Paths</span><span class="value">{{ pair.path_count }}</span></div>
@@ -318,6 +338,17 @@ PAGE_TEMPLATE = """
     </section>
     {% endif %}
 
+    {% if viewer_stats %}
+    <section class="panel">
+      <h2>Viewer Stats</h2>
+      <div class="stats">
+        {% for item in viewer_stats %}
+        <div><span class="label">{{ item.label }}</span><span class="value">{{ item.value }}</span></div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
     {% if stats %}
     <section class="panel">
       <h2>Dataset Stats</h2>
@@ -337,6 +368,7 @@ PAGE_TEMPLATE = """
       <form method="get" action="{{ url_for('index') }}">
         <input type="hidden" name="q" value="{{ query }}">
         <input type="hidden" name="split" value="{{ split }}">
+        <input type="hidden" name="row_view" value="{{ row_view }}">
         <input type="hidden" name="asset_type" value="{{ asset_type }}">
         <input type="number" name="page" min="1" max="{{ pages }}" value="{{ page }}">
         <button type="submit">Go</button>
@@ -383,19 +415,6 @@ def artifact_paths(output_dir: Path, artifact: str, manifest: dict[str, Any] | N
     return [flat] if flat.exists() else []
 
 
-def iter_artifact_records(output_dir: Path, artifact: str, manifest: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
-    if (output_dir / "dataset_manifest.json").exists():
-        yield from iter_manifest_records(
-            output_dir,
-            artifact,
-            log_every=0,
-        )
-        return
-    for path in artifact_paths(output_dir, artifact, manifest):
-        if path.exists():
-            yield from iter_jsonl(path)
-
-
 def single_file_path(output_dir: Path, key: str, fallback: str, manifest: dict[str, Any] | None = None) -> Path:
     manifest = manifest if manifest is not None else load_manifest(output_dir)
     rel = manifest.get("single_files", {}).get(key, fallback) if manifest else fallback
@@ -408,24 +427,6 @@ def load_json_if_exists(path: Path) -> dict[str, Any]:
 
 def table_id(record: dict[str, Any]) -> str:
     return clean_text(record.get("table_id") or record.get("object_id"))
-
-
-def load_tables(output_dir: Path, artifact: str, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    tables: dict[str, dict[str, Any]] = {}
-    for record in iter_artifact_records(output_dir, artifact, manifest):
-        ident = table_id(record)
-        if ident:
-            tables[ident] = record
-    return tables
-
-
-def load_assets(output_dir: Path, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    assets: dict[str, dict[str, Any]] = {}
-    for record in iter_artifact_records(output_dir, "bridge_assets", manifest):
-        asset_id = clean_text(record.get("asset_id"))
-        if asset_id:
-            assets[asset_id] = record
-    return assets
 
 
 def load_qrels(output_dir: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -503,7 +504,8 @@ def preview_table(record: dict[str, Any], max_rows: int, include_rows: set[int] 
     include_rows = include_rows or set()
     names = column_names(record)
     rows = []
-    for ordinal, row in enumerate(record.get("rows", []) or []):
+    raw_rows = record.get("rows", []) or []
+    for ordinal, row in enumerate(raw_rows):
         try:
             rid = int(row.get("row_id", ordinal))
         except (TypeError, ValueError):
@@ -527,7 +529,8 @@ def preview_table(record: dict[str, Any], max_rows: int, include_rows: set[int] 
         "section_title": clean_text(record.get("section_title")),
         "columns": names,
         "rows": rows,
-        "truncated": len(record.get("rows", []) or []) > len(rows),
+        "truncated": bool(record.get("_viewer_truncated"))
+        or len(raw_rows) > len(rows),
     }
 
 
@@ -647,6 +650,8 @@ def pair_search_text(pair: dict[str, Any]) -> str:
         pair.get("source_table_id", ""),
         pair.get("split", ""),
         pair.get("chain_id", ""),
+        pair.get("row_view_kind", ""),
+        pair.get("row_view_index", ""),
         pair.get("reason", ""),
     ]
     join_attribute = pair.get("join_attribute") if isinstance(pair.get("join_attribute"), dict) else {}
@@ -681,124 +686,1109 @@ def pair_search_text(pair: dict[str, Any]) -> str:
     return " ".join(clean_text(part).casefold() for part in parts)
 
 
-def load_pairs(output_dir: Path, max_rows: int, max_paths: int, max_asset_chars: int) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, dict[str, Any]]]:
-    manifest = load_manifest(output_dir)
-    query_tables = load_tables(output_dir, "query_tables", manifest)
-    target_tables = load_tables(output_dir, "data_lake_tables", manifest)
-    assets = load_assets(output_dir, manifest)
-    qrels = load_qrels(output_dir, manifest)
-    recoveries_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for record in iter_artifact_records(output_dir, "evidence_recoveries", manifest):
-        key = recovery_key(record)
-        if all(key):
-            recoveries_by_pair.setdefault(key, []).append(record)
+def coerce_row_view_index(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
-    qrels_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for qrel in qrels:
-        key = qrel_key(qrel)
-        if all(key):
-            qrels_by_key[key] = qrel
-    for key, records in recoveries_by_pair.items():
-        if key not in qrels_by_key and records:
-            qrels_by_key[key] = {
-                "query_table_id": key[0],
-                "target_table_id": key[1],
-                "data_lake_table_id": key[1],
-                "split": records[0].get("split"),
-                "source_table_id": records[0].get("source_table_id"),
-                "rel": "",
-                "reason": "evidence_recovery_only",
+
+def build_pair_preview(
+    *,
+    qrel: dict[str, Any],
+    query_record: dict[str, Any],
+    target_record: dict[str, Any],
+    raw_paths: list[dict[str, Any]],
+    assets: dict[str, dict[str, Any]],
+    output_dir: Path,
+    max_rows: int,
+    max_paths: int,
+    max_asset_chars: int,
+    row_view_count: int = 1,
+) -> dict[str, Any]:
+    query_id = query_id_from_qrel(qrel)
+    target_id = target_id_from_qrel(qrel)
+    query_highlights = coerce_int_set(
+        path.get("query_row_id") for path in raw_paths
+    )
+    target_highlights = coerce_int_set(
+        row
+        for path in raw_paths
+        for row in (path.get("target_row_ids") or [])
+    )
+    shown_raw_paths = raw_paths[:max_paths]
+    paths = [
+        recovery_preview(path, assets, output_dir, max_asset_chars)
+        for path in shown_raw_paths
+    ]
+    query_table = preview_table(query_record, max_rows, query_highlights)
+    target_table = preview_table(target_record, max_rows, target_highlights)
+    join_attribute = (
+        qrel.get("join_attribute")
+        if isinstance(qrel.get("join_attribute"), dict)
+        else {}
+    )
+    row_view_index = coerce_row_view_index(qrel.get("row_view_index"))
+    pair = {
+        "query_table_id": query_id,
+        "target_table_id": target_id,
+        "data_lake_table_id": clean_text(qrel.get("data_lake_table_id")),
+        "source_table_id": clean_text(
+            qrel.get("source_table_id") or query_table.get("source_table_id")
+        ),
+        "split": clean_text(qrel.get("split") or query_table.get("split")),
+        "chain_id": clean_text(qrel.get("chain_id")),
+        "row_view_index": row_view_index,
+        "row_view_number": row_view_index + 1,
+        "row_view_count": max(1, int(row_view_count)),
+        "row_view_kind": "canonical" if row_view_index == 0 else "augmented",
+        "rel": clean_text(qrel.get("rel")),
+        "reason": clean_text(qrel.get("reason")),
+        "join_attribute": {
+            "column_name": clean_text(join_attribute.get("column_name")),
+            "recovered_rows": clean_text(join_attribute.get("recovered_rows")),
+            "eligible_rows": clean_text(join_attribute.get("eligible_rows")),
+            "recovered_value_ratio": clean_text(
+                join_attribute.get("recovered_value_ratio")
+            ),
+        },
+        "join_col_name": clean_text(qrel.get("join_col_name")),
+        "query_table": query_table,
+        "target_table": target_table,
+        "query_highlight_rows": sorted(query_highlights),
+        "target_highlight_rows": sorted(target_highlights),
+        "paths": paths,
+        "path_count": len(raw_paths),
+        "path_count_displayed": len(paths),
+        "asset_type_summary": asset_type_summary(paths),
+        "asset_types": sorted(
+            {
+                path.get("asset_type")
+                for path in paths
+                if path.get("asset_type")
             }
+        ),
+    }
+    pair["_search"] = pair_search_text(pair)
+    return pair
 
-    pairs = []
-    for key, qrel in qrels_by_key.items():
-        query_id, target_id = key
-        raw_paths = recoveries_by_pair.get(key, [])
-        query_highlights = coerce_int_set(path.get("query_row_id") for path in raw_paths)
-        target_highlights = coerce_int_set(row for path in raw_paths for row in (path.get("target_row_ids") or []))
-        shown_raw_paths = raw_paths[:max_paths]
-        paths = [recovery_preview(path, assets, output_dir, max_asset_chars) for path in shown_raw_paths]
-        query_table = preview_table(query_tables.get(query_id, {}), max_rows, query_highlights)
-        target_table = preview_table(target_tables.get(target_id, {}), max_rows, target_highlights)
-        join_attribute = qrel.get("join_attribute") if isinstance(qrel.get("join_attribute"), dict) else {}
-        pair = {
-            "query_table_id": query_id,
-            "target_table_id": target_id,
-            "data_lake_table_id": clean_text(qrel.get("data_lake_table_id")),
-            "source_table_id": clean_text(qrel.get("source_table_id") or query_table.get("source_table_id")),
-            "split": clean_text(qrel.get("split") or query_table.get("split")),
-            "chain_id": clean_text(qrel.get("chain_id")),
-            "rel": clean_text(qrel.get("rel")),
-            "reason": clean_text(qrel.get("reason")),
-            "join_attribute": {
-                "column_name": clean_text(join_attribute.get("column_name")),
-                "recovered_rows": clean_text(join_attribute.get("recovered_rows")),
-                "eligible_rows": clean_text(join_attribute.get("eligible_rows")),
-                "recovered_value_ratio": clean_text(join_attribute.get("recovered_value_ratio")),
+
+def viewer_pair_key(query_id: str, target_id: str) -> str:
+    return json.dumps([query_id, target_id], ensure_ascii=False, separators=(",", ":"))
+
+
+def iter_artifact_record_offsets(
+    output_dir: Path,
+    artifact: str,
+    manifest: dict[str, Any],
+) -> Iterator[tuple[dict[str, Any], Path, int, int]]:
+    """Read raw JSONL records without expanding data-lake source references."""
+    for path in artifact_paths(output_dir, artifact, manifest):
+        if not path.exists():
+            continue
+        with path.open("rb") as handle:
+            while True:
+                offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                yield json.loads(line), path.resolve(), offset, len(line)
+
+
+def iter_jsonl_byte_ranges(
+    path: Path,
+) -> Iterator[tuple[bytes, int, int]]:
+    """Yield a bounded prefix and byte range for each JSONL record."""
+    with path.open("rb") as handle:
+        record_start = 0
+        record_length = 0
+        prefix = bytearray()
+        absolute_offset = 0
+        while True:
+            chunk = handle.read(JSONL_SCAN_CHUNK_BYTES)
+            if not chunk:
+                break
+            cursor = 0
+            while cursor < len(chunk):
+                newline = chunk.find(b"\n", cursor)
+                stop = len(chunk) if newline < 0 else newline + 1
+                segment = chunk[cursor:stop]
+                if len(prefix) < JSONL_ID_PREFIX_BYTES:
+                    remaining = JSONL_ID_PREFIX_BYTES - len(prefix)
+                    prefix.extend(segment[:remaining])
+                segment_length = len(segment)
+                record_length += segment_length
+                absolute_offset += segment_length
+                cursor = stop
+                if newline >= 0:
+                    if prefix.strip():
+                        yield bytes(prefix), record_start, record_length
+                    record_start = absolute_offset
+                    record_length = 0
+                    prefix.clear()
+        if record_length and prefix.strip():
+            yield bytes(prefix), record_start, record_length
+
+
+def json_string_field_from_prefix(prefix: bytes, field: str) -> str:
+    field_bytes = re.escape(field.encode("ascii"))
+    match = re.search(
+        rb'"' + field_bytes + rb'"\s*:\s*"((?:\\.|[^"\\])*)"',
+        prefix,
+    )
+    if match is None:
+        return ""
+    try:
+        return clean_text(json.loads(b'"' + match.group(1) + b'"'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+
+
+def iter_artifact_id_offsets(
+    output_dir: Path,
+    artifact: str,
+    manifest: dict[str, Any],
+    id_field: str,
+) -> Iterator[tuple[str, Path, int, int]]:
+    for path in artifact_paths(output_dir, artifact, manifest):
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        for prefix, offset, length in iter_jsonl_byte_ranges(path):
+            record_id = json_string_field_from_prefix(prefix, id_field)
+            if not record_id and id_field == "table_id":
+                record_id = json_string_field_from_prefix(prefix, "object_id")
+            if record_id:
+                yield record_id, resolved, offset, length
+
+
+def stream_table_preview_record(
+    handle: BinaryIO,
+    *,
+    max_rows: int,
+    include_rows: set[int],
+) -> dict[str, Any]:
+    """Materialize table metadata, columns, and only rows needed by the UI."""
+    scalar_fields = {
+        "table_id",
+        "object_id",
+        "role",
+        "split",
+        "source_table_id",
+        "page_title",
+        "caption",
+        "section_title",
+    }
+    record: dict[str, Any] = {"columns": [], "rows": []}
+    pending_rows = set(include_rows)
+    row_limit = max(0, int(max_rows))
+    rows_seen = 0
+    truncated = False
+    builder: ObjectBuilder | None = None
+    builder_prefix = ""
+    builder_kind = ""
+
+    for prefix, event, value in ijson.parse(handle):
+        if builder is not None:
+            builder.event(event, value)
+            if prefix == builder_prefix and event == "end_map":
+                item = builder.value
+                builder = None
+                if builder_kind == "column":
+                    record["columns"].append(item)
+                else:
+                    try:
+                        row_id = int(item.get("row_id", rows_seen))
+                    except (AttributeError, TypeError, ValueError):
+                        row_id = rows_seen
+                    rows_seen += 1
+                    if rows_seen <= row_limit or row_id in include_rows:
+                        record["rows"].append(item)
+                    pending_rows.discard(row_id)
+                    if rows_seen > row_limit and not pending_rows:
+                        truncated = True
+                        break
+                builder_prefix = ""
+                builder_kind = ""
+            continue
+
+        if prefix in scalar_fields and event in {
+            "string",
+            "number",
+            "boolean",
+            "null",
+        }:
+            record[prefix] = value
+        elif prefix == "columns.item" and event == "start_map":
+            builder = ObjectBuilder()
+            builder.event(event, value)
+            builder_prefix = prefix
+            builder_kind = "column"
+        elif prefix == "columns.item" and event in {
+            "string",
+            "number",
+            "boolean",
+            "null",
+        }:
+            record["columns"].append(value)
+        elif prefix == "rows.item" and event == "start_map":
+            builder = ObjectBuilder()
+            builder.event(event, value)
+            builder_prefix = prefix
+            builder_kind = "row"
+        elif prefix == "rows" and event == "end_array":
+            break
+
+    record["_viewer_truncated"] = truncated
+    return record
+
+
+class IndexedRecordReader:
+    def __init__(self) -> None:
+        self._handles: dict[str, BinaryIO] = {}
+
+    def read(self, path: str, offset: int, length: int) -> dict[str, Any]:
+        handle = self._handles.get(path)
+        if handle is None:
+            handle = Path(path).open("rb")
+            self._handles[path] = handle
+        handle.seek(offset)
+        return json.loads(handle.read(length))
+
+    def read_table_preview(
+        self,
+        path: str,
+        offset: int,
+        *,
+        max_rows: int,
+        include_rows: set[int],
+    ) -> dict[str, Any]:
+        handle = self._handles.get(path)
+        if handle is None:
+            handle = Path(path).open("rb")
+            self._handles[path] = handle
+        handle.seek(offset)
+        return stream_table_preview_record(
+            handle,
+            max_rows=max_rows,
+            include_rows=include_rows,
+        )
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            handle.close()
+        self._handles.clear()
+
+    def __enter__(self) -> "IndexedRecordReader":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+def viewer_index_signature(
+    output_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    max_rows: int,
+    max_paths: int,
+    max_asset_chars: int,
+) -> str:
+    paths = [manifest_path(output_dir)]
+    paths.append(single_file_path(output_dir, "qrels", "qrels.jsonl", manifest))
+    for artifact in (
+        "query_tables",
+        "data_lake_tables",
+        "bridge_assets",
+        "evidence_recoveries",
+    ):
+        paths.extend(artifact_paths(output_dir, artifact, manifest))
+    file_state = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved.exists():
+            stat = resolved.stat()
+            file_state.append(
+                {
+                    "path": str(resolved),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+        else:
+            file_state.append({"path": str(resolved), "missing": True})
+    payload = {
+        "schema_version": VIEWER_INDEX_SCHEMA_VERSION,
+        "files": file_state,
+        "preview": {
+            "max_rows": max_rows,
+            "max_paths": max_paths,
+            "max_asset_chars": max_asset_chars,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class ViewerDataset:
+    """Bounded-memory access to a joinability dataset through a local offset index."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        max_rows: int,
+        max_paths: int,
+        max_asset_chars: int,
+        index_path: Path | None = None,
+    ) -> None:
+        self.output_dir = Path(output_dir).resolve()
+        self.max_rows = max_rows
+        self.max_paths = max_paths
+        self.max_asset_chars = max_asset_chars
+        self.manifest = load_manifest(self.output_dir)
+        self.index_path = (
+            Path(index_path).resolve()
+            if index_path is not None
+            else self.output_dir / DEFAULT_INDEX_FILENAME
+        )
+        self.signature = viewer_index_signature(
+            self.output_dir,
+            self.manifest,
+            max_rows=max_rows,
+            max_paths=max_paths,
+            max_asset_chars=max_asset_chars,
+        )
+        self._ensure_index()
+
+    def _connect(self, path: Path | None = None) -> sqlite3.Connection:
+        connection = sqlite3.connect(path or self.index_path, timeout=60.0)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _index_is_current(self) -> bool:
+        if not self.index_path.exists():
+            return False
+        try:
+            with self._connect() as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM meta"))
+            return (
+                metadata.get("schema_version") == VIEWER_INDEX_SCHEMA_VERSION
+                and metadata.get("signature") == self.signature
+                and metadata.get("complete") == "1"
+            )
+        except (OSError, sqlite3.DatabaseError):
+            return False
+
+    def _ensure_index(self) -> None:
+        if self._index_is_current():
+            return
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.index_path.with_name(
+            f".{self.index_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        LOG.info("Building viewer index at %s", self.index_path)
+        try:
+            self._build_index(temporary_path)
+            os.replace(temporary_path, self.index_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=OFF;
+            PRAGMA temp_store=MEMORY;
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE pairs (
+                pair_key TEXT PRIMARY KEY,
+                query_table_id TEXT NOT NULL,
+                target_table_id TEXT NOT NULL,
+                data_lake_table_id TEXT NOT NULL,
+                source_table_id TEXT NOT NULL,
+                split TEXT NOT NULL,
+                chain_id TEXT NOT NULL,
+                row_view_index INTEGER NOT NULL,
+                rel TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                search_text TEXT NOT NULL DEFAULT '',
+                path_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE records (
+                artifact TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                byte_length INTEGER NOT NULL,
+                PRIMARY KEY (artifact, record_id)
+            );
+            CREATE TABLE recoveries (
+                ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair_key TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                path TEXT NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                byte_length INTEGER NOT NULL
+            );
+            CREATE TABLE pair_asset_types (
+                pair_key TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                PRIMARY KEY (pair_key, asset_type)
+            );
+            CREATE INDEX pairs_order_idx ON pairs (
+                split, source_table_id, chain_id, row_view_index,
+                query_table_id, target_table_id
+            );
+            CREATE INDEX recoveries_pair_idx ON recoveries (pair_key, ordinal);
+            CREATE INDEX recoveries_asset_idx ON recoveries (asset_id);
+            CREATE INDEX pair_asset_types_type_idx ON pair_asset_types (
+                asset_type, pair_key
+            );
+            """
+        )
+
+    @staticmethod
+    def _insert_pair(
+        connection: sqlite3.Connection,
+        qrel: dict[str, Any],
+    ) -> str:
+        query_id = query_id_from_qrel(qrel)
+        target_id = target_id_from_qrel(qrel)
+        key = viewer_pair_key(query_id, target_id)
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO pairs (
+                pair_key, query_table_id, target_table_id, data_lake_table_id,
+                source_table_id, split, chain_id, row_view_index, rel, reason,
+                raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                query_id,
+                target_id,
+                clean_text(qrel.get("data_lake_table_id")),
+                clean_text(qrel.get("source_table_id")),
+                clean_text(qrel.get("split")),
+                clean_text(qrel.get("chain_id")),
+                coerce_row_view_index(qrel.get("row_view_index")),
+                clean_text(qrel.get("rel")),
+                clean_text(qrel.get("reason")),
+                json.dumps(qrel, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+        return key
+
+    def _build_index(self, temporary_path: Path) -> None:
+        connection = self._connect(temporary_path)
+        try:
+            self._create_schema(connection)
+            pair_keys: set[str] = set()
+            query_ids: set[str] = set()
+            target_ids: set[str] = set()
+            for qrel in load_qrels(self.output_dir, self.manifest):
+                query_id, target_id = qrel_key(qrel)
+                if not query_id or not target_id:
+                    continue
+                key = self._insert_pair(connection, qrel)
+                pair_keys.add(key)
+                query_ids.add(query_id)
+                target_ids.add(target_id)
+
+            asset_ids: set[str] = set()
+            recovery_count = 0
+            for record, path, offset, length in iter_artifact_record_offsets(
+                self.output_dir, "evidence_recoveries", self.manifest
+            ):
+                query_id, target_id = recovery_key(record)
+                if not query_id or not target_id:
+                    continue
+                key = viewer_pair_key(query_id, target_id)
+                if key not in pair_keys:
+                    synthetic_qrel = {
+                        "query_table_id": query_id,
+                        "target_table_id": target_id,
+                        "data_lake_table_id": target_id,
+                        "split": record.get("split"),
+                        "source_table_id": record.get("source_table_id"),
+                        "rel": "",
+                        "reason": "evidence_recovery_only",
+                    }
+                    self._insert_pair(connection, synthetic_qrel)
+                    pair_keys.add(key)
+                    query_ids.add(query_id)
+                    target_ids.add(target_id)
+                evidence = (
+                    record.get("evidence")
+                    if isinstance(record.get("evidence"), dict)
+                    else {}
+                )
+                asset_id = clean_text(evidence.get("asset_id"))
+                asset_type = clean_text(evidence.get("asset_type"))
+                connection.execute(
+                    """
+                    INSERT INTO recoveries (
+                        pair_key, asset_id, asset_type, path,
+                        byte_offset, byte_length
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, asset_id, asset_type, str(path), offset, length),
+                )
+                if asset_type:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO pair_asset_types VALUES (?, ?)",
+                        (key, asset_type),
+                    )
+                if asset_id:
+                    asset_ids.add(asset_id)
+                recovery_count += 1
+                if recovery_count % 10000 == 0:
+                    connection.commit()
+                    LOG.info("Indexed %s evidence recoveries", f"{recovery_count:,}")
+
+            self._index_artifact_records(
+                connection,
+                artifact="query_tables",
+                wanted_ids=query_ids,
+                id_field="table_id",
+            )
+            self._index_artifact_records(
+                connection,
+                artifact="data_lake_tables",
+                wanted_ids=target_ids,
+                id_field="table_id",
+            )
+            self._index_artifact_records(
+                connection,
+                artifact="bridge_assets",
+                wanted_ids=asset_ids,
+                id_field="asset_id",
+            )
+
+            pair_rows = connection.execute(
+                "SELECT pair_key FROM pairs ORDER BY pair_key"
+            ).fetchall()
+            with IndexedRecordReader() as reader:
+                for index, row in enumerate(pair_rows, start=1):
+                    pair = self._hydrate_pair_from_connection(
+                        connection,
+                        row["pair_key"],
+                        reader,
+                        include_view_count=False,
+                    )
+                    connection.execute(
+                        "UPDATE pairs SET search_text = ?, path_count = ? WHERE pair_key = ?",
+                        (pair["_search"], pair["path_count"], row["pair_key"]),
+                    )
+                    if index % 1000 == 0:
+                        connection.commit()
+                        LOG.info("Prepared search text for %s pairs", f"{index:,}")
+
+            connection.executemany(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                [
+                    ("schema_version", VIEWER_INDEX_SCHEMA_VERSION),
+                    ("signature", self.signature),
+                    ("complete", "1"),
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _index_artifact_records(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        artifact: str,
+        wanted_ids: set[str],
+        id_field: str,
+    ) -> None:
+        found = 0
+        with IndexedRecordReader() as reader:
+            offsets = iter_artifact_id_offsets(
+                self.output_dir,
+                artifact,
+                self.manifest,
+                id_field,
+            )
+            for record_id, path, offset, length in offsets:
+                if record_id not in wanted_ids:
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO records (
+                        artifact, record_id, path, byte_offset, byte_length
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (artifact, record_id, str(path), offset, length),
+                )
+                record = (
+                    {}
+                    if artifact == "data_lake_tables"
+                    else reader.read(str(path), offset, length)
+                )
+                if artifact == "query_tables":
+                    connection.execute(
+                        """
+                        UPDATE pairs
+                        SET source_table_id = CASE
+                                WHEN source_table_id = '' THEN ? ELSE source_table_id END,
+                            split = CASE WHEN split = '' THEN ? ELSE split END
+                        WHERE query_table_id = ?
+                        """,
+                        (
+                            clean_text(record.get("source_table_id")),
+                            clean_text(record.get("split")),
+                            record_id,
+                        ),
+                    )
+                if artifact == "bridge_assets":
+                    asset_type = clean_text(record.get("asset_type"))
+                    if asset_type:
+                        connection.execute(
+                            """
+                            UPDATE recoveries SET asset_type = ?
+                            WHERE asset_id = ? AND asset_type = ''
+                            """,
+                            (asset_type, record_id),
+                        )
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO pair_asset_types (pair_key, asset_type)
+                            SELECT pair_key, ? FROM recoveries WHERE asset_id = ?
+                            """,
+                            (asset_type, record_id),
+                        )
+                found += 1
+        connection.commit()
+        LOG.info(
+            "Indexed %s/%s referenced %s records",
+            f"{found:,}",
+            f"{len(wanted_ids):,}",
+            artifact,
+        )
+
+    @staticmethod
+    def _read_record(
+        connection: sqlite3.Connection,
+        reader: IndexedRecordReader,
+        artifact: str,
+        record_id: str,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT path, byte_offset, byte_length FROM records
+            WHERE artifact = ? AND record_id = ?
+            """,
+            (artifact, record_id),
+        ).fetchone()
+        if row is None:
+            return {}
+        return reader.read(row["path"], row["byte_offset"], row["byte_length"])
+
+    def _read_table_preview_record(
+        self,
+        connection: sqlite3.Connection,
+        reader: IndexedRecordReader,
+        artifact: str,
+        record_id: str,
+        include_rows: set[int],
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT path, byte_offset FROM records
+            WHERE artifact = ? AND record_id = ?
+            """,
+            (artifact, record_id),
+        ).fetchone()
+        if row is None:
+            return {}
+        return reader.read_table_preview(
+            row["path"],
+            row["byte_offset"],
+            max_rows=self.max_rows,
+            include_rows=include_rows,
+        )
+
+    @staticmethod
+    def _row_view_count(
+        connection: sqlite3.Connection,
+        pair_row: sqlite3.Row,
+    ) -> int:
+        if not pair_row["chain_id"]:
+            return 1
+        row = connection.execute(
+            """
+            SELECT COUNT(DISTINCT row_view_index) AS count
+            FROM pairs
+            WHERE split = ? AND source_table_id = ? AND chain_id = ?
+            """,
+            (
+                pair_row["split"],
+                pair_row["source_table_id"],
+                pair_row["chain_id"],
+            ),
+        ).fetchone()
+        return max(1, int(row["count"] or 0))
+
+    def _hydrate_pair_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        pair_key: str,
+        reader: IndexedRecordReader,
+        *,
+        include_view_count: bool,
+    ) -> dict[str, Any]:
+        pair_row = connection.execute(
+            "SELECT * FROM pairs WHERE pair_key = ?", (pair_key,)
+        ).fetchone()
+        if pair_row is None:
+            raise KeyError(f"Unknown pair: {pair_key}")
+        qrel = json.loads(pair_row["raw_json"])
+        recovery_rows = connection.execute(
+            """
+            SELECT path, byte_offset, byte_length FROM recoveries
+            WHERE pair_key = ? ORDER BY ordinal
+            """,
+            (pair_key,),
+        ).fetchall()
+        raw_paths = [
+            reader.read(row["path"], row["byte_offset"], row["byte_length"])
+            for row in recovery_rows
+        ]
+        query_highlights = coerce_int_set(
+            path.get("query_row_id") for path in raw_paths
+        )
+        target_highlights = coerce_int_set(
+            row
+            for path in raw_paths
+            for row in (path.get("target_row_ids") or [])
+        )
+        query_record = self._read_table_preview_record(
+            connection,
+            reader,
+            "query_tables",
+            pair_row["query_table_id"],
+            query_highlights,
+        )
+        target_record = self._read_table_preview_record(
+            connection,
+            reader,
+            "data_lake_tables",
+            pair_row["target_table_id"],
+            target_highlights,
+        )
+        assets: dict[str, dict[str, Any]] = {}
+        for record in raw_paths[: self.max_paths]:
+            evidence = (
+                record.get("evidence")
+                if isinstance(record.get("evidence"), dict)
+                else {}
+            )
+            asset_id = clean_text(evidence.get("asset_id"))
+            if asset_id and asset_id not in assets:
+                assets[asset_id] = self._read_record(
+                    connection, reader, "bridge_assets", asset_id
+                )
+        pair = build_pair_preview(
+            qrel=qrel,
+            query_record=query_record,
+            target_record=target_record,
+            raw_paths=raw_paths,
+            assets=assets,
+            output_dir=self.output_dir,
+            max_rows=self.max_rows,
+            max_paths=self.max_paths,
+            max_asset_chars=self.max_asset_chars,
+            row_view_count=(
+                self._row_view_count(connection, pair_row)
+                if include_view_count
+                else 1
+            ),
+        )
+        pair["asset_types"] = [
+            row["asset_type"]
+            for row in connection.execute(
+                """
+                SELECT asset_type FROM pair_asset_types
+                WHERE pair_key = ? ORDER BY asset_type
+                """,
+                (pair_key,),
+            )
+        ]
+        return pair
+
+    def hydrate_pair(self, pair_key: str) -> dict[str, Any]:
+        with self._connect() as connection, IndexedRecordReader() as reader:
+            return self._hydrate_pair_from_connection(
+                connection,
+                pair_key,
+                reader,
+                include_view_count=True,
+            )
+
+    @staticmethod
+    def _filter_sql(
+        *,
+        query: str,
+        split: str,
+        asset_type: str,
+        row_view: str,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if split:
+            clauses.append("pairs.split = ?")
+            parameters.append(split)
+        if asset_type:
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM pair_asset_types
+                    WHERE pair_asset_types.pair_key = pairs.pair_key
+                      AND pair_asset_types.asset_type = ?
+                )
+                """
+            )
+            parameters.append(asset_type)
+        if row_view == "canonical":
+            clauses.append("pairs.row_view_index = 0")
+        elif row_view == "augmented":
+            clauses.append("pairs.row_view_index > 0")
+        if query:
+            clauses.append("instr(pairs.search_text, ?) > 0")
+            parameters.append(query.casefold())
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, parameters
+
+    def filtered_pair(
+        self,
+        *,
+        query: str,
+        split: str,
+        asset_type: str,
+        row_view: str,
+        page: int,
+    ) -> tuple[dict[str, Any] | None, int]:
+        where, parameters = self._filter_sql(
+            query=query,
+            split=split,
+            asset_type=asset_type,
+            row_view=row_view,
+        )
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM pairs{where}", parameters
+                ).fetchone()[0]
+            )
+            if total == 0:
+                return None, 0
+            page = min(max(1, page), total)
+            row = connection.execute(
+                f"""
+                SELECT pair_key FROM pairs{where}
+                ORDER BY split, source_table_id, chain_id, row_view_index,
+                         query_table_id, target_table_id
+                LIMIT 1 OFFSET ?
+                """,
+                [*parameters, max(0, page - 1)],
+            ).fetchone()
+        return self.hydrate_pair(row["pair_key"]), total
+
+    def filter_options(self) -> tuple[list[str], list[str]]:
+        with self._connect() as connection:
+            splits = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT split FROM pairs WHERE split != '' ORDER BY split"
+                )
+            ]
+            asset_types = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT asset_type FROM pair_asset_types
+                    WHERE asset_type != '' ORDER BY asset_type
+                    """
+                )
+            ]
+        return splits, asset_types
+
+    def viewer_stats(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT pair_key, query_table_id, split, source_table_id,
+                       chain_id, row_view_index
+                FROM pairs
+                """
+            ).fetchall()
+        chains: dict[tuple[str, ...], set[int]] = {}
+        query_ids: set[str] = set()
+        canonical = 0
+        augmented = 0
+        for row in rows:
+            query_ids.add(row["query_table_id"])
+            row_view_index = int(row["row_view_index"])
+            if row_view_index == 0:
+                canonical += 1
+            else:
+                augmented += 1
+            chain_key = (
+                (row["split"], row["source_table_id"], row["chain_id"])
+                if row["chain_id"]
+                else ("pair", row["pair_key"])
+            )
+            chains.setdefault(chain_key, set()).add(row_view_index)
+        return [
+            {"label": "Query-target pairs", "value": len(rows)},
+            {"label": "Unique query tables", "value": len(query_ids)},
+            {"label": "Unique join chains", "value": len(chains)},
+            {
+                "label": "Multi-view chains",
+                "value": sum(1 for views in chains.values() if len(views) > 1),
             },
-            "join_col_name": clean_text(qrel.get("join_col_name")),
-            "query_table": query_table,
-            "target_table": target_table,
-            "query_highlight_rows": sorted(query_highlights),
-            "target_highlight_rows": sorted(target_highlights),
-            "paths": paths,
-            "path_count": len(raw_paths),
-            "path_count_displayed": len(paths),
-            "asset_type_summary": asset_type_summary(paths),
-            "asset_types": sorted({path.get("asset_type") for path in paths if path.get("asset_type")}),
-        }
-        pair["_search"] = pair_search_text(pair)
-        pairs.append(pair)
-    pairs.sort(key=lambda item: (item.get("split", ""), item.get("source_table_id", ""), item.get("query_table_id", ""), item.get("target_table_id", "")))
-    stats = load_json_if_exists(single_file_path(output_dir, "stats", "stats.json", manifest))
-    return pairs, stats, assets
+            {"label": "Canonical pairs", "value": canonical},
+            {"label": "Augmented pairs", "value": augmented},
+        ]
+
+    def all_pair_keys(self) -> list[str]:
+        with self._connect() as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT pair_key FROM pairs
+                    ORDER BY split, source_table_id, chain_id, row_view_index,
+                             query_table_id, target_table_id
+                    """
+                )
+            ]
+
+    def referenced_assets(self) -> dict[str, dict[str, Any]]:
+        assets: dict[str, dict[str, Any]] = {}
+        with self._connect() as connection, IndexedRecordReader() as reader:
+            rows = connection.execute(
+                """
+                SELECT record_id, path, byte_offset, byte_length FROM records
+                WHERE artifact = 'bridge_assets'
+                """
+            )
+            for row in rows:
+                assets[row["record_id"]] = reader.read(
+                    row["path"], row["byte_offset"], row["byte_length"]
+                )
+        return assets
+
+    def asset(self, asset_id: str) -> dict[str, Any]:
+        with self._connect() as connection, IndexedRecordReader() as reader:
+            return self._read_record(
+                connection, reader, "bridge_assets", clean_text(asset_id)
+            )
+
+    def stats(self) -> dict[str, Any]:
+        return load_json_if_exists(
+            single_file_path(self.output_dir, "stats", "stats.json", self.manifest)
+        )
 
 
-def create_app(output_dir: Path, max_rows: int, max_paths: int, max_asset_chars: int) -> Flask:
+def load_pairs(
+    output_dir: Path,
+    max_rows: int,
+    max_paths: int,
+    max_asset_chars: int,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+]:
+    dataset = ViewerDataset(output_dir, max_rows, max_paths, max_asset_chars)
+    pairs = [dataset.hydrate_pair(key) for key in dataset.all_pair_keys()]
+    return pairs, dataset.stats(), dataset.referenced_assets()
+
+
+def create_app(
+    output_dir: Path,
+    max_rows: int,
+    max_paths: int,
+    max_asset_chars: int,
+    index_path: Path | None = None,
+) -> Flask:
     app = Flask(__name__)
     output_dir = Path(output_dir)
 
     @lru_cache(maxsize=1)
-    def cached_context() -> dict[str, Any]:
-        pairs, stats, assets = load_pairs(output_dir, max_rows, max_paths, max_asset_chars)
-        return {"pairs": pairs, "stats": stats, "assets": assets}
+    def cached_dataset() -> ViewerDataset:
+        return ViewerDataset(
+            output_dir,
+            max_rows,
+            max_paths,
+            max_asset_chars,
+            index_path=index_path,
+        )
 
     @app.get("/")
     def index() -> str:
         error = ""
         try:
-            context = cached_context()
-            pairs = list(context["pairs"])
-            stats = context["stats"]
+            dataset = cached_dataset()
+            stats = dataset.stats()
+            viewer_stats = dataset.viewer_stats()
+            splits, asset_types = dataset.filter_options()
         except Exception as exc:  # pragma: no cover - visible in browser for local debugging.
-            pairs = []
+            dataset = None
             stats = {}
+            viewer_stats = []
+            splits = []
+            asset_types = []
             error = str(exc)
         query = clean_text(request.args.get("q", ""))
         split = clean_text(request.args.get("split", ""))
         asset_type = clean_text(request.args.get("asset_type", ""))
+        row_view = clean_text(request.args.get("row_view", "all"))
+        if row_view not in {"all", "canonical", "augmented"}:
+            row_view = "all"
         try:
             page = max(1, int(request.args.get("page", "1") or "1"))
         except ValueError:
             page = 1
-        all_pairs = pairs
-        splits = sorted({pair["split"] for pair in all_pairs if pair.get("split")})
-        asset_types = sorted({atype for pair in all_pairs for atype in pair.get("asset_types", []) if atype})
-        if split:
-            pairs = [pair for pair in pairs if pair.get("split") == split]
-        if asset_type:
-            pairs = [pair for pair in pairs if asset_type in pair.get("asset_types", [])]
-        if query:
-            needle = query.casefold()
-            pairs = [pair for pair in pairs if needle in pair["_search"]]
-        total = len(pairs)
+        if dataset is None:
+            pair = None
+            total = 0
+        else:
+            pair, total = dataset.filtered_pair(
+                query=query,
+                split=split,
+                asset_type=asset_type,
+                row_view=row_view,
+                page=page,
+            )
         pages = max(1, math.ceil(total))
         page = min(page, pages)
-        pair = pairs[page - 1] if pairs else None
 
         def page_url(target: int) -> str:
             target = min(max(1, target), pages)
-            return url_for("index", page=target, q=query, split=split, asset_type=asset_type)
+            return url_for(
+                "index",
+                page=target,
+                q=query,
+                split=split,
+                row_view=row_view,
+                asset_type=asset_type,
+            )
 
         return render_template_string(
             PAGE_TEMPLATE,
@@ -808,10 +1798,12 @@ def create_app(output_dir: Path, max_rows: int, max_paths: int, max_asset_chars:
             pages=pages,
             query=query,
             split=split,
+            row_view=row_view,
             asset_type=asset_type,
             splits=splits,
             asset_types=asset_types,
             stats=stats,
+            viewer_stats=viewer_stats,
             error=error,
             page_url=page_url,
             render_table=render_table,
@@ -819,13 +1811,12 @@ def create_app(output_dir: Path, max_rows: int, max_paths: int, max_asset_chars:
 
     @app.get("/reload")
     def reload() -> Any:
-        cached_context.cache_clear()
+        cached_dataset.cache_clear()
         return redirect(url_for("index"))
 
     @app.get("/asset/<asset_id>")
     def asset_image(asset_id: str) -> Any:
-        context = cached_context()
-        asset = context["assets"].get(asset_id)
+        asset = cached_dataset().asset(asset_id)
         if not asset:
             abort(404, f"Unknown asset_id: {asset_id}")
         image_path = resolve_asset_file(output_dir, asset)
@@ -845,14 +1836,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_rows", type=int, default=12)
     parser.add_argument("--max_paths", type=int, default=50)
     parser.add_argument("--max_asset_chars", type=int, default=2400)
+    parser.add_argument(
+        "--index_path",
+        default=None,
+        help=(
+            "Persistent SQLite viewer index path. Defaults to "
+            f"<output_dir>/{DEFAULT_INDEX_FILENAME}."
+        ),
+    )
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args.host = resolve_gui_host(args.host, args.lan)
-    app = create_app(Path(args.output_dir), args.max_rows, args.max_paths, args.max_asset_chars)
+    app = create_app(
+        Path(args.output_dir),
+        args.max_rows,
+        args.max_paths,
+        args.max_asset_chars,
+        index_path=Path(args.index_path) if args.index_path else None,
+    )
     print(format_gui_urls("MM joinability viewer", args.host, args.port))
     app.run(host=args.host, port=args.port, debug=args.debug)
 

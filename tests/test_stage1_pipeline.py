@@ -17,10 +17,12 @@ import build_mm_table_dataset as mm_table_dataset
 import build_mm_joinability_dataset as join_dataset
 import build_stage1_embeddings as stage1_embeddings
 import qwen3_vl_embedding
+from build_stage1_evidence_paths import run as build_evidence_paths
 from build_stage1_logic_connectivity import add_same_source_bridge_positive_pairs, build_query_table_splits, build_target_rows, choose_query_context_cols
 from build_stage1_logic_connectivity import run as build_logic_connectivity
 from build_mm_table_dataset import ShardedJsonlWriter, WikipediaClient, build_bridge_assets, split_text_asset_content
 from hitl_annotation_app import create_app
+from generate_weak_labels import label_path
 from stage1_connection_viewer import create_app as create_connection_viewer_app
 from stage1_connection_viewer import load_assets
 from stage1_connection_viewer import load_groups
@@ -31,11 +33,16 @@ from qwen3_vl_embedding import Qwen3VLEmbeddingEncoder, image_limit_from_excepti
 from stage1_gui import format_gui_urls, resolve_gui_host
 from stage1_io import (
     fd_purity,
+    iter_jsonl,
     iter_manifest_records,
     project_rows,
     write_jsonl,
 )
-from stage1_serialization import serialize_table_for_embedding
+from stage1_serialization import (
+    serialize_image_asset_prompt,
+    serialize_table_for_embedding,
+    serialize_text_asset_for_embedding,
+)
 from stage1_training_cache import clear_training_outputs
 from train_teacher import TeacherMLP, score_paths
 from train_student import Student, build_distill_records, build_ranking_groups, train_loss
@@ -632,6 +639,206 @@ def test_table_serialization_sanitizes_cell_urls_for_model_context():
     assert "example.org" not in text
 
 
+def test_text_asset_serialization_exposes_only_intrinsic_content():
+    serialized = serialize_text_asset_for_embedding(
+        {
+            "content": "Alpha is located in Texas.",
+            "entity_wiki_title": "SECRET_WIKIPEDIA_TITLE",
+            "source": "SECRET_SOURCE",
+            "url": "https://private.example/wiki/Alpha",
+            "asset_id": "SECRET_ASSET_ID",
+        }
+    )
+
+    assert serialized == "[Text Material]\nAlpha is located in Texas."
+    assert "SECRET" not in serialized
+    assert "private.example" not in serialized
+
+
+def test_image_asset_prompt_exposes_no_asset_metadata_or_relationship():
+    prompt = serialize_image_asset_prompt(
+        {
+            "entity_wiki_title": "SECRET_WIKIPEDIA_TITLE",
+            "source": "SECRET_SOURCE",
+            "file_name": "SECRET_FILE.jpg",
+            "description_url": "https://private.example/file",
+            "metadata": {
+                "extmetadata": {
+                    "ObjectName": {"value": "SECRET_OBJECT"},
+                    "ImageDescription": {"value": "SECRET_DESCRIPTION"},
+                    "Categories": {"value": "SECRET_CATEGORY"},
+                    "Credit": {"value": "SECRET_CREDIT"},
+                }
+            },
+        }
+    )
+
+    assert prompt == "Represent only the intrinsic visual content of this independent image."
+    assert "SECRET" not in prompt
+    assert "private.example" not in prompt
+
+
+def test_weak_labels_ignore_asset_provenance_and_image_metadata():
+    path = {
+        "entity_text": "Alpha",
+        "bridge_value": "Texas",
+        "bridge_col_name": "State",
+        "weak_label": None,
+        "weak_score": None,
+    }
+    text_result = label_path(
+        path,
+        {
+            "asset_type": "text",
+            "content": "State: Texas",
+            "entity_wiki_title": "Alpha",
+        },
+    )
+    image_result = label_path(
+        path,
+        {
+            "asset_type": "image",
+            "entity_wiki_title": "Alpha",
+            "file_name": "Alpha-Texas.jpg",
+            "metadata": {
+                "extmetadata": {
+                    "ImageDescription": {"value": "Alpha in Texas"}
+                }
+            },
+        },
+    )
+
+    assert text_result["weak_label"] == "weak_indirect"
+    assert text_result["weak_score"] == 0.5
+    assert image_result["weak_label"] is None
+    assert image_result["weak_score"] is None
+
+
+def test_stage1_evidence_paths_ignore_raw_table_asset_links(tmp_path):
+    input_dir = tmp_path / "input"
+    stage1_dir = tmp_path / "stage1"
+    for artifact in (
+        "source_tables",
+        "bridge_assets",
+        "evidence_recoveries",
+        "table_asset_links",
+    ):
+        (input_dir / artifact).mkdir(parents=True, exist_ok=True)
+    stage1_dir.mkdir()
+
+    source_table = {
+        "source_table_id": "source-1",
+        "columns": [
+            {"column_index": 0, "column_name": "Name"},
+            {"column_index": 1, "column_name": "State"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {"column_index": 0, "text": "Alpha"},
+                    {"column_index": 1, "text": "Texas"},
+                ],
+            }
+        ],
+    }
+    assets = [
+        {
+            "asset_id": "recovered-asset",
+            "asset_type": "text",
+            "content": "Alpha has State Texas.",
+            "entity_wiki_title": "SECRET_RECOVERY_TITLE",
+        },
+        {
+            "asset_id": "raw-linked-asset",
+            "asset_type": "text",
+            "content": "Unrelated content.",
+            "entity_wiki_title": "SECRET_LINK_TITLE",
+        },
+    ]
+    recoveries = [
+        {
+            "source_table_id": "source-1",
+            "source_row_id": 0,
+            "recovered_attribute": {
+                "column_index": 1,
+                "column_name": "State",
+                "value": "Texas",
+            },
+            "evidence": {
+                "asset_id": "recovered-asset",
+                "asset_type": "text",
+            },
+        }
+    ]
+    raw_links = [
+        {
+            "source_table_id": "source-1",
+            "row_id": 0,
+            "column_index": 0,
+            "entity_id": "SECRET_ENTITY_ID",
+            "entity_wiki_title": "SECRET_LINK_TITLE",
+            "asset_ids": ["raw-linked-asset"],
+        }
+    ]
+    artifact_records = {
+        "source_tables": [source_table],
+        "bridge_assets": assets,
+        "evidence_recoveries": recoveries,
+        "table_asset_links": raw_links,
+    }
+    manifest_artifacts = {}
+    for artifact, records in artifact_records.items():
+        relative_path = f"{artifact}/part-00000.jsonl"
+        write_jsonl(input_dir / relative_path, records)
+        manifest_artifacts[artifact] = {
+            "shards": [{"path": relative_path, "records": len(records)}]
+        }
+    (input_dir / "dataset_manifest.json").write_text(
+        json.dumps({"artifacts": manifest_artifacts}),
+        encoding="utf-8",
+    )
+    write_jsonl(
+        stage1_dir / "logic_fragments.jsonl",
+        [
+            {
+                "fragment_id": "query-hidden",
+                "role": "left_hidden",
+                "split": "train",
+                "chain_id": "chain-1",
+                "source_table_id": "source-1",
+                "source_column_indices": [0],
+                "hidden_bridge_col": 1,
+                "source_row_indices": [0],
+            },
+            {
+                "fragment_id": "target",
+                "role": "right_target",
+                "chain_id": "chain-1",
+                "rows": [
+                    {"cells": [{"column_index": 0, "text": "Texas"}]}
+                ],
+            },
+        ],
+    )
+
+    build_evidence_paths(
+        argparse.Namespace(
+            input_dir=str(input_dir),
+            stage1_dir=str(stage1_dir),
+            seed=13,
+        )
+    )
+
+    paths = list(iter_jsonl(stage1_dir / "evidence_paths.jsonl"))
+    assert len(paths) == 1
+    assert paths[0]["asset_id"] == "recovered-asset"
+    assert paths[0]["entity_text"] == "Alpha"
+    assert paths[0]["reason"] == "candidate_path:intrinsic_recovery:Q_hidden->asset->T"
+    assert "entity_id" not in paths[0]
+    assert "SECRET" not in json.dumps(paths[0])
+
+
 def test_qwen_encoder_wrapper_dummy_text_mock_normalized():
     encoder = Qwen3VLEmbeddingEncoder(mock=True)
     arr = encoder.encode_texts(["hello", "world"])
@@ -647,6 +854,15 @@ def test_content_only_embedding_prompt_mode_uses_intrinsic_instructions():
     assert "connect" not in instructions["table"].casefold()
     assert "hidden table attributes" not in instructions["text"].casefold()
     assert "multimodal table discovery" not in instructions["image"].casefold()
+
+
+def test_connectivity_embedding_mode_does_not_assume_object_relationships():
+    instructions = stage1_embeddings.embedding_instructions(
+        argparse.Namespace(embedding_prompt_mode="connectivity")
+    )
+
+    assert all("intrinsic" in instruction for instruction in instructions.values())
+    assert all("do not assume" in instruction.casefold() for instruction in instructions.values())
 
 
 def test_embedding_prompt_mode_invalidates_incompatible_cache(tmp_path):
@@ -2775,16 +2991,16 @@ def test_hitl_template_preview_includes_bridge_entity_row(tmp_path):
     assert len(item["target_fragment_preview"]["rows"]) == 5
     assert any(row.get("Entity") == "Focus Entity" and row.get("_focus") for row in item["query_fragment_preview"]["rows"])
     assert any(row.get("Bridge") == "Focus Bridge" and row.get("_focus") for row in item["target_fragment_preview"]["rows"])
-    assert item["source_table_preview"]["page_url"] == "https://en.wikipedia.org/wiki/Focus_Page"
+    assert set(item["source_table_preview"]) == {"columns", "rows"}
     assert len(item["source_table_preview"]["rows"]) == 7
     assert sum(1 for row in item["source_table_preview"]["rows"] if row.get("_focus")) == 1
     assert sum(1 for row in item["query_fragment_preview"]["rows"] if row.get("_focus")) == 1
     assert sum(1 for row in item["target_fragment_preview"]["rows"] if row.get("_focus")) == 1
     source_focus = item["source_table_preview"]["rows"][-1]
     assert source_focus["Entity"] == "Focus Entity"
-    assert source_focus["_links"]["Entity"] == "https://en.wikipedia.org/wiki/Focus_Entity"
+    assert "_links" not in source_focus
     query_focus = next(row for row in item["query_fragment_preview"]["rows"] if row.get("Entity") == "Focus Entity")
-    assert query_focus["_links"]["Entity"] == "https://en.wikipedia.org/wiki/Focus_Entity"
+    assert "_links" not in query_focus
 
 
 def test_gui_host_resolution_and_lan_url(monkeypatch):

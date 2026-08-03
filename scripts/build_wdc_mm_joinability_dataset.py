@@ -2773,6 +2773,9 @@ def build_dataset(
             "unbounded WDC input requires --allow_unbounded; use positive source/row caps"
         )
     args.query_rows_per_table = join_builder.configured_query_rows_per_table(args)
+    args.max_train_query_row_views_per_join = (
+        join_builder.configured_max_train_query_row_views_per_join(args)
+    )
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     cache_dir = Path(args.cache_dir).expanduser().resolve()
@@ -2854,6 +2857,16 @@ def build_dataset(
                 skip_reasons[result.skip_reason or "unknown"] += 1
                 continue
             source_table = result.source_table
+            if (
+                join_builder.choose_entity_column(
+                    source_table,
+                    min_linked_rows=args.query_rows_per_table,
+                )
+                is None
+            ):
+                skipped_tables += 1
+                skip_reasons["too_few_candidate_entity_rows"] += 1
+                continue
             write_jsonl_record(source_handle, source_table)
             source_table_count += 1
             source_split_records.append(
@@ -3153,6 +3166,9 @@ def build_dataset(
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
         "query_rows_per_table": args.query_rows_per_table,
+        "max_train_query_row_views_per_join": (
+            args.max_train_query_row_views_per_join
+        ),
         "skipped_reasons": dict(skip_reasons),
         "safety_config": {
             "max_scanned_files": args.max_scanned_files,
@@ -3168,7 +3184,9 @@ def build_dataset(
             "WDC page_url is fetched for every selected entity even when direct images succeed",
             "direct image-column URLs and webpage images share one per-entity quota",
             "the source image attribute is excluded from every emitted table",
-            "query sampling prefers recoverable rows while projected targets retain every source row",
+            "tables without enough linked entity rows for one query are filtered before network and model work",
+            "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
+            "query row views balance recoverable evidence while projected targets retain every source row",
             "wide source tables may emit one query variant per qualifying bridge attribute",
             "identical visible queries are merged and may own multiple qrels",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
@@ -3210,7 +3228,11 @@ def build_dataset(
         },
         "query_construction": {
             "query_rows_per_table": args.query_rows_per_table,
-            "query_row_selection": "recoverable_first",
+            "query_row_selection": "recovery_balanced_disjoint_train_views",
+            "max_train_query_row_views_per_join": (
+                args.max_train_query_row_views_per_join
+            ),
+            "evaluation_query_row_views_per_join": 1,
             "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
@@ -3371,6 +3393,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min_recovery_denominator", type=int, default=2)
     parser.add_argument("--min_rows_per_output_table", type=int, default=2)
     parser.add_argument("--query_rows_per_table", type=int, default=5)
+    parser.add_argument(
+        "--max_train_query_row_views_per_join",
+        type=int,
+        default=5,
+        help=(
+            "Maximum deterministic disjoint query row views per train join chain; "
+            "0 means use every feasible view. Dev/test always use one."
+        ),
+    )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)

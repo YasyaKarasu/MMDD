@@ -21,14 +21,16 @@ import math
 import mimetypes
 import os
 import random
+import re
 import threading
 import time
+import unicodedata
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field as dataclass_field
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -82,7 +84,7 @@ from stage1_io import (
 from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 
 
-PROMPT_VERSION = "entity_attribute_extraction_v3_short_empty_precompressed_image"
+PROMPT_VERSION = "entity_attribute_extraction_v5_batched_leave_one_out"
 DEFAULT_SHARED_CACHE_DIR = Path("cache") / "mm_joinability"
 DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
 DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
@@ -659,6 +661,7 @@ def iter_random_source_tables(
     args: argparse.Namespace,
     counters: SourceCandidateCounters,
 ) -> Iterator[dict[str, Any]]:
+    query_rows_per_table = configured_query_rows_per_table(args)
     json_files = sorted(
         input_dir.rglob("*.json"),
         key=lambda path: path.relative_to(input_dir).as_posix(),
@@ -707,6 +710,14 @@ def iter_random_source_tables(
             ):
                 counters.skipped_tables += 1
                 counters.skip_reasons["no_candidate_entity_column"] += 1
+                continue
+            entity_col = choose_entity_column(
+                result.source_table,
+                min_linked_rows=query_rows_per_table,
+            )
+            if entity_col is None:
+                counters.skipped_tables += 1
+                counters.skip_reasons["too_few_candidate_entity_rows"] += 1
                 continue
             ref = SelectedSourceTableRef(
                 priority=int(
@@ -969,14 +980,69 @@ def normalize(value: Any) -> str:
     return clean_text(value).casefold()
 
 
-def values_match(predicted: Any, expected: Any) -> bool:
-    pred = normalize(predicted)
-    exp = normalize(expected)
+_NUMERIC_VALUE_RE = re.compile(
+    r"^([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*([%a-zA-Z°²³/_-]*)$"
+)
+_TEMPORAL_ATTRIBUTE_RE = re.compile(
+    r"(?:^|\W)(?:year|date|born|birth|death|died|season|term|opened|founded|released)(?:$|\W)",
+    re.IGNORECASE,
+)
+
+
+def _match_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", clean_text(value)).casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).split())
+
+
+def _numeric_value(value: Any) -> tuple[Decimal, str] | None:
+    text = unicodedata.normalize("NFKC", clean_text(value)).strip()
+    match = _NUMERIC_VALUE_RE.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        number = Decimal(match.group(1).replace(",", ""))
+    except InvalidOperation:
+        return None
+    return number, match.group(2).casefold()
+
+
+def _contains_whole_phrase(container: str, phrase: str) -> bool:
+    return f" {phrase} " in f" {container} "
+
+
+def values_match(
+    predicted: Any,
+    expected: Any,
+    *,
+    attribute_name: str = "",
+) -> bool:
+    pred = _match_text(predicted)
+    exp = _match_text(expected)
     if not pred or not exp:
         return False
     if pred == exp:
         return True
-    return len(exp) >= 4 and (exp in pred or pred in exp)
+
+    pred_number = _numeric_value(predicted)
+    exp_number = _numeric_value(expected)
+    if pred_number is not None and exp_number is not None:
+        return pred_number == exp_number
+    if pred_number is not None or exp_number is not None:
+        if not _TEMPORAL_ATTRIBUTE_RE.search(clean_text(attribute_name)):
+            return False
+        number_text = pred if pred_number is not None else exp
+        phrase_text = exp if pred_number is not None else pred
+        return (
+            len(number_text) == 4
+            and number_text.isdigit()
+            and _contains_whole_phrase(phrase_text, number_text)
+        )
+
+    shorter, longer = sorted((pred, exp), key=len)
+    compact_shorter = shorter.replace(" ", "")
+    if len(compact_shorter) < 4:
+        return False
+    return _contains_whole_phrase(longer, shorter)
 
 
 def iter_json_objects(text: str) -> Iterable[dict[str, Any]]:
@@ -1020,7 +1086,6 @@ def is_placeholder_text(value: str) -> bool:
 def normalize_extracted_attributes(
     payload: dict[str, Any],
     candidate_attributes: list[str] | None = None,
-    require_connection_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     items = payload.get("attributes")
     if not isinstance(items, list):
@@ -1038,22 +1103,31 @@ def normalize_extracted_attributes(
             continue
         if candidate_names and normalize(name) not in candidate_names:
             continue
-        connection_evidence = clean_text(
-            item.get("connection_evidence")
-            or item.get("entity_connection_evidence")
-            or item.get("link_evidence")
-        )[:500]
-        if require_connection_evidence and (not connection_evidence or is_placeholder_text(connection_evidence)):
-            continue
-        attr = {
-            "name": name,
-            "value": value,
-            "evidence": clean_text(item.get("evidence") or item.get("rationale"))[:500],
-        }
-        if connection_evidence:
-            attr["connection_evidence"] = connection_evidence
-        attrs.append(attr)
+        attrs.append({"name": name, "value": value})
     return attrs
+
+
+def canonical_extraction_row_attributes(
+    row_attributes: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(row_attributes, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in row_attributes:
+        if not isinstance(item, dict):
+            continue
+        name = sanitize_cell_text_for_model(item.get("name"))
+        value = sanitize_cell_text_for_model(item.get("value"))
+        if not name or not value:
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "value": value,
+                "is_entity": bool(item.get("is_entity")),
+            }
+        )
+    return normalized
 
 
 def image_data_url(path: Path) -> str:
@@ -1622,36 +1696,60 @@ class LocalAttributeExtractor:
         self,
         *,
         entity_text: str,
-        entity_wiki_title: str,
+        row_attributes: list[dict[str, Any]],
         candidate_attributes: list[str],
     ) -> str:
+        attributes = canonical_extraction_row_attributes(row_attributes)
+        if not attributes and clean_text(entity_text):
+            attributes = [
+                {
+                    "name": "Entity",
+                    "value": sanitize_cell_text_for_model(entity_text),
+                    "is_entity": True,
+                }
+            ]
+        row_lines = []
+        for attribute in attributes:
+            marker = " [ENTITY; NEVER MASK]" if attribute["is_entity"] else ""
+            row_lines.append(
+                f'- {attribute["name"]}{marker}: {attribute["value"]}'
+            )
         return (
-            "You extract factual attributes about one entity from one evidence item.\n"
-            f"Entity display text: {sanitize_cell_text_for_model(entity_text)}\n"
-            f"Entity Wikipedia title: {entity_wiki_title}\n"
-            "Candidate attribute names from the table:\n"
+            "You evaluate one table row and one independent material item using only their intrinsic content. "
+            "Their presence in the same request does not imply that they are related.\n"
+            "Table row attributes:\n"
+            + ("\n".join(row_lines) if row_lines else "- (no non-empty attributes)")
+            + "\nCandidate attributes to recover:\n"
             + "\n".join(f"- {name}" for name in candidate_attributes)
-            + "\nReturn strict JSON only in this shape:\n"
-            '{"attributes":[{"name":"<one candidate attribute name>","value":"<extracted value>","evidence":"<short quote or visual evidence>","connection_evidence":"<why this evidence item itself can be linked to the entity>"}]}\n'
-            "Only include attributes directly supported by the evidence item. "
-            'If no candidate attribute is directly supported, return exactly {"attributes":[]}. '
-            "Only include an attribute when the evidence item itself lets a reader connect the evidence to this entity, "
-            "for example through the entity name, an alias, a visible/quoted identifier, or an entity-specific attribute. "
-            "Do not rely on Wikipedia page provenance, source URL, or the fact that the asset was collected from the entity page. "
+            + "\nPerform a separate leave-one-attribute-out test for every candidate, while handling all candidates in this single request. "
+            "During each test, mentally mask and completely ignore only that candidate's displayed table value. "
+            "The entity attribute marked ENTITY is always visible and must never be masked. "
+            "All other row attributes remain available when they are not the candidate under test. "
+            "Use those remaining attributes and the material's intrinsic content to decide whether the material itself can be connected to the row, "
+            "then recover the masked value from the material. "
+            "Do not copy, verify, compare against, or otherwise use the candidate's displayed table value during its own test. "
+            "Omit the candidate unless the connection and recovered value are independently supported without that value.\n"
+            "Return strict JSON only in this shape:\n"
+            '{"attributes":[{"name":"<one candidate attribute name>","value":"<extracted value>"}]}\n'
+            "Output only extractable candidate attribute names and their extracted values. "
+            "Do not output evidence, explanations, rationale, confidence, or any other fields or text. "
+            'If no candidate attribute can be recovered, return exactly {"attributes":[]}. '
             "Do not guess. Do not include attributes outside the candidate list."
         )
 
     def extract(self, asset: dict[str, Any], entity: dict[str, Any], candidate_attributes: list[str]) -> dict[str, Any]:
         prompt = self.extraction_prompt(
             entity_text=clean_text(entity.get("cell_text")),
-            entity_wiki_title=clean_text(entity.get("wiki_title")),
+            row_attributes=canonical_extraction_row_attributes(
+                entity.get("row_attributes")
+            ),
             candidate_attributes=candidate_attributes,
         )
         if asset.get("asset_type") == "text":
             content = clean_text(asset.get("content"))[:6000]
             messages = [
                 {"role": "system", "content": "You are a precise information extraction engine."},
-                {"role": "user", "content": f"{prompt}\n\nText evidence:\n{content}"},
+                {"role": "user", "content": f"{prompt}\n\nIndependent text material:\n{content}"},
             ]
             with self.lease_model_base_url("text") as base_url:
                 raw = self.chat(
@@ -1667,8 +1765,10 @@ class LocalAttributeExtractor:
             local_image_path = Path(local_path) if local_path and Path(local_path).exists() else None
             if local_image_path is not None:
                 image_url = resized_image_data_url(local_image_path, self.image_request_max_pixels)
-            if not image_url:
-                raise ValueError(f"Image asset {asset.get('asset_id')} has no usable image URL or local path")
+            if not image_url.startswith("data:"):
+                raise ValueError(
+                    f"Image asset {asset.get('asset_id')} has no usable local image or data URL"
+                )
             messages = [
                 {"role": "system", "content": "You are a precise visual information extraction engine."},
                 {
@@ -1721,7 +1821,6 @@ class LocalAttributeExtractor:
             "attributes": normalize_extracted_attributes(
                 payload,
                 candidate_attributes,
-                require_connection_evidence=True,
             ),
             "raw_response": raw,
             "error": "",
@@ -1960,6 +2059,9 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
         "entity_id": task.entity["entity_id"],
         "entity_text": task.entity["cell_text"],
         "entity_wiki_title": task.entity["wiki_title"],
+        "row_attributes": canonical_extraction_row_attributes(
+            task.entity.get("row_attributes")
+        ),
         "asset_id": task.asset["asset_id"],
         "asset_type": task.asset.get("asset_type"),
         "candidate_attribute_names": task.candidate_attribute_names,
@@ -2154,7 +2256,6 @@ def tasks_requiring_model_analysis(
                 cached_record, changed = reparse_extraction_record(
                     cached_record,
                     task.candidate_attribute_names,
-                    require_connection_evidence=True,
                 )
                 if changed:
                     cache.put(task.cache_key, cached_record)
@@ -2206,7 +2307,6 @@ def resolve_extraction_tasks(
                 cached_record, changed = reparse_extraction_record(
                     cached_record,
                     task.candidate_attribute_names,
-                    require_connection_evidence=True,
                 )
                 if changed:
                     cache.put(task.cache_key, cached_record)
@@ -2244,6 +2344,19 @@ def resolve_extraction_tasks(
     for cache_key, record in model_records.items():
         if cache_key not in resolved_by_key:
             store_model_record(cache_key, record)
+
+    if (
+        extractor is not None
+        and getattr(extractor, "abort_on_transient_error", False)
+        and any(
+            record.get("error_class") == "model_endpoint_transient"
+            for record in model_records.values()
+        )
+    ):
+        raise TransientModelEndpointError(
+            "transient model endpoint failure encountered; successful "
+            "extractions were cached and the run can be resumed"
+        )
 
     return [(task, resolved_by_key[task.cache_key]) for task in tasks if task.cache_key in resolved_by_key]
 
@@ -2295,18 +2408,36 @@ def split_map(splits: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def choose_entity_column(table: dict[str, Any]) -> int | None:
-    candidates = list(table.get("metadata", {}).get("candidate_entity_columns", []) or [])
+def choose_entity_column(
+    table: dict[str, Any],
+    *,
+    min_linked_rows: int = 0,
+) -> int | None:
+    candidates = [
+        int(index)
+        for index in (
+            table.get("metadata", {}).get("candidate_entity_columns", []) or []
+        )
+        if linked_entity_row_count(table, int(index)) >= min_linked_rows
+    ]
     if not candidates:
         return None
     profiles = column_profiles(table)
     candidates.sort(
         key=lambda idx: (
-            -float(profiles.get(int(idx), {}).get("wiki_link_ratio", 0.0)),
-            int(idx),
+            -float(profiles.get(idx, {}).get("wiki_link_ratio", 0.0)),
+            idx,
         )
     )
-    return int(candidates[0])
+    return candidates[0]
+
+
+def linked_entity_row_count(table: dict[str, Any], entity_col: int) -> int:
+    return sum(
+        1
+        for row in table.get("rows", [])
+        if clean_text(get_cell(row, entity_col).get("wiki_title"))
+    )
 
 
 def candidate_attribute_columns(table: dict[str, Any], entity_col: int, min_non_empty_ratio: float) -> list[int]:
@@ -2323,6 +2454,41 @@ def candidate_attribute_columns(table: dict[str, Any], entity_col: int, min_non_
             continue
         cols.append(idx)
     return cols
+
+
+def extraction_row_attributes(
+    table: dict[str, Any],
+    row: dict[str, Any],
+    entity_col: int,
+) -> list[dict[str, Any]]:
+    attributes: list[dict[str, Any]] = []
+    seen_indices: set[int] = set()
+    for fallback, column in enumerate(table.get("columns", [])):
+        if not isinstance(column, dict):
+            continue
+        try:
+            column_index = int(column.get("column_index", fallback))
+        except (TypeError, ValueError):
+            continue
+        if column_index in seen_indices:
+            continue
+        seen_indices.add(column_index)
+        name = sanitize_cell_text_for_model(
+            clean_text(column.get("column_name"))
+            or clean_text(column.get("name"))
+            or f"col_{column_index}"
+        )
+        value = sanitize_cell_text_for_model(get_cell_text(row, column_index))
+        if not name or not value:
+            continue
+        attributes.append(
+            {
+                "name": name,
+                "value": value,
+                "is_entity": column_index == entity_col,
+            }
+        )
+    return attributes
 
 
 def row_id(row: dict[str, Any], fallback: int) -> int:
@@ -2612,6 +2778,61 @@ def select_query_source_rows(
     return selected
 
 
+def select_query_source_row_views(
+    *,
+    source_row_order: list[int],
+    recovered_source_rows: set[int],
+    query_rows_per_table: int,
+    required_recovered_rows: int,
+    max_views: int,
+) -> list[list[int]]:
+    """Select deterministic, disjoint query views with a recovery floor per view."""
+    if query_rows_per_table <= 0 or required_recovered_rows < 0 or max_views < 0:
+        raise ValueError("query row-view limits must be non-negative and row count positive")
+    if required_recovered_rows > query_rows_per_table:
+        return []
+
+    recovered = [row for row in source_row_order if row in recovered_source_rows]
+    total_view_capacity = len(source_row_order) // query_rows_per_table
+    recovery_view_capacity = (
+        total_view_capacity
+        if required_recovered_rows == 0
+        else len(recovered) // required_recovered_rows
+    )
+    view_count = min(total_view_capacity, recovery_view_capacity)
+    if max_views > 0:
+        view_count = min(view_count, max_views)
+    if view_count <= 0:
+        return []
+    if view_count == 1:
+        selected = select_query_source_rows(
+            source_row_order=source_row_order,
+            recovered_source_rows=recovered_source_rows,
+            query_rows_per_table=query_rows_per_table,
+            required_recovered_rows=required_recovered_rows,
+        )
+        return [selected] if selected else []
+
+    views: list[list[int]] = [[] for _ in range(view_count)]
+    reserved_rows: set[int] = set()
+    for view_index in range(view_count):
+        start = view_index * required_recovered_rows
+        stop = start + required_recovered_rows
+        reserved = recovered[start:stop]
+        views[view_index].extend(reserved)
+        reserved_rows.update(reserved)
+
+    remaining = [row for row in source_row_order if row not in reserved_rows]
+    remaining_index = 0
+    row_positions = {row: index for index, row in enumerate(source_row_order)}
+    for view in views:
+        needed = query_rows_per_table - len(view)
+        view.extend(remaining[remaining_index : remaining_index + needed])
+        remaining_index += needed
+        view.sort(key=row_positions.__getitem__)
+    return views
+
+
 def configured_query_rows_per_table(args: argparse.Namespace) -> int:
     query_rows = int(getattr(args, "query_rows_per_table", 5))
     min_output_rows = int(getattr(args, "min_rows_per_output_table", 2))
@@ -2624,6 +2845,15 @@ def configured_query_rows_per_table(args: argparse.Namespace) -> int:
     return query_rows
 
 
+def configured_max_train_query_row_views_per_join(
+    args: argparse.Namespace,
+) -> int:
+    max_views = int(getattr(args, "max_train_query_row_views_per_join", 1))
+    if max_views < 0:
+        raise ValueError("max_train_query_row_views_per_join must be non-negative")
+    return max_views
+
+
 def extraction_cache_key(
     *,
     asset_id: str,
@@ -2631,16 +2861,29 @@ def extraction_cache_key(
     candidate_attribute_names: list[str],
     asset_type: str,
     args: argparse.Namespace,
+    row_attributes: list[dict[str, Any]] | None = None,
 ) -> str:
     model = args.image_model_name if asset_type == "image" else args.text_model_name
-    return stable_hash(PROMPT_VERSION, model, asset_id, entity_id, "|".join(candidate_attribute_names), length=24)
+    row_context = json.dumps(
+        canonical_extraction_row_attributes(row_attributes),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return stable_hash(
+        PROMPT_VERSION,
+        model,
+        asset_id,
+        entity_id,
+        "|".join(candidate_attribute_names),
+        row_context,
+        length=24,
+    )
 
 
 def reparse_extraction_record(
     record: dict[str, Any],
     candidate_attribute_names: list[str],
-    *,
-    require_connection_evidence: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     raw_response = clean_text(record.get("raw_response"))
     if not raw_response:
@@ -2648,7 +2891,6 @@ def reparse_extraction_record(
     attributes = normalize_extracted_attributes(
         safe_json_object(raw_response),
         candidate_attribute_names,
-        require_connection_evidence=require_connection_evidence,
     )
     if attributes == record.get("attributes"):
         return record, False
@@ -2672,7 +2914,10 @@ def estimate_model_analysis_keys(
 ) -> set[str]:
     keys: set[str] = set()
     for source_table in iter_jsonl_records(source_paths):
-        entity_col = choose_entity_column(source_table)
+        entity_col = choose_entity_column(
+            source_table,
+            min_linked_rows=configured_query_rows_per_table(args),
+        )
         if entity_col is None:
             continue
         attribute_cols = candidate_attribute_columns(source_table, entity_col, args.min_column_non_empty_ratio)
@@ -2685,6 +2930,11 @@ def estimate_model_analysis_keys(
             entity_id = wiki_to_entity_id.get(wiki_title)
             if not wiki_title or not entity_id:
                 continue
+            row_attributes = extraction_row_attributes(
+                source_table,
+                source_row,
+                entity_col,
+            )
             for asset_id in entity_to_assets.get(entity_id, []):
                 asset = assets.get(asset_id)
                 if not asset:
@@ -2696,6 +2946,7 @@ def estimate_model_analysis_keys(
                         candidate_attribute_names=candidate_attribute_names,
                         asset_type=str(asset.get("asset_type")),
                         args=args,
+                        row_attributes=row_attributes,
                     )
                 )
     return keys
@@ -2710,7 +2961,10 @@ def collect_table_extraction_tasks(
     args: argparse.Namespace,
     asset_types: set[str] | None = None,
 ) -> list[ExtractionTask]:
-    entity_col = choose_entity_column(source_table)
+    entity_col = choose_entity_column(
+        source_table,
+        min_linked_rows=configured_query_rows_per_table(args),
+    )
     if entity_col is None:
         return []
     attribute_cols = candidate_attribute_columns(source_table, entity_col, args.min_column_non_empty_ratio)
@@ -2732,6 +2986,11 @@ def collect_table_extraction_tasks(
             "cell_text": entity_text,
             "entity_column_index": entity_col,
             "entity_column_name": get_column_name(source_table, entity_col),
+            "row_attributes": extraction_row_attributes(
+                source_table,
+                source_row,
+                entity_col,
+            ),
         }
         for asset_id in entity_to_assets.get(entity_id, []):
             asset = assets.get(asset_id)
@@ -2746,6 +3005,7 @@ def collect_table_extraction_tasks(
                 candidate_attribute_names=candidate_attribute_names,
                 asset_type=asset_type,
                 args=args,
+                row_attributes=entity["row_attributes"],
             )
             tasks.append(
                 ExtractionTask(
@@ -3225,6 +3485,7 @@ def extract_asset_attributes(
         candidate_attribute_names=candidate_attribute_names,
         asset_type=str(asset.get("asset_type")),
         args=args,
+        row_attributes=entity.get("row_attributes"),
     )
     transient = cache_get_transient(cache, cache_key)
     if transient is not None:
@@ -3241,7 +3502,6 @@ def extract_asset_attributes(
             cached_record, changed = reparse_extraction_record(
                 cached_record,
                 candidate_attribute_names,
-                require_connection_evidence=True,
             )
             if changed:
                 cache.put(cache_key, cached_record)
@@ -3251,6 +3511,15 @@ def extract_asset_attributes(
             return cached_record
     try:
         result = extractor.extract(asset, entity, candidate_attribute_names)
+    except TransientModelEndpointError:
+        if getattr(extractor, "abort_on_transient_error", False):
+            raise
+        result = {
+            "attributes": [],
+            "raw_response": "",
+            "error": "model endpoint temporarily unavailable",
+            "error_class": "model_endpoint_transient",
+        }
     except Exception as exc:
         result = {"attributes": [], "raw_response": "", "error": str(exc)}
     record = {
@@ -3259,6 +3528,9 @@ def extract_asset_attributes(
         "entity_id": entity["entity_id"],
         "entity_text": entity["cell_text"],
         "entity_wiki_title": entity["wiki_title"],
+        "row_attributes": canonical_extraction_row_attributes(
+            entity.get("row_attributes")
+        ),
         "asset_id": asset["asset_id"],
         "asset_type": asset.get("asset_type"),
         "candidate_attribute_names": candidate_attribute_names,
@@ -3278,20 +3550,9 @@ def extract_asset_attributes(
 def asset_preview(asset: dict[str, Any]) -> dict[str, Any]:
     if asset.get("asset_type") == "text":
         return {
-            "title": clean_text(asset.get("entity_wiki_title")),
             "content_snippet": clean_text(asset.get("content"))[:1600],
-            "url": clean_text(asset.get("url")),
-            "source": clean_text(asset.get("source")),
         }
-    return {
-        "title": clean_text(asset.get("entity_wiki_title")),
-        "file_name": clean_text(asset.get("file_name")),
-        "relative_path": clean_text(asset.get("relative_path")),
-        "local_path": clean_text(asset.get("local_path")),
-        "image_url": clean_text(asset.get("image_url")),
-        "description_url": clean_text(asset.get("description_url")),
-        "source": clean_text(asset.get("source")),
-    }
+    return {}
 
 
 def build_table_join_records(
@@ -3310,7 +3571,10 @@ def build_table_join_records(
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
-    entity_col = choose_entity_column(source_table)
+    entity_col = choose_entity_column(
+        source_table,
+        min_linked_rows=query_rows_per_table,
+    )
     if entity_col is None:
         raw = raw_data_lake_record(source_table, split)
         return [], [raw], [], {"reason": "no_entity_column", "qualified_columns": []}
@@ -3351,6 +3615,11 @@ def build_table_join_records(
             "cell_text": entity_text,
             "entity_column_index": entity_col,
             "entity_column_name": get_column_name(source_table, entity_col),
+            "row_attributes": extraction_row_attributes(
+                source_table,
+                source_row,
+                entity_col,
+            ),
         }
         for asset_id in asset_ids:
             asset = assets.get(asset_id)
@@ -3362,6 +3631,7 @@ def build_table_join_records(
                 candidate_attribute_names=candidate_attribute_names,
                 asset_type=str(asset.get("asset_type")),
                 args=args,
+                row_attributes=entity["row_attributes"],
             )
             extraction_tasks.append(
                 ExtractionTask(
@@ -3411,7 +3681,11 @@ def build_table_join_records(
             if not expected:
                 continue
             for predicted in attr_by_name.get(normalize(attr_name), []):
-                if not values_match(predicted.get("value"), expected):
+                if not values_match(
+                    predicted.get("value"),
+                    expected,
+                    attribute_name=attr_name,
+                ):
                     continue
                 recovered_rows_by_col[attr_col].add(source_row_id)
                 recoveries_by_col[attr_col].append(
@@ -3480,27 +3754,26 @@ def build_table_join_records(
     data_lake_tables: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
     emitted_qualified_cols: list[dict[str, Any]] = []
+    max_query_row_views = (
+        configured_max_train_query_row_views_per_join(args)
+        if split == "train"
+        else 1
+    )
     for qualified, query_context, target_context in variant_layouts:
         join_col = int(qualified["column_index"])
-        selected_source_rows = select_query_source_rows(
+        selected_source_row_views = select_query_source_row_views(
             source_row_order=valid_entity_source_row_order,
             recovered_source_rows=recovered_rows_by_col.get(join_col, set()),
             query_rows_per_table=query_rows_per_table,
             required_recovered_rows=int(qualified["required_recovered_rows"]),
+            max_views=max_query_row_views,
         )
-        if len(selected_source_rows) != query_rows_per_table:
+        if not selected_source_row_views:
             continue
-        selected_source_row_set = set(selected_source_rows)
         query_cols = [entity_col] + query_context
         target_cols = [join_col] + target_context
         if len(query_cols) < 2 or not target_cols:
             continue
-        query_rows, query_source_rows = project_selected_rows(
-            source_table,
-            query_cols,
-            selected_source_row_set,
-            min_required_cols=1,
-        )
         all_source_row_ids = {
             row_id(source_row, fallback)
             for fallback, source_row in enumerate(source_table.get("rows", []))
@@ -3511,16 +3784,17 @@ def build_table_join_records(
             all_source_row_ids,
             min_required_cols=0,
         )
-        if not set(query_source_rows).issubset(target_source_rows):
-            continue
-        if len(query_rows) != query_rows_per_table:
-            continue
         if len(target_rows) < args.min_rows_per_output_table:
             continue
-        qualified["selected_rows"] = query_rows_per_table
-        qualified["target_rows"] = len(target_rows)
         chain_id = f"chain_{stable_hash(source_table['source_table_id'], entity_col, join_col)}"
         target_table_id = f"target_{stable_hash(chain_id, 'target')}"
+        emitted_view_count = 0
+        emitted_qualified = {
+            **qualified,
+            "selected_rows": query_rows_per_table,
+            "target_rows": len(target_rows),
+            "row_views": 0,
+        }
         hidden_attribute = {
             "source_column_index": join_col,
             "column_name": qualified["column_name"],
@@ -3530,45 +3804,134 @@ def build_table_join_records(
             "recovered_rows": qualified["recovered_rows"],
             "required_recovered_rows": qualified["required_recovered_rows"],
             "recovered_value_ratio": qualified["recovered_value_ratio"],
-            "selected_rows": qualified["selected_rows"],
-            "target_rows": qualified["target_rows"],
+            "selected_rows": query_rows_per_table,
+            "target_rows": len(target_rows),
         }
-        query_fingerprint = visible_query_fingerprint(
-            source_table=source_table,
-            query_cols=query_cols,
-            query_rows=query_rows,
-        )
-        query_table = query_by_fingerprint.get(query_fingerprint)
-        if query_table is None:
-            query_table_id = (
-                f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
+        for row_view_index, selected_source_rows in enumerate(
+            selected_source_row_views
+        ):
+            selected_source_row_set = set(selected_source_rows)
+            query_rows, query_source_rows = project_selected_rows(
+                source_table,
+                query_cols,
+                selected_source_row_set,
+                min_required_cols=1,
             )
-            query_table = table_record(
-                table_id=query_table_id,
-                role="query",
-                split=split,
+            if not set(query_source_rows).issubset(target_source_rows):
+                continue
+            if len(query_rows) != query_rows_per_table:
+                continue
+            query_fingerprint = visible_query_fingerprint(
                 source_table=source_table,
-                column_indices=query_cols,
-                rows=query_rows,
-                source_row_indices=query_source_rows,
-                extra={
-                    "chain_id": chain_id,
-                    "chain_ids": [chain_id],
-                    "query_entity_col": entity_col,
-                    "query_entity_col_name": get_column_name(source_table, entity_col),
-                    "hidden_attributes": [hidden_attribute],
-                    "target_table_ids": [target_table_id],
-                    "query_context_col_names": [get_column_name(source_table, col) for col in query_context],
-                },
+                query_cols=query_cols,
+                query_rows=query_rows,
             )
-            query_by_fingerprint[query_fingerprint] = query_table
-            query_tables.append(query_table)
-        else:
-            query_table_id = str(query_table["table_id"])
-            query_table["chain_ids"].append(chain_id)
-            query_table["hidden_attributes"].append(hidden_attribute)
-            query_table["target_table_ids"].append(target_table_id)
+            query_table = query_by_fingerprint.get(query_fingerprint)
+            if query_table is None:
+                query_table_id = (
+                    f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
+                )
+                query_table = table_record(
+                    table_id=query_table_id,
+                    role="query",
+                    split=split,
+                    source_table=source_table,
+                    column_indices=query_cols,
+                    rows=query_rows,
+                    source_row_indices=query_source_rows,
+                    extra={
+                        "chain_id": chain_id,
+                        "chain_ids": [chain_id],
+                        "query_entity_col": entity_col,
+                        "query_entity_col_name": get_column_name(
+                            source_table, entity_col
+                        ),
+                        "hidden_attributes": [hidden_attribute],
+                        "target_table_ids": [target_table_id],
+                        "query_context_col_names": [
+                            get_column_name(source_table, col)
+                            for col in query_context
+                        ],
+                        "row_view_index": row_view_index,
+                    },
+                )
+                query_by_fingerprint[query_fingerprint] = query_table
+                query_tables.append(query_table)
+            else:
+                query_table_id = str(query_table["table_id"])
+                if target_table_id in query_table["target_table_ids"]:
+                    continue
+                query_table["chain_ids"].append(chain_id)
+                query_table["hidden_attributes"].append(hidden_attribute)
+                query_table["target_table_ids"].append(target_table_id)
 
+            emitted_view_count += 1
+            qrels.append(
+                {
+                    "query_table_id": query_table_id,
+                    "target_table_id": target_table_id,
+                    "data_lake_table_id": target_table_id,
+                    "rel": 3,
+                    "split": split,
+                    "chain_id": chain_id,
+                    "row_view_index": row_view_index,
+                    "source_table_id": source_table["source_table_id"],
+                    "join_attribute": hidden_attribute,
+                    "reason": "model_recoverable_join_column",
+                }
+            )
+            source_to_query_row = {
+                row["source_row_id"]: row["row_id"] for row in query_rows
+            }
+            source_to_target_rows: dict[int, list[int]] = defaultdict(list)
+            for row in target_rows:
+                source_to_target_rows[int(row["source_row_id"])].append(
+                    int(row["row_id"])
+                )
+            seen_recoveries: set[str] = set()
+            for recovery in recoveries_by_col.get(join_col, []):
+                source_row_id = int(recovery["source_row_id"])
+                if source_row_id not in source_to_query_row:
+                    continue
+                recovery_id = f"evrec_{stable_hash(query_table_id, target_table_id, source_row_id, recovery['evidence']['asset_id'], recovery['recovered_attribute']['value'])}"
+                if recovery_id in seen_recoveries:
+                    continue
+                seen_recoveries.add(recovery_id)
+                path_id = f"path_{stable_hash(query_table_id, recovery['evidence']['asset_id'], target_table_id, source_row_id)}"
+                write_jsonl_record(
+                    recovery_writer,
+                    {
+                        "recovery_id": recovery_id,
+                        "path_id": path_id,
+                        "query_table_id": query_table_id,
+                        "target_table_id": target_table_id,
+                        "data_lake_table_id": target_table_id,
+                        "query_row_id": source_to_query_row[source_row_id],
+                        "target_row_ids": source_to_target_rows.get(
+                            source_row_id, []
+                        ),
+                        "path_nodes": [
+                            {
+                                "node_id": query_table_id,
+                                "node_type": "query_table",
+                            },
+                            {
+                                "node_id": recovery["evidence"]["asset_id"],
+                                "node_type": f"{recovery['evidence']['asset_type']}_asset",
+                            },
+                            {
+                                "node_id": target_table_id,
+                                "node_type": "target_table",
+                            },
+                        ],
+                        **recovery,
+                    },
+                )
+
+        if emitted_view_count == 0:
+            continue
+        emitted_qualified["row_views"] = emitted_view_count
+        emitted_qualified_cols.append(emitted_qualified)
         data_lake_tables.append(
             table_record(
                 table_id=target_table_id,
@@ -3583,56 +3946,13 @@ def build_table_join_records(
                     "queryable_source_table": True,
                     "join_col": join_col,
                     "join_col_name": qualified["column_name"],
-                    "target_context_col_names": [get_column_name(source_table, col) for col in target_context],
-                },
-            )
-        )
-        emitted_qualified_cols.append(qualified)
-        qrels.append(
-            {
-                "query_table_id": query_table_id,
-                "target_table_id": target_table_id,
-                "data_lake_table_id": target_table_id,
-                "rel": 3,
-                "split": split,
-                "chain_id": chain_id,
-                "source_table_id": source_table["source_table_id"],
-                "join_attribute": hidden_attribute,
-                "reason": "model_recoverable_join_column",
-            }
-        )
-        source_to_query_row = {row["source_row_id"]: row["row_id"] for row in query_rows}
-        source_to_target_rows: dict[int, list[int]] = defaultdict(list)
-        for row in target_rows:
-            source_to_target_rows[int(row["source_row_id"])].append(int(row["row_id"]))
-        seen_recoveries: set[str] = set()
-        for recovery in recoveries_by_col.get(join_col, []):
-            source_row_id = int(recovery["source_row_id"])
-            if source_row_id not in source_to_query_row:
-                continue
-            recovery_id = f"evrec_{stable_hash(query_table_id, target_table_id, source_row_id, recovery['evidence']['asset_id'], recovery['recovered_attribute']['value'])}"
-            if recovery_id in seen_recoveries:
-                continue
-            seen_recoveries.add(recovery_id)
-            path_id = f"path_{stable_hash(query_table_id, recovery['evidence']['asset_id'], target_table_id, source_row_id)}"
-            write_jsonl_record(
-                recovery_writer,
-                {
-                    "recovery_id": recovery_id,
-                    "path_id": path_id,
-                    "query_table_id": query_table_id,
-                    "target_table_id": target_table_id,
-                    "data_lake_table_id": target_table_id,
-                    "query_row_id": source_to_query_row[source_row_id],
-                    "target_row_ids": source_to_target_rows.get(source_row_id, []),
-                    "path_nodes": [
-                        {"node_id": query_table_id, "node_type": "query_table"},
-                        {"node_id": recovery["evidence"]["asset_id"], "node_type": f"{recovery['evidence']['asset_type']}_asset"},
-                        {"node_id": target_table_id, "node_type": "target_table"},
+                    "target_context_col_names": [
+                        get_column_name(source_table, col)
+                        for col in target_context
                     ],
-                    **recovery,
                 },
             )
+        )
 
     if not query_tables:
         raw = raw_data_lake_record(source_table, split)
@@ -3863,8 +4183,12 @@ def build_bridge_assets_parallel(
 def _build_dataset(
     args: argparse.Namespace,
     owned_progress: list[ModelAnalysisProgress],
+    injected_extractor: LocalAttributeExtractor | None = None,
 ) -> dict[str, Any]:
     args.query_rows_per_table = configured_query_rows_per_table(args)
+    args.max_train_query_row_views_per_join = (
+        configured_max_train_query_row_views_per_join(args)
+    )
     policy = replacement_policy_from_args(args)
     if args.max_source_tables is not None and args.max_source_tables < 0:
         raise ValueError("max source tables must be non-negative or None")
@@ -3937,7 +4261,7 @@ def _build_dataset(
         wikipedia_client=wikipedia_client,
         extraction_cache=cache,
     )
-    extractor: LocalAttributeExtractor | None = None
+    extractor = injected_extractor
     evaluation_context = CandidateEvaluationContext(
         entity_records=candidate_entity_records,
         wiki_to_entity_id=candidate_wiki_to_entity_id,
@@ -3974,7 +4298,8 @@ def _build_dataset(
         wait_for_model_ready_marker(
             clean_text(getattr(args, "model_ready_marker", ""))
         )
-        extractor = LocalAttributeExtractor(args)
+        if extractor is None:
+            extractor = LocalAttributeExtractor(args)
         evaluation_context.extractor = extractor
 
     cleanup_totals = CacheCleanupStats()
@@ -4215,7 +4540,8 @@ def _build_dataset(
     source_sampling = {
         "mode": "seeded_random_file_and_table_order",
         "seed": args.seed,
-        "entity_column_policy": "require_candidate_before_global_sampling",
+        "entity_column_policy": "require_query_sized_linked_candidate_before_global_sampling",
+        "min_linked_entity_rows": args.query_rows_per_table,
         "unrecoverable_replacement_rounds": policy.rounds,
         "unrecoverable_drop_probability": policy.drop_probability,
         "replacement_scope": "all_current_failed_slots",
@@ -4245,6 +4571,7 @@ def _build_dataset(
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
         "query_rows_per_table": args.query_rows_per_table,
+        "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,
         "skipped_reasons": dict(counters.skip_reasons),
         "sampling_mode": source_sampling["mode"],
         "sampling_seed": args.seed,
@@ -4261,8 +4588,9 @@ def _build_dataset(
         "cleanup": asdict(cleanup_totals),
         "notes": [
             "source_tables are the fixed data-lake base pool",
-            "tables without a candidate entity column are filtered before the seeded global source-table sample",
-            "query_tables use a capped recovery threshold over valid entity rows, prefer recoverable rows, and contain exactly query_rows_per_table sampled rows",
+            "tables without a candidate entity column or enough linked entity rows for one query are filtered before the seeded global source-table sample",
+            "train join chains emit up to max_train_query_row_views_per_join deterministic disjoint row views; dev/test emit one canonical view",
+            "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table sampled rows",
             "wide source tables emit one variant per qualifying bridge attribute; all qualifying bridge columns stay out of every sibling query, and ordinary context columns are partitioned into source-level query-only and target-only sides",
             "identical visible queries from one source table are merged and retain every hidden attribute, target table ID, chain ID, and qrel",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
@@ -4302,7 +4630,9 @@ def _build_dataset(
         },
         "query_construction": {
             "query_rows_per_table": args.query_rows_per_table,
-            "query_row_selection": "recoverable_first",
+            "query_row_selection": "recovery_balanced_disjoint_train_views",
+            "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,
+            "evaluation_query_row_views_per_join": 1,
             "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
@@ -4361,17 +4691,29 @@ def _build_dataset(
     return stats
 
 
-def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
+def build_dataset(
+    args: argparse.Namespace,
+    *,
+    extractor: LocalAttributeExtractor | None = None,
+) -> dict[str, Any]:
     owned_progress: list[ModelAnalysisProgress] = []
     try:
-        return _build_dataset(args, owned_progress)
+        return _build_dataset(
+            args,
+            owned_progress,
+            injected_extractor=extractor,
+        )
     finally:
         for progress in owned_progress:
             if not getattr(progress, "_closed", False):
                 progress.close()
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build a multimodal joinability discovery dataset by asking local "
@@ -4396,6 +4738,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=5,
         help="Exact number of recoverable-first source rows sampled into each query; generated targets retain all source rows.",
+    )
+    parser.add_argument(
+        "--max_train_query_row_views_per_join",
+        type=int,
+        default=5,
+        help=(
+            "Maximum deterministic disjoint query row views per train join chain; "
+            "0 means use every feasible view. Dev/test always use one."
+        ),
     )
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Action API requests; does not control media downloads.")
     parser.add_argument(
@@ -4514,6 +4865,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_round_control_dir", default=None, help="Optional generation-scoped handshake directory used by a dynamic model runner between batched inference rounds.")
     parser.add_argument("--model_round_run_id", default=None, help="Opaque dynamic-run identifier used to reject stale model round markers.")
     parser.add_argument("--run_fingerprint", default="", help="Staged-run identity used to fence stale model markers.")
+    if configure_parser is not None:
+        configure_parser(parser)
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)
     parser.set_defaults(model_progress=True)
     return parser.parse_args(argv)

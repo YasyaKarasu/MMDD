@@ -1,0 +1,633 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "EntiTables MM Joinability 正例扩容诊断",
+    "description": "基于 output_mm_joinability_v9 及历史版本产物的构造漏斗、标签质量与扩容优先级分析。",
+    "generatedAt": "2026-08-02T00:00:00Z",
+    "cards": [
+      {
+        "id": "query_tables_card",
+        "description": "v9 中去重后的 query table 数量。",
+        "dataset": "headline_metrics",
+        "sourceId": "v9_stats",
+        "metrics": [
+          {
+            "label": "Query tables",
+            "field": "query_tables",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "queryable_sources_card",
+        "description": "40,000 个最终源表中能产生至少一个 query 的源表。",
+        "dataset": "headline_metrics",
+        "sourceId": "v9_stats",
+        "metrics": [
+          {
+            "label": "Queryable sources",
+            "field": "queryable_sources",
+            "format": "number"
+          },
+          {
+            "label": "源表命中率",
+            "field": "source_positive_rate",
+            "format": "percent"
+          }
+        ]
+      },
+      {
+        "id": "hard_fail_card",
+        "description": "chosen entity column 中可用实体行少于 5，按当前构造合同不可能生成 query。",
+        "dataset": "headline_metrics",
+        "sourceId": "v9_entity_diagnostic",
+        "metrics": [
+          {
+            "label": "结构性必失败槽位",
+            "field": "hard_fail_slots",
+            "format": "number"
+          },
+          {
+            "label": "占最终源表",
+            "field": "hard_fail_share",
+            "format": "percent"
+          }
+        ]
+      },
+      {
+        "id": "image_support_card",
+        "description": "至少有一条 image evidence recovery 的 query；同一 query 也可能同时有 text evidence。",
+        "dataset": "headline_metrics",
+        "sourceId": "v9_modality_diagnostic",
+        "metrics": [
+          {
+            "label": "Image-supported queries",
+            "field": "image_supported_queries",
+            "format": "number"
+          },
+          {
+            "label": "占全部 query",
+            "field": "image_supported_query_share",
+            "format": "percent"
+          }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "entity_rows_rate_chart",
+        "title": "可用实体行数与源表命中率",
+        "subtitle": "5–9 行命中率 3.7%，100+ 行为 52.9%；v9 最终 40,000 个源表",
+        "type": "bar",
+        "dataset": "entity_row_rates",
+        "sourceId": "v9_entity_diagnostic",
+        "valueFormat": "percent",
+        "encodings": {
+          "x": {
+            "field": "entity_rows_bin",
+            "type": "nominal",
+            "label": "Chosen entity column 的可用实体行"
+          },
+          "y": {
+            "field": "queryable_rate",
+            "type": "quantitative",
+            "label": "Queryable source rate"
+          },
+          "tooltip": [
+            {
+              "field": "tables",
+              "type": "quantitative",
+              "label": "源表数"
+            },
+            {
+              "field": "queryable_sources",
+              "type": "quantitative",
+              "label": "Queryable 源表"
+            }
+          ]
+        }
+      },
+      {
+        "id": "modality_recovery_chart",
+        "title": "正例证据按模态分布",
+        "subtitle": "Text 占 94.5% recovery records；image 证据仍是明显短板",
+        "type": "bar",
+        "dataset": "modality_evidence",
+        "sourceId": "v9_modality_diagnostic",
+        "valueFormat": "number",
+        "encodings": {
+          "x": {
+            "field": "modality",
+            "type": "nominal",
+            "label": "Evidence modality"
+          },
+          "y": {
+            "field": "recovery_records",
+            "type": "quantitative",
+            "label": "Evidence recovery records"
+          },
+          "tooltip": [
+            {
+              "field": "queries_with_modality",
+              "type": "quantitative",
+              "label": "有该模态证据的 query"
+            },
+            {
+              "field": "extraction_records",
+              "type": "quantitative",
+              "label": "Extraction records"
+            },
+            {
+              "field": "nonempty_extraction_rate",
+              "type": "quantitative",
+              "label": "Non-empty extraction rate",
+              "format": "percent"
+            }
+          ]
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "version_progress_table",
+        "title": "版本间正例扩容结果",
+        "subtitle": "v7–v9；版本同时改变了构造策略和最终源表集合，不能视作单变量实验",
+        "dataset": "version_progress",
+        "sourceId": "version_stats",
+        "defaultSort": {
+          "field": "version",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "version",
+            "label": "版本",
+            "type": "text"
+          },
+          {
+            "field": "queryable_sources",
+            "label": "Queryable sources",
+            "format": "number"
+          },
+          {
+            "field": "query_tables",
+            "label": "Query tables",
+            "format": "number"
+          },
+          {
+            "field": "qrels",
+            "label": "Positive qrels",
+            "format": "number"
+          },
+          {
+            "field": "min_ratio",
+            "label": "Min recovery ratio",
+            "format": "percent"
+          },
+          {
+            "field": "major_change",
+            "label": "主要变化",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "optimization_priority_table",
+        "title": "优化方向优先级",
+        "subtitle": "先修资格和标签质量，再扩训练 query；增量估计均以 v9 为基线",
+        "dataset": "optimization_priorities",
+        "sourceId": "optimization_synthesis",
+        "defaultSort": {
+          "field": "priority",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "priority",
+            "label": "优先级",
+            "type": "text"
+          },
+          {
+            "field": "lever",
+            "label": "优化杠杆",
+            "type": "text"
+          },
+          {
+            "field": "evidence",
+            "label": "当前证据",
+            "type": "text"
+          },
+          {
+            "field": "expected_impact",
+            "label": "预期影响",
+            "type": "text"
+          },
+          {
+            "field": "risk",
+            "label": "主要风险",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "v9_stats",
+        "label": "v9 aggregate statistics",
+        "path": "reports/entitables_mm_joinability_optimization/sql/v9_stats.sql"
+      },
+      {
+        "id": "v9_entity_diagnostic",
+        "label": "v9 source-table eligibility diagnostic",
+        "path": "reports/entitables_mm_joinability_optimization/sql/v9_entity_diagnostic.sql"
+      },
+      {
+        "id": "v9_modality_diagnostic",
+        "label": "v9 evidence modality diagnostic",
+        "path": "reports/entitables_mm_joinability_optimization/sql/v9_modality_diagnostic.sql"
+      },
+      {
+        "id": "version_stats",
+        "label": "Versioned joinability statistics",
+        "path": "reports/entitables_mm_joinability_optimization/sql/version_stats.sql"
+      },
+      {
+        "id": "matcher_quality",
+        "label": "Value matcher and v9 recovery evidence",
+        "path": "reports/entitables_mm_joinability_optimization/sql/matcher_quality.sql"
+      },
+      {
+        "id": "optimization_synthesis",
+        "label": "Derived optimization synthesis",
+        "path": "reports/entitables_mm_joinability_optimization/sql/optimization_synthesis.sql"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# EntiTables MM Joinability 正例扩容诊断"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## 技术摘要\n\n**最优先应修复结构资格条件，而不是继续降低 recovery threshold。** v9 在 40,000 个最终源表上得到 2,648 个 queryable source、3,341 个 query table 和 3,445 个 positive qrel。当前仍有 13,008 个槽位的可用实体行少于 5，但 query 合同要求恰好 5 行，因此这些槽位必然产生 0 个正例。\n\n**数量扩张的首选组合是：预采样硬过滤 + 训练集第二个不同行视图。** 前者释放被必失败样本占据的采样与模型预算；后者不降低单条证据门槛。按现有 qualified attributes 计算，每条链路最多保留 2 个互不相交的 5 行视图，可把可用链路变体从 3,445 提高到 4,766（+38.3%）；unique query 数需在生成后做 visible-query 去重，不能直接把 4,766 当作已实现 query 数。\n\n**如果目标是真正的多模态 joinability，不能只追总 query 数。** 现有 recovery records 中 text 占 94.5%，只有 344 个 query 至少带一条 image recovery。建议同时报告 total query、image-supported query 和 dual-modality query，避免通过文本证据扩容后稀释多模态含量。"
+      },
+      {
+        "id": "headline_metrics_block",
+        "type": "metric-strip",
+        "cardIds": [
+          "query_tables_card",
+          "queryable_sources_card",
+          "hard_fail_card",
+          "image_support_card"
+        ]
+      },
+      {
+        "id": "metric_definition",
+        "type": "markdown",
+        "body": "## 先把三个“正例数量”指标分开\n\n- **Queryable source tables：2,648。** 至少能生成一个 query 的原始源表，衡量来源多样性。\n- **Query tables：3,341。** visible query 去重后的查询工作负载，最接近当前讨论的 positive-label/query 数。\n- **Positive qrels：3,445。** query–target 正相关对；99 个 query 对应多个 target，因此 qrel 数略高于 query 数。\n\n后续扩容实验至少同时报告这三个数。只增加同源行视图会增加 query 数，却不会等比例增加独立页面、独立源表或属性覆盖。"
+      },
+      {
+        "id": "entity_rows_finding",
+        "type": "markdown",
+        "sourceId": "v9_entity_diagnostic",
+        "body": "## 可用实体行是最强的低成本预筛信号\n\n在 v9 最终池中，13,008 张表的 chosen entity column 只有 1–4 个可用 Wikipedia entity，命中率为 0。满足至少 5 行后，命中率随实体行数快速上升：5–9 行为 3.7%，20–49 行为 14.7%，50–99 行为 33.9%，100+ 行为 52.9%。\n\n这支持在全局随机采样前加入硬条件 `active_entity_rows >= query_rows_per_table`，再在合格池内做分层随机采样。它能减少确定无效的抓取和模型调用；最终净新增量必须通过同 seed 的 selection-only replay 测量，不能用条件命中率直接外推。"
+      },
+      {
+        "id": "entity_rows_chart_block",
+        "type": "chart",
+        "chartId": "entity_rows_rate_chart"
+      },
+      {
+        "id": "version_finding",
+        "type": "markdown",
+        "body": "## v8→v9 证明门槛有效，但已经进入标签强度边界\n\nv8 到 v9 的 query table 从 2,170 增至 3,341（+54.0%），queryable source 从 1,680 增至 2,648（+57.6%）。同时，v9 的 2,648 个 queryable source 中有 984 个源表最多只有 2 个 recovered rows；它们在当前 5 行 query、0.4 阈值下刚好过线。\n\n阈值是阶梯函数：当 valid entity rows 至少为 5 时，0.4 对应至少 2 个恢复值；把 0.4 改成 0.39 不会新增正例，只有降到 0.2 才会变成至少 1 个恢复值。后者会显著削弱标签，因此不建议作为下一步。v8 与 v9 的最终源表集合也因 replacement 结果而不同，表中变化不能解释为纯阈值 A/B。"
+      },
+      {
+        "id": "version_table_block",
+        "type": "table",
+        "tableId": "version_progress_table"
+      },
+      {
+        "id": "optimization_finding",
+        "type": "markdown",
+        "body": "## 推荐的扩容顺序\n\n**第一层：修无损漏损。** 对齐 sampling eligibility 与 5 行 query 合同；把 162 张“属性已合格但 query/target split 失败”的表归因为实体行不足，而不是笼统 split failure。\n\n**第二层：扩训练视图，不扩评测重复。** 对 recovered rows 足够的链路生成最多 2 个互不相交的 5 行 query view，只用于 train；dev/test 每条 source/chain 保留一个 canonical query。所有变体继续按 page title/source group 切分，并对 visible query 做全局指纹去重。\n\n**第三层：再扩大候选预算。** 当前 78,251 个已消费候选的总体命中率约 3.38%。若保持 2 个 replacement rounds、把 drop probability 从 0.5 提到 1.0，候选分析量上限从 78,251 接近 120,000（约 +53%）；按当前命中率的粗略外推，可能再得到约 1.4k 个 queryable source，但这只是容量估计，需在结构预筛后重新测量。"
+      },
+      {
+        "id": "optimization_table_block",
+        "type": "table",
+        "tableId": "optimization_priority_table"
+      },
+      {
+        "id": "modality_finding",
+        "type": "markdown",
+        "sourceId": "v9_modality_diagnostic",
+        "body": "## Image evidence 是多模态正例的真正瓶颈\n\nv9 的 12,762 条 evidence recovery 中，text 为 12,063 条，image 只有 699 条。Text extraction 的 non-empty rate 为 10.7%，image 仅 1.0%；3,341 个 query 中，3,234 个带 text recovery，344 个带 image recovery。\n\n如果研究目标要求视觉信息真正参与 join，下一轮应优先提高 image evidence 的可读性和实体可连接性，例如加入图片 caption、附近正文、OCR 文本或带实体标识的页面局部截图，并将 `image-supported query rate` 设为独立 guardrail。若目标只是扩大总 query 数，则把新增推理预算放在高命中 text evidence 上更经济，但必须明确这会降低数据集的视觉占比。"
+      },
+      {
+        "id": "modality_chart_block",
+        "type": "chart",
+        "chartId": "modality_recovery_chart"
+      },
+      {
+        "id": "quality_finding",
+        "type": "markdown",
+        "sourceId": "matcher_quality",
+        "body": "## 扩容前必须先收紧短字符串匹配\n\n当前 `values_match` 在 expected 长度至少为 4 时允许任一方向的 substring；因此 `a` 对 `Canada`、`1` 对 `2011` 都会返回 true。v9 已写出的 recovery 中有 49 条属于“预测值短于 4 且非精确相等”的匹配；移除这类宽松匹配后，有 15 个 qrel 的安全 recovered rows 会低于 2。样例包含 `1`→`Test 1152`、`f`→`Faafu`，也包含可能合理的缩写 `R`→`Republican`，所以需要按属性类型审核，而不是一刀切。\n\n建议改为：短 token 必须 exact 或命中显式 alias；数字按完整 token/单位规范化比较；日期、地点和列表使用类型化 canonicalizer。与此同时，对新增和边界 cohort 做分层人工抽检，至少分别覆盖 exact、长 substring、短 alias、numeric/date normalization、text/image evidence。"
+      },
+      {
+        "id": "scope_methods",
+        "type": "markdown",
+        "body": "## 范围、方法与限制\n\n分析基线是 `output_mm_joinability_v9`：40,000 个最终 source slots、固定 5 行 query、`min_recovered_value_ratio=0.4`、`min_recovery_denominator=2`。诊断读取了 stats、40,000 条 queryability decisions、40,000 张 source tables、3,341 张 query tables、3,445 条 qrels、12,762 条 evidence recoveries 和 886,913 条 attribute extraction records。\n\n行视图扩容的 4,766 是基于每个 qualified attribute 最多构造 2 个互不相交 5 行集合的链路变体数，不是已去重的 unique query 实测值。Replacement 的 +1.4k queryable source 是按历史总体命中率做的容量外推，不包含预筛、缓存命中、属性分布或模型成本变化。未保存的 failed-column recovered counts 限制了对 1-row threshold、alias normalization 和 near-miss 的精确离线反事实评估。"
+      },
+      {
+        "id": "recommended_next_steps",
+        "type": "markdown",
+        "body": "## 建议的最小验证计划\n\n1. **做 selection-only replay。** 同 seed 对比当前策略与 `active_entity_rows >= 5` 预筛，输出 candidate funnel，不调用模型。\n2. **复用缓存做 5k 源表回放。** 修短 token matcher，并让 failed decisions 保存每列 `valid_rows / recovered_rows / required_rows / failure_stage`。\n3. **只在 train 生成第二个 disjoint row view。** cap=2；报告生成前后 unique query、qrel、source/page 数、属性 Top-5 share 与重复率。\n4. **随后比较候选预算。** 在新预筛上 A/B `drop_probability=0.5` 与 `1.0`，以每千次 extraction 新增多少 verified query 为效率指标。\n5. **加质量门槛。** 分层人工抽检 precision，并同时监控 image-supported query rate、dual-modality rate、属性分布与 page/source group leakage。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 仍需确认的问题\n\n- 目标是扩大 **训练 query 数**，还是扩大 **独立 source/page/attribute 的覆盖**？前者适合行视图扩增，后者更依赖采样与证据改进。\n- 正例是否必须包含 image evidence，还是 text/image 任一模态即可？这会改变模型预算的最优分配。\n- 对短缩写、部分地点、年份与列表值，项目希望采用 exact、typed normalization，还是人工维护 alias policy？该选择会直接影响 precision–recall 边界。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-02T00:00:00Z",
+    "status": "ready",
+    "datasets": {
+      "headline_metrics": [
+        {
+          "query_tables": 3341,
+          "queryable_sources": 2648,
+          "source_positive_rate": 0.0662,
+          "hard_fail_slots": 13008,
+          "hard_fail_share": 0.3252,
+          "image_supported_queries": 344,
+          "image_supported_query_share": 0.102963
+        }
+      ],
+      "entity_row_rates": [
+        {
+          "entity_rows_bin": "5–9",
+          "tables": 10673,
+          "queryable_sources": 395,
+          "queryable_rate": 0.037009
+        },
+        {
+          "entity_rows_bin": "10–19",
+          "tables": 8910,
+          "queryable_sources": 710,
+          "queryable_rate": 0.079686
+        },
+        {
+          "entity_rows_bin": "20–49",
+          "tables": 5601,
+          "queryable_sources": 826,
+          "queryable_rate": 0.147474
+        },
+        {
+          "entity_rows_bin": "50–99",
+          "tables": 1258,
+          "queryable_sources": 426,
+          "queryable_rate": 0.338633
+        },
+        {
+          "entity_rows_bin": "100+",
+          "tables": 550,
+          "queryable_sources": 291,
+          "queryable_rate": 0.529091
+        }
+      ],
+      "modality_evidence": [
+        {
+          "modality": "Text",
+          "recovery_records": 12063,
+          "queries_with_modality": 3234,
+          "extraction_records": 396882,
+          "nonempty_extraction_rate": 0.106624
+        },
+        {
+          "modality": "Image",
+          "recovery_records": 699,
+          "queries_with_modality": 344,
+          "extraction_records": 490030,
+          "nonempty_extraction_rate": 0.010285
+        }
+      ],
+      "version_progress": [
+        {
+          "version_order": 7,
+          "version": "v7",
+          "queryable_sources": 1318,
+          "query_tables": 1318,
+          "qrels": 1318,
+          "min_ratio": 0.5,
+          "major_change": "全局 replacement；每个 source 最多一个 query"
+        },
+        {
+          "version_order": 8,
+          "version": "v8",
+          "queryable_sources": 1680,
+          "query_tables": 2170,
+          "qrels": 2232,
+          "min_ratio": 0.5,
+          "major_change": "宽表多属性 query variants 与 visible-query merge"
+        },
+        {
+          "version_order": 9,
+          "version": "v9",
+          "queryable_sources": 2648,
+          "query_tables": 3341,
+          "qrels": 3445,
+          "min_ratio": 0.4,
+          "major_change": "恢复门槛从 3/5 降为 2/5"
+        }
+      ],
+      "optimization_priorities": [
+        {
+          "priority_order": 1,
+          "priority": "P0",
+          "lever": "对齐预采样资格：active entity rows ≥ 5",
+          "evidence": "13,008/40,000 槽位结构性必失败；实测正例为 0",
+          "expected_impact": "释放 32.5% 最终槽位和对应证据/模型预算；净增需 replay 实测",
+          "risk": "若只按高行数筛选会改变数据分布，需分层采样"
+        },
+        {
+          "priority_order": 2,
+          "priority": "P0",
+          "lever": "修短 token matcher + 保存 failed-column near-miss",
+          "evidence": "49 条短非精确 recovery；15 个 qrel 的 ≥2 安全行不足",
+          "expected_impact": "先提高 label precision，并让后续阈值/alias 反事实可离线计算",
+          "risk": "合理缩写可能被误删，必须按属性类型和 alias 审核"
+        },
+        {
+          "priority_order": 3,
+          "priority": "P1",
+          "lever": "Train-only 第二个 disjoint 5-row view，cap=2",
+          "evidence": "1,321/3,445 qualified attributes 可支持至少第二个不相交视图",
+          "expected_impact": "链路变体 3,445→4,766（+38.3%）；unique query 需生成后去重",
+          "risk": "同源相关性和属性头部偏置上升；dev/test 不应扩增"
+        },
+        {
+          "priority_order": 4,
+          "priority": "P2",
+          "lever": "drop_probability 0.5→1.0，保持 2 rounds",
+          "evidence": "当前消费 78,251 候选；容量上限 120,000；总体命中率 3.38%",
+          "expected_impact": "粗略外推约 +1.4k queryable source；候选分析量约 +53%",
+          "risk": "模型/抓取成本明显增加，且条件命中率可能下降"
+        },
+        {
+          "priority_order": 5,
+          "priority": "P2",
+          "lever": "证据感知分层采样与属性配额",
+          "evidence": "实体行越多命中率越高；Top-5 属性占 49.5% qrels",
+          "expected_impact": "提高每次模型调用的 query yield，同时控制 Year/Venue 等头部属性",
+          "risk": "不加保留概率/权重会破坏总体代表性"
+        },
+        {
+          "priority_order": 6,
+          "priority": "P3",
+          "lever": "阈值 0.4→0.2，允许单行恢复",
+          "evidence": "984/2,648 queryable source 已处在恰好 2 行的边界",
+          "expected_impact": "可能大幅增量，但当前产物无法精确反事实估计",
+          "risk": "标签强度显著下降，不建议在 matcher QA 前采用"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "v9_stats",
+      "label": "v9 aggregate statistics",
+      "path": "reports/entitables_mm_joinability_optimization/sql/v9_stats.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Direct aggregate counts from the v9 dataset stats file.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "output_mm_joinability_v9/stats.json"
+        ],
+        "filters": [
+          "dataset version = v9"
+        ]
+      }
+    },
+    {
+      "id": "v9_entity_diagnostic",
+      "label": "v9 source-table eligibility diagnostic",
+      "path": "reports/entitables_mm_joinability_optimization/sql/v9_entity_diagnostic.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Joined v9 queryability decisions to source-table rows and entity titles, then computed queryability rates by active entity-row bin.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "output_mm_joinability_v9/table_queryability_decisions.jsonl",
+          "output_mm_joinability_v9/source_tables/part-00000.jsonl",
+          "output_mm_joinability_v9/entities/*.jsonl"
+        ],
+        "filters": [
+          "final v9 source slots only",
+          "chosen entity column from the recorded decision",
+          "active entity means a row wiki_title present in the v9 entities artifact"
+        ],
+        "metric_definitions": {
+          "queryable_rate": "queryable source tables divided by source tables in the same active-entity-row bin",
+          "hard_fail_slots": "final source tables with fewer than query_rows_per_table=5 active entity rows in the chosen entity column"
+        }
+      }
+    },
+    {
+      "id": "v9_modality_diagnostic",
+      "label": "v9 evidence modality diagnostic",
+      "path": "reports/entitables_mm_joinability_optimization/sql/v9_modality_diagnostic.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Counted v9 evidence recoveries, queries, extraction records, and non-empty extraction outputs by asset_type.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "output_mm_joinability_v9/evidence_recoveries/*.jsonl",
+          "output_mm_joinability_v9/attribute_extractions/*.jsonl",
+          "output_mm_joinability_v9/query_tables/part-00000.jsonl"
+        ],
+        "filters": [
+          "asset_type in (text, image)",
+          "v9 emitted evidence recoveries"
+        ],
+        "metric_definitions": {
+          "nonempty_extraction_rate": "extraction records with at least one parsed attribute divided by extraction records for the same modality",
+          "queries_with_modality": "distinct query_table_id with at least one emitted recovery of the modality"
+        }
+      }
+    },
+    {
+      "id": "version_stats",
+      "label": "Versioned joinability statistics",
+      "path": "reports/entitables_mm_joinability_optimization/sql/version_stats.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Selected comparable aggregate fields from v7, v8, and v9 stats files; versions are not a controlled single-variable experiment.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "output_mm_joinability_v7/stats.json",
+          "output_mm_joinability_v8/stats.json",
+          "output_mm_joinability_v9/stats.json"
+        ],
+        "filters": [
+          "versions in (v7, v8, v9)"
+        ]
+      }
+    },
+    {
+      "id": "matcher_quality",
+      "label": "Value matcher and v9 recovery evidence",
+      "path": "reports/entitables_mm_joinability_optimization/sql/matcher_quality.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Audited values_match behavior against emitted v9 recovery model_value and expected value pairs, deduplicated at query-target-source-row grain for the safe-row sensitivity check.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "scripts/build_mm_joinability_dataset.py",
+          "output_mm_joinability_v9/evidence_recoveries/*.jsonl",
+          "output_mm_joinability_v9/qrels.jsonl"
+        ],
+        "filters": [
+          "short non-exact means normalized predicted length < 4 and predicted != expected",
+          "safe-row sensitivity retains exact matches or predicted values of length >= 4"
+        ]
+      }
+    },
+    {
+      "id": "optimization_synthesis",
+      "label": "Derived optimization synthesis",
+      "path": "reports/entitables_mm_joinability_optimization/sql/optimization_synthesis.sql",
+      "query": {
+        "engine": "local-files",
+        "language": "python",
+        "description": "Combined source eligibility, qualified-column row counts, replacement capacity, modality evidence, and matcher audit into a prioritized intervention table.",
+        "executed_at": "2026-08-02T00:00:00Z",
+        "tables_used": [
+          "output_mm_joinability_v9/stats.json",
+          "output_mm_joinability_v9/table_queryability_decisions.jsonl",
+          "output_mm_joinability_v9/source_tables/part-00000.jsonl",
+          "output_mm_joinability_v9/evidence_recoveries/*.jsonl",
+          "scripts/build_mm_joinability_dataset.py"
+        ],
+        "filters": [
+          "disjoint row-view cap = 2",
+          "query_rows_per_table = 5",
+          "replacement candidate capacity = max_source_tables * (rounds + 1)"
+        ]
+      }
+    }
+  ]
+}

@@ -20,6 +20,7 @@ from build_mm_joinability_dataset import (
     ModelConcurrencyState,
     LocalAttributeExtractor,
     build_bridge_assets_parallel,
+    extraction_row_attributes,
     extraction_cache_key,
     image_data_url,
     normalize_extracted_attributes,
@@ -31,8 +32,10 @@ from build_mm_joinability_dataset import (
     resolve_extraction_tasks,
     safe_json_object,
     select_query_source_rows,
+    select_query_source_row_views,
     select_best_qualified_column,
     tasks_requiring_model_analysis,
+    values_match,
 )
 from build_mm_table_dataset import ShardedJsonlWriter
 from run_mm_joinability_dynamic_vllm import (
@@ -47,10 +50,10 @@ from run_mm_joinability_dynamic_vllm import (
 )
 
 
-def test_prompt_version_invalidates_cache_after_image_prompt_changes():
+def test_prompt_version_invalidates_cache_after_masked_value_prompt_changes():
     import build_mm_joinability_dataset as joinability_dataset
 
-    assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v3_short_empty_precompressed_image"
+    assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v5_batched_leave_one_out"
 
 
 def test_model_analysis_progress_registers_new_keys_once() -> None:
@@ -139,6 +142,8 @@ def build_multi_attribute_join_records(
     monkeypatch: pytest.MonkeyPatch,
     *,
     context_column_names: list[str],
+    row_count: int = 5,
+    split: str = "train",
 ):
     column_names = ["Entity", "Bridge B", "Bridge C", *context_column_names]
     rows = []
@@ -146,7 +151,7 @@ def build_multi_attribute_join_records(
     assets = {}
     entity_to_assets = {}
     wiki_to_entity_id = {}
-    for row_index in range(5):
+    for row_index in range(row_count):
         wiki_title = f"Entity {row_index}"
         entity_id = f"entity-{row_index}"
         asset_id = f"asset-{row_index}"
@@ -248,7 +253,7 @@ def build_multi_attribute_join_records(
     query_tables, target_tables, qrels, decision = (
         joinability_dataset.build_table_join_records(
             source_table=source_table,
-            split="train",
+            split=split,
             assets=assets,
             entity_to_assets=entity_to_assets,
             wiki_to_entity_id=wiki_to_entity_id,
@@ -387,12 +392,97 @@ def test_select_query_rows_prefers_extra_recoveries_over_failures():
     ) == [0, 1, 2, 3, 4]
 
 
+def test_select_query_row_views_are_disjoint_and_adapt_to_available_evidence():
+    views = select_query_source_row_views(
+        source_row_order=list(range(25)),
+        recovered_source_rows=set(range(10)),
+        query_rows_per_table=5,
+        required_recovered_rows=2,
+        max_views=5,
+    )
+
+    assert len(views) == 5
+    assert all(len(view) == 5 for view in views)
+    assert len({row for view in views for row in view}) == 25
+    assert all(len(set(view) & set(range(10))) >= 2 for view in views)
+
+
+def test_train_emits_multiple_disjoint_row_views_but_dev_stays_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train_queries, train_targets, train_qrels, decision, _recoveries = (
+        build_multi_attribute_join_records(
+            tmp_path,
+            monkeypatch,
+            context_column_names=["Query X", "Target Z"],
+            row_count=20,
+            split="train",
+        )
+    )
+    dev_queries, dev_targets, dev_qrels, _dev_decision, _dev_recoveries = (
+        build_multi_attribute_join_records(
+            tmp_path,
+            monkeypatch,
+            context_column_names=["Query X", "Target Z"],
+            row_count=20,
+            split="dev",
+        )
+    )
+
+    assert len(train_queries) == 4
+    assert len(train_targets) == 2
+    assert len(train_qrels) == 8
+    assert {item["row_views"] for item in decision["qualified_columns"]} == {4}
+    train_row_sets = [set(query["source_row_indices"]) for query in train_queries]
+    assert all(
+        left.isdisjoint(right)
+        for index, left in enumerate(train_row_sets)
+        for right in train_row_sets[index + 1 :]
+    )
+    assert len(dev_queries) == 1
+    assert len(dev_targets) == 2
+    assert len(dev_qrels) == 2
+
+
+@pytest.mark.parametrize(
+    ("predicted", "expected", "attribute_name"),
+    [
+        ("NBC", "NBC", "Network"),
+        ("1,000", "1000", "Population"),
+        ("Birmingham", "Olympic Stadium in Birmingham", "Venue"),
+        ("2001", "August 2001", "Year"),
+        ("Stade-5 Juillet", "Stade 5 Juillet", "Venue"),
+    ],
+)
+def test_values_match_accepts_safe_exact_numeric_and_phrase_matches(
+    predicted: str, expected: str, attribute_name: str
+) -> None:
+    assert values_match(predicted, expected, attribute_name=attribute_name)
+
+
+@pytest.mark.parametrize(
+    ("predicted", "expected", "attribute_name"),
+    [
+        ("a", "Canada", "Country"),
+        ("1", "Test 1152", "Test No."),
+        ("US", "Russia", "Country"),
+        ("7", "6.97", "Mile"),
+        ("GT2", "LMGT2", "Class"),
+    ],
+)
+def test_values_match_rejects_unsafe_short_or_partial_numeric_matches(
+    predicted: str, expected: str, attribute_name: str
+) -> None:
+    assert not values_match(predicted, expected, attribute_name=attribute_name)
+
+
 def test_query_rows_per_table_defaults_to_five(tmp_path):
     args = joinability_dataset.parse_args(
         ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "out")]
     )
 
     assert args.query_rows_per_table == 5
+    assert args.max_train_query_row_views_per_join == 5
 
 
 def test_query_rows_per_table_rejects_contradictory_output_minimum(tmp_path):
@@ -445,6 +535,43 @@ def test_query_rows_per_table_accepts_explicit_override(tmp_path):
     assert joinability_dataset.configured_query_rows_per_table(args) == 3
 
 
+@pytest.mark.parametrize(("value", "expected"), [("0", 0), ("7", 7)])
+def test_max_train_query_row_views_accepts_unbounded_or_explicit_cap(
+    tmp_path: Path, value: str, expected: int
+) -> None:
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_train_query_row_views_per_join",
+            value,
+        ]
+    )
+
+    assert (
+        joinability_dataset.configured_max_train_query_row_views_per_join(args)
+        == expected
+    )
+
+
+def test_max_train_query_row_views_rejects_negative_cap(tmp_path: Path) -> None:
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_train_query_row_views_per_join",
+            "-1",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        joinability_dataset.configured_max_train_query_row_views_per_join(args)
+
+
 def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
     raw = """
     Thinking Process:
@@ -458,7 +585,7 @@ def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
     payload = safe_json_object(raw)
     attrs = normalize_extracted_attributes(payload, ["State"])
 
-    assert attrs == [{"name": "State", "value": "Alabama", "evidence": "BAMA"}]
+    assert attrs == [{"name": "State", "value": "Alabama"}]
 
 
 def test_normalize_extracted_attributes_drops_placeholders_and_non_candidates():
@@ -471,11 +598,11 @@ def test_normalize_extracted_attributes_drops_placeholders_and_non_candidates():
     }
 
     assert normalize_extracted_attributes(payload, ["Year"]) == [
-        {"name": "Year", "value": "2008", "evidence": "October 20, 2008"}
+        {"name": "Year", "value": "2008"}
     ]
 
 
-def test_normalize_extracted_attributes_can_require_entity_connection_evidence():
+def test_normalize_extracted_attributes_discards_explanatory_fields():
     payload = {
         "attributes": [
             {"name": "State", "value": "Alabama", "evidence": "BAMA"},
@@ -488,13 +615,9 @@ def test_normalize_extracted_attributes_can_require_entity_connection_evidence()
         ]
     }
 
-    assert normalize_extracted_attributes(payload, ["State"], require_connection_evidence=True) == [
-        {
-            "name": "State",
-            "value": "Alabama",
-            "evidence": "BAMA",
-            "connection_evidence": "The jersey identifies the Alabama team.",
-        }
+    assert normalize_extracted_attributes(payload, ["State"]) == [
+        {"name": "State", "value": "Alabama"},
+        {"name": "State", "value": "Alabama"},
     ]
 
 
@@ -532,14 +655,27 @@ def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
 
     prompt = extractor.extraction_prompt(
         entity_text="Alpha",
-        entity_wiki_title="Alpha",
-        candidate_attributes=["State"],
+        row_attributes=[
+            {"name": "Name", "value": "Alpha", "is_entity": True},
+            {"name": "State", "value": "Texas", "is_entity": False},
+            {"name": "Founded", "value": "1901", "is_entity": False},
+        ],
+        candidate_attributes=["State", "Founded"],
     )
     extractor.chat(base_url="http://localhost:8001/v1", model="Qwen3.5-9B", api_key=None, messages=[])
 
     assert "Thinking Process" not in prompt
-    assert "connection_evidence" in prompt
-    assert "Do not rely on Wikipedia page provenance" in prompt
+    assert "Wikipedia" not in prompt
+    assert "Name [ENTITY; NEVER MASK]: Alpha" in prompt
+    assert "State: Texas" in prompt
+    assert "Founded: 1901" in prompt
+    assert "separate leave-one-attribute-out test" in prompt
+    assert "same request does not imply that they are related" in prompt
+    assert "entity attribute marked ENTITY is always visible" in prompt
+    assert "candidate's displayed table value" in prompt
+    assert '"name":"<one candidate attribute name>","value":"<extracted value>"' in prompt
+    assert "connection_evidence" not in prompt
+    assert "Do not rely on Wikipedia page provenance" not in prompt
     assert captured["json"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
@@ -548,11 +684,15 @@ def test_extraction_prompt_requires_short_empty_json_response():
 
     prompt = extractor.extraction_prompt(
         entity_text="Alpha",
-        entity_wiki_title="Alpha",
+        row_attributes=[
+            {"name": "Name", "value": "Alpha", "is_entity": True},
+            {"name": "State", "value": "Texas", "is_entity": False},
+        ],
         candidate_attributes=["State"],
     )
 
-    assert 'If no candidate attribute is directly supported, return exactly {"attributes":[]}' in prompt
+    assert 'If no candidate attribute can be recovered, return exactly {"attributes":[]}' in prompt
+    assert "Do not output evidence, explanations, rationale, confidence" in prompt
 
 
 def test_image_chat_uses_default_visual_token_limit(monkeypatch):
@@ -645,7 +785,7 @@ def test_chat_records_model_request_time_and_token_usage_by_kind(monkeypatch):
     assert summary["image"]["total_tokens"] == 10
 
 
-def test_image_extraction_keeps_image_url_but_sanitizes_entity_cell_url(monkeypatch):
+def test_image_extraction_rejects_remote_url_to_hide_asset_provenance(monkeypatch):
     captured = {}
 
     class Response:
@@ -662,25 +802,21 @@ def test_image_extraction_keeps_image_url_but_sanitizes_entity_cell_url(monkeypa
     monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
     extractor = LocalAttributeExtractor(_extractor_args())
 
-    image_url = "https://upload.wikimedia.org/example/large-image.jpg"
-    extractor.extract(
-        asset={
-            "asset_id": "img_1",
-            "asset_type": "image",
-            "image_url": image_url,
-        },
-        entity={
-            "cell_text": "https://example.com/entity/" + "a" * 200,
-            "wiki_title": "Alpha",
-        },
-        candidate_attributes=["State"],
-    )
+    with pytest.raises(ValueError, match="no usable local image or data URL"):
+        extractor.extract(
+            asset={
+                "asset_id": "img_1",
+                "asset_type": "image",
+                "image_url": "https://upload.wikimedia.org/example/large-image.jpg",
+            },
+            entity={
+                "cell_text": "Alpha",
+                "wiki_title": "SECRET_WIKIPEDIA_TITLE",
+            },
+            candidate_attributes=["State"],
+        )
 
-    user_content = captured["json"]["messages"][1]["content"]
-    assert user_content[0]["type"] == "text"
-    assert "Entity display text: [url]" in user_content[0]["text"]
-    assert "example.com/entity" not in user_content[0]["text"]
-    assert user_content[1] == {"type": "image_url", "image_url": {"url": image_url}}
+    assert "json" not in captured
 
 
 def test_image_extraction_retries_context_length_error_with_resized_local_image(monkeypatch, tmp_path):
@@ -882,6 +1018,132 @@ def test_old_cache_key_is_preserved_when_disabling_thinking():
     assert extraction_cache_key(**base, args=args_disabled) == extraction_cache_key(**base, args=args_enabled)
 
 
+def test_extraction_cache_key_includes_batched_row_context():
+    args = argparse.Namespace(
+        text_model_name="text-model",
+        image_model_name="image-model",
+    )
+    base = dict(
+        asset_id="asset_1",
+        entity_id="entity_1",
+        candidate_attribute_names=["State"],
+        asset_type="text",
+        args=args,
+    )
+
+    texas_key = extraction_cache_key(
+        **base,
+        row_attributes=[
+            {"name": "Name", "value": "Alpha", "is_entity": True},
+            {"name": "State", "value": "Texas", "is_entity": False},
+        ],
+    )
+    ohio_key = extraction_cache_key(
+        **base,
+        row_attributes=[
+            {"name": "Name", "value": "Alpha", "is_entity": True},
+            {"name": "State", "value": "Ohio", "is_entity": False},
+        ],
+    )
+
+    assert texas_key != ohio_key
+
+
+def test_extraction_row_attributes_use_only_sanitized_cell_content():
+    table = {
+        "columns": [
+            {"column_index": 0, "column_name": "Name"},
+            {"column_index": 1, "column_name": "State"},
+            {"column_index": 2, "column_name": "Reference"},
+        ]
+    }
+    row = {
+        "cells": [
+            {
+                "column_index": 0,
+                "text": "Alpha",
+                "wiki_title": "SECRET_WIKIPEDIA_TITLE",
+            },
+            {"column_index": 1, "text": "Texas"},
+            {
+                "column_index": 2,
+                "text": "https://private.example/entity/alpha",
+            },
+        ]
+    }
+
+    attributes = extraction_row_attributes(table, row, entity_col=0)
+
+    assert attributes == [
+        {"name": "Name", "value": "Alpha", "is_entity": True},
+        {"name": "State", "value": "Texas", "is_entity": False},
+        {"name": "Reference", "value": "[url]", "is_entity": False},
+    ]
+    assert "SECRET_WIKIPEDIA_TITLE" not in json.dumps(attributes)
+
+
+def test_collect_extraction_task_keeps_one_call_with_full_row_context():
+    source_table = {
+        "source_table_id": "source-1",
+        "columns": [
+            {"column_index": 0, "column_name": "Name"},
+            {"column_index": 1, "column_name": "State"},
+            {"column_index": 2, "column_name": "Founded"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "text": "Alpha",
+                        "wiki_title": "SECRET_WIKIPEDIA_TITLE",
+                    },
+                    {"column_index": 1, "text": "Texas"},
+                    {"column_index": 2, "text": "1901"},
+                ],
+            }
+        ],
+        "metadata": {
+            "candidate_entity_columns": [0],
+            "column_profiles": [
+                {"column_index": 0, "non_empty_ratio": 1.0},
+                {"column_index": 1, "non_empty_ratio": 1.0},
+                {"column_index": 2, "non_empty_ratio": 1.0},
+            ],
+        },
+    }
+    args = argparse.Namespace(
+        query_rows_per_table=1,
+        min_rows_per_output_table=1,
+        min_column_non_empty_ratio=0.5,
+        text_model_name="text-model",
+        image_model_name="image-model",
+    )
+
+    tasks = joinability_dataset.collect_table_extraction_tasks(
+        source_table=source_table,
+        assets={
+            "asset-1": {
+                "asset_id": "asset-1",
+                "asset_type": "text",
+                "content": "Alpha is in Texas and was founded in 1901.",
+            }
+        },
+        entity_to_assets={"entity-1": ["asset-1"]},
+        wiki_to_entity_id={"SECRET_WIKIPEDIA_TITLE": "entity-1"},
+        args=args,
+    )
+
+    assert len(tasks) == 1
+    assert tasks[0].candidate_attribute_names == ["State", "Founded"]
+    assert tasks[0].entity["row_attributes"] == [
+        {"name": "Name", "value": "Alpha", "is_entity": True},
+        {"name": "State", "value": "Texas", "is_entity": False},
+        {"name": "Founded", "value": "1901", "is_entity": False},
+    ]
+
+
 def test_reparse_extraction_record_updates_old_cached_raw_response():
     cached = {
         "attributes": [{"name": "<attribute>", "value": "<value>", "evidence": "<quote>"}],
@@ -894,7 +1156,7 @@ def test_reparse_extraction_record_updates_old_cached_raw_response():
     updated, changed = reparse_extraction_record(cached, ["State"])
 
     assert changed
-    assert updated["attributes"] == [{"name": "State", "value": "Alabama", "evidence": "BAMA"}]
+    assert updated["attributes"] == [{"name": "State", "value": "Alabama"}]
 
 
 def _task(asset_type: str, suffix: str = "1") -> ExtractionTask:
@@ -2917,6 +3179,10 @@ def test_failed_precompute_result_is_reused_during_table_evaluation_only(tmp_pat
             str(tmp_path),
             "--output_dir",
             str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "1",
+            "--min_rows_per_output_table",
+            "1",
         ]
     )
     args.model_attribute_errors_path = str(tmp_path / "model_attribute_errors.jsonl")

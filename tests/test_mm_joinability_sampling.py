@@ -80,11 +80,14 @@ def write_entitables_file(path: Path, table_ids: list[str]) -> None:
         table_id: {
             "title": ["Entity", "Value"],
             "data": [
-                [f"[{table_id}_entity_1|{table_id} entity 1]", "alpha"],
-                [f"[{table_id}_entity_2|{table_id} entity 2]", "beta"],
+                [
+                    f"[{table_id}_entity_{row_index}|{table_id} entity {row_index}]",
+                    f"value {row_index}",
+                ]
+                for row_index in range(5)
             ],
             "numCols": 2,
-            "numDataRows": 2,
+            "numDataRows": 5,
         }
         for table_id in table_ids
     }
@@ -451,6 +454,8 @@ def test_global_sample_filters_tables_without_candidate_entity_column(
             "2",
             "--unrecoverable_replacement_rounds",
             "0",
+            "--query_rows_per_table",
+            "2",
         ]
     )
     counters = builder.SourceCandidateCounters()
@@ -462,6 +467,48 @@ def test_global_sample_filters_tables_without_candidate_entity_column(
     ]
     assert counters.skipped_tables == 1
     assert counters.skip_reasons == {"no_candidate_entity_column": 1}
+
+
+def test_global_sample_filters_tables_that_cannot_fill_one_query(tmp_path: Path) -> None:
+    payload = {
+        "too_short": {
+            "title": ["Entity", "Value"],
+            "data": [
+                [f"[Short_{row}|Short {row}]", f"value {row}"]
+                for row in range(4)
+            ],
+            "numCols": 2,
+            "numDataRows": 4,
+        },
+        "query_sized": {
+            "title": ["Entity", "Value"],
+            "data": [
+                [f"[Sized_{row}|Sized {row}]", f"value {row}"]
+                for row in range(5)
+            ],
+            "numCols": 2,
+            "numDataRows": 5,
+        },
+    }
+    (tmp_path / "tables.json").write_text(json.dumps(payload), encoding="utf-8")
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    counters = builder.SourceCandidateCounters()
+
+    selected = list(builder.iter_random_source_tables(tmp_path, args, counters))
+
+    assert [table["source_table_id"] for table in selected] == [
+        f"st_query_sized_{builder.stable_hash('tables.json', 'query_sized', length=10)}"
+    ]
+    assert counters.skip_reasons == {"too_few_candidate_entity_rows": 1}
 
 
 def test_global_capped_sample_scans_every_file_before_first_yield(
@@ -2224,7 +2271,8 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
     assert manifest["source_sampling"] == {
         "mode": "seeded_random_file_and_table_order",
         "seed": args.seed,
-        "entity_column_policy": "require_candidate_before_global_sampling",
+        "entity_column_policy": "require_query_sized_linked_candidate_before_global_sampling",
+        "min_linked_entity_rows": 5,
         "unrecoverable_replacement_rounds": 1,
         "unrecoverable_drop_probability": 1.0,
         "replacement_scope": "all_current_failed_slots",
@@ -2389,7 +2437,16 @@ def test_candidate_evaluation_registers_real_extraction_tasks_for_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     args = builder.parse_args(
-        ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "output")]
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "1",
+            "--min_rows_per_output_table",
+            "1",
+        ]
     )
     source_table = {
         "source_table_id": "table",

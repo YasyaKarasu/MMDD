@@ -153,8 +153,10 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.model_retry_sleep_seconds == 2.0
     assert args.materialization_workers == 1
     assert args.materialization_validation_workers == 3
+    assert args.max_train_query_row_views_per_join == 5
     config = PipelineConfig.from_args(args)
     assert config.materialization_validation_workers == 3
+    assert config.max_train_query_row_views_per_join == 5
     assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
         "selection",
@@ -201,6 +203,8 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
                 "8",
                 "--materialization_validation_workers",
                 "4",
+                "--max_train_query_row_views_per_join",
+                "7",
             ]
         )
     )
@@ -219,9 +223,33 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
     assert runtime_args.model_retry_sleep_seconds == 0.25
     assert runtime_args.materialization_workers == 8
     assert runtime_args.materialization_validation_workers == 4
+    assert runtime_args.max_train_query_row_views_per_join == 7
     assert config.model_endpoint_ready_timeout_seconds == 45.5
     assert config.materialization_workers == 8
     assert config.materialization_validation_workers == 4
+    assert config.max_train_query_row_views_per_join == 7
+
+
+def test_train_row_view_cap_changes_only_materialization_fingerprint(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    )
+    changed = replace(config, max_train_query_row_views_per_join=2)
+
+    for stage in STAGES:
+        fingerprints_match = pipeline_module._stage_config_fingerprint(
+            config, stage
+        ) == pipeline_module._stage_config_fingerprint(changed, stage)
+        assert fingerprints_match is (stage != "materialize")
 
 
 @pytest.mark.parametrize(

@@ -1864,6 +1864,12 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
         manifest["query_construction"]["identical_visible_query_policy"]
         == "merge_with_multiple_qrels"
     )
+    assert (
+        manifest["query_construction"]["query_row_selection"]
+        == "recovery_balanced_disjoint_train_views"
+    )
+    assert manifest["query_construction"]["max_train_query_row_views_per_join"] == 5
+    assert manifest["query_construction"]["evaluation_query_row_views_per_join"] == 1
     assert set(manifest["artifacts"]) == expected_directories
     assert all(
         "mtime_ns" in shard
@@ -1931,8 +1937,13 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     assert {path: path.stat().st_mtime_ns for path in published} == mtimes
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    ["wdc200k-materialization-v1", "wdc200k-materialization-v2"],
+)
 def test_legacy_published_materialization_schema_is_rebuilt(
     tmp_path: Path,
+    schema_version: str,
 ) -> None:
     output_root = tmp_path / "output"
     output_root.mkdir()
@@ -1940,7 +1951,7 @@ def test_legacy_published_materialization_schema_is_rebuilt(
         json.dumps(
             {
                 "stage": "wdc200k_materialization",
-                "schema_version": "wdc200k-materialization-v1",
+                "schema_version": schema_version,
                 "complete": True,
             }
         ),
@@ -2329,6 +2340,23 @@ def test_partial_materialization_resume_uses_verified_upstream_certificate(
         and event.get("resumed_source_units") == 1
         for event in progress
     )
+
+
+def test_certificate_tracks_sqlite_wal_but_ignores_transient_shm(
+    tmp_path: Path,
+) -> None:
+    inputs, _args = _authoritative_inputs(tmp_path)
+    database_path = Path(inputs.model_result.jobset.database_path).resolve()
+    wal_path = Path(f"{database_path}-wal")
+    shm_path = Path(f"{database_path}-shm")
+    wal_path.write_bytes(b"durable WAL input")
+    shm_path.write_bytes(b"transient SQLite coordination state")
+
+    certificate_paths = set(materializer._certificate_input_paths(inputs))
+
+    assert database_path in certificate_paths
+    assert wal_path.resolve() in certificate_paths
+    assert shm_path.resolve() not in certificate_paths
 
 
 @pytest.mark.parametrize(

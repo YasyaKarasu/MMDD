@@ -171,10 +171,73 @@ This builder intentionally does not generate:
 
 The output is a multimodal table dataset plus query workload, not a joinability benchmark label generator.
 
+## EntiTables Joinability with OpenAI
+
+`build_mm_joinability_dataset_openai.py` runs the existing EntiTables
+joinability builder with one non-streaming OpenAI Chat Completions model for
+both text and image attribute extraction. It reuses the same extraction prompt, parser,
+sampling, recovery rules, caches, and canonical output format as
+`build_mm_joinability_dataset.py`.
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional
+conda run --no-capture-output -n MMDD python \
+  scripts/build_mm_joinability_dataset_openai.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability_openai \
+  --cache_dir cache/mm_joinability \
+  --openai_model gpt-5.6 \
+  --openai_reasoning_effort none \
+  --text_model_workers 4 \
+  --image_model_workers 4 \
+  --openai_max_inflight 4
+```
+
+Instead of exporting secrets in an interactive shell, create a dotenv file
+that is already ignored by this repository:
+
+```dotenv
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+Set its permissions to `0600`. Both OpenAI builders automatically load
+`./.env.openai` when it exists; use
+`--openai_env_file /path/to/another.env` to select a different file. The
+loader accepts only those two variables and never executes the file as shell
+code. File values override stale values inherited from the shell; an explicit
+`--openai_base_url` still has the highest priority.
+
+The API key is read only from `--openai_api_key_env` (default
+`OPENAI_API_KEY`) and is never written to run metadata. The API base URL uses
+`OPENAI_BASE_URL` when set and can be overridden by
+`--openai_base_url`. Wikipedia downloads
+and the shared extraction-cache file remain under `--cache_dir`. Every OpenAI
+setting that can change a result is included in the provider model identity,
+so changing the model, reasoning effort, output limit, image detail, or image
+pixel budget cannot reuse incompatible extraction records. Fingerprinted run
+configuration and cumulative token usage are stored under
+`<output parent>/work_mm_joinability_openai/openai_model_runs/` by default;
+override that root with `--openai_work_root`.
+
+`--text_model_workers` and `--image_model_workers` still size the existing
+per-modality task pools. `--openai_max_inflight` (default `4`) is a shared cap
+across both pools. Optional `--openai_requests_per_minute` and
+`--openai_tokens_per_minute` values proactively pace the shared request stream;
+zero disables the corresponding limit. Transient responses use exponential
+backoff, honor `Retry-After`, and share the resulting cooldown across both
+modalities. EntiTables stops on an exhausted transient failure after caching
+successful calls, so rerunning resumes instead of treating rate limiting as a
+negative extraction result.
+
 ## WDC Schema.org 200K Joinability Pipeline
 
 `build_wdc200k_mm_joinability_dataset.py` is the staged, resumable entry point
 for the 200K-scale WDC Schema.org Table Corpus 2023 build.
+`build_wdc200k_mm_joinability_dataset_openai.py` runs the same staged pipeline
+with OpenAI inference and accepts the shared concurrency and rate-limit flags
+described above; exhausted transient model jobs remain retryable on resume.
 `build_wdc_mm_joinability_dataset.py` remains the legacy bounded builder; its
 row-limited examples and in-memory behavior are not the 200K operating model.
 
@@ -572,7 +635,7 @@ To inspect `build_mm_joinability_dataset.py` outputs in a browser, run:
 conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir output_mm_joinability --port 7863
 ```
 
-The viewer paginates through every `query_table_id -> target_table_id` pair in `qrels.jsonl` and shows the query table, target table, evidence recovery paths, and the referenced text/image material for each path.
+The viewer paginates through every `query_table_id -> target_table_id` pair in `qrels.jsonl` and shows the query table, target table, evidence recovery paths, and the referenced text/image material for each path. Train-time disjoint row views are grouped by `chain_id` and `row_view_index`; use the row-view filter to inspect canonical or augmented views separately. The viewer builds `<output_dir>/.mm_joinability_viewer.sqlite3` on first use and reuses it while the relevant dataset shards are unchanged, so WDC-scale datasets are browsed without retaining all tables and assets in memory. Use `--index_path` to place this generated index elsewhere.
 
 By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, `stage1_connection_viewer.py`, or `mm_joinability_dataset_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
 
