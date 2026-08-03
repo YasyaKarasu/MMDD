@@ -421,10 +421,34 @@ def _links() -> list[dict[str, Any]]:
     ]
 
 
+def _row_attributes_for_asset(
+    source_table: dict[str, Any],
+    asset: dict[str, Any],
+) -> list[dict[str, Any]]:
+    entity_col = join_builder.choose_entity_column(
+        source_table,
+        min_linked_rows=1,
+    )
+    assert entity_col is not None
+    wiki_title = str(asset["entity_wiki_title"])
+    source_row = next(
+        row
+        for row in source_table["rows"]
+        if str(join_builder.get_cell(row, entity_col).get("wiki_title"))
+        == wiki_title
+    )
+    return join_builder.extraction_row_attributes(
+        source_table,
+        source_row,
+        entity_col,
+    )
+
+
 def _extractions(
     args: argparse.Namespace,
     assets: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    source_table = _source_table()
     state_by_entity = {
         "entity-alpha": "Texas",
         "entity-beta": "Ohio",
@@ -432,12 +456,14 @@ def _extractions(
     records = []
     for asset in assets:
         entity_id = str(asset["entity_id"])
+        row_attributes = _row_attributes_for_asset(source_table, asset)
         cache_key = join_builder.extraction_cache_key(
             asset_id=str(asset["asset_id"]),
             entity_id=entity_id,
             candidate_attribute_names=["State", "Category"],
             asset_type="text",
             args=args,
+            row_attributes=row_attributes,
         )
         records.append(
             {
@@ -448,6 +474,7 @@ def _extractions(
                 "asset_id": asset["asset_id"],
                 "asset_type": "text",
                 "candidate_attribute_names": ["State", "Category"],
+                "row_attributes": row_attributes,
                 "attributes": [
                     {
                         "name": "State",
@@ -468,6 +495,7 @@ def _multi_attribute_extractions(
     assets: list[dict[str, Any]],
     context_column_names: list[str],
 ) -> list[dict[str, Any]]:
+    source_table = _multi_attribute_source_table(context_column_names)
     candidate_attribute_names = [
         "Bridge B",
         "Bridge C",
@@ -477,12 +505,14 @@ def _multi_attribute_extractions(
     for asset in assets:
         entity_id = str(asset["entity_id"])
         entity_name = entity_id.removeprefix("entity-").title()
+        row_attributes = _row_attributes_for_asset(source_table, asset)
         cache_key = join_builder.extraction_cache_key(
             asset_id=str(asset["asset_id"]),
             entity_id=entity_id,
             candidate_attribute_names=candidate_attribute_names,
             asset_type="text",
             args=args,
+            row_attributes=row_attributes,
         )
         records.append(
             {
@@ -493,6 +523,7 @@ def _multi_attribute_extractions(
                 "asset_id": asset["asset_id"],
                 "asset_type": "text",
                 "candidate_attribute_names": candidate_attribute_names,
+                "row_attributes": row_attributes,
                 "attributes": [
                     {
                         "name": column_name,

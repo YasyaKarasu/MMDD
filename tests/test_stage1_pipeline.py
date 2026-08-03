@@ -2510,7 +2510,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
         "numCols": 3,
         "numericColumns": [],
         "pgTitle": "Rejected Page",
-        "numDataRows": 4,
+        "numDataRows": 5,
         "secondTitle": "Section",
         "caption": "Caption",
         "data": [
@@ -2518,6 +2518,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
             ["[No_B|No B]", "Berlin", "Two"],
             ["[No_C|No C]", "Lisbon", "Three"],
             ["[No_D|No D]", "Dublin", "Four"],
+            ["[No_E|No E]", "Rome", "Five"],
         ],
     }
     (input_dir / "tables.json").write_text(json.dumps({"table_1": queryable_table, "table_2": rejected_table}), encoding="utf-8")
@@ -2533,10 +2534,6 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
                 "Alpha Page": "Paris",
                 "Beta Page": "Paris",
                 "Gamma Page": "Oslo",
-                "No A": "Madrid",
-                "No B": "Berlin",
-                "No C": "Lisbon",
-                "No D": "Dublin",
             }
             city = city_by_title.get(wiki_title, "")
             return {
@@ -2577,7 +2574,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
             "--max_source_tables",
             "2",
             "--max_entities",
-            "10",
+            "20",
             "--max_images_per_entity",
             "0",
             "--text_asset_chunk_chars",
@@ -2623,7 +2620,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert stats["rejected_source_tables"] == 1
     assert stats["qrels"] == 1
     assert stats["evidence_recoveries"] == 3
-    assert stats["attribute_extractions"] == 10
+    assert stats["attribute_extractions"] == 11
     assert stats["query_rows_per_table"] == 5
 
     query = read_manifest_artifact(output_dir, "query_tables")[0]
@@ -2666,10 +2663,13 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
         for item in resolved_data_lake
         if item["role"] == "raw_data_lake_table"
     )
-    assert len(resolved_rejected["rows"]) == 4
+    assert len(resolved_rejected["rows"]) == 5
     assert "source_table_ref" not in resolved_rejected
     assert manifest["query_construction"]["query_rows_per_table"] == 5
-    assert manifest["query_construction"]["query_row_selection"] == "recoverable_first"
+    assert (
+        manifest["query_construction"]["query_row_selection"]
+        == "recovery_balanced_disjoint_train_views"
+    )
     assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]
@@ -2688,7 +2688,8 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert [node["node_type"] for node in alpha["path_nodes"]] == ["query_table", "text_asset", "target_table"]
     assert alpha["evidence"]["asset_type"] == "text"
     assert "City: Paris" in alpha["evidence"]["content_snippet"]
-    assert alpha["evidence"]["model_evidence"] == "City: Paris"
+    assert alpha["evidence"]["model_evidence"] == ""
+    assert alpha["evidence"]["model_connection_evidence"] == ""
 
 
 def test_wikipedia_svg_download_converts_to_png_without_thumbnail(tmp_path, monkeypatch):
