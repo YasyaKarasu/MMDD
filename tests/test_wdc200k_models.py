@@ -3518,7 +3518,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         "page_title": "Thing",
         "caption": "",
         "section_title": "",
-        "num_rows": 1,
+        "num_rows": 5,
         "num_cols": 2,
         "columns": [
             {"column_index": 0, "column_name": "name"},
@@ -3526,13 +3526,13 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         ],
         "rows": [
             {
-                "row_id": 0,
+                "row_id": row_id,
                 "cells": [
                     {
                         "column_index": 0,
                         "column_name": "name",
-                        "text": "Alpha",
-                        "wiki_title": "wdc_alpha",
+                        "text": f"Alpha {row_id}",
+                        "wiki_title": f"wdc_alpha_{row_id}",
                     },
                     {
                         "column_index": 1,
@@ -3542,6 +3542,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
                     },
                 ],
             }
+            for row_id in range(5)
         ],
         "provenance_builder": "build_wdc_mm_joinability_dataset.py",
         "metadata": {
@@ -3560,36 +3561,40 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
             ],
         },
     }
-    entity_record = {
-        "entity_id": "entity-alpha",
-        "wiki_title": "wdc_alpha",
-        "display_texts": ["Alpha"],
-        "context_terms": ["State"],
-        "appears_in": [
-            {
-                "source_table_id": "source-1",
-                "query_view_id": None,
-                "row_id": 0,
-                "column_index": 0,
-                "column_name": "name",
-            }
-        ],
-        "page_url": "https://example.test/alpha",
-        "image_urls": [],
-    }
+    entity_records = [
+        {
+            "entity_id": f"entity-alpha-{row_id}",
+            "wiki_title": f"wdc_alpha_{row_id}",
+            "display_texts": [f"Alpha {row_id}"],
+            "context_terms": ["State"],
+            "appears_in": [
+                {
+                    "source_table_id": "source-1",
+                    "query_view_id": None,
+                    "row_id": row_id,
+                    "column_index": 0,
+                    "column_name": "name",
+                }
+            ],
+            "page_url": f"https://example.test/alpha-{row_id}",
+            "image_urls": [],
+        }
+        for row_id in range(5)
+    ]
     shard_records = {
         "source_tables/part-00000.jsonl": [source],
-        "entities/part-00000.jsonl": [entity_record],
+        "entities/part-00000.jsonl": entity_records,
         "page_refs/part-00000.jsonl": [
             {
-                "entity_id": "entity-alpha",
-                "page_url": "https://example.test/alpha",
+                "entity_id": f"entity-alpha-{row_id}",
+                "page_url": f"https://example.test/alpha-{row_id}",
             }
+            for row_id in range(5)
         ],
         "direct_image_refs/part-00000.jsonl": [],
         "structural_failures/part-00000.jsonl": [],
         "selection/validated-00000.jsonl": [
-            {"relative_path": "Thing/test.json.gz", "rows": 1}
+            {"relative_path": "Thing/test.json.gz", "rows": 5}
         ],
     }
     completed = []
@@ -3623,7 +3628,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         / "validated-selected-tables.jsonl"
     )
     final_writer.write(
-        {"relative_path": "Thing/test.json.gz", "rows": 1}
+        {"relative_path": "Thing/test.json.gz", "rows": 5}
     )
     final_completed = asdict(final_writer.commit())
     final_completed["path"] = (
@@ -3684,7 +3689,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
     asset_writer = AtomicJsonlShard(
         assets_root / "bridge_assets" / "part-00000.jsonl"
     )
-    asset_writer.write(asset("asset-alpha"))
+    asset_writer.write(asset("asset-alpha-0"))
     asset_completed = asdict(asset_writer.commit())
     asset_completed["path"] = "bridge_assets/part-00000.jsonl"
     link_writer = AtomicJsonlShard(
@@ -3694,8 +3699,8 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         {
             "source_table_id": "source-1",
             "row_id": 0,
-            "entity_id": "entity-alpha",
-            "asset_ids": ["asset-alpha"],
+            "entity_id": "entity-alpha-0",
+            "asset_ids": ["asset-alpha-0"],
         }
     )
     link_completed = asdict(link_writer.commit())
@@ -3732,11 +3737,13 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
 
     assert adapted.tasks == 1
     assert adapted.errors == 0
+    assert len(records) == 1
     assert records[0]["extraction_task"]["candidate_attribute_names"] == ["State"]
     assert (
         records[0]["extraction_task"]["entity"]["entity_id"]
-        == "entity-alpha"
+        == "entity-alpha-0"
     )
+    assert records[0]["extraction_task"]["source_row_id"] == 0
 
     index_path = adapted.output_root / "model-task-adapter.sqlite3"
     stale_tmp = adapted.output_root / ".stale-adapter.tmp"
