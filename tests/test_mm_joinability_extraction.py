@@ -1262,6 +1262,51 @@ def test_runtime_endpoint_file_is_authoritative_when_service_is_removed(tmp_path
     ]
 
 
+def test_remote_endpoint_pool_routes_separately_with_its_own_key(monkeypatch):
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            text_model_base_url="http://localhost:8001/v1",
+            text_model_api_key="local-key",
+            remote_text_model_base_url="http://remote.example:18001/v1",
+            remote_text_model_api_key="remote-key",
+            remote_text_model_workers=4,
+        )
+    )
+    calls = []
+
+    def chat(**kwargs):
+        calls.append(kwargs)
+        return '{"attributes":[]}'
+
+    monkeypatch.setattr(extractor, "chat", chat)
+    task = _task("text", "remote-route")
+
+    extractor.extract(
+        task.asset,
+        task.entity,
+        task.candidate_attribute_names,
+    )
+    extractor.extract_from_pool(
+        task.asset,
+        task.entity,
+        task.candidate_attribute_names,
+        endpoint_pool="remote",
+    )
+
+    assert [call["base_url"] for call in calls] == [
+        "http://localhost:8001/v1",
+        "http://remote.example:18001/v1",
+    ]
+    assert [call["api_key"] for call in calls] == ["local-key", "remote-key"]
+
+
+def test_remote_workers_require_a_remote_endpoint():
+    with pytest.raises(ValueError, match="remote text workers require"):
+        LocalAttributeExtractor(
+            _extractor_args(remote_text_model_workers=2)
+        )
+
+
 def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(tmp_path):
     text_server = VllmServerSpec(
         role="text",
@@ -2976,6 +3021,96 @@ def test_resolve_extraction_tasks_runs_text_and_image_pools_concurrently(tmp_pat
 
     assert [record["asset_type"] for _task_item, record in records] == ["text", "image"]
     assert all(not record["error"] for _task_item, record in records)
+
+
+def test_local_and_remote_text_pools_run_with_independent_worker_limits(tmp_path):
+    first_wave = threading.Barrier(4, timeout=2.0)
+
+    class PoolCountingExtractor:
+        def __init__(self):
+            self.active = {"local": 0, "remote": 0}
+            self.maximum = {"local": 0, "remote": 0}
+            self.calls = {"local": 0, "remote": 0}
+            self.lock = threading.Lock()
+
+        def _extract(self, endpoint_pool):
+            with self.lock:
+                self.active[endpoint_pool] += 1
+                self.calls[endpoint_pool] += 1
+                self.maximum[endpoint_pool] = max(
+                    self.maximum[endpoint_pool],
+                    self.active[endpoint_pool],
+                )
+                call_number = sum(self.calls.values())
+            try:
+                if call_number <= 4:
+                    first_wave.wait()
+                return {
+                    "attributes": [],
+                    "raw_response": '{"attributes":[]}',
+                    "error": "",
+                }
+            finally:
+                with self.lock:
+                    self.active[endpoint_pool] -= 1
+
+        def extract(self, asset, entity, candidate_attribute_names):
+            return self._extract("local")
+
+        def extract_from_pool(
+            self,
+            asset,
+            entity,
+            candidate_attribute_names,
+            *,
+            endpoint_pool,
+        ):
+            return self._extract(endpoint_pool)
+
+    extractor = PoolCountingExtractor()
+    state = ModelConcurrencyState(
+        text_workers=1,
+        image_workers=1,
+        remote_text_workers=3,
+    )
+
+    records = resolve_extraction_tasks(
+        extractor=extractor,
+        cache=ExtractionCache(tmp_path / "model_cache.jsonl"),
+        tasks=[_task("text", str(index)) for index in range(12)],
+        args=_parallel_args(
+            text_model_workers=1,
+            remote_text_model_workers=3,
+        ),
+        state=state,
+        progress=None,
+    )
+
+    assert len(records) == 12
+    assert extractor.maximum == {"local": 1, "remote": 3}
+    assert extractor.calls["local"] > 0
+    assert extractor.calls["remote"] > 0
+    assert state.text_workers == 1
+    assert state.remote_text_workers == 3
+
+
+def test_remote_oom_downgrade_does_not_change_local_concurrency():
+    state = ModelConcurrencyState(
+        text_workers=2,
+        image_workers=3,
+        remote_text_workers=8,
+        remote_image_workers=6,
+    )
+
+    assert state.downgrade_after_oom(
+        "image",
+        attempted_workers=6,
+        endpoint_pool="remote",
+    ) == 3
+    assert state.image_workers == 3
+    assert state.remote_image_workers == 3
+    assert state.image_oom_downgrades == 0
+    assert state.remote_image_oom_downgrades == 1
 
 
 def test_resolve_extraction_tasks_marks_progress_as_each_model_task_finishes(tmp_path):

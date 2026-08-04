@@ -171,6 +171,43 @@ This builder intentionally does not generate:
 
 The output is a multimodal table dataset plus query workload, not a joinability benchmark label generator.
 
+## EntiTables inference on local and remote GPUs
+
+`build_mm_joinability_dataset.py` can run local and remote OpenAI-compatible
+vLLM endpoints at the same time. Local and remote requests use independent
+worker limits. Within each modality, both worker groups consume one pending
+task queue, so a faster remote GPU naturally completes a larger share without
+raising the local GPU concurrency.
+
+The existing endpoint and worker options remain the local pool. Configure the
+remote pool separately:
+
+```bash
+export MMDD_REMOTE_TEXT_MODEL_API_KEY="..."   # optional
+export MMDD_REMOTE_IMAGE_MODEL_API_KEY="..."  # optional
+conda run --no-capture-output -n MMDD python \
+  scripts/build_mm_joinability_dataset.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability \
+  --text_model_base_url http://127.0.0.1:8001/v1 \
+  --image_model_base_url http://127.0.0.1:8000/v1 \
+  --text_model_workers 2 \
+  --image_model_workers 1 \
+  --remote_text_model_base_url http://127.0.0.1:18001/v1 \
+  --remote_image_model_base_url http://127.0.0.1:18000/v1 \
+  --remote_text_model_workers 12 \
+  --remote_image_model_workers 8
+```
+
+The example assumes SSH tunnels expose the remote services on ports 18001 and
+18000. The remote services must expose the same served model names selected by
+`--text_model_name` and `--image_model_name`. Repeat remote endpoints with
+`--remote_text_model_base_urls` / `--remote_image_model_base_urls`, or use the
+corresponding `*_base_urls_file` options for dynamic endpoint lists. A remote
+worker count of zero disables that remote modality. Remote API keys fall back
+to `VLLM_API_KEY` and then the matching local modality key when a dedicated key
+is not supplied.
+
 ## EntiTables Joinability with OpenAI
 
 `build_mm_joinability_dataset_openai.py` runs the existing EntiTables

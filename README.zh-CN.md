@@ -286,6 +286,39 @@ python scripts/build_mm_table_dataset.py `
 
 本脚本的目标是构造 multimodal table dataset + query workload，而不是构造 joinability benchmark labels。
 
+## EntiTables 同时使用本地与远程 GPU 推理
+
+`build_mm_joinability_dataset.py` 现在可以同时使用本地和远程的
+OpenAI-compatible vLLM endpoint。两组请求使用完全独立的并发上限；同一模态的本地
+worker 与远程 worker 从同一个待处理任务队列取任务，因此性能更好的远程显卡会自然
+处理更多任务，但不会抬高本地显卡的并发。
+
+原有 endpoint 和 worker 参数继续表示本地池，远程池使用单独参数：
+
+```bash
+export MMDD_REMOTE_TEXT_MODEL_API_KEY="..."   # 可选
+export MMDD_REMOTE_IMAGE_MODEL_API_KEY="..."  # 可选
+conda run --no-capture-output -n MMDD python \
+  scripts/build_mm_joinability_dataset.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability \
+  --text_model_base_url http://127.0.0.1:8001/v1 \
+  --image_model_base_url http://127.0.0.1:8000/v1 \
+  --text_model_workers 2 \
+  --image_model_workers 1 \
+  --remote_text_model_base_url http://127.0.0.1:18001/v1 \
+  --remote_image_model_base_url http://127.0.0.1:18000/v1 \
+  --remote_text_model_workers 12 \
+  --remote_image_model_workers 8
+```
+
+上例假设通过 SSH tunnel 把远程 text/image 服务映射到本机的 18001/18000 端口。
+远程服务暴露的 served model name 必须与 `--text_model_name`、
+`--image_model_name` 一致。多个远程 endpoint 可通过
+`--remote_text_model_base_urls` / `--remote_image_model_base_urls` 指定；动态列表可用
+对应的 `*_base_urls_file`。某一远程 worker 数为 `0` 时，该远程模态关闭。没有提供
+专用远程 key 时，会依次回退到 `VLLM_API_KEY` 和对应的本地模态 key。
+
 ## 使用 OpenAI 构造 EntiTables Joinability 数据集
 
 `build_mm_joinability_dataset_openai.py` 使用同一个非流式 OpenAI Chat Completions

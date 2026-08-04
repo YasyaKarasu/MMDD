@@ -20,6 +20,7 @@ import logging
 import math
 import mimetypes
 import os
+import queue
 import random
 import re
 import threading
@@ -1341,6 +1342,39 @@ class LocalAttributeExtractor:
             getattr(args, "text_model_api_key", None),
             "MMDD_TEXT_MODEL_API_KEY",
         )
+        configured_remote_text_urls = normalize_model_base_urls(
+            getattr(args, "remote_text_model_base_urls", None)
+        )
+        remote_text_url = clean_text(
+            getattr(args, "remote_text_model_base_url", "")
+        ).rstrip("/")
+        if remote_text_url:
+            configured_remote_text_urls = normalize_model_base_urls(
+                [remote_text_url, *configured_remote_text_urls]
+            )
+        self.remote_text_model_base_urls = configured_remote_text_urls
+        self.remote_text_model_base_urls_file = clean_text(
+            getattr(args, "remote_text_model_base_urls_file", "")
+        )
+        self._remote_text_endpoint_lock = threading.Lock()
+        self._remote_text_endpoint_index = 0
+        self._remote_text_endpoint_inflight: dict[str, int] = {}
+        self.remote_text_model_api_key = model_api_key(
+            getattr(args, "remote_text_model_api_key", None),
+            "MMDD_REMOTE_TEXT_MODEL_API_KEY",
+        ) or self.text_model_api_key
+        self.remote_text_model_workers = max(
+            0,
+            int(getattr(args, "remote_text_model_workers", 0) or 0),
+        )
+        if (
+            self.remote_text_model_workers
+            and not self.remote_text_model_base_urls
+            and not self.remote_text_model_base_urls_file
+        ):
+            raise ValueError(
+                "remote text workers require a remote text model endpoint"
+            )
         configured_image_urls = normalize_model_base_urls(getattr(args, "image_model_base_urls", None))
         fallback_image_url = clean_text(getattr(args, "image_model_base_url", "")).rstrip("/")
         if fallback_image_url:
@@ -1357,6 +1391,39 @@ class LocalAttributeExtractor:
             getattr(args, "image_model_api_key", None),
             "MMDD_IMAGE_MODEL_API_KEY",
         )
+        configured_remote_image_urls = normalize_model_base_urls(
+            getattr(args, "remote_image_model_base_urls", None)
+        )
+        remote_image_url = clean_text(
+            getattr(args, "remote_image_model_base_url", "")
+        ).rstrip("/")
+        if remote_image_url:
+            configured_remote_image_urls = normalize_model_base_urls(
+                [remote_image_url, *configured_remote_image_urls]
+            )
+        self.remote_image_model_base_urls = configured_remote_image_urls
+        self.remote_image_model_base_urls_file = clean_text(
+            getattr(args, "remote_image_model_base_urls_file", "")
+        )
+        self._remote_image_endpoint_lock = threading.Lock()
+        self._remote_image_endpoint_index = 0
+        self._remote_image_endpoint_inflight: dict[str, int] = {}
+        self.remote_image_model_api_key = model_api_key(
+            getattr(args, "remote_image_model_api_key", None),
+            "MMDD_REMOTE_IMAGE_MODEL_API_KEY",
+        ) or self.image_model_api_key
+        self.remote_image_model_workers = max(
+            0,
+            int(getattr(args, "remote_image_model_workers", 0) or 0),
+        )
+        if (
+            self.remote_image_model_workers
+            and not self.remote_image_model_base_urls
+            and not self.remote_image_model_base_urls_file
+        ):
+            raise ValueError(
+                "remote image workers require a remote image model endpoint"
+            )
         self.timeout = args.model_timeout_seconds
         self.temperature = args.model_temperature
         self.max_tokens = args.model_max_tokens
@@ -1399,6 +1466,26 @@ class LocalAttributeExtractor:
             self._text_endpoint_index += 1
             return urls[index]
 
+    def current_remote_text_model_base_urls(self) -> list[str]:
+        if self.remote_text_model_base_urls_file:
+            path = Path(self.remote_text_model_base_urls_file)
+            if path.exists():
+                try:
+                    return normalize_model_base_urls(path.read_text(encoding="utf-8"))
+                except OSError as exc:
+                    logging.warning("Failed to read remote text endpoint file %s: %s", path, exc)
+                    return []
+        return list(self.remote_text_model_base_urls)
+
+    def next_remote_text_model_base_url(self) -> str:
+        with self._remote_text_endpoint_lock:
+            urls = self.current_remote_text_model_base_urls()
+            if not urls:
+                raise RuntimeError("no remote text model endpoints are configured")
+            index = self._remote_text_endpoint_index % len(urls)
+            self._remote_text_endpoint_index += 1
+            return urls[index]
+
     def current_image_model_base_urls(self) -> list[str]:
         if self.image_model_base_urls_file:
             path = Path(self.image_model_base_urls_file)
@@ -1421,24 +1508,76 @@ class LocalAttributeExtractor:
             self._image_endpoint_index += 1
             return urls[index]
 
-    def _acquire_model_base_url(self, model_kind: str) -> str:
+    def current_remote_image_model_base_urls(self) -> list[str]:
+        if self.remote_image_model_base_urls_file:
+            path = Path(self.remote_image_model_base_urls_file)
+            if path.exists():
+                try:
+                    return normalize_model_base_urls(path.read_text(encoding="utf-8"))
+                except OSError as exc:
+                    logging.warning("Failed to read remote image endpoint file %s: %s", path, exc)
+                    return []
+        return list(self.remote_image_model_base_urls)
+
+    def next_remote_image_model_base_url(self) -> str:
+        with self._remote_image_endpoint_lock:
+            urls = self.current_remote_image_model_base_urls()
+            if not urls:
+                raise RuntimeError("no remote image model endpoints are configured")
+            index = self._remote_image_endpoint_index % len(urls)
+            self._remote_image_endpoint_index += 1
+            return urls[index]
+
+    def _endpoint_pool_state(
+        self,
+        model_kind: str,
+        endpoint_pool: str,
+    ) -> tuple[
+        threading.Lock,
+        Callable[[], list[str]],
+        dict[str, int],
+        str,
+    ]:
+        if endpoint_pool not in {"local", "remote"}:
+            raise ValueError(f"unsupported endpoint pool: {endpoint_pool}")
+        prefix = "_remote" if endpoint_pool == "remote" else ""
         if model_kind == "text":
-            lock = self._text_endpoint_lock
-            urls_getter = self.current_text_model_base_urls
-            inflight = self._text_endpoint_inflight
-            index_name = "_text_endpoint_index"
+            urls_getter = (
+                self.current_remote_text_model_base_urls
+                if endpoint_pool == "remote"
+                else self.current_text_model_base_urls
+            )
         elif model_kind == "image":
-            lock = self._image_endpoint_lock
-            urls_getter = self.current_image_model_base_urls
-            inflight = self._image_endpoint_inflight
-            index_name = "_image_endpoint_index"
+            urls_getter = (
+                self.current_remote_image_model_base_urls
+                if endpoint_pool == "remote"
+                else self.current_image_model_base_urls
+            )
         else:
             raise ValueError(f"unsupported model kind: {model_kind}")
+        return (
+            getattr(self, f"{prefix}_{model_kind}_endpoint_lock"),
+            urls_getter,
+            getattr(self, f"{prefix}_{model_kind}_endpoint_inflight"),
+            f"{prefix}_{model_kind}_endpoint_index",
+        )
+
+    def _acquire_model_base_url(
+        self,
+        model_kind: str,
+        endpoint_pool: str = "local",
+    ) -> str:
+        lock, urls_getter, inflight, index_name = self._endpoint_pool_state(
+            model_kind,
+            endpoint_pool,
+        )
 
         with lock:
             urls = urls_getter()
             if not urls:
-                raise RuntimeError(f"no {model_kind} model endpoints are configured")
+                raise RuntimeError(
+                    f"no {endpoint_pool} {model_kind} model endpoints are configured"
+                )
             minimum_inflight = min(inflight.get(url, 0) for url in urls)
             candidates = [
                 url
@@ -1451,15 +1590,16 @@ class LocalAttributeExtractor:
             inflight[base_url] = inflight.get(base_url, 0) + 1
             return base_url
 
-    def _release_model_base_url(self, model_kind: str, base_url: str) -> None:
-        if model_kind == "text":
-            lock = self._text_endpoint_lock
-            inflight = self._text_endpoint_inflight
-        elif model_kind == "image":
-            lock = self._image_endpoint_lock
-            inflight = self._image_endpoint_inflight
-        else:
-            raise ValueError(f"unsupported model kind: {model_kind}")
+    def _release_model_base_url(
+        self,
+        model_kind: str,
+        base_url: str,
+        endpoint_pool: str = "local",
+    ) -> None:
+        lock, _urls_getter, inflight, _index_name = self._endpoint_pool_state(
+            model_kind,
+            endpoint_pool,
+        )
 
         with lock:
             count = inflight.get(base_url, 0)
@@ -1469,22 +1609,30 @@ class LocalAttributeExtractor:
                 inflight[base_url] = count - 1
 
     @contextmanager
-    def lease_model_base_url(self, model_kind: str) -> Iterator[str]:
+    def lease_model_base_url(
+        self,
+        model_kind: str,
+        endpoint_pool: str = "local",
+    ) -> Iterator[str]:
         """Lease the least-loaded current endpoint for one complete model call."""
 
-        base_url = self._acquire_model_base_url(model_kind)
+        base_url = self._acquire_model_base_url(model_kind, endpoint_pool)
         try:
             yield base_url
         finally:
-            self._release_model_base_url(model_kind, base_url)
+            self._release_model_base_url(model_kind, base_url, endpoint_pool)
 
-    def _endpoint_is_current(self, model_kind: str, base_url: str) -> bool:
-        if model_kind == "text":
-            urls = self.current_text_model_base_urls()
-        elif model_kind == "image":
-            urls = self.current_image_model_base_urls()
-        else:
-            raise ValueError(f"unsupported model kind: {model_kind}")
+    def _endpoint_is_current(
+        self,
+        model_kind: str,
+        base_url: str,
+        endpoint_pool: str = "local",
+    ) -> bool:
+        _lock, urls_getter, _inflight, _index_name = self._endpoint_pool_state(
+            model_kind,
+            endpoint_pool,
+        )
+        urls = urls_getter()
         return base_url in urls
 
     def _probe_endpoint(
@@ -1559,19 +1707,53 @@ class LocalAttributeExtractor:
         if not math.isfinite(poll_seconds) or poll_seconds < 0:
             raise ValueError("poll_seconds must be a finite non-negative number")
 
-        endpoint_configs: list[tuple[str, str, str, str | None]] = []
+        endpoint_configs: list[tuple[str, str, str, str, str | None]] = []
         for model_kind in ("text", "image"):
             if model_kind not in modalities:
                 continue
             if model_kind == "text":
-                urls = self.current_text_model_base_urls()
                 model = self.text_model_name
-                api_key = self.text_model_api_key
+                pools = [
+                    (
+                        "local",
+                        self.current_text_model_base_urls(),
+                        self.text_model_api_key,
+                    )
+                ]
+                if self.remote_text_model_workers:
+                    pools.append(
+                        (
+                            "remote",
+                            self.current_remote_text_model_base_urls(),
+                            self.remote_text_model_api_key,
+                        )
+                    )
             else:
-                urls = self.current_image_model_base_urls()
                 model = self.image_model_name
-                api_key = self.image_model_api_key
-            endpoint_configs.extend((model_kind, url, model, api_key) for url in urls)
+                pools = [
+                    (
+                        "local",
+                        self.current_image_model_base_urls(),
+                        self.image_model_api_key,
+                    )
+                ]
+                if self.remote_image_model_workers:
+                    pools.append(
+                        (
+                            "remote",
+                            self.current_remote_image_model_base_urls(),
+                            self.remote_image_model_api_key,
+                        )
+                    )
+            for endpoint_pool, urls, api_key in pools:
+                if not urls:
+                    raise TransientModelEndpointError(
+                        f"no {endpoint_pool} {model_kind} model endpoints are currently configured"
+                    )
+                endpoint_configs.extend(
+                    (endpoint_pool, model_kind, url, model, api_key)
+                    for url in urls
+                )
 
         configured_request_timeout = float(self.timeout)
         if not math.isfinite(configured_request_timeout) or configured_request_timeout <= 0:
@@ -1580,8 +1762,8 @@ class LocalAttributeExtractor:
         deadline = time.monotonic() + timeout_seconds
         while True:
             retry_error: TransientModelEndpointError | None = None
-            for model_kind, url, model, api_key in endpoint_configs:
-                if not self._endpoint_is_current(model_kind, url):
+            for endpoint_pool, model_kind, url, model, api_key in endpoint_configs:
+                if not self._endpoint_is_current(model_kind, url, endpoint_pool):
                     continue
                 if single_probe:
                     request_timeout = min(configured_request_timeout, 1.0)
@@ -1599,7 +1781,11 @@ class LocalAttributeExtractor:
                             f"{model_kind} model endpoint {url} readiness deadline expired"
                         )
                 except TransientModelEndpointError as error:
-                    if not self._endpoint_is_current(model_kind, url):
+                    if not self._endpoint_is_current(
+                        model_kind,
+                        url,
+                        endpoint_pool,
+                    ):
                         logging.info(
                             "Ignoring readiness failure for withdrawn %s endpoint %s",
                             model_kind,
@@ -1609,7 +1795,11 @@ class LocalAttributeExtractor:
                     retry_error = error
                     break
                 except RuntimeError:
-                    if not self._endpoint_is_current(model_kind, url):
+                    if not self._endpoint_is_current(
+                        model_kind,
+                        url,
+                        endpoint_pool,
+                    ):
                         logging.info(
                             "Ignoring readiness failure for withdrawn %s endpoint %s",
                             model_kind,
@@ -1736,7 +1926,46 @@ class LocalAttributeExtractor:
             "Do not guess. Do not include attributes outside the candidate list."
         )
 
-    def extract(self, asset: dict[str, Any], entity: dict[str, Any], candidate_attributes: list[str]) -> dict[str, Any]:
+    @contextmanager
+    def _lease_endpoint_pool(
+        self,
+        model_kind: str,
+        endpoint_pool: str,
+    ) -> Iterator[str]:
+        if endpoint_pool == "local":
+            # Preserve subclasses whose lease method predates endpoint pools.
+            with self.lease_model_base_url(model_kind) as base_url:
+                yield base_url
+            return
+        with self.lease_model_base_url(
+            model_kind,
+            endpoint_pool=endpoint_pool,
+        ) as base_url:
+            yield base_url
+
+    def extract(
+        self,
+        asset: dict[str, Any],
+        entity: dict[str, Any],
+        candidate_attributes: list[str],
+    ) -> dict[str, Any]:
+        return self.extract_from_pool(
+            asset,
+            entity,
+            candidate_attributes,
+            endpoint_pool="local",
+        )
+
+    def extract_from_pool(
+        self,
+        asset: dict[str, Any],
+        entity: dict[str, Any],
+        candidate_attributes: list[str],
+        *,
+        endpoint_pool: str,
+    ) -> dict[str, Any]:
+        if endpoint_pool not in {"local", "remote"}:
+            raise ValueError(f"unsupported endpoint pool: {endpoint_pool}")
         prompt = self.extraction_prompt(
             entity_text=clean_text(entity.get("cell_text")),
             row_attributes=canonical_extraction_row_attributes(
@@ -1750,11 +1979,16 @@ class LocalAttributeExtractor:
                 {"role": "system", "content": "You are a precise information extraction engine."},
                 {"role": "user", "content": f"{prompt}\n\nIndependent text material:\n{content}"},
             ]
-            with self.lease_model_base_url("text") as base_url:
+            api_key = (
+                self.remote_text_model_api_key
+                if endpoint_pool == "remote"
+                else self.text_model_api_key
+            )
+            with self._lease_endpoint_pool("text", endpoint_pool) as base_url:
                 raw = self.chat(
                     base_url=base_url,
                     model=self.text_model_name,
-                    api_key=self.text_model_api_key,
+                    api_key=api_key,
                     messages=messages,
                     model_kind="text",
                 )
@@ -1779,11 +2013,16 @@ class LocalAttributeExtractor:
                 },
             ]
             try:
-                with self.lease_model_base_url("image") as base_url:
+                api_key = (
+                    self.remote_image_model_api_key
+                    if endpoint_pool == "remote"
+                    else self.image_model_api_key
+                )
+                with self._lease_endpoint_pool("image", endpoint_pool) as base_url:
                     raw = self.chat(
                         base_url=base_url,
                         model=self.image_model_name,
-                        api_key=self.image_model_api_key,
+                        api_key=api_key,
                         messages=messages,
                         model_kind="image",
                     )
@@ -1805,11 +2044,11 @@ class LocalAttributeExtractor:
                     },
                 }
                 retry_messages[1]["content"] = retry_content
-                with self.lease_model_base_url("image") as base_url:
+                with self._lease_endpoint_pool("image", endpoint_pool) as base_url:
                     raw = self.chat(
                         base_url=base_url,
                         model=self.image_model_name,
-                        api_key=self.image_model_api_key,
+                        api_key=api_key,
                         messages=retry_messages,
                         model_kind="image",
                     )
@@ -1966,14 +2205,22 @@ class ExtractionTask:
 class ModelConcurrencyState:
     text_workers: int
     image_workers: int
+    remote_text_workers: int = 0
+    remote_image_workers: int = 0
     text_oom_downgrades: int = 0
     image_oom_downgrades: int = 0
+    remote_text_oom_downgrades: int = 0
+    remote_image_oom_downgrades: int = 0
     target_text_workers: int | None = None
     target_image_workers: int | None = None
+    target_remote_text_workers: int | None = None
+    target_remote_image_workers: int | None = None
 
     def __post_init__(self) -> None:
         self.text_workers = max(1, int(self.text_workers or 1))
         self.image_workers = max(1, int(self.image_workers or 1))
+        self.remote_text_workers = max(0, int(self.remote_text_workers or 0))
+        self.remote_image_workers = max(0, int(self.remote_image_workers or 0))
         if self.target_text_workers is None:
             self.target_text_workers = self.text_workers
         else:
@@ -1984,48 +2231,106 @@ class ModelConcurrencyState:
             self.target_image_workers = max(1, int(self.target_image_workers or 1))
         self.target_text_workers = max(self.target_text_workers, self.text_workers)
         self.target_image_workers = max(self.target_image_workers, self.image_workers)
+        if self.target_remote_text_workers is None:
+            self.target_remote_text_workers = self.remote_text_workers
+        else:
+            self.target_remote_text_workers = max(
+                0,
+                int(self.target_remote_text_workers or 0),
+            )
+        if self.target_remote_image_workers is None:
+            self.target_remote_image_workers = self.remote_image_workers
+        else:
+            self.target_remote_image_workers = max(
+                0,
+                int(self.target_remote_image_workers or 0),
+            )
+        self.target_remote_text_workers = max(
+            self.target_remote_text_workers,
+            self.remote_text_workers,
+        )
+        self.target_remote_image_workers = max(
+            self.target_remote_image_workers,
+            self.remote_image_workers,
+        )
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "ModelConcurrencyState":
         text_workers = max(1, int(getattr(args, "text_model_workers", 1) or 1))
         image_workers = max(1, int(getattr(args, "image_model_workers", 1) or 1))
+        remote_text_workers = max(
+            0,
+            int(getattr(args, "remote_text_model_workers", 0) or 0),
+        )
+        remote_image_workers = max(
+            0,
+            int(getattr(args, "remote_image_model_workers", 0) or 0),
+        )
         return cls(
             text_workers=text_workers,
             image_workers=image_workers,
+            remote_text_workers=remote_text_workers,
+            remote_image_workers=remote_image_workers,
             target_text_workers=text_workers,
             target_image_workers=image_workers,
+            target_remote_text_workers=remote_text_workers,
+            target_remote_image_workers=remote_image_workers,
         )
 
-    def workers_for(self, model_kind: str) -> int:
-        return self.image_workers if model_kind == "image" else self.text_workers
+    def workers_for(self, model_kind: str, endpoint_pool: str = "local") -> int:
+        prefix = "remote_" if endpoint_pool == "remote" else ""
+        return int(getattr(self, f"{prefix}{model_kind}_workers"))
 
-    def downgrade_after_oom(self, model_kind: str, attempted_workers: int | None = None) -> int:
-        attempted_workers = max(1, int(attempted_workers or self.workers_for(model_kind)))
+    def downgrade_after_oom(
+        self,
+        model_kind: str,
+        attempted_workers: int | None = None,
+        endpoint_pool: str = "local",
+    ) -> int:
+        worker_name = (
+            f"remote_{model_kind}_workers"
+            if endpoint_pool == "remote"
+            else f"{model_kind}_workers"
+        )
+        downgrade_name = (
+            f"remote_{model_kind}_oom_downgrades"
+            if endpoint_pool == "remote"
+            else f"{model_kind}_oom_downgrades"
+        )
+        current_workers = self.workers_for(model_kind, endpoint_pool)
+        attempted_workers = max(1, int(attempted_workers or current_workers))
         next_workers = max(1, (attempted_workers + 1) // 2)
-        if model_kind == "image":
-            if self.image_workers > 1:
-                self.image_oom_downgrades += 1
-            self.image_workers = next_workers
-            return self.image_workers
-        else:
-            if self.text_workers > 1:
-                self.text_oom_downgrades += 1
-            self.text_workers = next_workers
-            return self.text_workers
+        if current_workers > 1:
+            setattr(self, downgrade_name, getattr(self, downgrade_name) + 1)
+        setattr(self, worker_name, next_workers)
+        return next_workers
 
-    def recover_after_non_oom_window(self, model_kind: str) -> int:
-        if model_kind == "image":
-            self.image_workers = min(self.target_image_workers or self.image_workers, self.image_workers + 1)
-            return self.image_workers
-        self.text_workers = min(self.target_text_workers or self.text_workers, self.text_workers + 1)
-        return self.text_workers
+    def recover_after_non_oom_window(
+        self,
+        model_kind: str,
+        endpoint_pool: str = "local",
+    ) -> int:
+        prefix = "remote_" if endpoint_pool == "remote" else ""
+        worker_name = f"{prefix}{model_kind}_workers"
+        target_name = f"target_{prefix}{model_kind}_workers"
+        current_workers = int(getattr(self, worker_name))
+        target_workers = int(getattr(self, target_name) or current_workers)
+        if current_workers <= 0:
+            return current_workers
+        next_workers = min(target_workers, current_workers + 1)
+        setattr(self, worker_name, next_workers)
+        return next_workers
 
     def summary(self) -> dict[str, int]:
         return {
             "text_workers": self.text_workers,
             "image_workers": self.image_workers,
+            "remote_text_workers": self.remote_text_workers,
+            "remote_image_workers": self.remote_image_workers,
             "text_oom_downgrades": self.text_oom_downgrades,
             "image_oom_downgrades": self.image_oom_downgrades,
+            "remote_text_oom_downgrades": self.remote_text_oom_downgrades,
+            "remote_image_oom_downgrades": self.remote_image_oom_downgrades,
         }
 
 
@@ -2073,9 +2378,30 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
     return record
 
 
-def run_extraction_task(extractor: LocalAttributeExtractor, task: ExtractionTask) -> dict[str, Any]:
+def run_extraction_task(
+    extractor: LocalAttributeExtractor,
+    task: ExtractionTask,
+    endpoint_pool: str = "local",
+) -> dict[str, Any]:
     try:
-        result = extractor.extract(task.asset, task.entity, task.candidate_attribute_names)
+        if endpoint_pool == "local":
+            result = extractor.extract(
+                task.asset,
+                task.entity,
+                task.candidate_attribute_names,
+            )
+        else:
+            extract_from_pool = getattr(extractor, "extract_from_pool", None)
+            if not callable(extract_from_pool):
+                raise RuntimeError(
+                    "extractor does not support remote endpoint pools"
+                )
+            result = extract_from_pool(
+                task.asset,
+                task.entity,
+                task.candidate_attribute_names,
+                endpoint_pool=endpoint_pool,
+            )
     except TransientModelEndpointError:
         result = {
             "attributes": [],
@@ -2093,6 +2419,7 @@ def run_extraction_task_group(
     extractor: LocalAttributeExtractor,
     tasks: list[ExtractionTask],
     workers: int,
+    endpoint_pool: str = "local",
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not tasks:
@@ -2101,7 +2428,7 @@ def run_extraction_task_group(
     if workers == 1:
         records = {}
         for task in tasks:
-            record = run_extraction_task(extractor, task)
+            record = run_extraction_task(extractor, task, endpoint_pool)
             records[task.cache_key] = record
             if on_record is not None:
                 on_record(task.cache_key, record)
@@ -2109,7 +2436,15 @@ def run_extraction_task_group(
 
     records: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_task = {pool.submit(run_extraction_task, extractor, task): task for task in tasks}
+        future_to_task = {
+            pool.submit(
+                run_extraction_task,
+                extractor,
+                task,
+                endpoint_pool,
+            ): task
+            for task in tasks
+        }
         for future in as_completed(future_to_task):
             task = future_to_task[future]
             try:
@@ -2130,9 +2465,12 @@ def run_extraction_kind_adaptive(
     tasks: list[ExtractionTask],
     model_kind: str,
     state: ModelConcurrencyState,
+    endpoint_pool: str = "local",
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    configured_workers = state.workers_for(model_kind)
+    configured_workers = state.workers_for(model_kind, endpoint_pool)
+    if configured_workers <= 0:
+        return {}
     workers = max(1, min(configured_workers, len(tasks)))
     delayed_oom_records: dict[str, dict[str, Any]] = {}
 
@@ -2147,6 +2485,7 @@ def run_extraction_kind_adaptive(
         extractor=extractor,
         tasks=tasks,
         workers=workers,
+        endpoint_pool=endpoint_pool,
         on_record=handle_initial_record,
     )
     oom_tasks = [
@@ -2155,13 +2494,17 @@ def run_extraction_kind_adaptive(
         if task.cache_key in delayed_oom_records
     ]
     if oom_tasks and workers > 1:
-        next_workers = state.downgrade_after_oom(model_kind, attempted_workers=workers)
+        next_workers = state.downgrade_after_oom(
+            model_kind,
+            attempted_workers=workers,
+            endpoint_pool=endpoint_pool,
+        )
         logging.warning(
-            "%s model hit OOM-like errors with %d workers; retrying %d failed tasks serially and downgrading future %s workers to %d",
+            "%s %s model pool hit OOM-like errors with %d workers; retrying %d failed tasks serially and downgrading future workers to %d",
+            endpoint_pool,
             model_kind,
             workers,
             len(oom_tasks),
-            model_kind,
             next_workers,
         )
         records.update(
@@ -2169,11 +2512,130 @@ def run_extraction_kind_adaptive(
                 extractor=extractor,
                 tasks=oom_tasks,
                 workers=1,
+                endpoint_pool=endpoint_pool,
                 on_record=on_record,
             )
         )
     elif tasks and workers == configured_workers:
-        state.recover_after_non_oom_window(model_kind)
+        state.recover_after_non_oom_window(model_kind, endpoint_pool)
+    return records
+
+
+def run_extraction_kind_distributed(
+    *,
+    extractor: LocalAttributeExtractor,
+    tasks: list[ExtractionTask],
+    model_kind: str,
+    state: ModelConcurrencyState,
+    on_record: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Let independent local and remote worker groups consume one task queue."""
+
+    configured_workers = {
+        endpoint_pool: state.workers_for(model_kind, endpoint_pool)
+        for endpoint_pool in ("local", "remote")
+    }
+    configured_workers = {
+        endpoint_pool: workers
+        for endpoint_pool, workers in configured_workers.items()
+        if workers > 0
+    }
+    if len(configured_workers) == 1:
+        endpoint_pool = next(iter(configured_workers))
+        return run_extraction_kind_adaptive(
+            extractor=extractor,
+            tasks=tasks,
+            model_kind=model_kind,
+            state=state,
+            endpoint_pool=endpoint_pool,
+            on_record=on_record,
+        )
+    if not tasks:
+        return {}
+
+    task_queue: queue.Queue[ExtractionTask] = queue.Queue()
+    result_queue: queue.Queue[
+        tuple[str, ExtractionTask, dict[str, Any]]
+    ] = queue.Queue()
+    for task in tasks:
+        task_queue.put(task)
+
+    worker_specs: list[str] = []
+    worker_limit = min(len(tasks), sum(configured_workers.values()))
+    while len(worker_specs) < worker_limit:
+        made_progress = False
+        for endpoint_pool in ("local", "remote"):
+            if worker_specs.count(endpoint_pool) >= configured_workers.get(
+                endpoint_pool,
+                0,
+            ):
+                continue
+            worker_specs.append(endpoint_pool)
+            made_progress = True
+            if len(worker_specs) >= worker_limit:
+                break
+        if not made_progress:
+            break
+
+    def consume(endpoint_pool: str) -> None:
+        while True:
+            try:
+                task = task_queue.get_nowait()
+            except queue.Empty:
+                return
+            record = run_extraction_task(extractor, task, endpoint_pool)
+            result_queue.put((endpoint_pool, task, record))
+
+    records: dict[str, dict[str, Any]] = {}
+    delayed_oom_tasks: dict[str, list[ExtractionTask]] = defaultdict(list)
+    processed_by_pool: Counter[str] = Counter()
+    with ThreadPoolExecutor(
+        max_workers=len(worker_specs),
+        thread_name_prefix=f"{model_kind}-model",
+    ) as pool:
+        futures = [pool.submit(consume, endpoint_pool) for endpoint_pool in worker_specs]
+        for _ in tasks:
+            endpoint_pool, task, record = result_queue.get()
+            processed_by_pool[endpoint_pool] += 1
+            records[task.cache_key] = record
+            if (
+                configured_workers[endpoint_pool] > 1
+                and is_oom_error(record.get("error"))
+            ):
+                delayed_oom_tasks[endpoint_pool].append(task)
+            elif on_record is not None:
+                on_record(task.cache_key, record)
+        for future in futures:
+            future.result()
+
+    for endpoint_pool, processed in processed_by_pool.items():
+        oom_tasks = delayed_oom_tasks.get(endpoint_pool, [])
+        spawned_workers = worker_specs.count(endpoint_pool)
+        if oom_tasks:
+            next_workers = state.downgrade_after_oom(
+                model_kind,
+                attempted_workers=spawned_workers,
+                endpoint_pool=endpoint_pool,
+            )
+            logging.warning(
+                "%s %s model pool hit OOM-like errors with %d workers; retrying %d failed tasks serially and downgrading future workers to %d",
+                endpoint_pool,
+                model_kind,
+                spawned_workers,
+                len(oom_tasks),
+                next_workers,
+            )
+            records.update(
+                run_extraction_task_group(
+                    extractor=extractor,
+                    tasks=oom_tasks,
+                    workers=1,
+                    endpoint_pool=endpoint_pool,
+                    on_record=on_record,
+                )
+            )
+        elif processed and spawned_workers == configured_workers[endpoint_pool]:
+            state.recover_after_non_oom_window(model_kind, endpoint_pool)
     return records
 
 
@@ -2192,8 +2654,13 @@ def run_uncached_extraction_tasks(
     active_groups = [(kind, group_tasks) for kind, group_tasks in groups.items() if group_tasks]
     if len(active_groups) <= 1:
         for kind, group_tasks in active_groups:
+            runner = (
+                run_extraction_kind_distributed
+                if state.workers_for(kind, "remote") > 0
+                else run_extraction_kind_adaptive
+            )
             records.update(
-                run_extraction_kind_adaptive(
+                runner(
                     extractor=extractor,
                     tasks=group_tasks,
                     model_kind=kind,
@@ -2206,7 +2673,11 @@ def run_uncached_extraction_tasks(
     with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
         futures = {
             pool.submit(
-                run_extraction_kind_adaptive,
+                (
+                    run_extraction_kind_distributed
+                    if state.workers_for(kind, "remote") > 0
+                    else run_extraction_kind_adaptive
+                ),
                 extractor=extractor,
                 tasks=group_tasks,
                 model_kind=kind,
@@ -4643,10 +5114,16 @@ def _build_dataset(
             "text_model_base_url": args.text_model_base_url,
             "text_model_base_urls": getattr(args, "text_model_base_urls", None),
             "text_model_base_urls_file": getattr(args, "text_model_base_urls_file", None),
+            "remote_text_model_base_url": getattr(args, "remote_text_model_base_url", None),
+            "remote_text_model_base_urls": getattr(args, "remote_text_model_base_urls", None),
+            "remote_text_model_base_urls_file": getattr(args, "remote_text_model_base_urls_file", None),
             "text_model_name": args.text_model_name,
             "image_model_base_url": args.image_model_base_url,
             "image_model_base_urls": getattr(args, "image_model_base_urls", None),
             "image_model_base_urls_file": getattr(args, "image_model_base_urls_file", None),
+            "remote_image_model_base_url": getattr(args, "remote_image_model_base_url", None),
+            "remote_image_model_base_urls": getattr(args, "remote_image_model_base_urls", None),
+            "remote_image_model_base_urls_file": getattr(args, "remote_image_model_base_urls_file", None),
             "image_model_name": args.image_model_name,
             "prompt_version": PROMPT_VERSION,
             "image_model_max_tokens": getattr(args, "image_model_max_tokens", DEFAULT_IMAGE_MODEL_MAX_TOKENS),
@@ -4665,6 +5142,8 @@ def _build_dataset(
             "context_retry_image_max_pixels": args.context_retry_image_max_pixels,
             "configured_text_model_workers": args.text_model_workers,
             "configured_image_model_workers": args.image_model_workers,
+            "configured_remote_text_model_workers": getattr(args, "remote_text_model_workers", 0),
+            "configured_remote_image_model_workers": getattr(args, "remote_image_model_workers", 0),
             "final_model_concurrency": stats["model_concurrency"],
             "inference_stats": stats["model_inference"],
         },
@@ -4826,13 +5305,21 @@ def parse_args(
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None, help="Additional text-model OpenAI-compatible base URLs. Values may also be comma-separated.")
     parser.add_argument("--text_model_base_urls_file", default=None, help="Optional newline-separated text-model base URL file re-read before each text request. Dynamic vLLM runners can append endpoints here.")
+    parser.add_argument("--remote_text_model_base_url", default=None, help="Primary remote text-model OpenAI-compatible base URL. Kept in a separate concurrency pool from local endpoints.")
+    parser.add_argument("--remote_text_model_base_urls", nargs="*", default=None, help="Additional remote text-model base URLs for the remote pool. Values may also be comma-separated.")
+    parser.add_argument("--remote_text_model_base_urls_file", default=None, help="Optional newline-separated remote text endpoint file re-read before each remote request.")
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
     parser.add_argument("--text_model_api_key", default=None)
+    parser.add_argument("--remote_text_model_api_key", default=None, help="Remote text endpoint API key. Falls back to MMDD_REMOTE_TEXT_MODEL_API_KEY, then the local text key/VLLM_API_KEY.")
     parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
     parser.add_argument("--image_model_base_urls", nargs="*", default=None, help="Additional image-model OpenAI-compatible base URLs. Values may also be comma-separated.")
     parser.add_argument("--image_model_base_urls_file", default=None, help="Optional newline-separated image-model base URL file re-read before each image request. Dynamic vLLM runners can append endpoints here.")
+    parser.add_argument("--remote_image_model_base_url", default=None, help="Primary remote image-model OpenAI-compatible base URL. Kept in a separate concurrency pool from local endpoints.")
+    parser.add_argument("--remote_image_model_base_urls", nargs="*", default=None, help="Additional remote image-model base URLs for the remote pool. Values may also be comma-separated.")
+    parser.add_argument("--remote_image_model_base_urls_file", default=None, help="Optional newline-separated remote image endpoint file re-read before each remote request.")
     parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
     parser.add_argument("--image_model_api_key", default=None)
+    parser.add_argument("--remote_image_model_api_key", default=None, help="Remote image endpoint API key. Falls back to MMDD_REMOTE_IMAGE_MODEL_API_KEY, then the local image key/VLLM_API_KEY.")
     parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
     parser.add_argument("--model_temperature", type=float, default=0.0)
     parser.add_argument("--model_max_tokens", type=int, default=1024)
@@ -4840,6 +5327,8 @@ def parse_args(
     parser.add_argument("--image_request_max_pixels", type=int, default=DEFAULT_IMAGE_REQUEST_MAX_PIXELS, help="Resize local images to this pixel budget before image-model requests. Use 0 to send original local images.")
     parser.add_argument("--text_model_workers", type=int, default=1, help="Concurrent text-model requests. Default 1 is conservative for 24GB GPUs.")
     parser.add_argument("--image_model_workers", type=int, default=1, help="Concurrent image-model requests. Default 1 is conservative for 24GB GPUs.")
+    parser.add_argument("--remote_text_model_workers", type=int, default=0, help="Concurrent remote text-model requests, independent of --text_model_workers. Zero disables the remote text pool.")
+    parser.add_argument("--remote_image_model_workers", type=int, default=0, help="Concurrent remote image-model requests, independent of --image_model_workers. Zero disables the remote image pool.")
     parser.add_argument("--enable_thinking", dest="disable_thinking", action="store_false", help="Allow Qwen thinking mode. By default, chat_template_kwargs disables thinking for extraction calls.")
     parser.add_argument("--no_reparse_cached_model_outputs", dest="reparse_cached_model_outputs", action="store_false", help="Use cached parsed attributes as-is instead of reparsing cached raw_response with the current JSON parser.")
     parser.add_argument("--refresh_invalid_model_cache", action="store_true", help="When a cached raw_response still reparses to no valid candidate attributes, call the model again with the current request settings.")
