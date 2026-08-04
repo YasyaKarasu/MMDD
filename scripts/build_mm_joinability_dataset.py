@@ -47,7 +47,6 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs.
     tqdm = None  # type: ignore[assignment]
 
 from build_mm_table_dataset import (
-    DEFAULT_WIKIPEDIA_USER_AGENT,
     ShardedJsonlWriter,
     WikipediaClient,
     build_bridge_assets,
@@ -4222,10 +4221,6 @@ def _build_dataset(
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
-        if args.wikipedia_user_agent == DEFAULT_WIKIPEDIA_USER_AGENT:
-            logging.warning(
-                "The built-in Wikipedia User-Agent is a placeholder; set project/operator contact information before Wikimedia access."
-            )
         wikipedia_client = WikipediaClient(
             cache_dir=cache_paths["wikipedia_cache_dir"],
             image_output_dir=cache_paths["wikipedia_image_dir"],
@@ -4754,7 +4749,7 @@ def parse_args(
         default=default_wikipedia_user_agent(),
         help=(
             "Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address. "
-            "Defaults to $WIKIPEDIA_USER_AGENT when set."
+            "Defaults to $WIKIPEDIA_USER_AGENT when set, otherwise uses the built-in MMDD EntiTables User-Agent."
         ),
     )
     parser.add_argument(

@@ -52,8 +52,7 @@ from wikimedia_media import (
 
 MEDIAWIKI_API_URL = "https://en.wikipedia.org/w/api.php"
 DEFAULT_WIKIPEDIA_USER_AGENT = (
-    "MMJoinabilityDatasetBuilder/0.3 "
-    "(research dataset construction; set --wikipedia_user_agent with contact info)"
+    "MMDD-EntiTables-DatasetBuilder/1.0 (mailto:cy.ouyang@zju.edu.cn)"
 )
 WIKIPEDIA_USER_AGENT_ENV_VAR = "WIKIPEDIA_USER_AGENT"
 MEDIAWIKI_BATCH_TITLE_LIMIT = 50
@@ -2333,10 +2332,6 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     wikipedia_client: WikipediaClient | None = None
     if not args.no_wikipedia:
-        if args.wikipedia_user_agent == DEFAULT_WIKIPEDIA_USER_AGENT:
-            logging.warning(
-                "The built-in Wikipedia User-Agent is a placeholder; set project/operator contact information before Wikimedia access."
-            )
         wikipedia_client = WikipediaClient(
             cache_dir=output_dir / "cache",
             image_output_dir=output_dir / "images",
@@ -2502,7 +2497,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_wikipedia_user_agent(),
         help=(
             "Descriptive User-Agent for MediaWiki API requests. Include a project name and contact address. "
-            "Defaults to $WIKIPEDIA_USER_AGENT when set."
+            "Defaults to $WIKIPEDIA_USER_AGENT when set, otherwise uses the built-in MMDD EntiTables User-Agent."
         ),
     )
     parser.add_argument(

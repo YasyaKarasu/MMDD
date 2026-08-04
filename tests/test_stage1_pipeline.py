@@ -1118,6 +1118,18 @@ def test_wikipedia_user_agent_defaults_to_environment(monkeypatch):
     assert join_args.wikipedia_user_agent == env_user_agent
 
 
+def test_wikipedia_user_agent_has_usable_builtin_default(monkeypatch):
+    monkeypatch.delenv("WIKIPEDIA_USER_AGENT", raising=False)
+
+    table_args = mm_table_dataset.parse_args(["--input_dir", "in", "--output_dir", "out"])
+    join_args = join_dataset.parse_args(["--input_dir", "in", "--output_dir", "out"])
+
+    expected = "MMDD-EntiTables-DatasetBuilder/1.0 (mailto:cy.ouyang@zju.edu.cn)"
+    assert mm_table_dataset.DEFAULT_WIKIPEDIA_USER_AGENT == expected
+    assert table_args.wikipedia_user_agent == expected
+    assert join_args.wikipedia_user_agent == expected
+
+
 def test_wikipedia_user_agent_cli_overrides_environment(monkeypatch):
     monkeypatch.setenv("WIKIPEDIA_USER_AGENT", "MMDDDatasetBuilder/1.0 (mailto:env@example.com)")
 
@@ -1293,7 +1305,7 @@ def test_media_policy_is_wired_to_builder_client_and_manifest(
         (join_dataset, join_dataset.parse_args),
     ],
 )
-def test_builder_warns_once_for_placeholder_wikipedia_user_agent(
+def test_builder_uses_builtin_wikipedia_user_agent_without_placeholder_warning(
     tmp_path,
     monkeypatch,
     caplog,
@@ -1302,12 +1314,13 @@ def test_builder_warns_once_for_placeholder_wikipedia_user_agent(
 ):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
+    captured = {}
 
     class FakeWikipediaClient:
         api_failures = 0
 
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            captured["user_agent"] = kwargs["user_agent"]
 
         def media_summary(self):
             return {}
@@ -1326,13 +1339,8 @@ def test_builder_warns_once_for_placeholder_wikipedia_user_agent(
     with caplog.at_level("WARNING"):
         builder.build_dataset(parser(argv))
 
-    warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if "operator contact information" in record.getMessage()
-    ]
-    assert len(warnings) == 1
-    assert mm_table_dataset.DEFAULT_WIKIPEDIA_USER_AGENT not in caplog.text
+    assert captured["user_agent"] == mm_table_dataset.DEFAULT_WIKIPEDIA_USER_AGENT
+    assert "placeholder" not in caplog.text.lower()
 
 
 def test_wikipedia_client_limits_action_api_to_five_requests_per_second(tmp_path, monkeypatch):
