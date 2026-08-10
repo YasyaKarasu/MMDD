@@ -319,6 +319,71 @@ conda run --no-capture-output -n MMDD python \
 对应的 `*_base_urls_file`。某一远程 worker 数为 `0` 时，该远程模态关闭。没有提供
 专用远程 key 时，会依次回退到 `VLLM_API_KEY` 和对应的本地模态 key。
 
+### 显式可见 join query
+
+joinability builder 可以把多模态恢复失败、但仍有普通可见 join 列的 source table
+转成显式 join query。默认 `ratio` 模式使用固定 seed 的 0.2 比例，并保持原来的每张
+source table 最多一个显式 query。若希望 train/dev/test 各自的显式 query 数量与
+implicit query 数量配平，使用：
+
+```bash
+--explicit_join_fallback_mode match_implicit
+```
+
+`match_implicit` 是 query-level 配平：同一张 source table 可以按多个可行的可见 join
+列贡献多个 explicit query。所有 sibling variant 的 join 列都只放在各自的 query/target
+pair 中；普通 context 列则在整张 source table 上一次性划分为 query-only 和 target-only，
+因此一个 sibling query 不会通过 context 列与另一个 sibling target 产生 joinability。
+
+`stats.json` 会在 `explicit_join_candidate_*` 下分别记录候选 source-table 数量和候选
+query 数量。
+
+### WDC 优先的远端 GPU 反向借用
+
+当远端 vLLM 由 layout control agent 管理时，EntiTables 可以在 WDC 不运行模型任务
+期间借用同一组远端 GPU。本地 EntiTables worker 不会等待远端 lease；WDC 忙时它们
+继续处理共享队列，WDC 释放 lease 后远端 worker 会自动加入。WDC 再次进入模型阶段
+时，EntiTables 会先撤销远端路由、等待在途请求结束、释放 lease，然后确认 WDC 的
+优先请求。
+
+两边必须使用同一个 `--remote_layout_coordination_dir`。WDC 命令增加：
+
+```bash
+--remote_layout_control_url http://127.0.0.1:18999 \
+--remote_layout_control_token_file layout-control-token \
+--remote_layout_primary_image_url http://127.0.0.1:18000/v1 \
+--remote_layout_switchable_url http://127.0.0.1:18001/v1 \
+--remote_layout_coordination_dir work_gpu_priority/remote
+```
+
+EntiTables 使用动态本地 GPU runner，并增加相同的远端控制参数：
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability \
+  --text_model_path hf_models/Qwen3.5-9B \
+  --image_model_path hf_models/Qwen3-VL-8B-Thinking \
+  --gpu_coordination_dir work_gpu_priority/local \
+  --remote_layout_control_url http://127.0.0.1:18999 \
+  --remote_layout_control_token_file layout-control-token \
+  --remote_layout_primary_image_url http://127.0.0.1:18000/v1 \
+  --remote_layout_switchable_url http://127.0.0.1:18001/v1 \
+  --remote_layout_coordination_dir work_gpu_priority/remote \
+  --remote_text_model_workers 32 \
+  --remote_image_model_workers 64
+```
+
+远端文本和图像并发是彼此独立的总数。本例中 switchable endpoint 提供 32 个文本
+并发槽位；`image_burst` 布局下两个图像 endpoint 各提供 32 个槽位，因此图像 worker
+总数为 64。
+
+control token 文件必须是 `0600`，并且不能使用受保护的 `.env.openai`。远端推理 key
+仍通过 `MMDD_REMOTE_TEXT_MODEL_API_KEY`、`MMDD_REMOTE_IMAGE_MODEL_API_KEY` 或
+`VLLM_API_KEY` 提供。若 WDC 异常退出且留下 `priority_requested`，EntiTables 会保持
+远端路由关闭，直到新的 WDC 运行发布 `borrowable`，这是有意的 fail-closed 行为。
+
 ## 使用 OpenAI 构造 EntiTables Joinability 数据集
 
 `build_mm_joinability_dataset_openai.py` 使用同一个非流式 OpenAI Chat Completions

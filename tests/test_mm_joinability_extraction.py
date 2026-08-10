@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -349,6 +350,295 @@ def test_multi_attribute_split_falls_back_to_best_column_when_context_is_too_nar
     assert len(query_tables) == len(target_tables) == len(qrels) == 1
 
 
+def build_rejected_table_with_explicit_join(
+    tmp_path: Path,
+    *,
+    ratio: float,
+    mode: str = "ratio",
+):
+    column_names = ["Entity", "City", "Country", "Score"]
+    source_table = {
+        "source_table_id": "explicit-fallback-source",
+        "page_title": "Explicit fallback source",
+        "columns": [
+            {"column_index": index, "column_name": column_name}
+            for index, column_name in enumerate(column_names)
+        ],
+        "rows": [
+            {
+                "row_id": row_index,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": f"Entity {row_index}",
+                        "wiki_title": f"Entity {row_index}",
+                    },
+                    {
+                        "column_index": 1,
+                        "column_name": "City",
+                        "text": f"City {row_index}",
+                    },
+                    {
+                        "column_index": 2,
+                        "column_name": "Country",
+                        "text": f"Country {row_index}",
+                    },
+                    {
+                        "column_index": 3,
+                        "column_name": "Score",
+                        "text": str(row_index + 10),
+                    },
+                ],
+            }
+            for row_index in range(5)
+        ],
+        # With no assets, none of these attributes can pass multimodal recovery.
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "3",
+            "--min_rows_per_output_table",
+            "3",
+            "--explicit_join_fallback_mode",
+            mode,
+            "--explicit_join_fallback_ratio",
+            str(ratio),
+        ]
+    )
+    return joinability_dataset.build_table_join_records(
+        source_table=source_table,
+        split="train",
+        assets={},
+        entity_to_assets={},
+        wiki_to_entity_id={},
+        extractor=None,
+        cache=ExtractionCache(tmp_path / "model-cache.jsonl"),
+        progress=None,
+        concurrency_state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=joinability_dataset.ListRecordWriter(),
+        args=args,
+    )
+
+
+def test_multimodal_rejection_can_become_visible_join_pair(tmp_path: Path) -> None:
+    query_tables, target_tables, qrels, decision = (
+        build_rejected_table_with_explicit_join(tmp_path, ratio=1.0)
+    )
+
+    assert decision["reason"] == "explicit_join_fallback"
+    assert decision["rejected_multimodal_reason"] == "no_column_met_recovered_value_ratio"
+    assert len(query_tables) == len(target_tables) == len(qrels) == 1
+    query = query_tables[0]
+    target = target_tables[0]
+    join_col = decision["join_column_index"]
+    assert join_col != 0
+    assert join_col in query["source_column_indices"]
+    assert join_col in target["source_column_indices"]
+    assert set(query["source_column_indices"]) & set(
+        target["source_column_indices"]
+    ) == {join_col}
+    assert query["hidden_attributes"] == []
+    assert query["construction_type"] == "explicit_visible_join"
+    assert target["construction_type"] == "explicit_visible_join"
+    assert len(query["rows"]) == 3
+    assert len(target["rows"]) == 5
+    assert qrels[0]["join_attribute"]["hidden_in_query"] is False
+    assert qrels[0]["reason"] == "explicit_visible_join_column"
+
+
+def test_explicit_candidates_from_one_source_are_sibling_disjoint(
+    tmp_path: Path,
+) -> None:
+    # Enumerate every query-level explicit candidate for one rejected source.
+    source = {
+        "source_table_id": "explicit-fallback-source",
+        "page_title": "Explicit fallback source",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(
+                ["Entity", "City", "Country", "Score", "Context A", "Context B"]
+            )
+        ],
+        "rows": [
+            {
+                "row_id": index,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": f"Entity {index}" if index >= 2 else "",
+                        "wiki_title": f"Entity {index}" if index >= 2 else "",
+                    },
+                    *[
+                        {
+                            "column_index": column,
+                            "column_name": [
+                                "Entity",
+                                "City",
+                                "Country",
+                                "Score",
+                                "Context A",
+                                "Context B",
+                            ][column],
+                            "text": f"value-{column}-{index}",
+                        }
+                        for column in (1, 2, 3)
+                    ]
+                    + [
+                        {
+                            "column_index": column,
+                            "column_name": [
+                                "Entity",
+                                "City",
+                                "Country",
+                                "Score",
+                                "Context A",
+                                "Context B",
+                            ][column],
+                            "text": f"context-{column}-{index}" if index <= 2 else "",
+                        }
+                        for column in (4, 5)
+                    ],
+                ],
+            }
+            for index in range(5)
+        ],
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output-candidates"),
+            "--query_rows_per_table",
+            "3",
+            "--min_rows_per_output_table",
+            "3",
+            "--max_target_context_attrs",
+            "1",
+            "--explicit_join_fallback_mode",
+            "match_implicit",
+        ]
+    )
+    candidates = joinability_dataset.build_explicit_join_fallback_candidates(
+        source_table=source,
+        split="train",
+        entity_col=0,
+        rejected_multimodal_reason="no_column_met_recovered_value_ratio",
+        args=args,
+        force=True,
+    )
+    assert len(candidates) == 3
+    records = [
+        joinability_dataset.materialize_balanced_explicit_join_candidate(
+            source_table=source,
+            split="train",
+            candidate_decision=candidate,
+            args=args,
+        )
+        for candidate in candidates
+    ]
+    for index, (queries, targets, _qrels, _decision) in enumerate(records):
+        assert len(queries) == len(targets) == 1
+        own_join = candidates[index]["join_column_index"]
+        assert set(queries[0]["source_column_indices"]) & set(
+            targets[0]["source_column_indices"]
+        ) == {own_join}
+        for other_index, (_other_queries, other_targets, _q, _d) in enumerate(records):
+            if index == other_index:
+                continue
+            assert not (
+                set(queries[0]["source_column_indices"])
+                & set(other_targets[0]["source_column_indices"])
+            )
+    selected, _counts = joinability_dataset.select_balanced_explicit_join_candidates(
+        candidate_splits={candidate["candidate_id"]: "train" for candidate in candidates},
+        implicit_query_counts={"train": 2, "dev": 0, "test": 0},
+        args=argparse.Namespace(seed=13),
+    )
+    assert len(selected) == 2
+
+
+def test_visible_join_fallback_ratio_zero_keeps_rejection_raw(tmp_path: Path) -> None:
+    query_tables, data_lake_tables, qrels, decision = (
+        build_rejected_table_with_explicit_join(tmp_path, ratio=0.0)
+    )
+
+    assert query_tables == []
+    assert qrels == []
+    assert decision["reason"] == "no_column_met_recovered_value_ratio"
+    assert data_lake_tables[0]["role"] == "raw_data_lake_table"
+
+
+def test_match_implicit_defers_viable_explicit_candidate(
+    tmp_path: Path,
+) -> None:
+    query_tables, data_lake_tables, qrels, decision = (
+        build_rejected_table_with_explicit_join(
+            tmp_path,
+            ratio=0.0,
+            mode="match_implicit",
+        )
+    )
+
+    assert query_tables == []
+    assert qrels == []
+    assert data_lake_tables[0]["role"] == "raw_data_lake_table"
+    assert decision["reason"] == "no_column_met_recovered_value_ratio"
+    assert decision["explicit_join_candidate"]["reason"] == (
+        "explicit_join_fallback"
+    )
+
+
+def test_balanced_explicit_candidate_selection_matches_each_split() -> None:
+    args = argparse.Namespace(seed=13)
+    candidates = {
+        "train-a": "train",
+        "train-b": "train",
+        "train-c": "train",
+        "dev-a": "dev",
+        "dev-b": "dev",
+        "test-a": "test",
+    }
+
+    selected, counts = (
+        joinability_dataset.select_balanced_explicit_join_candidates(
+            candidate_splits=candidates,
+            implicit_query_counts={"train": 2, "dev": 1, "test": 1},
+            args=args,
+        )
+    )
+
+    assert counts == {"train": 3, "dev": 2, "test": 1}
+    assert sum(candidates[item] == "train" for item in selected) == 2
+    assert sum(candidates[item] == "dev" for item in selected) == 1
+    assert sum(candidates[item] == "test" for item in selected) == 1
+    repeated, _ = joinability_dataset.select_balanced_explicit_join_candidates(
+        candidate_splits=dict(reversed(list(candidates.items()))),
+        implicit_query_counts={"train": 2, "dev": 1, "test": 1},
+        args=args,
+    )
+    assert repeated == selected
+
+
+def test_balanced_explicit_candidate_selection_rejects_shortfall() -> None:
+    with pytest.raises(ValueError, match="required=2, available=1"):
+        joinability_dataset.select_balanced_explicit_join_candidates(
+            candidate_splits={"train-a": "train"},
+            implicit_query_counts={"train": 2, "dev": 0, "test": 0},
+            args=argparse.Namespace(seed=13),
+        )
+
+
 def test_required_recovered_rows_caps_denominator_at_query_size():
     assert required_recovered_row_count(4, 5, 0.6) == 3
     assert required_recovered_row_count(5, 5, 0.6) == 3
@@ -483,6 +773,27 @@ def test_query_rows_per_table_defaults_to_five(tmp_path):
 
     assert args.query_rows_per_table == 5
     assert args.max_train_query_row_views_per_join == 5
+    assert args.explicit_join_fallback_mode == "ratio"
+    assert args.explicit_join_fallback_ratio == 0.2
+
+
+@pytest.mark.parametrize("value", ["-0.01", "1.01"])
+def test_explicit_join_fallback_ratio_must_be_a_probability(
+    tmp_path: Path, value: str
+) -> None:
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--explicit_join_fallback_ratio",
+            value,
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
+        joinability_dataset.configured_explicit_join_fallback_ratio(args)
 
 
 def test_query_rows_per_table_rejects_contradictory_output_minimum(tmp_path):
@@ -1307,6 +1618,141 @@ def test_remote_workers_require_a_remote_endpoint():
         )
 
 
+def test_dynamic_remote_workers_leave_tasks_for_local_pool_until_routed():
+    calls: list[str] = []
+
+    class Extractor:
+        abort_on_transient_error = False
+
+        def wait_for_endpoint_pool(
+            self,
+            model_kind: str,
+            endpoint_pool: str,
+            timeout_seconds: float,
+        ) -> bool:
+            assert model_kind == "text"
+            assert endpoint_pool == "remote"
+            time.sleep(min(timeout_seconds, 0.01))
+            return False
+
+        def extract(self, *_args):
+            calls.append("local")
+            return {"attributes": [], "raw_response": ""}
+
+    tasks = [_task("text", str(index)) for index in range(4)]
+    records = joinability_dataset.run_extraction_kind_distributed(
+        extractor=Extractor(),
+        tasks=tasks,
+        model_kind="text",
+        state=ModelConcurrencyState(
+            text_workers=1,
+            image_workers=1,
+            remote_text_workers=2,
+        ),
+    )
+
+    assert set(records) == {task.cache_key for task in tasks}
+    assert calls == ["local"] * len(tasks)
+    assert all(not record.get("error") for record in records.values())
+
+
+def test_entitables_remote_borrower_returns_lease_before_acknowledging_wdc(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[str] = []
+    controller_started = threading.Event()
+
+    class FakeController:
+        def __init__(self, _config, _scheduler):
+            pass
+
+        def start(self):
+            events.append("controller:start")
+            controller_started.set()
+
+        def request_stop(self):
+            events.append("controller:stop-requested")
+
+        def close(self, **_kwargs):
+            events.append("controller:close")
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "RemoteLayoutController",
+        FakeController,
+    )
+    scheduler = joinability_dataset.RoutingScheduler(
+        tmp_path / "routing.json",
+        load_existing=False,
+    )
+    borrower = joinability_dataset.EntiTablesRemoteGpuBorrower(
+        controller_config=SimpleNamespace(request_timeout_seconds=0.1),
+        scheduler=scheduler,
+        workload=joinability_dataset._RoundRemoteWorkload(
+            {"text": 1, "image": 1}
+        ),
+        coordination_dir=tmp_path / "priority",
+        coordination_poll_seconds=0.01,
+        drain_timeout_seconds=1.0,
+    )
+    owner = joinability_dataset.gpu_priority.PriorityGpuOwner(
+        tmp_path / "priority",
+        gpu_ids=("remote:primary_image", "remote:switchable"),
+        owner="wdc-remote",
+        reclaim_timeout_seconds=2.0,
+        borrower_stale_seconds=1.0,
+        unregistered_grace_seconds=0.1,
+        poll_seconds=0.01,
+    )
+
+    borrower.start()
+    try:
+        assert controller_started.wait(timeout=1.0)
+        request = owner.request_gpus(reason="wdc_model_stage")
+        acknowledgement = joinability_dataset.gpu_priority.read_json(
+            owner.paths.acknowledgement
+        )
+        assert acknowledgement is not None
+        assert acknowledgement["generation"] == request.generation
+        assert acknowledgement["sequence"] == request.sequence
+        assert events.index("controller:close") >= events.index(
+            "controller:start"
+        )
+    finally:
+        borrower.close()
+
+
+def test_entitables_remote_borrower_keeps_status_when_shutdown_is_unsafe(
+    tmp_path,
+    monkeypatch,
+):
+    scheduler = joinability_dataset.RoutingScheduler(
+        tmp_path / "routing.json",
+        load_existing=False,
+    )
+    borrower = joinability_dataset.EntiTablesRemoteGpuBorrower(
+        controller_config=SimpleNamespace(request_timeout_seconds=0.1),
+        scheduler=scheduler,
+        workload=joinability_dataset._RoundRemoteWorkload(
+            {"text": 1, "image": 0}
+        ),
+        coordination_dir=tmp_path / "priority",
+        coordination_poll_seconds=0.01,
+        drain_timeout_seconds=0.1,
+    )
+    borrower._heartbeat("draining", None)
+    monkeypatch.setattr(borrower, "_stop_controller", lambda: False)
+    borrower._stop.set()
+
+    borrower._supervise()
+
+    assert borrower.coordination_paths is not None
+    assert borrower.coordination_paths.borrower.exists()
+    with pytest.raises(RuntimeError, match="without releasing"):
+        borrower.close()
+
+
 def test_dynamic_vllm_builder_command_enables_text_precompute_and_endpoint_file(tmp_path):
     text_server = VllmServerSpec(
         role="text",
@@ -1922,6 +2368,113 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     assert args.vllm_max_model_len == 8192
     assert args.model_start_timeout_seconds is None
     assert args.forwarded_signal_grace_seconds == 30.0
+
+
+def test_dynamic_vllm_remote_worker_counts_are_modality_specific():
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--remote_layout_control_url",
+            "http://127.0.0.1:18999",
+            "--remote_layout_control_token_file",
+            "/run/layout-token",
+            "--remote_layout_primary_image_url",
+            "http://127.0.0.1:18000/v1",
+            "--remote_layout_switchable_url",
+            "http://127.0.0.1:18001/v1",
+            "--remote_layout_coordination_dir",
+            "/run/remote-priority",
+            "--remote_text_model_workers",
+            "32",
+            "--remote_image_model_workers",
+            "64",
+        ]
+    )
+
+    assert args.remote_text_model_workers == 32
+    assert args.remote_image_model_workers == 64
+    assert passthrough == []
+    assert dynamic_vllm_runner.with_remote_model_workers(
+        [],
+        text_workers=args.remote_text_model_workers,
+        image_workers=args.remote_image_model_workers,
+    ) == [
+        "--remote_text_model_workers",
+        "32",
+        "--remote_image_model_workers",
+        "64",
+    ]
+
+
+def test_dynamic_vllm_local_worker_counts_are_modality_specific():
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--text_model_workers",
+            "4",
+            "--image_model_workers",
+            "8",
+        ]
+    )
+
+    assert args.text_model_workers == 4
+    assert args.image_model_workers == 8
+    assert passthrough == []
+    assert dynamic_vllm_runner.with_model_workers(
+        [],
+        text_workers=args.text_model_workers,
+        image_workers=args.image_model_workers,
+    ) == [
+        "--text_model_workers",
+        "4",
+        "--image_model_workers",
+        "8",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("combined_option", "replacement"),
+    [
+        ("--dynamic_model_workers", "--text_model_workers"),
+        ("--remote_dynamic_model_workers", "--remote_text_model_workers"),
+    ],
+)
+def test_dynamic_vllm_rejects_combined_worker_counts(
+    combined_option,
+    replacement,
+    capsys,
+):
+    with pytest.raises(SystemExit):
+        parse_dynamic_vllm_args(
+            [
+                "--input_dir",
+                "/data/input",
+                "--output_dir",
+                "/data/output",
+                "--text_model_path",
+                "/models/text",
+                "--image_model_path",
+                "/models/vl",
+                combined_option,
+                "2",
+            ]
+        )
+
+    assert replacement in capsys.readouterr().err
 
 
 def test_dynamic_vllm_forwards_signal_to_every_live_process_group(

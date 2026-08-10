@@ -2704,6 +2704,56 @@ def test_model_stage_never_exceeds_bounded_group(
     assert max(observed) <= 2
 
 
+def test_model_stage_reloads_dynamic_routing_capacity_for_each_wave(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[tuple[int, int]] = []
+    authoritative = models.run_extraction_task_group
+
+    def recording_group(**kwargs):
+        observed.append((len(kwargs["tasks"]), kwargs["workers"]))
+        return authoritative(**kwargs)
+
+    monkeypatch.setattr(
+        models,
+        "run_extraction_task_group",
+        recording_group,
+    )
+
+    class DynamicCapacityExtractor(CountingExtractor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capacity_reads = 0
+
+        def routing_capacity(self, modality: str) -> int:
+            assert modality == "text"
+            self.capacity_reads += 1
+            return 5 if self.capacity_reads <= 2 else 3
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset(str(index)) for index in range(11)],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    extractor = DynamicCapacityExtractor()
+
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        group_size=32,
+        workers_by_kind={"text": 99, "image": 99},
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert observed == [(5, 5), (3, 3), (3, 3)]
+    assert extractor.capacity_reads == 4
+
+
 def test_heartbeat_prevents_second_worker_from_repeating_model_call(
     tmp_path: Path,
 ) -> None:

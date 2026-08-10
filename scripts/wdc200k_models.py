@@ -1776,6 +1776,12 @@ def _process_claimed_group(
     progress_tracker: _ModelProgressTracker | None = None,
     write_tracker: GuardedWriteTracker | None = None,
 ) -> int:
+    routing_capacity = getattr(extractor, "routing_capacity", None)
+    dynamic_capacity = (
+        routing_capacity(modality)
+        if callable(routing_capacity)
+        else None
+    )
     model_jobs: list[Any] = []
     task_by_key: dict[str, Any] = {}
     job_by_key: dict[str, Any] = {}
@@ -1906,15 +1912,34 @@ def _process_claimed_group(
                 if progress_tracker is not None:
                     progress_tracker.finished(modality, status)
 
-        run_extraction_task_group(
-            extractor=extractor,
-            tasks=[
-                task_by_key[job.payload["model_call_key"]]
-                for job in model_jobs
-            ],
-            workers=workers,
-            on_record=commit_record,
-        )
+        tasks = [
+            task_by_key[job.payload["model_call_key"]]
+            for job in model_jobs
+        ]
+        if dynamic_capacity is None:
+            run_extraction_task_group(
+                extractor=extractor,
+                tasks=tasks,
+                workers=workers,
+                on_record=commit_record,
+            )
+        else:
+            offset = 0
+            while offset < len(tasks):
+                current_capacity = routing_capacity(modality)
+                # A route can be withdrawn after the jobs were claimed. One
+                # task then becomes retryable instead of a terminal result.
+                wave_workers = max(1, int(current_capacity or 0))
+                wave = tasks[offset : offset + wave_workers]
+                run_extraction_task_group(
+                    extractor=extractor,
+                    tasks=wave,
+                    workers=wave_workers,
+                    on_record=commit_record,
+                )
+                offset += len(wave)
+                if transient_errors:
+                    break
         if transient_errors:
             errors = sorted(set(error for error in transient_errors if error))
             detail = f": {'; '.join(errors)}" if errors else ""

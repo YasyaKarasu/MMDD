@@ -1628,6 +1628,186 @@ def test_empty_assets_keep_source_reference_in_raw_data_lake_table(
     assert actual.decision["reason"] == "no_column_met_recovered_value_ratio"
 
 
+def test_empty_assets_can_materialize_visible_join_fallback(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    args.explicit_join_fallback_ratio = 1.0
+
+    actual = materialize_dataset_shard(
+        _shard_inputs(tmp_path),
+        args=args,
+        split="test",
+    )
+
+    assert actual.decision["reason"] == "explicit_join_fallback"
+    assert len(actual.query_tables) == len(actual.data_lake_tables) == 1
+    assert len(actual.qrels) == 1
+    query = actual.query_tables[0]
+    target = actual.data_lake_tables[0]
+    join_col = actual.decision["join_column_index"]
+    assert join_col != query["query_entity_col"]
+    assert join_col in query["source_column_indices"]
+    assert join_col in target["source_column_indices"]
+    assert query["hidden_attributes"] == []
+    assert target["role"] == "target_data_lake_table"
+    assert actual.evidence_recoveries == []
+
+
+def test_materialization_index_balances_explicit_queries_and_resumes(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    args.explicit_join_fallback_mode = "match_implicit"
+    implicit_source = _source_table("source-implicit")
+    candidate_source = _source_table("source-candidate")
+    candidate = materialize_dataset_shard(
+        _shard_inputs(
+            tmp_path,
+            source_table=candidate_source,
+            entities=[],
+            assets=[],
+            links=[],
+            extractions=[],
+        ),
+        args=args,
+        split="test",
+    )
+    assert candidate.decision.get("explicit_join_candidate")
+
+    implicit = materializer.MaterializedTable(
+        source_table=implicit_source,
+        entities=[],
+        bridge_assets=[],
+        table_asset_links=[],
+        query_tables=[
+            {
+                "table_id": "query-implicit",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+            {
+                "table_id": "query-implicit-2",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+        ],
+        data_lake_tables=[
+            {
+                "table_id": "target-implicit",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+            {
+                "table_id": "target-implicit-2",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+        ],
+        qrels=[
+            {
+                "query_table_id": "query-implicit",
+                "target_table_id": "target-implicit",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+            {
+                "query_table_id": "query-implicit-2",
+                "target_table_id": "target-implicit-2",
+                "source_table_id": "source-implicit",
+                "split": "test",
+            },
+        ],
+        decision={"reason": "queryable"},
+        attribute_extractions=[],
+        evidence_recoveries=[],
+    )
+    database_path = tmp_path / "balance.sqlite3"
+    materializer._initialize_index(database_path)
+    materializer._catalog_source_records(
+        database_path,
+        [implicit_source, candidate_source],
+        args=args,
+        expected_tables=2,
+    )
+    with materializer._connect(database_path) as connection:
+        connection.execute("UPDATE source_catalog SET split = 'test'")
+        catalog = {
+            str(row["source_table_id"]): (
+                int(row["ordinal"]),
+                str(row["record_sha256"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT source_table_id, ordinal, record_sha256
+                FROM source_catalog
+                """
+            )
+        }
+        connection.commit()
+    for materialized in (implicit, candidate):
+        source_table_id = str(
+            materialized.source_table["source_table_id"]
+        )
+        ordinal, source_sha256 = catalog[source_table_id]
+        assert materializer._store_table_unit(
+            database_path,
+            materialized,
+            source_ordinal=ordinal,
+            source_sha256=source_sha256,
+            split="test",
+        )
+
+    payload = materializer._balance_explicit_join_records(
+        database_path,
+        args=args,
+    )
+
+    assert payload == {
+        "mode": "match_implicit",
+        "implicit_query_tables_by_split": {
+            "train": 0,
+            "dev": 0,
+            "test": 2,
+        },
+        "explicit_query_tables_by_split": {
+            "train": 0,
+            "dev": 0,
+            "test": 2,
+        },
+        "candidate_tables_by_split": {
+            "train": 0,
+            "dev": 0,
+            "test": 1,
+        },
+    }
+    assert len(
+        list(materializer._iter_materialized(database_path, "query_tables"))
+    ) == 4
+    assert len(
+        list(
+            materializer._iter_materialized(
+                database_path,
+                "data_lake_tables",
+            )
+        )
+    ) == 4
+    decisions = list(
+        materializer._iter_materialized(
+            database_path,
+            "table_queryability_decisions",
+        )
+    )
+    assert {decision["reason"] for decision in decisions} == {
+        "queryable",
+        "explicit_join_fallback",
+    }
+    assert materializer._balance_explicit_join_records(
+        database_path,
+        args=args,
+    ) == payload
+
+
 def test_terminal_model_error_is_consumed_without_a_model_retry(
     tmp_path: Path,
 ) -> None:
@@ -1968,9 +2148,34 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     assert {path: path.stat().st_mtime_ns for path in published} == mtimes
 
 
+def test_full_materialization_counts_visible_join_fallback_as_queryable(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    args.explicit_join_fallback_ratio = 1.0
+
+    result = materialize_dataset(
+        inputs,
+        output_root=tmp_path / "output-explicit",
+        args=args,
+        records_per_shard=1,
+    )
+
+    assert result.stats["queryable_source_tables"] == 1
+    assert result.stats["multimodal_queryable_source_tables"] == 0
+    assert result.stats["explicit_join_source_tables"] == 1
+    assert result.stats["rejected_source_tables"] == 0
+    assert result.stats["query_tables"] == 1
+    assert result.stats["qrels"] == 1
+
+
 @pytest.mark.parametrize(
     "schema_version",
-    ["wdc200k-materialization-v1", "wdc200k-materialization-v2"],
+    [
+        "wdc200k-materialization-v1",
+        "wdc200k-materialization-v2",
+        "wdc200k-materialization-v3",
+    ],
 )
 def test_legacy_published_materialization_schema_is_rebuilt(
     tmp_path: Path,
@@ -2373,21 +2578,62 @@ def test_partial_materialization_resume_uses_verified_upstream_certificate(
     )
 
 
-def test_certificate_tracks_sqlite_wal_but_ignores_transient_shm(
+def test_certificate_tracks_nonempty_sqlite_wal_but_ignores_sidecars(
     tmp_path: Path,
 ) -> None:
     inputs, _args = _authoritative_inputs(tmp_path)
     database_path = Path(inputs.model_result.jobset.database_path).resolve()
     wal_path = Path(f"{database_path}-wal")
     shm_path = Path(f"{database_path}-shm")
-    wal_path.write_bytes(b"durable WAL input")
+    wal_path.write_bytes(b"")
     shm_path.write_bytes(b"transient SQLite coordination state")
 
     certificate_paths = set(materializer._certificate_input_paths(inputs))
 
     assert database_path in certificate_paths
-    assert wal_path.resolve() in certificate_paths
+    assert wal_path.resolve() not in certificate_paths
     assert shm_path.resolve() not in certificate_paths
+
+    wal_path.write_bytes(b"durable WAL input")
+
+    certificate_paths = set(materializer._certificate_input_paths(inputs))
+
+    assert wal_path.resolve() in certificate_paths
+
+
+def test_empty_sqlite_sidecars_before_certificate_do_not_change_upstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, args = _authoritative_inputs(tmp_path)
+    database_path = Path(inputs.model_result.jobset.database_path).resolve()
+    wal_path = Path(f"{database_path}-wal")
+    shm_path = Path(f"{database_path}-shm")
+    wal_path.unlink(missing_ok=True)
+    shm_path.unlink(missing_ok=True)
+    compact = materializer._compact_materialized_table_copies
+
+    def compact_with_reader_sidecars(
+        *compact_args: Any,
+        **compact_kwargs: Any,
+    ) -> None:
+        compact(*compact_args, **compact_kwargs)
+        wal_path.touch()
+        shm_path.write_bytes(b"transient SQLite coordination state")
+
+    monkeypatch.setattr(
+        materializer,
+        "_compact_materialized_table_copies",
+        compact_with_reader_sidecars,
+    )
+
+    result = materialize_dataset(
+        inputs,
+        output_root=tmp_path / "output",
+        args=args,
+    )
+
+    assert result.complete is True
 
 
 @pytest.mark.parametrize(

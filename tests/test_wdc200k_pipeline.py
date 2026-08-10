@@ -154,9 +154,13 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.materialization_workers == 1
     assert args.materialization_validation_workers == 3
     assert args.max_train_query_row_views_per_join == 5
+    assert args.explicit_join_fallback_mode == "ratio"
+    assert args.explicit_join_fallback_ratio == 0.2
     config = PipelineConfig.from_args(args)
     assert config.materialization_validation_workers == 3
     assert config.max_train_query_row_views_per_join == 5
+    assert config.explicit_join_fallback_mode == "ratio"
+    assert config.explicit_join_fallback_ratio == 0.2
     assert config.runtime_dir == config.work_dir / "runtime"
     assert STAGES == (
         "selection",
@@ -4271,3 +4275,129 @@ def test_explicit_page_cache_refresh_archives_cache_without_deleting(
     )
     assert len(archived) == 1
     assert (config.cache_dir / "page_cache/outcomes.sqlite3").is_file()
+
+
+def test_remote_layout_control_reuses_extractor_api_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _full_pipeline_config(tmp_path)
+    runtime = base.work_dir / "runtime"
+    config = replace(
+        base,
+        remote_layout_control_url="http://127.0.0.1:18999",
+        remote_layout_control_token_file=tmp_path / "layout-token",
+        remote_layout_routing_manifest=runtime / "routing.json",
+        remote_layout_controller_id_file=runtime / "controller-id",
+        remote_layout_lock_file=runtime / "controller.lock",
+        remote_layout_primary_image_url="http://127.0.0.1:18000/v1",
+        remote_layout_switchable_url="http://127.0.0.1:18001/v1",
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeController:
+        def __init__(self, controller_config: Any, scheduler: Any) -> None:
+            captured["config"] = controller_config
+            captured["scheduler"] = scheduler
+
+        def __enter__(self) -> "FakeController":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    scheduler = object()
+    extractor = SimpleNamespace(
+        routing_scheduler=scheduler,
+        text_model_api_key="resolved-text-key",
+        image_model_api_key="resolved-image-key",
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "RemoteLayoutController",
+        FakeController,
+    )
+
+    with pipeline_module._remote_layout_control(
+        config,
+        extractor=extractor,
+        database_path=tmp_path / "jobs.sqlite3",
+    ):
+        pass
+
+    controller_config = captured["config"]
+    assert captured["scheduler"] is scheduler
+    assert controller_config.text_api_key == "resolved-text-key"
+    assert controller_config.image_api_key == "resolved-image-key"
+
+
+def test_remote_layout_control_reclaims_before_start_and_releases_afterward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _full_pipeline_config(tmp_path)
+    runtime = base.work_dir / "runtime"
+    config = replace(
+        base,
+        remote_layout_control_url="http://127.0.0.1:18999",
+        remote_layout_control_token_file=tmp_path / "layout-token",
+        remote_layout_routing_manifest=runtime / "routing.json",
+        remote_layout_controller_id_file=runtime / "controller-id",
+        remote_layout_lock_file=runtime / "controller.lock",
+        remote_layout_primary_image_url="http://127.0.0.1:18000/v1",
+        remote_layout_switchable_url="http://127.0.0.1:18001/v1",
+        remote_layout_coordination_dir=tmp_path / "remote-priority",
+    )
+    events: list[str] = []
+
+    class FakePriorityOwner:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request_gpus(self, *, reason: str) -> None:
+            events.append(f"request:{reason}")
+
+        def release_gpus(self, *, reason: str) -> None:
+            events.append(f"release:{reason}")
+
+    class FakeController:
+        def __init__(self, _config: Any, _scheduler: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeController":
+            events.append("controller:enter")
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            events.append("controller:exit")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "PriorityGpuOwner",
+        FakePriorityOwner,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "RemoteLayoutController",
+        FakeController,
+    )
+    extractor = SimpleNamespace(
+        routing_scheduler=object(),
+        text_model_api_key=None,
+        image_model_api_key=None,
+    )
+
+    with pipeline_module._remote_layout_control(
+        config,
+        extractor=extractor,
+        database_path=tmp_path / "jobs.sqlite3",
+    ):
+        events.append("model:run")
+
+    assert events == [
+        "request:wdc_model_stage",
+        "controller:enter",
+        "model:run",
+        "controller:exit",
+        "release:wdc_model_stage_complete",
+    ]

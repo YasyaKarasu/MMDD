@@ -11,6 +11,7 @@ htmlcov/
 # Local environments and editor state
 .env
 .env.*
+/layout-control-token
 .venv/
 venv/
 .idea/

@@ -208,6 +208,74 @@ worker count of zero disables that remote modality. Remote API keys fall back
 to `VLLM_API_KEY` and then the matching local modality key when a dedicated key
 is not supplied.
 
+### Explicit visible-join queries
+
+The joinability builder can promote rejected multimodal tables into ordinary
+visible-join queries. The default `ratio` mode uses a seeded 0.2 fraction and
+keeps the historical one-query-per-source behavior. Use
+`--explicit_join_fallback_mode match_implicit` when explicit query counts must
+match implicit query counts independently in the train, dev, and test splits.
+That mode works at query level: one source table may contribute multiple
+explicit candidates, one per viable visible join column. Candidate join columns
+are target-only across all sibling variants, and ordinary context columns are
+partitioned once per source table, so a sibling query cannot join to another
+sibling target through a context column.
+
+The resulting `stats.json` reports both candidate source-table counts and
+candidate query counts under `explicit_join_candidate_*`.
+
+### WDC-priority borrowing of the remote GPUs
+
+When the remote vLLM services are managed by the layout control agent,
+EntiTables can borrow the same GPUs while WDC has no model work. Local
+EntiTables workers never wait for the remote lease: they keep consuming the
+shared queue while WDC is active, and remote workers join after WDC releases
+it. Before WDC starts another model stage, EntiTables withdraws the remote
+routes, drains in-flight requests, releases the lease, and acknowledges WDC's
+priority request.
+
+Both processes must use the same `--remote_layout_coordination_dir`. Add these
+options to the WDC command:
+
+```bash
+--remote_layout_control_url http://127.0.0.1:18999 \
+--remote_layout_control_token_file layout-control-token \
+--remote_layout_primary_image_url http://127.0.0.1:18000/v1 \
+--remote_layout_switchable_url http://127.0.0.1:18001/v1 \
+--remote_layout_coordination_dir work_gpu_priority/remote
+```
+
+Run EntiTables through its dynamic local-GPU runner with the same remote
+control and coordination settings:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/run_mm_joinability_dynamic_vllm.py \
+  --input_dir dataset/tables_redi2_1 \
+  --output_dir output_mm_joinability \
+  --text_model_path hf_models/Qwen3.5-9B \
+  --image_model_path hf_models/Qwen3-VL-8B-Thinking \
+  --gpu_coordination_dir work_gpu_priority/local \
+  --remote_layout_control_url http://127.0.0.1:18999 \
+  --remote_layout_control_token_file layout-control-token \
+  --remote_layout_primary_image_url http://127.0.0.1:18000/v1 \
+  --remote_layout_switchable_url http://127.0.0.1:18001/v1 \
+  --remote_layout_coordination_dir work_gpu_priority/remote \
+  --remote_text_model_workers 32 \
+  --remote_image_model_workers 64
+```
+
+Remote text and image concurrency are independent totals. In this example the
+switchable endpoint supplies 32 text slots, while the `image_burst` layout
+supplies 32 image slots on each of two endpoints, for 64 image workers total.
+
+The control token file must have mode `0600` and cannot be `.env.openai`.
+Inference keys still come from `MMDD_REMOTE_TEXT_MODEL_API_KEY`,
+`MMDD_REMOTE_IMAGE_MODEL_API_KEY`, or `VLLM_API_KEY`. A stale
+`priority_requested` left by a failed WDC process keeps EntiTables remote
+routing disabled until a later WDC run publishes `borrowable`; this is the
+intentional fail-closed behavior.
+
 ## EntiTables Joinability with OpenAI
 
 `build_mm_joinability_dataset_openai.py` runs the existing EntiTables

@@ -52,7 +52,8 @@ conda run --no-capture-output -n MMDD python \
   --text_model_path /home/oycy/MMDD/hf_models/Qwen3.5-9B \
   --image_model_path /home/oycy/MMDD/hf_models/Qwen3-VL-8B-Thinking \
   --gpu_coordination_dir /home/oycy/MMDD/runtime_gpu_share \
-  --dynamic_model_workers 8 \
+  --text_model_workers 8 \
+  --image_model_workers 8 \
   --vllm_max_num_seqs 4 \
   --vllm_max_num_batched_tokens 2048 \
   --min_cols 4 \

@@ -26,6 +26,7 @@ import re
 import threading
 import time
 import unicodedata
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
@@ -67,7 +68,18 @@ from build_mm_table_dataset import (
     write_table_asset_links_from_jsonl,
 )
 from image_preprocessing import target_size
+import gpu_priority_protocol as gpu_priority
 import model_marker_protocol as model_markers
+from remote_vllm_layout import (
+    ControllerConfig as RemoteLayoutControllerConfig,
+    EndpointConfig as RemoteLayoutEndpointConfig,
+    ExclusiveControllerLock,
+    LayoutProtocolError,
+    RemoteLayoutController,
+    RoutingScheduler,
+    RoutingUnavailableError,
+    WorkloadSnapshot,
+)
 from stage1_io import (
     clean_text,
     column_profiles,
@@ -89,6 +101,13 @@ DEFAULT_SHARED_CACHE_DIR = Path("cache") / "mm_joinability"
 DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
 DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
 DEFAULT_IMAGE_MODEL_MAX_TOKENS = 384
+DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO = 0.2
+DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE = "ratio"
+EXPLICIT_JOIN_FALLBACK_MODES = (
+    "disabled",
+    "ratio",
+    "match_implicit",
+)
 _MODEL_ERROR_LOG_LOCK = threading.Lock()
 
 
@@ -1326,11 +1345,30 @@ class LocalAttributeExtractor:
     def __init__(self, args: argparse.Namespace) -> None:
         if requests is None:
             raise RuntimeError("requests is required for local model calls")
+        routing_manifest = clean_text(
+            getattr(args, "model_routing_manifest", "")
+        )
+        self.routing_scheduler = (
+            RoutingScheduler(Path(routing_manifest).resolve())
+            if routing_manifest
+            else None
+        )
+        remote_routing_manifest = clean_text(
+            getattr(args, "remote_model_routing_manifest", "")
+        )
+        self.remote_routing_scheduler = (
+            RoutingScheduler(
+                Path(remote_routing_manifest).resolve(),
+                load_existing=False,
+            )
+            if remote_routing_manifest
+            else None
+        )
         configured_text_urls = normalize_model_base_urls(getattr(args, "text_model_base_urls", None))
         fallback_text_url = clean_text(getattr(args, "text_model_base_url", "")).rstrip("/")
         if fallback_text_url:
             configured_text_urls = normalize_model_base_urls([fallback_text_url, *configured_text_urls])
-        if not configured_text_urls:
+        if not configured_text_urls and self.routing_scheduler is None:
             raise ValueError("at least one text model base URL is required")
         self.text_model_base_urls = configured_text_urls
         self.text_model_base_urls_file = clean_text(getattr(args, "text_model_base_urls_file", ""))
@@ -1371,6 +1409,7 @@ class LocalAttributeExtractor:
             self.remote_text_model_workers
             and not self.remote_text_model_base_urls
             and not self.remote_text_model_base_urls_file
+            and self.remote_routing_scheduler is None
         ):
             raise ValueError(
                 "remote text workers require a remote text model endpoint"
@@ -1379,7 +1418,7 @@ class LocalAttributeExtractor:
         fallback_image_url = clean_text(getattr(args, "image_model_base_url", "")).rstrip("/")
         if fallback_image_url:
             configured_image_urls = normalize_model_base_urls([fallback_image_url, *configured_image_urls])
-        if not configured_image_urls:
+        if not configured_image_urls and self.routing_scheduler is None:
             raise ValueError("at least one image model base URL is required")
         self.image_model_base_urls = configured_image_urls
         self.image_model_base_urls_file = clean_text(getattr(args, "image_model_base_urls_file", ""))
@@ -1420,6 +1459,7 @@ class LocalAttributeExtractor:
             self.remote_image_model_workers
             and not self.remote_image_model_base_urls
             and not self.remote_image_model_base_urls_file
+            and self.remote_routing_scheduler is None
         ):
             raise ValueError(
                 "remote image workers require a remote image model endpoint"
@@ -1445,6 +1485,11 @@ class LocalAttributeExtractor:
         self.model_call_stats = ModelCallStats()
 
     def current_text_model_base_urls(self) -> list[str]:
+        if self.routing_scheduler is not None:
+            return [
+                endpoint.base_url
+                for endpoint in self.routing_scheduler.endpoints("text")
+            ]
         if self.text_model_base_urls_file:
             path = Path(self.text_model_base_urls_file)
             if path.exists():
@@ -1467,6 +1512,11 @@ class LocalAttributeExtractor:
             return urls[index]
 
     def current_remote_text_model_base_urls(self) -> list[str]:
+        if self.remote_routing_scheduler is not None:
+            return [
+                endpoint.base_url
+                for endpoint in self.remote_routing_scheduler.endpoints("text")
+            ]
         if self.remote_text_model_base_urls_file:
             path = Path(self.remote_text_model_base_urls_file)
             if path.exists():
@@ -1487,6 +1537,11 @@ class LocalAttributeExtractor:
             return urls[index]
 
     def current_image_model_base_urls(self) -> list[str]:
+        if self.routing_scheduler is not None:
+            return [
+                endpoint.base_url
+                for endpoint in self.routing_scheduler.endpoints("image")
+            ]
         if self.image_model_base_urls_file:
             path = Path(self.image_model_base_urls_file)
             if path.exists():
@@ -1509,6 +1564,11 @@ class LocalAttributeExtractor:
             return urls[index]
 
     def current_remote_image_model_base_urls(self) -> list[str]:
+        if self.remote_routing_scheduler is not None:
+            return [
+                endpoint.base_url
+                for endpoint in self.remote_routing_scheduler.endpoints("image")
+            ]
         if self.remote_image_model_base_urls_file:
             path = Path(self.remote_image_model_base_urls_file)
             if path.exists():
@@ -1616,6 +1676,19 @@ class LocalAttributeExtractor:
     ) -> Iterator[str]:
         """Lease the least-loaded current endpoint for one complete model call."""
 
+        scheduler = (
+            self.routing_scheduler
+            if endpoint_pool == "local"
+            else self.remote_routing_scheduler
+        )
+        if scheduler is not None:
+            try:
+                with scheduler.lease(model_kind) as base_url:
+                    yield base_url
+            except RoutingUnavailableError as error:
+                raise TransientModelEndpointError(str(error)) from None
+            return
+
         base_url = self._acquire_model_base_url(model_kind, endpoint_pool)
         try:
             yield base_url
@@ -1628,12 +1701,53 @@ class LocalAttributeExtractor:
         base_url: str,
         endpoint_pool: str = "local",
     ) -> bool:
+        scheduler = (
+            self.routing_scheduler
+            if endpoint_pool == "local"
+            else self.remote_routing_scheduler
+        )
+        if scheduler is not None:
+            return scheduler.is_current(model_kind, base_url)
         _lock, urls_getter, _inflight, _index_name = self._endpoint_pool_state(
             model_kind,
             endpoint_pool,
         )
         urls = urls_getter()
         return base_url in urls
+
+    def routing_capacity(self, model_kind: str) -> int | None:
+        """Return authoritative dynamic capacity, or ``None`` in static mode."""
+        if self.routing_scheduler is None:
+            return None
+        return self.routing_scheduler.capacity(model_kind)
+
+    def wait_for_endpoint_pool(
+        self,
+        model_kind: str,
+        endpoint_pool: str,
+        timeout_seconds: float,
+    ) -> bool:
+        scheduler = (
+            self.routing_scheduler
+            if endpoint_pool == "local"
+            else self.remote_routing_scheduler
+        )
+        if scheduler is not None:
+            return scheduler.wait_for_capacity(model_kind, timeout_seconds)
+        urls = (
+            self.current_remote_text_model_base_urls()
+            if endpoint_pool == "remote" and model_kind == "text"
+            else self.current_remote_image_model_base_urls()
+            if endpoint_pool == "remote"
+            else self.current_text_model_base_urls()
+            if model_kind == "text"
+            else self.current_image_model_base_urls()
+        )
+        if urls:
+            return True
+        if timeout_seconds > 0:
+            time.sleep(timeout_seconds)
+        return False
 
     def _probe_endpoint(
         self,
@@ -2579,11 +2693,34 @@ def run_extraction_kind_distributed(
 
     def consume(endpoint_pool: str) -> None:
         while True:
+            if endpoint_pool == "remote":
+                wait_for_endpoint_pool = getattr(
+                    extractor,
+                    "wait_for_endpoint_pool",
+                    None,
+                )
+                if callable(wait_for_endpoint_pool):
+                    while not task_queue.empty() and not wait_for_endpoint_pool(
+                        model_kind,
+                        endpoint_pool,
+                        0.2,
+                    ):
+                        pass
             try:
                 task = task_queue.get_nowait()
             except queue.Empty:
                 return
             record = run_extraction_task(extractor, task, endpoint_pool)
+            if (
+                endpoint_pool == "remote"
+                and record.get("error_class") == "model_endpoint_transient"
+            ):
+                # A priority reclaim can withdraw the route between the
+                # availability check and the request lease. Return that task
+                # to the shared queue so a local worker can finish it.
+                task_queue.put(task)
+                time.sleep(0.05)
+                continue
             result_queue.put((endpoint_pool, task, record))
 
     records: dict[str, dict[str, Any]] = {}
@@ -3073,6 +3210,538 @@ def context_columns(table: dict[str, Any], excluded: set[int], limit: int) -> li
     return [idx for _non_empty, _unique, idx in candidates[:limit]]
 
 
+def _explicit_join_fallback_selected(
+    source_table: dict[str, Any], args: argparse.Namespace
+) -> bool:
+    ratio = configured_explicit_join_fallback_ratio(args)
+    if ratio <= 0.0:
+        return False
+    if ratio >= 1.0:
+        return True
+    draw = int(
+        stable_hash(
+            "explicit-join-fallback",
+            int(getattr(args, "seed", 13)),
+            source_table.get("source_table_id"),
+            length=40,
+        ),
+        16,
+    )
+    return draw / float(1 << 160) < ratio
+
+
+def _explicit_join_candidate_columns(
+    source_table: dict[str, Any],
+    entity_col: int,
+    args: argparse.Namespace,
+) -> list[int]:
+    rows = source_table.get("rows", [])
+    if not rows:
+        return []
+    query_rows_per_table = configured_query_rows_per_table(args)
+    min_target_rows = int(getattr(args, "min_rows_per_output_table", 2))
+    min_non_empty_ratio = float(
+        getattr(args, "min_column_non_empty_ratio", 0.5)
+    )
+    candidates: list[int] = []
+    for fallback, column in enumerate(source_table.get("columns", [])):
+        try:
+            column_index = int(column.get("column_index", fallback))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if column_index == entity_col:
+            continue
+        non_empty_join_rows = 0
+        query_eligible_rows = 0
+        for row in rows:
+            if not get_cell_text(row, column_index):
+                continue
+            non_empty_join_rows += 1
+            if get_cell_text(row, entity_col):
+                query_eligible_rows += 1
+        if non_empty_join_rows / len(rows) < min_non_empty_ratio:
+            continue
+        if non_empty_join_rows < min_target_rows:
+            continue
+        if query_eligible_rows < query_rows_per_table:
+            continue
+        candidates.append(column_index)
+    return candidates
+
+
+def _explicit_join_candidate_id(
+    source_table_id: str,
+    entity_col: int,
+    join_col: int,
+) -> str:
+    return f"explicit_candidate_{stable_hash(source_table_id, entity_col, join_col)}"
+
+
+def _explicit_join_context_partition(
+    *,
+    source_table: dict[str, Any],
+    entity_col: int,
+    join_columns: list[int],
+    args: argparse.Namespace,
+) -> tuple[list[int], list[int]]:
+    """Partition ordinary columns once for a source's explicit variants.
+
+    Every explicit query exposes its own join column.  All other join columns
+    are target-only, while the ordinary context columns are split globally
+    into query-only and target-only pools.  This keeps a query from one
+    variant from sharing a source column with a target from another variant.
+    """
+    min_target_rows = int(getattr(args, "min_rows_per_output_table", 2))
+    ordinary = context_columns(
+        source_table,
+        {entity_col, *join_columns},
+        0,
+    )
+    ordinary = [
+        column_index
+        for column_index in ordinary
+        if sum(
+            bool(get_cell_text(source_row, column_index))
+            for source_row in source_table.get("rows", [])
+        )
+        >= min_target_rows
+    ]
+    max_target_context = int(getattr(args, "max_target_context_attrs", 2))
+    if max_target_context <= 0:
+        target_context = list(ordinary)
+    else:
+        target_context = ordinary[:max_target_context]
+    query_context_pool = [
+        column_index
+        for column_index in ordinary
+        if column_index not in target_context
+    ]
+    max_query_context = int(getattr(args, "max_query_context_attrs", 1))
+    if max_query_context <= 0:
+        query_context = query_context_pool
+    else:
+        query_context = query_context_pool[:max_query_context]
+    return query_context, target_context
+
+
+def _build_explicit_join_candidate(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    entity_col: int,
+    join_col: int,
+    query_context: list[int],
+    target_context: list[int],
+    rejected_multimodal_reason: str,
+    rejected_multimodal_decision: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Build one deterministic explicit query/target candidate specification."""
+    seed = int(getattr(args, "seed", 13))
+    source_table_id = str(source_table["source_table_id"])
+    query_cols = [entity_col, join_col, *query_context]
+    target_cols = [join_col, *target_context]
+    eligible_source_rows = [
+        row_id(source_row, fallback)
+        for fallback, source_row in enumerate(source_table.get("rows", []))
+        if get_cell_text(source_row, entity_col)
+        and get_cell_text(source_row, join_col)
+    ]
+    eligible_source_rows.sort(
+        key=lambda source_row_id: (
+            stable_hash(
+                "explicit-join-query-row",
+                seed,
+                source_table_id,
+                join_col,
+                source_row_id,
+                length=40,
+            ),
+            source_row_id,
+        )
+    )
+    query_rows_per_table = configured_query_rows_per_table(args)
+    selected_source_rows = eligible_source_rows[:query_rows_per_table]
+    query_rows, query_source_rows = project_selected_rows(
+        source_table,
+        query_cols,
+        set(selected_source_rows),
+        min_required_cols=2,
+    )
+    all_source_rows = {
+        row_id(source_row, fallback)
+        for fallback, source_row in enumerate(source_table.get("rows", []))
+    }
+    target_rows, target_source_rows = project_selected_rows(
+        source_table,
+        target_cols,
+        all_source_rows,
+        min_required_cols=1,
+    )
+    min_target_rows = int(getattr(args, "min_rows_per_output_table", 2))
+    if len(query_rows) != query_rows_per_table:
+        return None
+    if len(target_rows) < min_target_rows:
+        return None
+    if not set(query_source_rows).issubset(target_source_rows):
+        return None
+
+    join_col_name = get_column_name(source_table, join_col)
+    chain_id = f"chain_explicit_{stable_hash(source_table_id, entity_col, join_col)}"
+    query_table_id = f"query_{stable_hash(chain_id, 'query')}"
+    target_table_id = f"target_{stable_hash(chain_id, 'target')}"
+    join_attribute = {
+        "source_column_index": join_col,
+        "column_name": join_col_name,
+        "role": "visible_join_column",
+        "hidden_in_query": False,
+        "selected_rows": len(query_rows),
+        "target_rows": len(target_rows),
+    }
+    return {
+        "reason": "explicit_join_fallback",
+        "candidate_id": _explicit_join_candidate_id(
+            source_table_id, entity_col, join_col
+        ),
+        "source_table_id": source_table_id,
+        "split": split,
+        "entity_column_index": entity_col,
+        "join_column_index": join_col,
+        "join_column_name": join_col_name,
+        "query_column_indices": query_cols,
+        "target_column_indices": target_cols,
+        "query_context_column_indices": query_context,
+        "target_context_column_indices": target_context,
+        "query_context_col_names": [
+            get_column_name(source_table, column_index)
+            for column_index in query_context
+        ],
+        "target_context_col_names": [
+            get_column_name(source_table, column_index)
+            for column_index in target_context
+        ],
+        "selected_source_row_ids": query_source_rows,
+        "query_table_id": query_table_id,
+        "target_table_id": target_table_id,
+        "chain_id": chain_id,
+        "join_attribute": join_attribute,
+        "rejected_multimodal_reason": rejected_multimodal_reason,
+        "rejected_multimodal_decision": dict(
+            rejected_multimodal_decision
+            or {"reason": rejected_multimodal_reason}
+        ),
+    }
+
+
+def _materialize_explicit_join_candidate(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    candidate: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    """Materialize one previously certified explicit candidate."""
+    entity_col = int(candidate["entity_column_index"])
+    join_col = int(candidate["join_column_index"])
+    query_context = [int(value) for value in candidate.get("query_context_column_indices", [])]
+    target_context = [int(value) for value in candidate.get("target_context_column_indices", [])]
+    query_cols = [entity_col, join_col, *query_context]
+    target_cols = [join_col, *target_context]
+    query_rows, query_source_rows = project_selected_rows(
+        source_table,
+        query_cols,
+        {int(value) for value in candidate["selected_source_row_ids"]},
+        min_required_cols=2,
+    )
+    all_source_rows = {
+        row_id(source_row, fallback)
+        for fallback, source_row in enumerate(source_table.get("rows", []))
+    }
+    target_rows, target_source_rows = project_selected_rows(
+        source_table,
+        target_cols,
+        all_source_rows,
+        min_required_cols=1,
+    )
+    query_table_id = str(candidate["query_table_id"])
+    target_table_id = str(candidate["target_table_id"])
+    chain_id = str(candidate["chain_id"])
+    join_col_name = get_column_name(source_table, join_col)
+    join_attribute = {
+        **dict(candidate.get("join_attribute") or {}),
+        "source_column_index": join_col,
+        "column_name": join_col_name,
+        "selected_rows": len(query_rows),
+        "target_rows": len(target_rows),
+        "hidden_in_query": False,
+    }
+    query_table = table_record(
+        table_id=query_table_id,
+        role="query",
+        split=split,
+        source_table=source_table,
+        column_indices=query_cols,
+        rows=query_rows,
+        source_row_indices=query_source_rows,
+        extra={
+            "chain_id": chain_id,
+            "chain_ids": [chain_id],
+            "construction_type": "explicit_visible_join",
+            "query_entity_col": entity_col,
+            "query_entity_col_name": get_column_name(source_table, entity_col),
+            "join_col": join_col,
+            "join_col_name": join_col_name,
+            "hidden_attributes": [],
+            "target_table_ids": [target_table_id],
+            "query_context_col_names": [
+                get_column_name(source_table, column_index)
+                for column_index in query_context
+            ],
+            "row_view_index": 0,
+        },
+    )
+    target_table = table_record(
+        table_id=target_table_id,
+        role="target_data_lake_table",
+        split=split,
+        source_table=source_table,
+        column_indices=target_cols,
+        rows=target_rows,
+        source_row_indices=target_source_rows,
+        extra={
+            "chain_id": chain_id,
+            "construction_type": "explicit_visible_join",
+            "queryable_source_table": True,
+            "join_col": join_col,
+            "join_col_name": join_col_name,
+            "target_context_col_names": [
+                get_column_name(source_table, column_index)
+                for column_index in target_context
+            ],
+        },
+    )
+    qrel = {
+        "query_table_id": query_table_id,
+        "target_table_id": target_table_id,
+        "data_lake_table_id": target_table_id,
+        "rel": 3,
+        "split": split,
+        "chain_id": chain_id,
+        "row_view_index": 0,
+        "source_table_id": str(source_table["source_table_id"]),
+        "join_attribute": join_attribute,
+        "reason": "explicit_visible_join_column",
+    }
+    decision = {
+        "reason": "explicit_join_fallback",
+        "rejected_multimodal_reason": candidate.get(
+            "rejected_multimodal_reason", ""
+        ),
+        "rejected_multimodal_decision": dict(
+            candidate.get("rejected_multimodal_decision") or {}
+        ),
+        "entity_column_index": entity_col,
+        "join_column_index": join_col,
+        "join_column_name": join_col_name,
+        "qualified_columns": [join_attribute],
+        "explicit_join_candidate": dict(candidate),
+    }
+    return [query_table], [target_table], [qrel], decision
+
+
+def build_explicit_join_fallback_records(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    entity_col: int | None,
+    rejected_multimodal_reason: str,
+    args: argparse.Namespace,
+    rejected_multimodal_decision: dict[str, Any] | None = None,
+    force: bool = False,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+] | None:
+    """Turn a sampled multimodal rejection into one visible-column join pair.
+
+    ``match_implicit`` uses :func:`build_explicit_join_fallback_candidates`
+    directly so a source table can contribute more than one query.  Ratio mode
+    retains the historical one-candidate behavior through this wrapper.
+    """
+    if entity_col is None or (
+        not force
+        and not _explicit_join_fallback_selected(source_table, args)
+    ):
+        return None
+
+    candidate_columns = _explicit_join_candidate_columns(
+        source_table, entity_col, args
+    )
+    if not candidate_columns:
+        return None
+    seed = int(getattr(args, "seed", 13))
+    source_table_id = str(source_table["source_table_id"])
+    join_column = min(
+        candidate_columns,
+        key=lambda column_index: (
+            stable_hash(
+                "explicit-join-column",
+                seed,
+                source_table_id,
+                column_index,
+                length=40,
+            ),
+            column_index,
+        ),
+    )
+    candidates = build_explicit_join_fallback_candidates(
+        source_table=source_table,
+        split=split,
+        entity_col=entity_col,
+        rejected_multimodal_reason=rejected_multimodal_reason,
+        rejected_multimodal_decision=rejected_multimodal_decision,
+        args=args,
+        join_columns=[join_column],
+    )
+    if not candidates:
+        return None
+    return _materialize_explicit_join_candidate(
+        source_table=source_table,
+        split=split,
+        candidate=candidates[0],
+        args=args,
+    )
+
+
+def build_explicit_join_fallback_candidates(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    entity_col: int | None,
+    rejected_multimodal_reason: str,
+    args: argparse.Namespace,
+    rejected_multimodal_decision: dict[str, Any] | None = None,
+    force: bool = False,
+    join_columns: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Build all viable explicit query candidates for one source table.
+
+    Candidate join columns are target-only for every sibling variant.  The
+    ordinary context columns are partitioned once into a query-only pool and a
+    target-only pool, so a query from one variant cannot accidentally match a
+    target produced for another variant from the same source table.
+    """
+    if entity_col is None or (
+        not force
+        and not _explicit_join_fallback_selected(source_table, args)
+    ):
+        return []
+    candidates = list(join_columns) if join_columns is not None else (
+        _explicit_join_candidate_columns(source_table, entity_col, args)
+    )
+    if not candidates:
+        return []
+    seed = int(getattr(args, "seed", 13))
+    source_table_id = str(source_table["source_table_id"])
+    candidates.sort(
+        key=lambda column_index: (
+            stable_hash(
+                "explicit-join-column",
+                seed,
+                source_table_id,
+                column_index,
+                length=40,
+            ),
+            column_index,
+        )
+    )
+    max_variants = int(getattr(args, "max_query_tables_per_source_table", 0))
+    if max_variants > 0:
+        candidates = candidates[:max_variants]
+    query_context, target_context = _explicit_join_context_partition(
+        source_table=source_table,
+        entity_col=entity_col,
+        join_columns=candidates,
+        args=args,
+    )
+    output: list[dict[str, Any]] = []
+    for join_col in candidates:
+        candidate = _build_explicit_join_candidate(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            join_col=join_col,
+            query_context=query_context,
+            target_context=target_context,
+            rejected_multimodal_reason=rejected_multimodal_reason,
+            rejected_multimodal_decision=rejected_multimodal_decision,
+            args=args,
+        )
+        if candidate is not None:
+            output.append(candidate)
+    return output
+
+
+def rejected_table_join_records(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    entity_col: int | None,
+    decision: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    mode = configured_explicit_join_fallback_mode(args)
+    if mode == "match_implicit":
+        explicit_candidates = build_explicit_join_fallback_candidates(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            rejected_multimodal_reason=str(decision["reason"]),
+            rejected_multimodal_decision=decision,
+            args=args,
+            force=True,
+        )
+        if explicit_candidates:
+            return (
+                [],
+                [raw_data_lake_record(source_table, split)],
+                [],
+                {
+                    **decision,
+                    "explicit_join_candidates": explicit_candidates,
+                    # Keep the singular field for callers written against the
+                    # pre-query-level candidate schema.
+                    "explicit_join_candidate": explicit_candidates[0],
+                },
+            )
+        return [], [raw_data_lake_record(source_table, split)], [], decision
+    if mode == "disabled":
+        return [], [raw_data_lake_record(source_table, split)], [], decision
+    explicit_records = build_explicit_join_fallback_records(
+        source_table=source_table,
+        split=split,
+        entity_col=entity_col,
+        rejected_multimodal_reason=str(decision["reason"]),
+        rejected_multimodal_decision=decision,
+        args=args,
+    )
+    if explicit_records is not None:
+        return explicit_records
+    return [], [raw_data_lake_record(source_table, split)], [], decision
+
+
 def select_best_qualified_column(qualified_cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not qualified_cols:
         return []
@@ -3322,6 +3991,140 @@ def configured_max_train_query_row_views_per_join(
     if max_views < 0:
         raise ValueError("max_train_query_row_views_per_join must be non-negative")
     return max_views
+
+
+def configured_explicit_join_fallback_mode(args: argparse.Namespace) -> str:
+    # Namespaces created by older callers did not carry a mode and retain the
+    # historical ratio behavior. CLI parsers also default to ratio for
+    # backward-compatible runs; match_implicit is opt-in.
+    mode = str(getattr(args, "explicit_join_fallback_mode", "ratio"))
+    if mode not in EXPLICIT_JOIN_FALLBACK_MODES:
+        raise ValueError(
+            "explicit_join_fallback_mode must be one of "
+            + ", ".join(EXPLICIT_JOIN_FALLBACK_MODES)
+        )
+    return mode
+
+
+def configured_explicit_join_fallback_ratio(args: argparse.Namespace) -> float:
+    ratio = float(
+        getattr(
+            args,
+            "explicit_join_fallback_ratio",
+            DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO,
+        )
+    )
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("explicit_join_fallback_ratio must be within [0, 1]")
+    return ratio
+
+
+def select_balanced_explicit_join_candidates(
+    *,
+    candidate_splits: dict[str, str],
+    implicit_query_counts: dict[str, int],
+    args: argparse.Namespace,
+) -> tuple[set[str], dict[str, int]]:
+    """Select one query-level explicit candidate per implicit query per split."""
+    candidates_by_split: dict[str, list[str]] = {
+        "train": [],
+        "dev": [],
+        "test": [],
+    }
+    for source_table_id, split in candidate_splits.items():
+        if split not in candidates_by_split:
+            raise ValueError(
+                f"explicit join candidate has invalid split: {split}"
+            )
+        candidates_by_split[split].append(source_table_id)
+
+    seed = int(getattr(args, "seed", 13))
+    selected: set[str] = set()
+    candidate_counts: dict[str, int] = {}
+    for split in ("train", "dev", "test"):
+        needed = int(implicit_query_counts.get(split, 0))
+        if needed < 0:
+            raise ValueError("implicit query count must be non-negative")
+        candidates = candidates_by_split[split]
+        candidate_counts[split] = len(candidates)
+        if len(candidates) < needed:
+            raise ValueError(
+                "insufficient explicit join candidates for balanced "
+                f"{split} split: required={needed}, available={len(candidates)}"
+            )
+        candidates.sort(
+            key=lambda source_table_id: (
+                stable_hash(
+                    "explicit-join-balance",
+                    seed,
+                    split,
+                    source_table_id,
+                    length=40,
+                ),
+                source_table_id,
+            )
+        )
+        selected.update(candidates[:needed])
+    return selected, candidate_counts
+
+
+def materialize_balanced_explicit_join_candidate(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    candidate_decision: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    """Rebuild a previously certified explicit candidate after selection."""
+    candidate = dict(candidate_decision)
+    if "selected_source_row_ids" not in candidate:
+        # Upgrade decisions written by the pre-query-level implementation so
+        # staged WDC runs can still be resumed safely.
+        generated = build_explicit_join_fallback_candidates(
+            source_table=source_table,
+            split=split,
+            entity_col=int(candidate["entity_column_index"]),
+            rejected_multimodal_reason=str(
+                candidate.get("rejected_multimodal_reason")
+                or candidate.get("reason")
+                or "explicit_join_fallback"
+            ),
+            rejected_multimodal_decision=(
+                candidate.get("rejected_multimodal_decision")
+                if isinstance(candidate.get("rejected_multimodal_decision"), dict)
+                else candidate
+            ),
+            args=args,
+            force=True,
+            join_columns=[int(candidate["join_column_index"])],
+        )
+        if not generated:
+            raise ValueError(
+                "legacy explicit join candidate is no longer viable: "
+                f"{source_table.get('source_table_id')}"
+            )
+        candidate = {**generated[0], **candidate}
+    records = _materialize_explicit_join_candidate(
+        source_table=source_table,
+        split=split,
+        candidate=candidate,
+        args=args,
+    )
+    if records[3].get("join_column_index") != candidate.get(
+        "join_column_index"
+    ) or records[3].get("explicit_join_candidate", {}).get(
+        "candidate_id"
+    ) != candidate.get("candidate_id"):
+        raise ValueError(
+            "explicit join candidate changed during balanced materialization: "
+            f"{source_table.get('source_table_id')}"
+        )
+    return records
 
 
 def extraction_cache_key(
@@ -3868,6 +4671,438 @@ def write_done_markers_after_selection(
             )
 
 
+class _RoundRemoteWorkload:
+    """Thread-safe unfinished counts for one EntiTables model round."""
+
+    def __init__(self, counts: dict[str, int]) -> None:
+        self._lock = threading.Lock()
+        self._identity = uuid.uuid4().hex
+        self._counts = {
+            "text": max(0, int(counts.get("text", 0))),
+            "image": max(0, int(counts.get("image", 0))),
+        }
+
+    def complete(self, modality: str) -> None:
+        if modality not in self._counts:
+            raise ValueError(f"unsupported model modality: {modality}")
+        with self._lock:
+            self._counts[modality] = 0
+
+    def snapshot(self) -> WorkloadSnapshot:
+        with self._lock:
+            counts = dict(self._counts)
+        return WorkloadSnapshot(
+            pair_identity=self._identity,
+            text_kind="entitables-text",
+            image_kind="entitables-image",
+            text_unfinished=counts["text"],
+            image_unfinished=counts["image"],
+        )
+
+
+class EntiTablesRemoteGpuBorrower:
+    """Borrow the WDC-owned remote layout without delaying local workers."""
+
+    def __init__(
+        self,
+        *,
+        controller_config: RemoteLayoutControllerConfig,
+        scheduler: RoutingScheduler,
+        workload: _RoundRemoteWorkload,
+        coordination_dir: Path | None,
+        coordination_poll_seconds: float,
+        drain_timeout_seconds: float,
+    ) -> None:
+        self.controller_config = controller_config
+        self.scheduler = scheduler
+        self.workload = workload
+        self.coordination_paths = (
+            gpu_priority.ProtocolPaths(coordination_dir.resolve())
+            if coordination_dir is not None
+            else None
+        )
+        self.coordination_poll_seconds = coordination_poll_seconds
+        self.drain_timeout_seconds = drain_timeout_seconds
+        self.borrower_id = uuid.uuid4().hex
+        self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._controller_stop_lock = threading.Lock()
+        self._controller: RemoteLayoutController | None = None
+        self._controller_thread: threading.Thread | None = None
+        self._controller_started = False
+        self._supervisor_thread: threading.Thread | None = None
+        self._borrower_lock = (
+            ExclusiveControllerLock(self.coordination_paths.borrower_lock)
+            if self.coordination_paths is not None
+            else None
+        )
+        self._last_acknowledged: tuple[str, int] | None = None
+        self._shutdown_error: RuntimeError | None = None
+
+    def start(self) -> None:
+        self.scheduler.clear()
+        if self._borrower_lock is not None:
+            self._borrower_lock.acquire()
+        try:
+            self._supervisor_thread = threading.Thread(
+                target=self._supervise,
+                name="entitables-remote-gpu-borrower",
+                daemon=True,
+            )
+            self._supervisor_thread.start()
+        except BaseException:
+            if self._borrower_lock is not None:
+                self._borrower_lock.release()
+            raise
+
+    def complete(self, modality: str) -> None:
+        self.workload.complete(modality)
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._supervisor_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(
+                timeout=max(
+                    1.0,
+                    self.drain_timeout_seconds
+                    + self.controller_config.request_timeout_seconds * 2,
+                )
+            )
+            if thread.is_alive():
+                raise RuntimeError(
+                    "timed out stopping the EntiTables remote GPU borrower"
+                )
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
+
+    def _current_request(self) -> gpu_priority.PriorityRequest | None:
+        if self.coordination_paths is None:
+            return None
+        return gpu_priority.read_priority_request(
+            self.coordination_paths.request
+        )
+
+    def _heartbeat(
+        self,
+        state: str,
+        request: gpu_priority.PriorityRequest | None,
+    ) -> None:
+        if self.coordination_paths is None:
+            return
+        gpu_priority.write_borrower_status(
+            self.coordination_paths.borrower,
+            borrower_id=self.borrower_id,
+            state=state,
+            request=request,
+        )
+
+    def _launch_controller(self) -> None:
+        with self._state_lock:
+            if self._controller is not None or self._stop.is_set():
+                return
+            controller = RemoteLayoutController(
+                self.controller_config,
+                self.scheduler,
+            )
+            thread = threading.Thread(
+                target=self._start_controller,
+                args=(controller,),
+                name="entitables-remote-layout-controller",
+                daemon=True,
+            )
+            self._controller = controller
+            self._controller_thread = thread
+            self._controller_started = False
+            thread.start()
+
+    def _start_controller(
+        self,
+        controller: RemoteLayoutController,
+    ) -> None:
+        try:
+            controller.start()
+        except LayoutProtocolError as error:
+            if not self._stop.is_set():
+                logging.info(
+                    "Remote GPUs remain with WDC; EntiTables will retry: %s",
+                    error,
+                )
+            self.scheduler.clear()
+            with self._state_lock:
+                if self._controller is controller:
+                    self._controller = None
+                    self._controller_started = False
+            return
+        except BaseException:
+            self.scheduler.clear()
+            with self._state_lock:
+                if self._controller is controller:
+                    self._controller = None
+                    self._controller_started = False
+            if not self._stop.is_set():
+                logging.exception(
+                    "EntiTables remote GPU borrower failed to start"
+                )
+            return
+        with self._state_lock:
+            if self._controller is controller and not self._stop.is_set():
+                self._controller_started = True
+
+    def _stop_controller(self) -> bool:
+        with self._controller_stop_lock:
+            with self._state_lock:
+                controller = self._controller
+                thread = self._controller_thread
+            if controller is not None:
+                controller.request_stop()
+            if thread is not None and thread is not threading.current_thread():
+                deadline = time.monotonic() + max(
+                    1.0,
+                    self.controller_config.request_timeout_seconds * 2,
+                )
+                while thread.is_alive():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    thread.join(min(remaining, 0.5))
+                    self._heartbeat("draining", self._current_request())
+                if thread.is_alive():
+                    logging.error(
+                        "Remote layout controller did not stop; withholding "
+                        "the WDC reclaim acknowledgement"
+                    )
+                    return False
+            if controller is not None:
+                try:
+                    controller.close(
+                        withdraw_routes=True,
+                        drain_timeout_seconds=self.drain_timeout_seconds,
+                        drain_progress=lambda: self._heartbeat(
+                            "draining",
+                            self._current_request(),
+                        ),
+                        require_lease_release=True,
+                    )
+                except LayoutProtocolError as error:
+                    logging.error(
+                        "Refusing to acknowledge the WDC remote reclaim: %s",
+                        error,
+                    )
+                    return False
+            else:
+                self.scheduler.clear()
+                if not self.scheduler.wait_all_drained(
+                    self.drain_timeout_seconds,
+                    on_wait=lambda: self._heartbeat(
+                        "draining",
+                        self._current_request(),
+                    ),
+                ):
+                    logging.error(
+                        "Refusing to release remote routes before all "
+                        "EntiTables requests drain"
+                    )
+                    return False
+            with self._state_lock:
+                if self._controller is controller:
+                    self._controller = None
+                    self._controller_thread = None
+                    self._controller_started = False
+            return True
+
+    def _controller_state(self) -> tuple[bool, bool]:
+        with self._state_lock:
+            return self._controller is not None, self._controller_started
+
+    def _acknowledge_reclaim(
+        self,
+        request: gpu_priority.PriorityRequest,
+    ) -> None:
+        if self.coordination_paths is None:
+            return
+        if request.token != self._last_acknowledged:
+            gpu_priority.write_acknowledgement(
+                self.coordination_paths.acknowledgement,
+                request,
+                borrower_id=self.borrower_id,
+                status=gpu_priority.RELEASED_STATUS,
+            )
+            self._last_acknowledged = request.token
+
+    def _supervise(self) -> None:
+        supervisor_error: Exception | None = None
+        try:
+            while not self._stop.is_set():
+                request = self._current_request()
+                priority_requested = bool(
+                    request is not None
+                    and request.state == gpu_priority.PRIORITY_REQUESTED_STATE
+                )
+                if priority_requested:
+                    if self._stop_controller():
+                        self._acknowledge_reclaim(request)
+                        self._heartbeat(gpu_priority.RELEASED_STATUS, request)
+                else:
+                    has_controller, started = self._controller_state()
+                    self._heartbeat(
+                        gpu_priority.SERVING_STATUS
+                        if started
+                        else "acquiring",
+                        request,
+                    )
+                    if not has_controller:
+                        self._launch_controller()
+                self._stop.wait(self.coordination_poll_seconds)
+        except Exception as error:
+            supervisor_error = error
+            logging.exception(
+                "EntiTables remote GPU borrower supervision failed"
+            )
+        finally:
+            try:
+                stopped = self._stop_controller()
+            except Exception as error:
+                logging.exception(
+                    "EntiTables remote GPU borrower cleanup failed"
+                )
+                stopped = False
+                cleanup_detail = f": {error}"
+            else:
+                cleanup_detail = ""
+            if not stopped:
+                message = (
+                    "EntiTables remote GPU borrower stopped without releasing "
+                    f"an undrained controller{cleanup_detail}"
+                )
+                logging.error(message)
+                self._shutdown_error = RuntimeError(message)
+            elif supervisor_error is not None:
+                self._shutdown_error = RuntimeError(
+                    "EntiTables remote GPU borrower supervision failed: "
+                    f"{supervisor_error}"
+                )
+            if stopped and self.coordination_paths is not None:
+                gpu_priority.remove_borrower_status(
+                    self.coordination_paths.borrower,
+                    borrower_id=self.borrower_id,
+                )
+            if self._borrower_lock is not None:
+                self._borrower_lock.release()
+
+
+def _entitables_remote_gpu_borrower(
+    *,
+    extractor: LocalAttributeExtractor,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+) -> EntiTablesRemoteGpuBorrower | None:
+    control_url = clean_text(
+        getattr(args, "remote_layout_control_url", "")
+    ).rstrip("/")
+    if not control_url:
+        return None
+    if not any(
+        counts.get(modality, 0) > 0
+        and getattr(extractor, f"remote_{modality}_model_workers", 0) > 0
+        for modality in ("text", "image")
+    ):
+        return None
+    scheduler = extractor.remote_routing_scheduler
+    if scheduler is None:
+        raise ValueError(
+            "remote layout control requires a remote routing manifest"
+        )
+    required_paths = {
+        "token": clean_text(
+            getattr(args, "remote_layout_control_token_file", "")
+        ),
+        "controller_id": clean_text(
+            getattr(args, "remote_layout_controller_id_file", "")
+        ),
+        "lock": clean_text(
+            getattr(args, "remote_layout_lock_file", "")
+        ),
+    }
+    if not all(required_paths.values()):
+        raise ValueError("remote layout control paths are incomplete")
+    primary_url = clean_text(
+        getattr(args, "remote_layout_primary_image_url", "")
+    ).rstrip("/")
+    switchable_url = clean_text(
+        getattr(args, "remote_layout_switchable_url", "")
+    ).rstrip("/")
+    if not primary_url or not switchable_url:
+        raise ValueError("remote layout endpoint mappings are incomplete")
+    workload = _RoundRemoteWorkload(counts)
+    drain_timeout = float(args.remote_layout_drain_timeout_seconds)
+    controller_config = RemoteLayoutControllerConfig(
+        control_url=control_url,
+        token_file=Path(required_paths["token"]).resolve(),
+        database_path=None,
+        controller_id_file=Path(required_paths["controller_id"]).resolve(),
+        lock_file=Path(required_paths["lock"]).resolve(),
+        endpoints={
+            "primary_image": RemoteLayoutEndpointConfig(
+                endpoint_id="primary_image",
+                base_url=primary_url,
+            ),
+            "switchable": RemoteLayoutEndpointConfig(
+                endpoint_id="switchable",
+                base_url=switchable_url,
+            ),
+        },
+        text_model_id=extractor.text_model_name,
+        image_model_id=extractor.image_model_name,
+        text_api_key=extractor.remote_text_model_api_key,
+        image_api_key=extractor.remote_image_model_api_key,
+        lease_ttl_seconds=int(args.remote_layout_lease_ttl_seconds),
+        lease_renew_seconds=float(args.remote_layout_lease_renew_seconds),
+        request_timeout_seconds=float(
+            args.remote_layout_request_timeout_seconds
+        ),
+        reconnect_timeout_seconds=float(
+            args.remote_layout_reconnect_timeout_seconds
+        ),
+        operation_timeout_seconds=float(
+            args.remote_layout_operation_timeout_seconds
+        ),
+        drain_timeout_seconds=drain_timeout,
+        poll_seconds=float(args.remote_layout_poll_seconds),
+        workload_poll_seconds=float(
+            args.remote_layout_workload_poll_seconds
+        ),
+        image_burst_stability_seconds=float(
+            args.remote_layout_stability_seconds
+        ),
+        endpoint_health_timeout_seconds=float(
+            args.remote_layout_health_timeout_seconds
+        ),
+        endpoint_health_stable_polls=int(
+            args.remote_layout_health_stable_polls
+        ),
+        workload_reader=workload.snapshot,
+    )
+    coordination_value = clean_text(
+        getattr(args, "remote_layout_coordination_dir", "")
+    )
+    if not coordination_value:
+        raise ValueError(
+            "EntiTables remote borrowing requires the shared WDC "
+            "coordination directory"
+        )
+    return EntiTablesRemoteGpuBorrower(
+        controller_config=controller_config,
+        scheduler=scheduler,
+        workload=workload,
+        coordination_dir=Path(coordination_value),
+        coordination_poll_seconds=float(
+            args.remote_layout_coordination_poll_seconds
+        ),
+        drain_timeout_seconds=drain_timeout,
+    )
+
+
 def precompute_extraction_task_groups(
     *,
     extractor: LocalAttributeExtractor,
@@ -3897,8 +5132,17 @@ def precompute_extraction_task_groups(
         return counts
 
     model_round = _begin_model_task_round(args, counts)
+    remote_borrower = _entitables_remote_gpu_borrower(
+        extractor=extractor,
+        args=args,
+        counts=counts,
+    )
     round_status = "completed"
+    remote_borrower_started = False
     try:
+        if remote_borrower is not None:
+            remote_borrower.start()
+            remote_borrower_started = True
         with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
             futures = {
                 pool.submit(
@@ -3915,6 +5159,8 @@ def precompute_extraction_task_groups(
             for future in as_completed(futures):
                 kind, task_count = futures[future]
                 future.result()
+                if remote_borrower is not None:
+                    remote_borrower.complete(kind)
                 _write_model_round_event(
                     model_round,
                     f"{kind}.done",
@@ -3933,9 +5179,16 @@ def precompute_extraction_task_groups(
         round_status = "failed"
         raise
     finally:
-        _write_model_round_event(
-            model_round, "done", status=f"model_round_{round_status}"
-        )
+        try:
+            if remote_borrower is not None and remote_borrower_started:
+                remote_borrower.close()
+        except BaseException:
+            round_status = "failed"
+            raise
+        finally:
+            _write_model_round_event(
+                model_round, "done", status=f"model_round_{round_status}"
+            )
     return counts
 
 
@@ -4046,13 +5299,27 @@ def build_table_join_records(
         min_linked_rows=query_rows_per_table,
     )
     if entity_col is None:
-        raw = raw_data_lake_record(source_table, split)
-        return [], [raw], [], {"reason": "no_entity_column", "qualified_columns": []}
+        return rejected_table_join_records(
+            source_table=source_table,
+            split=split,
+            entity_col=None,
+            decision={"reason": "no_entity_column", "qualified_columns": []},
+            args=args,
+        )
 
     attribute_cols = candidate_attribute_columns(source_table, entity_col, args.min_column_non_empty_ratio)
     if not attribute_cols:
-        raw = raw_data_lake_record(source_table, split)
-        return [], [raw], [], {"reason": "no_candidate_attribute_columns", "qualified_columns": []}
+        return rejected_table_join_records(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            decision={
+                "reason": "no_candidate_attribute_columns",
+                "entity_column_index": entity_col,
+                "qualified_columns": [],
+            },
+            args=args,
+        )
 
     candidate_attribute_names = [get_column_name(source_table, col) for col in attribute_cols]
     valid_entity_source_rows: set[int] = set()
@@ -4203,14 +5470,19 @@ def build_table_join_records(
             )
 
     if not qualified_cols:
-        raw = raw_data_lake_record(source_table, split)
-        return [], [raw], [], {
-            "reason": "no_column_met_recovered_value_ratio",
-            "entity_column_index": entity_col,
-            "candidate_attribute_columns": candidate_attribute_names,
-            "attribute_extractions": extraction_count,
-            "qualified_columns": [],
-        }
+        return rejected_table_join_records(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            decision={
+                "reason": "no_column_met_recovered_value_ratio",
+                "entity_column_index": entity_col,
+                "candidate_attribute_columns": candidate_attribute_names,
+                "attribute_extractions": extraction_count,
+                "qualified_columns": [],
+            },
+            args=args,
+        )
 
     variant_layouts = multi_attribute_context_layout(
         source_table=source_table,
@@ -4425,14 +5697,20 @@ def build_table_join_records(
         )
 
     if not query_tables:
-        raw = raw_data_lake_record(source_table, split)
-        return [], [raw], [], {
-            "reason": "qualified_columns_failed_query_target_split",
-            "entity_column_index": entity_col,
-            "qualified_columns": [
-                qualified for qualified, _query_context, _target_context in variant_layouts
-            ],
-        }
+        return rejected_table_join_records(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            decision={
+                "reason": "qualified_columns_failed_query_target_split",
+                "entity_column_index": entity_col,
+                "qualified_columns": [
+                    qualified
+                    for qualified, _query_context, _target_context in variant_layouts
+                ],
+            },
+            args=args,
+        )
     return query_tables, data_lake_tables, qrels, {
         "reason": "queryable",
         "entity_column_index": entity_col,
@@ -4658,6 +5936,12 @@ def _build_dataset(
     args.query_rows_per_table = configured_query_rows_per_table(args)
     args.max_train_query_row_views_per_join = (
         configured_max_train_query_row_views_per_join(args)
+    )
+    args.explicit_join_fallback_mode = (
+        configured_explicit_join_fallback_mode(args)
+    )
+    args.explicit_join_fallback_ratio = configured_explicit_join_fallback_ratio(
+        args
     )
     policy = replacement_policy_from_args(args)
     if args.max_source_tables is not None and args.max_source_tables < 0:
@@ -4945,11 +6229,34 @@ def _build_dataset(
     query_table_count = 0
     data_lake_table_count = 0
     queryable_source_tables = 0
+    multimodal_queryable_source_tables = 0
+    explicit_join_source_tables = 0
     rejected_source_tables = 0
+    implicit_query_table_count = 0
+    explicit_join_query_table_count = 0
+    implicit_query_counts_by_split = {
+        "train": 0,
+        "dev": 0,
+        "test": 0,
+    }
+    # In match_implicit mode candidates are query-level.  A source table may
+    # therefore contribute several candidate IDs (one per visible join
+    # column), while its queryability decision remains source-level.
+    explicit_candidate_splits: dict[str, str] = {}
+    explicit_candidate_source_ids: dict[str, str] = {}
+    explicit_candidate_decision_indices: dict[str, int] = {}
+    explicit_candidate_counts = {"train": 0, "dev": 0, "test": 0}
+    explicit_candidate_source_counts = {"train": 0, "dev": 0, "test": 0}
     try:
-        with query_writer as query_handle, data_lake_writer as data_lake_handle, extraction_writer as extraction_handle, recovery_writer as recovery_handle:
+        with (
+            query_writer as query_handle,
+            data_lake_writer as data_lake_handle,
+            extraction_writer as extraction_handle,
+            recovery_writer as recovery_handle,
+        ):
             for source_table in iter_jsonl_records(source_writer.paths()):
-                split = source_to_split.get(source_table["source_table_id"], "test")
+                source_table_id = str(source_table["source_table_id"])
+                split = source_to_split.get(source_table_id, "test")
                 query_tables, data_lake_tables, table_qrels, decision = build_table_join_records(
                     source_table=source_table,
                     split=split,
@@ -4966,16 +6273,51 @@ def _build_dataset(
                 )
                 if query_tables:
                     queryable_source_tables += 1
+                    if decision.get("reason") == "explicit_join_fallback":
+                        explicit_join_source_tables += 1
+                        explicit_join_query_table_count += len(query_tables)
+                    else:
+                        multimodal_queryable_source_tables += 1
+                        implicit_query_table_count += len(query_tables)
+                        implicit_query_counts_by_split[split] += len(
+                            query_tables
+                        )
                 else:
                     rejected_source_tables += 1
-                decision["source_table_id"] = source_table["source_table_id"]
+                candidates = decision.get("explicit_join_candidates")
+                if not isinstance(candidates, list):
+                    candidate = decision.get("explicit_join_candidate")
+                    candidates = [candidate] if isinstance(candidate, dict) else []
+                deferred_candidate = (
+                    args.explicit_join_fallback_mode == "match_implicit"
+                    and bool(candidates)
+                )
+                decision["source_table_id"] = source_table_id
                 decision["split"] = split
+                if deferred_candidate:
+                    for candidate in candidates:
+                        candidate_id = clean_text(candidate.get("candidate_id"))
+                        if not candidate_id:
+                            raise ValueError(
+                                "explicit join candidate is missing candidate_id: "
+                                f"{source_table_id}"
+                            )
+                        if candidate_id in explicit_candidate_splits:
+                            raise ValueError(
+                                "duplicate explicit join candidate: "
+                                f"{candidate_id}"
+                            )
+                        explicit_candidate_splits[candidate_id] = split
+                        explicit_candidate_source_ids[candidate_id] = source_table_id
+                        explicit_candidate_decision_indices[candidate_id] = len(
+                            table_decisions
+                        )
                 table_decisions.append(decision)
                 for record in query_tables:
                     write_jsonl_record(query_handle, record)
                     query_table_count += 1
                     splits[split]["query_table_ids"].append(record["table_id"])
-                for record in data_lake_tables:
+                for record in ([] if deferred_candidate else data_lake_tables):
                     write_jsonl_record(data_lake_handle, record)
                     data_lake_table_count += 1
                     splits[split]["data_lake_table_ids"].append(record["table_id"])
@@ -4985,6 +6327,128 @@ def _build_dataset(
                     data_lake_handle.flush()
                     extraction_handle.flush()
                     recovery_handle.flush()
+
+            if args.explicit_join_fallback_mode == "match_implicit":
+                selected_explicit, explicit_candidate_counts = (
+                    select_balanced_explicit_join_candidates(
+                        candidate_splits=explicit_candidate_splits,
+                        implicit_query_counts=implicit_query_counts_by_split,
+                        args=args,
+                    )
+                )
+                source_candidates_by_split: dict[str, set[str]] = {
+                    "train": set(),
+                    "dev": set(),
+                    "test": set(),
+                }
+                for candidate_id, candidate_split in explicit_candidate_splits.items():
+                    source_candidates_by_split[candidate_split].add(
+                        explicit_candidate_source_ids[candidate_id]
+                    )
+                explicit_candidate_source_counts = {
+                    split_name: len(source_ids)
+                    for split_name, source_ids in source_candidates_by_split.items()
+                }
+                source_by_id = {
+                    str(source_table["source_table_id"]): source_table
+                    for source_table in final_source_tables
+                    if str(source_table["source_table_id"]) in set(
+                        explicit_candidate_source_ids.values()
+                    )
+                }
+                selected_by_source: dict[str, list[str]] = defaultdict(list)
+                for candidate_id in selected_explicit:
+                    selected_by_source[
+                        explicit_candidate_source_ids[candidate_id]
+                    ].append(candidate_id)
+                candidate_source_ids = sorted(
+                    set(explicit_candidate_source_ids.values())
+                )
+                for source_table_id in candidate_source_ids:
+                    split = source_to_split.get(source_table_id, "test")
+                    source_table = source_by_id[source_table_id]
+                    selected_candidate_ids = sorted(
+                        selected_by_source.get(source_table_id, [])
+                    )
+                    if not selected_candidate_ids:
+                        record = raw_data_lake_record(source_table, split)
+                        write_jsonl_record(data_lake_handle, record)
+                        data_lake_table_count += 1
+                        splits[split]["data_lake_table_ids"].append(
+                            record["table_id"]
+                        )
+                        continue
+                    decision_index = explicit_candidate_decision_indices[
+                        selected_candidate_ids[0]
+                    ]
+                    original_decision = table_decisions[decision_index]
+                    explicit_queries: list[dict[str, Any]] = []
+                    explicit_targets: list[dict[str, Any]] = []
+                    explicit_qrels: list[dict[str, Any]] = []
+                    explicit_decisions: list[dict[str, Any]] = []
+                    selected_candidates: list[dict[str, Any]] = []
+                    for candidate_id in selected_candidate_ids:
+                        candidate_decision = next(
+                            candidate
+                            for candidate in original_decision[
+                                "explicit_join_candidates"
+                            ]
+                            if candidate.get("candidate_id") == candidate_id
+                        )
+                        (
+                            candidate_queries,
+                            candidate_targets,
+                            candidate_qrels,
+                            candidate_result_decision,
+                        ) = materialize_balanced_explicit_join_candidate(
+                            source_table=source_table,
+                            split=split,
+                            candidate_decision=candidate_decision,
+                            args=args,
+                        )
+                        explicit_queries.extend(candidate_queries)
+                        explicit_targets.extend(candidate_targets)
+                        explicit_qrels.extend(candidate_qrels)
+                        explicit_decisions.append(candidate_result_decision)
+                        selected_candidates.append(candidate_decision)
+                    explicit_decision = {
+                        **original_decision,
+                        **explicit_decisions[0],
+                        "source_table_id": source_table_id,
+                        "split": split,
+                        "qualified_columns": [
+                            qualified
+                            for item in explicit_decisions
+                            for qualified in item.get("qualified_columns", [])
+                        ],
+                        "explicit_join_candidates": selected_candidates,
+                        "explicit_join_candidate": selected_candidates[0],
+                        "explicit_join_query_count": len(explicit_queries),
+                    }
+                    table_decisions[decision_index] = explicit_decision
+                    rejected_source_tables -= 1
+                    queryable_source_tables += 1
+                    explicit_join_source_tables += 1
+                    for record in explicit_queries:
+                        write_jsonl_record(query_handle, record)
+                        query_table_count += 1
+                        explicit_join_query_table_count += 1
+                        splits[split]["query_table_ids"].append(
+                            record["table_id"]
+                        )
+                    for record in explicit_targets:
+                        write_jsonl_record(data_lake_handle, record)
+                        data_lake_table_count += 1
+                        splits[split]["data_lake_table_ids"].append(
+                            record["table_id"]
+                        )
+                    qrels.extend(explicit_qrels)
+                if explicit_join_query_table_count != implicit_query_table_count:
+                    raise ValueError(
+                        "explicit and implicit query counts are not balanced: "
+                        f"explicit={explicit_join_query_table_count}, "
+                        f"implicit={implicit_query_table_count}"
+                    )
     finally:
         if progress is not None:
             progress.close()
@@ -5018,6 +6482,17 @@ def _build_dataset(
         "skipped_tables": counters.skipped_tables,
         "source_tables": source_table_count,
         "queryable_source_tables": queryable_source_tables,
+        "multimodal_queryable_source_tables": multimodal_queryable_source_tables,
+        "explicit_join_source_tables": explicit_join_source_tables,
+        "implicit_join_query_tables": implicit_query_table_count,
+        "explicit_join_query_tables": explicit_join_query_table_count,
+        "explicit_join_candidate_tables": sum(
+            explicit_candidate_source_counts.values()
+        ),
+        "explicit_join_candidate_tables_by_split": explicit_candidate_source_counts,
+        "explicit_join_candidate_queries": sum(explicit_candidate_counts.values()),
+        "explicit_join_candidate_queries_by_split": explicit_candidate_counts,
+        "implicit_join_query_tables_by_split": implicit_query_counts_by_split,
         "rejected_source_tables": rejected_source_tables,
         "query_tables": query_table_count,
         "data_lake_tables": data_lake_table_count,
@@ -5038,6 +6513,8 @@ def _build_dataset(
         "min_recovery_denominator": args.min_recovery_denominator,
         "query_rows_per_table": args.query_rows_per_table,
         "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,
+        "explicit_join_fallback_mode": args.explicit_join_fallback_mode,
+        "explicit_join_fallback_ratio": args.explicit_join_fallback_ratio,
         "skipped_reasons": dict(counters.skip_reasons),
         "sampling_mode": source_sampling["mode"],
         "sampling_seed": args.seed,
@@ -5060,6 +6537,7 @@ def _build_dataset(
             "wide source tables emit one variant per qualifying bridge attribute; all qualifying bridge columns stay out of every sibling query, and ordinary context columns are partitioned into source-level query-only and target-only sides",
             "identical visible queries from one source table are merged and retain every hidden attribute, target table ID, chain ID, and qrel",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
+            "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
             "each replacement pass draws from every currently failed slot; retained_failed slots are deferred to the next pass unless the pass is terminal",
@@ -5099,6 +6577,9 @@ def _build_dataset(
             "query_row_selection": "recovery_balanced_disjoint_train_views",
             "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,
             "evaluation_query_row_views_per_join": 1,
+            "explicit_join_fallback_mode": args.explicit_join_fallback_mode,
+            "explicit_join_fallback_ratio": args.explicit_join_fallback_ratio,
+            "explicit_join_column_policy": "seeded_random_non_entity_visible_column",
             "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
@@ -5302,6 +6783,41 @@ def parse_args(
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0, help="0 means emit all qualifying join columns.")
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--explicit_join_fallback_mode",
+        choices=EXPLICIT_JOIN_FALLBACK_MODES,
+        default=DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE,
+        help=(
+            "match_implicit selects exactly one visible-join query per "
+            "implicit query within each split; ratio retains legacy sampling."
+        ),
+    )
+    parser.add_argument(
+        "--explicit_join_fallback_ratio",
+        type=float,
+        default=DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO,
+        help=(
+            "Seeded fraction of tables rejected by multimodal recovery to turn "
+            "into ordinary joins with a visible non-entity join column in both "
+            "query and target; 0 disables the fallback."
+        ),
+    )
+    parser.add_argument(
+        "--model_routing_manifest",
+        default=None,
+        help=(
+            "Authoritative mmdd-model-routing-v1 manifest. When set, empty "
+            "modality routes do not fall back to static model URLs."
+        ),
+    )
+    parser.add_argument(
+        "--remote_model_routing_manifest",
+        default=None,
+        help=(
+            "Authoritative routing manifest for an opportunistically borrowed "
+            "remote pool. Empty routes never fall back to static remote URLs."
+        ),
+    )
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None, help="Additional text-model OpenAI-compatible base URLs. Values may also be comma-separated.")
     parser.add_argument("--text_model_base_urls_file", default=None, help="Optional newline-separated text-model base URL file re-read before each text request. Dynamic vLLM runners can append endpoints here.")
@@ -5320,6 +6836,51 @@ def parse_args(
     parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
     parser.add_argument("--image_model_api_key", default=None)
     parser.add_argument("--remote_image_model_api_key", default=None, help="Remote image endpoint API key. Falls back to MMDD_REMOTE_IMAGE_MODEL_API_KEY, then the local image key/VLLM_API_KEY.")
+    parser.add_argument(
+        "--remote_layout_control_url",
+        default=None,
+        help="Loopback URL of the SSH-forwarded remote layout control API.",
+    )
+    parser.add_argument("--remote_layout_control_token_file")
+    parser.add_argument("--remote_layout_controller_id_file")
+    parser.add_argument("--remote_layout_lock_file")
+    parser.add_argument("--remote_layout_primary_image_url")
+    parser.add_argument("--remote_layout_switchable_url")
+    parser.add_argument("--remote_layout_coordination_dir")
+    parser.add_argument(
+        "--remote_layout_lease_ttl_seconds", type=int, default=15
+    )
+    parser.add_argument(
+        "--remote_layout_lease_renew_seconds", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--remote_layout_request_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_reconnect_timeout_seconds", type=float, default=30.0
+    )
+    parser.add_argument(
+        "--remote_layout_operation_timeout_seconds", type=float, default=1200.0
+    )
+    parser.add_argument(
+        "--remote_layout_drain_timeout_seconds", type=float, default=300.0
+    )
+    parser.add_argument("--remote_layout_poll_seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--remote_layout_workload_poll_seconds", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--remote_layout_stability_seconds", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_stable_polls", type=int, default=2
+    )
+    parser.add_argument(
+        "--remote_layout_coordination_poll_seconds", type=float, default=0.2
+    )
     parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
     parser.add_argument("--model_temperature", type=float, default=0.0)
     parser.add_argument("--model_max_tokens", type=int, default=1024)

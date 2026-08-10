@@ -2776,6 +2776,12 @@ def build_dataset(
     args.max_train_query_row_views_per_join = (
         join_builder.configured_max_train_query_row_views_per_join(args)
     )
+    args.explicit_join_fallback_mode = (
+        join_builder.configured_explicit_join_fallback_mode(args)
+    )
+    args.explicit_join_fallback_ratio = (
+        join_builder.configured_explicit_join_fallback_ratio(args)
+    )
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     cache_dir = Path(args.cache_dir).expanduser().resolve()
@@ -3065,7 +3071,21 @@ def build_dataset(
     query_table_count = 0
     data_lake_table_count = 0
     queryable_source_tables = 0
+    multimodal_queryable_source_tables = 0
+    explicit_join_source_tables = 0
     rejected_source_tables = 0
+    implicit_query_table_count = 0
+    explicit_join_query_table_count = 0
+    implicit_query_counts_by_split = {
+        "train": 0,
+        "dev": 0,
+        "test": 0,
+    }
+    explicit_candidate_splits: dict[str, str] = {}
+    explicit_candidate_source_ids: dict[str, str] = {}
+    explicit_candidate_decision_indices: dict[str, int] = {}
+    explicit_candidate_counts = {"train": 0, "dev": 0, "test": 0}
+    explicit_candidate_source_counts = {"train": 0, "dev": 0, "test": 0}
     try:
         with (
             query_writer as query_handle,
@@ -3074,7 +3094,8 @@ def build_dataset(
             recovery_writer as recovery_handle,
         ):
             for source_table in iter_jsonl_records(source_writer.paths()):
-                split = source_to_split.get(source_table["source_table_id"], "test")
+                source_table_id = str(source_table["source_table_id"])
+                split = source_to_split.get(source_table_id, "test")
                 query_tables, data_lake_tables, table_qrels, decision = (
                     join_builder.build_table_join_records(
                         source_table=source_table,
@@ -3093,16 +3114,48 @@ def build_dataset(
                 )
                 if query_tables:
                     queryable_source_tables += 1
+                    if decision.get("reason") == "explicit_join_fallback":
+                        explicit_join_source_tables += 1
+                        explicit_join_query_table_count += len(query_tables)
+                    else:
+                        multimodal_queryable_source_tables += 1
+                        implicit_query_table_count += len(query_tables)
+                        implicit_query_counts_by_split[split] += len(
+                            query_tables
+                        )
                 else:
                     rejected_source_tables += 1
-                decision["source_table_id"] = source_table["source_table_id"]
+                candidates = decision.get("explicit_join_candidates")
+                if not isinstance(candidates, list):
+                    candidate = decision.get("explicit_join_candidate")
+                    candidates = [candidate] if isinstance(candidate, dict) else []
+                deferred_candidate = (
+                    args.explicit_join_fallback_mode == "match_implicit"
+                    and bool(candidates)
+                )
+                decision["source_table_id"] = source_table_id
                 decision["split"] = split
+                if deferred_candidate:
+                    for candidate in candidates:
+                        candidate_id = join_builder.clean_text(
+                            candidate.get("candidate_id")
+                        )
+                        if not candidate_id:
+                            raise ValueError(
+                                "explicit join candidate is missing candidate_id: "
+                                f"{source_table_id}"
+                            )
+                        explicit_candidate_splits[candidate_id] = split
+                        explicit_candidate_source_ids[candidate_id] = source_table_id
+                        explicit_candidate_decision_indices[candidate_id] = len(
+                            table_decisions
+                        )
                 table_decisions.append(decision)
                 for record in query_tables:
                     write_jsonl_record(query_handle, record)
                     query_table_count += 1
                     splits[split]["query_table_ids"].append(record["table_id"])
-                for record in data_lake_tables:
+                for record in ([] if deferred_candidate else data_lake_tables):
                     write_jsonl_record(data_lake_handle, record)
                     data_lake_table_count += 1
                     splits[split]["data_lake_table_ids"].append(record["table_id"])
@@ -3112,6 +3165,134 @@ def build_dataset(
                     data_lake_handle.flush()
                     extraction_handle.flush()
                     recovery_handle.flush()
+
+            if args.explicit_join_fallback_mode == "match_implicit":
+                selected_explicit, explicit_candidate_counts = (
+                    join_builder.select_balanced_explicit_join_candidates(
+                        candidate_splits=explicit_candidate_splits,
+                        implicit_query_counts=implicit_query_counts_by_split,
+                        args=args,
+                    )
+                )
+                source_candidates_by_split: dict[str, set[str]] = {
+                    "train": set(),
+                    "dev": set(),
+                    "test": set(),
+                }
+                for candidate_id, candidate_split in explicit_candidate_splits.items():
+                    source_candidates_by_split[candidate_split].add(
+                        explicit_candidate_source_ids[candidate_id]
+                    )
+                explicit_candidate_source_counts = {
+                    split_name: len(source_ids)
+                    for split_name, source_ids in source_candidates_by_split.items()
+                }
+                seen_candidates: set[str] = set()
+                selected_by_source: dict[str, list[str]] = defaultdict(list)
+                for candidate_id in selected_explicit:
+                    selected_by_source[
+                        explicit_candidate_source_ids[candidate_id]
+                    ].append(candidate_id)
+                candidate_source_ids = sorted(
+                    set(explicit_candidate_source_ids.values())
+                )
+                for source_table in iter_jsonl_records(source_writer.paths()):
+                    source_table_id = str(source_table["source_table_id"])
+                    if source_table_id not in set(candidate_source_ids):
+                        continue
+                    split = source_to_split.get(source_table_id, "test")
+                    selected_candidate_ids = sorted(
+                        selected_by_source.get(source_table_id, [])
+                    )
+                    if not selected_candidate_ids:
+                        record = join_builder.raw_data_lake_record(
+                            source_table, split
+                        )
+                        write_jsonl_record(data_lake_handle, record)
+                        data_lake_table_count += 1
+                        splits[split]["data_lake_table_ids"].append(
+                            record["table_id"]
+                        )
+                        continue
+                    seen_candidates.update(
+                        explicit_candidate_source_ids[candidate_id]
+                        for candidate_id in selected_candidate_ids
+                    )
+                    decision_index = explicit_candidate_decision_indices[
+                        selected_candidate_ids[0]
+                    ]
+                    original_decision = table_decisions[decision_index]
+                    explicit_queries: list[dict[str, Any]] = []
+                    explicit_targets: list[dict[str, Any]] = []
+                    explicit_qrels: list[dict[str, Any]] = []
+                    explicit_decisions: list[dict[str, Any]] = []
+                    selected_candidates: list[dict[str, Any]] = []
+                    for candidate_id in selected_candidate_ids:
+                        candidate = next(
+                            item
+                            for item in original_decision[
+                                "explicit_join_candidates"
+                            ]
+                            if item.get("candidate_id") == candidate_id
+                        )
+                        (
+                            candidate_queries,
+                            candidate_targets,
+                            candidate_qrels,
+                            candidate_result_decision,
+                        ) = join_builder.materialize_balanced_explicit_join_candidate(
+                            source_table=source_table,
+                            split=split,
+                            candidate_decision=candidate,
+                            args=args,
+                        )
+                        explicit_queries.extend(candidate_queries)
+                        explicit_targets.extend(candidate_targets)
+                        explicit_qrels.extend(candidate_qrels)
+                        explicit_decisions.append(candidate_result_decision)
+                        selected_candidates.append(candidate)
+                    explicit_decision = {
+                        **original_decision,
+                        **explicit_decisions[0],
+                        "source_table_id": source_table_id,
+                        "split": split,
+                        "qualified_columns": [
+                            qualified
+                            for item in explicit_decisions
+                            for qualified in item.get("qualified_columns", [])
+                        ],
+                        "explicit_join_candidates": selected_candidates,
+                        "explicit_join_candidate": selected_candidates[0],
+                        "explicit_join_query_count": len(explicit_queries),
+                    }
+                    table_decisions[decision_index] = explicit_decision
+                    rejected_source_tables -= 1
+                    queryable_source_tables += 1
+                    explicit_join_source_tables += 1
+                    for record in explicit_queries:
+                        write_jsonl_record(query_handle, record)
+                        query_table_count += 1
+                        explicit_join_query_table_count += 1
+                        splits[split]["query_table_ids"].append(
+                            record["table_id"]
+                        )
+                    for record in explicit_targets:
+                        write_jsonl_record(data_lake_handle, record)
+                        data_lake_table_count += 1
+                        splits[split]["data_lake_table_ids"].append(
+                            record["table_id"]
+                        )
+                    qrels.extend(explicit_qrels)
+                if seen_candidates != set(candidate_source_ids):
+                    raise ValueError(
+                        "explicit join candidate source replay is incomplete"
+                    )
+                if explicit_join_query_table_count != implicit_query_table_count:
+                    raise ValueError(
+                        "explicit and implicit query counts are not balanced: "
+                        f"explicit={explicit_join_query_table_count}, "
+                        f"implicit={implicit_query_table_count}"
+                    )
     finally:
         if progress is not None:
             progress.close()
@@ -3136,6 +3317,17 @@ def build_dataset(
         "row_capped_source_tables": row_capped_source_tables,
         "source_entities": entity_count,
         "queryable_source_tables": queryable_source_tables,
+        "multimodal_queryable_source_tables": multimodal_queryable_source_tables,
+        "explicit_join_source_tables": explicit_join_source_tables,
+        "implicit_join_query_tables": implicit_query_table_count,
+        "explicit_join_query_tables": explicit_join_query_table_count,
+        "explicit_join_candidate_tables": sum(
+            explicit_candidate_source_counts.values()
+        ),
+        "explicit_join_candidate_tables_by_split": explicit_candidate_source_counts,
+        "explicit_join_candidate_queries": sum(explicit_candidate_counts.values()),
+        "explicit_join_candidate_queries_by_split": explicit_candidate_counts,
+        "implicit_join_query_tables_by_split": implicit_query_counts_by_split,
         "rejected_source_tables": rejected_source_tables,
         "query_tables": query_table_count,
         "data_lake_tables": data_lake_table_count,
@@ -3169,6 +3361,8 @@ def build_dataset(
         "max_train_query_row_views_per_join": (
             args.max_train_query_row_views_per_join
         ),
+        "explicit_join_fallback_mode": args.explicit_join_fallback_mode,
+        "explicit_join_fallback_ratio": args.explicit_join_fallback_ratio,
         "skipped_reasons": dict(skip_reasons),
         "safety_config": {
             "max_scanned_files": args.max_scanned_files,
@@ -3189,6 +3383,7 @@ def build_dataset(
             "query row views balance recoverable evidence while projected targets retain every source row",
             "wide source tables may emit one query variant per qualifying bridge attribute",
             "identical visible queries are merged and may own multiple qrels",
+            "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
         ],
     }
@@ -3233,6 +3428,9 @@ def build_dataset(
                 args.max_train_query_row_views_per_join
             ),
             "evaluation_query_row_views_per_join": 1,
+            "explicit_join_fallback_mode": args.explicit_join_fallback_mode,
+            "explicit_join_fallback_ratio": args.explicit_join_fallback_ratio,
+            "explicit_join_column_policy": "seeded_random_non_entity_visible_column",
             "target_row_scope": "all_source_rows",
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
@@ -3405,6 +3603,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--explicit_join_fallback_mode",
+        choices=join_builder.EXPLICIT_JOIN_FALLBACK_MODES,
+        default=join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE,
+        help=(
+            "match_implicit selects exactly one visible-join query per "
+            "implicit query within each split; ratio retains legacy sampling."
+        ),
+    )
+    parser.add_argument(
+        "--explicit_join_fallback_ratio",
+        type=float,
+        default=join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO,
+        help=(
+            "Seeded fraction of tables rejected by multimodal recovery to turn "
+            "into ordinary joins with a visible non-entity join column in both "
+            "query and target; 0 disables the fallback."
+        ),
+    )
 
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None)

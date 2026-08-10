@@ -110,6 +110,7 @@ def build_builder_command(
     model_round_control_dir: Path,
     model_round_run_id: str,
     passthrough_args: list[str],
+    remote_layout_args: list[str] | None = None,
 ) -> list[str]:
     return [
         python_executable,
@@ -143,6 +144,7 @@ def build_builder_command(
         str(model_round_control_dir),
         "--model_round_run_id",
         model_round_run_id,
+        *(remote_layout_args or []),
         *passthrough_args,
     ]
 
@@ -869,11 +871,35 @@ def passthrough_has_arg(passthrough_args: list[str], option: str) -> bool:
     return any(value == option or value.startswith(f"{option}=") for value in passthrough_args)
 
 
-def with_default_model_workers(passthrough_args: list[str], workers: int) -> list[str]:
-    if workers <= 0:
-        return passthrough_args
+def with_model_workers(
+    passthrough_args: list[str],
+    *,
+    text_workers: int,
+    image_workers: int,
+) -> list[str]:
     result = list(passthrough_args)
-    for option in ("--text_model_workers", "--image_model_workers"):
+    for option, workers in (
+        ("--text_model_workers", text_workers),
+        ("--image_model_workers", image_workers),
+    ):
+        if workers <= 0:
+            continue
+        if not passthrough_has_arg(result, option):
+            result.extend([option, str(workers)])
+    return result
+
+
+def with_remote_model_workers(
+    passthrough_args: list[str],
+    *,
+    text_workers: int,
+    image_workers: int,
+) -> list[str]:
+    result = list(passthrough_args)
+    for option, workers in (
+        ("--remote_text_model_workers", text_workers),
+        ("--remote_image_model_workers", image_workers),
+    ):
         if not passthrough_has_arg(result, option):
             result.extend([option, str(workers)])
     return result
@@ -908,7 +934,18 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--model_start_timeout_seconds", type=float, default=None, help="Maximum seconds to wait for the builder to finish Wikipedia/material preparation before vLLM startup. Default waits indefinitely.")
     parser.add_argument("--first_done_timeout_seconds", type=float, default=None)
     parser.add_argument("--text_done_timeout_seconds", type=float, default=None, help="Deprecated alias for --first_done_timeout_seconds.")
-    parser.add_argument("--dynamic_model_workers", type=int, default=2, help="Default per-modality builder workers unless overridden in passthrough args. Use 0 to leave builder defaults unchanged.")
+    parser.add_argument(
+        "--text_model_workers",
+        type=int,
+        default=2,
+        help="Concurrent local text requests; 0 leaves the builder default unchanged.",
+    )
+    parser.add_argument(
+        "--image_model_workers",
+        type=int,
+        default=2,
+        help="Concurrent local image requests; 0 leaves the builder default unchanged.",
+    )
     parser.add_argument(
         "--gpu_coordination_dir",
         default=None,
@@ -937,6 +974,64 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         type=float,
         default=0.2,
     )
+    parser.add_argument(
+        "--remote_layout_control_url",
+        default=None,
+        help=(
+            "Optional loopback control tunnel used to borrow WDC's remote "
+            "GPUs while its priority request is borrowable."
+        ),
+    )
+    parser.add_argument("--remote_layout_control_token_file")
+    parser.add_argument("--remote_layout_primary_image_url")
+    parser.add_argument("--remote_layout_switchable_url")
+    parser.add_argument("--remote_layout_coordination_dir")
+    parser.add_argument(
+        "--remote_text_model_workers",
+        type=int,
+        default=0,
+        help="Total concurrent remote text requests across routed text endpoints.",
+    )
+    parser.add_argument(
+        "--remote_image_model_workers",
+        type=int,
+        default=0,
+        help="Total concurrent remote image requests across routed image endpoints.",
+    )
+    parser.add_argument(
+        "--remote_layout_lease_ttl_seconds", type=int, default=15
+    )
+    parser.add_argument(
+        "--remote_layout_lease_renew_seconds", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--remote_layout_request_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_reconnect_timeout_seconds", type=float, default=30.0
+    )
+    parser.add_argument(
+        "--remote_layout_operation_timeout_seconds", type=float, default=1200.0
+    )
+    parser.add_argument(
+        "--remote_layout_drain_timeout_seconds", type=float, default=300.0
+    )
+    parser.add_argument("--remote_layout_poll_seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--remote_layout_workload_poll_seconds", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--remote_layout_stability_seconds", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_stable_polls", type=int, default=2
+    )
+    parser.add_argument(
+        "--remote_layout_coordination_poll_seconds", type=float, default=0.2
+    )
     parser.add_argument("--builder_script", default=str(Path(__file__).with_name("build_mm_joinability_dataset.py")))
     parser.add_argument("--python_executable", default=sys.executable)
     parser.add_argument("--vllm_dtype", default="bfloat16")
@@ -957,6 +1052,75 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         or args.gpu_coordination_poll_seconds <= 0
     ):
         parser.error("GPU coordination timeouts must be positive")
+    remote_required = (
+        args.remote_layout_control_token_file,
+        args.remote_layout_primary_image_url,
+        args.remote_layout_switchable_url,
+        args.remote_layout_coordination_dir,
+    )
+    if args.remote_layout_control_url and not all(remote_required):
+        parser.error(
+            "remote layout control requires token, both inference tunnels, "
+            "and the shared WDC coordination directory"
+        )
+    if not args.remote_layout_control_url and any(remote_required):
+        parser.error(
+            "remote layout settings require --remote_layout_control_url"
+        )
+    if passthrough_has_arg(passthrough, "--dynamic_model_workers"):
+        parser.error(
+            "--dynamic_model_workers was replaced by "
+            "--text_model_workers and --image_model_workers"
+        )
+    if passthrough_has_arg(passthrough, "--remote_dynamic_model_workers"):
+        parser.error(
+            "--remote_dynamic_model_workers was replaced by "
+            "--remote_text_model_workers and --remote_image_model_workers"
+        )
+    if min(args.text_model_workers, args.image_model_workers) < 0:
+        parser.error("local model worker counts must be non-negative")
+    if min(
+        args.remote_text_model_workers,
+        args.remote_image_model_workers,
+    ) < 0:
+        parser.error("remote model worker counts must be non-negative")
+    if (
+        args.remote_layout_control_url
+        and args.remote_text_model_workers == 0
+        and args.remote_image_model_workers == 0
+    ):
+        parser.error(
+            "remote layout control requires at least one positive remote "
+            "model worker count"
+        )
+    if args.remote_layout_control_url:
+        if not 5 <= args.remote_layout_lease_ttl_seconds <= 60:
+            parser.error("remote layout lease TTL must be between 5 and 60")
+        if not (
+            0
+            < args.remote_layout_lease_renew_seconds
+            < args.remote_layout_lease_ttl_seconds
+        ):
+            parser.error("remote layout renewal must be positive and below TTL")
+        positive = (
+            args.remote_layout_request_timeout_seconds,
+            args.remote_layout_reconnect_timeout_seconds,
+            args.remote_layout_operation_timeout_seconds,
+            args.remote_layout_drain_timeout_seconds,
+            args.remote_layout_poll_seconds,
+            args.remote_layout_workload_poll_seconds,
+            args.remote_layout_health_timeout_seconds,
+            args.remote_layout_coordination_poll_seconds,
+        )
+        if any(not math.isfinite(value) or value <= 0 for value in positive):
+            parser.error("remote layout timeouts must be finite and positive")
+        if (
+            not math.isfinite(args.remote_layout_stability_seconds)
+            or args.remote_layout_stability_seconds < 0
+        ):
+            parser.error("remote layout stability must be non-negative")
+        if args.remote_layout_health_stable_polls <= 0:
+            parser.error("remote layout stable polls must be positive")
     return args, passthrough
 
 
@@ -979,6 +1143,9 @@ def main(argv: list[str] | None = None) -> int:
     image_done_marker = runtime_dir / "image_done.json"
     model_round_control_dir = runtime_dir / "rounds"
     model_round_run_id = uuid.uuid4().hex
+    remote_routing_manifest = runtime_dir / "remote_model_routing.json"
+    remote_controller_id_file = runtime_dir / "remote_layout_controller_id"
+    remote_controller_lock_file = runtime_dir / "remote_layout_controller.lock"
     first_done_timeout = args.first_done_timeout_seconds
     if first_done_timeout is None:
         first_done_timeout = args.text_done_timeout_seconds
@@ -1073,7 +1240,60 @@ def main(argv: list[str] | None = None) -> int:
                 reason="entitables_network_preparation"
             )
 
-        builder_passthrough_args = with_default_model_workers(passthrough_args, args.dynamic_model_workers)
+        builder_passthrough_args = with_model_workers(
+            passthrough_args,
+            text_workers=args.text_model_workers,
+            image_workers=args.image_model_workers,
+        )
+        remote_layout_args: list[str] = []
+        if args.remote_layout_control_url:
+            builder_passthrough_args = with_remote_model_workers(
+                builder_passthrough_args,
+                text_workers=args.remote_text_model_workers,
+                image_workers=args.remote_image_model_workers,
+            )
+            remote_layout_args = [
+                "--remote_model_routing_manifest",
+                str(remote_routing_manifest),
+                "--remote_layout_control_url",
+                args.remote_layout_control_url,
+                "--remote_layout_control_token_file",
+                args.remote_layout_control_token_file,
+                "--remote_layout_controller_id_file",
+                str(remote_controller_id_file),
+                "--remote_layout_lock_file",
+                str(remote_controller_lock_file),
+                "--remote_layout_primary_image_url",
+                args.remote_layout_primary_image_url,
+                "--remote_layout_switchable_url",
+                args.remote_layout_switchable_url,
+                "--remote_layout_coordination_dir",
+                args.remote_layout_coordination_dir,
+                "--remote_layout_lease_ttl_seconds",
+                str(args.remote_layout_lease_ttl_seconds),
+                "--remote_layout_lease_renew_seconds",
+                str(args.remote_layout_lease_renew_seconds),
+                "--remote_layout_request_timeout_seconds",
+                str(args.remote_layout_request_timeout_seconds),
+                "--remote_layout_reconnect_timeout_seconds",
+                str(args.remote_layout_reconnect_timeout_seconds),
+                "--remote_layout_operation_timeout_seconds",
+                str(args.remote_layout_operation_timeout_seconds),
+                "--remote_layout_drain_timeout_seconds",
+                str(args.remote_layout_drain_timeout_seconds),
+                "--remote_layout_poll_seconds",
+                str(args.remote_layout_poll_seconds),
+                "--remote_layout_workload_poll_seconds",
+                str(args.remote_layout_workload_poll_seconds),
+                "--remote_layout_stability_seconds",
+                str(args.remote_layout_stability_seconds),
+                "--remote_layout_health_timeout_seconds",
+                str(args.remote_layout_health_timeout_seconds),
+                "--remote_layout_health_stable_polls",
+                str(args.remote_layout_health_stable_polls),
+                "--remote_layout_coordination_poll_seconds",
+                str(args.remote_layout_coordination_poll_seconds),
+            ]
         builder_command = build_builder_command(
             python_executable=args.python_executable,
             builder_script=Path(args.builder_script),
@@ -1090,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
             model_round_control_dir=model_round_control_dir,
             model_round_run_id=model_round_run_id,
             passthrough_args=builder_passthrough_args,
+            remote_layout_args=remote_layout_args,
         )
         builder_proc = subprocess.Popen(builder_command, text=True, start_new_session=True)
         wait_for_marker_or_builder_exit(

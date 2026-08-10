@@ -15,12 +15,19 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import build_mm_joinability_dataset as join_builder
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder
+from gpu_priority_protocol import PriorityGpuOwner
+from remote_vllm_layout import (
+    ControllerConfig as RemoteLayoutControllerConfig,
+    EndpointConfig as RemoteLayoutEndpointConfig,
+    RemoteLayoutController,
+)
 from stage1_io import stable_hash
 from wdc200k_assets import (
     AssetPlanShards,
@@ -210,6 +217,12 @@ class PipelineConfig:
     max_query_tables_per_source_table: int = 0
     max_query_context_attrs: int = 1
     max_target_context_attrs: int = 2
+    explicit_join_fallback_mode: str = (
+        join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE
+    )
+    explicit_join_fallback_ratio: float = (
+        join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO
+    )
     text_model_name: str = "Qwen3.5-9B"
     image_model_name: str = "Qwen3-VL-8B-Thinking"
     text_model_base_url: str = "http://localhost:8001/v1"
@@ -222,6 +235,29 @@ class PipelineConfig:
     image_model_api_key: str | None = None
     text_model_workers: int = 1
     image_model_workers: int = 1
+    remote_layout_control_url: str | None = None
+    remote_layout_control_token_file: Path | None = None
+    remote_layout_routing_manifest: Path | None = None
+    remote_layout_controller_id_file: Path | None = None
+    remote_layout_lock_file: Path | None = None
+    remote_layout_primary_image_url: str | None = None
+    remote_layout_switchable_url: str | None = None
+    remote_layout_lease_ttl_seconds: int = 15
+    remote_layout_lease_renew_seconds: float = 5.0
+    remote_layout_request_timeout_seconds: float = 3.0
+    remote_layout_reconnect_timeout_seconds: float = 120.0
+    remote_layout_operation_timeout_seconds: float = 1200.0
+    remote_layout_drain_timeout_seconds: float = 300.0
+    remote_layout_poll_seconds: float = 1.0
+    remote_layout_workload_poll_seconds: float = 2.0
+    remote_layout_stability_seconds: float = 10.0
+    remote_layout_health_timeout_seconds: float = 3.0
+    remote_layout_health_stable_polls: int = 2
+    remote_layout_coordination_dir: Path | None = None
+    remote_layout_reclaim_timeout_seconds: float = 90.0
+    remote_layout_borrower_stale_seconds: float = 10.0
+    remote_layout_unregistered_grace_seconds: float = 1.0
+    remote_layout_coordination_poll_seconds: float = 0.2
     materialization_workers: int = 1
     materialization_validation_workers: int = 3
     run_fingerprint: str = ""
@@ -311,6 +347,12 @@ class PipelineConfig:
             ),
             max_query_context_attrs=args.max_query_context_attrs,
             max_target_context_attrs=args.max_target_context_attrs,
+            explicit_join_fallback_mode=(
+                args.explicit_join_fallback_mode
+            ),
+            explicit_join_fallback_ratio=(
+                args.explicit_join_fallback_ratio
+            ),
             text_model_name=args.text_model_name,
             image_model_name=args.image_model_name,
             text_model_base_url=args.text_model_base_url,
@@ -331,6 +373,87 @@ class PipelineConfig:
             image_model_api_key=args.image_model_api_key,
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
+            remote_layout_control_url=(
+                str(args.remote_layout_control_url).rstrip("/")
+                if args.remote_layout_control_url
+                else None
+            ),
+            remote_layout_control_token_file=(
+                Path(args.remote_layout_control_token_file).resolve()
+                if args.remote_layout_control_token_file
+                else None
+            ),
+            remote_layout_routing_manifest=(
+                Path(args.remote_layout_routing_manifest).resolve()
+                if args.remote_layout_routing_manifest
+                else work_dir / "runtime" / "model-routing.json"
+            ),
+            remote_layout_controller_id_file=(
+                Path(args.remote_layout_controller_id_file).resolve()
+                if args.remote_layout_controller_id_file
+                else work_dir / "runtime" / "remote-layout-controller-id"
+            ),
+            remote_layout_lock_file=(
+                Path(args.remote_layout_lock_file).resolve()
+                if args.remote_layout_lock_file
+                else work_dir / "runtime" / "remote-layout-controller.lock"
+            ),
+            remote_layout_primary_image_url=(
+                str(args.remote_layout_primary_image_url).rstrip("/")
+                if args.remote_layout_primary_image_url
+                else None
+            ),
+            remote_layout_switchable_url=(
+                str(args.remote_layout_switchable_url).rstrip("/")
+                if args.remote_layout_switchable_url
+                else None
+            ),
+            remote_layout_lease_ttl_seconds=args.remote_layout_lease_ttl_seconds,
+            remote_layout_lease_renew_seconds=(
+                args.remote_layout_lease_renew_seconds
+            ),
+            remote_layout_request_timeout_seconds=(
+                args.remote_layout_request_timeout_seconds
+            ),
+            remote_layout_reconnect_timeout_seconds=(
+                args.remote_layout_reconnect_timeout_seconds
+            ),
+            remote_layout_operation_timeout_seconds=(
+                args.remote_layout_operation_timeout_seconds
+            ),
+            remote_layout_drain_timeout_seconds=(
+                args.remote_layout_drain_timeout_seconds
+            ),
+            remote_layout_poll_seconds=args.remote_layout_poll_seconds,
+            remote_layout_workload_poll_seconds=(
+                args.remote_layout_workload_poll_seconds
+            ),
+            remote_layout_stability_seconds=(
+                args.remote_layout_stability_seconds
+            ),
+            remote_layout_health_timeout_seconds=(
+                args.remote_layout_health_timeout_seconds
+            ),
+            remote_layout_health_stable_polls=(
+                args.remote_layout_health_stable_polls
+            ),
+            remote_layout_coordination_dir=(
+                Path(args.remote_layout_coordination_dir).resolve()
+                if args.remote_layout_coordination_dir
+                else None
+            ),
+            remote_layout_reclaim_timeout_seconds=(
+                args.remote_layout_reclaim_timeout_seconds
+            ),
+            remote_layout_borrower_stale_seconds=(
+                args.remote_layout_borrower_stale_seconds
+            ),
+            remote_layout_unregistered_grace_seconds=(
+                args.remote_layout_unregistered_grace_seconds
+            ),
+            remote_layout_coordination_poll_seconds=(
+                args.remote_layout_coordination_poll_seconds
+            ),
             materialization_workers=args.materialization_workers,
             materialization_validation_workers=(
                 args.materialization_validation_workers
@@ -1900,6 +2023,8 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "max_query_tables_per_source_table",
         "max_query_context_attrs",
         "max_target_context_attrs",
+        "explicit_join_fallback_mode",
+        "explicit_join_fallback_ratio",
         "records_per_shard",
     ),
 }
@@ -2657,6 +2782,14 @@ def _preflight(
         raise ValueError(
             "max_train_query_row_views_per_join must be non-negative"
         )
+    if not 0.0 <= config.explicit_join_fallback_ratio <= 1.0:
+        raise ValueError(
+            "explicit_join_fallback_ratio must be within [0, 1]"
+        )
+    if config.explicit_join_fallback_mode not in (
+        join_builder.EXPLICIT_JOIN_FALLBACK_MODES
+    ):
+        raise ValueError("explicit_join_fallback_mode is invalid")
     SamplingPolicy(
         sampled_entities_per_table=config.sampled_entities_per_table,
         entity_sampling_seed=config.entity_sampling_seed,
@@ -3041,21 +3174,26 @@ def _run_fast_model_resume(
             config.work_dir / "model_outputs" / "jobs.sqlite3",
             pre_write_guard=disk_guard,
         )
-        result = run_model_stage(
-            store,
-            extractor,
-            workers_by_kind={
-                "text": config.text_model_workers,
-                "image": config.image_model_workers,
-            },
-            output_root=config.work_dir / "model_outputs",
-            records_per_shard=config.records_per_shard,
-            model_progress_callback=reporter.update_model_progress,
-            endpoint_ready_timeout_seconds=(
-                config.model_endpoint_ready_timeout_seconds
-            ),
-            pre_write_guard=disk_guard,
-        )
+        with _remote_layout_control(
+            config,
+            extractor=extractor,
+            database_path=store.path,
+        ):
+            result = run_model_stage(
+                store,
+                extractor,
+                workers_by_kind={
+                    "text": config.text_model_workers,
+                    "image": config.image_model_workers,
+                },
+                output_root=config.work_dir / "model_outputs",
+                records_per_shard=config.records_per_shard,
+                model_progress_callback=reporter.update_model_progress,
+                endpoint_ready_timeout_seconds=(
+                    config.model_endpoint_ready_timeout_seconds
+                ),
+                pre_write_guard=disk_guard,
+            )
         counters = {
             "model_text_tasks": result.text_total,
             "model_image_tasks": result.image_total,
@@ -3207,6 +3345,10 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         str(config.max_query_context_attrs),
         "--max_target_context_attrs",
         str(config.max_target_context_attrs),
+        "--explicit_join_fallback_mode",
+        config.explicit_join_fallback_mode,
+        "--explicit_join_fallback_ratio",
+        str(config.explicit_join_fallback_ratio),
         "--text_model_base_url",
         config.text_model_base_url,
         "--text_model_name",
@@ -3257,7 +3399,125 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
     args.materialization_validation_workers = (
         config.materialization_validation_workers
     )
+    args.model_routing_manifest = (
+        str(config.remote_layout_routing_manifest)
+        if config.remote_layout_control_url
+        and config.remote_layout_routing_manifest is not None
+        else None
+    )
     return args
+
+
+@contextmanager
+def _remote_layout_control(
+    config: PipelineConfig,
+    *,
+    extractor: Any,
+    database_path: Path,
+) -> Iterator[RemoteLayoutController | None]:
+    """Run the local controller only around durable model execution."""
+    if not config.remote_layout_control_url:
+        yield None
+        return
+    scheduler = getattr(extractor, "routing_scheduler", None)
+    if scheduler is None:
+        raise ValueError(
+            "remote layout control requires an authoritative routing scheduler"
+        )
+    required_paths = (
+        config.remote_layout_control_token_file,
+        config.remote_layout_controller_id_file,
+        config.remote_layout_lock_file,
+    )
+    if any(path is None for path in required_paths):
+        raise ValueError("remote layout control paths are incomplete")
+    if (
+        not config.remote_layout_primary_image_url
+        or not config.remote_layout_switchable_url
+    ):
+        raise ValueError("remote layout endpoint tunnel mappings are incomplete")
+    priority_owner = (
+        PriorityGpuOwner(
+            config.remote_layout_coordination_dir,
+            gpu_ids=("remote:primary_image", "remote:switchable"),
+            owner="wdc-remote",
+            reclaim_timeout_seconds=(
+                config.remote_layout_reclaim_timeout_seconds
+            ),
+            borrower_stale_seconds=(
+                config.remote_layout_borrower_stale_seconds
+            ),
+            unregistered_grace_seconds=(
+                config.remote_layout_unregistered_grace_seconds
+            ),
+            poll_seconds=config.remote_layout_coordination_poll_seconds,
+            borrower_label="EntiTables remote GPU borrower",
+            owner_action_label="WDC remote inference",
+        )
+        if config.remote_layout_coordination_dir is not None
+        else None
+    )
+    controller = RemoteLayoutController(
+        RemoteLayoutControllerConfig(
+            control_url=config.remote_layout_control_url,
+            token_file=config.remote_layout_control_token_file,
+            database_path=database_path,
+            controller_id_file=config.remote_layout_controller_id_file,
+            lock_file=config.remote_layout_lock_file,
+            endpoints={
+                "primary_image": RemoteLayoutEndpointConfig(
+                    endpoint_id="primary_image",
+                    base_url=config.remote_layout_primary_image_url,
+                ),
+                "switchable": RemoteLayoutEndpointConfig(
+                    endpoint_id="switchable",
+                    base_url=config.remote_layout_switchable_url,
+                ),
+            },
+            text_model_id=config.text_model_name,
+            image_model_id=config.image_model_name,
+            text_api_key=(
+                getattr(extractor, "text_model_api_key", None)
+                or config.text_model_api_key
+            ),
+            image_api_key=(
+                getattr(extractor, "image_model_api_key", None)
+                or config.image_model_api_key
+            ),
+            lease_ttl_seconds=config.remote_layout_lease_ttl_seconds,
+            lease_renew_seconds=config.remote_layout_lease_renew_seconds,
+            request_timeout_seconds=config.remote_layout_request_timeout_seconds,
+            reconnect_timeout_seconds=(
+                config.remote_layout_reconnect_timeout_seconds
+            ),
+            operation_timeout_seconds=(
+                config.remote_layout_operation_timeout_seconds
+            ),
+            drain_timeout_seconds=config.remote_layout_drain_timeout_seconds,
+            poll_seconds=config.remote_layout_poll_seconds,
+            workload_poll_seconds=(
+                config.remote_layout_workload_poll_seconds
+            ),
+            image_burst_stability_seconds=(
+                config.remote_layout_stability_seconds
+            ),
+            endpoint_health_timeout_seconds=(
+                config.remote_layout_health_timeout_seconds
+            ),
+            endpoint_health_stable_polls=(
+                config.remote_layout_health_stable_polls
+            ),
+        ),
+        scheduler,
+    )
+    if priority_owner is not None:
+        priority_owner.request_gpus(reason="wdc_model_stage")
+    try:
+        with controller:
+            yield controller
+    finally:
+        if priority_owner is not None:
+            priority_owner.release_gpus(reason="wdc_model_stage_complete")
 
 
 def _structural_barrier(
@@ -4285,31 +4545,36 @@ def _run_models(
         jobset.image_fingerprint,
         length=40,
     )
-    result = run_model_stage(
-        store,
-        extractor,
-        jobset=jobset,
-        workers_by_kind={
-            "text": config.text_model_workers,
-            "image": config.image_model_workers,
-        },
-        output_root=config.work_dir / "model_outputs",
-        records_per_shard=config.records_per_shard,
-        model_progress_callback=reporter.update_model_progress,
-        start_marker=config.model_start_marker,
-        ready_marker=config.model_ready_marker,
-        network_manifests=network_manifests,
-        assets_manifest=materialized_assets.manifest_path,
-        assets_barrier=assets_barrier,
-        ready_timeout_seconds=config.model_ready_timeout_seconds,
-        endpoint_ready_timeout_seconds=(
-            config.model_endpoint_ready_timeout_seconds
-        ),
-        text_done_marker=config.model_text_done_marker,
-        image_done_marker=config.model_image_done_marker,
-        run_fingerprint=run_fingerprint,
-        pre_write_guard=pre_write_guard,
-    )
+    with _remote_layout_control(
+        config,
+        extractor=extractor,
+        database_path=store.path,
+    ):
+        result = run_model_stage(
+            store,
+            extractor,
+            jobset=jobset,
+            workers_by_kind={
+                "text": config.text_model_workers,
+                "image": config.image_model_workers,
+            },
+            output_root=config.work_dir / "model_outputs",
+            records_per_shard=config.records_per_shard,
+            model_progress_callback=reporter.update_model_progress,
+            start_marker=config.model_start_marker,
+            ready_marker=config.model_ready_marker,
+            network_manifests=network_manifests,
+            assets_manifest=materialized_assets.manifest_path,
+            assets_barrier=assets_barrier,
+            ready_timeout_seconds=config.model_ready_timeout_seconds,
+            endpoint_ready_timeout_seconds=(
+                config.model_endpoint_ready_timeout_seconds
+            ),
+            text_done_marker=config.model_text_done_marker,
+            image_done_marker=config.model_image_done_marker,
+            run_fingerprint=run_fingerprint,
+            pre_write_guard=pre_write_guard,
+        )
     authority = ModelStageAuthority.current(args)
     model_validation_store = (
         config.work_dir / "model_outputs" / "validation.sqlite3"
@@ -4838,6 +5103,24 @@ def parse_args(
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
     parser.add_argument("--max_query_context_attrs", type=int, default=1)
     parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--explicit_join_fallback_mode",
+        choices=join_builder.EXPLICIT_JOIN_FALLBACK_MODES,
+        default=join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE,
+        help=(
+            "match_implicit selects exactly one visible-join query per "
+            "implicit query within each split; ratio retains legacy sampling."
+        ),
+    )
+    parser.add_argument(
+        "--explicit_join_fallback_ratio",
+        type=float,
+        default=join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO,
+        help=(
+            "Seeded fraction of multimodal rejections materialized as ordinary "
+            "joins with a visible non-entity join column in query and target."
+        ),
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--from_stage", choices=STAGES)
     parser.add_argument("--stop_after", choices=STAGES)
@@ -4871,6 +5154,75 @@ def parse_args(
     parser.add_argument("--image_model_base_urls_file")
     parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
     parser.add_argument("--image_model_api_key")
+    parser.add_argument(
+        "--remote_layout_control_url",
+        default=None,
+        help="Loopback URL of the existing SSH-forwarded layout control API.",
+    )
+    parser.add_argument("--remote_layout_control_token_file")
+    parser.add_argument("--remote_layout_routing_manifest")
+    parser.add_argument("--remote_layout_controller_id_file")
+    parser.add_argument("--remote_layout_lock_file")
+    parser.add_argument(
+        "--remote_layout_primary_image_url",
+        help="Local inference tunnel URL mapped from endpoint ID primary_image.",
+    )
+    parser.add_argument(
+        "--remote_layout_switchable_url",
+        help="Local inference tunnel URL mapped from endpoint ID switchable.",
+    )
+    parser.add_argument(
+        "--remote_layout_lease_ttl_seconds", type=int, default=15
+    )
+    parser.add_argument(
+        "--remote_layout_lease_renew_seconds", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--remote_layout_request_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_reconnect_timeout_seconds", type=float, default=120.0
+    )
+    parser.add_argument(
+        "--remote_layout_operation_timeout_seconds", type=float, default=1200.0
+    )
+    parser.add_argument(
+        "--remote_layout_drain_timeout_seconds", type=float, default=300.0
+    )
+    parser.add_argument(
+        "--remote_layout_poll_seconds", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--remote_layout_workload_poll_seconds", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--remote_layout_stability_seconds", type=float, default=10.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_timeout_seconds", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--remote_layout_health_stable_polls", type=int, default=2
+    )
+    parser.add_argument(
+        "--remote_layout_coordination_dir",
+        help=(
+            "Shared priority directory used to reclaim the remote GPUs from "
+            "an opportunistic EntiTables borrower."
+        ),
+    )
+    parser.add_argument(
+        "--remote_layout_reclaim_timeout_seconds", type=float, default=90.0
+    )
+    parser.add_argument(
+        "--remote_layout_borrower_stale_seconds", type=float, default=10.0
+    )
+    parser.add_argument(
+        "--remote_layout_unregistered_grace_seconds", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--remote_layout_coordination_poll_seconds", type=float, default=0.2
+    )
     parser.add_argument("--precompute_model_cache", action="store_true")
     parser.add_argument("--precompute_text_model_cache", action="store_true")
     parser.add_argument("--text_model_workers", type=int, default=1)
@@ -4904,6 +5256,60 @@ def parse_args(
         parser.error("text asset chunk limits must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
+    remote_layout_required = (
+        args.remote_layout_control_token_file,
+        args.remote_layout_primary_image_url,
+        args.remote_layout_switchable_url,
+    )
+    if args.remote_layout_control_url and not all(remote_layout_required):
+        parser.error(
+            "--remote_layout_control_url requires token file and both endpoint tunnel URLs"
+        )
+    if not args.remote_layout_control_url and any(remote_layout_required):
+        parser.error(
+            "remote layout token and endpoint mappings require --remote_layout_control_url"
+        )
+    if args.remote_layout_coordination_dir and not args.remote_layout_control_url:
+        parser.error(
+            "--remote_layout_coordination_dir requires remote layout control"
+        )
+    if args.remote_layout_health_stable_polls <= 0:
+        parser.error("remote layout stable polls must be positive")
+    if not 5 <= args.remote_layout_lease_ttl_seconds <= 60:
+        parser.error("--remote_layout_lease_ttl_seconds must be between 5 and 60")
+    if not (
+        0
+        < args.remote_layout_lease_renew_seconds
+        < args.remote_layout_lease_ttl_seconds
+    ):
+        parser.error("remote layout lease renewal must be positive and below TTL")
+    remote_positive_timeouts = (
+        args.remote_layout_request_timeout_seconds,
+        args.remote_layout_reconnect_timeout_seconds,
+        args.remote_layout_operation_timeout_seconds,
+        args.remote_layout_drain_timeout_seconds,
+        args.remote_layout_poll_seconds,
+        args.remote_layout_workload_poll_seconds,
+        args.remote_layout_health_timeout_seconds,
+        args.remote_layout_reclaim_timeout_seconds,
+        args.remote_layout_borrower_stale_seconds,
+        args.remote_layout_coordination_poll_seconds,
+    )
+    if any(
+        not math.isfinite(value) or value <= 0
+        for value in remote_positive_timeouts
+    ):
+        parser.error("remote layout timeouts must be finite and positive")
+    if (
+        not math.isfinite(args.remote_layout_unregistered_grace_seconds)
+        or args.remote_layout_unregistered_grace_seconds < 0
+    ):
+        parser.error("remote layout unregistered grace must be non-negative")
+    if (
+        not math.isfinite(args.remote_layout_stability_seconds)
+        or args.remote_layout_stability_seconds < 0
+    ):
+        parser.error("--remote_layout_stability_seconds must be non-negative")
     if args.materialization_workers <= 0:
         parser.error("--materialization_workers must be positive")
     if not 1 <= args.materialization_validation_workers <= 4:

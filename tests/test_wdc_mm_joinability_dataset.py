@@ -2372,6 +2372,7 @@ def test_build_writes_swallowed_client_exceptions_to_failure_jsonl(tmp_path):
                 "row_id": index,
                 "name": f"Entity {index}",
                 "detail": f"Detail {index}",
+                "kind": f"Kind {index}",
                 "page_url": f"https://pages.test/{index}",
                 "image": f"https://images.test/{index}.png",
             }
@@ -2400,17 +2401,35 @@ def test_build_writes_swallowed_client_exceptions_to_failure_jsonl(tmp_path):
             "2",
             "--min_rows_per_output_table",
             "2",
+            "--explicit_join_fallback_ratio",
+            "1",
             "--web_workers",
             "1",
             "--no_model_progress",
         ]
     )
 
-    wdc_builder.build_dataset(
+    stats = wdc_builder.build_dataset(
         args,
         web_client_factory=lambda **_kwargs: client,
         extractor_factory=lambda _args: object(),
     )
+
+    queries = _read_sharded_records(output_dir, "query_tables")
+    targets = _read_sharded_records(output_dir, "data_lake_tables")
+    qrels = [
+        json.loads(line)
+        for line in (output_dir / "qrels.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(queries) == len(targets) == len(qrels) == 1
+    join_col = targets[0]["join_col"]
+    assert join_col != queries[0]["query_entity_col"]
+    assert join_col in queries[0]["source_column_indices"]
+    assert join_col in targets[0]["source_column_indices"]
+    assert queries[0]["hidden_attributes"] == []
+    assert stats["explicit_join_source_tables"] == 1
+    assert stats["multimodal_queryable_source_tables"] == 0
 
     web_records = [
         json.loads(line)
@@ -2670,6 +2689,7 @@ def test_safe_defaults_and_scan_cap_bound_rejected_file_walk(tmp_path):
     assert args.max_source_tables == 100
     assert args.max_rows_per_source_table == 100
     assert args.max_images_per_entity == 2
+    assert args.explicit_join_fallback_ratio == 0.2
 
     stats = wdc_builder.build_dataset(
         args,

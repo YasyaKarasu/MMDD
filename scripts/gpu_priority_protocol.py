@@ -285,6 +285,8 @@ class PriorityGpuOwner:
         borrower_stale_seconds: float = 10.0,
         unregistered_grace_seconds: float = 1.0,
         poll_seconds: float = 0.2,
+        borrower_label: str = "WDC GPU borrower",
+        owner_action_label: str = "EntiTables vLLM",
         wall_time: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -310,6 +312,10 @@ class PriorityGpuOwner:
             unregistered_grace_seconds
         )
         self.poll_seconds = float(poll_seconds)
+        self.borrower_label = str(borrower_label).strip() or "GPU borrower"
+        self.owner_action_label = (
+            str(owner_action_label).strip() or "priority workload"
+        )
         self._wall_time = wall_time
         self._monotonic = monotonic
         self._sleep = sleep
@@ -372,17 +378,19 @@ class PriorityGpuOwner:
                     or isinstance(heartbeat, bool)
                 ):
                     raise RuntimeError(
-                        "GPU borrower status is invalid; refusing an unsafe reclaim"
+                        f"{self.borrower_label} status is invalid; refusing "
+                        "an unsafe reclaim"
                     )
                 heartbeat_age = max(0.0, self._wall_time() - float(heartbeat))
                 if heartbeat_age > self.borrower_stale_seconds:
                     raise RuntimeError(
-                        "GPU borrower heartbeat is stale; refusing to start "
-                        "EntiTables vLLM until the borrower is cleaned up"
+                        f"{self.borrower_label} heartbeat is stale; refusing "
+                        f"to start {self.owner_action_label} until the borrower "
+                        "is cleaned up"
                     )
             if now >= deadline:
                 raise RuntimeError(
-                    "Timed out waiting for the WDC GPU borrower to acknowledge "
+                    f"Timed out waiting for {self.borrower_label} to acknowledge "
                     f"reclaim generation={request.generation} "
                     f"sequence={request.sequence}"
                 )
