@@ -41,6 +41,9 @@ class VllmServerSpec:
     extra_args: list[str]
     host: str = "127.0.0.1"
     vllm_bin: str = "vllm"
+    startup_attempts: int = 2
+    startup_retry_backoff_seconds: float = 0.0
+    cuda_readiness_timeout_seconds: float | None = None
 
     @property
     def base_url(self) -> str:
@@ -63,6 +66,10 @@ class VllmServerSpec:
 
 class ServerExitedBeforeHealthy(RuntimeError):
     """Raised when a vLLM child exits before its health endpoint is ready."""
+
+
+class CudaReadinessError(RuntimeError):
+    """Raised when a target GPU cannot initialize CUDA before vLLM startup."""
 
 
 def default_vllm_extra_args(args: argparse.Namespace) -> list[str]:
@@ -167,6 +174,44 @@ def start_server(spec: VllmServerSpec, *, log_path: Path) -> subprocess.Popen[st
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
+
+
+def run_cuda_readiness_probe(
+    gpu: str,
+    *,
+    log_path: Path,
+    timeout_seconds: float,
+) -> bool:
+    """Initialize a tiny CUDA tensor in a fresh process before starting vLLM."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import torch; "
+            "torch.cuda.init(); "
+            "torch.zeros(1, device='cuda'); "
+            "print(torch.cuda.get_device_name(0))"
+        ),
+    ]
+    with log_path.open("w", encoding="utf-8") as log_file:
+        try:
+            result = subprocess.run(
+                command,
+                env=process_env(gpu),
+                text=True,
+                start_new_session=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            log_file.write(
+                f"CUDA readiness probe timed out after {timeout_seconds:g}s\n"
+            )
+            return False
+    return result.returncode == 0
 
 
 def _cleanup_warning(proc: subprocess.Popen[str], message: str) -> None:
@@ -424,7 +469,31 @@ def start_and_wait_server(
     runtime_dir: Path,
     timeout_seconds: float,
 ) -> subprocess.Popen[str]:
-    for attempt in (1, 2):
+    for attempt in range(1, spec.startup_attempts + 1):
+        if spec.cuda_readiness_timeout_seconds is not None:
+            readiness_log_path = (
+                runtime_dir / f"{spec.role}.cuda-readiness.attempt-{attempt}.log"
+            )
+            if not run_cuda_readiness_probe(
+                spec.gpu,
+                log_path=readiness_log_path,
+                timeout_seconds=spec.cuda_readiness_timeout_seconds,
+            ):
+                cuda_error = CudaReadinessError(
+                    f"CUDA readiness probe failed for vLLM server {spec.role!r} "
+                    f"on visible GPU {spec.gpu!r}; log: {readiness_log_path}"
+                )
+                if attempt == spec.startup_attempts:
+                    raise cuda_error
+                delay = spec.startup_retry_backoff_seconds * attempt
+                print(
+                    f"Warning: {cuda_error}; retrying in {delay:g}s "
+                    f"(attempt {attempt + 1}/{spec.startup_attempts})",
+                    file=sys.stderr,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+                continue
         log_path = runtime_dir / f"{spec.role}.attempt-{attempt}.log"
         process = start_server(spec, log_path=log_path)
         try:
@@ -439,8 +508,17 @@ def start_and_wait_server(
             return process
         except ServerExitedBeforeHealthy:
             stop_process(process)
-            if attempt == 2:
+            if attempt == spec.startup_attempts:
                 raise
+            delay = spec.startup_retry_backoff_seconds * attempt
+            print(
+                f"Warning: vLLM server {spec.role!r} exited during startup; "
+                f"retrying in {delay:g}s "
+                f"(attempt {attempt + 1}/{spec.startup_attempts})",
+                file=sys.stderr,
+            )
+            if delay > 0:
+                time.sleep(delay)
         except BaseException:
             stop_process(process)
             raise
@@ -569,7 +647,7 @@ def start_round_services(
                 runtime_dir=runtime_dir,
                 timeout_seconds=server_start_timeout_seconds,
             )
-        elif image_task_count > 0:
+        elif image_task_count > 1:
             processes.secondary_image = start_and_wait_server(
                 secondary_image_server,
                 runtime_dir=runtime_dir,
@@ -714,7 +792,7 @@ def _run_round_service_loop_owned(
         text_task_count = max(0, int(active_start.get("text_task_count", 0)))
         image_task_count = max(0, int(active_start.get("image_task_count", 0)))
         if (
-            image_task_count > 0
+            image_task_count > 1
             and processes.text is not None
             and (text_task_count == 0 or text_done)
             and not image_done
@@ -927,6 +1005,24 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--vllm_bin", default="vllm")
     parser.add_argument("--server_start_timeout_seconds", type=float, default=900.0)
     parser.add_argument(
+        "--server_start_attempts",
+        type=int,
+        default=5,
+        help="Maximum early-exit/CUDA-readiness attempts per vLLM service.",
+    )
+    parser.add_argument(
+        "--server_start_retry_backoff_seconds",
+        type=float,
+        default=15.0,
+        help="Linear backoff base between recoverable vLLM startup attempts.",
+    )
+    parser.add_argument(
+        "--cuda_readiness_timeout_seconds",
+        type=float,
+        default=30.0,
+        help="Timeout for the fresh-process CUDA probe before each vLLM attempt.",
+    )
+    parser.add_argument(
         "--forwarded_signal_grace_seconds",
         type=float,
         default=30.0,
@@ -1045,6 +1141,14 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--text_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to the text vLLM server.")
     parser.add_argument("--image_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to both image vLLM servers.")
     args, passthrough = parser.parse_known_args(argv)
+    if (
+        args.server_start_attempts <= 0
+        or not math.isfinite(args.server_start_retry_backoff_seconds)
+        or args.server_start_retry_backoff_seconds < 0
+        or not math.isfinite(args.cuda_readiness_timeout_seconds)
+        or args.cuda_readiness_timeout_seconds <= 0
+    ):
+        parser.error("vLLM startup retries and CUDA readiness timeout are invalid")
     if args.gpu_coordination_dir and (
         args.gpu_reclaim_timeout_seconds <= 0
         or args.gpu_borrower_stale_seconds <= 0
@@ -1151,6 +1255,11 @@ def main(argv: list[str] | None = None) -> int:
         first_done_timeout = args.text_done_timeout_seconds
 
     common_extra = [*default_vllm_extra_args(args), *args.vllm_extra_arg]
+    startup_resilience = {
+        "startup_attempts": args.server_start_attempts,
+        "startup_retry_backoff_seconds": args.server_start_retry_backoff_seconds,
+        "cuda_readiness_timeout_seconds": args.cuda_readiness_timeout_seconds,
+    }
     text_server = VllmServerSpec(
         role="text",
         model_path=args.text_model_path,
@@ -1160,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         vllm_bin=args.vllm_bin,
         extra_args=[*common_extra, *args.text_vllm_extra_arg],
+        **startup_resilience,
     )
     primary_image_server = VllmServerSpec(
         role="image-primary",
@@ -1170,6 +1280,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         vllm_bin=args.vllm_bin,
         extra_args=[*common_extra, *args.image_vllm_extra_arg],
+        **startup_resilience,
     )
     secondary_image_server = VllmServerSpec(
         role="image-secondary",
@@ -1180,6 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         vllm_bin=args.vllm_bin,
         extra_args=[*common_extra, *args.image_vllm_extra_arg],
+        **startup_resilience,
     )
     secondary_text_server = VllmServerSpec(
         role="text-secondary",
@@ -1190,6 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         vllm_bin=args.vllm_bin,
         extra_args=[*common_extra, *args.text_vllm_extra_arg],
+        **startup_resilience,
     )
     gpu_priority_owner = (
         PriorityGpuOwner(

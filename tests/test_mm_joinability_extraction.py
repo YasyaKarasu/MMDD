@@ -2112,6 +2112,57 @@ def test_round_runner_treats_zero_text_as_done_and_avoids_late_endpoint_publish(
     assert image_endpoints.read_text() == "\n"
 
 
+def test_start_round_services_uses_one_image_server_for_one_task(
+    tmp_path, monkeypatch
+):
+    text_endpoints = tmp_path / "text_endpoints.txt"
+    image_endpoints = tmp_path / "image_endpoints.txt"
+    text_server = VllmServerSpec("text", "/text", "text", "1", 8001, [])
+    primary_image = VllmServerSpec(
+        "image-primary", "/image", "image", "0", 8000, []
+    )
+    secondary_image = VllmServerSpec(
+        "image-secondary", "/image", "image", "1", 8002, []
+    )
+    processes = dynamic_vllm_runner.RoundServiceProcesses(
+        text=None,
+        primary_image=None,
+        secondary_image=None,
+    )
+    events: list[str] = []
+
+    class Process:
+        def __init__(self, role: str):
+            self.role = role
+
+    def start(spec, **_kwargs):
+        events.append(f"start:{spec.role}")
+        return Process(spec.role)
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_and_wait_server", start)
+
+    dynamic_vllm_runner.start_round_services(
+        round_id=0,
+        text_task_count=0,
+        image_task_count=1,
+        runtime_dir=tmp_path,
+        text_server=text_server,
+        primary_image_server=primary_image,
+        secondary_image_server=secondary_image,
+        text_endpoints_file=text_endpoints,
+        image_endpoints_file=image_endpoints,
+        processes=processes,
+        server_start_timeout_seconds=10,
+        gpu_priority_owner=None,
+    )
+
+    assert events == ["start:image-primary"]
+    assert processes.primary_image is not None
+    assert processes.secondary_image is None
+    assert text_endpoints.read_text() == "\n"
+    assert image_endpoints.read_text().strip() == primary_image.base_url
+
+
 @pytest.mark.parametrize("failure_mode", ["endpoint", "timeout"])
 def test_round_runner_cleans_secondary_image_owned_when_loop_fails(
     tmp_path, monkeypatch, failure_mode
@@ -2403,6 +2454,9 @@ def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     assert args.vllm_max_model_len == 8192
     assert args.model_start_timeout_seconds is None
     assert args.forwarded_signal_grace_seconds == 30.0
+    assert args.server_start_attempts == 5
+    assert args.server_start_retry_backoff_seconds == 15.0
+    assert args.cuda_readiness_timeout_seconds == 30.0
 
 
 def test_dynamic_vllm_remote_worker_counts_are_modality_specific():
@@ -2690,6 +2744,137 @@ def test_start_and_wait_server_retries_one_early_exit(monkeypatch, tmp_path):
     ]
     assert waited == list(zip(processes, started_log_paths))
     assert stopped == [processes[0]]
+
+
+def test_start_and_wait_server_waits_for_cuda_readiness_to_recover(
+    monkeypatch, tmp_path
+):
+    process = object()
+    readiness_results = iter([False, True])
+    readiness_logs = []
+    server_logs = []
+    sleeps = []
+
+    def probe(_gpu, *, log_path, timeout_seconds):
+        readiness_logs.append((log_path, timeout_seconds))
+        return next(readiness_results)
+
+    monkeypatch.setattr(dynamic_vllm_runner, "run_cuda_readiness_probe", probe)
+    monkeypatch.setattr(
+        dynamic_vllm_runner,
+        "start_server",
+        lambda _spec, *, log_path: server_logs.append(log_path) or process,
+    )
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "wait_for_server", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", sleeps.append)
+    spec = VllmServerSpec(
+        role="image-primary",
+        model_path="/models/vl",
+        served_model_name="Qwen3-VL",
+        gpu="0",
+        port=8000,
+        extra_args=[],
+        startup_attempts=3,
+        startup_retry_backoff_seconds=4,
+        cuda_readiness_timeout_seconds=30,
+    )
+
+    assert (
+        dynamic_vllm_runner.start_and_wait_server(
+            spec,
+            runtime_dir=tmp_path,
+            timeout_seconds=900,
+        )
+        is process
+    )
+    assert readiness_logs == [
+        (tmp_path / "image-primary.cuda-readiness.attempt-1.log", 30),
+        (tmp_path / "image-primary.cuda-readiness.attempt-2.log", 30),
+    ]
+    assert server_logs == [tmp_path / "image-primary.attempt-2.log"]
+    assert sleeps == [4]
+
+
+def test_start_and_wait_server_uses_linear_backoff_for_early_exits(
+    monkeypatch, tmp_path
+):
+    processes = [object(), object(), object()]
+    starts = []
+    stopped = []
+    sleeps = []
+
+    def start(_spec, *, log_path):
+        starts.append(log_path)
+        return processes[len(starts) - 1]
+
+    def wait(_base_url, *, process, **_kwargs):
+        if process is not processes[-1]:
+            raise dynamic_vllm_runner.ServerExitedBeforeHealthy("early exit")
+
+    monkeypatch.setattr(dynamic_vllm_runner, "start_server", start)
+    monkeypatch.setattr(dynamic_vllm_runner, "wait_for_server", wait)
+    monkeypatch.setattr(
+        dynamic_vllm_runner, "stop_process", lambda process: stopped.append(process)
+    )
+    monkeypatch.setattr(dynamic_vllm_runner.time, "sleep", sleeps.append)
+    spec = VllmServerSpec(
+        role="text",
+        model_path="/models/text",
+        served_model_name="Qwen3.5-9B",
+        gpu="1",
+        port=8001,
+        extra_args=[],
+        startup_attempts=3,
+        startup_retry_backoff_seconds=2,
+    )
+
+    assert (
+        dynamic_vllm_runner.start_and_wait_server(
+            spec,
+            runtime_dir=tmp_path,
+            timeout_seconds=900,
+        )
+        is processes[-1]
+    )
+    assert starts == [
+        tmp_path / "text.attempt-1.log",
+        tmp_path / "text.attempt-2.log",
+        tmp_path / "text.attempt-3.log",
+    ]
+    assert stopped == processes[:-1]
+    assert sleeps == [2, 4]
+
+
+def test_cuda_readiness_probe_uses_fresh_target_gpu_process(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    class Result:
+        returncode = 0
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        kwargs["stdout"].write("NVIDIA GeForce RTX 4090\n")
+        return Result()
+
+    monkeypatch.setattr(dynamic_vllm_runner.subprocess, "run", run)
+    log_path = tmp_path / "cuda-readiness.log"
+
+    assert dynamic_vllm_runner.run_cuda_readiness_probe(
+        "1",
+        log_path=log_path,
+        timeout_seconds=30,
+    )
+    assert captured["command"][0] == sys.executable
+    assert "torch.cuda.init()" in captured["command"][2]
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert captured["start_new_session"] is True
+    assert captured["timeout"] == 30
+    assert log_path.read_text(encoding="utf-8") == "NVIDIA GeForce RTX 4090\n"
 
 
 def test_start_and_wait_server_cleans_second_failed_attempt(monkeypatch, tmp_path):
@@ -2999,6 +3184,10 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
 
     monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
     monkeypatch.setattr("run_mm_joinability_dynamic_vllm.wait_for_server", lambda *args, **kwargs: events.append("server_ready"))
+    monkeypatch.setattr(
+        "run_mm_joinability_dynamic_vllm.run_cuda_readiness_probe",
+        lambda *_args, **_kwargs: True,
+    )
 
     code = dynamic_vllm_main(
         [
