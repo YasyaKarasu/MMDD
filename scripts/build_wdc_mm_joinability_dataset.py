@@ -3302,6 +3302,10 @@ def build_dataset(
         splits[split]["data_lake_table_ids"] = sorted(
             splits[split]["data_lake_table_ids"]
         )
+    join_builder.validate_implicit_query_uniqueness(
+        qrels,
+        expected_query_count=implicit_query_table_count,
+    )
     qrels_count = write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
     write_json(output_dir / "splits.json", splits)
@@ -3382,7 +3386,7 @@ def build_dataset(
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "query row views balance recoverable evidence while projected targets retain every source row",
             "wide source tables may emit one query variant per qualifying bridge attribute",
-            "identical visible queries are merged and may own multiple qrels",
+            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
         ],
@@ -3439,7 +3443,7 @@ def build_dataset(
             "max_query_context_attrs": args.max_query_context_attrs,
             "qualified_attribute_policy": "all_safe_variants",
             "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
-            "identical_visible_query_policy": "merge_with_multiple_qrels",
+            "identical_visible_query_policy": "keep_best_recovery_single_target",
         },
         "model_endpoints": {
             "text_model_base_url": args.text_model_base_url,

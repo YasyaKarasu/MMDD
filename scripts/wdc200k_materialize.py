@@ -124,7 +124,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v4"
+MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v5"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -2274,7 +2274,7 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
             "globally_disjoint_query_and_target_sides"
         ),
         "identical_visible_query_policy": (
-            "merge_with_multiple_qrels"
+            "keep_best_recovery_single_target"
         ),
         "reparse_cached_model_outputs": bool(
             args.reparse_cached_model_outputs
@@ -4942,10 +4942,30 @@ def _validate_global_counts(
                 """
             ).fetchone()[0]
         )
+        ambiguous_implicit_queries = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT json_extract(
+                        record_json, '$.query_table_id'
+                    ) AS query_table_id
+                    FROM materialized_records
+                    WHERE artifact = 'qrels'
+                      AND json_extract(
+                          record_json, '$.reason'
+                      ) = 'model_recoverable_join_column'
+                    GROUP BY query_table_id
+                    HAVING COUNT(*) > 1
+                )
+                """
+            ).fetchone()[0]
+        )
     if queries_without_qrels:
         raise ValueError("global query table without qrel")
     if invalid_qrel_references:
         raise ValueError("global qrel reference closure is invalid")
+    if ambiguous_implicit_queries:
+        raise ValueError("global implicit query has multiple qrels")
     return counts
 
 
@@ -5264,7 +5284,7 @@ def _stats_payload(
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "wide source tables may emit multiple query variants, one per "
             "qualifying bridge attribute",
-            "identical visible queries are merged and may own multiple qrels",
+            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query construction is delegated to "
             "build_mm_joinability_dataset.py",

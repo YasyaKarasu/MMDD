@@ -1307,7 +1307,7 @@ def test_wdc_materializer_emits_multiple_queries_from_one_wide_table(
     )
 
 
-def test_wdc_global_validation_allows_merged_query_with_multiple_qrels(
+def test_wdc_global_validation_keeps_one_qrel_for_identical_visible_query(
     tmp_path: Path,
 ) -> None:
     args = _args(tmp_path)
@@ -1333,11 +1333,9 @@ def test_wdc_global_validation_allows_merged_query_with_multiple_qrels(
     )
 
     assert len(actual.query_tables) == 1
-    assert len(actual.data_lake_tables) == 2
-    assert len(actual.qrels) == 2
-    assert {
-        qrel["query_table_id"] for qrel in actual.qrels
-    } == {actual.query_tables[0]["table_id"]}
+    assert len(actual.data_lake_tables) == 1
+    assert len(actual.qrels) == 1
+    assert actual.qrels[0]["query_table_id"] == actual.query_tables[0]["table_id"]
     assert materializer._store_table_unit(
         inputs.lookup_database,
         actual,
@@ -1357,7 +1355,7 @@ def test_wdc_global_validation_allows_merged_query_with_multiple_qrels(
     )
 
     assert counts["query_tables"] == 1
-    assert counts["qrels"] == 2
+    assert counts["qrels"] == 1
 
 
 def test_public_shard_materializer_guards_actual_index_and_cleans_validation(
@@ -2073,7 +2071,7 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     )
     assert (
         manifest["query_construction"]["identical_visible_query_policy"]
-        == "merge_with_multiple_qrels"
+        == "keep_best_recovery_single_target"
     )
     assert (
         manifest["query_construction"]["query_row_selection"]

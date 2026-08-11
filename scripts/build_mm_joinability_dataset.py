@@ -3865,6 +3865,52 @@ def visible_query_fingerprint(
     )
 
 
+def validate_implicit_query_uniqueness(
+    qrels: Iterable[dict[str, Any]],
+    *,
+    expected_query_count: int | None = None,
+) -> int:
+    """Reject ambiguous implicit queries with more than one qrel.
+
+    An implicit query does not expose the requested hidden attribute.  Giving
+    identical visible input multiple target labels would therefore make a
+    single-target retrieval evaluation under-specified.
+    """
+    seen: dict[str, tuple[str, str]] = {}
+    for qrel in qrels:
+        if clean_text(qrel.get("reason")) != "model_recoverable_join_column":
+            continue
+        query_id = clean_text(qrel.get("query_table_id"))
+        target_id = clean_text(
+            qrel.get("target_table_id") or qrel.get("data_lake_table_id")
+        )
+        join_attribute = (
+            qrel.get("join_attribute")
+            if isinstance(qrel.get("join_attribute"), dict)
+            else {}
+        )
+        attribute = clean_text(
+            join_attribute.get("source_column_index")
+            if join_attribute.get("source_column_index") is not None
+            else join_attribute.get("column_name")
+        )
+        current = (target_id, attribute)
+        previous = seen.get(query_id)
+        if previous is not None:
+            raise ValueError(
+                "implicit query must have exactly one qrel: "
+                f"query_table_id={query_id!r}, first={previous!r}, "
+                f"second={current!r}"
+            )
+        seen[query_id] = current
+    if expected_query_count is not None and len(seen) != expected_query_count:
+        raise ValueError(
+            "implicit query/qrel count mismatch: "
+            f"queries={expected_query_count}, qrels={len(seen)}"
+        )
+    return len(seen)
+
+
 def required_recovered_row_count(
     valid_entity_rows: int,
     query_rows_per_table: int,
@@ -5600,12 +5646,12 @@ def build_table_join_records(
                 query_by_fingerprint[query_fingerprint] = query_table
                 query_tables.append(query_table)
             else:
-                query_table_id = str(query_table["table_id"])
-                if target_table_id in query_table["target_table_ids"]:
-                    continue
-                query_table["chain_ids"].append(chain_id)
-                query_table["hidden_attributes"].append(hidden_attribute)
-                query_table["target_table_ids"].append(target_table_id)
+                # Variants are ordered by descending recovery quality (then
+                # source column index), so the existing query owns the best
+                # deterministic label.  A later attribute with identical
+                # visible input is unanswerable as a distinct single-target
+                # query and must not receive another qrel.
+                continue
 
             emitted_view_count += 1
             qrels.append(
@@ -5711,6 +5757,10 @@ def build_table_join_records(
             },
             args=args,
         )
+    validate_implicit_query_uniqueness(
+        qrels,
+        expected_query_count=len(query_tables),
+    )
     return query_tables, data_lake_tables, qrels, {
         "reason": "queryable",
         "entity_column_index": entity_col,
@@ -6457,6 +6507,10 @@ def _build_dataset(
         splits[split]["query_table_ids"] = sorted(splits[split]["query_table_ids"])
         splits[split]["data_lake_table_ids"] = sorted(splits[split]["data_lake_table_ids"])
 
+    validate_implicit_query_uniqueness(
+        qrels,
+        expected_query_count=implicit_query_table_count,
+    )
     qrels_count = write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
     write_json(output_dir / "splits.json", splits)
@@ -6535,7 +6589,7 @@ def _build_dataset(
             "train join chains emit up to max_train_query_row_views_per_join deterministic disjoint row views; dev/test emit one canonical view",
             "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table sampled rows",
             "wide source tables emit one variant per qualifying bridge attribute; all qualifying bridge columns stay out of every sibling query, and ordinary context columns are partitioned into source-level query-only and target-only sides",
-            "identical visible queries from one source table are merged and retain every hidden attribute, target table ID, chain ID, and qrel",
+            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
@@ -6588,7 +6642,7 @@ def _build_dataset(
             "max_query_context_attrs": args.max_query_context_attrs,
             "qualified_attribute_policy": "all_safe_variants",
             "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
-            "identical_visible_query_policy": "merge_with_multiple_qrels",
+            "identical_visible_query_policy": "keep_best_recovery_single_target",
         },
         "source_sampling": source_sampling,
         "model_endpoints": {
