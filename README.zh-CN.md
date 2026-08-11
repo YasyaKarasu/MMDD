@@ -2,6 +2,9 @@
 
 本项目用于从 EntiTables JSON 文件中构造一个 multimodal table data lake，并进一步生成 query workload。
 
+EntiTables 与 WDC canonical joinability 输出的共同下游训练、负例采样和评测格式，
+见 [`docs/mm_joinability_downstream_data_format.zh-CN.md`](docs/mm_joinability_downstream_data_format.zh-CN.md)。
+
 这个脚本只负责构造数据集本体和 query views，不负责构造 joinability benchmark labels。它不会生成正样本、负样本、joinable/not joinable 标签、augmentation target 或 query-target pairs。
 
 ## 输入格式
@@ -709,6 +712,33 @@ conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir o
 ```
 
 这个 viewer 会按 `qrels.jsonl` 里的 `query_table_id -> target_table_id` 组合分页展示，每页包含 query table、target table、evidence recovery paths，以及路径上引用到的文本/图片素材。训练集里的不相交 row view 会按 `chain_id` 和 `row_view_index` 分组，可以通过 row-view 筛选器分别查看 canonical 或 augmented view。viewer 首次使用时会构建 `<output_dir>/.mm_joinability_viewer.sqlite3`，相关数据 shard 未变化时会直接复用，因此浏览 WDC 规模的数据集时不需要把所有 table 和 asset 常驻内存；可用 `--index_path` 把这个生成索引放到其他位置。
+
+新数据集构建完成后，可以分别启动 EntiTables 和 WDC 的 1% implicit-query 质量抽检页面：
+
+```bash
+conda run -n MMDD python scripts/entitables_dataset_checker.py --lan
+conda run -n MMDD python scripts/wdc_dataset_checker.py --lan
+```
+
+checker 使用固定 seed 精确抽取 1% 的唯一 implicit query，每页展示一条 `query -> multimodal evidence -> attribute -> target`。每个 query 可标记为“合格”或“不合格”并填写备注；审核状态保存在数据集目录内的 SQLite 文件中，重启后可以继续。全部样本审核完成后，页面会给出最终合格率，也可以导出 JSONL。checker 启动时会拒绝仍含有一对多 implicit qrel 的旧数据集。
+
+如果希望由多模态模型自动判断每条 `query row -> evidence -> attribute` 是否成立，可运行 10% 稳定抽样审阅：
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/mm_joinability_dataset_auto_checker.py \
+  --output_dir output_mm_joinability_v15 \
+  --provider local \
+  --local_base_url http://127.0.0.1:8001/v1 \
+  --local_model Qwen3.5-9B \
+  --sample_rate 0.10 \
+  --seed 13 \
+  --cache_path cache/mm_joinability/auto_checker.sqlite3
+```
+
+auto checker 对每个 `(row, evidence, attribute)` 做独立的 leave-one-attribute-out 抽取：从原始完整 row 中只移除当前 attribute，模型只看到剩余 row、一个 evidence 和 attribute 名称；模型看不到数据集声称的 value，也看不到 target row。模型只返回 `extracted_value`，checker 再用数据集 builder 相同的归一化规则在本地比较：匹配为 `supported`，非空但不匹配为 `contradicted`，空抽取为 `insufficient`。本地模型优先；只有本地结果为 `contradicted` 或 `insufficient` 时，才会交给 `gpt-5.6-terra` 以 `medium` 思考强度做相同的盲抽取，OpenAI 二次筛查最大并发固定不超过 5。最终 verdict 仍由 checker 对二次抽取值做本地比较得到，而不是让模型自己判定。
+
+默认报告写入 `<output_dir>/auto_checker_reviews/`，包括 path 级的本地/二次抽取、query 级覆盖、汇总、失败记录和用于后续数据清理的 `patch_candidates-*.jsonl`。两阶段成功抽取都会按 `(row, evidence, attribute, model identity)` 写入 SQLite cache，失败不会缓存。同一 seed 使用稳定哈希前缀抽样，因此以后把 `--sample_rate` 从 `0.10` 提高到 `0.20` 时会完整复用原 10% 的结果，只审阅新增部分。模型、prompt 或单条抽取输入变化时，对应 cache key 会自动变化。二次筛查从 `OPENAI_API_KEY` 读取密钥并沿用 OpenAI builder 的受限 dotenv 约定；密钥不会写入 cache 或报告。可用 `--no_secondary_openai` 关闭二次筛查。每个模型请求严格只包含一个 `masked row + evidence + attribute name`；同一 evidence 声称能抽取多个 attribute 时会分别请求。
 
 默认情况下，Flask GUI 绑定 `127.0.0.1`，只能在本机访问。给 `stage1_train_models.py`、`stage1_run_all.py`、`run_hitl_training_rounds.py`、`hitl_annotation_app.py`、`stage1_connection_viewer.py` 或 `mm_joinability_dataset_viewer.py` 加上 `--lan` 后会绑定到 `0.0.0.0`，启动日志会同时打印本机 URL 和内网设备可访问的 URL。如果内网 URL 仍然打不开，检查主机防火墙是否放行对应端口，并确认设备在同一个网络里。
 

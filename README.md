@@ -742,6 +742,33 @@ conda run -n MMDD python scripts/mm_joinability_dataset_viewer.py --output_dir o
 
 The viewer paginates through every `query_table_id -> target_table_id` pair in `qrels.jsonl` and shows the query table, target table, evidence recovery paths, and the referenced text/image material for each path. Train-time disjoint row views are grouped by `chain_id` and `row_view_index`; use the row-view filter to inspect canonical or augmented views separately. The viewer builds `<output_dir>/.mm_joinability_viewer.sqlite3` on first use and reuses it while the relevant dataset shards are unchanged, so WDC-scale datasets are browsed without retaining all tables and assets in memory. Use `--index_path` to place this generated index elsewhere.
 
+After the new datasets finish building, launch the 1% implicit-query quality checkers with:
+
+```bash
+conda run -n MMDD python scripts/entitables_dataset_checker.py --lan
+conda run -n MMDD python scripts/wdc_dataset_checker.py --lan
+```
+
+Each checker uses a fixed seed to select exactly 1% of unique implicit queries and presents one `query -> multimodal evidence -> attribute -> target` chain per page. Qualified/unqualified judgments and optional notes persist in SQLite, the completed sample reports its final qualified percentage, and reviews can be exported as JSONL. Startup rejects legacy datasets that still contain one-to-many implicit qrels.
+
+To have a multimodal model judge whether every sampled `query row -> evidence -> attribute` recovery is actually supported, run the stable 10% auto-check:
+
+```bash
+conda run --no-capture-output -n MMDD python \
+  scripts/mm_joinability_dataset_auto_checker.py \
+  --output_dir output_mm_joinability_v15 \
+  --provider local \
+  --local_base_url http://127.0.0.1:8001/v1 \
+  --local_model Qwen3.5-9B \
+  --sample_rate 0.10 \
+  --seed 13 \
+  --cache_path cache/mm_joinability/auto_checker.sqlite3
+```
+
+For every `(row, evidence, attribute)`, the auto checker performs an independent leave-one-attribute-out extraction. It removes only that attribute from the original complete row, and gives the model the remaining row, one evidence item, and the attribute name. The model never receives the dataset's claimed value or any target row; it returns only `extracted_value`. The checker then uses the builder's normalization locally: a match is `supported`, a nonempty mismatch is `contradicted`, and an empty extraction is `insufficient`. The local model runs first. Only local `contradicted` or `insufficient` results are sent through the same blind extraction with `gpt-5.6-terra` at `medium` reasoning, with OpenAI secondary concurrency hard-limited to five. The checker, not either model, derives the final verdict by comparing the secondary extraction when one was requested.
+
+Reports under `<output_dir>/auto_checker_reviews/` contain both extraction stages at path level, query coverage, aggregate statistics, errors, and `patch_candidates-*.jsonl` for later dataset cleanup. Successful results from both stages are cached by `(row, evidence, attribute, model identity)` in SQLite; failures are not cached. Stable hash-prefix sampling lets a later 20% run reuse the earlier 10%. Secondary screening reads `OPENAI_API_KEY` and follows the OpenAI builder's restricted dotenv convention; keys are never written to cache or reports. Use `--no_secondary_openai` to disable it. Every request contains exactly one `masked row + evidence + attribute name`; multiple attributes claimed by the same evidence are requested separately.
+
 By default, Flask GUIs bind to `127.0.0.1` and are available only on the same machine. Add `--lan` to `stage1_train_models.py`, `stage1_run_all.py`, `run_hitl_training_rounds.py`, `hitl_annotation_app.py`, `stage1_connection_viewer.py`, or `mm_joinability_dataset_viewer.py` to bind to `0.0.0.0`; the startup log prints both the local URL and the LAN URL for other devices. If the LAN URL is still unreachable, allow the selected port through the host firewall and make sure the devices are on the same network.
 
 Use `--force_retrain` when you want to ignore partially generated training outputs and start the training/HITL loop cleanly. It removes teacher/student models, teacher scores, train pairs, open HITL selections, templates, and annotation status files while preserving prepared data, embeddings, and merged human labels. Add `--reset_human_labels` only when you also want to discard previously merged human labels.
