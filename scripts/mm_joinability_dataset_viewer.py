@@ -600,6 +600,17 @@ def recovery_preview(
             "wiki_title": clean_text(entity.get("wiki_title")),
             "cell_text": clean_text(entity.get("cell_text")),
             "entity_column_name": clean_text(entity.get("entity_column_name")),
+            "row_attributes": [
+                {
+                    "name": clean_text(item.get("name")),
+                    "value": clean_text(item.get("value")),
+                    "is_entity": bool(item.get("is_entity")),
+                }
+                for item in entity.get("row_attributes") or []
+                if isinstance(item, dict)
+                and clean_text(item.get("name"))
+                and clean_text(item.get("value"))
+            ],
         },
         "recovered_attribute": {
             "column_name": clean_text(recovered.get("column_name")),
