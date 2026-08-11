@@ -31,6 +31,7 @@ from stage1_io import (
 LOG = logging.getLogger(__name__)
 VIEWER_INDEX_SCHEMA_VERSION = "mm-joinability-viewer-index-v2"
 DEFAULT_INDEX_FILENAME = ".mm_joinability_viewer.sqlite3"
+IMPLICIT_JOIN_REASON = "model_recoverable_join_column"
 JSONL_SCAN_CHUNK_BYTES = 1024 * 1024
 JSONL_ID_PREFIX_BYTES = 64 * 1024
 
@@ -1539,6 +1540,37 @@ class ViewerDataset:
                 include_view_count=True,
             )
 
+    def hydrate_full_pair_tables(
+        self,
+        pair_key: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load complete normalized query and target tables for one pair."""
+        with self._connect() as connection, IndexedRecordReader() as reader:
+            pair_row = connection.execute(
+                "SELECT query_table_id,target_table_id FROM pairs WHERE pair_key = ?",
+                (pair_key,),
+            ).fetchone()
+            if pair_row is None:
+                raise KeyError(f"Unknown pair: {pair_key}")
+            query_record = self._read_record(
+                connection,
+                reader,
+                "query_tables",
+                pair_row["query_table_id"],
+            )
+            target_record = self._read_record(
+                connection,
+                reader,
+                "data_lake_tables",
+                pair_row["target_table_id"],
+            )
+
+        def full_preview(record: dict[str, Any]) -> dict[str, Any]:
+            rows = record.get("rows") if isinstance(record.get("rows"), list) else []
+            return preview_table(record, max(1, len(rows)))
+
+        return full_preview(query_record), full_preview(target_record)
+
     @staticmethod
     def _filter_sql(
         *,
@@ -1675,6 +1707,75 @@ class ViewerDataset:
                     ORDER BY split, source_table_id, chain_id, row_view_index,
                              query_table_id, target_table_id
                     """
+                )
+            ]
+
+    def implicit_query_ids(self) -> list[str]:
+        """Return the unique implicit-query IDs represented by the dataset."""
+        with self._connect() as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT query_table_id FROM pairs
+                    WHERE reason = ?
+                    ORDER BY query_table_id
+                    """,
+                    (IMPLICIT_JOIN_REASON,),
+                )
+            ]
+
+    def validate_implicit_query_uniqueness(self) -> int:
+        """Require exactly one target qrel for every implicit query."""
+        with self._connect() as connection:
+            invalid = connection.execute(
+                """
+                SELECT query_table_id, COUNT(*) AS qrel_count
+                FROM pairs
+                WHERE reason = ?
+                GROUP BY query_table_id
+                HAVING COUNT(*) != 1
+                ORDER BY query_table_id
+                LIMIT 1
+                """,
+                (IMPLICIT_JOIN_REASON,),
+            ).fetchone()
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM pairs WHERE reason = ?",
+                    (IMPLICIT_JOIN_REASON,),
+                ).fetchone()[0]
+            )
+        if invalid is not None:
+            raise ValueError(
+                "checker requires one attribute/target per implicit query: "
+                f"query_table_id={invalid['query_table_id']!r}, "
+                f"qrels={invalid['qrel_count']}"
+            )
+        return total
+
+    def pair_keys_for_query(
+        self,
+        query_table_id: str,
+        *,
+        implicit_only: bool = False,
+    ) -> list[str]:
+        """Return all query-target pair keys for one query in stable order."""
+        clauses = ["query_table_id = ?"]
+        parameters: list[Any] = [clean_text(query_table_id)]
+        if implicit_only:
+            clauses.append("reason = ?")
+            parameters.append(IMPLICIT_JOIN_REASON)
+        with self._connect() as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    f"""
+                    SELECT pair_key FROM pairs
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY target_table_id, pair_key
+                    """,
+                    parameters,
                 )
             ]
 

@@ -139,6 +139,21 @@ def test_mm_joinability_viewer_loads_query_target_paths(tmp_path):
     assert pairs[0]["target_highlight_rows"] == [0]
     assert pairs[0]["paths"][0]["asset_content"] == "Argentina is visible in the referenced text chunk."
 
+    limited_dataset = ViewerDataset(
+        tmp_path,
+        max_rows=1,
+        max_paths=5,
+        max_asset_chars=2000,
+        index_path=tmp_path / "limited-viewer.sqlite3",
+    )
+    pair_key = limited_dataset.pair_keys_for_query("query_q")[0]
+    limited_pair = limited_dataset.hydrate_pair(pair_key)
+    full_query, full_target = limited_dataset.hydrate_full_pair_tables(pair_key)
+    assert len(limited_pair["query_table"]["rows"]) == 1
+    assert len(limited_pair["target_table"]["rows"]) == 1
+    assert len(full_query["rows"]) == 2
+    assert len(full_target["rows"]) == 2
+
     client = create_app(tmp_path, max_rows=5, max_paths=5, max_asset_chars=2000).test_client()
     response = client.get("/?q=Argentina")
     assert response.status_code == 200
