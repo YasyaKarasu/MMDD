@@ -720,15 +720,21 @@ def test_planning_persists_all_mappings_before_global_dedup_and_resumes(
         )
         for index in range(7)
     )
+    progress: list[dict[str, Any]] = []
     planned = persist_entity_asset_plans(
         entity_pages,
         output_root=tmp_path / "plans",
         input_fingerprint="entities-v1",
         budget=ImageBudget(2, 2),
         records_per_shard=3,
+        total_entities=7,
+        progress_callback=progress.append,
+        progress_every=2,
     )
 
     mappings = read_jsonl(planned.image_mapping_paths)
+    assert [item["completed"] for item in progress] == [0, 2, 4, 6, 7]
+    assert all(item["total"] == 7 for item in progress)
     assert len(mappings) == 14
     assert max(
         len(read_jsonl([path]))
@@ -742,15 +748,26 @@ def test_planning_persists_all_mappings_before_global_dedup_and_resumes(
         )
     }
 
+    resumed_progress: list[dict[str, Any]] = []
     resumed = persist_entity_asset_plans(
         (),
         output_root=tmp_path / "plans",
         input_fingerprint="entities-v1",
         budget=ImageBudget(2, 2),
         records_per_shard=3,
+        total_entities=7,
+        progress_callback=resumed_progress.append,
     )
 
     assert resumed == planned
+    assert resumed_progress == [
+        {
+            "phase": "plan_entity_assets",
+            "completed": 7,
+            "total": 7,
+            "resumed": True,
+        }
+    ]
     assert {
         path: path.stat().st_mtime_ns for path in mtimes
     } == mtimes
@@ -1946,6 +1963,85 @@ def test_image_fetch_expands_to_overlapping_larger_job_set(
         output_root=tmp_path / "small-materialized",
         input_fingerprint="small-assets-v1",
     )
+
+
+def test_image_outcomes_can_be_scoped_to_one_shared_cache_job_set(
+    tmp_path: Path,
+) -> None:
+    a = "https://i.test/scope-a.jpg"
+    b = "https://i.test/scope-b.jpg"
+    c = "https://i.test/scope-c.jpg"
+    _planned_ab, jobs_ab = write_named_job_set(tmp_path, "ab", [a, b])
+    _planned_bc, jobs_bc = write_named_job_set(tmp_path, "bc", [b, c])
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    transport = FakeImageTransport(
+        tmp_path,
+        {a: "a", b: "b", c: "c"},
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+    )
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+
+    fetched_ab = fetch_unique_images(
+        jobs_ab,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+    fetched_bc = fetch_unique_images(
+        jobs_bc,
+        store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    assert fetched_ab.policy_fingerprint == fetched_bc.policy_fingerprint
+    image_policy_fingerprint = fetched_ab.policy_fingerprint
+    unscoped = list(
+        iter_image_outcomes(outcomes_path, image_policy_fingerprint)
+    )
+    scoped_ab = list(
+        iter_image_outcomes(
+            outcomes_path,
+            image_policy_fingerprint,
+            job_store_path=fetched_ab.job_store_path,
+            job_kind=fetched_ab.job_kind,
+        )
+    )
+    scoped_bc = list(
+        iter_image_outcomes(
+            outcomes_path,
+            image_policy_fingerprint,
+            job_store_path=fetched_bc.job_store_path,
+            job_kind=fetched_bc.job_kind,
+        )
+    )
+
+    assert {item["image_url"] for item in unscoped} == {a, b, c}
+    assert {item["image_url"] for item in scoped_ab} == {a, b}
+    assert {item["image_url"] for item in scoped_bc} == {b, c}
+
+
+def test_scoped_image_outcomes_require_complete_job_scope(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="job_store_path and job_kind must be provided together",
+    ):
+        list(
+            iter_image_outcomes(
+                tmp_path / "outcomes.sqlite3",
+                "image-v1",
+                job_store_path=tmp_path / "jobs.sqlite3",
+            )
+        )
 
 
 def test_terminal_outcome_repairs_each_overlapping_job_set_without_network(

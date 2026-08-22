@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -79,8 +80,8 @@ except ModuleNotFoundError as error:
 
 MODEL_QUEUE_SCHEMA_VERSION = "wdc200k-model-queues-v1"
 MODEL_OUTPUT_SCHEMA_VERSION = "wdc200k-model-outputs-v1"
-MODEL_POLICY_VERSION = "existing-extraction-semantics-v1"
-MODEL_PARSER_SCHEMA_VERSION = "connection-evidence-parser-v1"
+MODEL_POLICY_VERSION = "post-analysis-auto-check-v1"
+MODEL_PARSER_SCHEMA_VERSION = "auto-check-filter-parser-v1"
 MODEL_MARKER_SCHEMA_VERSION = model_markers.MODEL_MARKER_SCHEMA_VERSION
 MODEL_START_STAGE = model_markers.MODEL_START_STAGE
 MODEL_READY_STAGE = model_markers.MODEL_READY_STAGE
@@ -88,6 +89,7 @@ MODEL_DONE_STAGE = model_markers.MODEL_DONE_STAGE
 STRUCTURAL_STAGE_SCHEMA_VERSION = "wdc200k-structural-v2"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
+_ROLLING_CLAIM_GROUPS = 8
 
 
 @dataclass(frozen=True)
@@ -1343,7 +1345,7 @@ def _repair_durable_results(
                 JOIN model_results
                   ON model_results.job_id = jobs.job_id
                 WHERE jobs.kind = ?
-                  AND jobs.status = 'leased'
+                  AND jobs.status IN ('leased', 'review_leased')
                   AND jobs.lease_expires <= ?
                   AND model_results.committed = 0
                   AND model_results.commit_owner = jobs.owner
@@ -1365,7 +1367,8 @@ def _repair_durable_results(
                     SET status = ?, result_json = ?, owner = NULL,
                         lease_expires = NULL, lease_id = NULL,
                         updated_at = ?
-                    WHERE job_id = ? AND status = 'leased'
+                    WHERE job_id = ?
+                      AND status IN ('leased', 'review_leased')
                       AND owner = ? AND lease_id = ?
                       AND lease_expires <= ?
                     """,
@@ -1422,12 +1425,109 @@ def _repair_durable_results(
     return repaired
 
 
+def _model_owner_pid(owner: str) -> int | None:
+    base = clean_text(owner).split(":", 1)[0]
+    prefix = "model-worker-"
+    if not base.startswith(prefix):
+        return None
+    value = base[len(prefix) :].split("-", 1)[0]
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reclaim_orphaned_local_leases(
+    database_path: Path,
+    jobset: ModelJobSet,
+    *,
+    write_tracker: GuardedWriteTracker | None = None,
+) -> int:
+    """Requeue leases owned by a dead local model-stage process."""
+    with _connect(database_path) as connection:
+        owners = [
+            (str(row["status"]), clean_text(row["owner"]))
+            for row in connection.execute(
+                """
+                SELECT DISTINCT status, owner
+                FROM jobs
+                WHERE kind IN (?, ?)
+                  AND status IN ('leased', 'review_leased')
+                  AND owner IS NOT NULL
+                """,
+                (jobset.text_kind, jobset.image_kind),
+            )
+        ]
+    orphaned = [
+        (status, owner)
+        for status, owner in owners
+        if (pid := _model_owner_pid(owner)) is not None
+        and not _process_is_alive(pid)
+    ]
+    if not orphaned:
+        return 0
+    if write_tracker is not None:
+        write_tracker.before_write(4096 * len(orphaned))
+    reclaimed = 0
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for status, owner in orphaned:
+            pending_status = (
+                "review_pending" if status == "review_leased" else "retryable"
+            )
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, owner = NULL, lease_expires = NULL,
+                    lease_id = NULL, updated_at = ?
+                WHERE kind IN (?, ?) AND status = ? AND owner = ?
+                  AND NOT EXISTS (
+                        SELECT 1 FROM model_results
+                        WHERE model_results.job_id = jobs.job_id
+                          AND model_results.committed = 0
+                          AND model_results.commit_owner = jobs.owner
+                          AND model_results.commit_lease_id = jobs.lease_id
+                  )
+                """,
+                (
+                    pending_status,
+                    time.time(),
+                    jobset.text_kind,
+                    jobset.image_kind,
+                    status,
+                    owner,
+                ),
+            )
+            reclaimed += max(0, int(cursor.rowcount))
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
+        connection.commit()
+    if reclaimed:
+        logging.warning(
+            "Reclaimed %d model leases from dead local worker processes",
+            reclaimed,
+        )
+    return reclaimed
+
+
 def _extend_leases(
     database_path: Path,
     jobs: list[Any],
     *,
     owner: str,
     lease_seconds: float,
+    lease_status: str = "leased",
 ) -> set[str]:
     renewed: set[str] = set()
     with _connect(database_path) as connection:
@@ -1438,7 +1538,7 @@ def _extend_leases(
                 """
                 UPDATE jobs
                 SET lease_expires = ?, updated_at = ?
-                WHERE job_id = ? AND status = 'leased'
+                WHERE job_id = ? AND status = ?
                   AND owner = ? AND lease_id = ?
                   AND lease_expires > ?
                 """,
@@ -1446,6 +1546,7 @@ def _extend_leases(
                     now + lease_seconds,
                     now,
                     job.job_id,
+                    lease_status,
                     owner,
                     job.lease_id,
                     now,
@@ -1465,12 +1566,14 @@ class _LeaseHeartbeat:
         owner: str,
         lease_seconds: float,
         interval: float,
+        lease_status: str = "leased",
     ) -> None:
         self.database_path = database_path
         self.jobs = jobs
         self.owner = owner
         self.lease_seconds = lease_seconds
         self.interval = interval
+        self.lease_status = lease_status
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: BaseException | None = None
@@ -1490,6 +1593,7 @@ class _LeaseHeartbeat:
                         self.jobs,
                         owner=self.owner,
                         lease_seconds=self.lease_seconds,
+                        lease_status=self.lease_status,
                     )
                     expected = {str(job.job_id) for job in self.jobs}
                     if isinstance(renewed, int):
@@ -1531,6 +1635,7 @@ def _fenced_commit_model_record(
     record: dict[str, Any],
     status: str,
     heartbeat: _LeaseHeartbeat,
+    lease_status: str = "leased",
     after_cache_write: (
         Callable[[str, dict[str, Any]], None] | None
     ),
@@ -1566,7 +1671,7 @@ def _fenced_commit_model_record(
             or str(row["kind"]) != expected_kind
             or _canonical_json(json.loads(str(row["payload_json"])))
             != _canonical_json(payload)
-            or str(row["status"]) != "leased"
+            or str(row["status"]) != lease_status
             or str(row["owner"]) != str(job.owner)
             or str(row["lease_id"]) != str(job.lease_id)
             or float(row["lease_expires"] or 0.0) <= now
@@ -1623,7 +1728,7 @@ def _fenced_commit_model_record(
             UPDATE jobs
             SET status = ?, result_json = ?, owner = NULL,
                 lease_expires = NULL, lease_id = NULL, updated_at = ?
-            WHERE job_id = ? AND kind = ? AND status = 'leased'
+            WHERE job_id = ? AND kind = ? AND status = ?
               AND owner = ? AND lease_id = ? AND lease_expires > ?
               AND EXISTS (
                     SELECT 1
@@ -1641,6 +1746,7 @@ def _fenced_commit_model_record(
                 finish_time,
                 job.job_id,
                 expected_kind,
+                lease_status,
                 job.owner,
                 job.lease_id,
                 finish_time,
@@ -1756,6 +1862,102 @@ def _fenced_retry_model_job(
     return True
 
 
+def _fenced_defer_remote_review(
+    database_path: Path,
+    *,
+    job: Any,
+    expected_kind: str,
+    payload: dict[str, Any],
+    record: dict[str, Any],
+    heartbeat: _LeaseHeartbeat,
+    write_tracker: GuardedWriteTracker | None = None,
+) -> bool:
+    """Persist a locally checked record for later Luna/Terra completion."""
+    if heartbeat.is_lost(str(job.job_id)):
+        return False
+    canonical = _canonical_extraction_record(payload, record)
+    encoded = _canonical_json(canonical)
+    now = time.time()
+    if write_tracker is not None:
+        write_tracker.before_write(
+            4096 + 2 * len(encoded.encode("utf-8"))
+        )
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'review_pending', result_json = ?, owner = NULL,
+                lease_expires = NULL, lease_id = NULL, updated_at = ?
+            WHERE job_id = ? AND kind = ? AND status = 'leased'
+              AND owner = ? AND lease_id = ? AND lease_expires > ?
+            """,
+            (
+                encoded,
+                now,
+                job.job_id,
+                expected_kind,
+                job.owner,
+                job.lease_id,
+                now,
+            ),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
+        connection.commit()
+    return True
+
+
+def _fenced_retry_remote_review(
+    database_path: Path,
+    *,
+    job: Any,
+    expected_kind: str,
+    record: dict[str, Any],
+    heartbeat: _LeaseHeartbeat,
+    write_tracker: GuardedWriteTracker | None = None,
+) -> bool:
+    """Return an incomplete remote review to its durable pending state."""
+    if heartbeat.is_lost(str(job.job_id)):
+        return False
+    encoded = _canonical_json(record)
+    now = time.time()
+    if write_tracker is not None:
+        write_tracker.before_write(
+            4096 + 2 * len(encoded.encode("utf-8"))
+        )
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'review_pending', result_json = ?, owner = NULL,
+                lease_expires = NULL, lease_id = NULL, updated_at = ?
+            WHERE job_id = ? AND kind = ? AND status = 'review_leased'
+              AND owner = ? AND lease_id = ? AND lease_expires > ?
+            """,
+            (
+                encoded,
+                now,
+                job.job_id,
+                expected_kind,
+                job.owner,
+                job.lease_id,
+                now,
+            ),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+        if write_tracker is not None:
+            write_tracker.before_commit(0)
+        connection.commit()
+    return True
+
+
 def _process_claimed_group(
     store: SqliteJobStore,
     extractor: Any,
@@ -1775,6 +1977,8 @@ def _process_claimed_group(
     ),
     progress_tracker: _ModelProgressTracker | None = None,
     write_tracker: GuardedWriteTracker | None = None,
+    review_transition_lock: threading.Lock | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> int:
     routing_capacity = getattr(extractor, "routing_capacity", None)
     dynamic_capacity = (
@@ -1912,34 +2116,52 @@ def _process_claimed_group(
                 if progress_tracker is not None:
                     progress_tracker.finished(modality, status)
 
+        def process_local_record(
+            model_call_key: str,
+            record: dict[str, Any],
+        ) -> None:
+            # Task 6 is deliberately high-recall local analysis only. The
+            # independent blind check is query-scoped and runs after Task 7
+            # has selected a concrete query view and hidden attribute.
+            commit_record(model_call_key, record)
+
         tasks = [
             task_by_key[job.payload["model_call_key"]]
             for job in model_jobs
         ]
-        if dynamic_capacity is None:
+        if executor is not None:
             run_extraction_task_group(
                 extractor=extractor,
                 tasks=tasks,
                 workers=workers,
-                on_record=commit_record,
+                apply_auto_check_gate=False,
+                on_record=process_local_record,
+                executor=executor,
+            )
+        elif dynamic_capacity is None:
+            run_extraction_task_group(
+                extractor=extractor,
+                tasks=tasks,
+                workers=workers,
+                apply_auto_check_gate=False,
+                on_record=process_local_record,
             )
         else:
-            offset = 0
-            while offset < len(tasks):
-                current_capacity = routing_capacity(modality)
-                # A route can be withdrawn after the jobs were claimed. One
-                # task then becomes retryable instead of a terminal result.
-                wave_workers = max(1, int(current_capacity or 0))
-                wave = tasks[offset : offset + wave_workers]
-                run_extraction_task_group(
-                    extractor=extractor,
-                    tasks=wave,
-                    workers=wave_workers,
-                    on_record=commit_record,
-                )
-                offset += len(wave)
-                if transient_errors:
-                    break
+            # Keep one bounded rolling queue. ThreadPoolExecutor immediately
+            # replaces each completed request instead of draining an entire
+            # capacity-sized wave before submitting more work.
+            current_capacity = routing_capacity(modality)
+            rolling_workers = max(
+                1,
+                int(current_capacity or dynamic_capacity or 0),
+            )
+            run_extraction_task_group(
+                extractor=extractor,
+                tasks=tasks,
+                workers=rolling_workers,
+                apply_auto_check_gate=False,
+                on_record=process_local_record,
+            )
         if transient_errors:
             errors = sorted(set(error for error in transient_errors if error))
             detail = f": {'; '.join(errors)}" if errors else ""
@@ -1977,6 +2199,62 @@ def _claimable_modalities(
     return claimable
 
 
+def _claimable_remote_review_count(
+    database_path: Path,
+    jobset: ModelJobSet,
+) -> int:
+    now = time.time()
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM jobs
+            WHERE kind IN (?, ?)
+              AND (
+                    status = 'review_pending'
+                    OR (status = 'review_leased' AND lease_expires <= ?)
+              )
+            """,
+            (jobset.text_kind, jobset.image_kind, now),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
+def _auto_check_review_parallelism(extractor: Any) -> int:
+    """Use aggregate reviewer-pool capacity with legacy compatibility."""
+    for attribute in (
+        "auto_check_parallelism",
+        "auto_check_openai_max_inflight",
+    ):
+        value = getattr(extractor, attribute, None)
+        if value is None:
+            continue
+        limit = int(value)
+        if limit > 0:
+            return limit
+    return 5
+
+
+def _local_kind_is_complete(database_path: Path, kind: str) -> bool:
+    """Return whether local inference/checking has handed off every job."""
+    now = time.time()
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM jobs
+            WHERE kind = ?
+              AND (
+                    status IN ('pending', 'retryable', 'leased')
+                    OR (status = 'leased' AND lease_expires <= ?)
+              )
+            LIMIT 1
+            """,
+            (kind, now),
+        ).fetchone()
+    return row is None
+
+
 def _job_snapshot(
     database_path: Path,
     jobset: ModelJobSet,
@@ -1988,6 +2266,8 @@ def _job_snapshot(
         "pending": 0,
         "retryable": 0,
         "leased": 0,
+        "review_pending": 0,
+        "review_leased": 0,
     }
     with _connect(database_path) as connection:
         for modality in ("text", "image"):
@@ -2033,7 +2313,7 @@ def _initial_model_progress_counts(
             """
             SELECT kind, status, COUNT(*) AS count,
                    SUM(
-                       CASE WHEN status = 'leased'
+                       CASE WHEN status IN ('leased', 'review_leased')
                                   AND COALESCE(lease_expires, 0) <= ?
                             THEN 1 ELSE 0 END
                    ) AS expired
@@ -2054,6 +2334,11 @@ def _initial_model_progress_counts(
         elif status in {"pending", "retryable"}:
             current["pending"] += count
         elif status == "leased":
+            current["pending"] += expired
+            current["leased"] += count - expired
+        elif status == "review_pending":
+            current["pending"] += count
+        elif status == "review_leased":
             current["pending"] += expired
             current["leased"] += count - expired
         else:
@@ -2119,7 +2404,7 @@ class _ModelProgressTracker:
             counts["leased"] -= 1
             if status in {"success", "terminal"}:
                 counts[status] += 1
-            elif status in {"pending", "retryable"}:
+            elif status in {"pending", "retryable", "review_pending"}:
                 counts["pending"] += 1
             else:
                 raise ValueError(f"unsupported model progress status: {status}")
@@ -2877,6 +3162,11 @@ def run_model_stage(
         jobset,
         write_tracker=result_write_tracker,
     )
+    _reclaim_orphaned_local_leases(
+        store.path,
+        jobset,
+        write_tracker=result_write_tracker,
+    )
     progress_tracker = (
         _ModelProgressTracker(
             _initial_model_progress_counts(store.path, jobset),
@@ -2905,6 +3195,7 @@ def run_model_stage(
     }
     idle_modalities: set[str] = set()
     idle_lock = threading.Lock()
+    review_transition_lock = threading.Lock()
 
     def process_modality(
         modality: str,
@@ -2916,104 +3207,183 @@ def run_model_stage(
             progress_tracker.set_modality(modality)
         processed = 0
         modality_owner = f"{owner}:{modality}"
-        while (
-            not stop_modalities.is_set()
-            and (limit is None or processed < limit)
-        ):
-            allowance = (
-                group_size
-                if limit is None
-                else min(group_size, limit - processed)
-            )
-            if allowance <= 0:
-                break
-            if (
-                callable(ensure_endpoints_ready)
-                and modality not in preflighted_modalities
+        configured_workers = max(
+            1,
+            int((workers_by_kind or {}).get(modality, workers)),
+        )
+        routing_capacity = getattr(extractor, "routing_capacity", None)
+        modality_task_count = (
+            jobset.text_tasks
+            if modality == "text"
+            else jobset.image_tasks
+        )
+        current_capacity = (
+            routing_capacity(modality)
+            if callable(routing_capacity) and modality_task_count > 0
+            else None
+        )
+        model_workers = max(
+            1,
+            int(current_capacity or configured_workers),
+        )
+        reserved = 0
+        no_more_claims = False
+        first_error: BaseException | None = None
+        with ThreadPoolExecutor(
+            max_workers=model_workers,
+            thread_name_prefix=f"wdc-model-{modality}",
+        ) as model_executor, ThreadPoolExecutor(
+            max_workers=_ROLLING_CLAIM_GROUPS,
+            thread_name_prefix=f"wdc-model-claim-{modality}",
+        ) as claim_executor:
+            inflight_groups: dict[Any, int] = {}
+            while inflight_groups or (
+                not no_more_claims
+                and not stop_modalities.is_set()
+                and (limit is None or processed < limit)
             ):
-                modality_is_claimable = modality in _claimable_modalities(
-                    store.path,
-                    jobset,
-                )
-                if modality_is_claimable:
-                    ensure_endpoints_ready(
-                        modalities={modality},
-                        timeout_seconds=endpoint_ready_timeout_seconds,
-                    )
-                    preflighted_modalities.add(modality)
-            claimed = store.claim(
-                jobset.kind_for(modality),
-                limit=allowance,
-                owner=modality_owner,
-                lease_seconds=lease_seconds,
-            )
-            if not claimed:
-                peer = "image" if modality == "text" else "text"
-                with idle_lock:
-                    idle_modalities.add(modality)
-                    peer_is_idle = peer in idle_modalities
-                if (
-                    wait_for_peer
-                    and not peer_is_idle
-                    and not finished_modalities[peer].is_set()
+                while (
+                    len(inflight_groups) < _ROLLING_CLAIM_GROUPS
+                    and not no_more_claims
+                    and first_error is None
+                    and not stop_modalities.is_set()
                 ):
-                    finished_modalities[peer].wait(timeout=0.05)
-                    continue
-                if (
-                    wait_for_peer
-                    and modality
-                    in _claimable_modalities(store.path, jobset)
-                ):
-                    # The peer can make a previously leased job claimable in
-                    # its final result callback immediately before signalling
-                    # completion. Recheck once through the normal readiness
-                    # and claim path instead of racing that transition.
-                    continue
-                break
-            if (
-                callable(ensure_endpoints_ready)
-                and modality not in preflighted_modalities
-            ):
-                # Claimability can change after the preflight check and
-                # before claim() acquires its transaction.
-                try:
-                    ensure_endpoints_ready(
-                        modalities={modality},
-                        timeout_seconds=endpoint_ready_timeout_seconds,
+                    allowance = (
+                        group_size
+                        if limit is None
+                        else min(
+                            group_size,
+                            limit - processed - reserved,
+                        )
                     )
-                except BaseException:
-                    store.release_owner_leases(
+                    if allowance <= 0:
+                        no_more_claims = True
+                        break
+                    if (
+                        callable(ensure_endpoints_ready)
+                        and modality not in preflighted_modalities
+                    ):
+                        modality_is_claimable = (
+                            modality
+                            in _claimable_modalities(store.path, jobset)
+                        )
+                        if modality_is_claimable:
+                            ensure_endpoints_ready(
+                                modalities={modality},
+                                timeout_seconds=(
+                                    endpoint_ready_timeout_seconds
+                                ),
+                            )
+                            preflighted_modalities.add(modality)
+                    claimed = store.claim(
                         jobset.kind_for(modality),
+                        limit=allowance,
                         owner=modality_owner,
+                        lease_seconds=lease_seconds,
                     )
-                    raise
-                preflighted_modalities.add(modality)
-            with idle_lock:
-                idle_modalities.discard(modality)
-            if progress_tracker is not None:
-                progress_tracker.claimed(modality, len(claimed))
-            processed += _process_claimed_group(
-                store,
-                extractor,
-                claimed,
-                modality=modality,
-                cache=persistent_cache,
-                workers=max(
-                    1,
-                    int(
-                        (workers_by_kind or {}).get(modality, workers)
-                    ),
-                ),
-                owner=modality_owner,
-                lease_seconds=lease_seconds,
-                heartbeat_seconds=heartbeat_seconds,
-                after_result_write=after_result_write,
-                after_cache_write=after_cache_write,
-                progress_tracker=progress_tracker,
-                write_tracker=result_write_tracker,
-            )
+                    if not claimed:
+                        # Existing groups may own all currently claimable
+                        # rows. Process one completion before checking again.
+                        if inflight_groups:
+                            break
+                        peer = (
+                            "image" if modality == "text" else "text"
+                        )
+                        with idle_lock:
+                            idle_modalities.add(modality)
+                            peer_is_idle = peer in idle_modalities
+                        if (
+                            wait_for_peer
+                            and not peer_is_idle
+                            and not finished_modalities[peer].is_set()
+                        ):
+                            finished_modalities[peer].wait(timeout=0.05)
+                            continue
+                        if (
+                            wait_for_peer
+                            and modality
+                            in _claimable_modalities(store.path, jobset)
+                        ):
+                            # The peer can make a previously leased job
+                            # claimable immediately before signalling done.
+                            continue
+                        no_more_claims = True
+                        break
+                    if (
+                        callable(ensure_endpoints_ready)
+                        and modality not in preflighted_modalities
+                    ):
+                        # Claimability can change after the preflight check
+                        # and before claim() acquires its transaction.
+                        try:
+                            ensure_endpoints_ready(
+                                modalities={modality},
+                                timeout_seconds=(
+                                    endpoint_ready_timeout_seconds
+                                ),
+                            )
+                        except BaseException:
+                            store.release_owner_leases(
+                                jobset.kind_for(modality),
+                                owner=modality_owner,
+                            )
+                            raise
+                        preflighted_modalities.add(modality)
+                    with idle_lock:
+                        idle_modalities.discard(modality)
+                    if progress_tracker is not None:
+                        progress_tracker.claimed(
+                            modality,
+                            len(claimed),
+                        )
+                    future = claim_executor.submit(
+                        _process_claimed_group,
+                        store,
+                        extractor,
+                        claimed,
+                        modality=modality,
+                        cache=persistent_cache,
+                        workers=model_workers,
+                        owner=modality_owner,
+                        lease_seconds=lease_seconds,
+                        heartbeat_seconds=heartbeat_seconds,
+                        after_result_write=after_result_write,
+                        after_cache_write=after_cache_write,
+                        progress_tracker=progress_tracker,
+                        write_tracker=result_write_tracker,
+                        review_transition_lock=review_transition_lock,
+                        executor=model_executor,
+                    )
+                    inflight_groups[future] = len(claimed)
+                    reserved += len(claimed)
+
+                if not inflight_groups:
+                    if first_error is not None:
+                        raise first_error
+                    if (
+                        no_more_claims
+                        or stop_modalities.is_set()
+                        or (limit is not None and processed >= limit)
+                    ):
+                        break
+                    continue
+
+                completed = next(
+                    as_completed(tuple(inflight_groups))
+                )
+                reserved -= inflight_groups.pop(completed)
+                try:
+                    processed += completed.result()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    no_more_claims = True
+                    stop_modalities.set()
+
+            if first_error is not None:
+                raise first_error
         snapshot = _job_snapshot(store.path, jobset)
-        modality_complete = _kind_is_complete(
+        modality_complete = _local_kind_is_complete(
             store.path,
             jobset.kind_for(modality),
         )
@@ -3046,11 +3416,89 @@ def run_model_stage(
         finally:
             finished_modalities[modality].set()
 
+    def promote_legacy_deferred_records() -> None:
+        """Finish old Task-6 review handoffs without issuing new reviews.
+
+        Builds interrupted under the former eager policy may contain durable
+        ``review_pending`` rows. Their local model analysis is already present
+        in ``result_json`` and remains useful; query materialization migrates
+        any individually completed reviews into its dedicated cache.
+        """
+        legacy_owner = f"{owner}:legacy-review-promotion"
+        while True:
+            claimed: list[Any] = []
+            for modality in ("text", "image"):
+                remaining = max(0, group_size - len(claimed))
+                if remaining <= 0:
+                    break
+                with review_transition_lock:
+                    newly_claimed = store.claim(
+                        jobset.kind_for(modality),
+                        limit=remaining,
+                        owner=legacy_owner,
+                        lease_seconds=lease_seconds,
+                        pending_statuses=("review_pending",),
+                        lease_status="review_leased",
+                    )
+                    if progress_tracker is not None and newly_claimed:
+                        progress_tracker.claimed(
+                            modality,
+                            len(newly_claimed),
+                        )
+                claimed.extend(newly_claimed)
+            if not claimed:
+                local_finished = all(
+                    event.is_set() for event in finished_modalities.values()
+                )
+                if (
+                    local_finished
+                    and _claimable_remote_review_count(store.path, jobset) == 0
+                ):
+                    return
+                time.sleep(0.05)
+                continue
+
+            with _LeaseHeartbeat(
+                store.path,
+                claimed,
+                owner=legacy_owner,
+                lease_seconds=lease_seconds,
+                interval=heartbeat_seconds,
+                lease_status="review_leased",
+            ) as heartbeat:
+                for job in claimed:
+                    modality = str(job.payload["modality"])
+                    pending_record = (
+                        dict(job.result)
+                        if isinstance(job.result, dict)
+                        else {}
+                    )
+                    status = (
+                        "terminal"
+                        if clean_text(pending_record.get("error"))
+                        else "success"
+                    )
+                    committed = _fenced_commit_model_record(
+                        store.path,
+                        job=job,
+                        expected_kind=job.kind,
+                        payload=job.payload,
+                        record=pending_record,
+                        status=status,
+                        heartbeat=heartbeat,
+                        lease_status="review_leased",
+                        after_cache_write=after_cache_write,
+                        after_result_write=after_result_write,
+                        write_tracker=result_write_tracker,
+                    )
+                    if progress_tracker is not None and committed:
+                        progress_tracker.finished(modality, status)
+
     processed = 0
     if stop_after is None:
         first_error: BaseException | None = None
         with ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=3,
             thread_name_prefix="wdc-model-modality",
         ) as executor:
             futures = {
@@ -3060,9 +3508,14 @@ def run_model_stage(
                 ): modality
                 for modality in ("text", "image")
             }
+            futures[
+                executor.submit(promote_legacy_deferred_records)
+            ] = "legacy-review-promotion"
             for future in as_completed(futures):
                 try:
-                    processed += future.result()
+                    result = future.result()
+                    if result is not None:
+                        processed += result
                 except BaseException as error:
                     stop_modalities.set()
                     if first_error is None:
@@ -3105,8 +3558,12 @@ def run_model_stage(
         image_total=jobset.image_tasks,
         success=snapshot["success"],
         terminal=snapshot["terminal"],
-        pending=snapshot["pending"] + snapshot["retryable"],
-        leased=snapshot["leased"],
+        pending=(
+            snapshot["pending"]
+            + snapshot["retryable"]
+            + snapshot["review_pending"]
+        ),
+        leased=snapshot["leased"] + snapshot["review_leased"],
         complete=False,
         jobset=jobset,
     )
@@ -3677,7 +4134,7 @@ def _model_adapter_parameter_fingerprint(
         sampling_manifest is not None
         and ratio == 0.5
         and text_model_name == "Qwen3.5-9B"
-        and image_model_name == "Qwen3-VL-8B-Thinking"
+        and image_model_name == "Qwen3-VL-8B-Instruct"
     )
     return fingerprint, legacy_safe
 

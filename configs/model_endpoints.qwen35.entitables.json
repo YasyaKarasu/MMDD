@@ -1,0 +1,56 @@
+{
+  "schema_version": "mmdd-model-endpoints-v1",
+  "served_model_name": "Qwen3.5-9B",
+  "endpoints": [
+    {
+      "endpoint_id": "local-4090-text",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 12,
+        "image": 0,
+        "total": 12
+      }
+    },
+    {
+      "endpoint_id": "local-4090-image-primary",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 0,
+        "image": 4,
+        "total": 4
+      }
+    },
+    {
+      "endpoint_id": "local-4090-image-donated",
+      "base_url": "http://127.0.0.1:8002/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 0,
+        "image": 4,
+        "total": 4
+      }
+    },
+    {
+      "endpoint_id": "remote-a100-gpu0",
+      "base_url": "http://127.0.0.1:18000/v1",
+      "pool": "remote",
+      "max_inflight": {
+        "text": 64,
+        "image": 16,
+        "total": 72
+      }
+    },
+    {
+      "endpoint_id": "remote-a100-gpu6",
+      "base_url": "http://127.0.0.1:18001/v1",
+      "pool": "remote",
+      "max_inflight": {
+        "text": 24,
+        "image": 6,
+        "total": 28
+      }
+    }
+  ]
+}

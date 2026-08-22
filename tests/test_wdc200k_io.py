@@ -718,11 +718,15 @@ def test_external_unique_jsonl_keeps_first_record_across_runs(
     )
     output_path = tmp_path / "final" / "unique.jsonl"
 
+    progress: list[dict[str, int | str]] = []
     completed = external_unique_jsonl(
         [first_input, second_input],
         output_path,
         key_fn=lambda record: record["id"],
         chunk_records=2,
+        progress_callback=progress.append,
+        progress_every=2,
+        total_records=5,
     )
 
     output = [
@@ -736,6 +740,16 @@ def test_external_unique_jsonl_keeps_first_record_across_runs(
     ]
     assert completed.records == 3
     assert validate_completed_shard(completed, root=output_path.parent)
+    assert progress == [
+        {"phase": "read_records", "completed": 0, "total": 5},
+        {"phase": "read_records", "completed": 2, "total": 5},
+        {"phase": "read_records", "completed": 4, "total": 5},
+        {"phase": "read_records", "completed": 5, "total": 5},
+        {"phase": "write_records", "completed": 0, "total": 5},
+        {"phase": "write_records", "completed": 2, "total": 5},
+        {"phase": "write_records", "completed": 4, "total": 5},
+        {"phase": "write_records", "completed": 5, "total": 5},
+    ]
 
 
 def test_external_unique_jsonl_bounds_open_runs_by_merge_fan_in(

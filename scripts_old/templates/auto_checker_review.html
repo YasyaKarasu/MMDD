@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>__REVIEW_TITLE__</title>
+  <style>
+    :root {
+      --bg: #f4f2ed;
+      --surface: #fffdf9;
+      --surface-2: #f0ede5;
+      --ink: #20231f;
+      --muted: #686d65;
+      --line: #d8d4ca;
+      --brand: #185c4a;
+      --brand-2: #dcece5;
+      --warn: #9a4c12;
+      --warn-bg: #fff0dc;
+      --danger: #a33131;
+      --ok: #1e6a45;
+      --shadow: 0 16px 36px rgba(40, 43, 38, .09);
+      --radius: 16px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171a17;
+        --surface: #20241f;
+        --surface-2: #2a2f29;
+        --ink: #edf0ea;
+        --muted: #aeb5ab;
+        --line: #3c433b;
+        --brand: #7fd0b0;
+        --brand-2: #264b3e;
+        --warn: #ffbc7c;
+        --warn-bg: #492f1c;
+        --danger: #ff9b9b;
+        --ok: #86d6a9;
+        --shadow: 0 18px 42px rgba(0, 0, 0, .28);
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .shell { max-width: 1500px; margin: 0 auto; padding: 22px; }
+    .topbar {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px;
+      align-items: start; margin-bottom: 18px;
+    }
+    h1 { margin: 0 0 7px; font-size: clamp(24px, 3vw, 36px); letter-spacing: -.035em; }
+    .subtitle { margin: 0; color: var(--muted); line-height: 1.6; }
+    .server-state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #999; }
+    .dot.ok { background: var(--ok); }
+    .dot.pending { background: #d69a2d; }
+    .dot.error { background: var(--danger); }
+    .summary {
+      display: grid; grid-template-columns: repeat(5, minmax(112px, 1fr)); gap: 10px;
+      margin-bottom: 16px;
+    }
+    .metric { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 13px 15px; }
+    .metric strong { display: block; font-size: 23px; letter-spacing: -.03em; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .progress-track { height: 7px; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin-top: 8px; }
+    .progress-fill { height: 100%; width: 0; background: var(--brand); transition: width .2s ease; }
+    .protocol {
+      background: var(--brand-2); border: 1px solid color-mix(in srgb, var(--brand), transparent 60%);
+      border-radius: 14px; padding: 13px 16px; margin-bottom: 16px; line-height: 1.55;
+    }
+    .protocol strong { color: var(--brand); }
+    .workspace { display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .sidebar, .review-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+    .sidebar { position: sticky; top: 14px; overflow: hidden; }
+    .filters { padding: 14px; border-bottom: 1px solid var(--line); display: grid; gap: 9px; }
+    .input, select, textarea {
+      width: 100%; color: var(--ink); background: var(--surface); border: 1px solid var(--line);
+      border-radius: 9px; padding: 9px 10px; outline: none;
+    }
+    .input:focus, select:focus, textarea:focus { border-color: var(--brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand), transparent 80%); }
+    .filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .item-list { max-height: calc(100vh - 280px); overflow: auto; padding: 8px; }
+    .item-button {
+      width: 100%; text-align: left; border: 1px solid transparent; background: transparent;
+      color: var(--ink); border-radius: 10px; padding: 10px; display: grid; grid-template-columns: 30px 1fr auto;
+      gap: 8px; align-items: start;
+    }
+    .item-button:hover { background: var(--surface-2); }
+    .item-button.active { background: var(--brand-2); border-color: var(--brand); }
+    .item-index { color: var(--muted); font-size: 12px; padding-top: 2px; }
+    .item-main { min-width: 0; }
+    .item-attribute { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item-entity { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+    .status-mark { width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; background: var(--line); }
+    .status-mark.locked { background: #d69a2d; }
+    .status-mark.done { background: var(--ok); }
+    .review-card { overflow: hidden; }
+    .card-head { padding: 18px 20px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; }
+    .eyebrow { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    h2 { margin: 3px 0 0; font-size: 24px; overflow-wrap: anywhere; }
+    .badges { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+    .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 5px 9px; background: var(--surface-2); color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .badge.brand { background: var(--brand-2); color: var(--brand); }
+    .section { padding: 18px 20px; border-bottom: 1px solid var(--line); }
+    .section:last-child { border-bottom: 0; }
+    .section h3 { margin: 0 0 12px; font-size: 16px; }
+    .claim-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .claim-box { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--surface-2); }
+    .claim-box span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .claim-box strong { font-size: 17px; overflow-wrap: anywhere; }
+    .row-context { overflow-x: auto; margin-top: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 8px; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    tr.entity-row td { background: var(--brand-2); }
+    .evidence-text { margin: 0; white-space: pre-wrap; line-height: 1.75; font-family: inherit; font-size: 15px; background: var(--surface-2); border-radius: 12px; padding: 16px; max-height: 520px; overflow: auto; }
+    .image-wrap { background: #111; border-radius: 12px; padding: 10px; text-align: center; }
+    .image-wrap img { display: block; max-width: 100%; max-height: 720px; margin: auto; object-fit: contain; border-radius: 7px; }
+    .image-link { display: inline-block; color: var(--brand); margin-top: 9px; }
+    .verdicts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .verdict-button { border: 1px solid var(--line); border-radius: 11px; background: var(--surface); color: var(--ink); padding: 12px 8px; font-weight: 700; }
+    .verdict-button:hover:not(:disabled) { border-color: var(--brand); }
+    .verdict-button.selected { border-color: var(--brand); background: var(--brand-2); color: var(--brand); }
+    .verdict-button:disabled { cursor: not-allowed; opacity: .72; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    label span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+    textarea { min-height: 90px; resize: vertical; }
+    .full { grid-column: 1 / -1; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .btn { border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 9px; padding: 9px 13px; font-weight: 650; }
+    .btn:hover:not(:disabled) { border-color: var(--brand); }
+    .btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+    @media (prefers-color-scheme: dark) { .btn.primary { color: #10251d; } }
+    .btn.danger { color: var(--danger); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .blind-note { color: var(--muted); font-size: 13px; margin: 9px 0 0; }
+    .model-panel { background: var(--warn-bg); }
+    .model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .model-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+    .model-card h4 { margin: 0 0 10px; }
+    .model-line { display: grid; grid-template-columns: 115px 1fr; gap: 8px; margin: 7px 0; }
+    .model-line span { color: var(--muted); }
+    .assessment { margin-top: 12px; padding: 11px; border-radius: 10px; background: var(--surface-2); line-height: 1.5; }
+    .footer-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .reviewer { min-width: 210px; }
+    .empty { padding: 32px; color: var(--muted); text-align: center; }
+    .shortcut { margin-left: auto; color: var(--muted); font-size: 12px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 950px) {
+      .shell { padding: 12px; }
+      .topbar { grid-template-columns: 1fr; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      .workspace { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      .item-list { max-height: 270px; }
+      .verdicts { grid-template-columns: 1fr 1fr; }
+      .model-grid, .claim-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <h1>__REVIEW_TITLE__</h1>
+        <p class="subtitle">54 条正例候选盲审：先根据原始证据提交人工判断，再揭示 Terra 与 Luna 的结果。</p>
+      </div>
+      <div class="server-state"><span id="server-dot" class="dot pending"></span><span id="server-text">正在连接保存服务…</span></div>
+    </header>
+
+    <section class="summary" aria-label="审核概览">
+      <div class="metric"><strong id="metric-total">0</strong><span>全部候选</span></div>
+      <div class="metric"><strong id="metric-done">0</strong><span>已完成</span><div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div></div>
+      <div class="metric"><strong id="metric-left">0</strong><span>待审核</span></div>
+      <div class="metric"><strong id="metric-text">0</strong><span>文本证据</span></div>
+      <div class="metric"><strong id="metric-image">0</strong><span>图片证据</span></div>
+    </section>
+
+    <section class="protocol">
+      <strong>严格标准：</strong>只有证据明确把 claimed value 与目标实体的目标属性联系起来，才判 <code>supported</code>；同一属性明确出现不同值才判 <code>contradicted</code>；不能可靠判断则判 <code>insufficient</code>；属性名或表格语义本身不可解释则判 <code>schema_bad</code>。
+    </section>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="filters">
+          <input id="search" class="input" type="search" placeholder="搜索实体、属性或 asset ID">
+          <div class="filter-row">
+            <select id="status-filter" aria-label="审核状态">
+              <option value="all">全部状态</option>
+              <option value="pending">待审核</option>
+              <option value="completed">已完成</option>
+              <option value="locked">已锁定未完成</option>
+            </select>
+            <select id="type-filter" aria-label="证据类型">
+              <option value="all">全部证据</option>
+              <option value="text">文本</option>
+              <option value="image">图片</option>
+            </select>
+          </div>
+        </div>
+        <nav id="item-list" class="item-list" aria-label="审核样本"></nav>
+      </aside>
+
+      <main id="review-card" class="review-card">
+        <div id="empty-state" class="empty" hidden>当前筛选下没有样本。</div>
+        <div id="review-content">
+          <header class="card-head">
+            <div><div id="item-position" class="eyebrow"></div><h2 id="item-title"></h2></div>
+            <div class="badges"><span id="type-badge" class="badge brand"></span><span id="state-badge" class="badge"></span></div>
+          </header>
+
+          <section class="section">
+            <h3>待验证声明</h3>
+            <div class="claim-grid">
+              <div class="claim-box"><span>目标属性</span><strong id="attribute-name"></strong></div>
+              <div class="claim-box"><span>Claimed value</span><strong id="claimed-value"></strong></div>
+            </div>
+            <div class="row-context">
+              <table><thead><tr><th>字段</th><th>源表值</th><th>角色</th></tr></thead><tbody id="row-context"></tbody></table>
+            </div>
+          </section>
+
+          <section class="section">
+            <h3>原始证据</h3>
+            <pre id="text-evidence" class="evidence-text"></pre>
+            <div id="image-evidence" class="image-wrap" hidden>
+              <a id="image-open" target="_blank" rel="noopener"><img id="evidence-image" alt="待审核的原始图片证据"></a>
+              <a id="image-link" class="image-link" target="_blank" rel="noopener">在新窗口打开原图</a>
+            </div>
+          </section>
+
+          <section class="section">
+            <h3>人工判断</h3>
+            <div id="verdicts" class="verdicts">
+              <button class="verdict-button" data-verdict="supported">1 · Supported</button>
+              <button class="verdict-button" data-verdict="contradicted">2 · Contradicted</button>
+              <button class="verdict-button" data-verdict="insufficient">3 · Insufficient</button>
+              <button class="verdict-button" data-verdict="schema_bad">4 · Schema bad</button>
+            </div>
+            <div class="form-grid">
+              <label><span>人工确认值（可选）</span><input id="human-value" class="input" placeholder="若证据中有明确值，可填写"></label>
+              <label><span>置信度</span><select id="confidence"><option value="">请选择</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
+              <label class="full"><span>问题类型（揭示模型后可补充）</span><select id="issue-type"><option value="">无 / 未判断</option><option value="model_false_positive">模型误保留</option><option value="model_false_negative">模型漏保留</option><option value="normalization">格式或归一化差异</option><option value="attribute_ambiguous">属性语义含糊</option><option value="evidence_ambiguous">证据本身含糊</option><option value="entity_mismatch">实体关联错误</option><option value="other">其他</option></select></label>
+              <label class="full"><span>备注</span><textarea id="notes" placeholder="记录判断依据、证据位置或异常原因"></textarea></label>
+            </div>
+            <div class="actions">
+              <button id="lock-button" class="btn primary">锁定人工判断并揭示模型</button>
+              <button id="unlock-button" class="btn" hidden>修改人工判断</button>
+              <button id="reset-button" class="btn danger">清空本条</button>
+            </div>
+            <p id="blind-note" class="blind-note">选择人工 verdict 后才能查看模型结果。页面源数据仍包含模型字段，因此这是防止无意锚定的工作流，不是密码学盲法。</p>
+          </section>
+
+          <section id="model-panel" class="section model-panel" hidden>
+            <h3>模型结果（人工判断已锁定）</h3>
+            <div class="model-grid">
+              <article class="model-card"><h4>Terra</h4><div class="model-line"><span>抽取值</span><strong id="terra-value"></strong></div><div class="model-line"><span>Verdict</span><strong id="terra-verdict"></strong></div></article>
+              <article class="model-card"><h4>Luna</h4><div class="model-line"><span>抽取值</span><strong id="luna-value"></strong></div><div class="model-line"><span>Verdict</span><strong id="luna-verdict"></strong></div></article>
+            </div>
+            <div id="assessment" class="assessment"></div>
+            <div class="actions"><button id="complete-button" class="btn primary">完成本条并进入下一条</button></div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <section class="section" style="margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)">
+      <h3>保存与交接</h3>
+      <div class="footer-actions">
+        <input id="reviewer" class="input reviewer" placeholder="审核人姓名或标识">
+        <button id="save-button" class="btn primary">立即保存到服务器</button>
+        <button id="export-button" class="btn">导出 JSONL</button>
+        <label class="btn" for="import-file">导入 JSONL</label><input id="import-file" type="file" accept=".jsonl,.json" hidden>
+        <span class="shortcut">快捷键：1–4 选择，←/→ 切换样本</span>
+      </div>
+    </section>
+  </div>
+
+  <script id="review-data" type="application/json">__REVIEW_DATA__</script>
+  <script>
+    (() => {
+      'use strict';
+      const data = JSON.parse(document.getElementById('review-data').textContent);
+      const items = data.items;
+      const byId = new Map(items.map(item => [item.review_id, item]));
+      const storageKey = `mmdd-review:${data.dataset_id}`;
+      let state = { dataset_id: data.dataset_id, reviewer: '', reviews: {} };
+      let currentId = items[0]?.review_id || '';
+      let saveTimer = null;
+
+      const $ = id => document.getElementById(id);
+      const now = () => new Date().toISOString();
+      const blankReview = () => ({ human_verdict:'', human_value:'', confidence:'', issue_type:'', notes:'', locked:false, completed:false, updated_at:'' });
+      const reviewFor = id => state.reviews[id] || blankReview();
+
+      function loadLocal() {
+        try {
+          const parsed = JSON.parse(localStorage.getItem(storageKey) || 'null');
+          if (parsed && parsed.dataset_id === data.dataset_id && parsed.reviews) state = parsed;
+        } catch (_) { /* Keep a clean local state. */ }
+      }
+
+      function mergeServer(remote) {
+        if (!remote || remote.dataset_id !== data.dataset_id || !remote.reviews) return;
+        if (!state.reviewer && remote.reviewer) state.reviewer = remote.reviewer;
+        for (const [id, incoming] of Object.entries(remote.reviews)) {
+          if (!byId.has(id)) continue;
+          const local = state.reviews[id];
+          if (!local || String(incoming.updated_at || '') > String(local.updated_at || '')) state.reviews[id] = incoming;
+        }
+      }
+
+      function setServerStatus(kind, text) {
+        $('server-dot').className = `dot ${kind}`;
+        $('server-text').textContent = text;
+      }
+
+      function persistLocal() {
+        localStorage.setItem(storageKey, JSON.stringify(state));
+      }
+
+      async function saveServer() {
+        clearTimeout(saveTimer);
+        setServerStatus('pending', '正在保存…');
+        try {
+          const response = await fetch('/api/reviews', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(state),
+          });
+          if (!response.ok) throw new Error('save failed');
+          const result = await response.json();
+          setServerStatus('ok', `已保存 · ${new Date(result.saved_at).toLocaleTimeString()}`);
+        } catch (_) {
+          setServerStatus('error', '服务器保存失败；浏览器本地副本仍在');
+        }
+      }
+
+      function scheduleSave() {
+        persistLocal();
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveServer, 650);
+      }
+
+      function updateReview(id, patch) {
+        state.reviews[id] = { ...reviewFor(id), ...patch, updated_at: now() };
+        scheduleSave();
+        renderSummary();
+        renderList();
+      }
+
+      function visibleItems() {
+        const query = $('search').value.trim().toLocaleLowerCase();
+        const status = $('status-filter').value;
+        const type = $('type-filter').value;
+        return items.filter(item => {
+          const review = reviewFor(item.review_id);
+          const text = `${item.entity_text} ${item.entity_wiki_title} ${item.attribute_name} ${item.asset_id}`.toLocaleLowerCase();
+          if (query && !text.includes(query)) return false;
+          if (type !== 'all' && item.asset_type !== type) return false;
+          if (status === 'completed' && !review.completed) return false;
+          if (status === 'pending' && (review.completed || review.locked)) return false;
+          if (status === 'locked' && (!review.locked || review.completed)) return false;
+          return true;
+        });
+      }
+
+      function renderSummary() {
+        const completed = items.filter(item => reviewFor(item.review_id).completed).length;
+        $('metric-total').textContent = items.length;
+        $('metric-done').textContent = completed;
+        $('metric-left').textContent = items.length - completed;
+        $('metric-text').textContent = items.filter(item => item.asset_type === 'text').length;
+        $('metric-image').textContent = items.filter(item => item.asset_type === 'image').length;
+        $('progress-fill').style.width = `${items.length ? completed / items.length * 100 : 0}%`;
+      }
+
+      function renderList() {
+        const list = $('item-list');
+        list.replaceChildren();
+        const visible = visibleItems();
+        if (visible.length && !visible.some(item => item.review_id === currentId)) currentId = visible[0].review_id;
+        visible.forEach(item => {
+          const review = reviewFor(item.review_id);
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = `item-button${item.review_id === currentId ? ' active' : ''}`;
+          button.addEventListener('click', () => { currentId = item.review_id; renderAll(); });
+          const index = document.createElement('span');
+          index.className = 'item-index';
+          index.textContent = String(items.indexOf(item) + 1).padStart(2, '0');
+          const main = document.createElement('span');
+          main.className = 'item-main';
+          const attr = document.createElement('div');
+          attr.className = 'item-attribute'; attr.textContent = item.attribute_name;
+          const entity = document.createElement('div');
+          entity.className = 'item-entity'; entity.textContent = `${item.asset_type === 'image' ? '图片' : '文本'} · ${item.entity_text || item.entity_wiki_title}`;
+          main.append(attr, entity);
+          const mark = document.createElement('span');
+          mark.className = `status-mark${review.completed ? ' done' : review.locked ? ' locked' : ''}`;
+          button.append(index, main, mark);
+          list.appendChild(button);
+        });
+        $('empty-state').hidden = visible.length > 0;
+        $('review-content').hidden = visible.length === 0;
+      }
+
+      function setControlValues(review) {
+        document.querySelectorAll('[data-verdict]').forEach(button => {
+          button.classList.toggle('selected', button.dataset.verdict === review.human_verdict);
+          button.disabled = review.locked;
+        });
+        $('human-value').value = review.human_value || '';
+        $('confidence').value = review.confidence || '';
+        $('issue-type').value = review.issue_type || '';
+        $('notes').value = review.notes || '';
+        $('human-value').disabled = review.locked;
+        $('confidence').disabled = review.locked;
+        $('lock-button').hidden = review.locked;
+        $('unlock-button').hidden = !review.locked;
+        $('model-panel').hidden = !review.locked;
+      }
+
+      function keepDropAssessment(item, review) {
+        if (review.human_verdict === 'schema_bad') return '该条被标记为 schema_bad，应从模型胜负统计中排除。';
+        const humanKeeps = review.human_verdict === 'supported';
+        const terraCorrect = (item.terra.verdict === 'supported') === humanKeeps;
+        const lunaCorrect = (item.luna.verdict === 'supported') === humanKeeps;
+        const winner = terraCorrect && lunaCorrect ? '两者 keep/drop 都正确' : terraCorrect ? 'Terra 的 keep/drop 正确' : lunaCorrect ? 'Luna 的 keep/drop 正确' : '两者 keep/drop 都错误';
+        const group = item.comparison_group === 'support_disagreement' ? '这是一条 supported 分歧样本。' : '这是一条双方共同 supported 的样本。';
+        return `${group} ${winner}。`;
+      }
+
+      function renderItem() {
+        const item = byId.get(currentId);
+        if (!item) return;
+        const review = reviewFor(currentId);
+        $('item-position').textContent = `样本 ${items.indexOf(item) + 1} / ${items.length} · ${item.asset_id}`;
+        $('item-title').textContent = item.entity_text || item.entity_wiki_title || item.asset_id;
+        $('type-badge').textContent = item.asset_type === 'image' ? '图片证据' : '文本证据';
+        $('state-badge').textContent = review.completed ? '已完成' : review.locked ? '已锁定' : '待判断';
+        $('attribute-name').textContent = item.attribute_name;
+        $('claimed-value').textContent = item.claimed_value || '（空）';
+
+        const body = $('row-context'); body.replaceChildren();
+        item.row_attributes.forEach(field => {
+          const row = document.createElement('tr');
+          if (field.is_entity) row.className = 'entity-row';
+          [field.name, field.value, field.is_entity ? '实体列' : '属性列'].forEach(text => {
+            const cell = document.createElement('td'); cell.textContent = text; row.appendChild(cell);
+          });
+          body.appendChild(row);
+        });
+
+        const isImage = item.evidence.kind === 'image';
+        $('text-evidence').hidden = isImage;
+        $('image-evidence').hidden = !isImage;
+        if (isImage) {
+          $('evidence-image').src = item.evidence.url;
+          $('image-open').href = item.evidence.url;
+          $('image-link').href = item.evidence.url;
+        } else {
+          $('evidence-image').removeAttribute('src');
+          $('text-evidence').textContent = item.evidence.text;
+        }
+        setControlValues(review);
+        if (review.locked) {
+          $('terra-value').textContent = item.terra.extracted_value || '（未抽取）';
+          $('terra-verdict').textContent = item.terra.verdict;
+          $('luna-value').textContent = item.luna.extracted_value || '（未抽取）';
+          $('luna-verdict').textContent = item.luna.verdict;
+          $('assessment').textContent = keepDropAssessment(item, review);
+          $('complete-button').textContent = review.completed ? '已完成 · 进入下一条' : '完成本条并进入下一条';
+        }
+      }
+
+      function renderAll() { renderSummary(); renderList(); renderItem(); $('reviewer').value = state.reviewer || ''; }
+
+      function move(delta, preferPending = false) {
+        const visible = visibleItems();
+        if (!visible.length) return;
+        if (preferPending) {
+          const next = items.find(item => !reviewFor(item.review_id).completed);
+          if (next) currentId = next.review_id;
+          else currentId = visible[0].review_id;
+        } else {
+          const index = Math.max(0, visible.findIndex(item => item.review_id === currentId));
+          currentId = visible[(index + delta + visible.length) % visible.length].review_id;
+        }
+        renderAll();
+        window.scrollTo({top:0, behavior:'smooth'});
+      }
+
+      function exportRows() {
+        return items.flatMap(item => {
+          const review = state.reviews[item.review_id];
+          if (!review || !review.human_verdict) return [];
+          return [{
+            schema_version: 'mmdd-auto-check-human-label-v1', dataset_id: data.dataset_id,
+            review_id: item.review_id, cache_key: item.cache_key, asset_id: item.asset_id,
+            asset_type: item.asset_type, entity_text: item.entity_text,
+            attribute_name: item.attribute_name, claimed_value: item.claimed_value,
+            comparison_group: item.comparison_group,
+            human_verdict: review.human_verdict, human_value: review.human_value,
+            confidence: review.confidence, issue_type: review.issue_type, notes: review.notes,
+            completed: review.completed, reviewer: state.reviewer, reviewed_at: review.updated_at,
+            terra_extracted_value: item.terra.extracted_value, terra_verdict: item.terra.verdict,
+            luna_extracted_value: item.luna.extracted_value, luna_verdict: item.luna.verdict,
+          }];
+        });
+      }
+
+      document.querySelectorAll('[data-verdict]').forEach(button => button.addEventListener('click', () => {
+        if (!reviewFor(currentId).locked) updateReview(currentId, {human_verdict:button.dataset.verdict, completed:false});
+        renderItem();
+      }));
+      const reviewFieldKeys = {'human-value':'human_value', confidence:'confidence', 'issue-type':'issue_type', notes:'notes'};
+      Object.entries(reviewFieldKeys).forEach(([id, key]) => $(id).addEventListener('change', () => {
+        updateReview(currentId, {[key]:$(id).value, completed:false});
+      }));
+      $('notes').addEventListener('input', () => {
+        updateReview(currentId, {notes:$('notes').value, completed:false});
+      });
+      $('human-value').addEventListener('input', () => {
+        updateReview(currentId, {human_value:$('human-value').value, completed:false});
+      });
+      $('lock-button').addEventListener('click', () => {
+        const review = reviewFor(currentId);
+        if (!review.human_verdict) { alert('请先选择人工 verdict。'); return; }
+        updateReview(currentId, {locked:true, completed:false}); renderItem();
+      });
+      $('unlock-button').addEventListener('click', () => {
+        if (!confirm('修改后需要重新锁定并完成本条，继续吗？')) return;
+        updateReview(currentId, {locked:false, completed:false}); renderItem();
+      });
+      $('complete-button').addEventListener('click', () => {
+        updateReview(currentId, {completed:true, locked:true}); move(1, true);
+      });
+      $('reset-button').addEventListener('click', () => {
+        if (!confirm('确定清空当前样本的人工判断吗？')) return;
+        delete state.reviews[currentId]; scheduleSave(); renderAll();
+      });
+      ['search','status-filter','type-filter'].forEach(id => $(id).addEventListener(id === 'search' ? 'input' : 'change', renderAll));
+      $('reviewer').addEventListener('input', () => { state.reviewer = $('reviewer').value; scheduleSave(); });
+      $('save-button').addEventListener('click', saveServer);
+      $('export-button').addEventListener('click', () => {
+        const rows = exportRows();
+        const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : '')], {type:'application/x-ndjson'});
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
+        link.download = `human_labels_${data.dataset_id}.jsonl`; link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      });
+      $('import-file').addEventListener('change', async event => {
+        const file = event.target.files[0]; if (!file) return;
+        try {
+          const imported = file.name.endsWith('.json') ? JSON.parse(await file.text()) : (await file.text()).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+          const rows = Array.isArray(imported) ? imported : Object.entries(imported.reviews || {}).map(([review_id, review]) => ({review_id, ...review}));
+          let count = 0;
+          for (const row of rows) {
+            const id = row.review_id; if (!byId.has(id)) continue;
+            state.reviews[id] = {
+              human_verdict: row.human_verdict || '', human_value: row.human_value || '',
+              confidence: row.confidence || '', issue_type: row.issue_type || '', notes: row.notes || '',
+              locked: Boolean(row.locked ?? row.human_verdict), completed: Boolean(row.completed),
+              updated_at: row.reviewed_at || row.updated_at || now(),
+            }; count++;
+          }
+          scheduleSave(); renderAll(); alert(`已导入 ${count} 条审核记录。`);
+        } catch (_) { alert('导入失败：文件不是有效的审核 JSON/JSONL。'); }
+        event.target.value = '';
+      });
+      document.addEventListener('keydown', event => {
+        if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || '')) return;
+        if (event.key === 'ArrowLeft') move(-1);
+        if (event.key === 'ArrowRight') move(1);
+        if ('1234'.includes(event.key) && !reviewFor(currentId).locked) {
+          const verdict = ['supported','contradicted','insufficient','schema_bad'][Number(event.key)-1];
+          updateReview(currentId, {human_verdict:verdict, completed:false}); renderItem();
+        }
+      });
+
+      async function initialize() {
+        loadLocal(); renderAll();
+        try {
+          const response = await fetch('/api/reviews', {cache:'no-store'});
+          if (!response.ok) throw new Error('load failed');
+          mergeServer(await response.json()); persistLocal(); renderAll();
+          setServerStatus('ok', '已连接 · 自动保存开启');
+        } catch (_) {
+          setServerStatus('error', '未连接保存服务；当前仅保存在浏览器');
+        }
+      }
+      initialize();
+    })();
+  </script>
+</body>
+</html>

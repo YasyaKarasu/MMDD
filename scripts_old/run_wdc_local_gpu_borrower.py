@@ -670,7 +670,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--text_gpu", default="1")
     parser.add_argument("--text_port", type=int, default=18101)
     parser.add_argument("--image_model_path", required=True)
-    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Instruct")
     parser.add_argument("--image_gpu", default="0")
     parser.add_argument("--image_port", type=int, default=18100)
     parser.add_argument("--secondary_image_port", type=int, default=18102)

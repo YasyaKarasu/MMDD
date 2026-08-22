@@ -1,0 +1,26 @@
+{
+  "schema_version": "mmdd-model-endpoints-v1",
+  "served_model_name": "Qwen3.5-9B",
+  "endpoints": [
+    {
+      "endpoint_id": "remote-a100-gpu0-via-tunnel",
+      "base_url": "http://127.0.0.1:18000/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 104,
+        "image": 32,
+        "total": 128
+      }
+    },
+    {
+      "endpoint_id": "remote-a100-gpu6-via-tunnel",
+      "base_url": "http://127.0.0.1:18001/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 56,
+        "image": 16,
+        "total": 64
+      }
+    }
+  ]
+}

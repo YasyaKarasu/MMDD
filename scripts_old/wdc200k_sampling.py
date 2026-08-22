@@ -6,9 +6,9 @@ import hashlib
 import json
 import os
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import build_mm_joinability_dataset as join_builder
 from stage1_io import clean_text, stable_hash
@@ -24,6 +24,12 @@ from wdc200k_structural import _normalize_http_url
 
 
 SAMPLING_SCHEMA_VERSION = "wdc200k-entity-sampling-v1"
+
+
+_SOURCE_AUTHORITY_VALIDATION_CACHE: dict[
+    tuple[Any, ...], SamplingSourceAuthority
+] = {}
+_SOURCE_AUTHORITY_VALIDATION_CACHE_LIMIT = 8
 ARTIFACTS = (
     "sampled_entities",
     "sampled_page_refs",
@@ -437,7 +443,8 @@ def validate_sampling_source_authority(
     *,
     structural_output_root: Path,
 ) -> SamplingSourceAuthority:
-    payload = json.loads(Path(sampling_manifest).read_text(encoding="utf-8"))
+    sampling_manifest = Path(sampling_manifest).resolve()
+    payload = json.loads(sampling_manifest.read_text(encoding="utf-8"))
     authority = payload.get("compact_source_authority")
     if (
         payload.get("stage") != "wdc200k_entity_sampling"
@@ -451,6 +458,7 @@ def validate_sampling_source_authority(
     root = Path(structural_output_root).resolve()
     if authority.get("structural_output_root") != root.as_posix():
         raise ValueError("sampling compact source root mismatch")
+    completed_sources: list[CompletedShard] = []
     source_paths: list[Path] = []
     total = 0
     for raw in authority.get("source_table_shards") or []:
@@ -460,10 +468,9 @@ def validate_sampling_source_authority(
             bytes=int(raw["bytes"]),
             sha256=str(raw["sha256"]),
         )
-        if not completed.path.startswith("source_tables/") or not validate_completed_shard(
-            completed, root
-        ):
+        if not completed.path.startswith("source_tables/"):
             raise ValueError("sampling compact source shard validation failed")
+        completed_sources.append(completed)
         source_paths.append(root / completed.path)
         total += completed.records
     if not source_paths or total != int(authority.get("source_tables", -1)):
@@ -475,13 +482,52 @@ def validate_sampling_source_authority(
     )
     if len(manifests) != len(source_paths):
         raise ValueError("sampling compact source manifest count mismatch")
+    try:
+        cache_key = (
+            sampling_manifest.as_posix(),
+            sampling_manifest.stat().st_size,
+            sampling_manifest.stat().st_mtime_ns,
+            root.as_posix(),
+            tuple(
+                (
+                    completed.path,
+                    completed.records,
+                    completed.bytes,
+                    completed.sha256,
+                    path.stat().st_dev,
+                    path.stat().st_ino,
+                    path.stat().st_size,
+                    path.stat().st_mtime_ns,
+                )
+                for completed, path in zip(completed_sources, source_paths)
+            ),
+            tuple(
+                (
+                    path.as_posix(),
+                    str(record["sha256"]),
+                    path.stat().st_dev,
+                    path.stat().st_ino,
+                    path.stat().st_size,
+                    path.stat().st_mtime_ns,
+                )
+                for path, record in zip(manifests, manifest_records)
+            ),
+        )
+    except OSError as error:
+        raise ValueError("sampling compact source authority is missing") from error
+    cached = _SOURCE_AUTHORITY_VALIDATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    for completed in completed_sources:
+        if not validate_completed_shard(completed, root):
+            raise ValueError("sampling compact source shard validation failed")
     for manifest_path, record in zip(manifests, manifest_records):
         if (
             not manifest_path.is_file()
             or _sha256_path(manifest_path) != str(record["sha256"])
         ):
             raise ValueError("sampling compact structural manifest checksum mismatch")
-    return SamplingSourceAuthority(
+    result = SamplingSourceAuthority(
         source_tables=tuple(source_paths),
         source_tables_count=total,
         structural_manifests=manifests,
@@ -489,6 +535,14 @@ def validate_sampling_source_authority(
             str(item["sha256"]) for item in manifest_records
         ),
     )
+    if len(_SOURCE_AUTHORITY_VALIDATION_CACHE) >= (
+        _SOURCE_AUTHORITY_VALIDATION_CACHE_LIMIT
+    ):
+        _SOURCE_AUTHORITY_VALIDATION_CACHE.pop(
+            next(iter(_SOURCE_AUTHORITY_VALIDATION_CACHE))
+        )
+    _SOURCE_AUTHORITY_VALIDATION_CACHE[cache_key] = result
+    return result
 
 
 def _relative_completed(completed: CompletedShard, path: Path, root: Path) -> CompletedShard:
@@ -771,6 +825,8 @@ def sample_structural_artifacts(
     structural_manifests: Sequence[Path],
     output_root: Path,
     policy: SamplingPolicy,
+    per_table_entity_limits: Mapping[str, int] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> SamplingResult:
     """Stream completed structural shards into durable sampled artifacts."""
@@ -779,6 +835,34 @@ def sample_structural_artifacts(
     manifests = tuple(sorted(Path(path).resolve() for path in structural_manifests))
     if not manifests:
         raise ValueError("sampling requires structural manifests")
+    total_manifests = len(manifests)
+
+    def report(completed: int, *, resumed: bool = False) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "sample_structural_shards",
+                    "completed": completed,
+                    "total": total_manifests,
+                    "resumed": resumed,
+                }
+            )
+
+    report(0)
+    table_limits = {
+        str(table_id): int(limit)
+        for table_id, limit in (per_table_entity_limits or {}).items()
+    }
+    if any(limit < policy.sampled_entities_per_table for limit in table_limits.values()):
+        raise ValueError(
+            "per-table entity limits cannot be below the initial sample cap"
+        )
+    limits_fingerprint = stable_hash(
+        SAMPLING_SCHEMA_VERSION,
+        "per-table-entity-limits-v1",
+        json.dumps(table_limits, sort_keys=True, separators=(",", ":")),
+        length=40,
+    )
     fingerprint = StageFingerprint(
         stage="wdc200k_entity_sampling",
         input_fingerprint=stable_hash(
@@ -787,7 +871,10 @@ def sample_structural_artifacts(
             length=40,
         ),
         parameter_fingerprint=stable_hash(
-            SAMPLING_SCHEMA_VERSION, json.dumps(asdict(policy), sort_keys=True), length=40
+            SAMPLING_SCHEMA_VERSION,
+            json.dumps(asdict(policy), sort_keys=True),
+            limits_fingerprint,
+            length=40,
         ),
         schema_version=SAMPLING_SCHEMA_VERSION,
     )
@@ -820,6 +907,7 @@ def sample_structural_artifacts(
             manifest.path,
             structural_output_root=structural_output_root,
         )
+        report(total_manifests, resumed=True)
         return completed_result
     try:
         for index, structural_manifest in enumerate(manifests):
@@ -848,6 +936,7 @@ def sample_structural_artifacts(
                     + ", ".join(invalid_recorded)
                 )
             if len(reusable) == len(ARTIFACTS):
+                report(index + 1, resumed=True)
                 continue
             inputs = _manifest_artifacts(structural_manifest, structural_output_root)
             entities_by_table: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -871,12 +960,22 @@ def sample_structural_artifacts(
             try:
                 for source_table in _iter_jsonl(inputs["source_tables"]):
                     table_id = str(source_table["source_table_id"])
+                    table_policy = policy
+                    table_limit = table_limits.get(table_id)
+                    if table_limit is not None:
+                        table_policy = replace(
+                            policy,
+                            sampled_entities_per_table=table_limit,
+                        )
                     sampled, decision = sample_table_entities(
                         source_table,
                         entities_by_table.get(table_id, ()),
                         pages_by_table.get(table_id, ()),
                         images_by_table.get(table_id, ()),
-                        policy,
+                        table_policy,
+                    )
+                    decision["sample_limit"] = (
+                        table_policy.sampled_entities_per_table
                     )
                     if "prefilter_tables" in writers:
                         writers["prefilter_tables"].write(decision)
@@ -923,6 +1022,7 @@ def sample_structural_artifacts(
                     committed.append(_relative_completed(completed, path, output_root))
                 for completed in committed:
                     manifest.record_shard(completed)
+                report(index + 1)
             except BaseException:
                 for writer in writers.values():
                     writer.abort()

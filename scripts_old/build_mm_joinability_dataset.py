@@ -70,6 +70,11 @@ from build_mm_table_dataset import (
 from image_preprocessing import target_size
 import gpu_priority_protocol as gpu_priority
 import model_marker_protocol as model_markers
+from model_endpoint_pool import (
+    EndpointPoolUnavailableError,
+    ModelEndpointScheduler,
+    load_model_endpoint_config,
+)
 from remote_vllm_layout import (
     ControllerConfig as RemoteLayoutControllerConfig,
     EndpointConfig as RemoteLayoutEndpointConfig,
@@ -97,6 +102,24 @@ from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 
 
 PROMPT_VERSION = "entity_attribute_extraction_v5_batched_leave_one_out"
+MODEL_AUTO_CHECK_SCHEMA_VERSION = (
+    "model-output-auto-check-v3-contextual-equivalence-canonical-value"
+)
+QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION = (
+    "query-recovery-remote-evidence-v1"
+)
+DEFAULT_AUTO_CHECK_LUNA_MODEL = "gpt-5.6-luna"
+DEFAULT_AUTO_CHECK_TERRA_MODEL = "gpt-5.6-terra"
+DEFAULT_AUTO_CHECK_API_CONFIG_FILE = Path(".auto_check_apis.json")
+# Compatibility name: the first OpenAI fallback is now Luna.
+DEFAULT_AUTO_CHECK_OPENAI_MODEL = DEFAULT_AUTO_CHECK_LUNA_MODEL
+DEFAULT_AUTO_CHECK_OPENAI_BASE_URL = "https://api.openai.com/v1"
+MAX_AUTO_CHECK_OPENAI_CONCURRENCY = 5
+DEFAULT_AUTO_CHECK_PROFILE_MAX_CONCURRENCY = 20
+AUTO_CHECK_PROFILE_INITIAL_CONCURRENCY = 5
+AUTO_CHECK_PROFILE_SUCCESSES_PER_INCREASE = 20
+AUTO_CHECK_PROFILE_FAILURE_COOLDOWN_SECONDS = 30.0
+AUTO_CHECK_PROFILE_MAX_FAILURE_COOLDOWN_SECONDS = 300.0
 DEFAULT_SHARED_CACHE_DIR = Path("cache") / "mm_joinability"
 DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS = 262_144
 DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
@@ -108,6 +131,7 @@ EXPLICIT_JOIN_FALLBACK_MODES = (
     "ratio",
     "match_implicit",
 )
+SOURCE_SAMPLE_CHECKPOINT_VERSION = "entitables-source-sample-v1"
 _MODEL_ERROR_LOG_LOCK = threading.Lock()
 
 
@@ -211,11 +235,389 @@ class CandidateEvaluationContext:
     progress: ModelAnalysisProgress | None
     concurrency_state: ModelConcurrencyState
     registry: CandidateMaterialRegistry
+    query_auto_check_cache: ExtractionCache | None = None
     max_entities: int | None = None
     eligible_entity_ids: set[str] = dataclass_field(default_factory=set)
     entity_imageinfo_keys: dict[str, set[str]] = dataclass_field(default_factory=dict)
     text_task_count: int = 0
     image_task_count: int = 0
+
+
+@dataclass(frozen=True)
+class QueryRecoveryCandidate:
+    task: ExtractionTask
+    extraction: dict[str, Any]
+    recovery: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class QueryRecoveryAutoCheckPlan:
+    query_key: str
+    required_recovered_rows: int
+    source_row_order: tuple[int, ...]
+    candidates: tuple[QueryRecoveryCandidate, ...]
+
+
+class AutoCheckProviderLoadBalancer:
+    """Share live provider capacity across initial and final reviewer roles."""
+
+    def __init__(
+        self,
+        controllers: dict[str, Any],
+        *,
+        failure_cooldown_seconds: float = (
+            AUTO_CHECK_PROFILE_FAILURE_COOLDOWN_SECONDS
+        ),
+        max_failure_cooldown_seconds: float = (
+            AUTO_CHECK_PROFILE_MAX_FAILURE_COOLDOWN_SECONDS
+        ),
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if failure_cooldown_seconds < 0 or max_failure_cooldown_seconds < 0:
+            raise ValueError("auto-check failure cooldowns must be non-negative")
+        if max_failure_cooldown_seconds < failure_cooldown_seconds:
+            raise ValueError(
+                "auto-check max failure cooldown must be at least the base cooldown"
+            )
+        self.controllers = dict(controllers)
+        self.max_parallelism = sum(
+            max(1, int(getattr(controller, "max_inflight", 1)))
+            for controller in self.controllers.values()
+        ) or 1
+        self._condition = threading.Condition()
+        self._assigned: dict[str, int] = defaultdict(int)
+        self._role_cursors: dict[str, int] = defaultdict(int)
+        self._failure_streaks: dict[tuple[str, str], int] = defaultdict(int)
+        self._cooldown_until: dict[tuple[str, str], float] = defaultdict(float)
+        self.failure_cooldown_seconds = float(failure_cooldown_seconds)
+        self.max_failure_cooldown_seconds = float(max_failure_cooldown_seconds)
+        self._monotonic = monotonic
+
+    def replace_controllers(self, controllers: dict[str, Any]) -> None:
+        """Atomically replace provider limits without disturbing active leases."""
+        with self._condition:
+            self.controllers = dict(controllers)
+            self.max_parallelism = sum(
+                max(1, int(getattr(controller, "max_inflight", 1)))
+                for controller in self.controllers.values()
+            ) or 1
+            self._condition.notify_all()
+
+    def _current_limit(self, profile_name: str) -> int:
+        controller = self.controllers.get(profile_name)
+        summary = getattr(controller, "summary", lambda: {})()
+        try:
+            return max(
+                1,
+                int(
+                    summary.get(
+                        "current_inflight_limit",
+                        summary.get("max_inflight", 1),
+                    )
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return 1
+
+    def _select_profile(
+        self,
+        reviewers: list[tuple[str, Any]],
+        role: str,
+        excluded_profiles: set[str],
+    ) -> tuple[str, Any] | None:
+        available: list[tuple[int, str, Any, int, int]] = []
+        now = self._monotonic()
+        for index, (profile_name, reviewer) in enumerate(reviewers):
+            if profile_name in excluded_profiles:
+                continue
+            if self._cooldown_until[(profile_name, role)] > now:
+                continue
+            assigned = self._assigned[profile_name]
+            limit = self._current_limit(profile_name)
+            if assigned < limit:
+                available.append((index, profile_name, reviewer, assigned, limit))
+        if not available:
+            return None
+
+        # Compare assigned/capacity exactly, then rotate equally loaded endpoints.
+        least_loaded = [
+            item
+            for item in available
+            if all(
+                item[3] * other[4] <= other[3] * item[4]
+                for other in available
+            )
+        ]
+        cursor = self._role_cursors[role] % len(reviewers)
+        selected = min(
+            least_loaded,
+            key=lambda item: (item[0] - cursor) % len(reviewers),
+        )
+        self._role_cursors[role] = (selected[0] + 1) % len(reviewers)
+        return selected[1], selected[2]
+
+    @contextmanager
+    def lease(
+        self,
+        reviewers: list[tuple[str, Any]],
+        role: str,
+        *,
+        excluded_profiles: set[str] | None = None,
+    ) -> Iterator[tuple[str, Any]]:
+        excluded = set(excluded_profiles or ())
+        eligible_profiles = {
+            profile_name
+            for profile_name, _reviewer in reviewers
+            if profile_name not in excluded
+        }
+        if not eligible_profiles:
+            raise RuntimeError(f"no untried auto-check {role} providers remain")
+        with self._condition:
+            selected = self._select_profile(reviewers, role, excluded)
+            while selected is None:
+                now = self._monotonic()
+                cooldown_waits = [
+                    self._cooldown_until[(profile_name, role)] - now
+                    for profile_name in eligible_profiles
+                    if self._cooldown_until[(profile_name, role)] > now
+                ]
+                self._condition.wait(
+                    timeout=min(cooldown_waits) if cooldown_waits else None
+                )
+                selected = self._select_profile(reviewers, role, excluded)
+            profile_name, reviewer = selected
+            self._assigned[profile_name] += 1
+        try:
+            yield profile_name, reviewer
+        finally:
+            with self._condition:
+                self._assigned[profile_name] -= 1
+                self._condition.notify_all()
+
+    def record_success(self, profile_name: str, role: str) -> None:
+        with self._condition:
+            key = (profile_name, role)
+            self._failure_streaks.pop(key, None)
+            self._cooldown_until.pop(key, None)
+            self._condition.notify_all()
+
+    def record_failure(self, profile_name: str, role: str) -> None:
+        with self._condition:
+            key = (profile_name, role)
+            streak = self._failure_streaks[key] + 1
+            self._failure_streaks[key] = streak
+            cooldown = min(
+                self.max_failure_cooldown_seconds,
+                self.failure_cooldown_seconds * (2 ** min(streak - 1, 10)),
+            )
+            self._cooldown_until[key] = max(
+                self._cooldown_until[key],
+                self._monotonic() + cooldown,
+            )
+            self._condition.notify_all()
+
+
+class BalancedAutoCheckReviewerPool:
+    """Dispatch each blind extraction to the least-loaded compatible provider."""
+
+    def __init__(
+        self,
+        reviewers: list[tuple[str, Any]],
+        *,
+        role: str,
+        load_balancer: AutoCheckProviderLoadBalancer,
+        allow_empty: bool = False,
+    ) -> None:
+        if not reviewers and not allow_empty:
+            raise ValueError(f"auto-check {role} reviewer pool must not be empty")
+        self.role = role
+        self.load_balancer = load_balancer
+        self._reviewers_lock = threading.RLock()
+        self._reviewers = list(reviewers)
+        self._reload_callback: Callable[[], bool] | None = None
+        self.companion_final_pool: BalancedAutoCheckReviewerPool | None = None
+        self.identity = self._make_identity(self._reviewers)
+        self.max_parallelism = self.load_balancer.max_parallelism
+
+    def _make_identity(
+        self,
+        reviewers: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "provider": "balanced_auto_check_reviewer_pool",
+            "role": self.role,
+            "reviewers": [
+                {
+                    "api_profile": profile_name,
+                    "identity": getattr(reviewer, "identity", None),
+                }
+                for profile_name, reviewer in reviewers
+            ],
+        }
+
+    @property
+    def reviewers(self) -> list[tuple[str, Any]]:
+        """Return the latest reviewer snapshot, reloading JSON if it changed."""
+        self.reload_if_changed()
+        with self._reviewers_lock:
+            return list(self._reviewers)
+
+    def set_reload_callback(self, callback: Callable[[], bool]) -> None:
+        self._reload_callback = callback
+
+    def reload_if_changed(self) -> bool:
+        callback = self._reload_callback
+        return bool(callback()) if callback is not None else False
+
+    def replace_reviewers(self, reviewers: list[tuple[str, Any]]) -> None:
+        with self._reviewers_lock:
+            self._reviewers = list(reviewers)
+            self.identity = self._make_identity(self._reviewers)
+            self.max_parallelism = self.load_balancer.max_parallelism
+
+    def has_reviewers(self) -> bool:
+        self.reload_if_changed()
+        with self._reviewers_lock:
+            return bool(self._reviewers)
+
+    def _reviewer_snapshot(self) -> list[tuple[str, Any]]:
+        self.reload_if_changed()
+        with self._reviewers_lock:
+            return list(self._reviewers)
+
+    @staticmethod
+    def _selected_identity(profile_name: str, reviewer: Any) -> dict[str, Any]:
+        identity = getattr(reviewer, "identity", None)
+        return {
+            "api_profile": profile_name,
+            "model": clean_text(identity.get("model"))
+            if isinstance(identity, dict)
+            else "",
+        }
+
+    def extract_batch(
+        self,
+        batch: dict[str, Any],
+        *,
+        on_selected: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, str]] | None:
+        reviewers = self._reviewer_snapshot()
+        if not reviewers:
+            raise RuntimeError(
+                f"no auto-check {self.role} providers are configured"
+            )
+        attempted_profiles: set[str] = set()
+        last_error: Exception | None = None
+        while len(attempted_profiles) < len(reviewers):
+            with self.load_balancer.lease(
+                reviewers,
+                self.role,
+                excluded_profiles=attempted_profiles,
+            ) as selected:
+                profile_name, reviewer = selected
+                attempted_profiles.add(profile_name)
+                if on_selected is not None:
+                    on_selected(self._selected_identity(profile_name, reviewer))
+                try:
+                    extracted = reviewer.extract_batches([batch]).get(
+                        batch["query_table_id"]
+                    )
+                except Exception as error:
+                    last_error = error
+                    self.load_balancer.record_failure(profile_name, self.role)
+                    logging.warning(
+                        "Auto-check %s provider %s failed (%s); trying another provider",
+                        self.role,
+                        profile_name,
+                        type(error).__name__,
+                    )
+                    continue
+                self.load_balancer.record_success(profile_name, self.role)
+                return extracted
+        raise TransientModelEndpointError(
+            f"all auto-check {self.role} providers failed for one recovery"
+        ) from last_error
+
+    def extract_batches(
+        self,
+        batches: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, str]]]:
+        extracted: dict[str, list[dict[str, str]]] = {}
+        for batch in batches:
+            values = self.extract_batch(batch)
+            if values is not None:
+                extracted[batch["query_table_id"]] = values
+        return extracted
+
+
+# Compatibility alias for callers that imported the earlier pool name.
+StableAutoCheckReviewerPool = BalancedAutoCheckReviewerPool
+
+
+class AutoCheckAPIConfigReloader:
+    """Reload a protected provider file after atomic, validated changes."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        reload_config: Callable[[], tuple[int, int, int]],
+        active_profile_count: Callable[[], int],
+        initial_signature: tuple[Any, ...] | None = None,
+    ) -> None:
+        self.path = path
+        self._reload_config = reload_config
+        self._active_profile_count = active_profile_count
+        self._lock = threading.Lock()
+        self._last_seen_signature = (
+            self.file_signature(path)
+            if initial_signature is None
+            else initial_signature
+        )
+
+    @staticmethod
+    def file_signature(path: Path) -> tuple[Any, ...]:
+        try:
+            stat = path.stat()
+        except OSError as error:
+            return ("unavailable", error.errno)
+        return (
+            "file",
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_mode & 0o777,
+        )
+
+    def reload_if_changed(self) -> bool:
+        signature = self.file_signature(self.path)
+        with self._lock:
+            if signature == self._last_seen_signature:
+                return False
+            self._last_seen_signature = signature
+            try:
+                initial_count, final_count, profile_count = self._reload_config()
+            except Exception as error:
+                logging.warning(
+                    "Ignoring updated auto-check API config %s (%s: %s); "
+                    "continuing with the last valid configuration (%d profiles)",
+                    self.path,
+                    type(error).__name__,
+                    error,
+                    self._active_profile_count(),
+                )
+                return False
+            logging.info(
+                "Reloaded auto-check API config %s: %d profiles "
+                "(%d initial, %d final)",
+                self.path,
+                profile_count,
+                initial_count,
+                final_count,
+            )
+            return True
 
 
 @dataclass
@@ -612,6 +1014,38 @@ def evaluate_candidate_batch(
     context.text_task_count += counts.get("text", 0)
     context.image_task_count += counts.get("image", 0)
 
+    auto_check_plans: list[QueryRecoveryAutoCheckPlan] = []
+    if auto_check_required(context.extractor):
+        if context.query_auto_check_cache is None:
+            raise RuntimeError(
+                "auto-check-enabled candidate evaluation requires a query cache"
+            )
+        for source_table in source_tables:
+            build_table_join_records(
+                source_table=source_table,
+                split="candidate",
+                assets=context.assets,
+                entity_to_assets=context.entity_to_assets,
+                wiki_to_entity_id=context.wiki_to_entity_id,
+                extractor=context.extractor,
+                cache=context.cache,
+                progress=None,
+                concurrency_state=context.concurrency_state,
+                extraction_writer=ListRecordWriter(),
+                recovery_writer=ListRecordWriter(),
+                args=args,
+                query_auto_check_cache=context.query_auto_check_cache,
+                apply_query_auto_check=False,
+                query_recovery_plans_out=auto_check_plans,
+            )
+        run_query_recovery_auto_check_round(
+            plans=auto_check_plans,
+            extractor=context.extractor,
+            cache=context.query_auto_check_cache,
+            args=args,
+            concurrency_state=context.concurrency_state,
+        )
+
     evaluations: list[CandidateEvaluation] = []
     for source_table in source_tables:
         entity_ids = _eligible_candidate_entity_ids(
@@ -637,6 +1071,7 @@ def evaluate_candidate_batch(
             extraction_writer=extraction_writer,
             recovery_writer=recovery_writer,
             args=args,
+            query_auto_check_cache=context.query_auto_check_cache,
         )
         table_id = str(source_table["source_table_id"])
         context.registry.register(
@@ -675,95 +1110,376 @@ def _close_iterator(iterator: Any) -> None:
         close()
 
 
+def _source_sample_checkpoint_dir(args: argparse.Namespace) -> Path | None:
+    if bool(getattr(args, "no_source_sample_checkpoint", False)):
+        return None
+    configured = clean_text(getattr(args, "source_sample_checkpoint_dir", ""))
+    if configured:
+        return Path(configured).resolve()
+    output_dir = clean_text(getattr(args, "output_dir", ""))
+    if not output_dir:
+        return None
+    return Path(output_dir).resolve() / "_source_sample_checkpoint"
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _source_sample_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "seed": int(args.seed),
+        "min_rows": int(args.min_rows),
+        "min_cols": int(args.min_cols),
+        "wiki_link_threshold": float(args.wiki_link_threshold),
+        "query_rows_per_table": configured_query_rows_per_table(args),
+        "max_source_tables": (
+            None if args.max_source_tables is None else int(args.max_source_tables)
+        ),
+        "unrecoverable_replacement_rounds": int(
+            args.unrecoverable_replacement_rounds
+        ),
+        "max_scanned_files": (
+            None
+            if getattr(args, "max_scanned_files", None) is None
+            else int(args.max_scanned_files)
+        ),
+    }
+
+
+def _source_inventory(
+    input_dir: Path,
+    json_files: list[Path],
+) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for path in json_files:
+        stat = path.stat()
+        inventory.append(
+            {
+                "path": path.relative_to(input_dir).as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    return inventory
+
+
+def _source_sample_fingerprint(
+    inventory: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> str:
+    payload = {
+        "schema_version": SOURCE_SAMPLE_CHECKPOINT_VERSION,
+        "inventory": inventory,
+        "config": config,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _restore_source_sample_refs(
+    manifest_path: Path,
+    fingerprint: str,
+    counters: SourceCandidateCounters,
+) -> list[SelectedSourceTableRef] | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != SOURCE_SAMPLE_CHECKPOINT_VERSION:
+            logging.info("Ignoring source sample checkpoint with an old schema")
+            return None
+        if manifest.get("fingerprint") != fingerprint:
+            logging.info("Source sample checkpoint inputs or parameters changed")
+            return None
+        raw_counters = manifest["counters"]
+        raw_refs = manifest["selected_refs"]
+        if not isinstance(raw_counters, dict) or not isinstance(raw_refs, list):
+            raise ValueError("checkpoint counters or selected_refs has the wrong type")
+        refs = [
+            SelectedSourceTableRef(
+                priority=int(item["priority"]),
+                relative_path=str(item["relative_path"]),
+                table_id=str(item["table_id"]),
+            )
+            for item in raw_refs
+        ]
+        if refs != sorted(refs):
+            raise ValueError("checkpoint selected_refs are not sorted")
+        processed_tables = int(raw_counters["processed_tables"])
+        skipped_tables = int(raw_counters["skipped_tables"])
+        skip_reasons = Counter(
+            {
+                str(reason): int(count)
+                for reason, count in dict(raw_counters["skip_reasons"]).items()
+            }
+        )
+        counters.processed_tables = processed_tables
+        counters.skipped_tables = skipped_tables
+        counters.skip_reasons = skip_reasons
+        logging.info(
+            "Reusing source sample checkpoint with %d selected tables: %s",
+            len(refs),
+            manifest_path,
+        )
+        return refs
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning(
+            "Ignoring invalid source sample checkpoint %s: %s",
+            manifest_path,
+            exc,
+        )
+        return None
+
+
+def _write_source_sample_manifest(
+    manifest_path: Path,
+    *,
+    fingerprint: str,
+    inventory_count: int,
+    config: dict[str, Any],
+    counters: SourceCandidateCounters,
+    selected_refs: list[SelectedSourceTableRef],
+) -> None:
+    _atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": SOURCE_SAMPLE_CHECKPOINT_VERSION,
+            "fingerprint": fingerprint,
+            "inventory_file_count": inventory_count,
+            "config": config,
+            "counters": {
+                "processed_tables": counters.processed_tables,
+                "skipped_tables": counters.skipped_tables,
+                "skip_reasons": dict(counters.skip_reasons),
+            },
+            "selected_refs": [asdict(ref) for ref in selected_refs],
+        },
+    )
+
+
+def _read_source_sample_chunk(
+    path: Path,
+    refs: list[SelectedSourceTableRef],
+) -> list[dict[str, Any]] | None:
+    if not path.exists():
+        return None
+    tables: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if line_number > len(refs):
+                    raise ValueError("chunk contains extra records")
+                ref = refs[line_number - 1]
+                record = json.loads(line)
+                if (
+                    record.get("relative_path") != ref.relative_path
+                    or record.get("table_id") != ref.table_id
+                    or not isinstance(record.get("source_table"), dict)
+                ):
+                    raise ValueError(f"reference mismatch on line {line_number}")
+                tables.append(record["source_table"])
+        if len(tables) != len(refs):
+            raise ValueError(
+                f"chunk contains {len(tables)} records; expected {len(refs)}"
+            )
+        return tables
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning("Ignoring invalid source sample chunk %s: %s", path, exc)
+        return None
+
+
+def _write_source_sample_chunk(
+    path: Path,
+    refs: list[SelectedSourceTableRef],
+    tables: list[dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for ref, source_table in zip(refs, tables, strict=True):
+                handle.write(
+                    json.dumps(
+                        {
+                            "relative_path": ref.relative_path,
+                            "table_id": ref.table_id,
+                            "source_table": source_table,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def iter_random_source_tables(
     input_dir: Path,
     args: argparse.Namespace,
     counters: SourceCandidateCounters,
 ) -> Iterator[dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
+    checkpoint_dir = _source_sample_checkpoint_dir(args)
     json_files = sorted(
-        input_dir.rglob("*.json"),
+        (
+            path
+            for path in input_dir.rglob("*.json")
+            if checkpoint_dir is None or not _is_within(path, checkpoint_dir)
+        ),
         key=lambda path: path.relative_to(input_dir).as_posix(),
     )
-    json_file_iterator: Iterable[Path] = json_files
-    if tqdm is not None:
-        json_file_iterator = tqdm(
-            json_file_iterator,
-            total=len(json_files),
-            desc="Scanning EntiTables for global sample",
-            unit="file",
-            dynamic_ncols=True,
-            disable=not args.model_progress,
-        )
+    max_scanned_files = getattr(args, "max_scanned_files", None)
+    if max_scanned_files is not None:
+        max_scanned_files = int(max_scanned_files)
+        if max_scanned_files <= 0:
+            raise ValueError("max scanned files must be positive or None")
+        json_files = json_files[:max_scanned_files]
+    sample_config = _source_sample_config(args)
+    fingerprint = ""
+    manifest_path: Path | None = None
+    if checkpoint_dir is not None:
+        inventory = _source_inventory(input_dir, json_files)
+        fingerprint = _source_sample_fingerprint(inventory, sample_config)
+        manifest_path = checkpoint_dir / "manifest.json"
+    else:
+        inventory = []
     capacity = (
         None
         if args.max_source_tables is None
         else args.max_source_tables * (args.unrecoverable_replacement_rounds + 1)
     )
     selected_heap: list[_DescendingSelectedSourceTableRef] = []
-    selected_refs: list[SelectedSourceTableRef] = []
-    for json_file in json_file_iterator:
-        payload = read_entitables_json(json_file)
-        if payload is None:
-            counters.skipped_tables += 1
-            counters.skip_reasons["malformed_json_file"] += 1
-            continue
-        relative_path = json_file.relative_to(input_dir).as_posix()
-        for table_id, table_obj in payload.items():
-            counters.processed_tables += 1
-            result = parse_source_table(
-                str(table_id),
-                table_obj,
-                json_file,
-                input_dir,
-                args.min_rows,
-                args.min_cols,
-                args.wiki_link_threshold,
+    selected_refs: list[SelectedSourceTableRef] | None = None
+    if (
+        manifest_path is not None
+        and not bool(getattr(args, "refresh_source_sample_checkpoint", False))
+    ):
+        selected_refs = _restore_source_sample_refs(
+            manifest_path,
+            fingerprint,
+            counters,
+        )
+    if selected_refs is None:
+        counters.processed_tables = 0
+        counters.skipped_tables = 0
+        counters.skip_reasons = Counter()
+        selected_refs = []
+        json_file_iterator: Iterable[Path] = json_files
+        if tqdm is not None:
+            json_file_iterator = tqdm(
+                json_file_iterator,
+                total=len(json_files),
+                desc="Scanning EntiTables for global sample",
+                unit="file",
+                dynamic_ncols=True,
+                disable=not args.model_progress,
             )
-            if result.source_table is None:
+        for json_file in json_file_iterator:
+            payload = read_entitables_json(json_file)
+            if payload is None:
                 counters.skipped_tables += 1
-                counters.skip_reasons[result.skip_reason or "unknown"] += 1
+                counters.skip_reasons["malformed_json_file"] += 1
                 continue
-            if not result.source_table.get("metadata", {}).get(
-                "candidate_entity_columns"
-            ):
-                counters.skipped_tables += 1
-                counters.skip_reasons["no_candidate_entity_column"] += 1
-                continue
-            entity_col = choose_entity_column(
-                result.source_table,
-                min_linked_rows=query_rows_per_table,
-            )
-            if entity_col is None:
-                counters.skipped_tables += 1
-                counters.skip_reasons["too_few_candidate_entity_rows"] += 1
-                continue
-            ref = SelectedSourceTableRef(
-                priority=int(
-                    stable_hash(
-                        "global-source-table",
-                        args.seed,
-                        relative_path,
-                        table_id,
-                        length=40,
+            relative_path = json_file.relative_to(input_dir).as_posix()
+            for table_id, table_obj in payload.items():
+                counters.processed_tables += 1
+                result = parse_source_table(
+                    str(table_id),
+                    table_obj,
+                    json_file,
+                    input_dir,
+                    args.min_rows,
+                    args.min_cols,
+                    args.wiki_link_threshold,
+                )
+                if result.source_table is None:
+                    counters.skipped_tables += 1
+                    counters.skip_reasons[result.skip_reason or "unknown"] += 1
+                    continue
+                if not result.source_table.get("metadata", {}).get(
+                    "candidate_entity_columns"
+                ):
+                    counters.skipped_tables += 1
+                    counters.skip_reasons["no_candidate_entity_column"] += 1
+                    continue
+                entity_col = choose_entity_column(
+                    result.source_table,
+                    min_linked_rows=query_rows_per_table,
+                )
+                if entity_col is None:
+                    counters.skipped_tables += 1
+                    counters.skip_reasons["too_few_candidate_entity_rows"] += 1
+                    continue
+                ref = SelectedSourceTableRef(
+                    priority=int(
+                        stable_hash(
+                            "global-source-table",
+                            args.seed,
+                            relative_path,
+                            table_id,
+                            length=40,
+                        ),
+                        16,
                     ),
-                    16,
-                ),
-                relative_path=relative_path,
-                table_id=str(table_id),
-            )
-            if capacity is None:
-                selected_refs.append(ref)
-            elif capacity > 0:
-                entry = _DescendingSelectedSourceTableRef(ref)
-                if len(selected_heap) < capacity:
-                    heapq.heappush(selected_heap, entry)
-                elif ref < selected_heap[0].ref:
-                    heapq.heapreplace(selected_heap, entry)
+                    relative_path=relative_path,
+                    table_id=str(table_id),
+                )
+                if capacity is None:
+                    selected_refs.append(ref)
+                elif capacity > 0:
+                    entry = _DescendingSelectedSourceTableRef(ref)
+                    if len(selected_heap) < capacity:
+                        heapq.heappush(selected_heap, entry)
+                    elif ref < selected_heap[0].ref:
+                        heapq.heapreplace(selected_heap, entry)
 
-    if capacity is not None:
-        selected_refs = [entry.ref for entry in selected_heap]
-    selected_refs.sort()
+        if capacity is not None:
+            selected_refs = [entry.ref for entry in selected_heap]
+        selected_refs.sort()
+        if manifest_path is not None:
+            _write_source_sample_manifest(
+                manifest_path,
+                fingerprint=fingerprint,
+                inventory_count=len(inventory),
+                config=sample_config,
+                counters=counters,
+                selected_refs=selected_refs,
+            )
+            logging.info(
+                "Saved source sample checkpoint with %d selected tables: %s",
+                len(selected_refs),
+                manifest_path,
+            )
     if not selected_refs:
         return
 
@@ -780,6 +1496,32 @@ def iter_random_source_tables(
     try:
         for chunk_start in range(0, len(selected_refs), chunk_size):
             chunk = selected_refs[chunk_start : chunk_start + chunk_size]
+            chunk_path = None
+            materialized_tables = None
+            if checkpoint_dir is not None:
+                chunk_path = (
+                    checkpoint_dir
+                    / "chunks"
+                    / fingerprint
+                    / f"candidates_{chunk_start:08d}_{chunk_start + len(chunk):08d}.jsonl"
+                )
+                if not bool(
+                    getattr(args, "refresh_source_sample_checkpoint", False)
+                ):
+                    materialized_tables = _read_source_sample_chunk(
+                        chunk_path,
+                        chunk,
+                    )
+            if materialized_tables is not None:
+                logging.info(
+                    "Reusing %d materialized source candidates from %s",
+                    len(materialized_tables),
+                    chunk_path,
+                )
+                if materialization_progress is not None:
+                    materialization_progress.update(1)
+                yield from materialized_tables
+                continue
             refs_by_path: dict[str, list[SelectedSourceTableRef]] = defaultdict(list)
             for ref in chunk:
                 refs_by_path[ref.relative_path].append(ref)
@@ -816,10 +1558,14 @@ def iter_random_source_tables(
                             f"table is no longer valid ({result.skip_reason or 'unknown'})"
                         )
                     materialized[(relative_path, ref.table_id)] = result.source_table
+            materialized_tables = [
+                materialized[(ref.relative_path, ref.table_id)] for ref in chunk
+            ]
+            if chunk_path is not None:
+                _write_source_sample_chunk(chunk_path, chunk, materialized_tables)
             if materialization_progress is not None:
                 materialization_progress.update(1)
-            for ref in chunk:
-                yield materialized[(ref.relative_path, ref.table_id)]
+            yield from materialized_tables
     finally:
         if materialization_progress is not None:
             materialization_progress.close()
@@ -981,6 +1727,7 @@ def resolve_shared_cache_paths(args: argparse.Namespace) -> dict[str, Path]:
         "wikipedia_cache_dir": wikipedia_cache_dir,
         "wikipedia_image_dir": wikipedia_image_dir,
         "model_attribute_extractions": root_dir / "model_attribute_extractions.jsonl",
+        "query_recovery_auto_checks": root_dir / "query_recovery_auto_checks.jsonl",
     }
 
 
@@ -1006,6 +1753,12 @@ _TEMPORAL_ATTRIBUTE_RE = re.compile(
     r"(?:^|\W)(?:year|date|born|birth|death|died|season|term|opened|founded|released)(?:$|\W)",
     re.IGNORECASE,
 )
+_STATION_ENTITY_COLUMN_RE = re.compile(r"(?:station|駅|站)", re.IGNORECASE)
+_STATION_NAME_ATTRIBUTE_RE = re.compile(
+    r"(?:name|japanese|english|kanji|kana|native|romanized|romaji|日本語|和名)",
+    re.IGNORECASE,
+)
+_STATION_NAME_SUFFIXES = (" railway station", " station", "駅", "站")
 
 
 def _match_text(value: Any) -> str:
@@ -1029,17 +1782,57 @@ def _contains_whole_phrase(container: str, phrase: str) -> bool:
     return f" {phrase} " in f" {container} "
 
 
+def _station_name_without_type_suffix(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", clean_text(value)).casefold().strip()
+    for suffix in _STATION_NAME_SUFFIXES:
+        if text.endswith(suffix):
+            stem = text[: -len(suffix)].strip()
+            if len(stem.replace(" ", "")) >= 2:
+                return stem
+    return text
+
+
+def _station_name_type_suffix_match(
+    predicted: Any,
+    expected: Any,
+    *,
+    attribute_name: str,
+    entity_column_name: str,
+) -> bool:
+    """Allow only a station-type suffix difference in station-name fields."""
+    if not _STATION_ENTITY_COLUMN_RE.search(clean_text(entity_column_name)):
+        return False
+    if not _STATION_NAME_ATTRIBUTE_RE.search(clean_text(attribute_name)):
+        return False
+    pred = unicodedata.normalize("NFKC", clean_text(predicted)).casefold().strip()
+    exp = unicodedata.normalize("NFKC", clean_text(expected)).casefold().strip()
+    if not pred or not exp or pred == exp:
+        return False
+    return (
+        _station_name_without_type_suffix(pred)
+        == _station_name_without_type_suffix(exp)
+    )
+
+
 def values_match(
     predicted: Any,
     expected: Any,
     *,
     attribute_name: str = "",
+    entity_column_name: str = "",
 ) -> bool:
     pred = _match_text(predicted)
     exp = _match_text(expected)
     if not pred or not exp:
         return False
     if pred == exp:
+        return True
+    if _station_name_type_suffix_match(
+        predicted,
+        expected,
+        attribute_name=attribute_name,
+        entity_column_name=entity_column_name,
+    ):
         return True
 
     pred_number = _numeric_value(predicted)
@@ -1339,12 +2132,736 @@ class ModelCallStats:
         return summary
 
 
+class ModelAutoCheckStats:
+    """Thread-safe counters for the post-analysis extraction gate."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: Counter[str] = Counter()
+
+    def record(
+        self,
+        verdict: str,
+        *,
+        error: bool = False,
+        luna_triggered: bool = False,
+        luna_verdict: str | None = None,
+        terra_triggered: bool = False,
+        terra_verdict: str | None = None,
+        decision_source: str = "",
+    ) -> None:
+        with self._lock:
+            self._counts["reviewed"] += 1
+            self._counts[verdict] += 1
+            if verdict != "supported":
+                self._counts["filtered"] += 1
+            if error:
+                self._counts["errors"] += 1
+            if luna_triggered:
+                self._counts["luna_triggered"] += 1
+            if luna_verdict in {"supported", "contradicted", "insufficient"}:
+                self._counts["luna_completed"] += 1
+                self._counts[f"luna_{luna_verdict}"] += 1
+            if terra_triggered:
+                self._counts["terra_triggered"] += 1
+                self._counts["final_judge_triggered"] += 1
+            if terra_verdict in {"supported", "contradicted", "insufficient"}:
+                self._counts["terra_completed"] += 1
+                self._counts[f"terra_{terra_verdict}"] += 1
+                self._counts["final_judge_completed"] += 1
+                self._counts[f"final_judge_{terra_verdict}"] += 1
+
+    def summary(self) -> dict[str, int | str | bool]:
+        with self._lock:
+            counts = dict(self._counts)
+        return {
+            "enabled": True,
+            "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "reviewed": int(counts.get("reviewed", 0)),
+            "supported": int(counts.get("supported", 0)),
+            "contradicted": int(counts.get("contradicted", 0)),
+            "insufficient": int(counts.get("insufficient", 0)),
+            "filtered": int(counts.get("filtered", 0)),
+            "errors": int(counts.get("errors", 0)),
+            "luna_triggered": int(counts.get("luna_triggered", 0)),
+            "luna_completed": int(counts.get("luna_completed", 0)),
+            "luna_supported": int(counts.get("luna_supported", 0)),
+            "terra_triggered": int(counts.get("terra_triggered", 0)),
+            "terra_completed": int(counts.get("terra_completed", 0)),
+            "terra_supported": int(counts.get("terra_supported", 0)),
+            "final_judge_triggered": int(
+                counts.get("final_judge_triggered", 0)
+            ),
+            "final_judge_completed": int(
+                counts.get("final_judge_completed", 0)
+            ),
+            "final_judge_supported": int(
+                counts.get("final_judge_supported", 0)
+            ),
+            # Compatibility counters: the secondary stage is Luna in v2.
+            "secondary_triggered": int(counts.get("luna_triggered", 0)),
+            "secondary_completed": int(counts.get("luna_completed", 0)),
+            "secondary_supported": int(counts.get("luna_supported", 0)),
+        }
+
+
+def model_auto_check_summary(extractor: Any | None) -> dict[str, Any]:
+    stats = getattr(extractor, "model_auto_check_stats", None)
+    if stats is None or not hasattr(stats, "summary"):
+        return {
+            "enabled": bool(getattr(extractor, "auto_check_enabled", False)),
+            "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "reviewed": 0,
+            "supported": 0,
+            "contradicted": 0,
+            "insufficient": 0,
+            "filtered": 0,
+            "errors": 0,
+            "luna_triggered": 0,
+            "luna_completed": 0,
+            "luna_supported": 0,
+            "terra_triggered": 0,
+            "terra_completed": 0,
+            "terra_supported": 0,
+            "final_judge_triggered": 0,
+            "final_judge_completed": 0,
+            "final_judge_supported": 0,
+            "secondary_triggered": 0,
+            "secondary_completed": 0,
+            "secondary_supported": 0,
+        }
+    return dict(stats.summary())
+
+
+def summarize_model_auto_check_records(
+    paths: Iterable[Path],
+) -> dict[str, Any]:
+    """Summarize durable checker decisions, including cache-reused records."""
+    counts: Counter[str] = Counter()
+    for record in iter_jsonl_records(paths):
+        if clean_text(record.get("error")):
+            counts["model_error_records"] += 1
+            continue
+        auto_check = record.get("auto_check")
+        if not isinstance(auto_check, dict):
+            counts["unchecked_records"] += 1
+            continue
+        counts["checked_records"] += 1
+        reviews = auto_check.get("reviews")
+        if not isinstance(reviews, list):
+            counts["invalid_check_records"] += 1
+            continue
+        for review in reviews:
+            if not isinstance(review, dict):
+                counts["invalid_check_reviews"] += 1
+                continue
+            verdict = clean_text(review.get("verdict"))
+            if verdict not in {"supported", "contradicted", "insufficient"}:
+                counts["invalid_check_reviews"] += 1
+                continue
+            counts["reviewed"] += 1
+            counts[verdict] += 1
+            if verdict != "supported":
+                counts["filtered"] += 1
+            if clean_text(review.get("error_code")):
+                counts["errors"] += 1
+            if bool(review.get("luna_triggered")):
+                counts["luna_triggered"] += 1
+            luna_verdict = clean_text(review.get("luna_verdict"))
+            if luna_verdict in {"supported", "contradicted", "insufficient"}:
+                counts["luna_completed"] += 1
+                if luna_verdict == "supported":
+                    counts["luna_supported"] += 1
+            if bool(review.get("terra_triggered")):
+                counts["terra_triggered"] += 1
+            if bool(
+                review.get("final_judge_triggered")
+                or review.get("terra_triggered")
+            ):
+                counts["final_judge_triggered"] += 1
+            terra_verdict = clean_text(review.get("terra_verdict"))
+            if terra_verdict in {"supported", "contradicted", "insufficient"}:
+                counts["terra_completed"] += 1
+                if terra_verdict == "supported":
+                    counts["terra_supported"] += 1
+                counts["final_judge_completed"] += 1
+                if terra_verdict == "supported":
+                    counts["final_judge_supported"] += 1
+    return {
+        "enabled": True,
+        "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "checked_records": int(counts.get("checked_records", 0)),
+        "model_error_records": int(counts.get("model_error_records", 0)),
+        "unchecked_records": int(counts.get("unchecked_records", 0)),
+        "invalid_check_records": int(counts.get("invalid_check_records", 0)),
+        "invalid_check_reviews": int(counts.get("invalid_check_reviews", 0)),
+        "reviewed": int(counts.get("reviewed", 0)),
+        "supported": int(counts.get("supported", 0)),
+        "contradicted": int(counts.get("contradicted", 0)),
+        "insufficient": int(counts.get("insufficient", 0)),
+        "filtered": int(counts.get("filtered", 0)),
+        "errors": int(counts.get("errors", 0)),
+        "luna_triggered": int(counts.get("luna_triggered", 0)),
+        "luna_completed": int(counts.get("luna_completed", 0)),
+        "luna_supported": int(counts.get("luna_supported", 0)),
+        "terra_triggered": int(counts.get("terra_triggered", 0)),
+        "terra_completed": int(counts.get("terra_completed", 0)),
+        "terra_supported": int(counts.get("terra_supported", 0)),
+        "final_judge_triggered": int(
+            counts.get("final_judge_triggered", 0)
+        ),
+        "final_judge_completed": int(
+            counts.get("final_judge_completed", 0)
+        ),
+        "final_judge_supported": int(
+            counts.get("final_judge_supported", 0)
+        ),
+        "secondary_triggered": int(counts.get("luna_triggered", 0)),
+        "secondary_completed": int(counts.get("luna_completed", 0)),
+        "secondary_supported": int(counts.get("luna_supported", 0)),
+    }
+
+
+def add_model_auto_check_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the shared local -> Luna -> Terra checker settings."""
+    group = parser.add_argument_group("post-analysis auto checker")
+    group.add_argument(
+        "--no_auto_check_secondary_openai",
+        dest="auto_check_secondary_openai",
+        action="store_false",
+        help=(
+            "Disable Luna review of non-matching local extractions and Terra "
+            "adjudication of local/Luna disagreements."
+        ),
+    )
+    group.add_argument(
+        "--auto_check_api_config_file",
+        default="",
+        help=(
+            "Chmod-600 JSON file containing named initial/final auto-check "
+            "API profiles. If omitted, ./.auto_check_apis.json is loaded "
+            "when present. Valid changes are reloaded while the builder runs; "
+            "invalid updates warn and leave the last valid profiles active."
+        ),
+    )
+    group.add_argument(
+        "--auto_check_openai_env_file",
+        default="",
+        help=(
+            "Legacy chmod-600 dotenv path for the auto checker. If neither "
+            "JSON nor dotenv is selected, ./.env.openai is loaded when "
+            "present."
+        ),
+    )
+    group.add_argument(
+        "--auto_check_luna_model",
+        "--auto_check_openai_model",
+        dest="auto_check_openai_model",
+        default=DEFAULT_AUTO_CHECK_LUNA_MODEL,
+    )
+    group.add_argument("--auto_check_openai_base_url", default="")
+    group.add_argument(
+        "--auto_check_openai_api_key_env",
+        default="OPENAI_API_KEY",
+    )
+    group.add_argument(
+        "--auto_check_luna_reasoning_effort",
+        "--auto_check_openai_reasoning_effort",
+        dest="auto_check_openai_reasoning_effort",
+        choices=("omit", "none", "minimal", "low", "medium", "high", "xhigh"),
+        default="none",
+    )
+    group.add_argument(
+        "--auto_check_openai_verbosity",
+        choices=("low", "medium", "high"),
+        default="low",
+    )
+    group.add_argument(
+        "--auto_check_openai_max_output_tokens",
+        type=int,
+        default=2048,
+    )
+    group.add_argument(
+        "--auto_check_terra_model",
+        default=DEFAULT_AUTO_CHECK_TERRA_MODEL,
+    )
+    group.add_argument(
+        "--auto_check_terra_reasoning_effort",
+        choices=("omit", "none", "minimal", "low", "medium", "high", "xhigh"),
+        default="none",
+    )
+    group.add_argument(
+        "--auto_check_terra_max_output_tokens",
+        type=int,
+        default=2048,
+    )
+    group.add_argument(
+        "--auto_check_openai_max_inflight",
+        type=int,
+        default=MAX_AUTO_CHECK_OPENAI_CONCURRENCY,
+    )
+    group.add_argument(
+        "--auto_check_openai_image_detail",
+        choices=("auto", "low", "high"),
+        default="auto",
+    )
+    group.add_argument(
+        "--auto_check_openai_image_max_pixels",
+        type=int,
+        default=DEFAULT_IMAGE_REQUEST_MAX_PIXELS,
+    )
+    group.add_argument(
+        "--auto_check_openai_timeout_seconds",
+        type=float,
+        default=180.0,
+    )
+    group.add_argument(
+        "--auto_check_openai_requests_per_minute",
+        type=int,
+        default=0,
+    )
+    group.add_argument(
+        "--auto_check_openai_tokens_per_minute",
+        type=int,
+        default=0,
+    )
+    parser.set_defaults(auto_check_secondary_openai=True)
+
+
+def prepare_model_auto_check_reviewers(
+    args: argparse.Namespace,
+) -> tuple[Any | None, Any | None]:
+    """Create Luna recovery and final-judge reviewer pools."""
+    if not bool(getattr(args, "auto_check_secondary_openai", False)):
+        return None, None
+
+    from mm_joinability_dataset_auto_checker import (
+        DEFAULT_OPENAI_ENV_FILE,
+        prepare_reviewer,
+    )
+    from openai_attribute_extractor import (
+        OpenAIRequestController,
+        load_openai_auto_check_api_config,
+        load_openai_compatible_api_profiles,
+        load_openai_environment_file,
+    )
+
+    configured_api_config_path = clean_text(
+        getattr(args, "auto_check_api_config_file", "")
+    )
+    configured_env_path = clean_text(
+        getattr(args, "auto_check_openai_env_file", "")
+    )
+    if configured_api_config_path and configured_env_path:
+        raise ValueError(
+            "--auto_check_api_config_file and --auto_check_openai_env_file "
+            "are mutually exclusive"
+        )
+    api_config_path = (
+        Path(configured_api_config_path)
+        if configured_api_config_path
+        else DEFAULT_AUTO_CHECK_API_CONFIG_FILE
+    )
+    use_api_config = bool(
+        configured_api_config_path
+        or not configured_env_path and api_config_path.exists()
+    )
+    if use_api_config:
+        api_config_path = api_config_path.resolve()
+        initial_api_config_signature = AutoCheckAPIConfigReloader.file_signature(
+            api_config_path
+        )
+        profiles = load_openai_auto_check_api_config(
+            api_config_path,
+            default_max_concurrency=(
+                DEFAULT_AUTO_CHECK_PROFILE_MAX_CONCURRENCY
+            ),
+        )
+    else:
+        environment_path = (
+            Path(configured_env_path)
+            if configured_env_path
+            else DEFAULT_OPENAI_ENV_FILE
+        )
+        if configured_env_path or environment_path.exists():
+            load_openai_environment_file(environment_path)
+        profiles = load_openai_compatible_api_profiles(
+            default_model=clean_text(
+                getattr(
+                    args,
+                    "auto_check_openai_model",
+                    DEFAULT_AUTO_CHECK_LUNA_MODEL,
+                )
+            ),
+            default_max_concurrency=DEFAULT_AUTO_CHECK_PROFILE_MAX_CONCURRENCY,
+        )
+
+    max_inflight = int(
+        getattr(
+            args,
+            "auto_check_openai_max_inflight",
+            MAX_AUTO_CHECK_OPENAI_CONCURRENCY,
+        )
+    )
+    if not 1 <= max_inflight <= MAX_AUTO_CHECK_OPENAI_CONCURRENCY:
+        raise ValueError(
+            "--auto_check_openai_max_inflight must be between 1 and "
+            f"{MAX_AUTO_CHECK_OPENAI_CONCURRENCY}"
+        )
+    output_dir = Path(getattr(args, "output_dir", ".")).resolve()
+    api_base_url = clean_text(
+        getattr(args, "auto_check_openai_base_url", "")
+    ) or os.environ.get("OPENAI_BASE_URL", DEFAULT_AUTO_CHECK_OPENAI_BASE_URL)
+
+    def make_reviewer(
+        *,
+        model: str,
+        reasoning_effort: str,
+        max_output_tokens: int,
+        role: str,
+        profile_name: str = "legacy",
+        api_key: str = "",
+        api_base_url_override: str = "",
+        profile_max_concurrency: int | None = None,
+        request_controller: Any | None = None,
+        use_responses: bool = False,
+    ) -> Any:
+        model = clean_text(model)
+        if not model:
+            raise ValueError(f"--auto_check_{role}_model must not be empty")
+        if max_output_tokens <= 0:
+            raise ValueError(
+                f"--auto_check_{role}_max_output_tokens must be positive"
+            )
+        model_component = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            model,
+        ).strip("-._") or role
+        usage_path = output_dir / "auto_checker_usage" / (
+            f"{profile_name}-{role}-{model_component[:64]}.jsonl"
+        )
+        reviewer_max_inflight = (
+            max_inflight
+            if profile_max_concurrency is None
+            else int(profile_max_concurrency)
+        )
+        reviewer_args = argparse.Namespace(
+            provider="openai",
+            openai_profile_name=profile_name,
+            openai_model=model,
+            openai_base_url=api_base_url_override or api_base_url,
+            openai_api_key=api_key,
+            openai_api_key_env=clean_text(
+                getattr(args, "auto_check_openai_api_key_env", "OPENAI_API_KEY")
+            ),
+            openai_reasoning_effort=reasoning_effort,
+            openai_verbosity=getattr(
+                args,
+                "auto_check_openai_verbosity",
+                "low",
+            ),
+            openai_max_output_tokens=max_output_tokens,
+            openai_image_detail=getattr(
+                args,
+                "auto_check_openai_image_detail",
+                "auto",
+            ),
+            openai_image_max_pixels=int(
+                getattr(
+                    args,
+                    "auto_check_openai_image_max_pixels",
+                    DEFAULT_IMAGE_REQUEST_MAX_PIXELS,
+                )
+            ),
+            openai_max_inflight=reviewer_max_inflight,
+            openai_adaptive_concurrency=request_controller is not None,
+            openai_initial_inflight=(
+                AUTO_CHECK_PROFILE_INITIAL_CONCURRENCY
+                if request_controller is not None
+                else None
+            ),
+            openai_successes_per_increase=(
+                AUTO_CHECK_PROFILE_SUCCESSES_PER_INCREASE
+            ),
+            openai_request_controller=request_controller,
+            openai_use_responses=use_responses,
+            openai_requests_per_minute=int(
+                getattr(args, "auto_check_openai_requests_per_minute", 0)
+            ),
+            openai_tokens_per_minute=int(
+                getattr(args, "auto_check_openai_tokens_per_minute", 0)
+            ),
+            model_timeout_seconds=float(
+                getattr(args, "auto_check_openai_timeout_seconds", 180.0)
+            ),
+            # Profile pools retry across providers; retrying the same failing
+            # endpoint here would hold a workflow worker for several timeouts.
+            model_max_retries=(
+                0
+                if request_controller is not None
+                else int(getattr(args, "model_max_retries", 2))
+            ),
+            model_retry_sleep_seconds=float(
+                getattr(args, "model_retry_sleep_seconds", 2.0)
+            ),
+            openai_retry_max_seconds=60.0,
+        )
+        return prepare_reviewer(
+            reviewer_args,
+            usage_journal_path=usage_path,
+            ensure_ready=False,
+        )
+
+    if profiles:
+        active_profiles: dict[str, Any] = {}
+        active_controllers: dict[str, Any] = {}
+        active_initial_reviewers: dict[str, Any] = {}
+        active_final_reviewers: dict[str, Any] = {}
+
+        def build_profile_snapshot(
+            configured_profiles: list[Any],
+        ) -> tuple[
+            dict[str, Any],
+            dict[str, Any],
+            list[tuple[str, Any]],
+            list[tuple[str, Any]],
+        ]:
+            profiles_by_name: dict[str, Any] = {}
+            profile_controllers: dict[str, Any] = {}
+            initial_reviewers: list[tuple[str, Any]] = []
+            final_reviewers: list[tuple[str, Any]] = []
+            for profile in configured_profiles:
+                profiles_by_name[profile.name] = profile
+                unchanged = active_profiles.get(profile.name) == profile
+                controller = (
+                    active_controllers[profile.name]
+                    if unchanged
+                    else OpenAIRequestController(
+                        max_inflight=profile.max_concurrency,
+                        adaptive=True,
+                        initial_inflight=AUTO_CHECK_PROFILE_INITIAL_CONCURRENCY,
+                        successes_per_increase=(
+                            AUTO_CHECK_PROFILE_SUCCESSES_PER_INCREASE
+                        ),
+                        requests_per_minute=int(
+                            getattr(
+                                args,
+                                "auto_check_openai_requests_per_minute",
+                                0,
+                            )
+                        ),
+                        tokens_per_minute=int(
+                            getattr(
+                                args,
+                                "auto_check_openai_tokens_per_minute",
+                                0,
+                            )
+                        ),
+                    )
+                )
+                profile_controllers[profile.name] = controller
+                if profile.model is not None:
+                    reviewer = (
+                        active_initial_reviewers[profile.name]
+                        if unchanged
+                        else make_reviewer(
+                            model=profile.model,
+                            reasoning_effort=getattr(
+                                args,
+                                "auto_check_openai_reasoning_effort",
+                                "medium",
+                            ),
+                            max_output_tokens=int(
+                                getattr(
+                                    args,
+                                    "auto_check_openai_max_output_tokens",
+                                    2048,
+                                )
+                            ),
+                            role="initial",
+                            profile_name=profile.name,
+                            api_key=profile.initial_api_key or "",
+                            api_base_url_override=(
+                                profile.initial_api_base_url or ""
+                            ),
+                            profile_max_concurrency=profile.max_concurrency,
+                            request_controller=controller,
+                            use_responses=profile.initial_use_responses,
+                        )
+                    )
+                    initial_reviewers.append((profile.name, reviewer))
+                if profile.final_judge_model is not None:
+                    reviewer = (
+                        active_final_reviewers[profile.name]
+                        if unchanged
+                        else make_reviewer(
+                            model=profile.final_judge_model,
+                            reasoning_effort=getattr(
+                                args,
+                                "auto_check_terra_reasoning_effort",
+                                "medium",
+                            ),
+                            max_output_tokens=int(
+                                getattr(
+                                    args,
+                                    "auto_check_terra_max_output_tokens",
+                                    2048,
+                                )
+                            ),
+                            role="final",
+                            profile_name=profile.name,
+                            api_key=profile.final_judge_api_key or "",
+                            api_base_url_override=(
+                                profile.final_judge_api_base_url or ""
+                            ),
+                            profile_max_concurrency=profile.max_concurrency,
+                            request_controller=controller,
+                            use_responses=profile.final_judge_use_responses,
+                        )
+                    )
+                    final_reviewers.append((profile.name, reviewer))
+            if not initial_reviewers:
+                raise ValueError(
+                    "auto-check API configuration must include at least one "
+                    "initial reviewer"
+                )
+            return (
+                profiles_by_name,
+                profile_controllers,
+                initial_reviewers,
+                final_reviewers,
+            )
+
+        (
+            active_profiles,
+            active_controllers,
+            initial_reviewers,
+            final_reviewers,
+        ) = build_profile_snapshot(profiles)
+        active_initial_reviewers = dict(initial_reviewers)
+        active_final_reviewers = dict(final_reviewers)
+        load_balancer = AutoCheckProviderLoadBalancer(active_controllers)
+        initial_pool = BalancedAutoCheckReviewerPool(
+            initial_reviewers,
+            role="initial",
+            load_balancer=load_balancer,
+        )
+        dynamic_final_pool = BalancedAutoCheckReviewerPool(
+            final_reviewers,
+            role="final",
+            load_balancer=load_balancer,
+            allow_empty=True,
+        )
+        # The builder can discover a final-only provider that is added after a
+        # run started even when the initial configuration had no final stage.
+        initial_pool.companion_final_pool = dynamic_final_pool
+
+        if use_api_config:
+            def reload_profile_config() -> tuple[int, int, int]:
+                nonlocal active_profiles
+                nonlocal active_controllers
+                nonlocal active_initial_reviewers
+                nonlocal active_final_reviewers
+
+                updated_profiles = load_openai_auto_check_api_config(
+                    api_config_path,
+                    default_max_concurrency=(
+                        DEFAULT_AUTO_CHECK_PROFILE_MAX_CONCURRENCY
+                    ),
+                )
+                (
+                    profiles_by_name,
+                    controllers,
+                    updated_initial_reviewers,
+                    updated_final_reviewers,
+                ) = build_profile_snapshot(updated_profiles)
+                load_balancer.replace_controllers(controllers)
+                initial_pool.replace_reviewers(updated_initial_reviewers)
+                dynamic_final_pool.replace_reviewers(updated_final_reviewers)
+                active_profiles = profiles_by_name
+                active_controllers = controllers
+                active_initial_reviewers = dict(updated_initial_reviewers)
+                active_final_reviewers = dict(updated_final_reviewers)
+                return (
+                    len(updated_initial_reviewers),
+                    len(updated_final_reviewers),
+                    len(profiles_by_name),
+                )
+
+            reloader = AutoCheckAPIConfigReloader(
+                api_config_path,
+                reload_config=reload_profile_config,
+                active_profile_count=lambda: len(active_profiles),
+                initial_signature=initial_api_config_signature,
+            )
+            initial_pool.set_reload_callback(reloader.reload_if_changed)
+            dynamic_final_pool.set_reload_callback(reloader.reload_if_changed)
+
+        return (
+            initial_pool,
+            dynamic_final_pool if final_reviewers else None,
+        )
+
+    luna = make_reviewer(
+        model=getattr(
+            args,
+            "auto_check_openai_model",
+            DEFAULT_AUTO_CHECK_LUNA_MODEL,
+        ),
+        reasoning_effort=getattr(
+            args,
+            "auto_check_openai_reasoning_effort",
+            "low",
+        ),
+        max_output_tokens=int(
+            getattr(args, "auto_check_openai_max_output_tokens", 2048)
+        ),
+        role="luna",
+    )
+    terra = make_reviewer(
+        model=getattr(
+            args,
+            "auto_check_terra_model",
+            DEFAULT_AUTO_CHECK_TERRA_MODEL,
+        ),
+        reasoning_effort=getattr(
+            args,
+            "auto_check_terra_reasoning_effort",
+            "medium",
+        ),
+        max_output_tokens=int(
+            getattr(args, "auto_check_terra_max_output_tokens", 2048)
+        ),
+        role="terra",
+    )
+    return luna, terra
+
+
+def prepare_model_auto_check_secondary(args: argparse.Namespace) -> Any | None:
+    """Backward-compatible helper returning the Luna recovery reviewer."""
+    luna, _terra = prepare_model_auto_check_reviewers(args)
+    return luna
+
+
 class LocalAttributeExtractor:
     """OpenAI-compatible client for local text and image extraction models."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         if requests is None:
             raise RuntimeError("requests is required for local model calls")
+        endpoint_config_path = clean_text(
+            getattr(args, "model_endpoint_config", "")
+        )
+        self.model_endpoint_config_path = endpoint_config_path
+        self.model_endpoint_scheduler = None
+        if endpoint_config_path:
+            endpoint_config = load_model_endpoint_config(
+                Path(endpoint_config_path).resolve()
+            )
+            self.model_endpoint_scheduler = ModelEndpointScheduler(
+                endpoint_config
+            )
         routing_manifest = clean_text(
             getattr(args, "model_routing_manifest", "")
         )
@@ -1364,10 +2881,29 @@ class LocalAttributeExtractor:
             if remote_routing_manifest
             else None
         )
-        configured_text_urls = normalize_model_base_urls(getattr(args, "text_model_base_urls", None))
-        fallback_text_url = clean_text(getattr(args, "text_model_base_url", "")).rstrip("/")
-        if fallback_text_url:
-            configured_text_urls = normalize_model_base_urls([fallback_text_url, *configured_text_urls])
+        if self.model_endpoint_scheduler is not None and (
+            self.routing_scheduler is not None
+            or self.remote_routing_scheduler is not None
+        ):
+            raise ValueError(
+                "--model_endpoint_config cannot be combined with dynamic "
+                "routing manifests"
+            )
+        if self.model_endpoint_scheduler is not None:
+            configured_text_urls = self.model_endpoint_scheduler.urls(
+                "local", "text"
+            )
+        else:
+            configured_text_urls = normalize_model_base_urls(
+                getattr(args, "text_model_base_urls", None)
+            )
+            fallback_text_url = clean_text(
+                getattr(args, "text_model_base_url", "")
+            ).rstrip("/")
+            if fallback_text_url:
+                configured_text_urls = normalize_model_base_urls(
+                    [fallback_text_url, *configured_text_urls]
+                )
         if not configured_text_urls and self.routing_scheduler is None:
             raise ValueError("at least one text model base URL is required")
         self.text_model_base_urls = configured_text_urls
@@ -1375,21 +2911,30 @@ class LocalAttributeExtractor:
         self._text_endpoint_lock = threading.Lock()
         self._text_endpoint_index = 0
         self._text_endpoint_inflight: dict[str, int] = {}
-        self.text_model_name = args.text_model_name
+        self.text_model_name = (
+            self.model_endpoint_scheduler.config.served_model_name
+            if self.model_endpoint_scheduler is not None
+            else args.text_model_name
+        )
         self.text_model_api_key = model_api_key(
             getattr(args, "text_model_api_key", None),
             "MMDD_TEXT_MODEL_API_KEY",
         )
-        configured_remote_text_urls = normalize_model_base_urls(
-            getattr(args, "remote_text_model_base_urls", None)
-        )
-        remote_text_url = clean_text(
-            getattr(args, "remote_text_model_base_url", "")
-        ).rstrip("/")
-        if remote_text_url:
-            configured_remote_text_urls = normalize_model_base_urls(
-                [remote_text_url, *configured_remote_text_urls]
+        if self.model_endpoint_scheduler is not None:
+            configured_remote_text_urls = self.model_endpoint_scheduler.urls(
+                "remote", "text"
             )
+        else:
+            configured_remote_text_urls = normalize_model_base_urls(
+                getattr(args, "remote_text_model_base_urls", None)
+            )
+            remote_text_url = clean_text(
+                getattr(args, "remote_text_model_base_url", "")
+            ).rstrip("/")
+            if remote_text_url:
+                configured_remote_text_urls = normalize_model_base_urls(
+                    [remote_text_url, *configured_remote_text_urls]
+                )
         self.remote_text_model_base_urls = configured_remote_text_urls
         self.remote_text_model_base_urls_file = clean_text(
             getattr(args, "remote_text_model_base_urls_file", "")
@@ -1414,10 +2959,21 @@ class LocalAttributeExtractor:
             raise ValueError(
                 "remote text workers require a remote text model endpoint"
             )
-        configured_image_urls = normalize_model_base_urls(getattr(args, "image_model_base_urls", None))
-        fallback_image_url = clean_text(getattr(args, "image_model_base_url", "")).rstrip("/")
-        if fallback_image_url:
-            configured_image_urls = normalize_model_base_urls([fallback_image_url, *configured_image_urls])
+        if self.model_endpoint_scheduler is not None:
+            configured_image_urls = self.model_endpoint_scheduler.urls(
+                "local", "image"
+            )
+        else:
+            configured_image_urls = normalize_model_base_urls(
+                getattr(args, "image_model_base_urls", None)
+            )
+            fallback_image_url = clean_text(
+                getattr(args, "image_model_base_url", "")
+            ).rstrip("/")
+            if fallback_image_url:
+                configured_image_urls = normalize_model_base_urls(
+                    [fallback_image_url, *configured_image_urls]
+                )
         if not configured_image_urls and self.routing_scheduler is None:
             raise ValueError("at least one image model base URL is required")
         self.image_model_base_urls = configured_image_urls
@@ -1425,21 +2981,30 @@ class LocalAttributeExtractor:
         self._image_endpoint_lock = threading.Lock()
         self._image_endpoint_index = 0
         self._image_endpoint_inflight: dict[str, int] = {}
-        self.image_model_name = args.image_model_name
+        self.image_model_name = (
+            self.model_endpoint_scheduler.config.served_model_name
+            if self.model_endpoint_scheduler is not None
+            else args.image_model_name
+        )
         self.image_model_api_key = model_api_key(
             getattr(args, "image_model_api_key", None),
             "MMDD_IMAGE_MODEL_API_KEY",
         )
-        configured_remote_image_urls = normalize_model_base_urls(
-            getattr(args, "remote_image_model_base_urls", None)
-        )
-        remote_image_url = clean_text(
-            getattr(args, "remote_image_model_base_url", "")
-        ).rstrip("/")
-        if remote_image_url:
-            configured_remote_image_urls = normalize_model_base_urls(
-                [remote_image_url, *configured_remote_image_urls]
+        if self.model_endpoint_scheduler is not None:
+            configured_remote_image_urls = self.model_endpoint_scheduler.urls(
+                "remote", "image"
             )
+        else:
+            configured_remote_image_urls = normalize_model_base_urls(
+                getattr(args, "remote_image_model_base_urls", None)
+            )
+            remote_image_url = clean_text(
+                getattr(args, "remote_image_model_base_url", "")
+            ).rstrip("/")
+            if remote_image_url:
+                configured_remote_image_urls = normalize_model_base_urls(
+                    [remote_image_url, *configured_remote_image_urls]
+                )
         self.remote_image_model_base_urls = configured_remote_image_urls
         self.remote_image_model_base_urls_file = clean_text(
             getattr(args, "remote_image_model_base_urls_file", "")
@@ -1471,7 +3036,11 @@ class LocalAttributeExtractor:
             1,
             int(getattr(args, "image_model_max_tokens", DEFAULT_IMAGE_MODEL_MAX_TOKENS) or DEFAULT_IMAGE_MODEL_MAX_TOKENS),
         )
-        self.disable_thinking = args.disable_thinking
+        if not bool(getattr(args, "disable_thinking", True)):
+            raise ValueError(
+                "thinking mode is disabled for every text and image model request"
+            )
+        self.disable_thinking = True
         self.max_retries = args.model_max_retries
         self.retry_sleep = args.model_retry_sleep_seconds
         self.image_request_max_pixels = max(
@@ -1483,6 +3052,37 @@ class LocalAttributeExtractor:
             int(getattr(args, "context_retry_image_max_pixels", DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS) or 1),
         )
         self.model_call_stats = ModelCallStats()
+        # Production builders always apply the independent, physically masked
+        # checker after the batched analysis call. Lightweight injected test
+        # extractors opt in explicitly by exposing the same attribute/method.
+        self.auto_check_enabled = True
+        self.model_auto_check_stats = ModelAutoCheckStats()
+        (
+            self.auto_check_luna_reviewer,
+            self.auto_check_terra_reviewer,
+        ) = prepare_model_auto_check_reviewers(args)
+        self.auto_check_parallelism = max(
+            int(
+                getattr(
+                    self.auto_check_luna_reviewer,
+                    "max_parallelism",
+                    getattr(
+                        args,
+                        "auto_check_openai_max_inflight",
+                        MAX_AUTO_CHECK_OPENAI_CONCURRENCY,
+                    ),
+                )
+            ),
+            int(
+                getattr(
+                    self.auto_check_terra_reviewer,
+                    "max_parallelism",
+                    1,
+                )
+            ),
+        )
+        # Compatibility alias: the v2 secondary stage is Luna.
+        self.auto_check_secondary_reviewer = self.auto_check_luna_reviewer
 
     def current_text_model_base_urls(self) -> list[str]:
         if self.routing_scheduler is not None:
@@ -1676,6 +3276,21 @@ class LocalAttributeExtractor:
     ) -> Iterator[str]:
         """Lease the least-loaded current endpoint for one complete model call."""
 
+        if self.model_endpoint_scheduler is not None:
+            _lock, urls_getter, _inflight, _index_name = (
+                self._endpoint_pool_state(model_kind, endpoint_pool)
+            )
+            try:
+                with self.model_endpoint_scheduler.lease(
+                    endpoint_pool,
+                    model_kind,
+                    available_urls_getter=urls_getter,
+                ) as endpoint:
+                    yield endpoint.base_url
+            except EndpointPoolUnavailableError as error:
+                raise TransientModelEndpointError(str(error)) from None
+            return
+
         scheduler = (
             self.routing_scheduler
             if endpoint_pool == "local"
@@ -1701,6 +3316,17 @@ class LocalAttributeExtractor:
         base_url: str,
         endpoint_pool: str = "local",
     ) -> bool:
+        if self.model_endpoint_scheduler is not None:
+            _lock, urls_getter, _inflight, _index_name = (
+                self._endpoint_pool_state(model_kind, endpoint_pool)
+            )
+            configured = {
+                endpoint.base_url
+                for endpoint in self.model_endpoint_scheduler.endpoints(
+                    endpoint_pool, model_kind
+                )
+            }
+            return base_url in configured and base_url in urls_getter()
         scheduler = (
             self.routing_scheduler
             if endpoint_pool == "local"
@@ -1717,6 +3343,8 @@ class LocalAttributeExtractor:
 
     def routing_capacity(self, model_kind: str) -> int | None:
         """Return authoritative dynamic capacity, or ``None`` in static mode."""
+        if self.model_endpoint_scheduler is not None:
+            return self.model_endpoint_scheduler.capacity("local", model_kind)
         if self.routing_scheduler is None:
             return None
         return self.routing_scheduler.capacity(model_kind)
@@ -1727,6 +3355,16 @@ class LocalAttributeExtractor:
         endpoint_pool: str,
         timeout_seconds: float,
     ) -> bool:
+        if self.model_endpoint_scheduler is not None:
+            _lock, urls_getter, _inflight, _index_name = (
+                self._endpoint_pool_state(model_kind, endpoint_pool)
+            )
+            return self.model_endpoint_scheduler.wait_for_capacity(
+                endpoint_pool,
+                model_kind,
+                timeout_seconds,
+                available_urls_getter=urls_getter,
+            )
         scheduler = (
             self.routing_scheduler
             if endpoint_pool == "local"
@@ -1935,6 +3573,8 @@ class LocalAttributeExtractor:
         api_key: str | None,
         messages: list[dict[str, Any]],
         model_kind: str = "text",
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
     ) -> str:
         headers = {"Content-Type": "application/json"}
         if api_key:
@@ -1945,8 +3585,21 @@ class LocalAttributeExtractor:
             "temperature": self.temperature,
             "max_tokens": self.image_max_tokens if model_kind == "image" else self.max_tokens,
         }
-        if self.disable_thinking:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        # This is deliberately unconditional: both text and visual Qwen calls
+        # must use their direct-answer path on every endpoint.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": (
+                        response_schema_name
+                        or "mm_joinability_structured_extraction"
+                    ),
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             started = time.perf_counter()
@@ -2178,19 +3831,446 @@ class LocalAttributeExtractor:
             "error": "",
         }
 
+    def _auto_check_review_batch(
+        self,
+        *,
+        task: ExtractionTask,
+        attribute_name: str,
+        claimed_value: str,
+    ) -> dict[str, Any]:
+        target_name = normalize(attribute_name)
+        masked_row = [
+            dict(item)
+            for item in canonical_extraction_row_attributes(
+                task.entity.get("row_attributes")
+            )
+            if normalize(item.get("name")) != target_name
+        ]
+        review_id = "model_check_" + stable_hash(
+            task.cache_key,
+            attribute_name,
+            claimed_value,
+            length=20,
+        )
+        query_entity = dict(task.entity)
+        query_entity.pop("row_attributes", None)
+        return {
+            "query_table_id": (
+                f"model_check:{task.source_table_id}:{task.source_row_id}"
+            ),
+            "target_table_id": "",
+            "source_table_id": task.source_table_id,
+            "split": "model_auto_check",
+            "query_row_ids": [str(task.source_row_id)],
+            "items": [
+                {
+                    "review_id": review_id,
+                    "recovery_id": "",
+                    "path_id": "",
+                    "query_row_id": str(task.source_row_id),
+                    "masked_row": masked_row,
+                    "masked_attribute_was_present": True,
+                    "query_entity": query_entity,
+                    "attribute": {
+                        "name": attribute_name,
+                        # review_messages intentionally omits this value.
+                        "value": claimed_value,
+                    },
+                    "evidence": {
+                        "asset_id": clean_text(task.asset.get("asset_id")),
+                        "asset_type": clean_text(task.asset.get("asset_type")),
+                        "title": clean_text(task.asset.get("title")),
+                        "source": clean_text(task.asset.get("source")),
+                        "content": clean_text(task.asset.get("content"))[:6000],
+                        "image_sha256": clean_text(task.asset.get("sha256")),
+                    },
+                    "image_path": clean_text(task.asset.get("local_path")),
+                }
+            ],
+        }
+
+    def extract_auto_check_value(
+        self,
+        *,
+        task: ExtractionTask,
+        attribute_name: str,
+        claimed_value: str,
+        endpoint_pool: str = "local",
+    ) -> str:
+        """Blindly re-extract one physically masked attribute from one asset."""
+        # Import lazily because the standalone checker imports this builder for
+        # normalization and image helpers.
+        from mm_joinability_dataset_auto_checker import (
+            AUTO_CHECK_EXTRACTION_SCHEMA,
+            parse_model_extractions,
+            review_messages,
+        )
+
+        batch = self._auto_check_review_batch(
+            task=task,
+            attribute_name=attribute_name,
+            claimed_value=claimed_value,
+        )
+        model_kind = model_kind_for_asset(task.asset)
+        api_key = (
+            self.remote_image_model_api_key
+            if endpoint_pool == "remote" and model_kind == "image"
+            else self.remote_text_model_api_key
+            if endpoint_pool == "remote"
+            else self.image_model_api_key
+            if model_kind == "image"
+            else self.text_model_api_key
+        )
+        model_name = (
+            self.image_model_name if model_kind == "image" else self.text_model_name
+        )
+        messages = review_messages(
+            [batch],
+            image_max_pixels=self.image_request_max_pixels,
+        )
+        with self._lease_endpoint_pool(model_kind, endpoint_pool) as base_url:
+            raw = self.chat(
+                base_url=base_url,
+                model=model_name,
+                api_key=api_key,
+                messages=messages,
+                model_kind=model_kind,
+                response_schema=AUTO_CHECK_EXTRACTION_SCHEMA,
+                response_schema_name=(
+                    "mm_joinability_single_attribute_extraction"
+                ),
+            )
+        extraction = parse_model_extractions(raw, [batch])[batch["query_table_id"]]
+        if len(extraction) != 1:
+            raise ValueError("auto checker returned an invalid extraction count")
+        return clean_text(extraction[0].get("extracted_value"))
+
+    def review_auto_check_attribute(
+        self,
+        *,
+        task: ExtractionTask,
+        attribute_name: str,
+        claimed_value: str,
+        endpoint_pool: str = "local",
+        defer_remote: bool = False,
+        local_review: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run local -> Luna recovery -> Terra adjudication, fail closed."""
+        from mm_joinability_dataset_auto_checker import _safe_error_code
+
+        def classify(value: str) -> tuple[str, str]:
+            if not value:
+                return "insufficient", "empty_extraction"
+            if values_match(
+                value,
+                claimed_value,
+                attribute_name=attribute_name,
+                entity_column_name=task.entity_column_name,
+            ):
+                return "supported", "normalized_values_match"
+            return "contradicted", "extracted_value_mismatch"
+
+        def results_agree(left_value: str, right_value: str) -> bool:
+            left_value = clean_text(left_value)
+            right_value = clean_text(right_value)
+            if not left_value or not right_value:
+                return not left_value and not right_value
+            return values_match(
+                left_value,
+                right_value,
+                attribute_name=attribute_name,
+                entity_column_name=task.entity_column_name,
+            ) or values_match(
+                right_value,
+                left_value,
+                attribute_name=attribute_name,
+                entity_column_name=task.entity_column_name,
+            )
+
+        def extract_with(
+            reviewer: Any,
+            batch: dict[str, Any],
+            *,
+            on_selected: Callable[[dict[str, Any]], None] | None = None,
+        ) -> str:
+            extract_batch = getattr(reviewer, "extract_batch", None)
+            if callable(extract_batch):
+                extracted = extract_batch(batch, on_selected=on_selected)
+            else:
+                extracted = reviewer.extract_batches([batch]).get(
+                    batch["query_table_id"]
+                )
+            if not isinstance(extracted, list) or len(extracted) != 1:
+                raise ValueError("auto checker returned an invalid extraction count")
+            return clean_text(extracted[0].get("extracted_value"))
+
+        state: dict[str, Any] = {
+            "primary_extracted_value": "",
+            "primary_verdict": None,
+            "primary_comparison": "auto_check_failed",
+            "primary_error_code": "",
+            "luna_triggered": False,
+            "luna_extracted_value": None,
+            "luna_verdict": None,
+            "luna_comparison": None,
+            "luna_agrees_with_local": None,
+            "luna_error_code": "",
+            "terra_triggered": False,
+            "terra_extracted_value": None,
+            "terra_verdict": None,
+            "terra_comparison": None,
+            "terra_error_code": "",
+            "initial_reviewer_profile": None,
+            "initial_reviewer_model": None,
+            "final_judge_profile": None,
+            "final_judge_model": None,
+            "final_judge_triggered": False,
+        }
+
+        def finish(
+            *,
+            value: str,
+            verdict: str,
+            comparison: str,
+            source: str,
+            complete: bool,
+            error_code: str = "",
+        ) -> dict[str, Any]:
+            return {
+                "extracted_value": value,
+                "verdict": verdict,
+                "comparison": comparison,
+                "decision_source": source,
+                "review_complete": complete,
+                "error_code": error_code,
+                **state,
+                # Backward-compatible aliases; secondary means Luna in v2.
+                "secondary_triggered": state["luna_triggered"],
+                "secondary_extracted_value": state["luna_extracted_value"],
+                "secondary_verdict": state["luna_verdict"],
+                "secondary_comparison": state["luna_comparison"],
+            }
+
+        if local_review is None:
+            try:
+                primary_value = self.extract_auto_check_value(
+                    task=task,
+                    attribute_name=attribute_name,
+                    claimed_value=claimed_value,
+                    endpoint_pool=endpoint_pool,
+                )
+            except Exception as error:
+                error_code = _safe_error_code(error)
+                state["primary_error_code"] = error_code
+                return finish(
+                    value="",
+                    verdict="insufficient",
+                    comparison="auto_check_failed",
+                    source="primary_local_incomplete",
+                    complete=False,
+                    error_code=error_code,
+                )
+            primary_verdict, primary_comparison = classify(primary_value)
+            state.update(
+                primary_extracted_value=primary_value,
+                primary_verdict=primary_verdict,
+                primary_comparison=primary_comparison,
+            )
+        else:
+            primary_value = clean_text(
+                local_review.get("primary_extracted_value")
+                or local_review.get("extracted_value")
+            )
+            primary_verdict = clean_text(local_review.get("primary_verdict"))
+            primary_comparison = clean_text(
+                local_review.get("primary_comparison")
+            )
+            if primary_verdict not in {
+                "supported",
+                "contradicted",
+                "insufficient",
+            }:
+                primary_verdict, primary_comparison = classify(primary_value)
+            state.update(
+                primary_extracted_value=primary_value,
+                primary_verdict=primary_verdict,
+                primary_comparison=primary_comparison,
+                primary_error_code=clean_text(
+                    local_review.get("primary_error_code")
+                ),
+            )
+        if primary_verdict == "supported":
+            return finish(
+                value=primary_value,
+                verdict=primary_verdict,
+                comparison=primary_comparison,
+                source="primary_local",
+                complete=True,
+            )
+
+        luna = getattr(self, "auto_check_luna_reviewer", None)
+        if luna is None:
+            return finish(
+                value=primary_value,
+                verdict=primary_verdict,
+                comparison=primary_comparison,
+                source="primary_local",
+                complete=True,
+            )
+
+        if defer_remote:
+            return finish(
+                value=primary_value,
+                verdict=primary_verdict,
+                comparison=primary_comparison,
+                source="remote_review_pending",
+                complete=False,
+            )
+
+        batch = self._auto_check_review_batch(
+            task=task,
+            attribute_name=attribute_name,
+            claimed_value=claimed_value,
+        )
+        def record_initial_identity(initial_identity: dict[str, Any]) -> None:
+            state["initial_reviewer_profile"] = clean_text(
+                initial_identity.get("api_profile")
+            ) or None
+            state["initial_reviewer_model"] = clean_text(
+                initial_identity.get("model")
+            ) or None
+        state["luna_triggered"] = True
+        try:
+            luna_value = extract_with(
+                luna,
+                batch,
+                on_selected=record_initial_identity,
+            )
+        except Exception as error:
+            error_code = _safe_error_code(error)
+            state["luna_error_code"] = error_code
+            return finish(
+                value="",
+                verdict="insufficient",
+                comparison="luna_recovery_failed",
+                source="luna_recovery_incomplete",
+                complete=False,
+                error_code=error_code,
+            )
+
+        luna_verdict, luna_comparison = classify(luna_value)
+        state.update(
+            luna_extracted_value=luna_value,
+            luna_verdict=luna_verdict,
+            luna_comparison=luna_comparison,
+            luna_agrees_with_local=results_agree(primary_value, luna_value),
+        )
+        if state["luna_agrees_with_local"]:
+            return finish(
+                value=luna_value,
+                verdict=luna_verdict,
+                comparison=luna_comparison,
+                source="local_luna_consensus",
+                complete=True,
+            )
+
+        terra = getattr(self, "auto_check_terra_reviewer", None)
+        if terra is None:
+            dynamic_final_pool = getattr(luna, "companion_final_pool", None)
+            if dynamic_final_pool is not None and dynamic_final_pool.has_reviewers():
+                terra = dynamic_final_pool
+        if terra is None:
+            return finish(
+                value="",
+                verdict="insufficient",
+                comparison="final_judge_failed",
+                source="final_judge_incomplete",
+                complete=False,
+                error_code="model_review_failed:final_judge_not_configured",
+            )
+        state["terra_triggered"] = True
+        state["final_judge_triggered"] = True
+        def record_final_identity(final_identity: dict[str, Any]) -> None:
+            state["final_judge_profile"] = clean_text(
+                final_identity.get("api_profile")
+            ) or None
+            state["final_judge_model"] = clean_text(
+                final_identity.get("model")
+            ) or None
+        try:
+            terra_value = extract_with(
+                terra,
+                batch,
+                on_selected=record_final_identity,
+            )
+        except Exception as error:
+            error_code = _safe_error_code(error)
+            state["terra_error_code"] = error_code
+            return finish(
+                value="",
+                verdict="insufficient",
+                comparison="final_judge_failed",
+                source="final_judge_incomplete",
+                complete=False,
+                error_code=error_code,
+            )
+
+        terra_verdict, terra_comparison = classify(terra_value)
+        state.update(
+            terra_extracted_value=terra_value,
+            terra_verdict=terra_verdict,
+            terra_comparison=terra_comparison,
+        )
+        return finish(
+            value=terra_value,
+            verdict=terra_verdict,
+            comparison=terra_comparison,
+            source=(
+                "final_judge"
+                if state["final_judge_model"]
+                else "terra_adjudication"
+            ),
+            complete=True,
+        )
+
+    def complete_auto_check_attribute_review(
+        self,
+        *,
+        task: ExtractionTask,
+        attribute_name: str,
+        claimed_value: str,
+        local_review: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Finish a deferred Luna/Terra review without repeating local inference."""
+        return self.review_auto_check_attribute(
+            task=task,
+            attribute_name=attribute_name,
+            claimed_value=claimed_value,
+            local_review=local_review,
+        )
+
 
 class ExtractionCache:
-    def __init__(self, path: Path, reuse: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        reuse: bool = True,
+        record_key_alias: Callable[[dict[str, Any]], str | None] | None = None,
+    ) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.items: dict[str, dict[str, Any]] = {}
         self.transient_items: dict[str, dict[str, Any]] = {}
+        self.record_key_alias = record_key_alias
         self._lock = threading.Lock()
         if reuse and path.exists():
             for record in iter_jsonl_records([path]):
                 key = clean_text(record.get("cache_key"))
                 if key:
                     self.items[key] = record
+                alias = record_key_alias(record) if record_key_alias else None
+                if alias:
+                    self.items[alias] = record
 
     def get(self, key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -2203,6 +4283,9 @@ class ExtractionCache:
     def put(self, key: str, record: dict[str, Any]) -> None:
         with self._lock:
             self.items[key] = record
+            alias = self.record_key_alias(record) if self.record_key_alias else None
+            if alias:
+                self.items[alias] = record
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -2313,6 +4396,408 @@ class ExtractionTask:
     entity: dict[str, Any]
     asset: dict[str, Any]
     candidate_attribute_names: list[str]
+
+
+def apply_model_auto_check(
+    *,
+    extractor: Any,
+    task: ExtractionTask,
+    record: dict[str, Any],
+    endpoint_pool: str = "local",
+    defer_remote: bool = False,
+    existing_reviews: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Keep only model attributes confirmed by an independent blind check.
+
+    The first model response is retained in ``model_attributes`` for auditability.
+    Downstream construction consumes only ``attributes``, which is fail-closed:
+    mismatches, empty extractions, and checker errors are all removed.
+    """
+    if not getattr(extractor, "auto_check_enabled", False):
+        return record
+    reviewer = getattr(extractor, "review_auto_check_attribute", None)
+    checker = getattr(extractor, "extract_auto_check_value", None)
+    deferred_reviewer = getattr(
+        extractor,
+        "complete_auto_check_attribute_review",
+        None,
+    )
+    if not callable(reviewer) and not callable(checker):
+        raise RuntimeError(
+            "auto-check is enabled but the extractor has no "
+            "review_auto_check_attribute or extract_auto_check_value method"
+        )
+
+    model_attributes = normalize_extracted_attributes(
+        {"attributes": record.get("attributes")},
+        task.candidate_attribute_names,
+    )
+    source_values: dict[str, tuple[str, str]] = {}
+    for item in canonical_extraction_row_attributes(
+        task.entity.get("row_attributes")
+    ):
+        normalized_name = normalize(item.get("name"))
+        if normalized_name and normalized_name not in source_values:
+            source_values[normalized_name] = (
+                clean_text(item.get("name")),
+                clean_text(item.get("value")),
+            )
+
+    kept: list[dict[str, str]] = []
+    reviews: list[dict[str, Any]] = []
+    stats = getattr(extractor, "model_auto_check_stats", None)
+    predictions_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for predicted in model_attributes:
+        normalized_name = normalize(predicted.get("name"))
+        if normalized_name:
+            predictions_by_name[normalized_name].append(predicted)
+    for normalized_name, predictions in predictions_by_name.items():
+        existing_review = (existing_reviews or {}).get(normalized_name)
+        source_attribute = source_values.get(normalized_name)
+        model_values = [clean_text(item.get("value")) for item in predictions]
+        model_value = model_values[0] if model_values else ""
+        extracted_value = ""
+        error_code = ""
+        decision_source = "model_analysis"
+        review_complete = True
+        primary_extracted_value: str | None = None
+        primary_verdict: str | None = None
+        primary_comparison: str | None = None
+        primary_error_code = ""
+        luna_triggered = False
+        luna_extracted_value: str | None = None
+        luna_verdict: str | None = None
+        luna_comparison: str | None = None
+        luna_agrees_with_local: bool | None = None
+        luna_error_code = ""
+        terra_triggered = False
+        terra_extracted_value: str | None = None
+        terra_verdict: str | None = None
+        terra_comparison: str | None = None
+        terra_error_code = ""
+        initial_reviewer_profile: str | None = None
+        initial_reviewer_model: str | None = None
+        final_judge_profile: str | None = None
+        final_judge_model: str | None = None
+        final_judge_triggered = False
+        secondary_triggered = False
+        secondary_extracted_value: str | None = None
+        secondary_verdict: str | None = None
+        secondary_comparison: str | None = None
+        if source_attribute is None:
+            attribute_name = clean_text(predictions[0].get("name"))
+            claimed_value = ""
+            verdict = "insufficient"
+            comparison = "source_attribute_missing"
+        else:
+            attribute_name, claimed_value = source_attribute
+            matching_model_values = [
+                value
+                for value in model_values
+                if values_match(
+                    value,
+                    claimed_value,
+                    attribute_name=attribute_name,
+                    entity_column_name=task.entity_column_name,
+                )
+            ]
+            if not matching_model_values:
+                verdict = "contradicted"
+                comparison = "model_value_mismatch"
+            else:
+                model_value = matching_model_values[0]
+                if callable(reviewer):
+                    try:
+                        if existing_review is not None and bool(
+                            existing_review.get("review_complete")
+                        ):
+                            review = dict(existing_review)
+                        elif existing_review is not None and callable(
+                            deferred_reviewer
+                        ):
+                            review = deferred_reviewer(
+                                task=task,
+                                attribute_name=attribute_name,
+                                claimed_value=claimed_value,
+                                local_review=existing_review,
+                            )
+                        else:
+                            review_kwargs = {
+                                "task": task,
+                                "attribute_name": attribute_name,
+                                "claimed_value": claimed_value,
+                                "endpoint_pool": endpoint_pool,
+                            }
+                            if defer_remote and callable(deferred_reviewer):
+                                review_kwargs["defer_remote"] = True
+                            review = reviewer(**review_kwargs)
+                        if not isinstance(review, dict):
+                            raise TypeError(
+                                "auto checker review must be an object"
+                            )
+                    except Exception as error:
+                        verdict = "insufficient"
+                        comparison = "auto_check_failed"
+                        error_code = type(error).__name__
+                        review_complete = False
+                        decision_source = "checker_failed"
+                    else:
+                        extracted_value = clean_text(
+                            review.get("extracted_value")
+                        )
+                        verdict = clean_text(review.get("verdict"))
+                        if verdict not in {
+                            "supported",
+                            "contradicted",
+                            "insufficient",
+                        }:
+                            verdict = "insufficient"
+                        comparison = clean_text(review.get("comparison")) or (
+                            "auto_check_failed"
+                        )
+                        decision_source = clean_text(
+                            review.get("decision_source")
+                        ) or "primary_local"
+                        review_complete = bool(review.get("review_complete"))
+                        error_code = clean_text(review.get("error_code"))
+                        primary_extracted_value = clean_text(
+                            review.get("primary_extracted_value")
+                        )
+                        primary_verdict = clean_text(
+                            review.get("primary_verdict")
+                        ) or None
+                        primary_comparison = clean_text(
+                            review.get("primary_comparison")
+                        ) or None
+                        primary_error_code = clean_text(
+                            review.get("primary_error_code")
+                        )
+                        luna_triggered = bool(review.get("luna_triggered"))
+                        raw_luna_value = review.get("luna_extracted_value")
+                        luna_extracted_value = (
+                            clean_text(raw_luna_value)
+                            if raw_luna_value is not None
+                            else None
+                        )
+                        luna_verdict = clean_text(review.get("luna_verdict")) or None
+                        luna_comparison = (
+                            clean_text(review.get("luna_comparison")) or None
+                        )
+                        raw_luna_agreement = review.get("luna_agrees_with_local")
+                        luna_agrees_with_local = (
+                            bool(raw_luna_agreement)
+                            if raw_luna_agreement is not None
+                            else None
+                        )
+                        luna_error_code = clean_text(
+                            review.get("luna_error_code")
+                        )
+                        terra_triggered = bool(review.get("terra_triggered"))
+                        raw_terra_value = review.get("terra_extracted_value")
+                        terra_extracted_value = (
+                            clean_text(raw_terra_value)
+                            if raw_terra_value is not None
+                            else None
+                        )
+                        terra_verdict = (
+                            clean_text(review.get("terra_verdict")) or None
+                        )
+                        terra_comparison = (
+                            clean_text(review.get("terra_comparison")) or None
+                        )
+                        terra_error_code = clean_text(
+                            review.get("terra_error_code")
+                        )
+                        initial_reviewer_profile = (
+                            clean_text(review.get("initial_reviewer_profile"))
+                            or None
+                        )
+                        initial_reviewer_model = (
+                            clean_text(review.get("initial_reviewer_model"))
+                            or None
+                        )
+                        final_judge_profile = (
+                            clean_text(review.get("final_judge_profile"))
+                            or None
+                        )
+                        final_judge_model = (
+                            clean_text(review.get("final_judge_model"))
+                            or None
+                        )
+                        final_judge_triggered = bool(
+                            review.get("final_judge_triggered")
+                        )
+                        secondary_triggered = bool(
+                            review.get("secondary_triggered")
+                        )
+                        raw_secondary_value = review.get(
+                            "secondary_extracted_value"
+                        )
+                        secondary_extracted_value = (
+                            clean_text(raw_secondary_value)
+                            if raw_secondary_value is not None
+                            else None
+                        )
+                        secondary_verdict = clean_text(
+                            review.get("secondary_verdict")
+                        ) or None
+                        secondary_comparison = clean_text(
+                            review.get("secondary_comparison")
+                        ) or None
+                        if verdict == "supported" and review_complete:
+                            kept.append(
+                                {
+                                    "name": attribute_name,
+                                    "value": claimed_value,
+                                }
+                            )
+                else:
+                    try:
+                        extracted_value = clean_text(
+                            checker(
+                                task=task,
+                                attribute_name=attribute_name,
+                                claimed_value=claimed_value,
+                                endpoint_pool=endpoint_pool,
+                            )
+                        )
+                    except Exception as error:
+                        verdict = "insufficient"
+                        comparison = "auto_check_failed"
+                        error_code = type(error).__name__
+                        review_complete = False
+                        decision_source = "checker_failed"
+                    else:
+                        if not extracted_value:
+                            verdict = "insufficient"
+                            comparison = "empty_extraction"
+                        elif values_match(
+                            extracted_value,
+                            claimed_value,
+                            attribute_name=attribute_name,
+                            entity_column_name=task.entity_column_name,
+                        ):
+                            verdict = "supported"
+                            comparison = "normalized_values_match"
+                            decision_source = "primary_local"
+                            kept.append(
+                                {
+                                    "name": attribute_name,
+                                    "value": claimed_value,
+                                }
+                            )
+                        else:
+                            verdict = "contradicted"
+                            comparison = "extracted_value_mismatch"
+                            decision_source = "primary_local"
+        if (
+            decision_source != "remote_review_pending"
+            and not (
+                existing_review is not None
+                and bool(existing_review.get("review_complete"))
+            )
+            and stats is not None
+            and hasattr(stats, "record")
+        ):
+            stats.record(
+                verdict,
+                error=bool(error_code),
+                luna_triggered=luna_triggered,
+                luna_verdict=luna_verdict,
+                terra_triggered=terra_triggered,
+                terra_verdict=terra_verdict,
+                decision_source=decision_source,
+            )
+        reviews.append(
+            {
+                "attribute_name": attribute_name,
+                "claimed_value": claimed_value,
+                "model_value": model_value,
+                "extracted_value": extracted_value,
+                "verdict": verdict,
+                "comparison": comparison,
+                "error_code": error_code,
+                "review_complete": review_complete,
+                "decision_source": decision_source,
+                "primary_extracted_value": primary_extracted_value,
+                "primary_verdict": primary_verdict,
+                "primary_comparison": primary_comparison,
+                "primary_error_code": primary_error_code,
+                "luna_triggered": luna_triggered,
+                "luna_extracted_value": luna_extracted_value,
+                "luna_verdict": luna_verdict,
+                "luna_comparison": luna_comparison,
+                "luna_agrees_with_local": luna_agrees_with_local,
+                "luna_error_code": luna_error_code,
+                "terra_triggered": terra_triggered,
+                "terra_extracted_value": terra_extracted_value,
+                "terra_verdict": terra_verdict,
+                "terra_comparison": terra_comparison,
+                "terra_error_code": terra_error_code,
+                "initial_reviewer_profile": initial_reviewer_profile,
+                "initial_reviewer_model": initial_reviewer_model,
+                "final_judge_profile": final_judge_profile,
+                "final_judge_model": final_judge_model,
+                "final_judge_triggered": final_judge_triggered,
+                "secondary_triggered": secondary_triggered,
+                "secondary_extracted_value": secondary_extracted_value,
+                "secondary_verdict": secondary_verdict,
+                "secondary_comparison": secondary_comparison,
+            }
+        )
+
+    updated = dict(record)
+    updated["model_attributes"] = model_attributes
+    updated["attributes"] = kept
+    updated["auto_check"] = {
+        "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "policy": "keep_source_canonical_supported_only_fail_closed",
+        "reviewed_attributes": len(reviews),
+        "supported_attributes": len(kept),
+        "filtered_attributes": len(reviews) - len(kept),
+        "reviews": reviews,
+    }
+    return updated
+
+
+def model_auto_check_has_remote_pending(record: dict[str, Any]) -> bool:
+    auto_check = record.get("auto_check")
+    reviews = auto_check.get("reviews") if isinstance(auto_check, dict) else None
+    return bool(
+        isinstance(reviews, list)
+        and any(
+            isinstance(review, dict)
+            and not bool(review.get("review_complete"))
+            and clean_text(review.get("decision_source"))
+            == "remote_review_pending"
+            for review in reviews
+        )
+    )
+
+
+def complete_deferred_model_auto_check(
+    *,
+    extractor: Any,
+    task: ExtractionTask,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Complete pending OpenAI reviews without repeating model analysis/checks."""
+    auto_check = record.get("auto_check")
+    reviews = auto_check.get("reviews") if isinstance(auto_check, dict) else []
+    existing_reviews = {
+        normalize(review.get("attribute_name")): review
+        for review in reviews
+        if isinstance(review, dict) and normalize(review.get("attribute_name"))
+    }
+    analysis_record = dict(record)
+    analysis_record["attributes"] = list(record.get("model_attributes") or [])
+    analysis_record.pop("auto_check", None)
+    return apply_model_auto_check(
+        extractor=extractor,
+        task=task,
+        record=analysis_record,
+        existing_reviews=existing_reviews,
+    )
 
 
 @dataclass
@@ -2496,6 +4981,7 @@ def run_extraction_task(
     extractor: LocalAttributeExtractor,
     task: ExtractionTask,
     endpoint_pool: str = "local",
+    apply_auto_check_gate: bool = True,
 ) -> dict[str, Any]:
     try:
         if endpoint_pool == "local":
@@ -2525,7 +5011,15 @@ def run_extraction_task(
         }
     except Exception as exc:
         result = {"attributes": [], "raw_response": "", "error": str(exc)}
-    return extraction_record_from_result(task, result)
+    record = extraction_record_from_result(task, result)
+    if apply_auto_check_gate and not clean_text(record.get("error")):
+        record = apply_model_auto_check(
+            extractor=extractor,
+            task=task,
+            record=record,
+            endpoint_pool=endpoint_pool,
+        )
+    return record
 
 
 def run_extraction_task_group(
@@ -2534,28 +5028,36 @@ def run_extraction_task_group(
     tasks: list[ExtractionTask],
     workers: int,
     endpoint_pool: str = "local",
+    apply_auto_check_gate: bool = True,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not tasks:
         return {}
     workers = max(1, min(workers, len(tasks)))
-    if workers == 1:
+    if workers == 1 and executor is None:
         records = {}
         for task in tasks:
-            record = run_extraction_task(extractor, task, endpoint_pool)
+            record = run_extraction_task(
+                extractor,
+                task,
+                endpoint_pool,
+                apply_auto_check_gate,
+            )
             records[task.cache_key] = record
             if on_record is not None:
                 on_record(task.cache_key, record)
         return records
 
-    records: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    def collect(pool: ThreadPoolExecutor) -> dict[str, dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
         future_to_task = {
             pool.submit(
                 run_extraction_task,
                 extractor,
                 task,
                 endpoint_pool,
+                apply_auto_check_gate,
             ): task
             for task in tasks
         }
@@ -2570,7 +5072,12 @@ def run_extraction_task_group(
                 )
             if on_record is not None:
                 on_record(task.cache_key, records[task.cache_key])
-    return records
+        return records
+
+    if executor is not None:
+        return collect(executor)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return collect(pool)
 
 
 def run_extraction_kind_adaptive(
@@ -2580,6 +5087,7 @@ def run_extraction_kind_adaptive(
     model_kind: str,
     state: ModelConcurrencyState,
     endpoint_pool: str = "local",
+    apply_auto_check_gate: bool = True,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     configured_workers = state.workers_for(model_kind, endpoint_pool)
@@ -2600,6 +5108,7 @@ def run_extraction_kind_adaptive(
         tasks=tasks,
         workers=workers,
         endpoint_pool=endpoint_pool,
+        apply_auto_check_gate=apply_auto_check_gate,
         on_record=handle_initial_record,
     )
     oom_tasks = [
@@ -2627,6 +5136,7 @@ def run_extraction_kind_adaptive(
                 tasks=oom_tasks,
                 workers=1,
                 endpoint_pool=endpoint_pool,
+                apply_auto_check_gate=apply_auto_check_gate,
                 on_record=on_record,
             )
         )
@@ -2641,6 +5151,7 @@ def run_extraction_kind_distributed(
     tasks: list[ExtractionTask],
     model_kind: str,
     state: ModelConcurrencyState,
+    apply_auto_check_gate: bool = True,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Let independent local and remote worker groups consume one task queue."""
@@ -2662,6 +5173,7 @@ def run_extraction_kind_distributed(
             model_kind=model_kind,
             state=state,
             endpoint_pool=endpoint_pool,
+            apply_auto_check_gate=apply_auto_check_gate,
             on_record=on_record,
         )
     if not tasks:
@@ -2710,7 +5222,12 @@ def run_extraction_kind_distributed(
                 task = task_queue.get_nowait()
             except queue.Empty:
                 return
-            record = run_extraction_task(extractor, task, endpoint_pool)
+            record = run_extraction_task(
+                extractor,
+                task,
+                endpoint_pool,
+                apply_auto_check_gate,
+            )
             if (
                 endpoint_pool == "remote"
                 and record.get("error_class") == "model_endpoint_transient"
@@ -2768,6 +5285,7 @@ def run_extraction_kind_distributed(
                     tasks=oom_tasks,
                     workers=1,
                     endpoint_pool=endpoint_pool,
+                    apply_auto_check_gate=apply_auto_check_gate,
                     on_record=on_record,
                 )
             )
@@ -2781,6 +5299,7 @@ def run_uncached_extraction_tasks(
     extractor: LocalAttributeExtractor,
     tasks: list[ExtractionTask],
     state: ModelConcurrencyState,
+    apply_auto_check_gate: bool = True,
     on_record: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     groups: dict[str, list[ExtractionTask]] = {"text": [], "image": []}
@@ -2802,6 +5321,7 @@ def run_uncached_extraction_tasks(
                     tasks=group_tasks,
                     model_kind=kind,
                     state=state,
+                    apply_auto_check_gate=apply_auto_check_gate,
                     on_record=on_record,
                 )
             )
@@ -2819,6 +5339,7 @@ def run_uncached_extraction_tasks(
                 tasks=group_tasks,
                 model_kind=kind,
                 state=state,
+                apply_auto_check_gate=apply_auto_check_gate,
                 on_record=on_record,
             ): kind
             for kind, group_tasks in active_groups
@@ -2828,7 +5349,56 @@ def run_uncached_extraction_tasks(
     return records
 
 
-def cached_extraction_is_reusable(record: dict[str, Any], args: argparse.Namespace) -> bool:
+def model_auto_check_is_complete(
+    record: dict[str, Any],
+    *,
+    required: bool = False,
+) -> bool:
+    """Return whether an attached post-analysis check reached a final decision.
+
+    Records without ``auto_check`` remain valid for callers that explicitly use
+    an extractor without the gate. When ``required`` is true, a legacy analysis
+    record without the current gate is incomplete and must be upgraded in place.
+    Malformed reviews, checker errors, and interrupted reviews must be retried.
+    A primary-local error is still terminal when the OpenAI secondary completed;
+    only the final ``error_code`` and ``review_complete`` fields govern reuse.
+    """
+    if "auto_check" not in record:
+        return not required
+    auto_check = record.get("auto_check")
+    if not isinstance(auto_check, dict):
+        return False
+    if clean_text(auto_check.get("schema_version")) != MODEL_AUTO_CHECK_SCHEMA_VERSION:
+        return False
+    reviews = auto_check.get("reviews")
+    if not isinstance(reviews, list):
+        return False
+    try:
+        reviewed_attributes = int(auto_check.get("reviewed_attributes", -1))
+    except (TypeError, ValueError):
+        return False
+    if reviewed_attributes != len(reviews):
+        return False
+    return all(
+        isinstance(review, dict)
+        and bool(review.get("review_complete"))
+        and not clean_text(review.get("error_code"))
+        for review in reviews
+    )
+
+
+def auto_check_required(extractor: Any | None) -> bool:
+    return bool(extractor is not None and getattr(extractor, "auto_check_enabled", False))
+
+
+def cached_extraction_is_reusable(
+    record: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    require_auto_check: bool = False,
+) -> bool:
+    # Model extraction is a high-recall discovery cache.  Query-level recovery
+    # checks are intentionally not part of its reuse contract.
     if clean_text(record.get("error")) and not getattr(args, "cache_failed_model_outputs", False):
         return False
     if getattr(args, "refresh_invalid_model_cache", False) and should_refresh_cached_extraction(record):
@@ -2836,11 +5406,801 @@ def cached_extraction_is_reusable(record: dict[str, Any], args: argparse.Namespa
     return True
 
 
+def candidate_extraction_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Expose the original model candidates, including legacy gated caches."""
+    updated = dict(record)
+    model_attributes = record.get("model_attributes")
+    if isinstance(model_attributes, list):
+        updated["attributes"] = model_attributes
+    # The old field represented a global pre-query gate.  Keep any completed
+    # reviews available for migration, but do not expose its filtered values.
+    updated.pop("auto_check", None)
+    return updated
+
+
+def _query_recovery_auto_check_key_fields(
+    *,
+    schema_version: str,
+    extraction_cache_key: Any,
+    attribute_name: Any,
+    claimed_value: Any,
+) -> str:
+    return stable_hash(
+        schema_version,
+        extraction_cache_key,
+        attribute_name,
+        claimed_value,
+        length=32,
+    )
+
+
+def _query_recovery_evidence_identity_fields(
+    *,
+    asset_id: Any,
+    asset_type: Any,
+    entity_id: Any,
+    entity_text: Any,
+    entity_wiki_title: Any,
+    row_attributes: Any,
+    attribute_name: Any,
+    claimed_value: Any,
+) -> dict[str, Any]:
+    """Return the model-independent semantic identity of one evidence check."""
+    target_name = normalize(attribute_name)
+    masked_row = [
+        item
+        for item in canonical_extraction_row_attributes(row_attributes)
+        if normalize(item.get("name")) != target_name
+    ]
+    return {
+        "cache_version": QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION,
+        "auto_check_schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "asset_id": clean_text(asset_id),
+        "asset_type": clean_text(asset_type),
+        "entity_id": clean_text(entity_id),
+        "entity_text": clean_text(entity_text),
+        "entity_wiki_title": clean_text(entity_wiki_title),
+        "masked_row": masked_row,
+        "attribute_name": target_name,
+        # The remote model never sees the claimed value, but the cached final
+        # verdict is obtained by comparing its blind extraction with this value.
+        "claimed_value": clean_text(claimed_value),
+    }
+
+
+def _query_recovery_evidence_identity_key(
+    identity: dict[str, Any],
+) -> str:
+    return stable_hash(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        length=32,
+    )
+
+
+def query_recovery_remote_evidence_identity(
+    candidate: QueryRecoveryCandidate,
+) -> dict[str, Any]:
+    recovered = candidate.recovery["recovered_attribute"]
+    task = candidate.task
+    return _query_recovery_evidence_identity_fields(
+        asset_id=task.asset.get("asset_id"),
+        asset_type=task.asset.get("asset_type"),
+        entity_id=task.entity.get("entity_id"),
+        entity_text=task.entity.get("cell_text"),
+        entity_wiki_title=task.entity.get("wiki_title"),
+        row_attributes=task.entity.get("row_attributes"),
+        attribute_name=recovered.get("column_name"),
+        claimed_value=recovered.get("value"),
+    )
+
+
+def query_recovery_remote_evidence_key(
+    candidate: QueryRecoveryCandidate,
+) -> str:
+    return _query_recovery_evidence_identity_key(
+        query_recovery_remote_evidence_identity(candidate)
+    )
+
+
+def query_recovery_remote_review_is_complete(
+    record: dict[str, Any],
+) -> bool:
+    """Whether a completed result contains a successful external API review."""
+    auto_check = record.get("auto_check")
+    if not model_auto_check_is_complete(
+        {"auto_check": auto_check}, required=True
+    ):
+        return False
+    reviews = auto_check.get("reviews") if isinstance(auto_check, dict) else []
+    remote_sources = {
+        "luna_recovery",
+        "local_luna_consensus",
+        "terra_adjudication",
+        "final_judge",
+    }
+    return any(
+        isinstance(review, dict)
+        and (
+            bool(review.get("luna_triggered"))
+            or bool(review.get("secondary_triggered"))
+            or bool(review.get("terra_triggered"))
+            or bool(review.get("final_judge_triggered"))
+            or bool(clean_text(review.get("initial_reviewer_model")))
+            or bool(clean_text(review.get("final_judge_model")))
+            or clean_text(review.get("decision_source")) in remote_sources
+        )
+        for review in reviews or []
+    )
+
+
+def query_recovery_auto_check_key(
+    candidate: QueryRecoveryCandidate,
+    _extractor: Any,
+) -> str:
+    recovered = candidate.recovery["recovered_attribute"]
+    return _query_recovery_auto_check_key_fields(
+        schema_version=MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        extraction_cache_key=candidate.task.cache_key,
+        attribute_name=recovered.get("column_name"),
+        claimed_value=recovered.get("value"),
+    )
+
+
+def query_recovery_auto_check_record_key(
+    record: dict[str, Any],
+    extraction_record: dict[str, Any] | None = None,
+) -> str | None:
+    """Derive a reusable alias for a completed recovery review.
+
+    External API decisions use a model-independent evidence alias. Purely local
+    decisions retain the extraction-model-specific alias.
+    """
+    extraction_cache_key = clean_text(record.get("extraction_cache_key"))
+    if not extraction_cache_key:
+        return None
+    if "attribute_name" not in record or "claimed_value" not in record:
+        return None
+    auto_check = record.get("auto_check")
+    schema_version = clean_text(record.get("schema_version"))
+    if not schema_version and isinstance(auto_check, dict):
+        schema_version = clean_text(auto_check.get("schema_version"))
+    if schema_version != MODEL_AUTO_CHECK_SCHEMA_VERSION:
+        return None
+    if not model_auto_check_is_complete(
+        {"auto_check": auto_check}, required=True
+    ):
+        return None
+    if query_recovery_remote_review_is_complete(record):
+        identity = record.get("evidence_identity")
+        if not isinstance(identity, dict) and isinstance(extraction_record, dict):
+            identity = _query_recovery_evidence_identity_fields(
+                asset_id=extraction_record.get("asset_id"),
+                asset_type=extraction_record.get("asset_type"),
+                entity_id=extraction_record.get("entity_id"),
+                entity_text=extraction_record.get("entity_text"),
+                entity_wiki_title=extraction_record.get("entity_wiki_title"),
+                row_attributes=extraction_record.get("row_attributes"),
+                attribute_name=record.get("attribute_name"),
+                claimed_value=record.get("claimed_value"),
+            )
+        if isinstance(identity, dict):
+            return _query_recovery_evidence_identity_key(identity)
+    return _query_recovery_auto_check_key_fields(
+        schema_version=schema_version,
+        extraction_cache_key=extraction_cache_key,
+        attribute_name=record.get("attribute_name"),
+        claimed_value=record.get("claimed_value"),
+    )
+
+
+def query_recovery_plan_row_groups(
+    plan: QueryRecoveryAutoCheckPlan,
+    extractor: Any,
+) -> list[tuple[int, list[QueryRecoveryCandidate]]]:
+    candidates_by_row: dict[int, list[QueryRecoveryCandidate]] = defaultdict(list)
+    seen_keys_by_row: dict[int, set[str]] = defaultdict(set)
+    for candidate in plan.candidates:
+        row_id = int(candidate.recovery["source_row_id"])
+        key = query_recovery_auto_check_key(candidate, extractor)
+        if key in seen_keys_by_row[row_id]:
+            continue
+        seen_keys_by_row[row_id].add(key)
+        candidates_by_row[row_id].append(candidate)
+    ordered_rows = list(dict.fromkeys(plan.source_row_order))
+    ordered_rows.extend(
+        row_id for row_id in candidates_by_row if row_id not in ordered_rows
+    )
+    return [
+        (row_id, candidates_by_row[row_id])
+        for row_id in ordered_rows
+        if candidates_by_row.get(row_id)
+    ]
+
+
+def query_recovery_cached_check(
+    key: str,
+    cache: ExtractionCache,
+    candidate: QueryRecoveryCandidate | None = None,
+) -> dict[str, Any] | None:
+    transient = cache.get_transient(key)
+    if transient is not None:
+        return transient
+    cached = cache.get(key)
+    if cached and model_auto_check_is_complete(
+        {"auto_check": cached.get("auto_check")}, required=True
+    ):
+        return cached
+    if candidate is not None:
+        remote_key = query_recovery_remote_evidence_key(candidate)
+        remote_cached = cache.get(remote_key)
+        if remote_cached and query_recovery_remote_review_is_complete(
+            remote_cached
+        ):
+            return remote_cached
+    return None
+
+
+def query_recovery_plan_needs_model_check(
+    plan: QueryRecoveryAutoCheckPlan,
+    extractor: Any,
+    cache: ExtractionCache,
+    *,
+    exhaustive: bool = False,
+) -> bool:
+    if exhaustive:
+        return any(
+            query_recovery_cached_check(
+                query_recovery_auto_check_key(candidate, extractor),
+                cache,
+                candidate,
+            )
+            is None
+            for _row_id, row_candidates in query_recovery_plan_row_groups(
+                plan, extractor
+            )
+            for candidate in row_candidates
+        )
+    required = max(0, int(plan.required_recovered_rows))
+    if required == 0:
+        return False
+    supported_rows = 0
+    groups = query_recovery_plan_row_groups(plan, extractor)
+    for group_index, (_row_id, row_candidates) in enumerate(groups):
+        row_supported = False
+        has_pending = False
+        for candidate in row_candidates:
+            key = query_recovery_auto_check_key(candidate, extractor)
+            record = query_recovery_cached_check(
+                key, cache, candidate
+            )
+            if record is None:
+                has_pending = True
+                continue
+            if record.get("supported"):
+                row_supported = True
+                break
+        if row_supported:
+            supported_rows += 1
+            if supported_rows >= required:
+                return False
+        elif has_pending:
+            return True
+        remaining_rows = len(groups) - group_index - 1
+        if supported_rows + remaining_rows < required:
+            return False
+    return False
+
+
+def query_recovery_plan_is_supported(
+    plan: QueryRecoveryAutoCheckPlan,
+    extractor: Any,
+    cache: ExtractionCache,
+) -> bool:
+    """Return whether cached checks satisfy one query view's table floor."""
+    required = max(0, int(plan.required_recovered_rows))
+    if required == 0:
+        return True
+    supported_rows = 0
+    for _row_id, row_candidates in query_recovery_plan_row_groups(
+        plan, extractor
+    ):
+        if any(
+            bool(
+                (
+                    query_recovery_cached_check(
+                        query_recovery_auto_check_key(candidate, extractor),
+                        cache,
+                        candidate,
+                    )
+                    or {}
+                ).get("supported")
+            )
+            for candidate in row_candidates
+        ):
+            supported_rows += 1
+            if supported_rows >= required:
+                return True
+    return False
+
+
+def check_query_recovery_candidate(
+    *,
+    candidate: QueryRecoveryCandidate,
+    extractor: Any,
+    endpoint_pool: str = "local",
+    defer_remote: bool = False,
+    local_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    recovered = candidate.recovery["recovered_attribute"]
+    predicted = {
+        "name": recovered["column_name"],
+        "value": recovered["model_value"],
+    }
+    analysis_record = {
+        **candidate.extraction,
+        "attributes": [predicted],
+        "error": "",
+    }
+    if local_result is None:
+        checked = apply_model_auto_check(
+            extractor=extractor,
+            task=candidate.task,
+            record=analysis_record,
+            endpoint_pool=endpoint_pool,
+            defer_remote=defer_remote,
+        )
+    else:
+        pending_record = {
+            **analysis_record,
+            "model_attributes": [predicted],
+            "auto_check": local_result.get("auto_check"),
+        }
+        checked = complete_deferred_model_auto_check(
+            extractor=extractor,
+            task=candidate.task,
+            record=pending_record,
+        )
+    return {
+        "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "supported": bool(checked.get("attributes")),
+        "auto_check": checked.get("auto_check"),
+    }
+
+
+class QueryRecoveryLocalCheckScheduler:
+    """Run blind local checks independently of external-review workers."""
+
+    def __init__(
+        self,
+        *,
+        extractor: Any,
+        state: ModelConcurrencyState,
+    ) -> None:
+        self.extractor = extractor
+        self._lock = threading.Lock()
+        self._assigned: dict[tuple[str, str], int] = defaultdict(int)
+        self._cursors: dict[str, int] = defaultdict(int)
+        self._capacities: dict[tuple[str, str], int] = {}
+        self._executors: dict[tuple[str, str], ThreadPoolExecutor] = {}
+        for model_kind in ("text", "image"):
+            for endpoint_pool in ("local", "remote"):
+                workers = state.workers_for(model_kind, endpoint_pool)
+                if workers <= 0:
+                    continue
+                key = (model_kind, endpoint_pool)
+                self._capacities[key] = workers
+                self._executors[key] = ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix=(
+                        f"query-recovery-{endpoint_pool}-{model_kind}"
+                    ),
+                )
+        self.max_parallelism = sum(self._capacities.values()) or 1
+
+    def _select_pool(self, model_kind: str) -> tuple[str, str]:
+        candidates = [
+            key for key in self._capacities if key[0] == model_kind
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"no query-recovery {model_kind} model workers are configured"
+            )
+        least_loaded = [
+            key
+            for key in candidates
+            if all(
+                self._assigned[key] * self._capacities[other]
+                <= self._assigned[other] * self._capacities[key]
+                for other in candidates
+            )
+        ]
+        cursor = self._cursors[model_kind] % len(candidates)
+        selected = min(
+            least_loaded,
+            key=lambda key: (candidates.index(key) - cursor) % len(candidates),
+        )
+        self._cursors[model_kind] = (
+            candidates.index(selected) + 1
+        ) % len(candidates)
+        return selected
+
+    def submit(self, candidate: QueryRecoveryCandidate) -> Any:
+        model_kind = model_kind_for_asset(candidate.task.asset)
+        with self._lock:
+            selected = self._select_pool(model_kind)
+            self._assigned[selected] += 1
+        endpoint_pool = selected[1]
+        future = self._executors[selected].submit(
+            check_query_recovery_candidate,
+            candidate=candidate,
+            extractor=self.extractor,
+            endpoint_pool=endpoint_pool,
+            defer_remote=True,
+        )
+
+        def release(_future: Any) -> None:
+            with self._lock:
+                self._assigned[selected] -= 1
+
+        future.add_done_callback(release)
+        return future
+
+    def close(self) -> None:
+        for executor in self._executors.values():
+            executor.shutdown(wait=True)
+
+
+def resolve_query_recovery_auto_checks(
+    *,
+    candidates: list[QueryRecoveryCandidate],
+    extractor: Any | None,
+    cache: ExtractionCache,
+    args: argparse.Namespace,
+    required_recovered_rows: int | None = None,
+    source_row_order: Iterable[int] | None = None,
+    exhaustive: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Check one query view, optionally exhausting every evidence candidate."""
+    if not candidates:
+        return {}
+    ordered_rows = tuple(
+        dict.fromkeys(
+            int(row_id)
+            for row_id in (
+                source_row_order
+                if source_row_order is not None
+                else (
+                    candidate.recovery["source_row_id"]
+                    for candidate in candidates
+                )
+            )
+        )
+    )
+    candidate_rows = {
+        int(candidate.recovery["source_row_id"]) for candidate in candidates
+    }
+    default_required = len(candidate_rows)
+    required = (
+        default_required
+        if required_recovered_rows is None
+        else int(required_recovered_rows)
+    )
+    plan = QueryRecoveryAutoCheckPlan(
+        query_key="query_view_"
+        + stable_hash(
+            *(candidate.task.source_table_id for candidate in candidates),
+            *(str(row_id) for row_id in ordered_rows),
+            length=24,
+        ),
+        required_recovered_rows=required,
+        source_row_order=ordered_rows,
+        candidates=tuple(candidates),
+    )
+    return resolve_query_recovery_auto_check_plans(
+        plans=[plan],
+        extractor=extractor,
+        cache=cache,
+        args=args,
+        exhaustive=exhaustive,
+    )
+
+
+def resolve_query_recovery_auto_check_plans(
+    *,
+    plans: list[QueryRecoveryAutoCheckPlan],
+    extractor: Any | None,
+    cache: ExtractionCache,
+    args: argparse.Namespace,
+    concurrency_state: ModelConcurrencyState | None = None,
+    exhaustive: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Resolve query plans with independent local and external-review stages."""
+    if not plans:
+        return {}
+    if not auto_check_required(extractor):
+        return {
+            query_recovery_auto_check_key(candidate, extractor): {
+                "supported": True,
+                "auto_check": None,
+            }
+            for plan in plans
+            for candidate in plan.candidates
+        }
+
+    progress_bar = None
+    if tqdm is not None and any(
+        query_recovery_plan_needs_model_check(
+            plan, extractor, cache, exhaustive=exhaustive
+        )
+        for plan in plans
+    ):
+        progress_bar = tqdm(
+            total=0,
+            desc="Query recovery auto-check",
+            unit="recovery",
+            dynamic_ncols=True,
+            disable=not bool(getattr(args, "model_progress", True)),
+        )
+    progress_lock = threading.Lock()
+
+    def begin_check() -> None:
+        if progress_bar is None:
+            return
+        with progress_lock:
+            progress_bar.total += 1
+            refresh = getattr(progress_bar, "refresh", None)
+            if callable(refresh):
+                refresh()
+
+    def finish_check() -> None:
+        if progress_bar is None:
+            return
+        with progress_lock:
+            progress_bar.update(1)
+
+    @dataclass
+    class PlanState:
+        groups: list[tuple[int, list[QueryRecoveryCandidate]]]
+        required: int
+        row_index: int = 0
+        supported_rows: int = 0
+        pending_candidates: list[QueryRecoveryCandidate] = dataclass_field(
+            default_factory=list
+        )
+        candidate_index: int = 0
+        row_initialized: bool = False
+        awaiting_key: str | None = None
+        done: bool = False
+
+    states = [
+        PlanState(
+            groups=query_recovery_plan_row_groups(plan, extractor),
+            required=max(0, int(plan.required_recovered_rows)),
+        )
+        for plan in plans
+    ]
+    resolved: dict[str, dict[str, Any]] = {}
+    in_flight: dict[str, QueryRecoveryCandidate] = {}
+    waiters: dict[str, list[PlanState]] = defaultdict(list)
+    completions: queue.Queue[
+        tuple[
+            str,
+            str,
+            QueryRecoveryCandidate,
+            dict[str, Any] | None,
+            BaseException | None,
+        ]
+    ] = queue.Queue()
+    local_scheduler = QueryRecoveryLocalCheckScheduler(
+        extractor=extractor,
+        state=concurrency_state or ModelConcurrencyState.from_args(args),
+    )
+    external_workers = max(
+        1,
+        int(
+            getattr(
+                extractor,
+                "auto_check_parallelism",
+                getattr(
+                    args,
+                    "auto_check_openai_max_inflight",
+                    MAX_AUTO_CHECK_OPENAI_CONCURRENCY,
+                ),
+            )
+        ),
+    )
+    external_executor = ThreadPoolExecutor(
+        max_workers=external_workers,
+        thread_name_prefix="query-recovery-external-review",
+    )
+
+    def queue_completion(
+        future: Any,
+        *,
+        phase: str,
+        key: str,
+        candidate: QueryRecoveryCandidate,
+    ) -> None:
+        try:
+            result = future.result()
+        except BaseException as error:
+            completions.put((phase, key, candidate, None, error))
+        else:
+            completions.put((phase, key, candidate, result, None))
+
+    def submit_local(key: str, candidate: QueryRecoveryCandidate) -> None:
+        begin_check()
+        in_flight[key] = candidate
+        future = local_scheduler.submit(candidate)
+        future.add_done_callback(
+            lambda completed, key=key, candidate=candidate: queue_completion(
+                completed,
+                phase="local",
+                key=key,
+                candidate=candidate,
+            )
+        )
+
+    def submit_external(
+        key: str,
+        candidate: QueryRecoveryCandidate,
+        local_result: dict[str, Any],
+    ) -> None:
+        future = external_executor.submit(
+            check_query_recovery_candidate,
+            candidate=candidate,
+            extractor=extractor,
+            local_result=local_result,
+        )
+        future.add_done_callback(
+            lambda completed, key=key, candidate=candidate: queue_completion(
+                completed,
+                phase="external",
+                key=key,
+                candidate=candidate,
+            )
+        )
+
+    def finish_row(state: PlanState, *, supported: bool) -> None:
+        if supported:
+            state.supported_rows += 1
+        state.row_index += 1
+        state.pending_candidates = []
+        state.candidate_index = 0
+        state.row_initialized = False
+        if state.row_index >= len(state.groups) or (
+            not exhaustive
+            and (
+                state.supported_rows >= state.required
+                or state.supported_rows
+                + len(state.groups)
+                - state.row_index
+                < state.required
+            )
+        ):
+            state.done = True
+
+    def advance(state: PlanState) -> None:
+        while not state.done and state.awaiting_key is None:
+            if (
+                (state.required == 0 and not exhaustive)
+                or state.row_index >= len(state.groups)
+            ):
+                state.done = True
+                return
+            if not state.row_initialized:
+                state.pending_candidates = []
+                state.candidate_index = 0
+                state.row_initialized = True
+                _row_id, row_candidates = state.groups[state.row_index]
+                cached_support = False
+                for candidate in row_candidates:
+                    key = query_recovery_auto_check_key(candidate, extractor)
+                    record = query_recovery_cached_check(
+                        key, cache, candidate
+                    )
+                    if record is None:
+                        state.pending_candidates.append(candidate)
+                        continue
+                    resolved[key] = record
+                    if record.get("supported"):
+                        cached_support = True
+                        if not exhaustive:
+                            break
+                if cached_support and not exhaustive:
+                    finish_row(state, supported=True)
+                    continue
+
+            if state.candidate_index >= len(state.pending_candidates):
+                finish_row(state, supported=False)
+                continue
+
+            candidate = state.pending_candidates[state.candidate_index]
+            state.candidate_index += 1
+            key = query_recovery_auto_check_key(candidate, extractor)
+            cached = query_recovery_cached_check(key, cache, candidate)
+            if cached is not None:
+                resolved[key] = cached
+                if cached.get("supported") and not exhaustive:
+                    finish_row(state, supported=True)
+                continue
+            state.awaiting_key = key
+            waiters[key].append(state)
+            if key not in in_flight:
+                submit_local(key, candidate)
+
+    def store_final_result(
+        key: str,
+        candidate: QueryRecoveryCandidate,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        record = {
+            "cache_key": key,
+            "extraction_cache_key": candidate.task.cache_key,
+            "attribute_name": candidate.recovery["recovered_attribute"][
+                "column_name"
+            ],
+            "claimed_value": candidate.recovery["recovered_attribute"]["value"],
+            "evidence_identity": query_recovery_remote_evidence_identity(
+                candidate
+            ),
+            **result,
+        }
+        if model_auto_check_is_complete(
+            {"auto_check": record.get("auto_check")}, required=True
+        ):
+            cache.put(key, record)
+        else:
+            cache.put_transient(key, record)
+        resolved[key] = record
+        return record
+
+    for state in states:
+        advance(state)
+
+    try:
+        while any(not state.done for state in states):
+            phase, key, candidate, result, error = completions.get()
+            if error is not None:
+                raise error
+            if result is None:
+                raise RuntimeError("query recovery check returned no result")
+            if phase == "local" and model_auto_check_has_remote_pending(
+                {"auto_check": result.get("auto_check")}
+            ):
+                submit_external(key, candidate, result)
+                continue
+
+            record = store_final_result(key, candidate, result)
+            in_flight.pop(key, None)
+            candidate_waiters = waiters.pop(key, [])
+            finish_check()
+            for state in candidate_waiters:
+                if state.awaiting_key != key:
+                    continue
+                state.awaiting_key = None
+                if record.get("supported") and not exhaustive:
+                    finish_row(state, supported=True)
+                advance(state)
+    finally:
+        local_scheduler.close()
+        external_executor.shutdown(wait=True)
+        if progress_bar is not None:
+            progress_bar.close()
+    return resolved
+
+
 def tasks_requiring_model_analysis(
     tasks: list[ExtractionTask],
     cache: ExtractionCache,
     args: argparse.Namespace,
     progress: ModelAnalysisProgress | None = None,
+    extractor: Any | None = None,
 ) -> list[ExtractionTask]:
     pending: list[ExtractionTask] = []
     seen: set[str] = set()
@@ -2866,7 +6226,10 @@ def tasks_requiring_model_analysis(
                 )
                 if changed:
                     cache.put(task.cache_key, cached_record)
-            if cached_extraction_is_reusable(cached_record, args):
+            if cached_extraction_is_reusable(
+                cached_record,
+                args,
+            ):
                 if progress is not None:
                     progress.mark(task.cache_key, "cached")
                 continue
@@ -2892,6 +6255,7 @@ def resolve_extraction_tasks(
     args: argparse.Namespace,
     state: ModelConcurrencyState,
     progress: ModelAnalysisProgress | None = None,
+    on_local_phase_done: Callable[[], None] | None = None,
 ) -> list[tuple[ExtractionTask, dict[str, Any]]]:
     resolved_by_key: dict[str, dict[str, Any]] = {}
     uncached_by_key: dict[str, ExtractionTask] = {}
@@ -2917,14 +6281,25 @@ def resolve_extraction_tasks(
                 )
                 if changed:
                     cache.put(task.cache_key, cached_record)
-            if cached_extraction_is_reusable(cached_record, args):
-                resolved_by_key[task.cache_key] = cached_record
+            if cached_extraction_is_reusable(
+                cached_record,
+                args,
+            ):
+                resolved_by_key[task.cache_key] = candidate_extraction_record(
+                    cached_record
+                )
                 if progress is not None:
                     progress.mark(task.cache_key, "cached")
                 continue
         uncached_by_key[task.cache_key] = task
 
-    def store_model_record(cache_key: str, record: dict[str, Any]) -> None:
+    def store_model_record(
+        cache_key: str,
+        record: dict[str, Any],
+        *,
+        success_status: str = "model",
+    ) -> None:
+        record = candidate_extraction_record(record)
         resolved_by_key[cache_key] = record
         has_error = bool(clean_text(record.get("error")))
         if not has_error or getattr(args, "cache_failed_model_outputs", False):
@@ -2934,15 +6309,20 @@ def resolve_extraction_tasks(
         if has_error:
             append_model_error_record(getattr(args, "model_attribute_errors_path", ""), record)
         if progress is not None:
-            progress.mark(cache_key, "error" if has_error else "model")
+            progress.mark(
+                cache_key,
+                "error" if has_error else success_status,
+            )
 
     if uncached_by_key and extractor is None:
         raise RuntimeError("Model analysis is required but no extractor was initialized")
+
     model_records = (
         run_uncached_extraction_tasks(
             extractor=extractor,
             tasks=list(uncached_by_key.values()),
             state=state,
+            apply_auto_check_gate=False,
             on_record=store_model_record,
         )
         if uncached_by_key and extractor is not None
@@ -2951,6 +6331,8 @@ def resolve_extraction_tasks(
     for cache_key, record in model_records.items():
         if cache_key not in resolved_by_key:
             store_model_record(cache_key, record)
+    if on_local_phase_done is not None:
+        on_local_phase_done()
 
     if (
         extractor is not None
@@ -4211,16 +7593,25 @@ def reparse_extraction_record(
         safe_json_object(raw_response),
         candidate_attribute_names,
     )
-    if attributes == record.get("attributes"):
+    target_field = (
+        "model_attributes"
+        if isinstance(record.get("auto_check"), dict)
+        else "attributes"
+    )
+    if attributes == record.get(target_field):
         return record, False
     updated = dict(record)
-    updated["attributes"] = attributes
+    updated[target_field] = attributes
     updated["reparsed_raw_response"] = True
     return updated, True
 
 
 def should_refresh_cached_extraction(record: dict[str, Any]) -> bool:
-    return not clean_text(record.get("error")) and not record.get("attributes")
+    candidate_record = candidate_extraction_record(record)
+    return (
+        not clean_text(record.get("error"))
+        and not candidate_record.get("attributes")
+    )
 
 
 def estimate_model_analysis_keys(
@@ -4402,6 +7793,33 @@ def model_jobset_policy_identity(
         "no_reuse_model_cache": bool(
             getattr(args, "no_reuse_model_cache", False)
         ),
+        "auto_check_secondary_openai": bool(
+            getattr(args, "auto_check_secondary_openai", False)
+        ),
+        "auto_check_luna_model": clean_text(
+            getattr(args, "auto_check_openai_model", "")
+        ),
+        "auto_check_luna_reasoning_effort": clean_text(
+            getattr(args, "auto_check_openai_reasoning_effort", "")
+        ),
+        "auto_check_openai_max_output_tokens": int(
+            getattr(args, "auto_check_openai_max_output_tokens", 0) or 0
+        ),
+        "auto_check_openai_image_detail": clean_text(
+            getattr(args, "auto_check_openai_image_detail", "")
+        ),
+        "auto_check_openai_image_max_pixels": int(
+            getattr(args, "auto_check_openai_image_max_pixels", 0) or 0
+        ),
+        "auto_check_terra_model": clean_text(
+            getattr(args, "auto_check_terra_model", "")
+        ),
+        "auto_check_terra_reasoning_effort": clean_text(
+            getattr(args, "auto_check_terra_reasoning_effort", "")
+        ),
+        "auto_check_terra_max_output_tokens": int(
+            getattr(args, "auto_check_terra_max_output_tokens", 0) or 0
+        ),
     }
     if model_kind == "image":
         identity.update(
@@ -4456,7 +7874,7 @@ def build_model_marker_context(
                     f"{kind}_model_name",
                     "Qwen3.5-9B"
                     if kind == "text"
-                    else "Qwen3-VL-8B-Thinking",
+                    else "Qwen3-VL-8B-Instruct",
                 )
             ),
             prompt_version=PROMPT_VERSION,
@@ -5149,6 +8567,106 @@ def _entitables_remote_gpu_borrower(
     )
 
 
+def run_query_recovery_auto_check_round(
+    *,
+    plans: list[QueryRecoveryAutoCheckPlan],
+    extractor: Any | None,
+    cache: ExtractionCache,
+    args: argparse.Namespace,
+    concurrency_state: ModelConcurrencyState | None = None,
+    exhaustive: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Keep local model services alive for one query-recovery check round."""
+    if not auto_check_required(extractor) or not plans:
+        return {}
+    active_plans = [
+        plan
+        for plan in plans
+        if query_recovery_plan_needs_model_check(
+            plan, extractor, cache, exhaustive=exhaustive
+        )
+    ]
+    if not active_plans:
+        return {}
+
+    pending_candidates: dict[str, QueryRecoveryCandidate] = {}
+    for plan in active_plans:
+        for candidate in plan.candidates:
+            key = query_recovery_auto_check_key(candidate, extractor)
+            if query_recovery_cached_check(key, cache, candidate) is None:
+                pending_candidates.setdefault(key, candidate)
+    counts = Counter(
+        model_kind_for_asset(candidate.task.asset)
+        for candidate in pending_candidates.values()
+    )
+    round_counts = {
+        "text": counts.get("text", 0),
+        "image": counts.get("image", 0),
+    }
+    model_round = _begin_model_task_round(args, round_counts)
+    round_status = "completed"
+    try:
+        return resolve_query_recovery_auto_check_plans(
+            plans=active_plans,
+            extractor=extractor,
+            cache=cache,
+            args=args,
+            concurrency_state=concurrency_state,
+            exhaustive=exhaustive,
+        )
+    except BaseException:
+        round_status = "failed"
+        raise
+    finally:
+        for kind in ("text", "image"):
+            _write_model_round_event(
+                model_round,
+                f"{kind}.done",
+                status=f"{kind}_round_tasks_completed",
+                model_kind=kind,
+                task_count=round_counts[kind],
+            )
+        _write_model_round_event(
+            model_round,
+            "done",
+            status=f"model_round_{round_status}",
+        )
+
+
+def finalize_query_recovery_auto_checks(
+    *,
+    plans: list[QueryRecoveryAutoCheckPlan],
+    extractor: Any | None,
+    cache: ExtractionCache,
+    args: argparse.Namespace,
+    concurrency_state: ModelConcurrencyState | None = None,
+) -> list[QueryRecoveryAutoCheckPlan]:
+    """Resolve table eligibility, then exhaust evidence for accepted plans."""
+    if not auto_check_required(extractor) or not plans:
+        return list(plans)
+    run_query_recovery_auto_check_round(
+        plans=plans,
+        extractor=extractor,
+        cache=cache,
+        args=args,
+        concurrency_state=concurrency_state,
+    )
+    accepted = [
+        plan
+        for plan in plans
+        if query_recovery_plan_is_supported(plan, extractor, cache)
+    ]
+    run_query_recovery_auto_check_round(
+        plans=accepted,
+        extractor=extractor,
+        cache=cache,
+        args=args,
+        concurrency_state=concurrency_state,
+        exhaustive=True,
+    )
+    return accepted
+
+
 def precompute_extraction_task_groups(
     *,
     extractor: LocalAttributeExtractor,
@@ -5190,21 +8708,16 @@ def precompute_extraction_task_groups(
             remote_borrower.start()
             remote_borrower_started = True
         with ThreadPoolExecutor(max_workers=len(active_groups)) as pool:
-            futures = {
-                pool.submit(
-                    resolve_extraction_tasks,
-                    extractor=extractor,
-                    cache=cache,
-                    tasks=tasks,
-                    args=args,
-                    state=state,
-                    progress=progress,
-                ): (kind, len(tasks))
-                for kind, tasks in active_groups.items()
+            local_phase_events = {
+                kind: threading.Event()
+                for kind in active_groups
             }
-            for future in as_completed(futures):
-                kind, task_count = futures[future]
-                future.result()
+
+            def mark_local_phase_done(kind: str, task_count: int) -> None:
+                event = local_phase_events[kind]
+                if event.is_set():
+                    return
+                event.set()
                 if remote_borrower is not None:
                     remote_borrower.complete(kind)
                 _write_model_round_event(
@@ -5214,6 +8727,27 @@ def precompute_extraction_task_groups(
                     model_kind=kind,
                     task_count=task_count,
                 )
+
+            futures = {
+                pool.submit(
+                    resolve_extraction_tasks,
+                    extractor=extractor,
+                    cache=cache,
+                    tasks=tasks,
+                    args=args,
+                    state=state,
+                    progress=progress,
+                    on_local_phase_done=(
+                        lambda kind=kind, task_count=len(tasks):
+                        mark_local_phase_done(kind, task_count)
+                    ),
+                ): (kind, len(tasks))
+                for kind, tasks in active_groups.items()
+            }
+            for future in as_completed(futures):
+                kind, task_count = futures[future]
+                future.result()
+                mark_local_phase_done(kind, task_count)
                 if write_done_markers:
                     write_model_done_marker(
                         model_done_marker_for_kind(args, kind),
@@ -5274,10 +8808,13 @@ def extract_asset_attributes(
             )
             if changed:
                 cache.put(cache_key, cached_record)
-        if cached_extraction_is_reusable(cached_record, args):
+        if cached_extraction_is_reusable(
+            cached_record,
+            args,
+        ):
             if progress is not None:
                 progress.mark(cache_key, "cached")
-            return cached_record
+            return candidate_extraction_record(cached_record)
     try:
         result = extractor.extract(asset, entity, candidate_attribute_names)
     except TransientModelEndpointError:
@@ -5338,6 +8875,11 @@ def build_table_join_records(
     extraction_writer: ShardedJsonlWriter,
     recovery_writer: ShardedJsonlWriter,
     args: argparse.Namespace,
+    query_auto_check_cache: ExtractionCache | None = None,
+    apply_query_auto_check: bool = True,
+    finalize_query_recoveries: bool = False,
+    query_recovery_candidates_out: list[QueryRecoveryCandidate] | None = None,
+    query_recovery_plans_out: list[QueryRecoveryAutoCheckPlan] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
     entity_col = choose_entity_column(
@@ -5371,7 +8913,7 @@ def build_table_join_records(
     valid_entity_source_rows: set[int] = set()
     valid_entity_source_row_order: list[int] = []
     recovered_rows_by_col: dict[int, set[int]] = defaultdict(set)
-    recoveries_by_col: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    recoveries_by_col: dict[int, list[QueryRecoveryCandidate]] = defaultdict(list)
     extraction_count = 0
     extraction_tasks: list[ExtractionTask] = []
     source_rows_by_id = {
@@ -5463,38 +9005,57 @@ def build_table_join_records(
             expected = clean_text(get_cell_text(source_row, attr_col))
             if not expected:
                 continue
-            for predicted in attr_by_name.get(normalize(attr_name), []):
-                if not values_match(
-                    predicted.get("value"),
-                    expected,
-                    attribute_name=attr_name,
-                ):
-                    continue
-                recovered_rows_by_col[attr_col].add(source_row_id)
-                recoveries_by_col[attr_col].append(
-                    {
-                        "source_table_id": source_table["source_table_id"],
-                        "source_row_id": source_row_id,
-                        "split": split,
-                        "query_entity": entity,
-                        "recovered_attribute": {
-                            "column_index": attr_col,
-                            "column_name": attr_name,
-                            "value": expected,
-                            "model_value": clean_text(predicted.get("value")),
-                            "hidden_in_query": True,
-                        },
-                        "evidence": {
-                            "asset_id": asset["asset_id"],
-                            "asset_type": asset.get("asset_type"),
-                            **asset_preview(asset),
-                            "model_evidence": clean_text(predicted.get("evidence")),
-                            "model_connection_evidence": clean_text(predicted.get("connection_evidence")),
-                            "extraction_cache_key": extraction.get("cache_key"),
-                        },
-                    }
+            predictions = attr_by_name.get(normalize(attr_name), [])
+            matched_prediction = next(
+                (
+                    predicted
+                    for predicted in predictions
+                    if values_match(
+                        predicted.get("value"),
+                        expected,
+                        attribute_name=attr_name,
+                        entity_column_name=task.entity_column_name,
+                    )
+                ),
+                None,
+            )
+            if matched_prediction is None:
+                continue
+            recovered_rows_by_col[attr_col].add(source_row_id)
+            recovery = {
+                "source_table_id": source_table["source_table_id"],
+                "source_row_id": source_row_id,
+                "split": split,
+                "query_entity": entity,
+                "recovered_attribute": {
+                    "column_index": attr_col,
+                    "column_name": attr_name,
+                    "value": expected,
+                    "model_value": clean_text(
+                        matched_prediction.get("value")
+                    ),
+                    "hidden_in_query": True,
+                },
+                "evidence": {
+                    "asset_id": asset["asset_id"],
+                    "asset_type": asset.get("asset_type"),
+                    **asset_preview(asset),
+                    "model_evidence": clean_text(
+                        matched_prediction.get("evidence")
+                    ),
+                    "model_connection_evidence": clean_text(
+                        matched_prediction.get("connection_evidence")
+                    ),
+                    "extraction_cache_key": extraction.get("cache_key"),
+                },
+            }
+            recoveries_by_col[attr_col].append(
+                QueryRecoveryCandidate(
+                    task=task,
+                    extraction=extraction,
+                    recovery=recovery,
                 )
-                break
+            )
 
     qualified_cols: list[dict[str, Any]] = []
     for attr_col in attribute_cols:
@@ -5539,6 +9100,7 @@ def build_table_join_records(
 
     query_tables: list[dict[str, Any]] = []
     query_by_fingerprint: dict[str, dict[str, Any]] = {}
+    claimed_query_fingerprints: set[str] = set()
     data_lake_tables: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
     emitted_qualified_cols: list[dict[str, Any]] = []
@@ -5614,44 +9176,137 @@ def build_table_join_records(
                 query_cols=query_cols,
                 query_rows=query_rows,
             )
-            query_table = query_by_fingerprint.get(query_fingerprint)
-            if query_table is None:
-                query_table_id = (
-                    f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
-                )
-                query_table = table_record(
-                    table_id=query_table_id,
-                    role="query",
-                    split=split,
-                    source_table=source_table,
-                    column_indices=query_cols,
-                    rows=query_rows,
-                    source_row_indices=query_source_rows,
-                    extra={
-                        "chain_id": chain_id,
-                        "chain_ids": [chain_id],
-                        "query_entity_col": entity_col,
-                        "query_entity_col_name": get_column_name(
-                            source_table, entity_col
-                        ),
-                        "hidden_attributes": [hidden_attribute],
-                        "target_table_ids": [target_table_id],
-                        "query_context_col_names": [
-                            get_column_name(source_table, col)
-                            for col in query_context
-                        ],
-                        "row_view_index": row_view_index,
-                    },
-                )
-                query_by_fingerprint[query_fingerprint] = query_table
-                query_tables.append(query_table)
-            else:
-                # Variants are ordered by descending recovery quality (then
-                # source column index), so the existing query owns the best
-                # deterministic label.  A later attribute with identical
-                # visible input is unanswerable as a distinct single-target
-                # query and must not receive another qrel.
+            if query_fingerprint in claimed_query_fingerprints:
+                # Only one hidden target may own an identical visible query.
                 continue
+            claimed_query_fingerprints.add(query_fingerprint)
+            view_candidates = [
+                candidate
+                for candidate in recoveries_by_col.get(join_col, [])
+                if int(candidate.recovery["source_row_id"])
+                in selected_source_row_set
+            ]
+            if query_recovery_candidates_out is not None:
+                query_recovery_candidates_out.extend(view_candidates)
+            auto_check_plan = QueryRecoveryAutoCheckPlan(
+                query_key="query_view_"
+                + stable_hash(
+                    source_table["source_table_id"],
+                    query_fingerprint,
+                    join_col,
+                    length=24,
+                ),
+                required_recovered_rows=int(
+                    qualified["required_recovered_rows"]
+                ),
+                source_row_order=tuple(selected_source_rows),
+                candidates=tuple(view_candidates),
+            )
+            if query_recovery_plans_out is not None:
+                query_recovery_plans_out.append(auto_check_plan)
+            if apply_query_auto_check and auto_check_required(extractor):
+                if query_auto_check_cache is None:
+                    raise RuntimeError(
+                        "query recovery auto-check requires its dedicated cache"
+                    )
+                check_results = resolve_query_recovery_auto_checks(
+                    candidates=view_candidates,
+                    extractor=extractor,
+                    cache=query_auto_check_cache,
+                    args=args,
+                    required_recovered_rows=(
+                        auto_check_plan.required_recovered_rows
+                    ),
+                    source_row_order=auto_check_plan.source_row_order,
+                )
+                approved_candidates = [
+                    candidate
+                    for candidate in view_candidates
+                    if check_results.get(
+                        query_recovery_auto_check_key(candidate, extractor), {}
+                    ).get("supported")
+                ]
+            else:
+                check_results = {}
+                approved_candidates = view_candidates
+            approved_source_rows = {
+                int(candidate.recovery["source_row_id"])
+                for candidate in approved_candidates
+            }
+            if len(approved_source_rows) < int(
+                qualified["required_recovered_rows"]
+            ):
+                continue
+            final_check_results = check_results
+            if finalize_query_recoveries:
+                if auto_check_required(extractor):
+                    if query_auto_check_cache is None:
+                        raise RuntimeError(
+                            "final query recovery materialization requires the "
+                            "query recovery cache"
+                        )
+                    final_check_results = {}
+                    for candidate in view_candidates:
+                        key = query_recovery_auto_check_key(
+                            candidate, extractor
+                        )
+                        record = query_recovery_cached_check(
+                            key, query_auto_check_cache, candidate
+                        )
+                        if record is None:
+                            raise RuntimeError(
+                                "final query evidence auto-check is incomplete: "
+                                f"{auto_check_plan.query_key} {key}"
+                            )
+                        final_check_results[key] = record
+                    approved_candidates = [
+                        candidate
+                        for candidate in view_candidates
+                        if final_check_results[
+                            query_recovery_auto_check_key(
+                                candidate, extractor
+                            )
+                        ].get("supported")
+                    ]
+                    approved_source_rows = {
+                        int(candidate.recovery["source_row_id"])
+                        for candidate in approved_candidates
+                    }
+            view_hidden_attribute = {
+                **hidden_attribute,
+                "recovered_rows": len(approved_source_rows),
+                "recovered_value_ratio": len(approved_source_rows)
+                / query_rows_per_table,
+            }
+            query_table_id = (
+                f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
+            )
+            query_table = table_record(
+                table_id=query_table_id,
+                role="query",
+                split=split,
+                source_table=source_table,
+                column_indices=query_cols,
+                rows=query_rows,
+                source_row_indices=query_source_rows,
+                extra={
+                    "chain_id": chain_id,
+                    "chain_ids": [chain_id],
+                    "query_entity_col": entity_col,
+                    "query_entity_col_name": get_column_name(
+                        source_table, entity_col
+                    ),
+                    "hidden_attributes": [view_hidden_attribute],
+                    "target_table_ids": [target_table_id],
+                    "query_context_col_names": [
+                        get_column_name(source_table, col)
+                        for col in query_context
+                    ],
+                    "row_view_index": row_view_index,
+                },
+            )
+            query_by_fingerprint[query_fingerprint] = query_table
+            query_tables.append(query_table)
 
             emitted_view_count += 1
             qrels.append(
@@ -5664,7 +9319,7 @@ def build_table_join_records(
                     "chain_id": chain_id,
                     "row_view_index": row_view_index,
                     "source_table_id": source_table["source_table_id"],
-                    "join_attribute": hidden_attribute,
+                    "join_attribute": view_hidden_attribute,
                     "reason": "model_recoverable_join_column",
                 }
             )
@@ -5677,7 +9332,8 @@ def build_table_join_records(
                     int(row["row_id"])
                 )
             seen_recoveries: set[str] = set()
-            for recovery in recoveries_by_col.get(join_col, []):
+            for candidate in approved_candidates:
+                recovery = candidate.recovery
                 source_row_id = int(recovery["source_row_id"])
                 if source_row_id not in source_to_query_row:
                     continue
@@ -5686,35 +9342,38 @@ def build_table_join_records(
                     continue
                 seen_recoveries.add(recovery_id)
                 path_id = f"path_{stable_hash(query_table_id, recovery['evidence']['asset_id'], target_table_id, source_row_id)}"
-                write_jsonl_record(
-                    recovery_writer,
-                    {
-                        "recovery_id": recovery_id,
-                        "path_id": path_id,
-                        "query_table_id": query_table_id,
-                        "target_table_id": target_table_id,
-                        "data_lake_table_id": target_table_id,
-                        "query_row_id": source_to_query_row[source_row_id],
-                        "target_row_ids": source_to_target_rows.get(
-                            source_row_id, []
-                        ),
-                        "path_nodes": [
-                            {
-                                "node_id": query_table_id,
-                                "node_type": "query_table",
-                            },
-                            {
-                                "node_id": recovery["evidence"]["asset_id"],
-                                "node_type": f"{recovery['evidence']['asset_type']}_asset",
-                            },
-                            {
-                                "node_id": target_table_id,
-                                "node_type": "target_table",
-                            },
-                        ],
-                        **recovery,
-                    },
-                )
+                recovery_record = {
+                    "recovery_id": recovery_id,
+                    "path_id": path_id,
+                    "query_table_id": query_table_id,
+                    "target_table_id": target_table_id,
+                    "data_lake_table_id": target_table_id,
+                    "query_row_id": source_to_query_row[source_row_id],
+                    "target_row_ids": source_to_target_rows.get(
+                        source_row_id, []
+                    ),
+                    "path_nodes": [
+                        {
+                            "node_id": query_table_id,
+                            "node_type": "query_table",
+                        },
+                        {
+                            "node_id": recovery["evidence"]["asset_id"],
+                            "node_type": f"{recovery['evidence']['asset_type']}_asset",
+                        },
+                        {
+                            "node_id": target_table_id,
+                            "node_type": "target_table",
+                        },
+                    ],
+                    **recovery,
+                }
+                check = final_check_results.get(
+                    query_recovery_auto_check_key(candidate, extractor), {}
+                ).get("auto_check")
+                if isinstance(check, dict):
+                    recovery_record["auto_check"] = check
+                write_jsonl_record(recovery_writer, recovery_record)
 
         if emitted_view_count == 0:
             continue
@@ -6039,6 +9698,40 @@ def _build_dataset(
         cache_paths["model_attribute_extractions"],
         reuse=not args.no_reuse_model_cache,
     )
+    query_recovery_alias_stats: Counter[str] = Counter()
+
+    def query_recovery_record_alias(record: dict[str, Any]) -> str | None:
+        extraction_key = clean_text(record.get("extraction_cache_key"))
+        extraction_record = cache.get(extraction_key) if extraction_key else None
+        alias = query_recovery_auto_check_record_key(
+            record,
+            extraction_record=extraction_record,
+        )
+        if query_recovery_remote_review_is_complete(record):
+            if isinstance(record.get("evidence_identity"), dict):
+                query_recovery_alias_stats["remote_native"] += 1
+            elif extraction_record is not None:
+                query_recovery_alias_stats["remote_migrated"] += 1
+            else:
+                query_recovery_alias_stats["remote_unmapped"] += 1
+        else:
+            query_recovery_alias_stats["local_model_specific"] += 1
+        return alias
+
+    query_auto_check_cache = ExtractionCache(
+        cache_paths["query_recovery_auto_checks"],
+        reuse=not args.no_reuse_model_cache,
+        record_key_alias=query_recovery_record_alias,
+    )
+    if not args.no_reuse_model_cache:
+        logging.info(
+            "Query recovery cache aliases: remote_native=%d, "
+            "remote_migrated=%d, remote_unmapped=%d, local_model_specific=%d",
+            query_recovery_alias_stats["remote_native"],
+            query_recovery_alias_stats["remote_migrated"],
+            query_recovery_alias_stats["remote_unmapped"],
+            query_recovery_alias_stats["local_model_specific"],
+        )
     concurrency_state = ModelConcurrencyState.from_args(args)
     progress: ModelAnalysisProgress | None = None
     counters = SourceCandidateCounters()
@@ -6070,6 +9763,7 @@ def _build_dataset(
         wikipedia_client=wikipedia_client,
         extractor=extractor,
         cache=cache,
+        query_auto_check_cache=query_auto_check_cache,
         progress=progress,
         concurrency_state=concurrency_state,
         registry=registry,
@@ -6211,7 +9905,11 @@ def _build_dataset(
         cached_keys = {
             key
             for key in planned_keys
-            if key in cache.items and cached_extraction_is_reusable(cache.items[key], args)
+            if key in cache.items
+            and cached_extraction_is_reusable(
+                cache.items[key],
+                args,
+            )
         }
         progress.register(planned_keys)
         for cache_key in cached_keys:
@@ -6239,10 +9937,16 @@ def _build_dataset(
                 asset_types={"image"},
             )
         pending_text_tasks = tasks_requiring_model_analysis(
-            text_tasks, cache, args, progress=progress
+            text_tasks,
+            cache,
+            args,
+            progress=progress,
         )
         pending_image_tasks = tasks_requiring_model_analysis(
-            image_tasks, cache, args, progress=progress
+            image_tasks,
+            cache,
+            args,
+            progress=progress,
         )
         precomputed_text_task_count += len(pending_text_tasks)
         precomputed_image_task_count += len(pending_image_tasks)
@@ -6269,6 +9973,34 @@ def _build_dataset(
             args,
             text_task_count=precomputed_text_task_count,
             image_task_count=precomputed_image_task_count,
+        )
+    if auto_check_required(extractor):
+        final_query_auto_check_plans: list[QueryRecoveryAutoCheckPlan] = []
+        for source_table in iter_jsonl_records(source_writer.paths()):
+            source_table_id = str(source_table["source_table_id"])
+            build_table_join_records(
+                source_table=source_table,
+                split=source_to_split.get(source_table_id, "test"),
+                assets=assets,
+                entity_to_assets=entity_to_assets,
+                wiki_to_entity_id=wiki_to_entity_id,
+                extractor=extractor,
+                cache=cache,
+                progress=None,
+                concurrency_state=concurrency_state,
+                extraction_writer=ListRecordWriter(),
+                recovery_writer=ListRecordWriter(),
+                args=args,
+                query_auto_check_cache=query_auto_check_cache,
+                apply_query_auto_check=False,
+                query_recovery_plans_out=final_query_auto_check_plans,
+            )
+        finalize_query_recovery_auto_checks(
+            plans=final_query_auto_check_plans,
+            extractor=extractor,
+            cache=query_auto_check_cache,
+            args=args,
+            concurrency_state=concurrency_state,
         )
     query_writer = ShardedJsonlWriter(query_tables_dir, records_per_shard)
     data_lake_writer = ShardedJsonlWriter(data_lake_tables_dir, records_per_shard)
@@ -6320,6 +10052,8 @@ def _build_dataset(
                     extraction_writer=extraction_handle,
                     recovery_writer=recovery_handle,
                     args=args,
+                    query_auto_check_cache=query_auto_check_cache,
+                    finalize_query_recoveries=True,
                 )
                 if query_tables:
                     queryable_source_tables += 1
@@ -6559,6 +10293,10 @@ def _build_dataset(
         "attribute_extractions": extraction_writer.total_records,
         "evidence_recoveries": recovery_writer.total_records,
         "model_inference": model_call_stats_summary(extractor),
+        "model_auto_check": {
+            **summarize_model_auto_check_records(recovery_writer.paths()),
+            "current_process": model_auto_check_summary(extractor),
+        },
         "model_concurrency": concurrency_state.summary(),
         "precomputed_text_model_cache_tasks": precomputed_text_task_count,
         "precomputed_image_model_cache_tasks": precomputed_image_task_count,
@@ -6593,6 +10331,8 @@ def _build_dataset(
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
+            "every local-positive evidence candidate for a final accepted query receives an exhaustive auto-check before evidence_recoveries are materialized",
+            "evidence_recoveries contain supported paths only; omitted evidence is an implicit negative",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
             "each replacement pass draws from every currently failed slot; retained_failed slots are deferred to the next pass unless the pass is terminal",
             "discarded candidates are pruned from active output material while downloaded images and persistent Wikipedia/model caches are retained for later runs",
@@ -6646,6 +10386,9 @@ def _build_dataset(
         },
         "source_sampling": source_sampling,
         "model_endpoints": {
+            "model_endpoint_config": getattr(
+                args, "model_endpoint_config", None
+            ),
             "text_model_base_url": args.text_model_base_url,
             "text_model_base_urls": getattr(args, "text_model_base_urls", None),
             "text_model_base_urls_file": getattr(args, "text_model_base_urls_file", None),
@@ -6669,7 +10412,7 @@ def _build_dataset(
             "model_ready_marker": getattr(args, "model_ready_marker", None),
             "model_text_done_marker": getattr(args, "model_text_done_marker", None),
             "model_image_done_marker": getattr(args, "model_image_done_marker", None),
-            "disable_thinking": args.disable_thinking,
+            "disable_thinking": True,
             "reparse_cached_model_outputs": args.reparse_cached_model_outputs,
             "refresh_invalid_model_cache": args.refresh_invalid_model_cache,
             "cache_failed_model_outputs": args.cache_failed_model_outputs,
@@ -6681,12 +10424,16 @@ def _build_dataset(
             "configured_remote_image_model_workers": getattr(args, "remote_image_model_workers", 0),
             "final_model_concurrency": stats["model_concurrency"],
             "inference_stats": stats["model_inference"],
+            "auto_check": stats["model_auto_check"],
         },
         "cache": {
             "root_dir": str(cache_paths["root_dir"]),
             "wikipedia_cache_dir": str(cache_paths["wikipedia_cache_dir"]),
             "wikipedia_image_dir": str(cache_paths["wikipedia_image_dir"]),
             "model_attribute_extractions": str(cache_paths["model_attribute_extractions"]),
+            "query_recovery_auto_checks": str(
+                cache_paths["query_recovery_auto_checks"]
+            ),
         },
         "wikipedia_cache": {
             "cache_dir": str(cache_paths["wikipedia_cache_dir"]),
@@ -6733,6 +10480,38 @@ def parse_args(
     parser.add_argument("--output_dir", required=True, help="Directory where dataset artifacts are written.")
     parser.add_argument("--max_source_tables", type=int, default=20000, help="Number of filtered EntiTables source tables to use as the data-lake base.")
     parser.add_argument("--max_tables", type=int, default=None, dest="max_source_tables", help="(Deprecated) Use --max_source_tables instead.")
+    parser.add_argument(
+        "--max_scanned_files",
+        type=int,
+        default=None,
+        help=(
+            "Optional deterministic prefix limit on EntiTables JSON files "
+            "scanned before stable-hash sampling. Intended for smoke runs; "
+            "the default scans the full input directory."
+        ),
+    )
+    parser.add_argument(
+        "--source_sample_checkpoint_dir",
+        default=None,
+        help=(
+            "Directory for the validated global-sample reference and "
+            "materialization checkpoint. Defaults to "
+            "<output_dir>/_source_sample_checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--refresh_source_sample_checkpoint",
+        action="store_true",
+        help=(
+            "Ignore reusable source-sample checkpoints and rebuild them from "
+            "the current input files."
+        ),
+    )
+    parser.add_argument(
+        "--no_source_sample_checkpoint",
+        action="store_true",
+        help="Disable source-sample checkpoint reads and writes.",
+    )
     parser.add_argument("--max_entities", type=int, default=None, help="Maximum number of entities for Wikipedia asset fetching.")
     parser.add_argument("--max_images_per_entity", type=int, default=3)
     parser.add_argument("--text_asset_chunk_chars", type=int, default=800)
@@ -6872,6 +10651,15 @@ def parse_args(
             "remote pool. Empty routes never fall back to static remote URLs."
         ),
     )
+    parser.add_argument(
+        "--model_endpoint_config",
+        default=None,
+        help=(
+            "Optional mmdd-model-endpoints-v1 JSON config. It makes one "
+            "served model authoritative across local/remote endpoints and "
+            "enforces per-text, per-image, and shared total limits per URL."
+        ),
+    )
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None, help="Additional text-model OpenAI-compatible base URLs. Values may also be comma-separated.")
     parser.add_argument("--text_model_base_urls_file", default=None, help="Optional newline-separated text-model base URL file re-read before each text request. Dynamic vLLM runners can append endpoints here.")
@@ -6887,7 +10675,7 @@ def parse_args(
     parser.add_argument("--remote_image_model_base_url", default=None, help="Primary remote image-model OpenAI-compatible base URL. Kept in a separate concurrency pool from local endpoints.")
     parser.add_argument("--remote_image_model_base_urls", nargs="*", default=None, help="Additional remote image-model base URLs for the remote pool. Values may also be comma-separated.")
     parser.add_argument("--remote_image_model_base_urls_file", default=None, help="Optional newline-separated remote image endpoint file re-read before each remote request.")
-    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Instruct")
     parser.add_argument("--image_model_api_key", default=None)
     parser.add_argument("--remote_image_model_api_key", default=None, help="Remote image endpoint API key. Falls back to MMDD_REMOTE_IMAGE_MODEL_API_KEY, then the local image key/VLLM_API_KEY.")
     parser.add_argument(
@@ -6944,7 +10732,15 @@ def parse_args(
     parser.add_argument("--image_model_workers", type=int, default=1, help="Concurrent image-model requests. Default 1 is conservative for 24GB GPUs.")
     parser.add_argument("--remote_text_model_workers", type=int, default=0, help="Concurrent remote text-model requests, independent of --text_model_workers. Zero disables the remote text pool.")
     parser.add_argument("--remote_image_model_workers", type=int, default=0, help="Concurrent remote image-model requests, independent of --image_model_workers. Zero disables the remote image pool.")
-    parser.add_argument("--enable_thinking", dest="disable_thinking", action="store_false", help="Allow Qwen thinking mode. By default, chat_template_kwargs disables thinking for extraction calls.")
+    parser.add_argument(
+        "--enable_thinking",
+        dest="disable_thinking",
+        action="store_false",
+        help=(
+            "Deprecated and rejected: dataset construction always disables "
+            "thinking for both text and image requests."
+        ),
+    )
     parser.add_argument("--no_reparse_cached_model_outputs", dest="reparse_cached_model_outputs", action="store_false", help="Use cached parsed attributes as-is instead of reparsing cached raw_response with the current JSON parser.")
     parser.add_argument("--refresh_invalid_model_cache", action="store_true", help="When a cached raw_response still reparses to no valid candidate attributes, call the model again with the current request settings.")
     parser.add_argument("--model_max_retries", type=int, default=2)
@@ -6964,11 +10760,24 @@ def parse_args(
     parser.add_argument("--model_round_control_dir", default=None, help="Optional generation-scoped handshake directory used by a dynamic model runner between batched inference rounds.")
     parser.add_argument("--model_round_run_id", default=None, help="Opaque dynamic-run identifier used to reject stale model round markers.")
     parser.add_argument("--run_fingerprint", default="", help="Staged-run identity used to fence stale model markers.")
+    add_model_auto_check_arguments(parser)
     if configure_parser is not None:
         configure_parser(parser)
     parser.set_defaults(disable_thinking=True, reparse_cached_model_outputs=True)
     parser.set_defaults(model_progress=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.disable_thinking:
+        parser.error(
+            "thinking mode cannot be enabled for dataset construction"
+        )
+    if min(
+        args.text_model_workers,
+        args.image_model_workers,
+        args.remote_text_model_workers,
+        args.remote_image_model_workers,
+    ) < 0:
+        parser.error("model worker counts must be non-negative")
+    return args
 
 
 def main() -> None:

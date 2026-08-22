@@ -13,6 +13,7 @@ import threading
 import time
 from contextlib import contextmanager
 from collections.abc import MutableMapping
+from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -24,11 +25,64 @@ import build_mm_joinability_dataset as join_builder
 
 
 OPENAI_OUTPUT_SCHEMA_VERSION = "openai_attribute_extraction_schema_v2_values_only"
-OPENAI_TRANSPORT_VERSION = "openai_chat_completions_transport_v1"
+OPENAI_CHAT_TRANSPORT_VERSION = "openai_chat_completions_transport_v1"
+OPENAI_RESPONSES_TRANSPORT_VERSION = "openai_responses_transport_v1"
+OPENAI_TRANSPORT_VERSION = OPENAI_CHAT_TRANSPORT_VERSION
+AUTO_CHECK_API_PROFILES_ENV = "MMDD_AUTO_CHECK_API_PROFILES"
+AUTO_CHECK_API_PROFILE_PREFIX = "MMDD_AUTO_CHECK_API_"
+AUTO_CHECK_API_PROFILE_FIELDS = frozenset(
+    {
+        "API_KEY",
+        "BASE_URL",
+        "INITIAL_API_KEY",
+        "INITIAL_BASE_URL",
+        "MODEL",
+        "FINAL_JUDGE_API_KEY",
+        "FINAL_JUDGE_BASE_URL",
+        "FINAL_JUDGE_MODEL",
+        "MAX_CONCURRENCY",
+    }
+)
 OPENAI_ENVIRONMENT_KEYS = frozenset(
-    {"OPENAI_API_KEY", "OPENAI_BASE_URL"}
+    {"OPENAI_API_KEY", "OPENAI_BASE_URL", AUTO_CHECK_API_PROFILES_ENV}
 )
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_AUTO_CHECK_PROFILE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_AUTO_CHECK_JSON_ROOT_FIELDS = frozenset({"version", "profiles"})
+_AUTO_CHECK_JSON_PROFILE_FIELDS = frozenset(
+    {"initial", "final_judge", "max_concurrency", "response"}
+)
+_AUTO_CHECK_JSON_STAGE_FIELDS = frozenset(
+    {"api_key", "base_url", "model", "response"}
+)
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleAPIProfile:
+    """One independently limited OpenAI-compatible auto-check endpoint."""
+
+    name: str
+    initial_api_base_url: str | None
+    model: str | None
+    final_judge_model: str | None
+    final_judge_api_base_url: str | None
+    max_concurrency: int
+    initial_api_key: str | None = field(repr=False)
+    final_judge_api_key: str | None = field(repr=False)
+    initial_use_responses: bool = False
+    final_judge_use_responses: bool = False
+
+    @property
+    def api_base_url(self) -> str | None:
+        """Return the legacy shared URL view, which maps to initial review."""
+
+        return self.initial_api_base_url
+
+    @property
+    def api_key(self) -> str | None:
+        """Return the legacy shared key view, which maps to initial review."""
+
+        return self.initial_api_key
 
 ATTRIBUTE_EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -127,6 +181,9 @@ class OpenAIRequestController:
         max_inflight: int,
         requests_per_minute: int = 0,
         tokens_per_minute: int = 0,
+        adaptive: bool = False,
+        initial_inflight: int | None = None,
+        successes_per_increase: int = 20,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -135,11 +192,30 @@ class OpenAIRequestController:
         if requests_per_minute < 0 or tokens_per_minute < 0:
             raise ValueError("OpenAI rate limits must be non-negative")
         self.max_inflight = int(max_inflight)
+        self.adaptive = bool(adaptive)
+        initial_limit = (
+            self.max_inflight
+            if initial_inflight is None
+            else int(initial_inflight)
+        )
+        if not 1 <= initial_limit <= self.max_inflight:
+            raise ValueError(
+                "OpenAI initial inflight requests must be between 1 and max inflight"
+            )
+        if successes_per_increase <= 0:
+            raise ValueError("OpenAI adaptive success threshold must be positive")
+        self.initial_inflight = initial_limit
+        self.successes_per_increase = int(successes_per_increase)
         self.requests_per_minute = int(requests_per_minute)
         self.tokens_per_minute = int(tokens_per_minute)
         self._monotonic = monotonic
         self._sleep = sleep
-        self._inflight = threading.BoundedSemaphore(self.max_inflight)
+        self._concurrency_condition = threading.Condition()
+        self._active_requests = 0
+        self._current_limit = initial_limit
+        self._success_streak = 0
+        self._concurrency_increases = 0
+        self._concurrency_decreases = 0
         self._schedule_lock = threading.Lock()
         self._request_ready_at = 0.0
         self._token_ready_at = 0.0
@@ -202,21 +278,68 @@ class OpenAIRequestController:
                 self._monotonic() + seconds,
             )
 
+    def record_success(self) -> None:
+        if not self.adaptive:
+            return
+        with self._concurrency_condition:
+            self._success_streak += 1
+            if (
+                self._success_streak >= self.successes_per_increase
+                and self._current_limit < self.max_inflight
+            ):
+                self._current_limit += 1
+                self._success_streak = 0
+                self._concurrency_increases += 1
+                self._concurrency_condition.notify_all()
+
+    def record_failure(self) -> None:
+        if not self.adaptive:
+            return
+        with self._concurrency_condition:
+            self._success_streak = 0
+            reduced = max(1, self._current_limit // 2)
+            if reduced < self._current_limit:
+                self._current_limit = reduced
+                self._concurrency_decreases += 1
+
+    def _acquire_concurrency(self) -> None:
+        with self._concurrency_condition:
+            while self._active_requests >= self._current_limit:
+                self._concurrency_condition.wait()
+            self._active_requests += 1
+
+    def _release_concurrency(self) -> None:
+        with self._concurrency_condition:
+            self._active_requests -= 1
+            self._concurrency_condition.notify_all()
+
     @contextmanager
     def request_slot(self, estimated_tokens: int) -> Iterator[None]:
-        self._inflight.acquire()
+        self._acquire_concurrency()
         try:
             self.wait_for_budget(estimated_tokens)
             yield
         finally:
-            self._inflight.release()
+            self._release_concurrency()
 
     def summary(self) -> dict[str, int]:
-        return {
+        summary = {
             "max_inflight": self.max_inflight,
             "requests_per_minute": self.requests_per_minute,
             "tokens_per_minute": self.tokens_per_minute,
         }
+        if self.adaptive:
+            with self._concurrency_condition:
+                summary.update(
+                    {
+                        "initial_inflight": self.initial_inflight,
+                        "current_inflight_limit": self._current_limit,
+                        "successes_per_increase": self.successes_per_increase,
+                        "concurrency_increases": self._concurrency_increases,
+                        "concurrency_decreases": self._concurrency_decreases,
+                    }
+                )
+        return summary
 
 
 def _environment_value(raw_value: str, *, line_number: int) -> str:
@@ -238,6 +361,62 @@ def _environment_value(raw_value: str, *, line_number: int) -> str:
     return value[1:-1]
 
 
+def _profile_names(value: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_name in re.split(r"[\s,]+", value.strip()):
+        if not raw_name:
+            continue
+        if _AUTO_CHECK_PROFILE_NAME.fullmatch(raw_name) is None:
+            raise ValueError(
+                "MMDD_AUTO_CHECK_API_PROFILES contains an invalid profile name"
+            )
+        canonical = raw_name.casefold()
+        if canonical in seen:
+            raise ValueError(
+                "MMDD_AUTO_CHECK_API_PROFILES contains a duplicate profile name"
+            )
+        seen.add(canonical)
+        names.append(raw_name)
+    if not names:
+        raise ValueError("MMDD_AUTO_CHECK_API_PROFILES must not be empty")
+    return names
+
+
+def _profile_environment_prefix(name: str) -> str:
+    return f"{AUTO_CHECK_API_PROFILE_PREFIX}{name.upper()}_"
+
+
+def _allowed_environment_keys(values: dict[str, str]) -> frozenset[str]:
+    allowed = set(OPENAI_ENVIRONMENT_KEYS)
+    profile_list = values.get(AUTO_CHECK_API_PROFILES_ENV)
+    if profile_list is None:
+        return frozenset(allowed)
+    for profile_name in _profile_names(profile_list):
+        prefix = _profile_environment_prefix(profile_name)
+        allowed.update(prefix + field for field in AUTO_CHECK_API_PROFILE_FIELDS)
+    return frozenset(allowed)
+
+
+def _read_protected_text_file(path: Path, *, description: str) -> str:
+    protected_path = Path(path).expanduser()
+    try:
+        path_stat = protected_path.stat()
+    except OSError as error:
+        raise ValueError(f"{description} is not readable: {protected_path}") from error
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ValueError(f"{description} is not a regular file: {protected_path}")
+    if path_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ValueError(
+            f"{description} permissions are too broad; run chmod 600 "
+            f"{protected_path}"
+        )
+    try:
+        return protected_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"{description} is not valid UTF-8: {protected_path}") from error
+
+
 def load_openai_environment_file(
     path: Path,
     *,
@@ -245,30 +424,13 @@ def load_openai_environment_file(
 ) -> frozenset[str]:
     """Load a strict, non-executable OpenAI dotenv file into an environment."""
 
-    environment_path = Path(path).expanduser()
-    try:
-        path_stat = environment_path.stat()
-    except OSError as error:
-        raise ValueError(
-            f"OpenAI environment file is not readable: {environment_path}"
-        ) from error
-    if not stat.S_ISREG(path_stat.st_mode):
-        raise ValueError(
-            f"OpenAI environment file is not a regular file: {environment_path}"
-        )
-    if path_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ValueError(
-            "OpenAI environment file permissions are too broad; run "
-            f"chmod 600 {environment_path}"
-        )
-    try:
-        lines = environment_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        raise ValueError(
-            f"OpenAI environment file is not valid UTF-8: {environment_path}"
-        ) from error
+    lines = _read_protected_text_file(
+        path,
+        description="OpenAI environment file",
+    ).splitlines()
 
     values: dict[str, str] = {}
+    value_lines: dict[str, int] = {}
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -280,10 +442,6 @@ def load_openai_environment_file(
         if not separator or _ENVIRONMENT_NAME.fullmatch(name) is None:
             raise ValueError(
                 f"OpenAI environment file has an invalid assignment on line {line_number}"
-            )
-        if name not in OPENAI_ENVIRONMENT_KEYS:
-            raise ValueError(
-                f"OpenAI environment file does not allow {name!r} on line {line_number}"
             )
         if name in values:
             raise ValueError(
@@ -299,10 +457,319 @@ def load_openai_environment_file(
                 f"OpenAI environment file has an invalid {name!r} on line {line_number}"
             )
         values[name] = value
+        value_lines[name] = line_number
+
+    allowed_keys = _allowed_environment_keys(values)
+    for name in values:
+        if name not in allowed_keys:
+            raise ValueError(
+                "OpenAI environment file does not allow "
+                f"{name!r} on line {value_lines[name]}"
+            )
 
     target = os.environ if environ is None else environ
     target.update(values)
     return frozenset(values)
+
+
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(
+                "OpenAI auto-check API config contains a duplicate object key"
+            )
+        value[key] = item
+    return value
+
+
+def _require_json_object_fields(
+    value: dict[str, Any],
+    *,
+    allowed: frozenset[str],
+    context: str,
+) -> None:
+    if set(value) - allowed:
+        raise ValueError(f"{context} contains unsupported fields")
+
+
+def _required_json_string(
+    value: dict[str, Any],
+    field_name: str,
+    *,
+    context: str,
+) -> str:
+    item = value.get(field_name)
+    if not isinstance(item, str) or not item.strip():
+        raise ValueError(f"{context}.{field_name} must be a non-empty string")
+    return item.strip()
+
+
+def _json_api_stage(
+    value: Any,
+    *,
+    context: str,
+    default_use_responses: bool = False,
+) -> tuple[str, str, str, bool]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be an object")
+    _require_json_object_fields(
+        value,
+        allowed=_AUTO_CHECK_JSON_STAGE_FIELDS,
+        context=context,
+    )
+    api_key = _required_json_string(value, "api_key", context=context)
+    api_base_url = validate_api_base_url(
+        _required_json_string(value, "base_url", context=context)
+    )
+    model = _required_json_string(value, "model", context=context)
+    use_responses = value.get("response", default_use_responses)
+    if not isinstance(use_responses, bool):
+        raise ValueError(f"{context}.response must be a boolean")
+    return api_key, api_base_url, model, use_responses
+
+
+def load_openai_auto_check_api_config(
+    path: Path,
+    *,
+    default_max_concurrency: int = 20,
+) -> list[OpenAICompatibleAPIProfile]:
+    """Load strict JSON auto-check profiles from a chmod-600 secret file."""
+
+    if default_max_concurrency < 5:
+        raise ValueError("default auto-check max concurrency must be at least 5")
+    raw_config = _read_protected_text_file(
+        path,
+        description="OpenAI auto-check API config",
+    )
+    try:
+        config = json.loads(
+            raw_config,
+            object_pairs_hook=_json_object_without_duplicates,
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "OpenAI auto-check API config is invalid JSON at "
+            f"line {error.lineno}, column {error.colno}"
+        ) from error
+    if not isinstance(config, dict):
+        raise ValueError("OpenAI auto-check API config root must be an object")
+    _require_json_object_fields(
+        config,
+        allowed=_AUTO_CHECK_JSON_ROOT_FIELDS,
+        context="OpenAI auto-check API config root",
+    )
+    version = config.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise ValueError("OpenAI auto-check API config version must be 1")
+    raw_profiles = config.get("profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise ValueError("OpenAI auto-check API config profiles must be an object")
+
+    profiles: list[OpenAICompatibleAPIProfile] = []
+    canonical_names: set[str] = set()
+    for name, raw_profile in raw_profiles.items():
+        if _AUTO_CHECK_PROFILE_NAME.fullmatch(name) is None:
+            raise ValueError("OpenAI auto-check API config has an invalid profile name")
+        canonical_name = name.casefold()
+        if canonical_name in canonical_names:
+            raise ValueError(
+                "OpenAI auto-check API config has duplicate profile names"
+            )
+        canonical_names.add(canonical_name)
+        context = f"profile {name!r}"
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"{context} must be an object")
+        _require_json_object_fields(
+            raw_profile,
+            allowed=_AUTO_CHECK_JSON_PROFILE_FIELDS,
+            context=context,
+        )
+        if "initial" not in raw_profile:
+            raise ValueError(
+                f"{context}.initial must be an object or null"
+            )
+        if "final_judge" not in raw_profile:
+            raise ValueError(
+                f"{context}.final_judge must be an object or null"
+            )
+        profile_use_responses = raw_profile.get("response", False)
+        if not isinstance(profile_use_responses, bool):
+            raise ValueError(f"{context}.response must be a boolean")
+        raw_initial = raw_profile["initial"]
+        initial_api_key: str | None = None
+        initial_api_base_url: str | None = None
+        model: str | None = None
+        initial_use_responses = False
+        if raw_initial is not None:
+            (
+                initial_api_key,
+                initial_api_base_url,
+                model,
+                initial_use_responses,
+            ) = _json_api_stage(
+                raw_initial,
+                context=f"{context}.initial",
+                default_use_responses=profile_use_responses,
+            )
+        raw_max_concurrency = raw_profile.get(
+            "max_concurrency",
+            default_max_concurrency,
+        )
+        if (
+            isinstance(raw_max_concurrency, bool)
+            or not isinstance(raw_max_concurrency, int)
+            or raw_max_concurrency < 5
+        ):
+            raise ValueError(f"{context}.max_concurrency must be an integer >= 5")
+
+        raw_final_judge = raw_profile["final_judge"]
+        final_judge_api_key: str | None = None
+        final_judge_api_base_url: str | None = None
+        final_judge_model: str | None = None
+        final_judge_use_responses = False
+        if raw_final_judge is not None:
+            (
+                final_judge_api_key,
+                final_judge_api_base_url,
+                final_judge_model,
+                final_judge_use_responses,
+            ) = _json_api_stage(
+                raw_final_judge,
+                context=f"{context}.final_judge",
+                default_use_responses=profile_use_responses,
+            )
+        if model is None and final_judge_model is None:
+            raise ValueError(
+                f"{context} must configure initial, final_judge, or both"
+            )
+        profiles.append(
+            OpenAICompatibleAPIProfile(
+                name=name,
+                initial_api_key=initial_api_key,
+                initial_api_base_url=initial_api_base_url,
+                model=model,
+                final_judge_api_key=final_judge_api_key,
+                final_judge_api_base_url=final_judge_api_base_url,
+                final_judge_model=final_judge_model,
+                max_concurrency=raw_max_concurrency,
+                initial_use_responses=initial_use_responses,
+                final_judge_use_responses=final_judge_use_responses,
+            )
+        )
+    return profiles
+
+
+def load_openai_compatible_api_profiles(
+    *,
+    environ: MutableMapping[str, str] | None = None,
+    default_model: str = "gpt-5.6-luna",
+    default_max_concurrency: int = 20,
+) -> list[OpenAICompatibleAPIProfile]:
+    """Parse any number of explicitly declared auto-check API profiles."""
+
+    source = os.environ if environ is None else environ
+    raw_profiles = str(source.get(AUTO_CHECK_API_PROFILES_ENV, "")).strip()
+    if not raw_profiles:
+        return []
+    if default_max_concurrency < 5:
+        raise ValueError("default auto-check max concurrency must be at least 5")
+
+    profiles: list[OpenAICompatibleAPIProfile] = []
+    for name in _profile_names(raw_profiles):
+        prefix = _profile_environment_prefix(name)
+        legacy_api_key = str(source.get(prefix + "API_KEY", "")).strip()
+        legacy_api_base_url = str(source.get(prefix + "BASE_URL", "")).strip()
+        initial_api_key = (
+            str(source.get(prefix + "INITIAL_API_KEY", "")).strip()
+            or legacy_api_key
+        )
+        initial_api_base_url = (
+            str(source.get(prefix + "INITIAL_BASE_URL", "")).strip()
+            or legacy_api_base_url
+        )
+        model = str(source.get(prefix + "MODEL", default_model)).strip()
+        final_model_key = prefix + "FINAL_JUDGE_MODEL"
+        if final_model_key not in source:
+            raise ValueError(
+                f"auto-check API profile {name!r} has no FINAL_JUDGE_MODEL; "
+                "set it to a full model name or none"
+            )
+        raw_final_model = str(source[final_model_key]).strip()
+        if raw_final_model == "":
+            raise ValueError(
+                f"auto-check API profile {name!r} has empty FINAL_JUDGE_MODEL"
+            )
+        final_judge_model = (
+            None if raw_final_model.casefold() == "none" else raw_final_model
+        )
+        if not initial_api_key:
+            raise ValueError(
+                f"auto-check API profile {name!r} has no INITIAL_API_KEY "
+                "or fallback API_KEY"
+            )
+        if not initial_api_base_url:
+            raise ValueError(
+                f"auto-check API profile {name!r} has no INITIAL_BASE_URL "
+                "or fallback BASE_URL"
+            )
+        if not model:
+            raise ValueError(f"auto-check API profile {name!r} has no MODEL")
+        final_judge_api_key: str | None = None
+        final_judge_api_base_url: str | None = None
+        if final_judge_model is not None:
+            final_judge_api_key = (
+                str(source.get(prefix + "FINAL_JUDGE_API_KEY", "")).strip()
+                or legacy_api_key
+            )
+            raw_final_judge_api_base_url = (
+                str(source.get(prefix + "FINAL_JUDGE_BASE_URL", "")).strip()
+                or legacy_api_base_url
+            )
+            if not final_judge_api_key:
+                raise ValueError(
+                    f"auto-check API profile {name!r} has no "
+                    "FINAL_JUDGE_API_KEY or fallback API_KEY"
+                )
+            if not raw_final_judge_api_base_url:
+                raise ValueError(
+                    f"auto-check API profile {name!r} has no "
+                    "FINAL_JUDGE_BASE_URL or fallback BASE_URL"
+                )
+            final_judge_api_base_url = validate_api_base_url(
+                raw_final_judge_api_base_url
+            )
+        try:
+            max_concurrency = int(
+                source.get(prefix + "MAX_CONCURRENCY", default_max_concurrency)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"auto-check API profile {name!r} has invalid MAX_CONCURRENCY"
+            ) from error
+        if max_concurrency < 5:
+            raise ValueError(
+                f"auto-check API profile {name!r} MAX_CONCURRENCY must be at least 5"
+            )
+        profiles.append(
+            OpenAICompatibleAPIProfile(
+                name=name,
+                initial_api_key=initial_api_key,
+                initial_api_base_url=validate_api_base_url(
+                    initial_api_base_url
+                ),
+                model=model,
+                final_judge_model=final_judge_model,
+                final_judge_api_key=final_judge_api_key,
+                final_judge_api_base_url=final_judge_api_base_url,
+                max_concurrency=max_concurrency,
+                initial_use_responses=False,
+                final_judge_use_responses=False,
+            )
+        )
+    return profiles
 
 
 def openai_inference_identity(
@@ -315,13 +782,18 @@ def openai_inference_identity(
     image_detail: str,
     image_max_pixels: int,
     context_retry_image_max_pixels: int,
+    use_responses: bool = False,
 ) -> dict[str, Any]:
     """Return every setting that can change a cached extraction result."""
 
     return {
         "provider": "openai",
-        "transport_version": OPENAI_TRANSPORT_VERSION,
-        "api": "chat_completions",
+        "transport_version": (
+            OPENAI_RESPONSES_TRANSPORT_VERSION
+            if use_responses
+            else OPENAI_CHAT_TRANSPORT_VERSION
+        ),
+        "api": "responses" if use_responses else "chat_completions",
         "api_base_url": api_base_url.rstrip("/"),
         "model": model,
         "prompt_version": join_builder.PROMPT_VERSION,
@@ -427,6 +899,73 @@ def chat_messages(
     return converted
 
 
+def _responses_message_content(
+    content: Any,
+    *,
+    role: str,
+    image_detail: str,
+) -> list[dict[str, Any]]:
+    text_type = "output_text" if role == "assistant" else "input_text"
+    if isinstance(content, str):
+        return [{"type": text_type, "text": content}]
+    if not isinstance(content, list):
+        raise TypeError("OpenAI message content must be text or a content list")
+    converted: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise TypeError("OpenAI message content items must be objects")
+        item_type = str(item.get("type") or "")
+        if item_type in {"text", "input_text", "output_text"}:
+            converted.append(
+                {
+                    "type": text_type,
+                    "text": str(item.get("text") or ""),
+                }
+            )
+            continue
+        if item_type in {"image_url", "input_image"}:
+            image_value = item.get("image_url")
+            if isinstance(image_value, dict):
+                image_url = str(image_value.get("url") or "")
+            else:
+                image_url = str(image_value or "")
+            if not image_url:
+                raise ValueError("OpenAI image input is missing image_url")
+            converted.append(
+                {
+                    "type": "input_image",
+                    "image_url": image_url,
+                    "detail": image_detail,
+                }
+            )
+            continue
+        raise ValueError(f"unsupported OpenAI message content type: {item_type!r}")
+    return converted
+
+
+def responses_input(
+    messages: Iterable[dict[str, Any]],
+    *,
+    image_detail: str,
+) -> list[dict[str, Any]]:
+    converted = []
+    for message in messages:
+        role = str(message.get("role") or "")
+        if role not in {"system", "developer", "user", "assistant"}:
+            raise ValueError(f"unsupported OpenAI message role: {role!r}")
+        converted.append(
+            {
+                "role": role,
+                "content": _responses_message_content(
+                    message.get("content"),
+                    role=role,
+                    image_detail=image_detail,
+                ),
+            }
+        )
+    return converted
+
+
 def chat_output_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -462,6 +1001,39 @@ def chat_output_text(payload: dict[str, Any]) -> str:
             f"{finish_reason}"
         )
     raise RuntimeError("OpenAI chat completion did not contain message content")
+
+
+def responses_output_text(payload: dict[str, Any]) -> str:
+    output = payload.get("output")
+    if not isinstance(output, list):
+        raise RuntimeError("OpenAI response did not contain output")
+    text_parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type == "refusal":
+                refusal = str(part.get("refusal") or "").strip()
+                raise RuntimeError(
+                    f"OpenAI model refused extraction: {refusal[:300]}"
+                )
+            if part_type == "output_text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    text_parts.append(text)
+    rendered = "\n".join(text_parts).strip()
+    if rendered:
+        return rendered
+    status = str(payload.get("status") or "")
+    if status and status != "completed":
+        raise RuntimeError(f"OpenAI response did not complete normally: {status}")
+    raise RuntimeError("OpenAI response did not contain output text")
 
 
 def _token_count(usage: dict[str, Any], *keys: str) -> int:
@@ -507,7 +1079,7 @@ def normalized_usage(usage: Any) -> dict[str, int]:
 
 
 class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
-    """Use the existing extraction prompt/parser with Chat Completions."""
+    """Use the existing extraction prompt/parser with an OpenAI API."""
 
     def __init__(
         self,
@@ -527,6 +1099,12 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
             join_builder.DEFAULT_CONTEXT_RETRY_IMAGE_MAX_PIXELS
         ),
         max_inflight: int = 4,
+        adaptive_concurrency: bool = False,
+        initial_inflight: int | None = None,
+        successes_per_increase: int = 20,
+        request_controller: OpenAIRequestController | None = None,
+        portable_chat_completions: bool = False,
+        use_responses: bool = False,
         requests_per_minute: int = 0,
         tokens_per_minute: int = 0,
         retry_max_seconds: float = 60.0,
@@ -584,10 +1162,22 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
         self.usage_journal_path = (
             Path(usage_journal_path) if usage_journal_path is not None else None
         )
+        self.portable_chat_completions = bool(portable_chat_completions)
+        self.use_responses = bool(use_responses)
         self.model_call_stats = join_builder.ModelCallStats()
+        self.auto_check_enabled = True
+        self.model_auto_check_stats = join_builder.ModelAutoCheckStats()
+        # OpenAI-primary builders do not recursively invoke the local-primary
+        # Luna/Terra checker cascade.
+        self.auto_check_luna_reviewer = None
+        self.auto_check_terra_reviewer = None
+        self.auto_check_secondary_reviewer = None
         self._usage_lock = threading.Lock()
-        self.request_controller = OpenAIRequestController(
+        self.request_controller = request_controller or OpenAIRequestController(
             max_inflight=max_inflight,
+            adaptive=adaptive_concurrency,
+            initial_inflight=initial_inflight,
+            successes_per_increase=successes_per_increase,
             requests_per_minute=requests_per_minute,
             tokens_per_minute=tokens_per_minute,
         )
@@ -615,7 +1205,34 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
         *,
         model: str,
         messages: list[dict[str, Any]],
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
     ) -> dict[str, Any]:
+        schema = response_schema or ATTRIBUTE_EXTRACTION_SCHEMA
+        schema_name = response_schema_name or "attribute_extraction"
+        if self.use_responses:
+            payload = {
+                "model": model,
+                "input": responses_input(
+                    messages,
+                    image_detail=self.image_detail,
+                ),
+                "stream": False,
+                "store": False,
+                "max_output_tokens": self.max_output_tokens,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema,
+                    },
+                    "verbosity": self.verbosity,
+                },
+            }
+            if self.reasoning_effort != "omit":
+                payload["reasoning"] = {"effort": self.reasoning_effort}
+            return payload
         payload: dict[str, Any] = {
             "model": model,
             "messages": chat_messages(
@@ -626,21 +1243,25 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "attribute_extraction",
+                    "name": schema_name,
                     "strict": True,
-                    "schema": ATTRIBUTE_EXTRACTION_SCHEMA,
+                    "schema": schema,
                 },
             },
-            "max_completion_tokens": self.max_output_tokens,
-            "store": False,
-            "verbosity": self.verbosity,
         }
-        if self.reasoning_effort != "omit":
-            payload["reasoning_effort"] = self.reasoning_effort
+        if self.portable_chat_completions:
+            payload["max_tokens"] = self.max_output_tokens
+            if self.reasoning_effort != "omit":
+                payload["reasoning_effort"] = self.reasoning_effort
+        else:
+            payload["max_completion_tokens"] = self.max_output_tokens
+            payload["store"] = False
+            payload["verbosity"] = self.verbosity
+            if self.reasoning_effort != "omit":
+                payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
-    @staticmethod
-    def _http_error(response: Any, status_code: int) -> RuntimeError:
+    def _http_error(self, response: Any, status_code: int) -> RuntimeError:
         message = ""
         try:
             payload = response.json()
@@ -652,7 +1273,8 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
         if not message:
             message = str(getattr(response, "text", "") or "")
         message = join_builder.clean_text(message)[:500]
-        rendered = f"OpenAI Chat Completions API returned HTTP {status_code}"
+        api_name = "Responses" if self.use_responses else "Chat Completions"
+        rendered = f"OpenAI {api_name} API returned HTTP {status_code}"
         if message:
             rendered = f"{rendered}: {message}"
         if status_code in {408, 409, 429} or status_code >= 500:
@@ -687,7 +1309,11 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
             return
         record = {
             "record_type": "openai_api_usage",
-            "transport_version": OPENAI_TRANSPORT_VERSION,
+            "transport_version": (
+                OPENAI_RESPONSES_TRANSPORT_VERSION
+                if self.use_responses
+                else OPENAI_CHAT_TRANSPORT_VERSION
+            ),
             "recorded_at": time.time(),
             "response_id": str(response_payload.get("id") or ""),
             "model": self.model,
@@ -711,6 +1337,8 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
         api_key: str | None,
         messages: list[dict[str, Any]],
         model_kind: str = "text",
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
     ) -> str:
         del api_key
         if not self.api_key:
@@ -719,7 +1347,12 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = self.request_payload(model=model, messages=messages)
+        payload = self.request_payload(
+            model=model,
+            messages=messages,
+            response_schema=response_schema,
+            response_schema_name=response_schema_name,
+        )
         estimated_tokens = _estimated_request_tokens(
             messages,
             max_output_tokens=self.max_output_tokens,
@@ -727,6 +1360,8 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
         )
         last_error: Exception | None = None
         last_error_transient = False
+        endpoint = "responses" if self.use_responses else "chat/completions"
+        api_name = "Responses" if self.use_responses else "Chat Completions"
         for attempt in range(self.max_retries + 1):
             started = time.perf_counter()
             usage: dict[str, Any] | None = None
@@ -735,7 +1370,7 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
             try:
                 with self.request_controller.request_slot(estimated_tokens):
                     response = requests.post(
-                        f"{base_url.rstrip('/')}/chat/completions",
+                        f"{base_url.rstrip('/')}/{endpoint}",
                         headers=headers,
                         json=payload,
                         timeout=self.timeout,
@@ -765,7 +1400,7 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
                     data = response.json()
                     if not isinstance(data, dict):
                         raise RuntimeError(
-                            "OpenAI Chat Completions API returned non-object JSON"
+                            f"OpenAI {api_name} API returned non-object JSON"
                         )
                     usage_value = data.get("usage")
                     usage = (
@@ -777,8 +1412,13 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
                         model_kind=model_kind,
                         response_payload=data,
                     )
-                    content = chat_output_text(data)
+                    content = (
+                        responses_output_text(data)
+                        if self.use_responses
+                        else chat_output_text(data)
+                    )
             except Exception as error:  # pragma: no cover - branches unit tested.
+                self.request_controller.record_failure()
                 self.model_call_stats.record(
                     model_kind,
                     elapsed_seconds=time.perf_counter() - started,
@@ -811,6 +1451,7 @@ class OpenAIAttributeExtractor(join_builder.LocalAttributeExtractor):
                 elapsed_seconds=time.perf_counter() - started,
                 usage=usage,
             )
+            self.request_controller.record_success()
             return content
         message = f"OpenAI {model_kind} model call failed: {last_error}"
         if last_error_transient:
@@ -920,16 +1561,22 @@ def current_process_usage(
 
 __all__ = [
     "ATTRIBUTE_EXTRACTION_SCHEMA",
+    "AUTO_CHECK_API_PROFILES_ENV",
+    "AUTO_CHECK_API_PROFILE_FIELDS",
+    "AUTO_CHECK_API_PROFILE_PREFIX",
     "OPENAI_OUTPUT_SCHEMA_VERSION",
     "OPENAI_TRANSPORT_VERSION",
     "OPENAI_ENVIRONMENT_KEYS",
     "OpenAIAttributeExtractor",
+    "OpenAICompatibleAPIProfile",
     "OpenAIRequestController",
     "OpenAITransientModelError",
     "chat_messages",
     "chat_output_text",
     "current_process_usage",
     "load_openai_environment_file",
+    "load_openai_auto_check_api_config",
+    "load_openai_compatible_api_profiles",
     "normalized_usage",
     "openai_inference_identity",
     "retry_after_seconds",

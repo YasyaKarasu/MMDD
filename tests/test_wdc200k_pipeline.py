@@ -135,15 +135,24 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
             str(tmp_path / "out"),
         ]
     )
+    config = PipelineConfig.from_args(args)
+    assert config.cache_dir == (tmp_path / "cache" / "wdc_webtable").resolve()
     assert args.max_source_tables == 200_000
     assert args.max_rows_per_source_table is None
     assert args.selection_seed == 13
+    assert args.top100_policy == "bounded"
+    assert args.top100_per_class == 10
+    assert args.include_rest is False
+    assert args.min_candidate_rows == 5
+    assert args.min_candidate_columns == 3
+    assert args.minimum3_fraction == 1.0
     assert args.web_max_retries == 0
     assert args.web_max_response_seconds == 8
     assert args.web_global_concurrency == 128
     assert args.web_per_host_concurrency == 2
     assert args.max_image_attempts_per_entity == 3
     assert args.max_images_per_entity == 3
+    assert tuple(args.sampled_entity_expansion_schedule) == (12, 20, 25)
     assert args.resume is True
     assert args.refresh_page_cache is False
     assert args.refresh_image_cache is False
@@ -151,8 +160,262 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.model_timeout_seconds == 120.0
     assert args.model_max_retries == 2
     assert args.model_retry_sleep_seconds == 2.0
+    assert args.model_cache_database_path is None
+    assert args.unrecoverable_replacement_rounds == 0
+    assert args.unrecoverable_drop_probability == 0.5
     assert args.materialization_workers == 1
     assert args.materialization_validation_workers == 3
+
+
+def test_progressive_sampling_expands_failed_tables_before_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--cache_dir",
+                str(tmp_path / "cache"),
+            ]
+        )
+    )
+    decisions = {
+        "expand": {
+            "source_table_id": "expand",
+            "eligible": True,
+            "sampled_entities": 8,
+            "attemptable_entities": 25,
+            "sample_limit": 8,
+        },
+        "exhausted": {
+            "source_table_id": "exhausted",
+            "eligible": True,
+            "sampled_entities": 8,
+            "attemptable_entities": 8,
+            "sample_limit": 8,
+        },
+        "prefiltered": {
+            "source_table_id": "prefiltered",
+            "eligible": False,
+            "sampled_entities": 0,
+        },
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_sampling_prefilter_decisions",
+        lambda _config: decisions,
+    )
+    failures = [
+        {"source_table_id": table_id}
+        for table_id in ("expand", "exhausted", "prefiltered")
+    ]
+    state = pipeline_module.SamplingExpansionState(0, None, {})
+
+    limits, expanded, stats = pipeline_module._plan_sampling_expansion(
+        config,
+        state=state,
+        failures=failures,
+    )
+
+    assert limits == {"expand": 12}
+    assert expanded == ["expand"]
+    assert stats == {
+        "failed_tables": 3,
+        "eligible_failed_tables": 2,
+        "expanded_tables": 1,
+        "sampling_exhausted_failed_tables": 2,
+    }
+    persisted = pipeline_module._write_sampling_expansion_state(
+        config,
+        previous=state,
+        limits=limits,
+        expanded_table_ids=expanded,
+    )
+    assert pipeline_module._load_sampling_expansion_state(config) == persisted
+
+    decisions["expand"].update(
+        sampled_entities=12,
+        sample_limit=12,
+    )
+    next_limits, next_expanded, _ = (
+        pipeline_module._plan_sampling_expansion(
+            config,
+            state=persisted,
+            failures=failures,
+        )
+    )
+    assert next_limits == {"expand": 20}
+    assert next_expanded == ["expand"]
+
+
+def test_legacy_work_model_cache_is_copied_to_shared_cache(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--cache_dir",
+                str(tmp_path / "cache"),
+            ]
+        )
+    )
+    legacy = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    legacy.parent.mkdir(parents=True)
+    with sqlite3.connect(legacy) as connection:
+        connection.execute("CREATE TABLE cached (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO cached VALUES ('reused')")
+
+    target = pipeline_module._promote_legacy_model_cache(config)
+
+    assert target == config.cache_dir / "model_cache" / "jobs.sqlite3"
+    assert legacy.is_file()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("SELECT value FROM cached").fetchone()[0] == (
+            "reused"
+        )
+
+
+def test_recovery_replacement_claims_every_failed_slot_and_persists_active_round(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--work_dir",
+                str(tmp_path / "work"),
+                "--cache_dir",
+                str(tmp_path / "cache"),
+                "--max_source_tables",
+                "2",
+                "--class_max_tables",
+                "2",
+                "--unrecoverable_replacement_rounds",
+                "5",
+                "--unrecoverable_drop_probability",
+                "1",
+            ]
+        )
+    )
+    from wdc200k_selection import ReserveManager, SelectionPolicy, TableCandidate
+
+    selected = [
+        TableCandidate(
+            "Thing",
+            "minimum3",
+            f"selected-{index}.test",
+            f"Thing/Thing_selected-{index}.test_October2023.json.gz",
+            8,
+            4,
+        )
+        for index in range(2)
+    ]
+    reserve = [
+        TableCandidate(
+            "Thing",
+            "minimum3",
+            f"reserve-{index}.test",
+            f"Thing/Thing_reserve-{index}.test_October2023.json.gz",
+            9,
+            5,
+        )
+        for index in range(2)
+    ]
+    selection_root = config.work_dir / "selection"
+    selection_root.mkdir(parents=True)
+    ReserveManager.create(
+        selection_root / "reserve.sqlite3",
+        reserve=reserve,
+        selected=selected,
+        policy=SelectionPolicy(
+            target_tables=2,
+            seed=13,
+            top100_policy=config.top100_policy,
+            top100_per_class=config.top100_per_class,
+            include_rest=config.include_rest,
+            min_candidate_rows=config.min_candidate_rows,
+            min_candidate_columns=config.min_candidate_columns,
+            minimum3_fraction=config.minimum3_fraction,
+            rest_base_per_class=0,
+            class_cap=2,
+        ),
+    )
+    active = [
+        {
+            **candidate.__dict__,
+            "source_table_id": f"source-{index}",
+            "selection_seed": 13,
+        }
+        for index, candidate in enumerate(selected)
+    ]
+    # Structural validation records the materialized table shape, which can
+    # differ from the statistics metadata that identifies reserve candidates.
+    active[0]["columns"] += 1
+    active[1]["rows"] += 2
+
+    replaced, stats = pipeline_module._claim_recovery_replacements(
+        config,
+        round_index=1,
+        active_records=active,
+        failures=active,
+    )
+
+    assert stats == {
+        "failed": 2,
+        "replaced": 2,
+        "retained_by_probability": 0,
+        "reserve_exhausted": 0,
+    }
+    assert {record["relative_path"] for record in replaced} == {
+        candidate.relative_path for candidate in reserve
+    }
+    previous = tmp_path / "previous.jsonl"
+    previous.write_text("{}\n", encoding="utf-8")
+    state = pipeline_module._write_active_recovery_selection(
+        config,
+        round_index=1,
+        records=replaced,
+        previous_selection_path=previous,
+    )
+    assert state.records == 2
+    assert pipeline_module._load_active_recovery_selection(config) == state
+
+
+def test_wdc200k_cli_forwards_shared_endpoint_pool_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "model-endpoints.json"
+    args = parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--model_endpoint_config",
+            str(config_path),
+            "--remote_text_model_workers",
+            "64",
+            "--remote_image_model_workers",
+            "16",
+        ]
+    )
+
+    assert args.model_endpoint_config == str(config_path)
+    assert args.remote_text_model_workers == 64
+    assert args.remote_image_model_workers == 16
     assert args.max_train_query_row_views_per_join == 5
     assert args.explicit_join_fallback_mode == "ratio"
     assert args.explicit_join_fallback_ratio == 0.2
@@ -176,6 +439,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
 
 def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> None:
     secret = "explicit-secret-must-not-be-persisted"
+    auto_check_api_config = tmp_path / "auto-check.json"
     config = PipelineConfig.from_args(
         parse_args(
             [
@@ -207,6 +471,8 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
                 "8",
                 "--materialization_validation_workers",
                 "4",
+                "--auto_check_api_config_file",
+                str(auto_check_api_config),
                 "--max_train_query_row_views_per_join",
                 "7",
             ]
@@ -227,10 +493,12 @@ def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> N
     assert runtime_args.model_retry_sleep_seconds == 0.25
     assert runtime_args.materialization_workers == 8
     assert runtime_args.materialization_validation_workers == 4
+    assert runtime_args.auto_check_api_config_file == str(auto_check_api_config)
     assert runtime_args.max_train_query_row_views_per_join == 7
     assert config.model_endpoint_ready_timeout_seconds == 45.5
     assert config.materialization_workers == 8
     assert config.materialization_validation_workers == 4
+    assert config.auto_check_api_config_file == str(auto_check_api_config)
     assert config.max_train_query_row_views_per_join == 7
 
 
@@ -332,6 +600,7 @@ def test_runtime_args_leave_api_key_environment_precedence_to_extractor(
             str(tmp_path / "input"),
             "--output_dir",
             str(tmp_path / "output"),
+            "--no_auto_check_secondary_openai",
         ]
     )
     runtime_args = pipeline_module._runtime_args(
@@ -373,7 +642,7 @@ def test_remote_vllm_runbook_pins_resume_state_and_secure_tmux() -> None:
         in resume_command
     )
     assert (
-        "--cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720"
+        "--cache_dir /home/oycy/MMDD/cache/wdc_webtable"
         in resume_command
     )
     assert "--sampled_entities_per_table 8" in resume_command
@@ -689,6 +958,13 @@ def test_stop_after_structural_emits_exact_counts_without_network(
                 "1",
                 "--stop_after",
                 "structural",
+                "--top100_policy",
+                "all",
+                "--include_rest",
+                "--min_candidate_rows",
+                "0",
+                "--min_candidate_columns",
+                "0",
             ]
         )
     )
@@ -1219,7 +1495,7 @@ def test_incomplete_models_fast_resume_skips_completed_upstream_stages(
         ),
         encoding="utf-8",
     )
-    model_database = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    model_database = config.cache_dir / "model_cache" / "jobs.sqlite3"
     model_database.parent.mkdir(parents=True)
     sqlite3.connect(model_database).close()
 
@@ -1327,6 +1603,30 @@ def test_pipeline_resume_after_sampling_does_not_require_replaced_full_shards(
 
     assert resumed.stage == "pages"
     assert transport.calls == 1
+
+
+def test_completed_sampling_resume_does_not_iterate_source_tables_to_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="sampling")
+    assert run_pipeline(config).stage == "sampling"
+    original_iter = pipeline_module._iter_jsonl
+
+    def reject_source_table_scan(path: Path):
+        if Path(path).parent.name == "source_tables":
+            raise AssertionError("resume scanned a complete source-table shard")
+        yield from original_iter(path)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_iter_jsonl",
+        reject_source_table_scan,
+    )
+
+    resumed = run_pipeline(config)
+
+    assert resumed.stage == "sampling"
 
 
 def test_pipeline_resumes_incomplete_sampling_manifest(
@@ -2141,10 +2441,83 @@ def test_non_model_progress_tty_uses_native_tqdm_bar(
 
     assert len(bars) == 1
     assert bars[0].desc == "WDC structural"
-    assert bars[0].unit == "shard"
+    assert bars[0].unit == "table"
     assert (bars[0].n, bars[0].total) == (3, 10)
     assert bars[0].refreshes == 2
     assert "[wdc200k]" not in stream.getvalue()
+
+
+def test_non_model_progress_publishes_detail_to_json_and_console(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(pipeline_module.sys, "stdout", stream)
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(
+        stage="selection",
+        detail="rank candidates",
+        completed_shards=4,
+        total_shards=7,
+    )
+
+    reporter.publish()
+
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    assert payload["detail"] == "rank candidates"
+    assert payload["completed_shards"] == 4
+    assert payload["total_shards"] == 7
+    assert "progress=4/7" in stream.getvalue()
+    assert "detail=rank candidates" in stream.getvalue()
+
+
+def test_non_model_progress_tty_displays_detail_as_postfix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    bars: list[Any] = []
+
+    class FakeTqdm:
+        def __init__(self, **kwargs: Any) -> None:
+            self.total = kwargs["total"]
+            self.n = kwargs["initial"]
+            self.unit = kwargs["unit"]
+            self.postfix = ""
+            bars.append(self)
+
+        def update(self, amount: int) -> None:
+            self.n += amount
+
+        def set_postfix_str(self, value: str, *, refresh: bool) -> None:
+            assert refresh is False
+            self.postfix = value
+
+        def refresh(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(pipeline_module.sys, "stdout", TtyBuffer())
+    monkeypatch.setattr(pipeline_module, "tqdm", FakeTqdm)
+    reporter = ProgressReporter(_full_pipeline_config(tmp_path))
+    reporter.update(
+        stage="asset_planning",
+        detail="plan entity assets",
+        completed_shards=1_000,
+        total_shards=8_000,
+    )
+
+    reporter.publish()
+
+    assert len(bars) == 1
+    assert bars[0].unit == "record"
+    assert (bars[0].n, bars[0].total) == (1_000, 8_000)
+    assert bars[0].postfix == "plan entity assets"
 
 
 def test_url_progress_tty_replaces_shard_bar_with_url_bar(
@@ -2745,7 +3118,9 @@ def test_run_pages_wires_nonzero_tracker_elapsed_through_reporter_restore(
         lambda *_args, **_kwargs: {"identity": "pages"},
     )
     monkeypatch.setattr(
-        pipeline_module, "iter_page_outcomes", lambda *_args: iter(())
+        pipeline_module,
+        "iter_page_outcomes",
+        lambda *_args, **_kwargs: iter(()),
     )
 
     result = SimpleNamespace(
@@ -2813,8 +3188,16 @@ def test_run_images_wires_nonzero_tracker_elapsed_through_reporter_restore(
     monkeypatch.setattr(
         pipeline_module, "validate_complete_image_fetch", lambda *_args, **_kwargs: None
     )
+    image_outcome_scope: dict[str, Any] = {}
+
+    def fake_iter_image_outcomes(*_args: Any, **kwargs: Any):
+        image_outcome_scope.update(kwargs)
+        return iter(())
+
     monkeypatch.setattr(
-        pipeline_module, "iter_image_outcomes", lambda *_args: iter(())
+        pipeline_module,
+        "iter_image_outcomes",
+        fake_iter_image_outcomes,
     )
     monkeypatch.setattr(
         pipeline_module,
@@ -2874,6 +3257,10 @@ def test_run_images_wires_nonzero_tracker_elapsed_through_reporter_restore(
         object(),
     )
     assert returned[-1] == network_manifest
+    assert image_outcome_scope == {
+        "job_store_path": image_result.job_store_path,
+        "job_kind": image_result.job_kind,
+    }
 
     restored = ProgressReporter(replace(config, resume=True))
     samples = restored._stage_telemetry["images"]["samples"]
@@ -4062,6 +4449,60 @@ def test_network_outcome_manifest_repairs_only_the_corrupt_shard(
     assert shards[0].stat().st_mtime_ns == mtimes[0]
     assert shards[2].stat().st_mtime_ns == mtimes[2]
     assert shards[1].stat().st_mtime_ns != corrupt_mtime
+
+
+def test_scoped_image_cache_publishes_only_current_job_set(
+    tmp_path: Path,
+) -> None:
+    policy_fingerprint = "image-policy-v1"
+    current_kind = "current-image-jobs"
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    jobs_path = tmp_path / "jobs.sqlite3"
+    outcome_store = ImageOutcomeStore(outcomes_path)
+    job_store = SqliteJobStore(jobs_path)
+    current_urls = [
+        "https://i.test/current-a.jpg",
+        "https://i.test/current-b.jpg",
+    ]
+    cached_urls = [*current_urls, "https://i.test/other-dataset.jpg"]
+
+    for image_url in cached_urls:
+        url_key = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+        outcome_store.put(
+            policy_fingerprint,
+            url_key,
+            image_url,
+            {"status": "success"},
+        )
+        if image_url in current_urls:
+            job_store.enqueue(
+                current_kind,
+                f"{current_kind}:{url_key}",
+                {"url_key": url_key, "image_url": image_url},
+            )
+
+    manifest_path = _publish_network_manifest(
+        tmp_path / "network",
+        pipeline_module.iter_image_outcomes(
+            outcomes_path,
+            policy_fingerprint,
+            job_store_path=jobs_path,
+            job_kind=current_kind,
+        ),
+        policy_fingerprint=policy_fingerprint,
+        unique=2,
+        success=2,
+        terminal=0,
+        pending=0,
+        leased=0,
+        records_per_shard=10,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert sum(
+        int(shard["records"])
+        for shard in manifest["completed_shards"]
+    ) == 2
 
 
 def test_resume_rejects_tampered_existing_registry_chain(

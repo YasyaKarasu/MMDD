@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from wdc200k_sampling import (
 )
 import build_wdc200k_mm_joinability_dataset as pipeline
 import build_mm_joinability_dataset as join_builder
+import wdc200k_sampling as sampling_module
 from stage1_io import stable_hash
 
 
@@ -222,6 +224,72 @@ def test_sampling_is_stable_across_input_order_and_seed_controls_order() -> None
     assert [item["entity_id"] for item in first] != [item["entity_id"] for item in other_seed]
     assert len(first) == 8
     assert len(source["rows"]) == 10
+
+
+def test_per_table_limit_expands_only_named_table_and_preserves_prefix(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _ = _structural_fixture(structural_root)
+    initial = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=tmp_path / "initial",
+        policy=SamplingPolicy(sampled_entities_per_table=5),
+    )
+    expanded = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=tmp_path / "expanded",
+        policy=SamplingPolicy(sampled_entities_per_table=5),
+        per_table_entity_limits={"table-1": 8},
+    )
+
+    initial_entities = list(iter_sampled_records(initial, "sampled_entities"))
+    expanded_entities = list(iter_sampled_records(expanded, "sampled_entities"))
+    assert len(initial_entities) == 5
+    assert len(expanded_entities) == 8
+    assert [item["entity_id"] for item in expanded_entities[:5]] == [
+        item["entity_id"] for item in initial_entities
+    ]
+    decision = next(iter(iter_sampled_records(expanded, "prefilter_tables")))
+    assert decision["sample_limit"] == 8
+
+
+def test_sampling_progress_reports_real_shards_and_resume_completion(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _ = _structural_fixture(structural_root)
+    output_root = tmp_path / "sampling"
+    updates: list[dict[str, Any]] = []
+
+    sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+        progress_callback=updates.append,
+    )
+
+    assert [(item["completed"], item["total"]) for item in updates] == [
+        (0, 1),
+        (1, 1),
+    ]
+    resumed: list[dict[str, Any]] = []
+    sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=output_root,
+        policy=SamplingPolicy(),
+        progress_callback=resumed.append,
+    )
+    assert resumed[-1] == {
+        "phase": "sample_structural_shards",
+        "completed": 1,
+        "total": 1,
+        "resumed": True,
+    }
 
 
 @pytest.mark.parametrize("shard_size", [1, 2, 3, 7])
@@ -693,6 +761,59 @@ def test_compact_authority_survives_removed_full_entity_and_reference_shards(
         structural_root / "source_tables/part-00000.jsonl",
     )
     assert authority.source_tables_count == 1
+
+
+def test_sampling_source_authority_reuses_unchanged_process_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    structural_root = tmp_path / "structural"
+    manifest_path, _source_record = _structural_fixture(structural_root)
+    result = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[manifest_path],
+        output_root=tmp_path / "sampling",
+        policy=SamplingPolicy(),
+    )
+    sampling_module._SOURCE_AUTHORITY_VALIDATION_CACHE.clear()
+    original_validate = sampling_module.validate_completed_shard
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sampling_module,
+        "validate_completed_shard",
+        counted,
+    )
+    first = validate_sampling_source_authority(
+        result.manifest_path,
+        structural_output_root=structural_root,
+    )
+    first_calls = calls
+    second = validate_sampling_source_authority(
+        result.manifest_path,
+        structural_output_root=structural_root,
+    )
+
+    assert first == second
+    assert first_calls > 0
+    assert calls == first_calls
+
+    source_path = first.source_tables[0]
+    source_stat = source_path.stat()
+    os.utime(
+        source_path,
+        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1_000_000),
+    )
+    validate_sampling_source_authority(
+        result.manifest_path,
+        structural_output_root=structural_root,
+    )
+    assert calls > first_calls
 
 
 def test_sampling_authority_rejects_unknown_completed_shard(tmp_path: Path) -> None:

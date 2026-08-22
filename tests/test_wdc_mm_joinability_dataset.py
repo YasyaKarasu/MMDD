@@ -2561,6 +2561,44 @@ def test_unbounded_input_requires_explicit_opt_in(tmp_path):
     assert allowed.allow_unbounded is True
 
 
+def test_wdc_parser_accepts_shared_local_remote_endpoint_config(tmp_path):
+    config_path = tmp_path / "model-endpoints.json"
+    args = wdc_builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--model_endpoint_config",
+            str(config_path),
+            "--remote_text_model_workers",
+            "32",
+            "--remote_image_model_workers",
+            "8",
+        ]
+    )
+
+    assert args.model_endpoint_config == str(config_path)
+    assert args.remote_text_model_workers == 32
+    assert args.remote_image_model_workers == 8
+    assert args.disable_thinking is True
+
+
+def test_wdc_parser_rejects_thinking_mode(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        wdc_builder.parse_args(
+            [
+                "--input_dir",
+                str(tmp_path),
+                "--output_dir",
+                str(tmp_path / "out"),
+                "--enable_thinking",
+            ]
+        )
+
+    assert "thinking mode cannot be enabled" in capsys.readouterr().err
+
+
 def test_legacy_image_cache_bytes_are_backfilled_from_actual_files(tmp_path):
     image_dir = tmp_path / "wdc_images"
     image_dir.mkdir()

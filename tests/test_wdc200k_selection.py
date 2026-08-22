@@ -293,6 +293,145 @@ def test_mixed_allocation_is_exact_capped_and_reproducible() -> None:
     )
 
 
+def test_cost_aware_policy_bounds_top100_and_excludes_rest_from_reserve() -> None:
+    catalog = synthetic_catalog(
+        classes=2,
+        top100_per_class=20,
+        minimum3_per_class=30,
+        rest_per_class=30,
+    )
+    policy = SelectionPolicy(
+        target_tables=20,
+        top100_policy="bounded",
+        top100_per_class=3,
+        include_rest=False,
+        min_candidate_rows=5,
+        min_candidate_columns=3,
+        minimum3_fraction=1.0,
+        rest_base_per_class=0,
+    )
+
+    result = select_tables(catalog, policy)
+
+    selected_top100 = [
+        item for item in result.selected if item.subset == "top100"
+    ]
+    assert len(selected_top100) == 6
+    assert Counter(item.schema_class for item in selected_top100) == {
+        "Class00": 3,
+        "Class01": 3,
+    }
+    assert not any(item.subset == "rest" for item in result.selected)
+    assert not any(item.subset == "rest" for item in result.reserve)
+    assert not any(item.subset == "top100" for item in result.reserve)
+    assert all(item.rows >= 5 and item.columns >= 3 for item in result.reserve)
+
+
+def test_streaming_selection_never_persists_excluded_candidates(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    make_statistics_zip(
+        input_dir,
+        schema_class="Product",
+        subsets={
+            "top100": [
+                (f"top-{index}.test", 100 + index, 4)
+                for index in range(5)
+            ],
+            "minimum3": [
+                (f"minimum-{index}.test", 10 + index, 4)
+                for index in range(10)
+            ],
+            "rest": [
+                (f"rest-{index}.test", 10 + index, 4)
+                for index in range(10)
+            ],
+        },
+    )
+    work_dir = tmp_path / "work"
+    policy = SelectionPolicy(
+        target_tables=4,
+        top100_policy="bounded",
+        top100_per_class=2,
+        include_rest=False,
+        min_candidate_rows=5,
+        min_candidate_columns=3,
+        minimum3_fraction=1.0,
+        rest_base_per_class=0,
+    )
+
+    run_selection(input_dir, work_dir, policy, sort_chunk_records=3)
+
+    selection_root = work_dir / "selection"
+    selected = [
+        json.loads(line)
+        for line in (selection_root / "selected_tables.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    reserve = [
+        json.loads(line)
+        for line in (selection_root / "reserve_tables.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert sum(record["subset"] == "top100" for record in selected) == 2
+    assert {record["subset"] for record in reserve} == {"minimum3"}
+    assert len(reserve) == 8
+
+
+def test_selection_progress_is_monotonic_and_names_long_phases(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    for schema_class in ("Event", "Product"):
+        make_statistics_zip(
+            input_dir,
+            schema_class=schema_class,
+            subsets={
+                "minimum3": [
+                    (f"{schema_class.lower()}-{index}.test", 10, 4)
+                    for index in range(4)
+                ]
+            },
+        )
+    updates: list[dict[str, object]] = []
+
+    run_selection(
+        input_dir,
+        tmp_path / "work",
+        SelectionPolicy(
+            target_tables=4,
+            top100_policy="exclude",
+            include_rest=False,
+            min_candidate_rows=1,
+            min_candidate_columns=1,
+            minimum3_fraction=1.0,
+            rest_base_per_class=0,
+        ),
+        sort_chunk_records=2,
+        progress_callback=updates.append,
+    )
+
+    assert all(
+        0 <= int(update["completed"]) <= int(update["total"])
+        for update in updates
+    )
+    assert int(updates[-1]["completed"]) == int(updates[-1]["total"])
+    assert {str(update["phase"]) for update in updates} >= {
+        "scan_statistics_archives",
+        "canonicalize_candidates_read_records",
+        "canonicalize_candidates_write_records",
+        "deduplicate_candidates",
+        "apply_candidate_policy",
+        "allocate_candidate_quotas",
+        "rank_candidates_read_records",
+        "rank_candidates_write_records",
+        "write_selection_outputs",
+    }
+
+
 def test_conflicting_duplicate_path_is_canonical_across_input_order() -> None:
     first_record = TableCandidate(
         schema_class="Product",
@@ -1189,6 +1328,38 @@ def test_exhausted_operation_is_terminal_and_replays_after_restart(
         )
 
 
+def test_recovery_exhaustion_can_retain_the_active_slot(tmp_path: Path) -> None:
+    active = TableCandidate(
+        "Product",
+        "minimum3",
+        "active.test",
+        "Product/Product_active.test_October2023.json.gz",
+        7,
+        4,
+    )
+    policy = SelectionPolicy(target_tables=1)
+    database = tmp_path / "reserve.sqlite"
+    manager = ReserveManager.create(
+        database,
+        reserve=[],
+        selected=[active],
+        policy=policy,
+    )
+
+    with pytest.raises(ReserveExhaustedError):
+        manager.claim_replacement(
+            operation_key="recovery-exhausted",
+            invalid_candidate=active,
+            reason="unrecoverable after auto-check",
+            retain_on_exhaustion=True,
+        )
+
+    resumed = ReserveManager.open(database, policy)
+    assert resumed.class_counts() == {"Product": 1}
+    assert resumed.used_paths() == {active.relative_path}
+    assert resumed.terminal_claims()[0].status == "exhausted"
+
+
 def test_first_claim_requires_full_active_candidate_metadata(
     tmp_path: Path,
 ) -> None:
@@ -1279,6 +1450,17 @@ def test_selection_cli_writes_exact_stable_provisional_and_reserve(
         "20",
         "--seed",
         "13",
+        "--top100_policy",
+        "all",
+        "--include_rest",
+        "--min_candidate_rows",
+        "0",
+        "--min_candidate_columns",
+        "0",
+        "--minimum3_fraction",
+        "0.9",
+        "--rest_base_per_class",
+        "50",
     ]
 
     subprocess.run(command, check=True, capture_output=True, text=True)
@@ -1377,6 +1559,17 @@ def test_selection_cli_deduplicates_paths_before_allocating(
                 str(work_dir),
                 "--target_tables",
                 "4",
+                "--top100_policy",
+                "all",
+                "--include_rest",
+                "--min_candidate_rows",
+                "0",
+                "--min_candidate_columns",
+                "0",
+                "--minimum3_fraction",
+                "0.9",
+                "--rest_base_per_class",
+                "50",
             ],
             check=True,
             capture_output=True,

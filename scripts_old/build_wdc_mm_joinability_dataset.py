@@ -2949,6 +2949,21 @@ def build_dataset(
         model_cache_path,
         reuse=not args.no_reuse_model_cache,
     )
+    query_auto_check_cache_path = cache_dir / "query_recovery_auto_checks.jsonl"
+
+    def query_recovery_record_alias(record: dict[str, Any]) -> str | None:
+        extraction_key = clean_text(record.get("extraction_cache_key"))
+        extraction_record = cache.get(extraction_key) if extraction_key else None
+        return join_builder.query_recovery_auto_check_record_key(
+            record,
+            extraction_record=extraction_record,
+        )
+
+    query_auto_check_cache = join_builder.ExtractionCache(
+        query_auto_check_cache_path,
+        reuse=not args.no_reuse_model_cache,
+        record_key_alias=query_recovery_record_alias,
+    )
     concurrency_state = join_builder.ModelConcurrencyState.from_args(args)
     progress: Any | None = None
     if getattr(args, "model_progress", True):
@@ -3056,6 +3071,37 @@ def build_dataset(
         )
         extractor = _new_extractor(args, extractor_factory)
 
+    if join_builder.auto_check_required(extractor):
+        final_query_auto_check_plans: list[
+            join_builder.QueryRecoveryAutoCheckPlan
+        ] = []
+        for source_table in iter_jsonl_records(source_writer.paths()):
+            source_table_id = str(source_table["source_table_id"])
+            join_builder.build_table_join_records(
+                source_table=source_table,
+                split=source_to_split.get(source_table_id, "test"),
+                assets=assets,
+                entity_to_assets=entity_to_assets,
+                wiki_to_entity_id=wiki_to_entity_id,
+                extractor=extractor,
+                cache=cache,
+                progress=None,
+                concurrency_state=concurrency_state,
+                extraction_writer=join_builder.ListRecordWriter(),
+                recovery_writer=join_builder.ListRecordWriter(),
+                args=args,
+                query_auto_check_cache=query_auto_check_cache,
+                apply_query_auto_check=False,
+                query_recovery_plans_out=final_query_auto_check_plans,
+            )
+        join_builder.finalize_query_recovery_auto_checks(
+            plans=final_query_auto_check_plans,
+            extractor=extractor,
+            cache=query_auto_check_cache,
+            args=args,
+            concurrency_state=concurrency_state,
+        )
+
     query_writer = ShardedJsonlWriter(output_dir / "query_tables", records_per_shard)
     data_lake_writer = ShardedJsonlWriter(
         output_dir / "data_lake_tables", records_per_shard
@@ -3110,6 +3156,8 @@ def build_dataset(
                         extraction_writer=extraction_handle,
                         recovery_writer=recovery_handle,
                         args=args,
+                        query_auto_check_cache=query_auto_check_cache,
+                        finalize_query_recoveries=True,
                     )
                 )
                 if query_tables:
@@ -3165,6 +3213,7 @@ def build_dataset(
                     data_lake_handle.flush()
                     extraction_handle.flush()
                     recovery_handle.flush()
+                    evidence_label_handle.flush()
 
             if args.explicit_join_fallback_mode == "match_implicit":
                 selected_explicit, explicit_candidate_counts = (
@@ -3344,6 +3393,12 @@ def build_dataset(
         "attribute_extractions": extraction_writer.total_records,
         "evidence_recoveries": recovery_writer.total_records,
         "model_inference": join_builder.model_call_stats_summary(extractor),
+        "model_auto_check": {
+            **join_builder.summarize_model_auto_check_records(
+                extraction_writer.paths()
+            ),
+            "current_process": join_builder.model_auto_check_summary(extractor),
+        },
         "model_concurrency": concurrency_state.summary(),
         "precomputed_text_model_cache_tasks": precomputed_text_task_count,
         "precomputed_image_model_cache_tasks": precomputed_image_task_count,
@@ -3389,6 +3444,8 @@ def build_dataset(
             "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
+            "every local-positive evidence candidate for a final accepted query receives an exhaustive auto-check before evidence_recoveries are materialized",
+            "evidence_recoveries contain supported paths only; omitted evidence is an implicit negative",
         ],
     }
     write_json(output_dir / "stats.json", stats)
@@ -3446,13 +3503,24 @@ def build_dataset(
             "identical_visible_query_policy": "keep_best_recovery_single_target",
         },
         "model_endpoints": {
+            "model_endpoint_config": args.model_endpoint_config,
             "text_model_base_url": args.text_model_base_url,
             "text_model_base_urls": args.text_model_base_urls,
             "text_model_base_urls_file": args.text_model_base_urls_file,
+            "remote_text_model_base_url": args.remote_text_model_base_url,
+            "remote_text_model_base_urls": args.remote_text_model_base_urls,
+            "remote_text_model_base_urls_file": (
+                args.remote_text_model_base_urls_file
+            ),
             "text_model_name": args.text_model_name,
             "image_model_base_url": args.image_model_base_url,
             "image_model_base_urls": args.image_model_base_urls,
             "image_model_base_urls_file": args.image_model_base_urls_file,
+            "remote_image_model_base_url": args.remote_image_model_base_url,
+            "remote_image_model_base_urls": args.remote_image_model_base_urls,
+            "remote_image_model_base_urls_file": (
+                args.remote_image_model_base_urls_file
+            ),
             "image_model_name": args.image_model_name,
             "prompt_version": join_builder.PROMPT_VERSION,
             "precompute_model_cache": args.precompute_model_cache,
@@ -3463,8 +3531,15 @@ def build_dataset(
             "model_image_done_marker": args.model_image_done_marker,
             "configured_text_model_workers": args.text_model_workers,
             "configured_image_model_workers": args.image_model_workers,
+            "configured_remote_text_model_workers": (
+                args.remote_text_model_workers
+            ),
+            "configured_remote_image_model_workers": (
+                args.remote_image_model_workers
+            ),
             "final_model_concurrency": stats["model_concurrency"],
             "inference_stats": stats["model_inference"],
+            "auto_check": stats["model_auto_check"],
         },
         "web_cache": {
             "cache_dir": str(cache_dir),
@@ -3485,6 +3560,7 @@ def build_dataset(
         "cache": {
             "root_dir": str(cache_dir),
             "model_attribute_extractions": str(model_cache_path),
+            "query_recovery_auto_checks": str(query_auto_check_cache_path),
         },
         "note": "Read only shards listed here; a reused output directory may contain stale unlisted files.",
     }
@@ -3627,16 +3703,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--model_endpoint_config",
+        default=None,
+        help=(
+            "Optional mmdd-model-endpoints-v1 JSON config shared with the "
+            "EntiTables builder."
+        ),
+    )
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None)
     parser.add_argument("--text_model_base_urls_file", default=None)
+    parser.add_argument("--remote_text_model_base_url", default=None)
+    parser.add_argument("--remote_text_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--remote_text_model_base_urls_file", default=None)
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
     parser.add_argument("--text_model_api_key", default=None)
+    parser.add_argument("--remote_text_model_api_key", default=None)
     parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
     parser.add_argument("--image_model_base_urls", nargs="*", default=None)
     parser.add_argument("--image_model_base_urls_file", default=None)
-    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--remote_image_model_base_url", default=None)
+    parser.add_argument("--remote_image_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--remote_image_model_base_urls_file", default=None)
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Instruct")
     parser.add_argument("--image_model_api_key", default=None)
+    parser.add_argument("--remote_image_model_api_key", default=None)
     parser.add_argument("--model_timeout_seconds", type=float, default=120.0)
     parser.add_argument("--model_temperature", type=float, default=0.0)
     parser.add_argument("--model_max_tokens", type=int, default=1024)
@@ -3652,8 +3744,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--text_model_workers", type=int, default=1)
     parser.add_argument("--image_model_workers", type=int, default=1)
+    parser.add_argument("--remote_text_model_workers", type=int, default=0)
+    parser.add_argument("--remote_image_model_workers", type=int, default=0)
     parser.add_argument(
-        "--enable_thinking", dest="disable_thinking", action="store_false"
+        "--enable_thinking",
+        dest="disable_thinking",
+        action="store_false",
+        help=(
+            "Deprecated and rejected: all text and image requests disable "
+            "thinking."
+        ),
     )
     parser.add_argument(
         "--no_reparse_cached_model_outputs",
@@ -3665,6 +3765,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_retry_sleep_seconds", type=float, default=2.0)
     parser.add_argument("--no_reuse_model_cache", action="store_true")
     parser.add_argument("--cache_failed_model_outputs", action="store_true")
+    join_builder.add_model_auto_check_arguments(parser)
     parser.add_argument("--model_attribute_errors_path", default="")
     parser.add_argument(
         "--context_retry_image_max_pixels",
@@ -3681,6 +3782,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model_ready_timeout_seconds", type=float, default=None)
     parser.add_argument("--model_text_done_marker", default=None)
     parser.add_argument("--model_image_done_marker", default=None)
+    parser.add_argument("--model_round_control_dir", default=None)
+    parser.add_argument("--model_round_run_id", default=None)
     parser.add_argument("--run_fingerprint", default="")
     parser.set_defaults(
         disable_thinking=True,
@@ -3688,6 +3791,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         model_progress=True,
     )
     args = parser.parse_args(argv)
+    if not args.disable_thinking:
+        parser.error(
+            "thinking mode cannot be enabled for dataset construction"
+        )
+    if min(
+        args.text_model_workers,
+        args.image_model_workers,
+        args.remote_text_model_workers,
+        args.remote_image_model_workers,
+    ) < 0:
+        parser.error("model worker counts must be non-negative")
     if args.max_rows_per_source_table < 0:
         parser.error("--max_rows_per_source_table must be >= 0")
     if not args.allow_unbounded and (

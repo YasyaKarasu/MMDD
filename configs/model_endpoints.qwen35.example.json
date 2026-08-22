@@ -1,0 +1,46 @@
+{
+  "schema_version": "mmdd-model-endpoints-v1",
+  "served_model_name": "Qwen3.5-9B",
+  "endpoints": [
+    {
+      "endpoint_id": "local-4090-text",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 12,
+        "image": 0,
+        "total": 12
+      }
+    },
+    {
+      "endpoint_id": "local-4090-image",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 0,
+        "image": 4,
+        "total": 4
+      }
+    },
+    {
+      "endpoint_id": "local-4090-image-donated",
+      "base_url": "http://127.0.0.1:8002/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 0,
+        "image": 4,
+        "total": 4
+      }
+    },
+    {
+      "endpoint_id": "remote-a100-0",
+      "base_url": "http://127.0.0.1:18011/v1",
+      "pool": "remote",
+      "max_inflight": {
+        "text": 32,
+        "image": 8,
+        "total": 36
+      }
+    }
+  ]
+}

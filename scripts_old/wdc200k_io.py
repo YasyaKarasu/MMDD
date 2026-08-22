@@ -475,25 +475,39 @@ class SqliteJobStore:
         limit: int,
         owner: str,
         lease_seconds: float = 300.0,
+        *,
+        pending_statuses: tuple[str, ...] = ("pending", "retryable"),
+        lease_status: str = "leased",
     ) -> list[Job]:
+        if not pending_statuses or any(not status for status in pending_statuses):
+            raise ValueError("pending statuses must not be empty")
+        if not lease_status:
+            raise ValueError("lease status must not be empty")
         now = time.time()
         lease_expires = now + lease_seconds
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            status_placeholders = ",".join("?" for _ in pending_statuses)
             rows = connection.execute(
-                """
+                f"""
                 SELECT job_id
                 FROM jobs
                 WHERE kind = ?
                   AND (
-                    status IN ('pending', 'retryable')
-                    OR (status = 'leased' AND lease_expires <= ?)
+                    status IN ({status_placeholders})
+                    OR (status = ? AND lease_expires <= ?)
                   )
                 ORDER BY updated_at, job_id
                 LIMIT ?
                 """,
-                (kind, now, max(0, limit)),
+                (
+                    kind,
+                    *pending_statuses,
+                    lease_status,
+                    now,
+                    max(0, limit),
+                ),
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             if job_ids:
@@ -505,11 +519,18 @@ class SqliteJobStore:
                     connection.execute(
                         """
                     UPDATE jobs
-                    SET status = 'leased', owner = ?, lease_expires = ?,
+                    SET status = ?, owner = ?, lease_expires = ?,
                         lease_id = ?, updated_at = ?
                     WHERE job_id = ?
                     """,
-                        (owner, lease_expires, uuid.uuid4().hex, now, job_id),
+                        (
+                            lease_status,
+                            owner,
+                            lease_expires,
+                            uuid.uuid4().hex,
+                            now,
+                            job_id,
+                        ),
                     )
                 claimed = connection.execute(
                     f"""
@@ -801,12 +822,30 @@ def external_unique_jsonl(
     chunk_records: int,
     merge_fan_in: int = 64,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, int | str]], None] | None = None,
+    progress_every: int = 10_000,
+    total_records: int | None = None,
 ) -> CompletedShard:
     """Externally sort JSONL records and keep the first record for each key."""
     if chunk_records <= 0:
         raise ValueError("chunk_records must be positive")
     if merge_fan_in < 2:
         raise ValueError("merge_fan_in must be at least 2")
+    if progress_every <= 0:
+        raise ValueError("progress_every must be positive")
+    if total_records is not None and total_records < 0:
+        raise ValueError("total_records must be non-negative")
+
+    def report(phase: str, completed: int, total: int) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": phase,
+                    "completed": completed,
+                    "total": total,
+                }
+            )
+
     _guard_write(pre_write_guard, output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -822,15 +861,24 @@ def external_unique_jsonl(
         run_index = 0
         chunk: list[tuple[str, int, dict[str, Any]]] = []
         ordinal = 0
+        expected_total = 0 if total_records is None else total_records
+        report("read_records", 0, expected_total)
         for record in iter_jsonl_records(input_paths):
             chunk.append((_external_key(key_fn(record)), ordinal, record))
             ordinal += 1
+            if ordinal % progress_every == 0:
+                report(
+                    "read_records",
+                    ordinal,
+                    max(expected_total, ordinal),
+                )
             if len(chunk) >= chunk_records:
                 run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
                 run_index += 1
                 _write_sorted_run(chunk, run_path, pre_write_guard)
                 run_accumulator.add(run_path)
                 chunk = []
+        report("read_records", ordinal, max(expected_total, ordinal))
         if chunk:
             run_path = temporary_dir / f"run-{run_index:08d}.jsonl"
             _write_sorted_run(chunk, run_path, pre_write_guard)
@@ -849,12 +897,18 @@ def external_unique_jsonl(
         try:
             previous_key: str | None = None
             has_previous_key = False
+            merged_records = 0
+            report("write_records", 0, ordinal)
             for key, _ordinal, record in _iter_merged_runs(run_paths):
+                merged_records += 1
+                if merged_records % progress_every == 0:
+                    report("write_records", merged_records, ordinal)
                 if has_previous_key and key == previous_key:
                     continue
                 output.write(record)
                 previous_key = key
                 has_previous_key = True
+            report("write_records", merged_records, ordinal)
             return output.commit()
         except BaseException:
             output.abort()

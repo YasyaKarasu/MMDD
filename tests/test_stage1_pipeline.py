@@ -2644,7 +2644,8 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert query["hidden_attributes"][0]["column_name"] == "City"
     assert query["hidden_attributes"][0]["valid_entity_rows"] == 6
     assert query["hidden_attributes"][0]["required_recovered_rows"] == 3
-    assert query["hidden_attributes"][0]["recovered_value_ratio"] == 0.5
+    # Coverage is measured over the five rows exposed by this query view.
+    assert query["hidden_attributes"][0]["recovered_value_ratio"] == 0.6
     assert query["hidden_attributes"][0]["selected_rows"] == 5
     assert query["hidden_attributes"][0]["target_rows"] == 6
     assert len(query["rows"]) == 5

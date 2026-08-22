@@ -11,6 +11,7 @@ htmlcov/
 # Local environments and editor state
 .env
 .env.*
+.auto_check_apis.json
 /layout-control-token
 .venv/
 venv/

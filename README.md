@@ -254,7 +254,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir dataset/tables_redi2_1 \
   --output_dir output_mm_joinability \
   --text_model_path hf_models/Qwen3.5-9B \
-  --image_model_path hf_models/Qwen3-VL-8B-Thinking \
+  --image_model_path hf_models/Qwen3-VL-8B-Instruct \
   --gpu_coordination_dir work_gpu_priority/local \
   --remote_layout_control_url http://127.0.0.1:18999 \
   --remote_layout_control_token_file layout-control-token \
@@ -352,7 +352,7 @@ The staged pipeline keeps three roots separate:
 output_wdc_200k/   canonical dataset artifacts only
 work_wdc_200k/     selections, shards, durable job stores, checkpoints,
                    stage manifests, runtime markers, and progress.json
-cache/wdc_200k/    reusable positive and negative network/media/model outcomes
+cache/wdc_webtable/    reusable positive and negative network/media/model outcomes
 ```
 
 Never nest or reuse these roots as one another. Only `output_dir` has the
@@ -374,7 +374,7 @@ conda run -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --dry_run
@@ -389,7 +389,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --web_max_retries 0 \
@@ -411,7 +411,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --resume \
@@ -429,7 +429,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --from_stage pages \
   --stop_after pages
@@ -496,7 +496,7 @@ conda run --no-capture-output -n MMDD python \
   --text_model_path /path/to/text-model \
   --image_model_path /path/to/vision-model \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --resume
@@ -543,8 +543,8 @@ remote host before serving. From the local repository, `rsync` is preferred:
 ssh user@REMOTE_HOST 'mkdir -p /srv/mmdd/hf_models'
 rsync -a --info=progress2 hf_models/Qwen3.5-9B/ \
   user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3.5-9B/
-rsync -a --info=progress2 hf_models/Qwen3-VL-8B-Thinking/ \
-  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3-VL-8B-Thinking/
+rsync -a --info=progress2 hf_models/Qwen3-VL-8B-Instruct/ \
+  user@REMOTE_HOST:/srv/mmdd/hf_models/Qwen3-VL-8B-Instruct/
 ```
 
 If those local directories are unavailable, downloading the corresponding
@@ -573,7 +573,7 @@ tmux -L mmdd-vllm new-session -d -s serve -n text \
   'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3.5-9B" --host 127.0.0.1 --port 8001 --served-model-name Qwen3.5-9B --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --language-model-only'
 
 tmux -L mmdd-vllm new-window -d -t serve -n image \
-  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Thinking" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Thinking --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt "{\"image\":1,\"video\":0}" --mm-processor-cache-gb 1'
+  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate vllm-023 && export VLLM_API_KEY="$(cat "$HOME/.config/mmdd/vllm-api-key")" && export REMOTE_MODEL_ROOT=/srv/mmdd/hf_models && exec env CUDA_VISIBLE_DEVICES=0 vllm serve "$REMOTE_MODEL_ROOT/Qwen3-VL-8B-Instruct" --host 127.0.0.1 --port 8000 --served-model-name Qwen3-VL-8B-Instruct --trust-remote-code --dtype bfloat16 --max-model-len 8192 --enforce-eager --gpu-memory-utilization 0.44 --max-num-seqs 16 --max-num-batched-tokens 8192 --limit-mm-per-prompt "{\"image\":1,\"video\":0}" --mm-processor-cache-gb 1'
 
 tmux -L mmdd-vllm attach-session -t serve:text
 # Detach with Ctrl-b d; switch to the image window with Ctrl-b n.
@@ -623,7 +623,7 @@ EOF
 ```
 
 The first response must contain `Qwen3.5-9B`; the second must contain
-`Qwen3-VL-8B-Thinking`. Only after both are healthy, resume the stopped local
+`Qwen3-VL-8B-Instruct`. Only after both are healthy, resume the stopped local
 builder with the formal roots and ordinary `--resume`:
 
 ```bash
@@ -632,7 +632,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir /home/oycy/MMDD/wdc_schemaorg_2023 \
   --output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720 \
   --work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719 \
-  --cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720 \
+  --cache_dir /home/oycy/MMDD/cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --sampled_entities_per_table 8 \
@@ -642,7 +642,7 @@ conda run --no-capture-output -n MMDD python \
   --text_model_base_url http://127.0.0.1:18001/v1 \
   --text_model_name Qwen3.5-9B \
   --image_model_base_url http://127.0.0.1:18000/v1 \
-  --image_model_name Qwen3-VL-8B-Thinking \
+  --image_model_name Qwen3-VL-8B-Instruct \
   --text_model_workers 1 \
   --image_model_workers 1 \
   --model_endpoint_ready_timeout_seconds 180 \
@@ -665,7 +665,7 @@ tmux pane and use a second pane for the atomic progress snapshot:
 
 ```bash
 tmux new-session -d -s wdc_200k \
-  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_200k --max_source_tables 200000 --selection_seed 13 --stop_after structural'
+  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_webtable --max_source_tables 200000 --selection_seed 13 --stop_after structural'
 tmux new-window -t wdc_200k -n progress \
   "watch -n 5 'conda run -n MMDD python -m json.tool work_wdc_200k/progress.json'"
 tmux attach-session -t wdc_200k
@@ -765,7 +765,91 @@ conda run --no-capture-output -n MMDD python \
   --cache_path cache/mm_joinability/auto_checker.sqlite3
 ```
 
-For every `(row, evidence, attribute)`, the auto checker performs an independent leave-one-attribute-out extraction. It removes only that attribute from the original complete row, and gives the model the remaining row, one evidence item, and the attribute name. The model never receives the dataset's claimed value or any target row; it returns only `extracted_value`. The checker then uses the builder's normalization locally: a match is `supported`, a nonempty mismatch is `contradicted`, and an empty extraction is `insufficient`. The local model runs first. Only local `contradicted` or `insufficient` results are sent through the same blind extraction with `gpt-5.6-terra` at `medium` reasoning, with OpenAI secondary concurrency hard-limited to five. The checker, not either model, derives the final verdict by comparing the secondary extraction when one was requested.
+The EntiTables, legacy WDC, and staged WDC-200K builders also apply this blind
+single-attribute extraction as a mandatory post-analysis gate. The batched model
+response is retained as `model_attributes`; every claimed attribute is then
+physically removed from the row and independently extracted from its one evidence
+item. Only `supported` results remain in `attributes`, which is the field consumed
+by query and recovery materialization. Empty, mismatched, and failed checker calls
+are filtered fail-closed, so they cannot contribute to recovery ratios or qrels.
+The prompt/model cache identity was advanced for this policy, preventing older
+unchecked model outputs from being silently reused.
+The inline gate runs the builder's configured text/image model first, then uses
+Luna for blind recovery and a separately configured model for final adjudication.
+Incomplete checker records are fail-closed and are not reused as successful
+cache entries, so a later resumed run retries them. Use
+`--no_auto_check_secondary_openai` only when an intentionally local-only build is
+required. The standalone checker remains available for sampled auditing.
+
+Auto-check API profiles should be stored in a protected JSON file. By default the
+builder loads `./.auto_check_apis.json`; use `--auto_check_api_config_file` to
+select another path. Start from `.auto_check_apis.example.json`; the active file
+must have mode `0600`. Profile names identify providers/concurrency budgets, not
+model vendors:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "gateway_a": {
+      "max_concurrency": 12,
+      "response": true,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://gateway-a.example/v1",
+        "api_key": "fake-example-key-a"
+      },
+      "final_judge": null
+    },
+    "gateway_b": {
+      "max_concurrency": 20,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://gateway-b-initial.example/v1",
+        "api_key": "fake-example-initial-key-b"
+      },
+      "final_judge": {
+        "model": "grok-4.5",
+        "base_url": "https://gateway-b-final.example/v1",
+        "api_key": "fake-example-final-key-b"
+      }
+    },
+    "gateway_c": {
+      "max_concurrency": 12,
+      "initial": null,
+      "final_judge": {
+        "model": "gemini-3.0-pro",
+        "base_url": "https://gateway-c-final.example/v1",
+        "api_key": "fake-example-final-key-c"
+      }
+    }
+  }
+}
+```
+
+Profiles with an `initial` object participate in stable initial-review routing;
+`initial: null` makes a provider final-judge-only. A profile with
+`final_judge: null` never receives final-adjudication requests. At least one
+initial reviewer must exist across the configuration, and the two stages cannot
+both be null in one profile. If no final judge is configured, disagreements
+remain incomplete and fail closed. Each profile has one adaptive concurrency
+controller: it starts at five, increases by one after 20 consecutive successful
+calls up to `max_concurrency`, and halves its current limit after an API or
+transport failure. Its initial and final clients share that controller when both
+exist, even if they use different credentials and URLs. Profiles use OpenAI-compatible
+Chat Completions by default. Set `"response": true` on a profile to use the
+Responses API for both stages, or set it inside `initial` / `final_judge` to
+override one stage. Both transports require structured JSON output. While a builder is running, it checks the JSON
+file before each provider request and atomically reloads a changed, fully valid
+configuration; newly added initial and final providers become available without
+restarting the run. If an update is unreadable, partially written, permissioned
+incorrectly, or otherwise invalid, the builder emits one warning for that file
+revision and keeps using the last valid provider set. The older named dotenv
+profile format and
+`--auto_check_openai_env_file` remain available for compatibility, but JSON is
+the recommended configuration.
+
+For every `(row, evidence, attribute)`, the auto checker performs an independent leave-one-attribute-out extraction. It removes only that attribute from the original complete row, and gives the model the remaining row, one evidence item, and the attribute name. The model never receives the dataset's claimed value or any target row; it returns only `extracted_value`. The checker then uses the builder's normalization locally: a match is `supported`, a nonempty mismatch is `contradicted`, and an empty extraction is `insufficient`. The local model runs first. Only local `contradicted` or `insufficient` results are sent through the same blind extraction with `gpt-5.6-terra` with reasoning disabled, with OpenAI secondary concurrency hard-limited to five. The checker, not either model, derives the final verdict by comparing the secondary extraction when one was requested.
 
 Reports under `<output_dir>/auto_checker_reviews/` contain both extraction stages at path level, query coverage, aggregate statistics, errors, and `patch_candidates-*.jsonl` for later dataset cleanup. Successful results from both stages are cached by `(row, evidence, attribute, model identity)` in SQLite; failures are not cached. Stable hash-prefix sampling lets a later 20% run reuse the earlier 10%. Secondary screening reads `OPENAI_API_KEY` and follows the OpenAI builder's restricted dotenv convention; keys are never written to cache or reports. Use `--no_secondary_openai` to disable it. Every request contains exactly one `masked row + evidence + attribute name`; multiple attributes claimed by the same evidence are requested separately.
 

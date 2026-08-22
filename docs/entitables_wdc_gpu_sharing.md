@@ -80,7 +80,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir /home/oycy/MMDD/wdc_schemaorg_2023 \
   --output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720 \
   --work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719 \
-  --cache_dir /home/oycy/MMDD/cache/wdc_200k_sampled_20260720 \
+  --cache_dir /home/oycy/MMDD/cache/wdc_webtable \
   --runtime_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719/runtime \
   --max_source_tables 200000 \
   --selection_seed 13 \

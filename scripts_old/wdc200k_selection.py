@@ -82,6 +82,15 @@ def _candidate_sqlite_payload_bytes(
 class SelectionPolicy:
     target_tables: int = 200_000
     seed: int = 13
+    # Library callers retain the legacy all-subset behavior unless they opt in.
+    # The WDC builder and this module's CLI pass the cost-aware defaults below
+    # explicitly, which also lets old reserve databases be reopened by legacy
+    # configurations without changing their serialized policy identity.
+    top100_policy: str = "all"
+    top100_per_class: int = 10
+    include_rest: bool = True
+    min_candidate_rows: int = 0
+    min_candidate_columns: int = 0
     minimum3_fraction: float = 0.90
     minimum3_base_per_class: int = 250
     rest_base_per_class: int = 50
@@ -90,6 +99,18 @@ class SelectionPolicy:
     def __post_init__(self) -> None:
         if self.target_tables < 0:
             raise ValueError("target_tables must be non-negative")
+        if self.top100_policy not in {"all", "bounded", "exclude"}:
+            raise ValueError("top100_policy must be all, bounded, or exclude")
+        if self.top100_per_class < 0:
+            raise ValueError("top100_per_class must be non-negative")
+        if self.top100_policy == "bounded" and self.top100_per_class == 0:
+            raise ValueError(
+                "top100_per_class must be positive for bounded top100"
+            )
+        if self.min_candidate_rows < 0:
+            raise ValueError("min_candidate_rows must be non-negative")
+        if self.min_candidate_columns < 0:
+            raise ValueError("min_candidate_columns must be non-negative")
         if not 0.0 <= self.minimum3_fraction <= 1.0:
             raise ValueError("minimum3_fraction must be between zero and one")
         if self.minimum3_base_per_class < 0:
@@ -149,6 +170,55 @@ def _canonical_catalog(
         ) < _candidate_canonical_key(existing):
             by_path[candidate.relative_path] = candidate
     return tuple(by_path.values())
+
+
+def _candidate_passes_base_policy(
+    candidate: TableCandidate,
+    policy: SelectionPolicy,
+) -> bool:
+    if candidate.rows < policy.min_candidate_rows:
+        return False
+    if candidate.columns < policy.min_candidate_columns:
+        return False
+    if candidate.subset == "rest" and not policy.include_rest:
+        return False
+    if candidate.subset == "top100" and policy.top100_policy == "exclude":
+        return False
+    return True
+
+
+def _eligible_catalog(
+    catalog: Iterable[TableCandidate],
+    policy: SelectionPolicy,
+) -> tuple[TableCandidate, ...]:
+    """Apply the cost-aware candidate gate before quota allocation.
+
+    The bounded ``top100`` cohort is selected deterministically per schema
+    class.  Candidates excluded here never enter the replacement reserve, so
+    a later global fallback cannot silently reintroduce giant stress tables or
+    structurally impossible ``rest`` tables.
+    """
+    candidates = tuple(
+        candidate
+        for candidate in _canonical_catalog(catalog)
+        if _candidate_passes_base_policy(candidate, policy)
+    )
+    if policy.top100_policy != "bounded":
+        return candidates
+    top100_by_class: dict[str, list[TableCandidate]] = defaultdict(list)
+    output: list[TableCandidate] = []
+    for candidate in candidates:
+        if candidate.subset == "top100":
+            top100_by_class[candidate.schema_class].append(candidate)
+        else:
+            output.append(candidate)
+    for schema_class in sorted(top100_by_class):
+        ranked = sorted(
+            top100_by_class[schema_class],
+            key=lambda item: _candidate_rank(item, policy.seed),
+        )
+        output.extend(ranked[: policy.top100_per_class])
+    return tuple(output)
 
 
 def _candidate_canonical_key(
@@ -350,7 +420,7 @@ def allocate_strata(
     policy: SelectionPolicy = SelectionPolicy(),
 ) -> dict[tuple[str, str], int]:
     """Allocate exact deterministic class/subset quotas when capacity permits."""
-    candidates = _canonical_catalog(catalog)
+    candidates = _eligible_catalog(catalog, policy)
     availability: dict[tuple[str, str], int] = defaultdict(int)
     for candidate in candidates:
         availability[(candidate.schema_class, candidate.subset)] += 1
@@ -458,8 +528,11 @@ def select_tables(
     policy: SelectionPolicy = SelectionPolicy(),
 ) -> SelectionResult:
     """Select candidates by allocated stratum and stable path hash."""
-    candidates = _canonical_catalog(catalog)
-    quotas = allocate_strata(candidates, policy)
+    candidates = _eligible_catalog(catalog, policy)
+    availability: dict[tuple[str, str], int] = defaultdict(int)
+    for candidate in candidates:
+        availability[(candidate.schema_class, candidate.subset)] += 1
+    quotas = _allocate_from_availability(availability, policy)
     by_stratum: dict[tuple[str, str], list[TableCandidate]] = defaultdict(list)
     for candidate in candidates:
         by_stratum[(candidate.schema_class, candidate.subset)].append(
@@ -844,8 +917,26 @@ class ReserveManager:
             ).fetchone()
         finally:
             connection.close()
-        expected = json.dumps(asdict(policy), sort_keys=True)
-        if row is None or str(row[0]) != expected:
+        if row is None:
+            raise ValueError("reserve database policy does not match")
+        try:
+            stored_policy = json.loads(str(row[0]))
+        except json.JSONDecodeError as error:
+            raise ValueError("reserve database policy does not match") from error
+        expected_policy = asdict(policy)
+        legacy_defaults = asdict(SelectionPolicy())
+        compatible_legacy = (
+            isinstance(stored_policy, dict)
+            and all(
+                expected_policy.get(key) == value
+                for key, value in stored_policy.items()
+            )
+            and all(
+                key in stored_policy or expected_policy[key] == legacy_defaults[key]
+                for key in expected_policy
+            )
+        )
+        if not compatible_legacy:
             raise ValueError("reserve database policy does not match")
         return cls(
             database_path,
@@ -881,6 +972,24 @@ class ReserveManager:
         finally:
             connection.close()
 
+    def active_candidate(self, relative_path: str) -> TableCandidate | None:
+        """Return the selection-authority metadata for an active path."""
+        if not relative_path:
+            raise ValueError("relative_path must be non-empty")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM active_selections
+                WHERE relative_path = ?
+                """,
+                (relative_path,),
+            ).fetchone()
+            return None if row is None else _candidate_from_active_sqlite(row)
+        finally:
+            connection.close()
+
     def replace(
         self,
         invalid_candidate: TableCandidate,
@@ -910,8 +1019,16 @@ class ReserveManager:
         invalid_candidate: TableCandidate,
         reason: str,
         is_invalid: Callable[[TableCandidate], bool] | None = None,
+        retain_on_exhaustion: bool = False,
     ) -> ReplacementClaim:
-        """Persist and return an idempotent pending replacement operation."""
+        """Persist and return an idempotent pending replacement operation.
+
+        Structural replacement cannot keep an invalid table and therefore uses
+        the default destructive exhaustion behavior.  Recovery replacement is
+        different: a terminal-round unrecoverable table still occupies its
+        dataset slot when the reserve is exhausted.  ``retain_on_exhaustion``
+        keeps that active selection while recording the exhausted operation.
+        """
         if not operation_key:
             raise ValueError("operation_key must be non-empty")
         if not reason:
@@ -1023,6 +1140,31 @@ class ReserveManager:
                 )
             if replacement is None:
                 now = time.time()
+                if retain_on_exhaustion:
+                    connection.execute(
+                        """
+                        INSERT INTO active_selections (
+                            relative_path, schema_class, subset_name,
+                            host, rows_count, columns_count
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            invalid_candidate.relative_path,
+                            invalid_candidate.schema_class,
+                            invalid_candidate.subset,
+                            invalid_candidate.host,
+                            invalid_candidate.rows,
+                            invalid_candidate.columns,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE class_counts
+                        SET active_count = active_count + 1
+                        WHERE schema_class = ?
+                        """,
+                        (invalid_candidate.schema_class,),
+                    )
                 connection.execute(
                     """
                     INSERT INTO replacement_operations (
@@ -1590,16 +1732,80 @@ def _iter_input_catalog(archives: Iterable[Path]) -> Iterator[TableCandidate]:
         yield from read_statistics_catalog(archive)
 
 
+def _write_eligible_catalog(
+    unique_path: Path,
+    eligible_path: Path,
+    policy: SelectionPolicy,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    progress_every: int = 10_000,
+) -> CompletedShard:
+    """Persist the policy-eligible catalog without loading the full lake."""
+    writer = AtomicJsonlShard(
+        eligible_path,
+        pre_write_guard=pre_write_guard,
+    )
+    bounded_top100: dict[str, list[dict[str, object]]] = defaultdict(list)
+    try:
+        processed = 0
+        with unique_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                processed += 1
+                record = json.loads(line)
+                candidate = TableCandidate(
+                    schema_class=str(record["schema_class"]),
+                    subset=str(record["subset"]),
+                    host=str(record["host"]),
+                    relative_path=str(record["relative_path"]),
+                    rows=int(record["rows"]),
+                    columns=int(record["columns"]),
+                )
+                if not _candidate_passes_base_policy(candidate, policy):
+                    continue
+                if (
+                    candidate.subset == "top100"
+                    and policy.top100_policy == "bounded"
+                ):
+                    bounded_top100[candidate.schema_class].append(record)
+                else:
+                    writer.write(record)
+                if (
+                    progress_callback is not None
+                    and processed % progress_every == 0
+                ):
+                    progress_callback(processed)
+        if progress_callback is not None:
+            progress_callback(processed)
+        if policy.top100_policy == "bounded":
+            for schema_class in sorted(bounded_top100):
+                records = sorted(
+                    bounded_top100[schema_class],
+                    key=lambda record: (
+                        str(record["rank"]),
+                        str(record["relative_path"]),
+                    ),
+                )
+                for record in records[: policy.top100_per_class]:
+                    writer.write(record)
+        return writer.commit()
+    except BaseException:
+        writer.abort()
+        raise
+
+
 def _write_selection_outputs(
     archives: list[Path],
     selection_dir: Path,
     policy: SelectionPolicy,
     sort_chunk_records: int,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[CompletedShard, CompletedShard]:
     unsorted_path = selection_dir / "catalog-unsorted.jsonl"
     canonical_path = selection_dir / "catalog-canonical.jsonl"
     unique_path = selection_dir / "catalog-unique.jsonl"
+    eligible_path = selection_dir / "catalog-eligible.jsonl"
     sorted_path = selection_dir / "catalog-ranked.jsonl"
     unsorted = AtomicJsonlShard(
         unsorted_path,
@@ -1607,16 +1813,62 @@ def _write_selection_outputs(
     )
     selected: AtomicJsonlShard | None = None
     reserve: AtomicJsonlShard | None = None
+    def report(
+        phase: str,
+        completed: int,
+        *,
+        total: int,
+        candidates: int | None = None,
+    ) -> None:
+        if progress_callback is not None:
+            event: dict[str, object] = {
+                "phase": phase,
+                "completed": completed,
+                "total": total,
+            }
+            if candidates is not None:
+                event["candidates"] = candidates
+            progress_callback(event)
+
+    report(
+        "scan_statistics_archives",
+        0,
+        total=len(archives),
+        candidates=0,
+    )
     try:
-        for candidate in _iter_input_catalog(archives):
-            unsorted.write(_candidate_record(candidate, policy))
+        scanned_candidates = 0
+        for archive_index, archive in enumerate(archives, 1):
+            for candidate in read_statistics_catalog(archive):
+                unsorted.write(_candidate_record(candidate, policy))
+                scanned_candidates += 1
+            report(
+                "scan_statistics_archives",
+                archive_index,
+                total=len(archives),
+                candidates=scanned_candidates,
+            )
         unsorted.commit()
+
+        def external_progress(prefix: str) -> Callable[[dict[str, int | str]], None]:
+            def callback(event: dict[str, int | str]) -> None:
+                report(
+                    f"{prefix}_{event['phase']}",
+                    int(event["completed"]),
+                    total=int(event["total"]),
+                    candidates=scanned_candidates,
+                )
+
+            return callback
+
         external_unique_jsonl(
             [unsorted_path],
             canonical_path,
             key_fn=_record_canonical_key,
             chunk_records=sort_chunk_records,
             pre_write_guard=pre_write_guard,
+            progress_callback=external_progress("canonicalize_candidates"),
+            total_records=scanned_candidates,
         )
         unique = AtomicJsonlShard(
             unique_path,
@@ -1624,28 +1876,84 @@ def _write_selection_outputs(
         )
         try:
             previous_path: str | None = None
+            deduplicated_input = 0
+            unique_candidates = 0
+            report(
+                "deduplicate_candidates",
+                0,
+                total=scanned_candidates,
+            )
             with canonical_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
+                    deduplicated_input += 1
                     record = json.loads(line)
                     relative_path = str(record["relative_path"])
                     if relative_path == previous_path:
+                        if deduplicated_input % 10_000 == 0:
+                            report(
+                                "deduplicate_candidates",
+                                deduplicated_input,
+                                total=scanned_candidates,
+                            )
                         continue
                     unique.write(record)
+                    unique_candidates += 1
                     previous_path = relative_path
+                    if deduplicated_input % 10_000 == 0:
+                        report(
+                            "deduplicate_candidates",
+                            deduplicated_input,
+                            total=scanned_candidates,
+                        )
             unique.commit()
+            report(
+                "deduplicate_candidates",
+                deduplicated_input,
+                total=scanned_candidates,
+            )
         except BaseException:
             unique.abort()
             raise
+        report("apply_candidate_policy", 0, total=unique_candidates)
+        eligible_completed = _write_eligible_catalog(
+            unique_path,
+            eligible_path,
+            policy,
+            pre_write_guard=pre_write_guard,
+            progress_callback=lambda completed: report(
+                "apply_candidate_policy",
+                completed,
+                total=unique_candidates,
+            ),
+        )
         availability: dict[tuple[str, str], int] = defaultdict(int)
-        with unique_path.open("r", encoding="utf-8") as handle:
+        allocated_input = 0
+        report(
+            "allocate_candidate_quotas",
+            0,
+            total=eligible_completed.records,
+        )
+        with eligible_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 record = json.loads(line)
                 availability[
                     (str(record["schema_class"]), str(record["subset"]))
                 ] += 1
+                allocated_input += 1
+                if allocated_input % 10_000 == 0:
+                    report(
+                        "allocate_candidate_quotas",
+                        allocated_input,
+                        total=eligible_completed.records,
+                    )
+        report(
+            "allocate_candidate_quotas",
+            allocated_input,
+            total=eligible_completed.records,
+        )
         quotas = _allocate_from_availability(availability, policy)
         external_unique_jsonl(
-            [unique_path],
+            [eligible_path],
             sorted_path,
             key_fn=lambda record: [
                 record["rank"],
@@ -1653,6 +1961,8 @@ def _write_selection_outputs(
             ],
             chunk_records=sort_chunk_records,
             pre_write_guard=pre_write_guard,
+            progress_callback=external_progress("rank_candidates"),
+            total_records=eligible_completed.records,
         )
 
         selected = AtomicJsonlShard(
@@ -1664,8 +1974,15 @@ def _write_selection_outputs(
             pre_write_guard=pre_write_guard,
         )
         selected_by_stratum: dict[tuple[str, str], int] = defaultdict(int)
+        output_input = 0
+        report(
+            "write_selection_outputs",
+            0,
+            total=eligible_completed.records,
+        )
         with sorted_path.open("r", encoding="utf-8") as handle:
             for line in handle:
+                output_input += 1
                 record = json.loads(line)
                 stratum = (
                     str(record["schema_class"]),
@@ -1676,10 +1993,21 @@ def _write_selection_outputs(
                     selected_by_stratum[stratum] += 1
                 else:
                     reserve.write(record)
+                if output_input % 10_000 == 0:
+                    report(
+                        "write_selection_outputs",
+                        output_input,
+                        total=eligible_completed.records,
+                    )
         selected_completed = selected.commit()
         reserve_completed = reserve.commit()
         if selected_completed.records != sum(quotas.values()):
             raise RuntimeError("selection output did not satisfy its quotas")
+        report(
+            "write_selection_outputs",
+            output_input,
+            total=eligible_completed.records,
+        )
     except BaseException:
         unsorted.abort()
         if selected is not None:
@@ -1691,6 +2019,7 @@ def _write_selection_outputs(
         unsorted_path.unlink(missing_ok=True)
         canonical_path.unlink(missing_ok=True)
         unique_path.unlink(missing_ok=True)
+        eligible_path.unlink(missing_ok=True)
         sorted_path.unlink(missing_ok=True)
     return selected_completed, reserve_completed
 
@@ -1702,6 +2031,7 @@ def run_selection(
     *,
     sort_chunk_records: int = 100_000,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[int, int]:
     """Create or resume the durable provisional selection stage."""
     if sort_chunk_records <= 0:
@@ -1749,10 +2079,20 @@ def run_selection(
         counts = {
             shard.path: shard.records for shard in manifest.completed_shards
         }
-        return (
+        result = (
             counts.get("selected_tables.jsonl", 0),
             counts.get("reserve_tables.jsonl", 0),
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "selection_complete",
+                    "completed": len(archives) + 4,
+                    "total": len(archives) + 4,
+                    "resumed": True,
+                }
+            )
+        return result
 
     selected_completed, reserve_completed = _write_selection_outputs(
         archives,
@@ -1760,6 +2100,7 @@ def run_selection(
         policy,
         sort_chunk_records,
         pre_write_guard,
+        progress_callback,
     )
     manifest.record_shard(selected_completed)
     manifest.record_shard(reserve_completed)
@@ -1775,9 +2116,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work_dir", type=Path, required=True)
     parser.add_argument("--target_tables", type=int, default=200_000)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--minimum3_fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--top100_policy",
+        choices=("all", "bounded", "exclude"),
+        default="bounded",
+    )
+    parser.add_argument("--top100_per_class", type=int, default=10)
+    parser.add_argument(
+        "--include_rest",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--min_candidate_rows", type=int, default=5)
+    parser.add_argument("--min_candidate_columns", type=int, default=3)
+    parser.add_argument("--minimum3_fraction", type=float, default=1.0)
     parser.add_argument("--minimum3_base_per_class", type=int, default=250)
-    parser.add_argument("--rest_base_per_class", type=int, default=50)
+    parser.add_argument("--rest_base_per_class", type=int, default=0)
     parser.add_argument("--class_cap", type=int, default=40_000)
     parser.add_argument("--sort_chunk_records", type=int, default=100_000)
     return parser.parse_args()
@@ -1788,6 +2142,11 @@ def main() -> None:
     policy = SelectionPolicy(
         target_tables=args.target_tables,
         seed=args.seed,
+        top100_policy=args.top100_policy,
+        top100_per_class=args.top100_per_class,
+        include_rest=args.include_rest,
+        min_candidate_rows=args.min_candidate_rows,
+        min_candidate_columns=args.min_candidate_columns,
         minimum3_fraction=args.minimum3_fraction,
         minimum3_base_per_class=args.minimum3_base_per_class,
         rest_base_per_class=args.rest_base_per_class,

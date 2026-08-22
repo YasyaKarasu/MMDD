@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import build_mm_joinability_dataset as join_builder
 from build_mm_joinability_dataset import (
     ExtractionCache,
     TransientModelEndpointError,
@@ -361,6 +362,191 @@ class CountingExtractor:
             "raw_response": '{"attributes":[]}',
             "error": "",
         }
+
+
+def test_wdc_model_stage_persists_local_candidates_without_auto_check(
+    tmp_path: Path,
+) -> None:
+    record = asset("checked")
+    record["entity"] = {
+        "entity_id": "entity-checked",
+        "wiki_title": "Entity checked",
+        "cell_text": "Entity checked",
+        "row_attributes": [
+            {
+                "name": "Name",
+                "value": "Entity checked",
+                "is_entity": True,
+            },
+            {"name": "State", "value": "Alabama", "is_entity": False},
+        ],
+    }
+
+    class RejectingAutoChecker(CountingExtractor):
+        auto_check_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.auto_check_calls = 0
+
+        def extract_auto_check_value(self, **_kwargs):
+            self.auto_check_calls += 1
+            return "Georgia"
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [record],
+        store,
+        args=model_args(),
+    )
+    extractor = RejectingAutoChecker()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    output = json.loads(
+        result.extraction_paths[0].read_text(encoding="utf-8").strip()
+    )
+
+    assert output["attributes"] == [
+        {
+            "name": "State",
+            "value": "Alabama",
+            "evidence": "Alabama",
+            "connection_evidence": "The entity name is visible.",
+        }
+    ]
+    assert "model_attributes" not in output
+    assert "auto_check" not in output
+    assert extractor.auto_check_calls == 0
+
+
+def test_wdc_model_stage_promotes_legacy_review_pending_without_model_call(
+    tmp_path: Path,
+) -> None:
+    record = asset("deferred-review")
+    record["entity"] = {
+        "entity_id": "entity-deferred-review",
+        "wiki_title": "Entity deferred review",
+        "cell_text": "Entity deferred review",
+        "row_attributes": [
+            {
+                "name": "Name",
+                "value": "Entity deferred review",
+                "is_entity": True,
+            },
+            {"name": "State", "value": "Alabama", "is_entity": False},
+        ],
+    }
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks([record], store, args=model_args())
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'review_pending', result_json = ?, updated_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "attributes": [],
+                        "model_attributes": [
+                            {"name": "State", "value": "Alabama"}
+                        ],
+                        "raw_response": "",
+                        "error": "",
+                        "auto_check": {
+                            "schema_version": (
+                                join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
+                            ),
+                            "reviewed_attributes": 1,
+                            "supported_attributes": 0,
+                            "filtered_attributes": 1,
+                            "reviews": [
+                                {
+                                    "attribute_name": "State",
+                                    "claimed_value": "Alabama",
+                                    "verdict": "insufficient",
+                                    "error_code": "",
+                                    "review_complete": False,
+                                    "decision_source": "remote_review_pending",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                time.time(),
+                jobset.jobs[0].job_id,
+            ),
+        )
+        connection.commit()
+
+    extractor = CountingExtractor()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        output_root=tmp_path / "outputs",
+    )
+    output = json.loads(
+        result.extraction_paths[0].read_text(encoding="utf-8").strip()
+    )
+
+    assert result.complete is True
+    assert extractor.asset_ids == []
+    assert output["model_attributes"] == [
+        {"name": "State", "value": "Alabama"}
+    ]
+    assert output["auto_check"]["reviews"][0]["decision_source"] == (
+        "remote_review_pending"
+    )
+
+
+def test_auto_check_review_parallelism_prefers_provider_pool_capacity() -> None:
+    class Extractor:
+        auto_check_parallelism = 37
+        auto_check_openai_max_inflight = 1
+
+    assert models._auto_check_review_parallelism(Extractor()) == 37
+
+
+def test_auto_check_review_parallelism_supports_legacy_extractors() -> None:
+    class Extractor:
+        auto_check_openai_max_inflight = 7
+
+    assert models._auto_check_review_parallelism(Extractor()) == 7
+
+
+def test_model_stage_reclaims_dead_local_worker_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("orphaned")],
+        store,
+        args=model_args(),
+    )
+    claimed = store.claim(
+        jobset.text_kind,
+        limit=1,
+        owner="model-worker-99999999-dead:text",
+        lease_seconds=3600,
+    )
+    assert len(claimed) == 1
+    monkeypatch.setattr(models, "_process_is_alive", lambda _pid: False)
+
+    assert models._reclaim_orphaned_local_leases(store.path, jobset) == 1
+    with sqlite3.connect(store.path) as connection:
+        status, owner = connection.execute(
+            "SELECT status, owner FROM jobs WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone()
+    assert status == "retryable"
+    assert owner is None
 
 
 class EndpointAwareExtractor(CountingExtractor):
@@ -1116,7 +1302,7 @@ def test_fenced_retry_mismatch_returns_false_before_write_guard(
     ) is False
 
 
-def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
+def test_transient_group_keeps_prefetched_success_and_healthy_resume_succeeds(
     tmp_path: Path,
 ) -> None:
     store = SqliteJobStore(tmp_path / "models.sqlite3")
@@ -1129,7 +1315,7 @@ def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
     claim_order = _claim_order(store)
     first_success = claim_order[0]
     transient = claim_order[1]
-    not_claimed = claim_order[2]
+    prefetched_success = claim_order[2]
     failing = EndpointAwareExtractor(transient_asset_ids={transient[1]})
 
     with pytest.raises(RuntimeError, match="transient model endpoint"):
@@ -1142,19 +1328,23 @@ def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
             output_root=tmp_path / "outputs",
         )
 
-    assert set(failing.asset_ids) == {first_success[1], transient[1]}
+    assert set(failing.asset_ids) == {
+        first_success[1],
+        transient[1],
+        prefetched_success[1],
+    }
     assert dict(_job_rows(store)) == {
         first_success[0]: "success",
         transient[0]: "retryable",
-        not_claimed[0]: "pending",
+        prefetched_success[0]: "success",
     }
     with sqlite3.connect(store.path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM model_results"
-        ).fetchone() == (1,)
+        ).fetchone() == (2,)
         assert connection.execute(
             "SELECT COUNT(*) FROM model_call_cache"
-        ).fetchone() == (1,)
+        ).fetchone() == (2,)
 
     healthy = EndpointAwareExtractor()
     result = run_model_stage(
@@ -1166,7 +1356,7 @@ def test_transient_group_commits_success_stops_and_healthy_resume_succeeds(
     )
 
     assert result.complete is True
-    assert set(healthy.asset_ids) == {transient[1], not_claimed[1]}
+    assert set(healthy.asset_ids) == {transient[1]}
     assert all(status == "success" for _job_id, status in _job_rows(store))
 
 
@@ -2037,7 +2227,7 @@ def test_existing_extraction_cache_repairs_job_without_model_call(
             "asset_id": "a",
             "asset_type": "text",
             "modality": "text",
-            "policy_fingerprint": "existing-extraction-semantics-v1",
+            "policy_fingerprint": models.MODEL_POLICY_VERSION,
             "parser_schema_version": MODEL_PARSER_SCHEMA_VERSION,
             "candidate_attribute_names": ["State"],
             "attributes": [],
@@ -2704,7 +2894,7 @@ def test_model_stage_never_exceeds_bounded_group(
     assert max(observed) <= 2
 
 
-def test_model_stage_reloads_dynamic_routing_capacity_for_each_wave(
+def test_model_stage_uses_one_rolling_dynamic_capacity_group(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2750,8 +2940,70 @@ def test_model_stage_reloads_dynamic_routing_capacity_for_each_wave(
     )
 
     assert result.complete is True
-    assert observed == [(5, 5), (3, 3), (3, 3)]
-    assert extractor.capacity_reads == 4
+    assert observed == [(11, 5)]
+    assert extractor.capacity_reads == 2
+
+
+def test_model_stage_refills_executor_across_claim_groups(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset(str(index)) for index in range(4)],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    claim_order = [asset_id for _job_id, asset_id in _claim_order(store)]
+    slow_asset_id = claim_order[0]
+    replacement_asset_id = claim_order[2]
+
+    class CrossClaimExtractor(CountingExtractor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.replacement_started = threading.Event()
+            self.replaced_while_slow = False
+            self.active = 0
+            self.max_active = 0
+
+        def routing_capacity(self, modality: str) -> int:
+            assert modality == "text"
+            return 2
+
+        def extract(self, current_asset, entity, candidate_attributes):
+            asset_id = current_asset["asset_id"]
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if asset_id == slow_asset_id:
+                    self.replaced_while_slow = (
+                        self.replacement_started.wait(timeout=2)
+                    )
+                elif asset_id == replacement_asset_id:
+                    self.replacement_started.set()
+                return super().extract(
+                    current_asset,
+                    entity,
+                    candidate_attributes,
+                )
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    extractor = CrossClaimExtractor()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        group_size=2,
+        workers_by_kind={"text": 99, "image": 99},
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert extractor.replaced_while_slow is True
+    assert extractor.max_active == 2
 
 
 def test_heartbeat_prevents_second_worker_from_repeating_model_call(

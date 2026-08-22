@@ -692,6 +692,176 @@ def test_global_materialization_progress_updates_before_yield_and_closes_on_stop
     assert materialization_call["closed"] is True
 
 
+def test_source_sample_checkpoint_reuses_refs_counters_and_materialized_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_entitables_file(tmp_path / "a.json", ["a_table", "b_table"])
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "1",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    first_counters = builder.SourceCandidateCounters()
+    first = list(builder.iter_random_source_tables(tmp_path, args, first_counters))
+
+    monkeypatch.setattr(
+        builder,
+        "read_entitables_json",
+        lambda _path: pytest.fail("a valid checkpoint reread an EntiTables file"),
+    )
+    second_counters = builder.SourceCandidateCounters()
+    second = list(builder.iter_random_source_tables(tmp_path, args, second_counters))
+
+    assert second == first
+    assert second_counters.processed_tables == first_counters.processed_tables
+    assert second_counters.skipped_tables == first_counters.skipped_tables
+    assert second_counters.skip_reasons == first_counters.skip_reasons
+
+
+def test_source_sample_checkpoint_invalidates_when_input_inventory_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_entitables_file(tmp_path / "a.json", ["a_table"])
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "2",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    list(builder.iter_random_source_tables(tmp_path, args, builder.SourceCandidateCounters()))
+    write_entitables_file(tmp_path / "b.json", ["b_table"])
+    reads: list[str] = []
+    real_read = builder.read_entitables_json
+
+    def recording_read(path: Path):
+        reads.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(builder, "read_entitables_json", recording_read)
+    selected = list(
+        builder.iter_random_source_tables(
+            tmp_path,
+            args,
+            builder.SourceCandidateCounters(),
+        )
+    )
+
+    assert {table["source_file"] for table in selected} == {"a.json", "b.json"}
+    assert {"a.json", "b.json"}.issubset(reads)
+
+
+def test_corrupt_source_sample_manifest_falls_back_to_global_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_entitables_file(tmp_path / "a.json", ["a_table", "b_table"])
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "1",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    first = list(
+        builder.iter_random_source_tables(
+            tmp_path,
+            args,
+            builder.SourceCandidateCounters(),
+        )
+    )
+    manifest = tmp_path / "out" / "_source_sample_checkpoint" / "manifest.json"
+    manifest.write_text("{broken", encoding="utf-8")
+    parse_count = 0
+    real_parse = builder.parse_source_table
+
+    def recording_parse(*parse_args, **parse_kwargs):
+        nonlocal parse_count
+        parse_count += 1
+        return real_parse(*parse_args, **parse_kwargs)
+
+    monkeypatch.setattr(builder, "parse_source_table", recording_parse)
+    second = list(
+        builder.iter_random_source_tables(
+            tmp_path,
+            args,
+            builder.SourceCandidateCounters(),
+        )
+    )
+
+    assert second == first
+    assert parse_count == 2
+
+
+def test_corrupt_source_sample_chunk_rematerializes_without_global_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_entitables_file(
+        tmp_path / "a.json",
+        ["a_table", "b_table", "c_table", "d_table"],
+    )
+    args = builder.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--max_source_tables",
+            "1",
+            "--unrecoverable_replacement_rounds",
+            "0",
+        ]
+    )
+    first = list(
+        builder.iter_random_source_tables(
+            tmp_path,
+            args,
+            builder.SourceCandidateCounters(),
+        )
+    )
+    chunk = next(
+        (tmp_path / "out" / "_source_sample_checkpoint" / "chunks").rglob(
+            "*.jsonl"
+        )
+    )
+    chunk.write_text("not-json\n", encoding="utf-8")
+    parse_count = 0
+    real_parse = builder.parse_source_table
+
+    def recording_parse(*parse_args, **parse_kwargs):
+        nonlocal parse_count
+        parse_count += 1
+        return real_parse(*parse_args, **parse_kwargs)
+
+    monkeypatch.setattr(builder, "parse_source_table", recording_parse)
+    second = list(
+        builder.iter_random_source_tables(
+            tmp_path,
+            args,
+            builder.SourceCandidateCounters(),
+        )
+    )
+
+    assert second == first
+    assert parse_count == 1
+
+
 def test_queryable_table_never_draws_or_replaces() -> None:
     tables = replacement_tables()
     discarded: list[str] = []
@@ -2155,8 +2325,11 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
                 {
                     "query_table_id": query_id,
                     "candidate_table_id": target_id,
+                    "target_table_id": target_id,
                     "relevance": 1,
                     "source_table_id": table_id,
+                    "reason": "model_recoverable_join_column",
+                    "join_attribute": {"column_name": "Synthetic"},
                 }
             ]
             if queryable
@@ -2630,12 +2803,26 @@ def test_candidate_selection_and_materialization_share_first_seen_entity_budget(
         entity_id = wiki_to_entity_id[wiki_title]
         queryable = bool(entity_to_assets.get(entity_id))
         table_id = str(source_table["source_table_id"])
+        query_id = f"query-{table_id}"
+        target_id = f"target-{table_id}"
         return (
-            [{"table_id": f"query-{table_id}", "source_table_id": table_id}]
+            [{"table_id": query_id, "source_table_id": table_id}]
             if queryable
             else [],
-            [],
-            [],
+            [{"table_id": target_id, "source_table_id": table_id}]
+            if queryable
+            else [],
+            [
+                {
+                    "query_table_id": query_id,
+                    "target_table_id": target_id,
+                    "source_table_id": table_id,
+                    "reason": "model_recoverable_join_column",
+                    "join_attribute": {"column_name": "Synthetic"},
+                }
+            ]
+            if queryable
+            else [],
             {"source_table_id": table_id, "reason": "queryable" if queryable else "failed"},
         )
 

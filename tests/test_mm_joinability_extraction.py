@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +20,9 @@ from build_mm_joinability_dataset import (
     ExtractionCache,
     ExtractionTask,
     ModelConcurrencyState,
+    ModelAutoCheckStats,
     LocalAttributeExtractor,
+    apply_model_auto_check,
     build_bridge_assets_parallel,
     extraction_row_attributes,
     extraction_cache_key,
@@ -51,10 +54,12 @@ from run_mm_joinability_dynamic_vllm import (
 )
 
 
-def test_prompt_version_invalidates_cache_after_masked_value_prompt_changes():
+def test_prompt_version_preserves_stage_one_analysis_cache():
     import build_mm_joinability_dataset as joinability_dataset
 
-    assert joinability_dataset.PROMPT_VERSION == "entity_attribute_extraction_v5_batched_leave_one_out"
+    assert joinability_dataset.PROMPT_VERSION == (
+        "entity_attribute_extraction_v5_batched_leave_one_out"
+    )
 
 
 def test_model_analysis_progress_registers_new_keys_once() -> None:
@@ -306,6 +311,896 @@ def test_multi_attribute_queries_use_globally_disjoint_context_sides(
     assert {record["target_table_id"] for record in recovery_records} == {
         target["table_id"] for target in target_tables
     }
+
+
+def build_query_auto_check_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    recovered_rows: set[int],
+    supported_rows: set[int],
+    apply_query_auto_check: bool = True,
+    finalize_query_recoveries: bool = False,
+):
+    row_count = 6
+    source_table = {
+        "source_table_id": "query-auto-check-source",
+        "columns": [
+            {"column_index": 0, "column_name": "Entity"},
+            {"column_index": 1, "column_name": "Bridge"},
+            {"column_index": 2, "column_name": "Context"},
+        ],
+        "rows": [
+            {
+                "row_id": index,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": f"Entity {index}",
+                        "wiki_title": f"Entity {index}",
+                    },
+                    {
+                        "column_index": 1,
+                        "column_name": "Bridge",
+                        "text": f"Bridge {index}",
+                    },
+                    {
+                        "column_index": 2,
+                        "column_name": "Context",
+                        "text": f"Context {index}",
+                    },
+                ],
+            }
+            for index in range(row_count)
+        ],
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+    assets = {
+        f"asset-{index}": {
+            "asset_id": f"asset-{index}",
+            "asset_type": "text",
+            "content": f"Entity {index} has Bridge {index}.",
+        }
+        for index in range(row_count)
+    }
+    entity_to_assets = {
+        f"entity-{index}": [f"asset-{index}"]
+        for index in range(row_count)
+    }
+    wiki_to_entity_id = {
+        f"Entity {index}": f"entity-{index}"
+        for index in range(row_count)
+    }
+
+    def fake_resolve_extraction_tasks(**kwargs):
+        return [
+            (
+                task,
+                {
+                    "cache_key": task.cache_key,
+                    "attributes": (
+                        [
+                            {
+                                "name": "Bridge",
+                                "value": f"Bridge {task.source_row_id}",
+                            }
+                        ]
+                        if task.source_row_id in recovered_rows
+                        else []
+                    ),
+                    "error": "",
+                },
+            )
+            for task in kwargs["tasks"]
+        ]
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "resolve_extraction_tasks",
+        fake_resolve_extraction_tasks,
+    )
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+
+        def __init__(self):
+            self.calls: list[int] = []
+            self.model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, *, task, claimed_value, **_kwargs):
+            self.calls.append(task.source_row_id)
+            supported = task.source_row_id in supported_rows
+            return {
+                "extracted_value": claimed_value if supported else "",
+                "verdict": "supported" if supported else "insufficient",
+                "comparison": (
+                    "normalized_values_match" if supported else "empty_extraction"
+                ),
+                "decision_source": "primary_local",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "5",
+            "--min_rows_per_output_table",
+            "5",
+            "--min_recovered_value_ratio",
+            "0.6",
+            "--explicit_join_fallback_ratio",
+            "0",
+        ]
+    )
+    extractor = Extractor()
+    recovery_writer = joinability_dataset.ListRecordWriter()
+    records = joinability_dataset.build_table_join_records(
+        source_table=source_table,
+        split="test",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=extractor,
+        cache=ExtractionCache(tmp_path / "model-cache.jsonl"),
+        progress=None,
+        concurrency_state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=recovery_writer,
+        args=args,
+        query_auto_check_cache=ExtractionCache(
+            tmp_path / "query-auto-check-cache.jsonl"
+        ),
+        apply_query_auto_check=apply_query_auto_check,
+        finalize_query_recoveries=finalize_query_recoveries,
+    )
+    return records, recovery_writer.records, extractor.calls
+
+
+def test_auto_check_runs_only_for_recoveries_in_selected_query_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (queries, _targets, _qrels, decision), recoveries, calls = (
+        build_query_auto_check_fixture(
+            tmp_path,
+            monkeypatch,
+            recovered_rows=set(range(6)),
+            supported_rows={0, 1, 2},
+        )
+    )
+
+    assert decision["reason"] == "queryable"
+    assert len(queries) == 1
+    assert sorted(calls) == [0, 1, 2]
+    assert {record["source_row_id"] for record in recoveries} == {0, 1, 2}
+    assert all("auto_check" in record for record in recoveries)
+
+
+def test_auto_check_skips_recoveries_when_no_query_can_be_formed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (queries, _targets, _qrels, decision), recoveries, calls = (
+        build_query_auto_check_fixture(
+            tmp_path,
+            monkeypatch,
+            recovered_rows={0, 1},
+            supported_rows={0, 1},
+        )
+    )
+
+    assert queries == []
+    assert decision["reason"] == "no_column_met_recovered_value_ratio"
+    assert recoveries == []
+    assert calls == []
+
+
+def test_final_query_materialization_rejects_incomplete_evidence_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="final query evidence auto-check is incomplete",
+    ):
+        build_query_auto_check_fixture(
+            tmp_path,
+            monkeypatch,
+            recovered_rows=set(range(6)),
+            supported_rows=set(range(6)),
+            apply_query_auto_check=False,
+            finalize_query_recoveries=True,
+        )
+
+
+def test_query_recovery_auto_check_reuses_completed_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ProgressBar:
+        def __init__(self, total: int) -> None:
+            self.total = total
+            self.updates = 0
+            self.closes = 0
+
+        def update(self, amount: int = 1) -> None:
+            self.updates += amount
+
+        def close(self) -> None:
+            self.closes += 1
+
+    bars: list[ProgressBar] = []
+
+    def fake_tqdm(*, total: int, **kwargs: object) -> ProgressBar:
+        assert kwargs["desc"] == "Query recovery auto-check"
+        assert kwargs["unit"] == "recovery"
+        assert kwargs["dynamic_ncols"] is True
+        assert kwargs["disable"] is False
+        bar = ProgressBar(total)
+        bars.append(bar)
+        return bar
+
+    monkeypatch.setattr(joinability_dataset, "tqdm", fake_tqdm)
+    first, _recoveries, first_calls = build_query_auto_check_fixture(
+        tmp_path,
+        monkeypatch,
+        recovered_rows=set(range(6)),
+        supported_rows=set(range(6)),
+    )
+    second, _recoveries, second_calls = build_query_auto_check_fixture(
+        tmp_path,
+        monkeypatch,
+        recovered_rows=set(range(6)),
+        supported_rows=set(range(6)),
+    )
+
+    assert first[0] and second[0]
+    assert sorted(first_calls) == [0, 1, 2]
+    assert second_calls == []
+    assert len(bars) == 1
+    assert bars[0].total == 3
+    assert bars[0].updates == 3
+    assert bars[0].closes == 1
+
+
+def _make_query_recovery_candidate(
+    *,
+    cache_key: str = "extraction-cache-key",
+    asset_id: str = "evidence",
+) -> joinability_dataset.QueryRecoveryCandidate:
+    task = ExtractionTask(
+        order=0,
+        cache_key=cache_key,
+        source_table_id="source",
+        source_row_id=0,
+        entity_column_index=0,
+        entity_column_name="Entity",
+        entity={
+            "entity_id": "entity",
+            "wiki_title": "Entity",
+            "cell_text": "Entity",
+            "row_attributes": [
+                {"name": "Entity", "value": "Entity", "is_entity": True},
+                {"name": "State", "value": "Alabama", "is_entity": False},
+            ],
+        },
+        asset={
+            "asset_id": asset_id,
+            "asset_type": "text",
+            "content": "Evidence",
+        },
+        candidate_attribute_names=["State"],
+    )
+    return joinability_dataset.QueryRecoveryCandidate(
+        task=task,
+        extraction={"attributes": [{"name": "State", "value": "Alabama"}]},
+        recovery={
+            "source_table_id": "source",
+            "source_row_id": 0,
+            "recovered_attribute": {
+                "column_index": 1,
+                "column_name": "State",
+                "value": "Alabama",
+                "model_value": "Alabama",
+                "hidden_in_query": True,
+            },
+            "evidence": {"asset_id": asset_id, "asset_type": "text"},
+        },
+    )
+
+
+def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
+    return {
+        "cache_key": cache_key,
+        "extraction_cache_key": "extraction-cache-key",
+        "attribute_name": "State",
+        "claimed_value": "Alabama",
+        "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "supported": True,
+        "auto_check": {
+            "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "reviewed_attributes": 1,
+            "reviews": [
+                {
+                    "review_complete": True,
+                    "error_code": "",
+                    "verdict": "supported",
+                    "final_judge_model": "grok-4.5",
+                }
+            ],
+        },
+    }
+
+
+def test_query_recovery_auto_check_key_ignores_reviewer_pool_identity() -> None:
+    candidate = _make_query_recovery_candidate()
+    first_pool = SimpleNamespace(
+        auto_check_luna_reviewer=SimpleNamespace(identity={"model": "gpt-5.6-luna"}),
+        auto_check_terra_reviewer=SimpleNamespace(identity={"model": "grok-4.5"}),
+    )
+    changed_pool = SimpleNamespace(
+        auto_check_luna_reviewer=SimpleNamespace(identity={"model": "other-luna"}),
+        auto_check_terra_reviewer=SimpleNamespace(
+            identity={"model": "claude-sonnet-5"}
+        ),
+    )
+
+    assert joinability_dataset.query_recovery_auto_check_key(
+        candidate, first_pool
+    ) == joinability_dataset.query_recovery_auto_check_key(candidate, changed_pool)
+
+
+def _extraction_record_for_candidate(
+    candidate: joinability_dataset.QueryRecoveryCandidate,
+) -> dict[str, object]:
+    return {
+        "cache_key": candidate.task.cache_key,
+        "asset_id": candidate.task.asset["asset_id"],
+        "asset_type": candidate.task.asset["asset_type"],
+        "entity_id": candidate.task.entity["entity_id"],
+        "entity_text": candidate.task.entity["cell_text"],
+        "entity_wiki_title": candidate.task.entity["wiki_title"],
+        "row_attributes": candidate.task.entity["row_attributes"],
+    }
+
+
+def test_remote_review_cache_survives_local_model_change(
+    tmp_path: Path,
+) -> None:
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = object()
+        auto_check_terra_reviewer = object()
+        auto_check_parallelism = 1
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, **_kwargs):
+            raise AssertionError("remote-reviewed evidence must come from cache")
+
+    old_candidate = _make_query_recovery_candidate(cache_key="old-local-model")
+    new_candidate = _make_query_recovery_candidate(cache_key="new-local-model")
+    old_key = joinability_dataset.query_recovery_auto_check_key(
+        old_candidate, None
+    )
+    new_key = joinability_dataset.query_recovery_auto_check_key(
+        new_candidate, None
+    )
+    assert old_key != new_key
+    assert joinability_dataset.query_recovery_remote_evidence_key(
+        old_candidate
+    ) == joinability_dataset.query_recovery_remote_evidence_key(new_candidate)
+
+    legacy_record = _completed_query_recovery_record(old_key)
+    legacy_record["extraction_cache_key"] = old_candidate.task.cache_key
+    cache_path = tmp_path / "query-auto-check-cache.jsonl"
+    cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
+    old_extraction = _extraction_record_for_candidate(old_candidate)
+    cache = ExtractionCache(
+        cache_path,
+        record_key_alias=lambda record: (
+            joinability_dataset.query_recovery_auto_check_record_key(
+                record,
+                extraction_record=(
+                    old_extraction
+                    if record.get("extraction_cache_key")
+                    == old_candidate.task.cache_key
+                    else None
+                ),
+            )
+        ),
+    )
+
+    results = joinability_dataset.resolve_query_recovery_auto_checks(
+        candidates=[new_candidate],
+        extractor=Extractor(),
+        cache=cache,
+        args=argparse.Namespace(model_progress=False),
+        required_recovered_rows=1,
+        source_row_order=[0],
+    )
+
+    assert results == {new_key: legacy_record}
+
+
+def test_local_only_review_cache_remains_local_model_specific(
+    tmp_path: Path,
+) -> None:
+    old_candidate = _make_query_recovery_candidate(cache_key="old-local-model")
+    new_candidate = _make_query_recovery_candidate(cache_key="new-local-model")
+    old_key = joinability_dataset.query_recovery_auto_check_key(
+        old_candidate, None
+    )
+    local_record = _completed_query_recovery_record(old_key)
+    local_record["extraction_cache_key"] = old_candidate.task.cache_key
+    review = local_record["auto_check"]["reviews"][0]
+    review["final_judge_model"] = None
+    review["decision_source"] = "primary_local"
+    cache_path = tmp_path / "query-auto-check-cache.jsonl"
+    cache_path.write_text(json.dumps(local_record) + "\n", encoding="utf-8")
+    old_extraction = _extraction_record_for_candidate(old_candidate)
+    cache = ExtractionCache(
+        cache_path,
+        record_key_alias=lambda record: (
+            joinability_dataset.query_recovery_auto_check_record_key(
+                record, extraction_record=old_extraction
+            )
+        ),
+    )
+    new_key = joinability_dataset.query_recovery_auto_check_key(
+        new_candidate, None
+    )
+
+    assert joinability_dataset.query_recovery_cached_check(
+        new_key, cache, new_candidate
+    ) is None
+
+
+def test_query_recovery_cache_aliases_legacy_pool_dependent_key(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "query-auto-check-cache.jsonl"
+    legacy_key = "legacy-reviewer-pool-dependent-key"
+    legacy_record = _completed_query_recovery_record(legacy_key)
+    cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
+
+    cache = ExtractionCache(
+        cache_path,
+        record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
+    )
+    candidate = _make_query_recovery_candidate()
+    canonical_key = joinability_dataset.query_recovery_auto_check_key(candidate, None)
+
+    assert cache.get(legacy_key) == legacy_record
+    assert cache.get(canonical_key) == legacy_record
+
+
+def test_changed_reviewer_pool_reuses_completed_legacy_recovery(
+    tmp_path: Path,
+) -> None:
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = SimpleNamespace(identity={"model": "new-luna"})
+        auto_check_terra_reviewer = SimpleNamespace(identity={"model": "gemini-3.0-pro"})
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, **_kwargs):
+            raise AssertionError("a completed recovery must not be judged again")
+
+    cache_path = tmp_path / "query-auto-check-cache.jsonl"
+    legacy_record = _completed_query_recovery_record("old-pool-key")
+    cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
+    cache = ExtractionCache(
+        cache_path,
+        record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
+    )
+    candidate = _make_query_recovery_candidate()
+    canonical_key = joinability_dataset.query_recovery_auto_check_key(
+        candidate, Extractor()
+    )
+
+    results = joinability_dataset.resolve_query_recovery_auto_checks(
+        candidates=[candidate],
+        extractor=Extractor(),
+        cache=cache,
+        args=argparse.Namespace(model_progress=False),
+        required_recovered_rows=1,
+        source_row_order=[0],
+    )
+
+    assert results == {canonical_key: legacy_record}
+
+
+def test_query_recovery_auto_check_short_circuits_evidence_and_rows(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+        auto_check_parallelism = 4
+
+        def __init__(self) -> None:
+            self.model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, *, task, claimed_value, **_kwargs):
+            asset_id = str(task.asset["asset_id"])
+            calls.append((task.source_row_id, asset_id))
+            supported = asset_id in {"row-0-second", "row-1-first"}
+            return {
+                "extracted_value": claimed_value if supported else "",
+                "verdict": "supported" if supported else "insufficient",
+                "comparison": (
+                    "normalized_values_match" if supported else "empty_extraction"
+                ),
+                "decision_source": "primary_local",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    def candidate(row_id: int, asset_id: str):
+        task = ExtractionTask(
+            order=0,
+            cache_key=f"cache-{asset_id}",
+            source_table_id="source",
+            source_row_id=row_id,
+            entity_column_index=0,
+            entity_column_name="Entity",
+            entity={
+                "entity_id": f"entity-{row_id}",
+                "wiki_title": f"Entity {row_id}",
+                "cell_text": f"Entity {row_id}",
+                "row_attributes": [
+                    {
+                        "name": "Entity",
+                        "value": f"Entity {row_id}",
+                        "is_entity": True,
+                    },
+                    {"name": "State", "value": "Alabama", "is_entity": False},
+                ],
+            },
+            asset={
+                "asset_id": asset_id,
+                "asset_type": "text",
+                "content": "Evidence",
+            },
+            candidate_attribute_names=["State"],
+        )
+        recovery = {
+            "source_table_id": "source",
+            "source_row_id": row_id,
+            "recovered_attribute": {
+                "column_index": 1,
+                "column_name": "State",
+                "value": "Alabama",
+                "model_value": "Alabama",
+                "hidden_in_query": True,
+            },
+            "evidence": {"asset_id": asset_id, "asset_type": "text"},
+        }
+        return joinability_dataset.QueryRecoveryCandidate(
+            task=task,
+            extraction={"attributes": [{"name": "State", "value": "Alabama"}]},
+            recovery=recovery,
+        )
+
+    candidates = [
+        candidate(0, "row-0-first"),
+        candidate(0, "row-0-second"),
+        candidate(0, "row-0-third"),
+        candidate(1, "row-1-first"),
+        candidate(1, "row-1-second"),
+        candidate(2, "row-2-first"),
+    ]
+    extractor = Extractor()
+    results = joinability_dataset.resolve_query_recovery_auto_checks(
+        candidates=candidates,
+        extractor=extractor,
+        cache=ExtractionCache(tmp_path / "query-auto-check-cache.jsonl"),
+        args=argparse.Namespace(model_progress=False),
+        required_recovered_rows=2,
+        source_row_order=[0, 1, 2],
+    )
+
+    assert calls == [
+        (0, "row-0-first"),
+        (0, "row-0-second"),
+        (1, "row-1-first"),
+    ]
+    assert len(results) == 3
+    assert sum(bool(result.get("supported")) for result in results.values()) == 2
+
+    exhaustive_results = (
+        joinability_dataset.resolve_query_recovery_auto_checks(
+            candidates=candidates,
+            extractor=extractor,
+            cache=ExtractionCache(
+                tmp_path / "query-auto-check-cache.jsonl"
+            ),
+            args=argparse.Namespace(model_progress=False),
+            required_recovered_rows=2,
+            source_row_order=[0, 1, 2],
+            exhaustive=True,
+        )
+    )
+
+    assert calls == [
+        (0, "row-0-first"),
+        (0, "row-0-second"),
+        (1, "row-1-first"),
+        (0, "row-0-third"),
+        (1, "row-1-second"),
+        (2, "row-2-first"),
+    ]
+    assert len(exhaustive_results) == 6
+
+
+def test_query_recovery_auto_check_prefers_cached_supported_evidence(
+    tmp_path: Path,
+) -> None:
+    extractor_calls: list[str] = []
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, *, task, **_kwargs):
+            extractor_calls.append(str(task.asset["asset_id"]))
+            raise AssertionError("uncached earlier evidence must not be checked")
+
+    def candidate(asset_id: str):
+        task = ExtractionTask(
+            order=0,
+            cache_key=f"cache-{asset_id}",
+            source_table_id="source",
+            source_row_id=0,
+            entity_column_index=0,
+            entity_column_name="Entity",
+            entity={
+                "entity_id": "entity",
+                "wiki_title": "Entity",
+                "cell_text": "Entity",
+                "row_attributes": [
+                    {"name": "Entity", "value": "Entity", "is_entity": True},
+                    {"name": "State", "value": "Alabama", "is_entity": False},
+                ],
+            },
+            asset={"asset_id": asset_id, "asset_type": "text", "content": ""},
+            candidate_attribute_names=["State"],
+        )
+        return joinability_dataset.QueryRecoveryCandidate(
+            task=task,
+            extraction={"attributes": [{"name": "State", "value": "Alabama"}]},
+            recovery={
+                "source_table_id": "source",
+                "source_row_id": 0,
+                "recovered_attribute": {
+                    "column_index": 1,
+                    "column_name": "State",
+                    "value": "Alabama",
+                    "model_value": "Alabama",
+                    "hidden_in_query": True,
+                },
+                "evidence": {"asset_id": asset_id, "asset_type": "text"},
+            },
+        )
+
+    extractor = Extractor()
+    first = candidate("first")
+    cached = candidate("cached")
+    cache = ExtractionCache(tmp_path / "query-auto-check-cache.jsonl")
+    cached_key = joinability_dataset.query_recovery_auto_check_key(
+        cached, extractor
+    )
+    cache.put(
+        cached_key,
+        {
+            "cache_key": cached_key,
+            "supported": True,
+            "auto_check": {
+                "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "reviewed_attributes": 1,
+                "reviews": [
+                    {
+                        "review_complete": True,
+                        "error_code": "",
+                        "verdict": "supported",
+                    }
+                ],
+            },
+        },
+    )
+
+    results = joinability_dataset.resolve_query_recovery_auto_checks(
+        candidates=[first, cached],
+        extractor=extractor,
+        cache=cache,
+        args=argparse.Namespace(model_progress=False),
+        required_recovered_rows=1,
+        source_row_order=[0],
+    )
+
+    assert extractor_calls == []
+    assert results == {cached_key: cache.get(cached_key)}
+
+
+def test_query_recovery_external_wait_does_not_block_local_checks(
+    tmp_path: Path,
+) -> None:
+    external_started = threading.Event()
+    release_external = threading.Event()
+    second_local_finished = threading.Event()
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_parallelism = 2
+        auto_check_luna_reviewer = object()
+        auto_check_terra_reviewer = None
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(
+            self,
+            *,
+            task,
+            claimed_value,
+            defer_remote=False,
+            **_kwargs,
+        ):
+            asset_id = str(task.asset["asset_id"])
+            if asset_id == "second-local":
+                second_local_finished.set()
+                return {
+                    "extracted_value": claimed_value,
+                    "verdict": "supported",
+                    "comparison": "normalized_values_match",
+                    "decision_source": "primary_local",
+                    "review_complete": True,
+                    "error_code": "",
+                }
+            assert defer_remote is True
+            return {
+                "extracted_value": "",
+                "verdict": "insufficient",
+                "comparison": "empty_extraction",
+                "decision_source": "remote_review_pending",
+                "review_complete": False,
+                "error_code": "",
+                "primary_extracted_value": "",
+                "primary_verdict": "insufficient",
+                "primary_comparison": "empty_extraction",
+            }
+
+        def complete_auto_check_attribute_review(
+            self,
+            *,
+            claimed_value,
+            **_kwargs,
+        ):
+            external_started.set()
+            assert release_external.wait(timeout=2.0)
+            return {
+                "extracted_value": claimed_value,
+                "verdict": "supported",
+                "comparison": "normalized_values_match",
+                "decision_source": "luna_recovery",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    first = _make_query_recovery_candidate(
+        cache_key="first-cache",
+        asset_id="external-wait",
+    )
+    second = _make_query_recovery_candidate(
+        cache_key="second-cache",
+        asset_id="second-local",
+    )
+    plans = [
+        joinability_dataset.QueryRecoveryAutoCheckPlan(
+            query_key="first",
+            required_recovered_rows=1,
+            source_row_order=(0,),
+            candidates=(first,),
+        ),
+        joinability_dataset.QueryRecoveryAutoCheckPlan(
+            query_key="second",
+            required_recovered_rows=1,
+            source_row_order=(0,),
+            candidates=(second,),
+        ),
+    ]
+    errors: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            joinability_dataset.resolve_query_recovery_auto_check_plans(
+                plans=plans,
+                extractor=Extractor(),
+                cache=ExtractionCache(tmp_path / "query-auto-check-cache.jsonl"),
+                args=argparse.Namespace(model_progress=False),
+                concurrency_state=ModelConcurrencyState(
+                    text_workers=1,
+                    image_workers=1,
+                ),
+            )
+        except BaseException as error:  # pragma: no cover - asserted below.
+            errors.append(error)
+
+    resolver = threading.Thread(target=resolve)
+    resolver.start()
+    assert external_started.wait(timeout=2.0)
+    assert second_local_finished.wait(timeout=1.0)
+    release_external.set()
+    resolver.join(timeout=2.0)
+
+    assert not resolver.is_alive()
+    assert errors == []
+
+
+def test_query_recovery_image_checks_use_local_and_remote_pools() -> None:
+    first_wave = threading.Barrier(2, timeout=2.0)
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(
+            self,
+            *,
+            claimed_value,
+            endpoint_pool,
+            **_kwargs,
+        ):
+            with calls_lock:
+                calls.append(endpoint_pool)
+            first_wave.wait()
+            return {
+                "extracted_value": claimed_value,
+                "verdict": "supported",
+                "comparison": "normalized_values_match",
+                "decision_source": "primary_local",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    def image_candidate(cache_key: str, asset_id: str):
+        text_candidate = _make_query_recovery_candidate(
+            cache_key=cache_key,
+            asset_id=asset_id,
+        )
+        text_candidate.task.asset["asset_type"] = "image"
+        text_candidate.recovery["evidence"]["asset_type"] = "image"
+        return text_candidate
+
+    scheduler = joinability_dataset.QueryRecoveryLocalCheckScheduler(
+        extractor=Extractor(),
+        state=ModelConcurrencyState(
+            text_workers=1,
+            image_workers=1,
+            remote_image_workers=1,
+        ),
+    )
+    try:
+        futures = [
+            scheduler.submit(image_candidate("image-1", "image-local")),
+            scheduler.submit(image_candidate("image-2", "image-remote")),
+        ]
+        assert all(future.result(timeout=2.0)["supported"] for future in futures)
+    finally:
+        scheduler.close()
+
+    assert sorted(calls) == ["local", "remote"]
 
 
 def test_identical_visible_multi_attribute_queries_keep_one_best_target(
@@ -801,6 +1696,32 @@ def test_values_match_rejects_unsafe_short_or_partial_numeric_matches(
     assert not values_match(predicted, expected, attribute_name=attribute_name)
 
 
+def test_values_match_accepts_station_type_suffix_only_with_name_context() -> None:
+    assert values_match(
+        "観音駅",
+        "観音",
+        attribute_name="Japanese",
+        entity_column_name="Station",
+    )
+    assert values_match(
+        "Kannon Station",
+        "Kannon",
+        attribute_name="English name",
+        entity_column_name="Station",
+    )
+    assert not values_match(
+        "観音駅",
+        "観音",
+        attribute_name="Japanese",
+    )
+    assert not values_match(
+        "観音駅",
+        "観音",
+        attribute_name="Location",
+        entity_column_name="Station",
+    )
+
+
 def test_query_rows_per_table_defaults_to_five(tmp_path):
     args = joinability_dataset.parse_args(
         ["--input_dir", str(tmp_path), "--output_dir", str(tmp_path / "out")]
@@ -810,6 +1731,687 @@ def test_query_rows_per_table_defaults_to_five(tmp_path):
     assert args.max_train_query_row_views_per_join == 5
     assert args.explicit_join_fallback_mode == "ratio"
     assert args.explicit_join_fallback_ratio == 0.2
+    assert args.image_model_name == "Qwen3-VL-8B-Instruct"
+    assert args.max_scanned_files is None
+    assert args.auto_check_secondary_openai is True
+    assert args.auto_check_openai_model == "gpt-5.6-luna"
+    assert args.auto_check_openai_reasoning_effort == "none"
+    assert args.auto_check_terra_model == "gpt-5.6-terra"
+
+
+def test_auto_check_json_profiles_use_split_connections_and_shared_concurrency(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "auto-check.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "luna_only": {
+                        "initial": {
+                            "api_key": "fake-luna",
+                            "base_url": "https://luna.example.test/v1",
+                            "model": "gpt-5.6-luna",
+                        },
+                        "final_judge": None,
+                    },
+                    "mixed_api": {
+                        "initial": {
+                            "api_key": "fake-mixed-initial",
+                            "base_url": (
+                                "https://mixed-initial.example.test/v1"
+                            ),
+                            "model": "gpt-5.6-luna",
+                        },
+                        "final_judge": {
+                            "api_key": "fake-mixed-final",
+                            "base_url": (
+                                "https://mixed-final.example.test/v1"
+                            ),
+                            "model": "grok-4.5",
+                        },
+                    },
+                    "other_api": {
+                        "initial": {
+                            "api_key": "fake-other-initial",
+                            "base_url": (
+                                "https://other-initial.example.test/v1"
+                            ),
+                            "model": "gpt-5.6-luna",
+                        },
+                        "final_judge": {
+                            "api_key": "fake-other-final",
+                            "base_url": (
+                                "https://other-final.example.test/v1"
+                            ),
+                            "model": "gemini-3.0-pro",
+                        },
+                    },
+                    "final_only_api": {
+                        "initial": None,
+                        "final_judge": {
+                            "api_key": "fake-final-only",
+                            "base_url": (
+                                "https://final-only.example.test/v1"
+                            ),
+                            "model": "claude-sonnet-5",
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file.chmod(0o600)
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_api_config_file",
+            str(config_file),
+        ]
+    )
+
+    initial_pool, final_pool = (
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+    )
+
+    assert isinstance(
+        initial_pool,
+        joinability_dataset.StableAutoCheckReviewerPool,
+    )
+    assert isinstance(final_pool, joinability_dataset.StableAutoCheckReviewerPool)
+    assert [name for name, _reviewer in initial_pool.reviewers] == [
+        "luna_only",
+        "mixed_api",
+        "other_api",
+    ]
+    assert [name for name, _reviewer in final_pool.reviewers] == [
+        "mixed_api",
+        "other_api",
+        "final_only_api",
+    ]
+    assert [reviewer.identity["model"] for _name, reviewer in final_pool.reviewers] == [
+        "grok-4.5",
+        "gemini-3.0-pro",
+        "claude-sonnet-5",
+    ]
+    initial_by_name = dict(initial_pool.reviewers)
+    final_by_name = dict(final_pool.reviewers)
+    assert (
+        initial_by_name["mixed_api"].client.request_controller
+        is final_by_name["mixed_api"].client.request_controller
+    )
+    assert initial_by_name["mixed_api"].client.api_key == "fake-mixed-initial"
+    assert initial_by_name["mixed_api"].client.api_base_url == (
+        "https://mixed-initial.example.test/v1"
+    )
+    assert final_by_name["mixed_api"].client.api_key == "fake-mixed-final"
+    assert final_by_name["mixed_api"].client.api_base_url == (
+        "https://mixed-final.example.test/v1"
+    )
+    assert final_by_name["final_only_api"].client.api_key == (
+        "fake-final-only"
+    )
+    assert final_by_name["final_only_api"].client.api_base_url == (
+        "https://final-only.example.test/v1"
+    )
+    for reviewer in (
+        initial_by_name["mixed_api"],
+        final_by_name["mixed_api"],
+    ):
+        identity_json = json.dumps(reviewer.identity, sort_keys=True)
+        assert "fake-mixed" not in identity_json
+        assert "mixed-initial.example.test" not in identity_json
+        assert "mixed-final.example.test" not in identity_json
+    assert initial_by_name["mixed_api"].client.request_controller.summary()[
+        "current_inflight_limit"
+    ] == 5
+    assert initial_by_name["mixed_api"].client.max_retries == 0
+    assert final_by_name["mixed_api"].client.max_retries == 0
+
+
+def test_balanced_auto_check_pool_round_robins_equal_providers() -> None:
+    class Controller:
+        max_inflight = 5
+
+        @staticmethod
+        def summary() -> dict[str, int]:
+            return {"max_inflight": 5, "current_inflight_limit": 5}
+
+    class Reviewer:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.identity = {"model": f"model-{name}"}
+
+        def extract_batches(self, batches):
+            return {
+                batch["query_table_id"]: [{"extracted_value": self.name}]
+                for batch in batches
+            }
+
+    names = ["provider-a", "provider-b", "provider-c"]
+    load_balancer = joinability_dataset.AutoCheckProviderLoadBalancer(
+        {name: Controller() for name in names}
+    )
+    pool = joinability_dataset.BalancedAutoCheckReviewerPool(
+        [(name, Reviewer(name)) for name in names],
+        role="final",
+        load_balancer=load_balancer,
+    )
+    selected: list[str] = []
+
+    for index in range(6):
+        values = pool.extract_batch(
+            {"query_table_id": f"query-{index}"},
+            on_selected=lambda identity: selected.append(identity["api_profile"]),
+        )
+        assert values is not None
+
+    assert selected == names * 2
+
+
+def test_balanced_auto_check_pool_routes_around_busy_provider() -> None:
+    class Controller:
+        max_inflight = 1
+
+        @staticmethod
+        def summary() -> dict[str, int]:
+            return {"max_inflight": 1, "current_inflight_limit": 1}
+
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    class Reviewer:
+        def __init__(self, name: str, *, slow: bool = False) -> None:
+            self.name = name
+            self.slow = slow
+            self.identity = {"model": f"model-{name}"}
+
+        def extract_batches(self, batches):
+            if self.slow:
+                slow_started.set()
+                assert release_slow.wait(timeout=5)
+            return {
+                batch["query_table_id"]: [{"extracted_value": self.name}]
+                for batch in batches
+            }
+
+    load_balancer = joinability_dataset.AutoCheckProviderLoadBalancer(
+        {"slow": Controller(), "fast": Controller()}
+    )
+    pool = joinability_dataset.BalancedAutoCheckReviewerPool(
+        [
+            ("slow", Reviewer("slow", slow=True)),
+            ("fast", Reviewer("fast")),
+        ],
+        role="initial",
+        load_balancer=load_balancer,
+    )
+    selected: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow_future = executor.submit(
+            pool.extract_batch,
+            {"query_table_id": "slow-query"},
+            on_selected=lambda identity: selected.append(identity["api_profile"]),
+        )
+        assert slow_started.wait(timeout=5)
+        fast_future = executor.submit(
+            pool.extract_batch,
+            {"query_table_id": "fast-query"},
+            on_selected=lambda identity: selected.append(identity["api_profile"]),
+        )
+        assert fast_future.result(timeout=5) == [{"extracted_value": "fast"}]
+        release_slow.set()
+        assert slow_future.result(timeout=5) == [{"extracted_value": "slow"}]
+
+    assert selected == ["slow", "fast"]
+
+
+def test_balanced_auto_check_pool_fails_over_and_cools_failed_provider() -> None:
+    class Controller:
+        max_inflight = 1
+
+        @staticmethod
+        def summary() -> dict[str, int]:
+            return {"max_inflight": 1, "current_inflight_limit": 1}
+
+    class Reviewer:
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+            self.calls = 0
+            self.identity = {"model": f"model-{name}"}
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            if self.fail:
+                raise joinability_dataset.TransientModelEndpointError(
+                    f"{self.name} failed"
+                )
+            return {
+                batch["query_table_id"]: [{"extracted_value": self.name}]
+                for batch in batches
+            }
+
+    failed = Reviewer("failed", fail=True)
+    healthy = Reviewer("healthy")
+    load_balancer = joinability_dataset.AutoCheckProviderLoadBalancer(
+        {"failed": Controller(), "healthy": Controller()},
+        failure_cooldown_seconds=60,
+        max_failure_cooldown_seconds=60,
+    )
+    pool = joinability_dataset.BalancedAutoCheckReviewerPool(
+        [("failed", failed), ("healthy", healthy)],
+        role="final",
+        load_balancer=load_balancer,
+    )
+    selected: list[str] = []
+
+    first = pool.extract_batch(
+        {"query_table_id": "first"},
+        on_selected=lambda identity: selected.append(identity["api_profile"]),
+    )
+    second = pool.extract_batch(
+        {"query_table_id": "second"},
+        on_selected=lambda identity: selected.append(identity["api_profile"]),
+    )
+
+    assert first == [{"extracted_value": "healthy"}]
+    assert second == [{"extracted_value": "healthy"}]
+    assert selected == ["failed", "healthy", "healthy"]
+    assert failed.calls == 1
+    assert healthy.calls == 2
+
+
+def test_balanced_auto_check_pool_shares_provider_capacity_across_roles() -> None:
+    class Controller:
+        max_inflight = 1
+
+        @staticmethod
+        def summary() -> dict[str, int]:
+            return {"max_inflight": 1, "current_inflight_limit": 1}
+
+    initial_started = threading.Event()
+    release_initial = threading.Event()
+    final_started = threading.Event()
+
+    class Reviewer:
+        def __init__(self, name: str, *, wait: bool = False) -> None:
+            self.name = name
+            self.wait = wait
+            self.identity = {"model": name}
+
+        def extract_batches(self, batches):
+            if self.wait:
+                initial_started.set()
+                assert release_initial.wait(timeout=5)
+            else:
+                final_started.set()
+            return {
+                batch["query_table_id"]: [{"extracted_value": self.name}]
+                for batch in batches
+            }
+
+    load_balancer = joinability_dataset.AutoCheckProviderLoadBalancer(
+        {"shared": Controller()}
+    )
+    initial_pool = joinability_dataset.BalancedAutoCheckReviewerPool(
+        [("shared", Reviewer("initial", wait=True))],
+        role="initial",
+        load_balancer=load_balancer,
+    )
+    final_pool = joinability_dataset.BalancedAutoCheckReviewerPool(
+        [("shared", Reviewer("final"))],
+        role="final",
+        load_balancer=load_balancer,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        initial_future = executor.submit(
+            initial_pool.extract_batch,
+            {"query_table_id": "initial-query"},
+        )
+        assert initial_started.wait(timeout=5)
+        final_future = executor.submit(
+            final_pool.extract_batch,
+            {"query_table_id": "final-query"},
+        )
+        assert not final_started.wait(timeout=0.1)
+        release_initial.set()
+        assert initial_future.result(timeout=5) == [
+            {"extracted_value": "initial"}
+        ]
+        assert final_future.result(timeout=5) == [{"extracted_value": "final"}]
+
+
+def test_auto_check_json_profiles_require_an_initial_reviewer(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "auto-check.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "final_only": {
+                        "initial": None,
+                        "final_judge": {
+                            "api_key": "fake-final-only",
+                            "base_url": "https://final-only.example.test/v1",
+                            "model": "grok-4.5",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file.chmod(0o600)
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_api_config_file",
+            str(config_file),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="at least one initial reviewer"):
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+
+
+def test_auto_check_default_json_config_is_discovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_file = tmp_path / ".auto_check_apis.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "default_api": {
+                        "response": True,
+                        "initial": {
+                            "api_key": "default-key",
+                            "base_url": "https://default.example.test/v1",
+                            "model": "gpt-5.6-luna",
+                        },
+                        "final_judge": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    initial_pool, final_pool = (
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+    )
+
+    assert [name for name, _reviewer in initial_pool.reviewers] == [
+        "default_api"
+    ]
+    reviewer = dict(initial_pool.reviewers)["default_api"]
+    assert reviewer.client.use_responses is True
+    assert reviewer.client.portable_chat_completions is False
+    assert reviewer.identity["api"] == "responses"
+    assert final_pool is None
+
+
+def test_auto_check_json_config_hot_adds_providers_and_reuses_unchanged_clients(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "auto-check.json"
+
+    def write_profiles(profiles: dict[str, object]) -> None:
+        config_file.write_text(
+            json.dumps({"version": 1, "profiles": profiles}),
+            encoding="utf-8",
+        )
+        config_file.chmod(0o600)
+
+    primary = {
+        "initial": {
+            "api_key": "fake-primary-key",
+            "base_url": "https://primary.example.test/v1",
+            "model": "gpt-5.6-luna",
+        },
+        "final_judge": None,
+    }
+    write_profiles({"primary": primary})
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_api_config_file",
+            str(config_file),
+        ]
+    )
+    initial_pool, final_pool = (
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+    )
+    original_reviewer = dict(initial_pool.reviewers)["primary"]
+    assert final_pool is None
+
+    write_profiles(
+        {
+            "primary": primary,
+            "new_gateway": {
+                "initial": {
+                    "api_key": "fake-new-initial-key",
+                    "base_url": "https://new-initial.example.test/v1",
+                    "model": "gpt-5.6-luna",
+                },
+                "final_judge": {
+                    "api_key": "fake-new-final-key",
+                    "base_url": "https://new-final.example.test/v1",
+                    "model": "grok-4.5",
+                },
+            },
+        }
+    )
+
+    assert initial_pool.reload_if_changed()
+    assert [name for name, _reviewer in initial_pool.reviewers] == [
+        "primary",
+        "new_gateway",
+    ]
+    assert dict(initial_pool.reviewers)["primary"] is original_reviewer
+    dynamic_final_pool = initial_pool.companion_final_pool
+    assert [name for name, _reviewer in dynamic_final_pool.reviewers] == [
+        "new_gateway"
+    ]
+    new_initial = dict(initial_pool.reviewers)["new_gateway"]
+    new_final = dict(dynamic_final_pool.reviewers)["new_gateway"]
+    assert (
+        new_initial.client.request_controller
+        is new_final.client.request_controller
+    )
+
+
+def test_auto_check_json_config_keeps_last_valid_profiles_after_bad_update(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config_file = tmp_path / "auto-check.json"
+
+    def write_profiles(names: list[str]) -> None:
+        profiles = {
+            name: {
+                "initial": {
+                    "api_key": f"fake-{name}-key",
+                    "base_url": f"https://{name}.example.test/v1",
+                    "model": "gpt-5.6-luna",
+                },
+                "final_judge": None,
+            }
+            for name in names
+        }
+        config_file.write_text(
+            json.dumps({"version": 1, "profiles": profiles}),
+            encoding="utf-8",
+        )
+        config_file.chmod(0o600)
+
+    write_profiles(["primary"])
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_api_config_file",
+            str(config_file),
+        ]
+    )
+    initial_pool, _final_pool = (
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+    )
+
+    config_file.write_text('{"version": 1, "profiles":', encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert not initial_pool.reload_if_changed()
+        assert not initial_pool.reload_if_changed()
+
+    assert [name for name, _reviewer in initial_pool.reviewers] == ["primary"]
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Ignoring updated auto-check API config" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "continuing with the last valid configuration" in warnings[0]
+    assert "fake-primary-key" not in warnings[0]
+
+    write_profiles(["primary", "recovered_gateway"])
+    assert initial_pool.reload_if_changed()
+    assert [name for name, _reviewer in initial_pool.reviewers] == [
+        "primary",
+        "recovered_gateway",
+    ]
+
+
+def test_auto_check_explicit_json_and_dotenv_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_api_config_file",
+            str(tmp_path / "profiles.json"),
+            "--auto_check_openai_env_file",
+            str(tmp_path / "profiles.env"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+
+
+def test_all_none_profiles_leave_conflicts_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_file = tmp_path / "profiles.env"
+    environment_file.write_text(
+        "MMDD_AUTO_CHECK_API_PROFILES=luna_only\n"
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_API_KEY=fake-luna\n"
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_BASE_URL=https://luna.example.test/v1\n"
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_MODEL=gpt-5.6-luna\n"
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_FINAL_JUDGE_MODEL=none\n",
+        encoding="utf-8",
+    )
+    environment_file.chmod(0o600)
+    for name in (
+        "MMDD_AUTO_CHECK_API_PROFILES",
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_API_KEY",
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_BASE_URL",
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_MODEL",
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_FINAL_JUDGE_MODEL",
+        "MMDD_AUTO_CHECK_API_LUNA_ONLY_MAX_CONCURRENCY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--auto_check_openai_env_file",
+            str(environment_file),
+        ]
+    )
+    initial_pool, final_pool = (
+        joinability_dataset.prepare_model_auto_check_reviewers(args)
+    )
+    extractor = LocalAttributeExtractor(_extractor_args())
+    extractor.auto_check_luna_reviewer = initial_pool
+    extractor.auto_check_terra_reviewer = final_pool
+    monkeypatch.setattr(
+        initial_pool,
+        "extract_batch",
+        lambda _batch, **_kwargs: [{"extracted_value": "Alabama"}],
+    )
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Georgia",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert final_pool is None
+    assert review["verdict"] == "insufficient"
+    assert review["review_complete"] is False
+    assert review["decision_source"] == "final_judge_incomplete"
+    assert review["error_code"] == (
+        "model_review_failed:final_judge_not_configured"
+    )
+
+
+def test_dynamic_vllm_runner_defaults_to_instruct_image_model(tmp_path: Path) -> None:
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/image",
+        ]
+    )
+
+    assert args.image_model_name == "Qwen3-VL-8B-Instruct"
+    assert passthrough == []
 
 
 @pytest.mark.parametrize("value", ["-0.01", "1.01"])
@@ -968,7 +2570,7 @@ def test_normalize_extracted_attributes_discards_explanatory_fields():
 
 
 def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
-    captured = {}
+    captured = []
 
     class Response:
         def raise_for_status(self):
@@ -978,7 +2580,7 @@ def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
             return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
 
     def fake_post(url, headers, json, timeout):
-        captured["json"] = json
+        captured.append(json)
         return Response()
 
     monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
@@ -1009,20 +2611,32 @@ def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
         candidate_attributes=["State", "Founded"],
     )
     extractor.chat(base_url="http://localhost:8001/v1", model="Qwen3.5-9B", api_key=None, messages=[])
+    extractor.chat(
+        model_kind="image",
+        base_url="http://localhost:8000/v1",
+        model="Qwen3.5-9B",
+        api_key=None,
+        messages=[],
+    )
 
     assert "Thinking Process" not in prompt
     assert "Wikipedia" not in prompt
     assert "Name [ENTITY; NEVER MASK]: Alpha" in prompt
     assert "State: Texas" in prompt
     assert "Founded: 1901" in prompt
-    assert "separate leave-one-attribute-out test" in prompt
+    assert "Perform a separate leave-one-attribute-out test" in prompt
     assert "same request does not imply that they are related" in prompt
-    assert "entity attribute marked ENTITY is always visible" in prompt
+    assert "ENTITY is always visible" in prompt
     assert "candidate's displayed table value" in prompt
+    assert "pretrained, memorized, and outside knowledge" not in prompt
     assert '"name":"<one candidate attribute name>","value":"<extracted value>"' in prompt
     assert "connection_evidence" not in prompt
     assert "Do not rely on Wikipedia page provenance" not in prompt
-    assert captured["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert len(captured) == 2
+    assert all(
+        payload["chat_template_kwargs"] == {"enable_thinking": False}
+        for payload in captured
+    )
 
 
 def test_extraction_prompt_requires_short_empty_json_response():
@@ -1519,6 +3133,386 @@ def _task(asset_type: str, suffix: str = "1") -> ExtractionTask:
     )
 
 
+def _auto_check_task() -> ExtractionTask:
+    return ExtractionTask(
+        order=0,
+        cache_key="cache_text_auto_check",
+        source_table_id="src",
+        source_row_id=7,
+        entity_column_index=0,
+        entity_column_name="Entity",
+        entity={
+            "entity_id": "ent_auto_check",
+            "wiki_title": "Alpha",
+            "cell_text": "Alpha",
+            "row_attributes": [
+                {"name": "Entity", "value": "Alpha", "is_entity": True},
+                {"name": "State", "value": "Alabama", "is_entity": False},
+                {"name": "Founded", "value": "1901", "is_entity": False},
+            ],
+        },
+        asset={
+            "asset_id": "asset_text_auto_check",
+            "asset_type": "text",
+            "content": "Alpha is in Alabama.",
+        },
+        candidate_attribute_names=["State", "Founded"],
+    )
+
+
+def test_post_analysis_auto_check_keeps_only_supported_attributes():
+    class Checker:
+        auto_check_enabled = True
+
+        def __init__(self):
+            self.model_auto_check_stats = ModelAutoCheckStats()
+
+        def extract_auto_check_value(self, *, attribute_name, **_kwargs):
+            return "Alabama" if attribute_name == "State" else ""
+
+    record = apply_model_auto_check(
+        extractor=Checker(),
+        task=_auto_check_task(),
+        record={
+            "attributes": [
+                {"name": "State", "value": "Alabama"},
+                {"name": "Founded", "value": "1901"},
+            ],
+            "error": "",
+        },
+    )
+
+    assert record["model_attributes"] == [
+        {"name": "State", "value": "Alabama"},
+        {"name": "Founded", "value": "1901"},
+    ]
+    assert record["attributes"] == [{"name": "State", "value": "Alabama"}]
+    assert record["auto_check"]["supported_attributes"] == 1
+    assert record["auto_check"]["filtered_attributes"] == 1
+    assert [review["verdict"] for review in record["auto_check"]["reviews"]] == [
+        "supported",
+        "insufficient",
+    ]
+
+
+def test_post_analysis_auto_check_fails_closed_on_checker_error():
+    class BrokenChecker:
+        auto_check_enabled = True
+
+        def extract_auto_check_value(self, **_kwargs):
+            raise RuntimeError("synthetic checker outage")
+
+    record = apply_model_auto_check(
+        extractor=BrokenChecker(),
+        task=_auto_check_task(),
+        record={
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "error": "",
+        },
+    )
+
+    assert record["attributes"] == []
+    assert record["auto_check"]["reviews"][0]["comparison"] == (
+        "auto_check_failed"
+    )
+    assert record["auto_check"]["reviews"][0]["error_code"] == "RuntimeError"
+
+
+def test_post_analysis_auto_check_accepts_supported_terra_adjudication():
+    class Checker:
+        auto_check_enabled = True
+
+        def __init__(self):
+            self.model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, **_kwargs):
+            return {
+                "extracted_value": "Alabama",
+                "verdict": "supported",
+                "comparison": "normalized_values_match",
+                "decision_source": "terra_adjudication",
+                "review_complete": True,
+                "error_code": "",
+                "primary_extracted_value": "Georgia",
+                "primary_verdict": "contradicted",
+                "primary_comparison": "extracted_value_mismatch",
+                "primary_error_code": "",
+                "luna_triggered": True,
+                "luna_extracted_value": "Alabama",
+                "luna_verdict": "supported",
+                "luna_comparison": "normalized_values_match",
+                "luna_agrees_with_local": False,
+                "luna_error_code": "",
+                "terra_triggered": True,
+                "terra_extracted_value": "Alabama",
+                "terra_verdict": "supported",
+                "terra_comparison": "normalized_values_match",
+                "terra_error_code": "",
+            }
+
+    checker = Checker()
+    record = apply_model_auto_check(
+        extractor=checker,
+        task=_auto_check_task(),
+        record={
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "error": "",
+        },
+    )
+
+    assert record["attributes"] == [{"name": "State", "value": "Alabama"}]
+    review = record["auto_check"]["reviews"][0]
+    assert review["decision_source"] == "terra_adjudication"
+    assert review["primary_verdict"] == "contradicted"
+    assert review["luna_triggered"] is True
+    assert review["terra_triggered"] is True
+    assert checker.model_auto_check_stats.summary()["terra_supported"] == 1
+
+
+def test_post_analysis_auto_check_keeps_source_value_for_equivalent_full_name():
+    class Checker:
+        auto_check_enabled = True
+
+        def review_auto_check_attribute(self, **_kwargs):
+            return {
+                "extracted_value": "観音駅",
+                "verdict": "supported",
+                "comparison": "normalized_values_match",
+                "decision_source": "terra_adjudication",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    task = ExtractionTask(
+        order=0,
+        cache_key="cache_station",
+        source_table_id="src",
+        source_row_id=0,
+        entity_column_index=0,
+        entity_column_name="Station",
+        entity={
+            "cell_text": "Kannon",
+            "row_attributes": [
+                {"name": "Station", "value": "Kannon", "is_entity": True},
+                {"name": "Japanese", "value": "観音", "is_entity": False},
+            ],
+        },
+        asset={"asset_id": "asset_station", "asset_type": "image"},
+        candidate_attribute_names=["Japanese"],
+    )
+
+    record = apply_model_auto_check(
+        extractor=Checker(),
+        task=task,
+        record={
+            "attributes": [{"name": "Japanese", "value": "観音"}],
+            "error": "",
+        },
+    )
+
+    assert record["attributes"] == [{"name": "Japanese", "value": "観音"}]
+    assert record["auto_check"]["reviews"][0]["extracted_value"] == "観音駅"
+
+
+def test_local_auto_check_escalates_luna_disagreement_to_terra(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Alabama")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Georgia",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["verdict"] == "supported"
+    assert review["decision_source"] == "terra_adjudication"
+    assert review["primary_verdict"] == "contradicted"
+    assert review["luna_extracted_value"] == "Alabama"
+    assert review["luna_agrees_with_local"] is False
+    assert review["terra_extracted_value"] == "Alabama"
+    assert luna.calls == 1
+    assert terra.calls == 1
+
+
+def test_local_and_luna_matching_mismatch_skips_terra(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Georgia")
+    terra = Reviewer("Alabama")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Georgia",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["verdict"] == "contradicted"
+    assert review["decision_source"] == "local_luna_consensus"
+    assert review["luna_agrees_with_local"] is True
+    assert luna.calls == 1
+    assert terra.calls == 0
+
+
+def test_deferred_auto_check_does_not_repeat_local_inference(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    local_calls = 0
+
+    def extract_local(**_kwargs):
+        nonlocal local_calls
+        local_calls += 1
+        return "Georgia"
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Alabama")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(extractor, "extract_auto_check_value", extract_local)
+
+    pending = apply_model_auto_check(
+        extractor=extractor,
+        task=_auto_check_task(),
+        record={
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "error": "",
+        },
+        defer_remote=True,
+    )
+
+    assert local_calls == 1
+    assert luna.calls == 0
+    assert terra.calls == 0
+    review = pending["auto_check"]["reviews"][0]
+    assert review["decision_source"] == "remote_review_pending"
+    assert review["review_complete"] is False
+
+    completed = joinability_dataset.complete_deferred_model_auto_check(
+        extractor=extractor,
+        task=_auto_check_task(),
+        record=pending,
+    )
+
+    assert local_calls == 1
+    assert luna.calls == 1
+    assert terra.calls == 1
+    assert completed["attributes"] == [
+        {"name": "State", "value": "Alabama"}
+    ]
+
+
+def test_resolve_finishes_raw_extraction_without_starting_openai(tmp_path):
+    luna_calls = 0
+    local_done = threading.Event()
+
+    class Reviewer:
+        def extract_batches(self, batches):
+            nonlocal luna_calls
+            luna_calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": "Georgia"}
+                ]
+            }
+
+    class Extractor:
+        auto_check_enabled = True
+        model_auto_check_stats = ModelAutoCheckStats()
+        auto_check_luna_reviewer = Reviewer()
+        auto_check_terra_reviewer = None
+
+        def extract(self, *_args, **_kwargs):
+            return {
+                "attributes": [{"name": "State", "value": "Alabama"}],
+                "raw_response": '{"attributes":[]}',
+                "error": "",
+            }
+
+        def extract_auto_check_value(self, **_kwargs):
+            return "Georgia"
+
+        review_auto_check_attribute = (
+            LocalAttributeExtractor.review_auto_check_attribute
+        )
+        complete_auto_check_attribute_review = (
+            LocalAttributeExtractor.complete_auto_check_attribute_review
+        )
+        _auto_check_review_batch = LocalAttributeExtractor._auto_check_review_batch
+
+    task = _auto_check_task()
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    result = resolve_extraction_tasks(
+        extractor=Extractor(),
+        cache=cache,
+        tasks=[task],
+        args=_parallel_args(auto_check_openai_max_inflight=1),
+        state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        on_local_phase_done=local_done.set,
+    )
+
+    assert local_done.is_set()
+    assert luna_calls == 0
+    assert result[0][1]["attributes"] == [
+        {"name": "State", "value": "Alabama"}
+    ]
+    assert "auto_check" not in result[0][1]
+    assert cache.get(task.cache_key) is not None
+
+
 def _parallel_args(**overrides):
     values = {
         "text_model_workers": 1,
@@ -1551,6 +3545,101 @@ def _extractor_args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def test_local_attribute_extractor_uses_one_model_endpoint_config(tmp_path):
+    config_path = tmp_path / "model-endpoints.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "mmdd-model-endpoints-v1",
+                "served_model_name": "Qwen3.5-9B",
+                "endpoints": [
+                    {
+                        "endpoint_id": "local-text",
+                        "base_url": "http://127.0.0.1:8001/v1",
+                        "pool": "local",
+                        "max_inflight": {
+                            "text": 2,
+                            "image": 0,
+                            "total": 2,
+                        },
+                    },
+                    {
+                        "endpoint_id": "local-image",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "pool": "local",
+                        "max_inflight": {
+                            "text": 0,
+                            "image": 1,
+                            "total": 1,
+                        },
+                    },
+                    {
+                        "endpoint_id": "remote-mm",
+                        "base_url": "http://127.0.0.1:18011/v1",
+                        "pool": "remote",
+                        "max_inflight": {
+                            "text": 4,
+                            "image": 2,
+                            "total": 5,
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    extractor = LocalAttributeExtractor(
+        _extractor_args(
+            model_endpoint_config=str(config_path),
+            remote_text_model_workers=4,
+            remote_image_model_workers=2,
+        )
+    )
+
+    assert extractor.text_model_name == "Qwen3.5-9B"
+    assert extractor.image_model_name == "Qwen3.5-9B"
+    assert extractor.current_text_model_base_urls() == [
+        "http://127.0.0.1:8001/v1"
+    ]
+    assert extractor.current_image_model_base_urls() == [
+        "http://127.0.0.1:8000/v1"
+    ]
+    assert extractor.current_remote_text_model_base_urls() == [
+        "http://127.0.0.1:18011/v1"
+    ]
+    assert extractor.current_remote_image_model_base_urls() == [
+        "http://127.0.0.1:18011/v1"
+    ]
+
+
+def test_builder_auto_check_uses_existing_blind_single_attribute_prompt(
+    monkeypatch,
+):
+    extractor = LocalAttributeExtractor(_extractor_args())
+    calls = []
+
+    def chat(**kwargs):
+        calls.append(kwargs)
+        return '{"extracted_value":"Alabama"}'
+
+    monkeypatch.setattr(extractor, "chat", chat)
+
+    task = _auto_check_task()
+    task.asset["content"] = "Alpha has a state listed in the material."
+    value = extractor.extract_auto_check_value(
+        task=task,
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert value == "Alabama"
+    rendered = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert "Alabama" not in rendered
+    assert "Alpha" in rendered
+    assert "1901" in rendered
+    assert calls[0]["response_schema"]["required"] == ["extracted_value"]
 
 
 def test_endpoint_pools_add_urls_from_runtime_files(tmp_path):
@@ -2437,6 +4526,60 @@ def test_dynamic_vllm_defaults_limit_startup_kv_cache_memory():
     ]
 
 
+def test_dynamic_vllm_unified_model_has_role_specific_local_profiles():
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--model_path",
+            "/models/Qwen3.5-9B",
+            "--model_name",
+            "Qwen3.5-9B",
+            "--text_language_model_only",
+            "--text_vllm_gpu_memory_utilization",
+            "0.9",
+            "--image_vllm_gpu_memory_utilization",
+            "0.92",
+            "--text_vllm_max_num_seqs",
+            "12",
+            "--image_vllm_max_num_seqs",
+            "4",
+        ]
+    )
+
+    assert passthrough == []
+    assert args.text_model_path == "/models/Qwen3.5-9B"
+    assert args.image_model_path == "/models/Qwen3.5-9B"
+    assert args.text_model_name == args.image_model_name == "Qwen3.5-9B"
+    text_args = default_vllm_extra_args(args, "text")
+    image_args = default_vllm_extra_args(args, "image")
+    assert text_args[text_args.index("--gpu-memory-utilization") + 1] == "0.9"
+    assert image_args[image_args.index("--gpu-memory-utilization") + 1] == "0.92"
+    assert text_args[text_args.index("--max-num-seqs") + 1] == "12"
+    assert image_args[image_args.index("--max-num-seqs") + 1] == "4"
+    assert "--language-model-only" in text_args
+    assert "--language-model-only" not in image_args
+
+
+def test_dynamic_vllm_rejects_thinking_for_either_modality(capsys):
+    with pytest.raises(SystemExit):
+        parse_dynamic_vllm_args(
+            [
+                "--input_dir",
+                "/data/input",
+                "--output_dir",
+                "/data/output",
+                "--model_path",
+                "/models/Qwen3.5-9B",
+                "--enable_thinking",
+            ]
+        )
+
+    assert "thinking mode is always disabled" in capsys.readouterr().err
+
+
 def test_dynamic_vllm_default_context_length_is_larger_for_vl_images():
     args, _passthrough = parse_dynamic_vllm_args(
         [
@@ -2499,6 +4642,40 @@ def test_dynamic_vllm_remote_worker_counts_are_modality_specific():
         "32",
         "--remote_image_model_workers",
         "64",
+    ]
+
+
+def test_dynamic_vllm_static_remote_workers_are_forwarded_without_layout():
+    args, passthrough = parse_dynamic_vllm_args(
+        [
+            "--input_dir",
+            "/data/input",
+            "--output_dir",
+            "/data/output",
+            "--text_model_path",
+            "/models/text",
+            "--image_model_path",
+            "/models/vl",
+            "--remote_image_model_base_url",
+            "http://127.0.0.1:18000/v1",
+            "--remote_image_model_workers",
+            "32",
+        ]
+    )
+
+    assert args.remote_layout_control_url is None
+    assert args.remote_image_model_workers == 32
+    assert "--remote_image_model_base_url" in passthrough
+    forwarded = dynamic_vllm_runner.with_remote_model_workers(
+        passthrough,
+        text_workers=args.remote_text_model_workers,
+        image_workers=args.remote_image_model_workers,
+    )
+    assert forwarded[-4:] == [
+        "--remote_text_model_workers",
+        "0",
+        "--remote_image_model_workers",
+        "32",
     ]
 
 
@@ -2643,11 +4820,14 @@ def test_start_server_persists_vllm_output_and_closes_parent_handle(monkeypatch,
     class FakePopen:
         def __init__(self, command, **kwargs):
             captured["command"] = command
+            captured["env"] = kwargs["env"]
             captured["stdout"] = kwargs["stdout"]
             captured["stderr"] = kwargs["stderr"]
             captured["text"] = kwargs["text"]
             captured["start_new_session"] = kwargs["start_new_session"]
 
+    monkeypatch.setenv("VLLM_API_KEY", "remote-only-secret")
+    monkeypatch.setenv("MMDD_REMOTE_IMAGE_MODEL_API_KEY", "remote-image-secret")
     monkeypatch.setattr("run_mm_joinability_dynamic_vllm.subprocess.Popen", FakePopen)
     spec = VllmServerSpec(
         role="text",
@@ -2662,6 +4842,10 @@ def test_start_server_persists_vllm_output_and_closes_parent_handle(monkeypatch,
     start_server(spec, log_path=log_path)
 
     assert captured["command"] == spec.command()
+    assert "VLLM_API_KEY" not in captured["env"]
+    assert captured["env"]["MMDD_REMOTE_IMAGE_MODEL_API_KEY"] == (
+        "remote-image-secret"
+    )
     assert Path(captured["stdout"].name) == log_path
     assert captured["stdout"].closed
     assert captured["stderr"] == subprocess.STDOUT
@@ -3209,7 +5393,7 @@ def test_dynamic_vllm_delays_server_start_until_builder_requests_models(monkeypa
         "builder_started",
         "server_started:Qwen3.5-9B",
         "server_ready",
-        "server_started:Qwen3-VL-8B-Thinking",
+        "server_started:Qwen3-VL-8B-Instruct",
         "server_ready",
     ]
 
@@ -3657,6 +5841,149 @@ def test_tasks_requiring_model_analysis_excludes_reusable_cached_tasks(tmp_path)
     pending = tasks_requiring_model_analysis(tasks, cache, _parallel_args())
 
     assert pending == [tasks[1]]
+
+
+def test_tasks_requiring_model_analysis_ignores_legacy_checker_state(tmp_path):
+    task = _task("text", "checker-failed")
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    cache.put(
+        task.cache_key,
+        {
+            "cache_key": task.cache_key,
+            "attributes": [],
+            "model_attributes": [{"name": "State", "value": "Alabama"}],
+            "raw_response": '{"attributes":[{"name":"State","value":"Alabama"}]}',
+            "error": "",
+            "auto_check": {
+                "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "reviewed_attributes": 1,
+                "reviews": [
+                    {
+                        "verdict": "insufficient",
+                        "review_complete": False,
+                        "error_code": "model_review_failed:response_invalid_json",
+                        "decision_source": "primary_provisional_secondary_failed",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert tasks_requiring_model_analysis(
+        [task],
+        cache,
+        _parallel_args(
+            reparse_cached_model_outputs=False,
+            refresh_invalid_model_cache=True,
+        ),
+    ) == []
+
+
+def test_tasks_requiring_model_analysis_reuses_completed_secondary_review(tmp_path):
+    task = _task("text", "secondary-complete")
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    cache.put(
+        task.cache_key,
+        {
+            "cache_key": task.cache_key,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "model_attributes": [{"name": "State", "value": "Alabama"}],
+            "raw_response": '{"attributes":[{"name":"State","value":"Alabama"}]}',
+            "error": "",
+            "auto_check": {
+                "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "reviewed_attributes": 1,
+                "reviews": [
+                    {
+                        "verdict": "supported",
+                        "review_complete": True,
+                        "error_code": "",
+                        "primary_error_code": "LocalModelHTTPError",
+                        "decision_source": "secondary_openai",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert tasks_requiring_model_analysis(
+        [task], cache, _parallel_args(reparse_cached_model_outputs=False)
+    ) == []
+
+
+def test_resolve_extraction_tasks_reuses_legacy_analysis_without_checker(
+    tmp_path,
+):
+    class CheckerExtractor:
+        auto_check_enabled = True
+        model_auto_check_stats = joinability_dataset.ModelAutoCheckStats()
+
+        def __init__(self):
+            self.analysis_calls = 0
+            self.checker_calls = 0
+
+        def extract(self, *_args, **_kwargs):
+            self.analysis_calls += 1
+            raise AssertionError("legacy cache upgrade must not rerun analysis")
+
+        def review_auto_check_attribute(self, **_kwargs):
+            self.checker_calls += 1
+            return {
+                "extracted_value": "Alabama",
+                "verdict": "supported",
+                "comparison": "normalized_values_match",
+                "decision_source": "primary_local",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    task = _task("text", "legacy-auto-check-upgrade")
+    task.entity["row_attributes"] = [
+        {"name": "Entity", "value": "Entity", "is_entity": True},
+        {"name": "State", "value": "Alabama", "is_entity": False},
+    ]
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    cache.put(
+        task.cache_key,
+        {
+            "cache_key": task.cache_key,
+            "prompt_version": joinability_dataset.PROMPT_VERSION,
+            "attributes": [{"name": "State", "value": "Alabama"}],
+            "raw_response": (
+                '{"attributes":[{"name":"State","value":"Alabama"}]}'
+            ),
+            "error": "",
+        },
+    )
+    extractor = CheckerExtractor()
+    progress = joinability_dataset.ModelAnalysisProgress(
+        total=1, cached_keys=set(), enabled=False
+    )
+    progress.register([task.cache_key])
+
+    assert tasks_requiring_model_analysis(
+        [task],
+        cache,
+        _parallel_args(reparse_cached_model_outputs=False),
+        extractor=extractor,
+    ) == []
+    records = resolve_extraction_tasks(
+        extractor=extractor,
+        cache=cache,
+        tasks=[task],
+        args=_parallel_args(reparse_cached_model_outputs=False),
+        state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        progress=progress,
+    )
+
+    assert extractor.analysis_calls == 0
+    assert extractor.checker_calls == 0
+    assert records[0][1]["attributes"] == [
+        {"name": "State", "value": "Alabama"}
+    ]
+    assert "auto_check" not in records[0][1]
+    assert progress.cached == 1
+    assert progress.model == 0
 
 
 def test_tasks_requiring_model_analysis_immediately_marks_only_reusable_records(
@@ -4206,6 +6533,43 @@ def test_resolve_extraction_tasks_writes_failed_model_outputs_to_error_log(tmp_p
     lines = [line for line in error_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     assert "Input length (6749)" in lines[0]
+
+
+def test_resolve_extraction_tasks_persists_raw_result_without_running_checker(tmp_path):
+    class FakeExtractor:
+        auto_check_enabled = True
+        model_auto_check_stats = joinability_dataset.ModelAutoCheckStats()
+
+        def extract(self, asset, entity, candidate_attribute_names):
+            return {
+                "attributes": [{"name": "State", "value": "Alabama"}],
+                "raw_response": (
+                    '{"attributes":[{"name":"State","value":"Alabama"}]}'
+                ),
+                "error": "",
+            }
+
+        def review_auto_check_attribute(self, **_kwargs):
+            raise RuntimeError("secondary checker unavailable")
+
+    cache = ExtractionCache(tmp_path / "model_cache.jsonl")
+    task = _auto_check_task()
+
+    records = resolve_extraction_tasks(
+        extractor=FakeExtractor(),
+        cache=cache,
+        tasks=[task],
+        args=_parallel_args(),
+        state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        progress=None,
+    )
+
+    assert records[0][1]["attributes"] == [
+        {"name": "State", "value": "Alabama"}
+    ]
+    assert "auto_check" not in records[0][1]
+    assert cache.get(task.cache_key) is not None
+    assert cache.get_transient(task.cache_key) is None
 
 
 def test_parallel_bridge_asset_builder_fetches_entities_concurrently(tmp_path):

@@ -151,7 +151,11 @@ def _write_auto_check_dataset(
 
 
 class FakeExtractor:
-    def __init__(self, identity_version: str = "v1", value_override: str = "") -> None:
+    def __init__(
+        self,
+        identity_version: str = "v1",
+        value_override: str | None = None,
+    ) -> None:
         self.identity = {"provider": "fake", "version": identity_version}
         self.calls: list[list[str]] = []
         self.value_override = value_override
@@ -170,7 +174,8 @@ class FakeExtractor:
                     "review_id": item["review_id"],
                     "attribute_name": item["attribute"]["name"],
                     "extracted_value": self.value_override
-                    or re.search(
+                    if self.value_override is not None
+                    else re.search(
                         r"founded in (\d{4})",
                         item["evidence"]["content"],
                     ).group(1),
@@ -179,6 +184,16 @@ class FakeExtractor:
             ]
             for batch in batches
         }
+
+
+class BrokenExtractor:
+    def __init__(self, identity_version: str) -> None:
+        self.identity = {"provider": "fake", "version": identity_version}
+        self.calls = 0
+
+    def extract_batches(self, _batches: list[dict]) -> dict:
+        self.calls += 1
+        raise RuntimeError("synthetic model failure")
 
 
 def _config(root: Path, sample_rate: float) -> AutoCheckConfig:
@@ -267,6 +282,8 @@ def test_review_prompt_omits_target_rows_and_parser_requires_exact_ids() -> None
     assert "secret-target" not in rendered
     assert "France" not in rendered
     assert "Country" in rendered
+    assert "pretrained, memorized, and outside knowledge as unavailable" in rendered
+    assert "leaves multiple candidates" in rendered
 
     response = json.dumps({"extracted_value": "France"})
     assert parse_model_extractions(response, [batch])["query-1"][0][
@@ -314,24 +331,29 @@ def test_local_comparison_rejects_different_extracted_value(tmp_path: Path) -> N
     assert row["recommended_action"] == "drop_recovery"
 
 
-def test_secondary_runs_only_for_local_mismatch_and_can_rescue(
+def test_local_mismatch_runs_luna_and_disagreement_runs_terra(
     tmp_path: Path,
 ) -> None:
     _write_auto_check_dataset(tmp_path, query_count=2)
     primary = FakeExtractor(identity_version="local", value_override="1999")
-    secondary = FakeExtractor(identity_version="terra")
+    luna = FakeExtractor(identity_version="luna")
+    terra = FakeExtractor(identity_version="terra")
 
     summary = run_auto_check(
         _config(tmp_path, 1.0),
         primary,
-        secondary,
+        luna,
+        terra,
     )
 
     assert len(primary.calls) == 2
-    assert len(secondary.calls) == 2
+    assert len(luna.calls) == 2
+    assert len(terra.calls) == 2
     assert summary["execution"]["secondary_candidates"] == 2
     assert summary["execution"]["secondary_model_calls"] == 2
     assert summary["execution"]["secondary_max_concurrency"] == 5
+    assert summary["execution"]["terra_candidates"] == 2
+    assert summary["execution"]["terra_model_calls"] == 2
     assert summary["path_judgments"]["supported"] == 2
     rows = [
         json.loads(line)
@@ -340,57 +362,119 @@ def test_secondary_runs_only_for_local_mismatch_and_can_rescue(
         .splitlines()
     ]
     assert {row["primary_verdict"] for row in rows} == {"contradicted"}
-    assert {row["secondary_verdict"] for row in rows} == {"supported"}
-    assert {row["decision_source"] for row in rows} == {"secondary_openai"}
+    assert {row["luna_verdict"] for row in rows} == {"supported"}
+    assert {row["luna_agrees_with_local"] for row in rows} == {False}
+    assert {row["terra_verdict"] for row in rows} == {"supported"}
+    assert {row["decision_source"] for row in rows} == {"terra_adjudication"}
     assert all(row["review_complete"] for row in rows)
 
 
-def test_supported_local_extraction_skips_secondary(tmp_path: Path) -> None:
+def test_supported_local_extraction_skips_luna_and_terra(tmp_path: Path) -> None:
     _write_auto_check_dataset(tmp_path, query_count=1)
     primary = FakeExtractor(identity_version="local")
-    secondary = FakeExtractor(identity_version="terra", value_override="1999")
+    luna = FakeExtractor(identity_version="luna", value_override="1999")
+    terra = FakeExtractor(identity_version="terra", value_override="1999")
 
     summary = run_auto_check(
         _config(tmp_path, 1.0),
         primary,
-        secondary,
+        luna,
+        terra,
     )
 
     assert len(primary.calls) == 1
-    assert secondary.calls == []
+    assert luna.calls == []
+    assert terra.calls == []
     assert summary["execution"]["secondary_candidates"] == 0
     assert summary["execution"]["secondary_model_calls"] == 0
+    assert summary["execution"]["terra_model_calls"] == 0
     assert summary["path_judgments"]["supported"] == 1
 
 
-def test_secondary_cache_is_reused_after_local_mismatch(tmp_path: Path) -> None:
+def test_luna_and_terra_caches_are_reused_after_local_mismatch(tmp_path: Path) -> None:
     _write_auto_check_dataset(tmp_path, query_count=1)
     config = _config(tmp_path, 1.0)
     run_auto_check(
         config,
         FakeExtractor(identity_version="local", value_override="1999"),
+        FakeExtractor(identity_version="luna"),
         FakeExtractor(identity_version="terra"),
     )
     primary = FakeExtractor(identity_version="local", value_override="1999")
-    secondary = FakeExtractor(identity_version="terra")
+    luna = FakeExtractor(identity_version="luna")
+    terra = FakeExtractor(identity_version="terra")
 
-    summary = run_auto_check(config, primary, secondary)
+    summary = run_auto_check(config, primary, luna, terra)
 
     assert primary.calls == []
-    assert secondary.calls == []
+    assert luna.calls == []
+    assert terra.calls == []
     assert summary["execution"]["primary_cache_hits"] == 1
     assert summary["execution"]["secondary_cache_hits"] == 1
+    assert summary["execution"]["terra_cache_hits"] == 1
     assert summary["execution"]["model_calls"] == 0
     assert summary["path_judgments"]["supported"] == 1
 
 
-def test_secondary_concurrency_is_hard_limited_to_five(tmp_path: Path) -> None:
+def test_luna_concurrency_is_hard_limited_to_five(tmp_path: Path) -> None:
     _write_auto_check_dataset(tmp_path, query_count=1)
     config = _config(tmp_path, 1.0)
     config = AutoCheckConfig(**{**config.__dict__, "secondary_workers": 6})
 
     with pytest.raises(ValueError, match="between 1 and 5"):
-        run_auto_check(config, FakeExtractor(), FakeExtractor("terra"))
+        run_auto_check(config, FakeExtractor(), FakeExtractor("luna"))
+
+
+def test_matching_empty_local_and_luna_results_skip_terra(tmp_path: Path) -> None:
+    _write_auto_check_dataset(tmp_path, query_count=1)
+    primary = FakeExtractor(identity_version="local", value_override="")
+    luna = FakeExtractor(identity_version="luna", value_override="")
+    terra = FakeExtractor(identity_version="terra")
+
+    summary = run_auto_check(_config(tmp_path, 1.0), primary, luna, terra)
+
+    assert len(luna.calls) == 1
+    assert terra.calls == []
+    assert summary["execution"]["terra_candidates"] == 0
+    assert summary["path_judgments"]["insufficient"] == 1
+    row = json.loads(
+        Path(summary["artifacts"]["path_reviews"]).read_text(encoding="utf-8")
+    )
+    assert row["luna_agrees_with_local"] is True
+    assert row["decision_source"] == "local_luna_consensus"
+
+
+def test_any_local_luna_result_disagreement_runs_terra(tmp_path: Path) -> None:
+    _write_auto_check_dataset(tmp_path, query_count=1)
+    primary = FakeExtractor(identity_version="local", value_override="1999")
+    luna = FakeExtractor(identity_version="luna", value_override="")
+    terra = FakeExtractor(identity_version="terra")
+
+    summary = run_auto_check(_config(tmp_path, 1.0), primary, luna, terra)
+
+    assert len(luna.calls) == 1
+    assert len(terra.calls) == 1
+    assert summary["path_judgments"]["supported"] == 1
+
+
+def test_terra_failure_is_incomplete_and_fail_closed(tmp_path: Path) -> None:
+    _write_auto_check_dataset(tmp_path, query_count=1)
+    primary = FakeExtractor(identity_version="local", value_override="")
+    luna = FakeExtractor(identity_version="luna")
+    terra = BrokenExtractor("terra")
+
+    summary = run_auto_check(_config(tmp_path, 1.0), primary, luna, terra)
+
+    assert terra.calls == 1
+    assert summary["execution"]["complete"] is False
+    assert summary["execution"]["failed_attribute_reviews"] == 1
+    assert summary["path_judgments"]["reviewed"] == 0
+    row = json.loads(
+        Path(summary["artifacts"]["path_reviews"]).read_text(encoding="utf-8")
+    )
+    assert row["review_complete"] is False
+    assert row["decision_source"] == "terra_adjudication_incomplete"
+    assert row["recommended_action"] == "manual_review_checker_incomplete"
 
 
 def test_local_base_url_validation() -> None:

@@ -2173,6 +2173,9 @@ def test_full_materialization_counts_visible_join_fallback_as_queryable(
         "wdc200k-materialization-v1",
         "wdc200k-materialization-v2",
         "wdc200k-materialization-v3",
+        "wdc200k-materialization-v4",
+        "wdc200k-materialization-v5",
+        "wdc200k-materialization-v6",
     ],
 )
 def test_legacy_published_materialization_schema_is_rebuilt(
@@ -2887,6 +2890,151 @@ def test_nonempty_task6_outputs_materialize_query_qrel_and_evidence(
     )
 
 
+def test_query_auto_check_exhausts_final_query_evidence_after_threshold_selection(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        extractor=_StateExtractor(),
+    )
+
+    class QueryChecker:
+        auto_check_enabled = True
+        auto_check_parallelism = 1
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, str]] = []
+            self.supported_asset_ids: set[str] = set()
+
+        def extract_auto_check_value(
+            self,
+            *,
+            task: Any,
+            attribute_name: str,
+            claimed_value: str,
+            **_kwargs: Any,
+        ) -> str:
+            asset_id = str(task.asset["asset_id"])
+            self.calls.append((task.source_row_id, asset_id))
+            if asset_id.endswith("_000"):
+                self.supported_asset_ids.add(asset_id)
+                return claimed_value
+            return ""
+
+    checker = QueryChecker()
+    output_root = tmp_path / "output"
+    result = materialize_dataset(
+        inputs,
+        output_root=output_root,
+        args=args,
+        extractor=checker,
+        records_per_shard=2,
+    )
+
+    assert len(checker.calls) == 4
+    assert [row_id for row_id, _asset_id in checker.calls] == [
+        0,
+        0,
+        1,
+        1,
+    ]
+    assert [
+        asset_id.rsplit("_", 1)[-1]
+        for _row_id, asset_id in checker.calls
+    ] == [
+        "000",
+        "001",
+        "000",
+        "001",
+    ]
+    assert result.stats["query_tables"] == 1
+    recoveries = list(
+        iter_manifest_records(
+            output_root, "evidence_recoveries", log_every=0
+        )
+    )
+    assert len(recoveries) == 2
+    assert {
+        recovery["evidence"]["asset_id"] for recovery in recoveries
+    } == checker.supported_asset_ids
+    assert all(
+        recovery["auto_check"]["reviews"][0]["verdict"]
+        == "supported"
+        for recovery in recoveries
+    )
+    assert (
+        Path(args.cache_dir) / "query_recovery_auto_checks.jsonl"
+    ).is_file()
+    database_path = next(
+        (inputs.work_root / "materialization").glob("index-*.sqlite3")
+    )
+    with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM query_auto_check_units WHERE complete = 1"
+        ).fetchone()[0] == 1
+
+
+def test_legacy_remote_review_migrates_to_query_auto_check_cache() -> None:
+    task = join_builder.ExtractionTask(
+        order=0,
+        cache_key="legacy-extraction",
+        source_table_id="source-1",
+        source_row_id=0,
+        entity_column_index=0,
+        entity_column_name="Name",
+        entity={
+            "entity_id": "entity-alpha",
+            "wiki_title": "wdc_alpha",
+            "cell_text": "Alpha",
+            "row_attributes": [
+                {"name": "Name", "value": "Alpha", "is_entity": True},
+                {"name": "State", "value": "Texas", "is_entity": False},
+            ],
+        },
+        asset={"asset_id": "asset-alpha", "asset_type": "text"},
+        candidate_attribute_names=["State"],
+    )
+    candidate = join_builder.QueryRecoveryCandidate(
+        task=task,
+        extraction={"cache_key": task.cache_key},
+        recovery={
+            "source_row_id": 0,
+            "recovered_attribute": {
+                "column_name": "State",
+                "value": "Texas",
+                "model_value": "Texas",
+            },
+        },
+    )
+    review = {
+        "attribute_name": "State",
+        "claimed_value": "Texas",
+        "verdict": "supported",
+        "error_code": "",
+        "review_complete": True,
+        "decision_source": "terra_adjudication",
+        "luna_triggered": True,
+        "terra_triggered": True,
+    }
+
+    migrated = materializer._legacy_query_auto_check_record(
+        candidate,
+        {
+            "cache_key": task.cache_key,
+            "auto_check": {
+                "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "reviews": [review],
+            },
+        },
+    )
+
+    assert migrated is not None
+    assert migrated["supported"] is True
+    assert migrated["auto_check"]["reviews"] == [review]
+    assert join_builder.query_recovery_remote_review_is_complete(migrated)
+
+
 def test_partial_source_catalog_import_resumes_after_committed_batch(
     tmp_path: Path,
 ) -> None:
@@ -2966,13 +3114,17 @@ def test_materialization_checkpoints_between_bounded_source_batches(
         "_checkpoint_wal",
         recording_checkpoint,
     )
+    progress: list[dict[str, Any]] = []
     materializer._materialize_all_tables(
         database_path,
         args=args,
         expected_tables=len(sources),
+        progress_callback=progress.append,
     )
 
     assert checkpoints == [database_path] * 3
+    assert [item["completed"] for item in progress] == [0, 1, 2, 3, 4, 5, 5]
+    assert all(item["total"] == 5 for item in progress)
     with materializer._connect(database_path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM source_units WHERE complete = 1"
@@ -3019,13 +3171,16 @@ def test_parallel_materialization_commits_in_source_order_and_resumes(
     assert stored_ids == expected_ids
 
     resumed_commits: list[str] = []
+    resumed_progress: list[dict[str, Any]] = []
     materializer._materialize_all_tables(
         database_path,
         args=args,
         expected_tables=len(sources),
         after_table_commit=resumed_commits.append,
+        progress_callback=resumed_progress.append,
     )
     assert resumed_commits == []
+    assert [item["completed"] for item in resumed_progress] == [5, 5]
 
 
 def test_existing_full_table_copies_migrate_to_references(

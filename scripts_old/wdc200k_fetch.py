@@ -1028,6 +1028,83 @@ def _refresh_page_url_counts(
     )
 
 
+def _scoped_page_outcome_counts(
+    store: SqliteJobStore,
+    kind: str,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+) -> tuple[int, int]:
+    """Count durable outcomes belonging to this work-local job set."""
+    connection = store._connect()
+    try:
+        connection.execute(
+            "ATTACH DATABASE ? AS scoped_page_outcomes",
+            (str(Path(outcomes_path)),),
+        )
+        row = connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(
+                    CASE WHEN outcome.status = 'success' THEN 1 ELSE 0 END
+                ), 0) AS success,
+                COALESCE(SUM(
+                    CASE WHEN outcome.status = 'terminal' THEN 1 ELSE 0 END
+                ), 0) AS terminal
+            FROM jobs AS job
+            JOIN scoped_page_outcomes.page_outcomes AS outcome
+              ON outcome.policy_fingerprint = ?
+             AND job.job_id = ? || ':' || outcome.url_key
+             AND outcome.status = job.status
+            WHERE job.kind = ?
+              AND job.status IN ('success', 'terminal')
+            """,
+            (policy_fingerprint, policy_fingerprint, kind),
+        ).fetchone()
+    finally:
+        connection.close()
+    return int(row["success"]), int(row["terminal"])
+
+
+def _iter_scoped_page_outcomes(
+    outcome_store: PageOutcomeStore,
+    *,
+    job_store_path: Path,
+    job_kind: str,
+    policy_fingerprint: str,
+) -> Iterator[dict[str, Any]]:
+    """Yield cache outcomes only for URLs owned by one work-local job set."""
+    connection = outcome_store._connect()
+    try:
+        connection.execute(
+            "ATTACH DATABASE ? AS scoped_page_jobs",
+            (str(Path(job_store_path)),),
+        )
+        cursor = connection.execute(
+            """
+            SELECT outcomes.*, (
+                SELECT COUNT(*)
+                FROM scoped_page_jobs.page_scope_references AS refs
+                WHERE refs.policy_fingerprint = outcomes.policy_fingerprint
+                  AND refs.url_key = outcomes.url_key
+            ) AS reference_count
+            FROM page_outcomes AS outcomes
+            WHERE outcomes.policy_fingerprint = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM scoped_page_jobs.jobs AS job
+                  WHERE job.kind = ?
+                    AND job.job_id = ? || ':' || outcomes.url_key
+              )
+            ORDER BY outcomes.url_key
+            """,
+            (policy_fingerprint, job_kind, policy_fingerprint),
+        )
+        for row in cursor:
+            yield outcome_store._decode(row)
+    finally:
+        connection.close()
+
+
 def _durable_page_completions(
     store: SqliteJobStore,
     kind: str,
@@ -1316,7 +1393,12 @@ def _publish_snapshots(
                     outcome,
                     int(outcome["affected_reference_count"]),
                 )
-                for outcome in outcome_store.iter(policy_fingerprint)
+                for outcome in _iter_scoped_page_outcomes(
+                    outcome_store,
+                    job_store_path=store.path,
+                    job_kind=kind,
+                    policy_fingerprint=policy_fingerprint,
+                )
                 if outcome["status"] == "terminal"
             ),
             pre_write_guard,
@@ -1368,7 +1450,12 @@ def _publish_progress_unlocked(
     inflight: int,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
-    success, terminal = outcome_store.counts(policy_fingerprint)
+    success, terminal = _scoped_page_outcome_counts(
+        store,
+        kind,
+        outcome_store.path,
+        policy_fingerprint,
+    )
     leased = _leased_count(store, kind)
     remaining = max(0, unique - success - terminal)
     observed_inflight = max(inflight, leased)
@@ -1406,6 +1493,22 @@ def _enqueue_page_refs(
     reference_connection = outcome_store._connect()
     pending = 0
     try:
+        store.reserve_write(64 * 1024)
+        job_connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS page_scope_references (
+                policy_fingerprint TEXT NOT NULL,
+                url_key TEXT NOT NULL,
+                reference_key TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                source_table_id TEXT NOT NULL,
+                row_id_json TEXT NOT NULL,
+                PRIMARY KEY (
+                    policy_fingerprint, url_key, reference_key
+                )
+            )
+            """
+        )
         for record in page_refs:
             encoded_record = json.dumps(record, ensure_ascii=False)
             estimated = 8192 + 2 * len(encoded_record.encode("utf-8"))
@@ -1422,6 +1525,32 @@ def _enqueue_page_refs(
             reference_connection.execute(
                 """
                 INSERT OR IGNORE INTO page_references (
+                    policy_fingerprint, url_key, reference_key,
+                    entity_id, source_table_id, row_id_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    policy_fingerprint, url_key, reference_key
+                ) DO UPDATE SET
+                    entity_id = excluded.entity_id,
+                    source_table_id = excluded.source_table_id,
+                    row_id_json = excluded.row_id_json
+                """,
+                (
+                    policy_fingerprint,
+                    url_key,
+                    reference_key,
+                    str(record.get("entity_id") or ""),
+                    str(record.get("source_table_id") or ""),
+                    json.dumps(
+                        record.get("row_id"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            job_connection.execute(
+                """
+                INSERT INTO page_scope_references (
                     policy_fingerprint, url_key, reference_key,
                     entity_id, source_table_id, row_id_json
                 ) VALUES (?, ?, ?, ?, ?, ?)
@@ -1803,8 +1932,13 @@ def fetch_unique_pages(
                     if claimed_count:
                         raise RuntimeError("page scheduler made no progress")
                     if claimed_now == 0:
-                        success_now, terminal_now = outcome_store.counts(
-                            fingerprint
+                        success_now, terminal_now = (
+                            _scoped_page_outcome_counts(
+                                store,
+                                kind,
+                                outcomes_path,
+                                fingerprint,
+                            )
                         )
                         unresolved = unique - success_now - terminal_now
                         active_leases = _leased_count(store, kind)
@@ -2097,20 +2231,20 @@ def validate_complete_page_fetch(
                 "SELECT COUNT(*) FROM expected_page_refs"
             ).fetchone()[0]
         )
-        actual_ref_count = int(
+        scoped_ref_count = int(
             connection.execute(
                 """
-                SELECT COUNT(*) FROM outcomes_db.page_references
+                SELECT COUNT(*) FROM jobs_db.page_scope_references
                 WHERE policy_fingerprint = ?
                 """,
                 (policy,),
             ).fetchone()[0]
         )
-        missing_refs = connection.execute(
+        missing_scoped_refs = connection.execute(
             """
             SELECT COUNT(*)
             FROM expected_page_refs AS expected
-            LEFT JOIN outcomes_db.page_references AS actual
+            LEFT JOIN jobs_db.page_scope_references AS actual
               ON actual.policy_fingerprint = ?
              AND actual.url_key = expected.url_key
              AND actual.reference_key = expected.reference_key
@@ -2121,7 +2255,27 @@ def validate_complete_page_fetch(
             """,
             (policy,),
         ).fetchone()[0]
-        if int(missing_refs) != 0 or actual_ref_count != expected_ref_count:
+        missing_cached_refs = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs_db.page_scope_references AS scoped
+            LEFT JOIN outcomes_db.page_references AS cached
+              ON cached.policy_fingerprint = scoped.policy_fingerprint
+             AND cached.url_key = scoped.url_key
+             AND cached.reference_key = scoped.reference_key
+             AND cached.entity_id = scoped.entity_id
+             AND cached.source_table_id = scoped.source_table_id
+             AND cached.row_id_json = scoped.row_id_json
+            WHERE scoped.policy_fingerprint = ?
+              AND cached.url_key IS NULL
+            """,
+            (policy,),
+        ).fetchone()[0]
+        if (
+            int(missing_scoped_refs) != 0
+            or int(missing_cached_refs) != 0
+            or scoped_ref_count != expected_ref_count
+        ):
             raise ValueError("page fetch reference set mismatch")
         expected_url_count = int(
             connection.execute(
@@ -2131,10 +2285,14 @@ def validate_complete_page_fetch(
         actual_url_count = int(
             connection.execute(
                 """
-                SELECT COUNT(*) FROM outcomes_db.page_outcomes
-                WHERE policy_fingerprint = ?
+                SELECT COUNT(*)
+                FROM jobs_db.jobs AS job
+                JOIN outcomes_db.page_outcomes AS outcome
+                  ON outcome.policy_fingerprint = ?
+                 AND job.job_id = ? || ':' || outcome.url_key
+                WHERE job.kind = ?
                 """,
-                (policy,),
+                (policy, policy, expected_kind),
             ).fetchone()[0]
         )
         missing_urls = connection.execute(
@@ -2174,14 +2332,17 @@ def validate_complete_page_fetch(
             """
             SELECT
                 COUNT(*) AS total,
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN outcome.status = 'success' THEN 1 ELSE 0 END)
                     AS success,
-                SUM(CASE WHEN status = 'terminal' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN outcome.status = 'terminal' THEN 1 ELSE 0 END)
                     AS terminal
-            FROM outcomes_db.page_outcomes
-            WHERE policy_fingerprint = ?
+            FROM jobs_db.jobs AS job
+            JOIN outcomes_db.page_outcomes AS outcome
+              ON outcome.policy_fingerprint = ?
+             AND job.job_id = ? || ':' || outcome.url_key
+            WHERE job.kind = ?
             """,
-            (policy,),
+            (policy, policy, expected_kind),
         ).fetchone()
         counts = {
             "unique": expected_unique,
@@ -2260,12 +2421,16 @@ def validate_complete_page_fetch(
         )
         for row in connection.execute(
             """
-            SELECT url_key, page_url, status, payload_sha256
-            FROM outcomes_db.page_outcomes
-            WHERE policy_fingerprint = ?
-            ORDER BY url_key
+            SELECT outcome.url_key, outcome.page_url,
+                   outcome.status, outcome.payload_sha256
+            FROM jobs_db.jobs AS job
+            JOIN outcomes_db.page_outcomes AS outcome
+              ON outcome.policy_fingerprint = ?
+             AND job.job_id = ? || ':' || outcome.url_key
+            WHERE job.kind = ?
+            ORDER BY outcome.url_key
             """,
-            (policy,),
+            (policy, policy, expected_kind),
         ):
             digest.update(
                 json.dumps(
@@ -2297,8 +2462,11 @@ def validate_complete_page_fetch(
             pre_write_guard,
         ),
     )
-    for outcome in outcome_store.iter(
-        result.policy_fingerprint
+    for outcome in _iter_scoped_page_outcomes(
+        outcome_store,
+        job_store_path=result.job_store_path,
+        job_kind=result.job_kind,
+        policy_fingerprint=result.policy_fingerprint,
     ):
         canonical = {
             "policy_fingerprint": outcome["policy_fingerprint"],
@@ -2343,8 +2511,11 @@ def validate_complete_page_fetch(
             outcome,
             int(outcome["affected_reference_count"]),
         )
-        for outcome in outcome_store.iter(
-            result.policy_fingerprint
+        for outcome in _iter_scoped_page_outcomes(
+            outcome_store,
+            job_store_path=result.job_store_path,
+            job_kind=result.job_kind,
+            policy_fingerprint=result.policy_fingerprint,
         )
         if outcome["status"] == "terminal"
     ]
@@ -2365,21 +2536,48 @@ def validate_complete_page_fetch(
 def iter_page_outcomes(
     outcomes_path: Path,
     policy_fingerprint: str | None = None,
+    *,
+    job_store_path: Path | None = None,
+    job_kind: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream durable page outcomes without loading them into memory."""
-    yield from PageOutcomeStore(Path(outcomes_path)).iter(policy_fingerprint)
+    if (job_store_path is None) != (job_kind is None):
+        raise ValueError(
+            "job_store_path and job_kind must be provided together"
+        )
+    outcome_store = PageOutcomeStore(Path(outcomes_path))
+    if job_store_path is None:
+        yield from outcome_store.iter(policy_fingerprint)
+        return
+    if policy_fingerprint is None:
+        raise ValueError("scoped page outcomes require a policy fingerprint")
+    yield from _iter_scoped_page_outcomes(
+        outcome_store,
+        job_store_path=job_store_path,
+        job_kind=str(job_kind),
+        policy_fingerprint=policy_fingerprint,
+    )
 
 
 def iter_page_fanout(
     outcomes_path: Path,
     policy_fingerprint: str,
+    *,
+    job_store_path: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream the disk-backed entity-ref to unique-outcome join for Task 5."""
     outcome_store = PageOutcomeStore(Path(outcomes_path))
     connection = outcome_store._connect()
     try:
+        reference_table = "page_references"
+        if job_store_path is not None:
+            connection.execute(
+                "ATTACH DATABASE ? AS scoped_page_jobs",
+                (str(Path(job_store_path)),),
+            )
+            reference_table = "scoped_page_jobs.page_scope_references"
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 refs.entity_id,
                 refs.source_table_id,
@@ -2393,7 +2591,7 @@ def iter_page_fanout(
                 outcomes.error_class,
                 outcomes.http_status,
                 outcomes.payload_sha256
-            FROM page_references AS refs
+            FROM {reference_table} AS refs
             JOIN page_outcomes AS outcomes
               ON outcomes.policy_fingerprint = refs.policy_fingerprint
              AND outcomes.url_key = refs.url_key

@@ -124,7 +124,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v5"
+MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v7"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -266,6 +266,7 @@ class _TableExtractionCache:
             for record in records
             if clean_text(record.get("cache_key"))
         }
+        self.transient_items: dict[str, dict[str, Any]] = {}
 
     def get(self, key: str) -> dict[str, Any] | None:
         record = self.items.get(key)
@@ -273,6 +274,24 @@ class _TableExtractionCache:
 
     def put(self, key: str, record: dict[str, Any]) -> None:
         self.items[key] = dict(record)
+
+    def get_transient(self, key: str) -> dict[str, Any] | None:
+        record = self.transient_items.get(key)
+        return dict(record) if record is not None else None
+
+    def put_transient(self, key: str, record: dict[str, Any]) -> None:
+        self.transient_items[key] = dict(record)
+
+
+class _CachedQueryAutoCheckExtractor:
+    """Require cached query checks without carrying a live client to workers."""
+
+    auto_check_enabled = True
+
+    def extract_auto_check_value(self, **_kwargs: Any) -> str:
+        raise RuntimeError(
+            "query auto-check cache is incomplete during final materialization"
+        )
 
 
 def _canonical_json(value: Any) -> str:
@@ -788,6 +807,25 @@ def _report_validation_progress(
         )
 
 
+def _report_work_progress(
+    callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    phase: str,
+    completed: int,
+    total: int,
+    **details: Any,
+) -> None:
+    if callback is not None:
+        callback(
+            {
+                "phase": phase,
+                "completed": completed,
+                "total": total,
+                **details,
+            }
+        )
+
+
 def _truncate_validation_wals(paths: Iterable[Path]) -> None:
     for path in paths:
         database_path = Path(path)
@@ -1270,6 +1308,22 @@ def _initialize_index(
             CREATE UNIQUE INDEX IF NOT EXISTS extractions_job
                 ON extractions(job_id)
                 WHERE job_id <> '';
+
+            CREATE TABLE IF NOT EXISTS query_auto_checks (
+                cache_key TEXT PRIMARY KEY,
+                extraction_cache_key TEXT NOT NULL,
+                record_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS query_auto_checks_extraction
+                ON query_auto_checks(extraction_cache_key, cache_key);
+
+            CREATE TABLE IF NOT EXISTS query_auto_check_units (
+                source_table_id TEXT PRIMARY KEY,
+                source_sha256 TEXT NOT NULL,
+                plan_count INTEGER NOT NULL,
+                cached_check_count INTEGER NOT NULL,
+                complete INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS evidence (
                 recovery_id TEXT PRIMARY KEY,
@@ -2282,6 +2336,15 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
         "refresh_invalid_model_cache": bool(
             args.refresh_invalid_model_cache
         ),
+        "unrecoverable_replacement_rounds": int(
+            getattr(args, "unrecoverable_replacement_rounds", 0)
+        ),
+        "unrecoverable_drop_probability": float(
+            getattr(args, "unrecoverable_drop_probability", 0.5)
+        ),
+        "recovery_replacement_round_index": int(
+            getattr(args, "recovery_replacement_round_index", 0)
+        ),
     }
 
 
@@ -3265,7 +3328,14 @@ def _catalog_source_records(
     args: argparse.Namespace,
     expected_tables: int,
     write_tracker: GuardedWriteTracker | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
+    _report_work_progress(
+        progress_callback,
+        phase="catalog_sources",
+        completed=0,
+        total=expected_tables,
+    )
     with _connect(database_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         observed_stream = 0
@@ -3383,6 +3453,13 @@ def _catalog_source_records(
                     write_tracker.before_commit(0)
                 connection.commit()
                 connection.execute("BEGIN IMMEDIATE")
+            if (ordinal + 1) % 100 == 0:
+                _report_work_progress(
+                    progress_callback,
+                    phase="catalog_sources",
+                    completed=ordinal + 1,
+                    total=expected_tables,
+                )
         observed = int(
             connection.execute(
                 "SELECT COUNT(*) FROM source_catalog"
@@ -3399,6 +3476,12 @@ def _catalog_source_records(
         if write_tracker is not None:
             write_tracker.before_commit(0)
         connection.commit()
+    _report_work_progress(
+        progress_callback,
+        phase="catalog_sources",
+        completed=expected_tables,
+        total=expected_tables,
+    )
 
 
 def _catalog_sources(
@@ -3408,6 +3491,7 @@ def _catalog_sources(
     args: argparse.Namespace,
     expected_tables: int,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     _catalog_source_records(
@@ -3416,6 +3500,7 @@ def _catalog_sources(
         args=args,
         expected_tables=expected_tables,
         write_tracker=write_tracker,
+        progress_callback=progress_callback,
     )
 
 
@@ -3698,6 +3783,35 @@ def _table_inputs(
     return entities, assets, links, extractions, wiki_to_entity_id
 
 
+def _query_auto_check_records_for_extractions(
+    database_path: Path,
+    extraction_cache_keys: Iterable[str],
+) -> list[dict[str, Any]]:
+    keys = list(
+        dict.fromkeys(
+            clean_text(key) for key in extraction_cache_keys if clean_text(key)
+        )
+    )
+    records: list[dict[str, Any]] = []
+    with _connect(database_path) as connection:
+        for offset in range(0, len(keys), _SQLITE_IN_BATCH_RECORDS):
+            batch = keys[offset : offset + _SQLITE_IN_BATCH_RECORDS]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"""
+                SELECT cache_key, record_json
+                FROM query_auto_checks
+                WHERE extraction_cache_key IN ({placeholders})
+                ORDER BY cache_key
+                """,
+                tuple(batch),
+            ):
+                record = json.loads(str(row["record_json"]))
+                record["cache_key"] = str(row["cache_key"])
+                records.append(record)
+    return records
+
+
 def _materialize_from_index(
     source_table: dict[str, Any],
     database_path: Path,
@@ -3731,6 +3845,20 @@ def _materialize_from_index(
     materialize_args = copy.copy(args)
     materialize_args.cache_failed_model_outputs = True
     materialize_args.model_attribute_errors_path = ""
+    query_auto_check_required = bool(
+        getattr(materialize_args, "_query_auto_check_required", False)
+    )
+    query_auto_check_records = (
+        _query_auto_check_records_for_extractions(
+            database_path,
+            (
+                clean_text(record.get("cache_key"))
+                for record in extractions
+            ),
+        )
+        if query_auto_check_required
+        else []
+    )
     (
         query_tables,
         data_lake_tables,
@@ -3742,7 +3870,11 @@ def _materialize_from_index(
         assets=asset_by_id,
         entity_to_assets=entity_to_assets,
         wiki_to_entity_id=wiki_to_entity_id,
-        extractor=None,
+        extractor=(
+            _CachedQueryAutoCheckExtractor()
+            if query_auto_check_required
+            else None
+        ),
         cache=_TableExtractionCache(extractions),
         progress=None,
         concurrency_state=join_builder.ModelConcurrencyState.from_args(
@@ -3751,6 +3883,12 @@ def _materialize_from_index(
         extraction_writer=extraction_sink,
         recovery_writer=recovery_sink,
         args=materialize_args,
+        query_auto_check_cache=(
+            _TableExtractionCache(query_auto_check_records)
+            if query_auto_check_required
+            else None
+        ),
+        finalize_query_recoveries=True,
     )
     return MaterializedTable(
         source_table=source_table,
@@ -3766,11 +3904,10 @@ def _materialize_from_index(
     )
 
 
-def _materialize_work_item(
+def _load_materialization_source(
     database_path: Path,
-    args: argparse.Namespace,
     item: _MaterializationWorkItem,
-) -> MaterializedTable:
+) -> dict[str, Any]:
     with _connect(database_path) as connection:
         row = connection.execute(
             """
@@ -3806,6 +3943,15 @@ def _materialize_work_item(
             f"source table retains forbidden image column: "
             f"{item.source_table_id}"
         )
+    return source_table
+
+
+def _materialize_work_item(
+    database_path: Path,
+    args: argparse.Namespace,
+    item: _MaterializationWorkItem,
+) -> MaterializedTable:
+    source_table = _load_materialization_source(database_path, item)
     materialized = _materialize_from_index(
         source_table,
         database_path,
@@ -4242,6 +4388,374 @@ def _store_table_unit(
     return True
 
 
+def _query_auto_check_plans_for_table(
+    database_path: Path,
+    source_table: dict[str, Any],
+    *,
+    split: str,
+    args: argparse.Namespace,
+) -> tuple[
+    list[Any],
+    dict[str, dict[str, Any]],
+]:
+    (
+        _entities,
+        assets,
+        links,
+        extractions,
+        wiki_to_entity_id,
+    ) = _table_inputs(database_path, source_table)
+    assets_by_id = {
+        str(asset["asset_id"]): asset for asset in assets
+    }
+    entity_to_assets: dict[str, list[str]] = {}
+    for link in links:
+        entity_id = clean_text(link.get("entity_id"))
+        if not entity_id:
+            continue
+        linked = entity_to_assets.setdefault(entity_id, [])
+        for asset_id in link.get("asset_ids") or []:
+            asset_id = clean_text(asset_id)
+            if asset_id and asset_id not in linked:
+                linked.append(asset_id)
+
+    plans: list[Any] = []
+    prepass_args = copy.copy(args)
+    prepass_args.cache_failed_model_outputs = True
+    prepass_args.model_attribute_errors_path = ""
+    join_builder.build_table_join_records(
+        source_table=source_table,
+        split=split,
+        assets=assets_by_id,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=None,
+        cache=_TableExtractionCache(extractions),
+        progress=None,
+        concurrency_state=join_builder.ModelConcurrencyState.from_args(
+            prepass_args
+        ),
+        extraction_writer=_RecordSink(),
+        recovery_writer=_RecordSink(),
+        args=prepass_args,
+        apply_query_auto_check=False,
+        query_recovery_plans_out=plans,
+    )
+    return plans, {
+        clean_text(record.get("cache_key")): record
+        for record in extractions
+        if clean_text(record.get("cache_key"))
+    }
+
+
+def _legacy_query_auto_check_record(
+    candidate: Any,
+    extraction: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Split one completed eager Task-6 review into a query-level record."""
+    if not isinstance(extraction, dict):
+        return None
+    auto_check = extraction.get("auto_check")
+    if (
+        not isinstance(auto_check, dict)
+        or clean_text(auto_check.get("schema_version"))
+        != join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
+    ):
+        return None
+    recovered = candidate.recovery["recovered_attribute"]
+    target_name = join_builder.normalize(recovered.get("column_name"))
+    target_value = clean_text(recovered.get("value"))
+    for review_value in auto_check.get("reviews") or []:
+        if not isinstance(review_value, dict):
+            continue
+        review = dict(review_value)
+        if (
+            join_builder.normalize(review.get("attribute_name"))
+            != target_name
+            or not join_builder.values_match(
+                review.get("claimed_value"),
+                target_value,
+                attribute_name=recovered.get("column_name"),
+                entity_column_name=candidate.task.entity_column_name,
+            )
+            or not bool(review.get("review_complete"))
+            or clean_text(review.get("error_code"))
+        ):
+            continue
+        supported = clean_text(review.get("verdict")) == "supported"
+        key = join_builder.query_recovery_auto_check_key(candidate, None)
+        return {
+            "cache_key": key,
+            "extraction_cache_key": candidate.task.cache_key,
+            "attribute_name": recovered.get("column_name"),
+            "claimed_value": target_value,
+            "evidence_identity": (
+                join_builder.query_recovery_remote_evidence_identity(candidate)
+            ),
+            "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "supported": supported,
+            "auto_check": {
+                "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "policy": auto_check.get("policy")
+                or "keep_source_canonical_supported_only_fail_closed",
+                "reviewed_attributes": 1,
+                "supported_attributes": int(supported),
+                "filtered_attributes": int(not supported),
+                "reviews": [review],
+            },
+        }
+    return None
+
+
+def _migrate_legacy_query_auto_checks(
+    plans: Iterable[Any],
+    extraction_records: dict[str, dict[str, Any]],
+    cache: Any,
+) -> int:
+    migrated = 0
+    for plan in plans:
+        for candidate in plan.candidates:
+            key = join_builder.query_recovery_auto_check_key(candidate, None)
+            if (
+                join_builder.query_recovery_cached_check(
+                    key, cache, candidate
+                )
+                is not None
+            ):
+                continue
+            record = _legacy_query_auto_check_record(
+                candidate,
+                extraction_records.get(candidate.task.cache_key),
+            )
+            if record is None:
+                continue
+            cache.put(key, record)
+            migrated += 1
+    return migrated
+
+
+def _persist_query_auto_check_batch(
+    database_path: Path,
+    units: list[tuple[_MaterializationWorkItem, list[Any]]],
+    *,
+    cache: Any,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> tuple[int, int]:
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    persisted_checks = 0
+    persisted_units = 0
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for item, plans in units:
+            checks: dict[str, dict[str, Any]] = {}
+            for plan in plans:
+                for candidate in plan.candidates:
+                    key = join_builder.query_recovery_auto_check_key(
+                        candidate, None
+                    )
+                    record = join_builder.query_recovery_cached_check(
+                        key, cache, candidate
+                    )
+                    if record is None:
+                        continue
+                    stored = {
+                        **record,
+                        "cache_key": key,
+                        "extraction_cache_key": candidate.task.cache_key,
+                    }
+                    checks[key] = stored
+            for key, record in checks.items():
+                encoded = _canonical_json(record)
+                write_tracker.before_write(
+                    4096 + 2 * len(encoded.encode("utf-8"))
+                )
+                connection.execute(
+                    """
+                    INSERT INTO query_auto_checks (
+                        cache_key, extraction_cache_key, record_json
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        extraction_cache_key = excluded.extraction_cache_key,
+                        record_json = excluded.record_json
+                    """,
+                    (
+                        key,
+                        clean_text(record.get("extraction_cache_key")),
+                        encoded,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO query_auto_check_units (
+                    source_table_id, source_sha256, plan_count,
+                    cached_check_count, complete
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(source_table_id) DO UPDATE SET
+                    source_sha256 = excluded.source_sha256,
+                    plan_count = excluded.plan_count,
+                    cached_check_count = excluded.cached_check_count,
+                    complete = 1
+                """,
+                (
+                    item.source_table_id,
+                    item.source_sha256,
+                    len(plans),
+                    len(checks),
+                ),
+            )
+            persisted_checks += len(checks)
+            persisted_units += 1
+        write_tracker.before_commit(0)
+        connection.commit()
+    return persisted_units, persisted_checks
+
+
+def _run_query_auto_check_prepass(
+    database_path: Path,
+    *,
+    extractor: Any,
+    cache: Any,
+    args: argparse.Namespace,
+    expected_tables: int,
+    pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    with _connect(database_path) as connection:
+        completed = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM query_auto_check_units
+                WHERE complete = 1
+                """
+            ).fetchone()[0]
+        )
+    _report_work_progress(
+        progress_callback,
+        phase="query_auto_check",
+        completed=completed,
+        total=expected_tables,
+    )
+    last_ordinal = -1
+    observed = 0
+    migrated_total = 0
+    cached_total = 0
+    while True:
+        with _connect(database_path) as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT source_catalog.source_table_id,
+                           source_catalog.ordinal,
+                           source_catalog.split,
+                           source_catalog.record_sha256,
+                           query_auto_check_units.source_sha256
+                               AS checked_sha256,
+                           query_auto_check_units.complete AS checked
+                    FROM source_catalog
+                    LEFT JOIN query_auto_check_units
+                      ON query_auto_check_units.source_table_id =
+                         source_catalog.source_table_id
+                    WHERE source_catalog.ordinal > ?
+                    ORDER BY source_catalog.ordinal
+                    LIMIT ?
+                    """,
+                    (last_ordinal, _MATERIALIZATION_READ_BATCH_RECORDS),
+                )
+            ]
+        if not rows:
+            break
+        observed += len(rows)
+        pending: list[_MaterializationWorkItem] = []
+        for row in rows:
+            if row["checked"] is not None:
+                if (
+                    int(row["checked"]) != 1
+                    or str(row["checked_sha256"])
+                    != str(row["record_sha256"])
+                ):
+                    raise ValueError(
+                        "query auto-check source unit resume mismatch: "
+                        f"{row['source_table_id']}"
+                    )
+                continue
+            pending.append(
+                _MaterializationWorkItem(
+                    source_table_id=str(row["source_table_id"]),
+                    source_ordinal=int(row["ordinal"]),
+                    source_sha256=str(row["record_sha256"]),
+                    split=clean_text(row["split"]),
+                )
+            )
+
+        units: list[tuple[_MaterializationWorkItem, list[Any]]] = []
+        plans: list[Any] = []
+        for item in pending:
+            source_table = _load_materialization_source(database_path, item)
+            table_plans, extraction_records = (
+                _query_auto_check_plans_for_table(
+                    database_path,
+                    source_table,
+                    split=item.split,
+                    args=args,
+                )
+            )
+            migrated_total += _migrate_legacy_query_auto_checks(
+                table_plans,
+                extraction_records,
+                cache,
+            )
+            units.append((item, table_plans))
+            plans.extend(table_plans)
+        join_builder.finalize_query_recovery_auto_checks(
+            plans=plans,
+            extractor=extractor,
+            cache=cache,
+            args=args,
+            concurrency_state=join_builder.ModelConcurrencyState.from_args(args),
+        )
+        persisted_units, persisted_checks = _persist_query_auto_check_batch(
+            database_path,
+            units,
+            cache=cache,
+            pre_write_guard=pre_write_guard,
+        )
+        completed += persisted_units
+        cached_total += persisted_checks
+        _report_work_progress(
+            progress_callback,
+            phase="query_auto_check",
+            completed=completed,
+            total=expected_tables,
+            plans=len(plans),
+            cached_checks=cached_total,
+            migrated_legacy_checks=migrated_total,
+        )
+        last_ordinal = int(rows[-1]["ordinal"])
+        _checkpoint_wal(database_path)
+    if observed != expected_tables:
+        raise ValueError("query auto-check source iteration count mismatch")
+    with _connect(database_path) as connection:
+        durable_completed = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM query_auto_check_units
+                WHERE complete = 1
+                """
+            ).fetchone()[0]
+        )
+    if durable_completed != expected_tables:
+        raise ValueError("query auto-check table barrier is incomplete")
+    _report_work_progress(
+        progress_callback,
+        phase="query_auto_check",
+        completed=durable_completed,
+        total=expected_tables,
+        cached_checks=cached_total,
+        migrated_legacy_checks=migrated_total,
+    )
+
+
 def _materialize_all_tables(
     database_path: Path,
     *,
@@ -4249,6 +4763,7 @@ def _materialize_all_tables(
     expected_tables: int,
     after_table_commit: Callable[[str], None] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
     worker_count = int(getattr(args, "materialization_workers", 1))
@@ -4256,6 +4771,18 @@ def _materialize_all_tables(
         raise ValueError("materialization worker count must be positive")
     observed = 0
     last_ordinal = -1
+    with _connect(database_path) as connection:
+        completed_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM source_units WHERE complete = 1"
+            ).fetchone()[0]
+        )
+    _report_work_progress(
+        progress_callback,
+        phase="materialize_tables",
+        completed=completed_count,
+        total=expected_tables,
+    )
     executor: ProcessPoolExecutor | None = None
     with ExitStack() as stack:
         while True:
@@ -4367,6 +4894,14 @@ def _materialize_all_tables(
                     split=item.split,
                     write_tracker=write_tracker,
                 )
+                completed_count += 1
+                _report_work_progress(
+                    progress_callback,
+                    phase="materialize_tables",
+                    completed=completed_count,
+                    total=expected_tables,
+                    source_table_id=item.source_table_id,
+                )
                 if after_table_commit is not None:
                     after_table_commit(item.source_table_id)
             last_ordinal = int(batch[-1]["ordinal"])
@@ -4374,15 +4909,21 @@ def _materialize_all_tables(
     if observed != expected_tables:
         raise ValueError("materialization source iteration count mismatch")
     with _connect(database_path) as connection:
-        completed_count = int(
+        durable_completed_count = int(
             connection.execute(
                 """
                 SELECT COUNT(*) FROM source_units WHERE complete = 1
                 """
             ).fetchone()[0]
         )
-    if completed_count != expected_tables:
+    if durable_completed_count != expected_tables:
         raise ValueError("materialization table barrier is incomplete")
+    _report_work_progress(
+        progress_callback,
+        phase="materialize_tables",
+        completed=durable_completed_count,
+        total=expected_tables,
+    )
 
 
 def _balance_explicit_join_records(
@@ -5277,6 +5818,15 @@ def _stats_payload(
         "explicit_join_fallback_ratio": (
             join_builder.configured_explicit_join_fallback_ratio(args)
         ),
+        "unrecoverable_replacement_rounds": int(
+            getattr(args, "unrecoverable_replacement_rounds", 0)
+        ),
+        "unrecoverable_drop_probability": float(
+            getattr(args, "unrecoverable_drop_probability", 0.5)
+        ),
+        "recovery_replacement_round_index": int(
+            getattr(args, "recovery_replacement_round_index", 0)
+        ),
         "notes": [
             "source_tables are the fixed data-lake base pool",
             "source-table rows are never capped",
@@ -5288,6 +5838,8 @@ def _stats_payload(
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query construction is delegated to "
             "build_mm_joinability_dataset.py",
+            "every local-positive evidence candidate for a final accepted query receives an exhaustive auto-check before evidence_recoveries are materialized",
+            "evidence_recoveries contain supported paths only; omitted evidence is an implicit negative",
         ],
     }
 
@@ -5343,6 +5895,9 @@ def _load_published_result(
                 "wdc200k-materialization-v1",
                 "wdc200k-materialization-v2",
                 "wdc200k-materialization-v3",
+                "wdc200k-materialization-v4",
+                "wdc200k-materialization-v5",
+                "wdc200k-materialization-v6",
             }
     ):
         return None
@@ -5439,7 +5994,28 @@ def _finalize_dataset(
     records_per_shard: int,
     after_finalize_commit: Callable[[str], None] | None = None,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> MaterializationResult:
+    finalize_total = len(_CORE_ARTIFACTS) + 7
+    finalized = 0
+
+    def report_finalize(item: str) -> None:
+        nonlocal finalized
+        finalized += 1
+        _report_work_progress(
+            progress_callback,
+            phase="publish_artifacts",
+            completed=finalized,
+            total=finalize_total,
+            item=item,
+        )
+
+    _report_work_progress(
+        progress_callback,
+        phase="publish_artifacts",
+        completed=0,
+        total=finalize_total,
+    )
     counts = _validate_global_counts(database_path, upstream)
     if pre_write_guard is not None:
         pre_write_guard(output_root, 0)
@@ -5456,6 +6032,7 @@ def _finalize_dataset(
             for record in _iter_materialized(database_path, artifact):
                 writer.write(record)
             artifact_shards[artifact] = writer.close()
+            report_finalize(f"artifact:{artifact}")
             if after_finalize_commit is not None:
                 after_finalize_commit(f"artifact:{artifact}")
         except BaseException:
@@ -5467,6 +6044,7 @@ def _finalize_dataset(
         _iter_materialized(database_path, "qrels"),
         pre_write_guard=pre_write_guard,
     )
+    report_finalize("single:qrels.jsonl")
     if after_finalize_commit is not None:
         after_finalize_commit("single:qrels.jsonl")
     decisions = _atomic_jsonl_from_records(
@@ -5476,6 +6054,7 @@ def _finalize_dataset(
         ),
         pre_write_guard=pre_write_guard,
     )
+    report_finalize("single:table_queryability_decisions.jsonl")
     if after_finalize_commit is not None:
         after_finalize_commit(
             "single:table_queryability_decisions.jsonl"
@@ -5486,6 +6065,7 @@ def _finalize_dataset(
         args,
         pre_write_guard=pre_write_guard,
     )
+    report_finalize("single:splits.json")
     if after_finalize_commit is not None:
         after_finalize_commit("single:splits.json")
     stats_payload = _stats_payload(database_path, counts, args)
@@ -5494,6 +6074,7 @@ def _finalize_dataset(
         stats_payload,
         pre_write_guard=pre_write_guard,
     )
+    report_finalize("single:stats.json")
     if after_finalize_commit is not None:
         after_finalize_commit("single:stats.json")
     diagnostics: dict[str, CompletedShard] = {}
@@ -5511,6 +6092,7 @@ def _finalize_dataset(
         ),
         pre_write_guard=pre_write_guard,
     )
+    report_finalize(f"single:{web_failure_name}")
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{web_failure_name}")
     media_failure_name = "media_download_failures.jsonl"
@@ -5531,6 +6113,7 @@ def _finalize_dataset(
         ),
         pre_write_guard=pre_write_guard,
     )
+    report_finalize(f"single:{media_failure_name}")
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{media_failure_name}")
     model_error_name = "model_attribute_errors.jsonl"
@@ -5547,6 +6130,7 @@ def _finalize_dataset(
         ),
         pre_write_guard=pre_write_guard,
     )
+    report_finalize(f"single:{model_error_name}")
     if after_finalize_commit is not None:
         after_finalize_commit(f"single:{model_error_name}")
     single_shards = {
@@ -5668,6 +6252,7 @@ def materialize_dataset(
     *,
     output_root: Path,
     args: argparse.Namespace,
+    extractor: Any | None = None,
     records_per_shard: int = 50_000,
     after_table_commit: Callable[[str], None] | None = None,
     after_finalize_commit: Callable[[str], None] | None = None,
@@ -5675,6 +6260,7 @@ def materialize_dataset(
     validation_progress_callback: (
         Callable[[dict[str, Any]], None] | None
     ) = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> MaterializationResult:
     """Validate upstream barriers and stream the canonical final dataset."""
     if records_per_shard <= 0:
@@ -5811,6 +6397,7 @@ def materialize_dataset(
             args=args,
             expected_tables=upstream.expected_tables,
             pre_write_guard=pre_write_guard,
+            progress_callback=progress_callback,
         )
         _validate_materialization_index_closures(
             database_path,
@@ -5857,25 +6444,62 @@ def materialize_dataset(
             input_files=strict_input_files,
             pre_write_guard=pre_write_guard,
         )
+    materialize_args = copy.copy(args)
+    query_auto_check_required = join_builder.auto_check_required(extractor)
+    materialize_args._query_auto_check_required = query_auto_check_required
+    if query_auto_check_required:
+        query_auto_check_cache = join_builder.ExtractionCache(
+            Path(args.cache_dir).expanduser().resolve()
+            / "query_recovery_auto_checks.jsonl",
+            reuse=not bool(getattr(args, "no_reuse_model_cache", False)),
+            record_key_alias=(
+                lambda record: join_builder.query_recovery_auto_check_record_key(
+                    record
+                )
+            ),
+        )
+        _run_query_auto_check_prepass(
+            database_path,
+            extractor=extractor,
+            cache=query_auto_check_cache,
+            args=materialize_args,
+            expected_tables=upstream.expected_tables,
+            pre_write_guard=pre_write_guard,
+            progress_callback=progress_callback,
+        )
     _materialize_all_tables(
         database_path,
-        args=args,
+        args=materialize_args,
         expected_tables=upstream.expected_tables,
         after_table_commit=after_table_commit,
         pre_write_guard=pre_write_guard,
+        progress_callback=progress_callback,
+    )
+    _report_work_progress(
+        progress_callback,
+        phase="balance_explicit_joins",
+        completed=0,
+        total=1,
     )
     _balance_explicit_join_records(
         database_path,
-        args=args,
+        args=materialize_args,
         pre_write_guard=pre_write_guard,
+    )
+    _report_work_progress(
+        progress_callback,
+        phase="balance_explicit_joins",
+        completed=1,
+        total=1,
     )
     return _finalize_dataset(
         database_path,
         output_root=output_root,
         upstream=upstream,
-        args=args,
+        args=materialize_args,
         parameter_fingerprint=parameter_fingerprint,
         records_per_shard=records_per_shard,
         after_finalize_commit=after_finalize_commit,
         pre_write_guard=pre_write_guard,
+        progress_callback=progress_callback,
     )

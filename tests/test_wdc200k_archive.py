@@ -105,6 +105,37 @@ def test_archive_uses_root_local_stale_trees_and_keeps_runtime(
     )
 
 
+def test_new_archive_prunes_previous_completed_generation(
+    tmp_path: Path,
+) -> None:
+    arguments = _archive_arguments(tmp_path)
+    work_dir = arguments["work_dir"]
+    output_dir = arguments["output_dir"]
+    assert isinstance(work_dir, Path)
+    assert isinstance(output_dir, Path)
+
+    _write(work_dir / "page_jobs/first", "first-work")
+    _write(output_dir / "first", "first-output")
+    first = archive_pipeline_state(**arguments)
+
+    _write(work_dir / "page_jobs/second", "second-work")
+    _write(output_dir / "second", "second-output")
+    second = archive_pipeline_state(**arguments)
+
+    work_stale = work_dir.parent / f".{work_dir.name}.wdc200k-stale"
+    output_stale = output_dir.parent / f".{output_dir.name}.wdc200k-stale"
+    assert not (work_stale / first.transaction_id).exists()
+    assert not (output_stale / first.transaction_id).exists()
+    assert not first.journal_path.exists()
+    assert (
+        work_stale / second.transaction_id / "page_jobs/second"
+    ).read_text(encoding="utf-8") == "second-work"
+    assert (
+        output_stale / second.transaction_id / "root/second"
+    ).read_text(encoding="utf-8") == "second-output"
+    assert second.journal_path.is_file()
+
+
 def test_archive_recovers_after_move_failure_without_repeating_completed_moves(
     tmp_path: Path,
 ) -> None:

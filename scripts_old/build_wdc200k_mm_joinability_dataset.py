@@ -18,7 +18,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import build_mm_joinability_dataset as join_builder
 import build_wdc_mm_joinability_dataset as legacy_wdc_builder
@@ -101,12 +101,15 @@ from wdc200k_sampling import (
     SamplingPolicy,
     SamplingResult,
     sample_structural_artifacts,
+    validate_sampling_artifacts,
     validate_sampling_consumed_paths,
     validate_sampling_source_authority,
 )
 from wdc200k_selection import (
+    ReserveExhaustedError,
     ReserveManager,
     SelectionPolicy,
+    TableCandidate,
     run_selection,
 )
 from wdc200k_structural import (
@@ -182,7 +185,12 @@ class PipelineConfig:
     max_source_tables: int = 200_000
     max_rows_per_source_table: None = None
     selection_seed: int = 13
-    minimum3_fraction: float = 0.90
+    top100_policy: str = "bounded"
+    top100_per_class: int = 10
+    include_rest: bool = False
+    min_candidate_rows: int = 5
+    min_candidate_columns: int = 3
+    minimum3_fraction: float = 1.0
     class_max_tables: int = 40_000
     web_max_retries: int = 0
     web_max_response_seconds: float = 8.0
@@ -191,6 +199,8 @@ class PipelineConfig:
     max_image_attempts_per_entity: int = 3
     max_images_per_entity: int = 3
     sampled_entities_per_table: int = 8
+    sampled_entity_expansion_schedule: tuple[int, ...] = (12, 20, 25)
+    sampling_expansion_round_index: int = 0
     entity_sampling_seed: int = 20260720
     global_entity_budget: int | None = None
     min_free_disk_bytes: int = 1_000_000_000
@@ -223,18 +233,29 @@ class PipelineConfig:
     explicit_join_fallback_ratio: float = (
         join_builder.DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO
     )
+    model_endpoint_config: str | None = None
     text_model_name: str = "Qwen3.5-9B"
-    image_model_name: str = "Qwen3-VL-8B-Thinking"
+    image_model_name: str = "Qwen3-VL-8B-Instruct"
     text_model_base_url: str = "http://localhost:8001/v1"
     text_model_base_urls: tuple[str, ...] = ()
     text_model_base_urls_file: str | None = None
     text_model_api_key: str | None = None
+    remote_text_model_base_url: str | None = None
+    remote_text_model_base_urls: tuple[str, ...] = ()
+    remote_text_model_base_urls_file: str | None = None
+    remote_text_model_api_key: str | None = None
     image_model_base_url: str = "http://localhost:8000/v1"
     image_model_base_urls: tuple[str, ...] = ()
     image_model_base_urls_file: str | None = None
     image_model_api_key: str | None = None
+    remote_image_model_base_url: str | None = None
+    remote_image_model_base_urls: tuple[str, ...] = ()
+    remote_image_model_base_urls_file: str | None = None
+    remote_image_model_api_key: str | None = None
     text_model_workers: int = 1
     image_model_workers: int = 1
+    remote_text_model_workers: int = 0
+    remote_image_model_workers: int = 0
     remote_layout_control_url: str | None = None
     remote_layout_control_token_file: Path | None = None
     remote_layout_routing_manifest: Path | None = None
@@ -269,6 +290,32 @@ class PipelineConfig:
     model_timeout_seconds: float = 120.0
     model_max_retries: int = 2
     model_retry_sleep_seconds: float = 2.0
+    model_cache_database_path: Path | None = None
+    unrecoverable_replacement_rounds: int = 0
+    unrecoverable_drop_probability: float = 0.5
+    recovery_replacement_round_index: int = 0
+    auto_check_secondary_openai: bool = True
+    auto_check_api_config_file: str = ""
+    auto_check_openai_env_file: str = ""
+    auto_check_openai_model: str = join_builder.DEFAULT_AUTO_CHECK_OPENAI_MODEL
+    auto_check_openai_base_url: str = ""
+    auto_check_openai_api_key_env: str = "OPENAI_API_KEY"
+    auto_check_openai_reasoning_effort: str = "none"
+    auto_check_openai_verbosity: str = "low"
+    auto_check_openai_max_output_tokens: int = 2048
+    auto_check_terra_model: str = join_builder.DEFAULT_AUTO_CHECK_TERRA_MODEL
+    auto_check_terra_reasoning_effort: str = "none"
+    auto_check_terra_max_output_tokens: int = 2048
+    auto_check_openai_max_inflight: int = (
+        join_builder.MAX_AUTO_CHECK_OPENAI_CONCURRENCY
+    )
+    auto_check_openai_image_detail: str = "auto"
+    auto_check_openai_image_max_pixels: int = (
+        join_builder.DEFAULT_IMAGE_REQUEST_MAX_PIXELS
+    )
+    auto_check_openai_timeout_seconds: float = 180.0
+    auto_check_openai_requests_per_minute: int = 0
+    auto_check_openai_tokens_per_minute: int = 0
     model_text_done_marker: Path | None = None
     model_image_done_marker: Path | None = None
     refresh_page_cache: bool = False
@@ -286,7 +333,7 @@ class PipelineConfig:
         cache_dir = (
             Path(args.cache_dir).resolve()
             if args.cache_dir
-            else output_dir.parent / "cache" / "wdc_200k"
+            else output_dir.parent / "cache" / "wdc_webtable"
         )
         roots = (input_dir, output_dir, work_dir, cache_dir)
         if len(set(roots)) != len(roots):
@@ -304,6 +351,11 @@ class PipelineConfig:
             cache_dir=cache_dir,
             max_source_tables=args.max_source_tables,
             selection_seed=args.selection_seed,
+            top100_policy=args.top100_policy,
+            top100_per_class=args.top100_per_class,
+            include_rest=args.include_rest,
+            min_candidate_rows=args.min_candidate_rows,
+            min_candidate_columns=args.min_candidate_columns,
             minimum3_fraction=args.minimum3_fraction,
             class_max_tables=args.class_max_tables,
             web_max_retries=args.web_max_retries,
@@ -315,6 +367,9 @@ class PipelineConfig:
             ),
             max_images_per_entity=args.max_images_per_entity,
             sampled_entities_per_table=args.sampled_entities_per_table,
+            sampled_entity_expansion_schedule=tuple(
+                args.sampled_entity_expansion_schedule
+            ),
             entity_sampling_seed=args.entity_sampling_seed,
             global_entity_budget=args.global_entity_budget,
             min_free_disk_bytes=args.min_free_disk_bytes,
@@ -353,6 +408,11 @@ class PipelineConfig:
             explicit_join_fallback_ratio=(
                 args.explicit_join_fallback_ratio
             ),
+            model_endpoint_config=(
+                str(Path(args.model_endpoint_config).resolve())
+                if args.model_endpoint_config
+                else None
+            ),
             text_model_name=args.text_model_name,
             image_model_name=args.image_model_name,
             text_model_base_url=args.text_model_base_url,
@@ -363,6 +423,16 @@ class PipelineConfig:
                 else None
             ),
             text_model_api_key=args.text_model_api_key,
+            remote_text_model_base_url=args.remote_text_model_base_url,
+            remote_text_model_base_urls=tuple(
+                args.remote_text_model_base_urls or ()
+            ),
+            remote_text_model_base_urls_file=(
+                str(Path(args.remote_text_model_base_urls_file).resolve())
+                if args.remote_text_model_base_urls_file
+                else None
+            ),
+            remote_text_model_api_key=args.remote_text_model_api_key,
             image_model_base_url=args.image_model_base_url,
             image_model_base_urls=tuple(args.image_model_base_urls or ()),
             image_model_base_urls_file=(
@@ -371,8 +441,20 @@ class PipelineConfig:
                 else None
             ),
             image_model_api_key=args.image_model_api_key,
+            remote_image_model_base_url=args.remote_image_model_base_url,
+            remote_image_model_base_urls=tuple(
+                args.remote_image_model_base_urls or ()
+            ),
+            remote_image_model_base_urls_file=(
+                str(Path(args.remote_image_model_base_urls_file).resolve())
+                if args.remote_image_model_base_urls_file
+                else None
+            ),
+            remote_image_model_api_key=args.remote_image_model_api_key,
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
+            remote_text_model_workers=args.remote_text_model_workers,
+            remote_image_model_workers=args.remote_image_model_workers,
             remote_layout_control_url=(
                 str(args.remote_layout_control_url).rstrip("/")
                 if args.remote_layout_control_url
@@ -481,6 +563,55 @@ class PipelineConfig:
             model_timeout_seconds=args.model_timeout_seconds,
             model_max_retries=args.model_max_retries,
             model_retry_sleep_seconds=args.model_retry_sleep_seconds,
+            model_cache_database_path=(
+                Path(args.model_cache_database_path).resolve()
+                if args.model_cache_database_path
+                else None
+            ),
+            unrecoverable_replacement_rounds=(
+                args.unrecoverable_replacement_rounds
+            ),
+            unrecoverable_drop_probability=(
+                args.unrecoverable_drop_probability
+            ),
+            auto_check_secondary_openai=args.auto_check_secondary_openai,
+            auto_check_api_config_file=args.auto_check_api_config_file,
+            auto_check_openai_env_file=args.auto_check_openai_env_file,
+            auto_check_openai_model=args.auto_check_openai_model,
+            auto_check_openai_base_url=args.auto_check_openai_base_url,
+            auto_check_openai_api_key_env=args.auto_check_openai_api_key_env,
+            auto_check_openai_reasoning_effort=(
+                args.auto_check_openai_reasoning_effort
+            ),
+            auto_check_openai_verbosity=args.auto_check_openai_verbosity,
+            auto_check_openai_max_output_tokens=(
+                args.auto_check_openai_max_output_tokens
+            ),
+            auto_check_terra_model=args.auto_check_terra_model,
+            auto_check_terra_reasoning_effort=(
+                args.auto_check_terra_reasoning_effort
+            ),
+            auto_check_terra_max_output_tokens=(
+                args.auto_check_terra_max_output_tokens
+            ),
+            auto_check_openai_max_inflight=(
+                args.auto_check_openai_max_inflight
+            ),
+            auto_check_openai_image_detail=(
+                args.auto_check_openai_image_detail
+            ),
+            auto_check_openai_image_max_pixels=(
+                args.auto_check_openai_image_max_pixels
+            ),
+            auto_check_openai_timeout_seconds=(
+                args.auto_check_openai_timeout_seconds
+            ),
+            auto_check_openai_requests_per_minute=(
+                args.auto_check_openai_requests_per_minute
+            ),
+            auto_check_openai_tokens_per_minute=(
+                args.auto_check_openai_tokens_per_minute
+            ),
             model_text_done_marker=(
                 Path(args.model_text_done_marker).resolve()
                 if args.model_text_done_marker
@@ -509,9 +640,266 @@ class PipelineResult:
     output_manifest: Path | None = None
 
 
+@dataclass(frozen=True)
+class ActiveRecoverySelection:
+    """Durable active WDC slot assignment for one recovery round."""
+
+    round_index: int
+    path: Path
+    manifest_path: Path
+    records: int
+
+
+@dataclass(frozen=True)
+class SamplingExpansionState:
+    """Durable per-table evidence caps for progressive sampling."""
+
+    round_index: int
+    path: Path | None
+    limits: dict[str, int]
+
+
+def _model_jobs_path(config: PipelineConfig) -> Path:
+    configured = config.model_cache_database_path
+    if configured is not None:
+        return Path(configured).resolve()
+    return config.cache_dir / "model_cache" / "jobs.sqlite3"
+
+
+def _promote_legacy_model_cache(
+    config: PipelineConfig,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> Path:
+    """Copy the old work-local SQLite cache before staged archival can move it."""
+    target = _model_jobs_path(config)
+    if config.model_cache_database_path is not None or target.is_file():
+        return target
+    legacy = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    if not legacy.is_file():
+        return target
+    if pre_write_guard is not None:
+        pre_write_guard(target, legacy.stat().st_size)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.parent / (
+        f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    source = sqlite3.connect(
+        legacy.resolve().as_uri() + "?mode=ro",
+        uri=True,
+    )
+    destination = sqlite3.connect(temporary)
+    try:
+        source.backup(destination)
+        destination.commit()
+    except BaseException:
+        destination.close()
+        source.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    destination.close()
+    source.close()
+    if target.exists():
+        temporary.unlink(missing_ok=True)
+    else:
+        temporary.replace(target)
+    return target
+
+
+def _recovery_root(config: PipelineConfig) -> Path:
+    return config.work_dir / "recovery_replacement"
+
+
+def _sampling_expansion_root(config: PipelineConfig) -> Path:
+    return config.work_dir / "sampling_expansion"
+
+
+def _sampling_expansion_policy_identity(config: PipelineConfig) -> str:
+    # The schedule is deliberately excluded so a later invocation can append
+    # a larger cap without invalidating already completed expansion rounds.
+    return stable_hash(
+        "wdc200k-progressive-sampling-policy-v1",
+        config.sampled_entities_per_table,
+        config.entity_sampling_seed,
+        length=40,
+    )
+
+
+def _load_sampling_expansion_state(
+    config: PipelineConfig,
+) -> SamplingExpansionState:
+    pointer_path = _sampling_expansion_root(config) / "current.json"
+    if not pointer_path.is_file():
+        return SamplingExpansionState(0, None, {})
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(pointer, dict)
+        or pointer.get("schema_version")
+        != "wdc200k-sampling-expansion-pointer-v1"
+        or pointer.get("policy_identity")
+        != _sampling_expansion_policy_identity(config)
+    ):
+        raise ValueError("sampling expansion pointer identity mismatch")
+    round_index = int(pointer.get("round_index", -1))
+    if round_index <= 0:
+        raise ValueError("sampling expansion round must be positive")
+    state_path = Path(str(pointer.get("state_path") or "")).resolve()
+    root = _sampling_expansion_root(config).resolve()
+    if not state_path.is_relative_to(root) or not state_path.is_file():
+        raise ValueError("sampling expansion state is outside the work root")
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != "wdc200k-sampling-expansion-state-v1"
+        or payload.get("complete") is not True
+        or payload.get("policy_identity")
+        != _sampling_expansion_policy_identity(config)
+        or int(payload.get("round_index", -1)) != round_index
+        or not isinstance(payload.get("limits"), dict)
+    ):
+        raise ValueError("sampling expansion state is invalid")
+    limits = {
+        str(table_id): int(limit)
+        for table_id, limit in payload["limits"].items()
+    }
+    if any(
+        limit < config.sampled_entities_per_table
+        for limit in limits.values()
+    ):
+        raise ValueError("sampling expansion limit is below initial cap")
+    return SamplingExpansionState(round_index, state_path, limits)
+
+
+def _write_sampling_expansion_state(
+    config: PipelineConfig,
+    *,
+    previous: SamplingExpansionState,
+    limits: Mapping[str, int],
+    expanded_table_ids: Sequence[str],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> SamplingExpansionState:
+    round_index = previous.round_index + 1
+    root = _sampling_expansion_root(config)
+    state_path = root / f"round-{round_index:05d}.json"
+    normalized = {
+        str(table_id): int(limit)
+        for table_id, limit in sorted(limits.items())
+    }
+    payload = {
+        "schema_version": "wdc200k-sampling-expansion-state-v1",
+        "policy_identity": _sampling_expansion_policy_identity(config),
+        "round_index": round_index,
+        "previous_state_path": (
+            None if previous.path is None else str(previous.path.resolve())
+        ),
+        "expanded_source_table_ids": sorted(
+            str(table_id) for table_id in expanded_table_ids
+        ),
+        "limits": normalized,
+        "complete": True,
+    }
+    if state_path.is_file():
+        if json.loads(state_path.read_text(encoding="utf-8")) != payload:
+            raise ValueError("conflicting persisted sampling expansion round")
+    else:
+        _atomic_json(
+            state_path,
+            payload,
+            pre_write_guard=pre_write_guard,
+        )
+    _atomic_json(
+        root / "current.json",
+        {
+            "schema_version": "wdc200k-sampling-expansion-pointer-v1",
+            "policy_identity": _sampling_expansion_policy_identity(config),
+            "round_index": round_index,
+            "state_path": str(state_path.resolve()),
+        },
+        pre_write_guard=pre_write_guard,
+    )
+    return SamplingExpansionState(round_index, state_path, normalized)
+
+
+def _recovery_policy_identity(config: PipelineConfig) -> str:
+    # The maximum number of rounds is deliberately excluded so a later run
+    # can request more passes without invalidating already evaluated rounds.
+    return stable_hash(
+        "wdc200k-recovery-replacement-policy-v1",
+        config.max_source_tables,
+        config.selection_seed,
+        config.unrecoverable_drop_probability,
+        length=40,
+    )
+
+
+def _completed_shard_from_json(value: dict[str, Any]) -> CompletedShard:
+    return CompletedShard(
+        path=str(value["path"]),
+        records=int(value["records"]),
+        bytes=int(value["bytes"]),
+        sha256=str(value["sha256"]),
+    )
+
+
+def _load_active_recovery_selection(
+    config: PipelineConfig,
+) -> ActiveRecoverySelection | None:
+    pointer_path = _recovery_root(config) / "current.json"
+    if not pointer_path.is_file():
+        return None
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(pointer, dict)
+        or pointer.get("schema_version")
+        != "wdc200k-recovery-selection-pointer-v1"
+        or pointer.get("policy_identity")
+        != _recovery_policy_identity(config)
+    ):
+        raise ValueError("recovery replacement pointer identity mismatch")
+    round_index = int(pointer["round_index"])
+    if round_index <= 0:
+        raise ValueError("active recovery round must be positive")
+    if round_index > config.unrecoverable_replacement_rounds:
+        raise ValueError(
+            "persisted recovery round exceeds configured replacement rounds"
+        )
+    manifest_path = Path(str(pointer["manifest_path"])).resolve()
+    expected_root = _recovery_root(config).resolve()
+    if not manifest_path.is_relative_to(expected_root):
+        raise ValueError("active recovery manifest is outside the work root")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    completed = manifest.get("completed_shards") or []
+    if (
+        manifest.get("stage") != "wdc200k_selection"
+        or manifest.get("schema_version")
+        != "wdc200k-recovery-selection-v1"
+        or manifest.get("complete") is not True
+        or manifest.get("policy_identity")
+        != _recovery_policy_identity(config)
+        or int(manifest.get("round_index", -1)) != round_index
+        or not isinstance(completed, list)
+        or len(completed) != 1
+    ):
+        raise ValueError("active recovery selection manifest is invalid")
+    shard = _completed_shard_from_json(completed[0])
+    if (
+        shard.records != config.max_source_tables
+        or not validate_completed_shard(shard, manifest_path.parent)
+    ):
+        raise ValueError("active recovery selection shard is invalid")
+    return ActiveRecoverySelection(
+        round_index=round_index,
+        path=manifest_path.parent / shard.path,
+        manifest_path=manifest_path,
+        records=shard.records,
+    )
+
+
 @dataclass
 class _ProgressState:
     stage: str = "preflight"
+    detail: str = "initializing"
     completed_shards: int = 0
     total_shards: int = 0
     counters: dict[str, int] = field(default_factory=dict)
@@ -1099,6 +1487,7 @@ class ProgressReporter:
         self,
         *,
         stage: str | None = None,
+        detail: str | None = None,
         completed_shards: int | None = None,
         total_shards: int | None = None,
         counters: dict[str, int] | None = None,
@@ -1113,6 +1502,7 @@ class ProgressReporter:
                     self._close_model_bars()
                 self._complete_unit_stage_locked()
                 self._state.stage = stage
+                self._state.detail = ""
                 self._state.stage_started_at = time.time()
                 self._rolling_samples.clear()
                 self._state.completed_units = 0
@@ -1122,6 +1512,8 @@ class ProgressReporter:
                     self._model_progress.clear()
                     self._model_samples.clear()
                 self._force_console = True
+            if detail is not None:
+                self._state.detail = str(detail)
             if completed_shards is not None:
                 self._state.completed_shards = completed_shards
             if total_shards is not None:
@@ -1544,6 +1936,7 @@ class ProgressReporter:
                     )
             return {
                 "stage": self._state.stage,
+                "detail": self._state.detail,
                 "completed_shards": complete,
                 "total_shards": total,
                 "completed_units": self._state.completed_units,
@@ -1695,8 +2088,9 @@ class ProgressReporter:
         eta = self._format_console_eta(snapshot["eta_seconds"])
         return (
             f"[wdc200k] stage={snapshot['stage']} "
-            f"shards={snapshot['completed_shards']}/"
+            f"progress={snapshot['completed_shards']}/"
             f"{snapshot['total_shards']} "
+            f"detail={snapshot['detail'] or '-'} "
             f"units={snapshot['completed_units']}/"
             f"{snapshot['total_units']} ETA={eta} "
             f"work={snapshot['disk']['work_bytes']} "
@@ -1770,11 +2164,28 @@ class ProgressReporter:
                 int(snapshot["total_units"]),
                 unit,
             )
+        stage = str(snapshot["stage"])
+        detail = str(snapshot.get("detail") or "")
+        unit = {
+            "structural": "table",
+            "sampling": "shard",
+            "asset_planning": "record",
+            "selection": "step",
+            "materialize": "step",
+        }.get(stage, "step")
+        progress_key = unit
+        if stage == "selection" and detail:
+            progress_key = detail
+            unit = (
+                "archive"
+                if detail == "scan statistics archives"
+                else "record"
+            )
         return (
-            (str(snapshot["stage"]), "shards"),
+            (stage, progress_key),
             int(snapshot["completed_shards"]),
             int(snapshot["total_shards"]),
-            "shard",
+            unit,
         )
 
     def _refresh_stage_bar(self, snapshot: dict[str, Any]) -> None:
@@ -1801,6 +2212,9 @@ class ProgressReporter:
         self._stage_bar.total = total
         if completed > self._stage_bar.n:
             self._stage_bar.update(completed - self._stage_bar.n)
+        detail = str(snapshot.get("detail") or "")
+        if detail:
+            self._stage_bar.set_postfix_str(detail, refresh=False)
         self._stage_bar.refresh()
 
     def _close_stage_bar(self) -> None:
@@ -1963,12 +2377,19 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
     "selection": (
         "max_source_tables",
         "selection_seed",
+        "top100_policy",
+        "top100_per_class",
+        "include_rest",
+        "min_candidate_rows",
+        "min_candidate_columns",
         "minimum3_fraction",
         "class_max_tables",
     ),
     "structural": ("selection_shard_tables",),
     "sampling": (
         "sampled_entities_per_table",
+        "sampled_entity_expansion_schedule",
+        "sampling_expansion_round_index",
         "entity_sampling_seed",
         "global_entity_budget",
         "query_rows_per_table",
@@ -2026,6 +2447,9 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "explicit_join_fallback_mode",
         "explicit_join_fallback_ratio",
         "records_per_shard",
+        "unrecoverable_replacement_rounds",
+        "unrecoverable_drop_probability",
+        "recovery_replacement_round_index",
     ),
 }
 
@@ -2770,6 +3194,18 @@ def _preflight(
     archives = _statistics_archives(config.input_dir)
     if config.max_source_tables <= 0:
         raise ValueError("max_source_tables must be positive")
+    SelectionPolicy(
+        target_tables=config.max_source_tables,
+        seed=config.selection_seed,
+        top100_policy=config.top100_policy,
+        top100_per_class=config.top100_per_class,
+        include_rest=config.include_rest,
+        min_candidate_rows=config.min_candidate_rows,
+        min_candidate_columns=config.min_candidate_columns,
+        minimum3_fraction=config.minimum3_fraction,
+        rest_base_per_class=0,
+        class_cap=config.class_max_tables,
+    )
     if config.web_max_retries != 0:
         raise ValueError("web_max_retries must be zero")
     if config.web_max_response_seconds <= 0:
@@ -2800,6 +3236,17 @@ def _preflight(
         min_rows_per_output_table=config.min_rows_per_output_table,
         global_entity_budget=config.global_entity_budget,
     )
+    schedule = config.sampled_entity_expansion_schedule
+    if tuple(sorted(set(schedule))) != schedule:
+        raise ValueError(
+            "sampled entity expansion schedule must be strictly increasing"
+        )
+    if any(limit <= config.sampled_entities_per_table for limit in schedule):
+        raise ValueError(
+            "sampled entity expansion caps must exceed the initial cap"
+        )
+    if config.sampling_expansion_round_index < 0:
+        raise ValueError("sampling expansion round index must be non-negative")
     marker_values = (
         config.model_start_marker,
         config.model_ready_marker,
@@ -2969,9 +3416,7 @@ def _fast_model_resume_candidate(config: PipelineConfig) -> bool:
             / "adapted_model_tasks"
             / "model-task-adapter-manifest.json"
         ).is_file()
-        and (
-            config.work_dir / "model_outputs" / "jobs.sqlite3"
-        ).is_file()
+        and _model_jobs_path(config).is_file()
     )
 
 
@@ -3171,7 +3616,7 @@ def _run_fast_model_resume(
         if extractor is None:
             extractor = join_builder.LocalAttributeExtractor(args)
         store = SqliteJobStore(
-            config.work_dir / "model_outputs" / "jobs.sqlite3",
+            _model_jobs_path(config),
             pre_write_guard=disk_guard,
         )
         with _remote_layout_control(
@@ -3209,7 +3654,7 @@ def _run_fast_model_resume(
             )
     finally:
         reporter.close()
-    return run_pipeline(
+    return _run_pipeline_once(
         config,
         page_transport=page_transport,
         image_transport=image_transport,
@@ -3224,16 +3669,21 @@ def _run_fast_materialization_resume(
     archives: tuple[Path, ...],
     inputs: MaterializationInputs,
     args: argparse.Namespace,
+    extractor: Any | None = None,
 ) -> PipelineResult:
     """Resume Task 7 directly from a verified materialization certificate."""
     disk_guard = DiskGuard(config.min_free_disk_bytes)
     reporter = ProgressReporter(config, pre_write_guard=disk_guard)
     reporter.start()
     try:
+        table_total = config.max_source_tables
+        finalize_steps = 15
+        total_work = table_total * 2 + finalize_steps
         reporter.update(
             stage="materialize",
+            detail="resume materialization",
             completed_shards=0,
-            total_shards=1,
+            total_shards=total_work,
         )
 
         def report_validation(event: dict[str, Any]) -> None:
@@ -3254,13 +3704,56 @@ def _run_fast_materialization_resume(
                 )
             reporter.update(counters=counters)
 
+        def report_materialization(event: dict[str, Any]) -> None:
+            phase = str(event.get("phase") or "materialize")
+            completed = int(event.get("completed", 0))
+            if phase == "query_auto_check":
+                overall = completed
+                detail = "auto-check selected query evidence"
+            elif phase == "materialize_tables":
+                overall = table_total + completed
+                detail = "materialize source tables"
+            elif phase == "balance_explicit_joins":
+                overall = table_total * 2
+                detail = "balance explicit joins"
+            elif phase == "publish_artifacts":
+                overall = table_total * 2 + completed
+                detail = "publish dataset artifacts"
+            else:
+                overall = 0
+                detail = phase.replace("_", " ")
+            reporter.update(
+                detail=detail,
+                completed_shards=overall,
+                total_shards=total_work,
+                counters={
+                    "materialization_phase_completed": completed,
+                    "materialization_phase_total": int(
+                        event.get("total", 0)
+                    ),
+                    **{
+                        f"materialization_{key}": int(event[key])
+                        for key in (
+                            "plans",
+                            "cached_checks",
+                            "migrated_legacy_checks",
+                        )
+                        if event.get(key) is not None
+                    },
+                },
+            )
+
+        if extractor is None:
+            extractor = join_builder.LocalAttributeExtractor(args)
         result = materialize_dataset(
             inputs,
             output_root=config.output_dir,
             args=args,
+            extractor=extractor,
             records_per_shard=config.records_per_shard,
             pre_write_guard=disk_guard,
             validation_progress_callback=report_validation,
+            progress_callback=report_materialization,
         )
         counters = {
             str(key): int(value)
@@ -3276,8 +3769,8 @@ def _run_fast_materialization_resume(
             pre_write_guard=disk_guard,
         )
         reporter.update(
-            completed_shards=1,
-            total_shards=1,
+            completed_shards=total_work,
+            total_shards=total_work,
             counters=counters,
         )
         _refresh_known_disk(reporter, config, output=True)
@@ -3361,6 +3854,10 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         str(config.text_model_workers),
         "--image_model_workers",
         str(config.image_model_workers),
+        "--remote_text_model_workers",
+        str(config.remote_text_model_workers),
+        "--remote_image_model_workers",
+        str(config.remote_image_model_workers),
         "--model_timeout_seconds",
         str(config.model_timeout_seconds),
         "--model_max_retries",
@@ -3374,6 +3871,10 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         "--min_free_disk_bytes",
         str(config.min_free_disk_bytes),
     ]
+    if config.model_endpoint_config:
+        argv.extend(
+            ["--model_endpoint_config", config.model_endpoint_config]
+        )
     if config.text_model_base_urls:
         argv.extend(["--text_model_base_urls", *config.text_model_base_urls])
     if config.text_model_base_urls_file:
@@ -3382,6 +3883,28 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         )
     if config.text_model_api_key:
         argv.extend(["--text_model_api_key", config.text_model_api_key])
+    if config.remote_text_model_base_url:
+        argv.extend(
+            ["--remote_text_model_base_url", config.remote_text_model_base_url]
+        )
+    if config.remote_text_model_base_urls:
+        argv.extend(
+            [
+                "--remote_text_model_base_urls",
+                *config.remote_text_model_base_urls,
+            ]
+        )
+    if config.remote_text_model_base_urls_file:
+        argv.extend(
+            [
+                "--remote_text_model_base_urls_file",
+                config.remote_text_model_base_urls_file,
+            ]
+        )
+    if config.remote_text_model_api_key:
+        argv.extend(
+            ["--remote_text_model_api_key", config.remote_text_model_api_key]
+        )
     if config.image_model_base_urls:
         argv.extend(["--image_model_base_urls", *config.image_model_base_urls])
     if config.image_model_base_urls_file:
@@ -3390,6 +3913,34 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         )
     if config.image_model_api_key:
         argv.extend(["--image_model_api_key", config.image_model_api_key])
+    if config.remote_image_model_base_url:
+        argv.extend(
+            [
+                "--remote_image_model_base_url",
+                config.remote_image_model_base_url,
+            ]
+        )
+    if config.remote_image_model_base_urls:
+        argv.extend(
+            [
+                "--remote_image_model_base_urls",
+                *config.remote_image_model_base_urls,
+            ]
+        )
+    if config.remote_image_model_base_urls_file:
+        argv.extend(
+            [
+                "--remote_image_model_base_urls_file",
+                config.remote_image_model_base_urls_file,
+            ]
+        )
+    if config.remote_image_model_api_key:
+        argv.extend(
+            [
+                "--remote_image_model_api_key",
+                config.remote_image_model_api_key,
+            ]
+        )
     args = legacy_wdc_builder.parse_args(argv)
     args.max_rows_per_source_table = None
     args.model_endpoint_ready_timeout_seconds = (
@@ -3398,6 +3949,53 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
     args.materialization_workers = config.materialization_workers
     args.materialization_validation_workers = (
         config.materialization_validation_workers
+    )
+    args.auto_check_secondary_openai = config.auto_check_secondary_openai
+    args.auto_check_api_config_file = config.auto_check_api_config_file
+    args.auto_check_openai_env_file = config.auto_check_openai_env_file
+    args.auto_check_openai_model = config.auto_check_openai_model
+    args.auto_check_openai_base_url = config.auto_check_openai_base_url
+    args.auto_check_openai_api_key_env = config.auto_check_openai_api_key_env
+    args.auto_check_openai_reasoning_effort = (
+        config.auto_check_openai_reasoning_effort
+    )
+    args.auto_check_openai_verbosity = config.auto_check_openai_verbosity
+    args.auto_check_openai_max_output_tokens = (
+        config.auto_check_openai_max_output_tokens
+    )
+    args.auto_check_terra_model = config.auto_check_terra_model
+    args.auto_check_terra_reasoning_effort = (
+        config.auto_check_terra_reasoning_effort
+    )
+    args.auto_check_terra_max_output_tokens = (
+        config.auto_check_terra_max_output_tokens
+    )
+    args.auto_check_openai_max_inflight = (
+        config.auto_check_openai_max_inflight
+    )
+    args.auto_check_openai_image_detail = (
+        config.auto_check_openai_image_detail
+    )
+    args.auto_check_openai_image_max_pixels = (
+        config.auto_check_openai_image_max_pixels
+    )
+    args.auto_check_openai_timeout_seconds = (
+        config.auto_check_openai_timeout_seconds
+    )
+    args.auto_check_openai_requests_per_minute = (
+        config.auto_check_openai_requests_per_minute
+    )
+    args.auto_check_openai_tokens_per_minute = (
+        config.auto_check_openai_tokens_per_minute
+    )
+    args.unrecoverable_replacement_rounds = (
+        config.unrecoverable_replacement_rounds
+    )
+    args.unrecoverable_drop_probability = (
+        config.unrecoverable_drop_probability
+    )
+    args.recovery_replacement_round_index = (
+        config.recovery_replacement_round_index
     )
     args.model_routing_manifest = (
         str(config.remote_layout_routing_manifest)
@@ -3788,18 +4386,52 @@ def _run_selection_and_structural(
     policy = SelectionPolicy(
         target_tables=config.max_source_tables,
         seed=config.selection_seed,
+        top100_policy=config.top100_policy,
+        top100_per_class=config.top100_per_class,
+        include_rest=config.include_rest,
+        min_candidate_rows=config.min_candidate_rows,
+        min_candidate_columns=config.min_candidate_columns,
         minimum3_fraction=config.minimum3_fraction,
+        rest_base_per_class=0,
         class_cap=config.class_max_tables,
     )
-    reporter.update(stage="selection")
+    reporter.update(
+        stage="selection",
+        detail="scan statistics archives",
+        completed_shards=0,
+        total_shards=0,
+    )
+
+    def report_selection(event: dict[str, object]) -> None:
+        phase = str(event.get("phase") or "selection")
+        counters: dict[str, int] = {}
+        if event.get("candidates") is not None:
+            counters["selection_candidates_scanned"] = int(
+                event["candidates"]
+            )
+        reporter.update(
+            detail=phase.replace("_", " "),
+            completed_shards=int(event["completed"]),
+            total_shards=int(event["total"]),
+            counters=counters,
+        )
+
     selected_count, reserve_count = run_selection(
         config.input_dir,
         config.work_dir,
         policy,
         pre_write_guard=pre_write_guard,
+        progress_callback=report_selection,
     )
     selection_dir = config.work_dir / "selection"
     selection_manifest = selection_dir / "manifest.json"
+    active_selection = _load_active_recovery_selection(config)
+    selection_manifests = [selection_manifest]
+    selected_path = selection_dir / "selected_tables.jsonl"
+    if active_selection is not None:
+        selected_path = active_selection.path
+        selected_count = active_selection.records
+        selection_manifests.append(active_selection.manifest_path)
     selection_counters = {
         "selected_tables": selected_count,
         "reserve_tables": reserve_count,
@@ -3807,7 +4439,7 @@ def _run_selection_and_structural(
     _write_stage_registry(
         config,
         "selection",
-        producer_manifests=(selection_manifest,),
+        producer_manifests=selection_manifests,
         counters=selection_counters,
         upstream_identity=input_identity,
         pre_write_guard=pre_write_guard,
@@ -3835,13 +4467,21 @@ def _run_selection_and_structural(
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             completed = payload.get("completed_shards") or []
 
-            def artifact(prefix: str) -> Path:
-                item = next(
+            def artifact_record(prefix: str) -> dict[str, Any]:
+                return next(
                     raw
                     for raw in completed
                     if str(raw["path"]).startswith(prefix)
                 )
-                return structural_root / str(item["path"])
+
+            def artifact(prefix: str) -> Path:
+                return structural_root / str(artifact_record(prefix)["path"])
+
+            source_record = artifact_record("source_tables/")
+            if (structural_root / str(source_record["path"])).resolve() != (
+                source_path.resolve()
+            ):
+                raise ValueError("compact source shard path mismatch")
 
             reconstructed.append(
                 StructuralExpansionResult(
@@ -3852,7 +4492,7 @@ def _run_selection_and_structural(
                     structural_failures=artifact("structural_failures/"),
                     validated_selection=artifact("selection/validated-"),
                     manifest=manifest_path,
-                    tables=sum(1 for _record in _iter_jsonl(source_path)),
+                    tables=int(source_record["records"]),
                     entities_count=0,
                     page_references=0,
                     direct_image_references=0,
@@ -3875,7 +4515,6 @@ def _run_selection_and_structural(
         counters = dict(_load_stage_registry(structural_registry).counters)
         return tuple(reconstructed), finalized, counters
 
-    selected_path = selection_dir / "selected_tables.jsonl"
     reserve_path = selection_dir / "reserve_tables.jsonl"
     reserve_database = selection_dir / "reserve.sqlite3"
     if pre_write_guard is not None:
@@ -3895,13 +4534,11 @@ def _run_selection_and_structural(
             pre_write_guard=pre_write_guard,
         )
     )
-    total_shards = (
-        selected_count + config.selection_shard_tables - 1
-    ) // config.selection_shard_tables
     reporter.update(
         stage="structural",
+        detail="expand source tables",
         completed_shards=0,
-        total_shards=total_shards,
+        total_shards=selected_count,
     )
     structural_root = config.work_dir / "structural"
     results = []
@@ -3910,6 +4547,33 @@ def _run_selection_and_structural(
     for index, records in enumerate(
         _selection_chunks(selected_path, config.selection_shard_tables)
     ):
+        shard_baseline_tables = validated_tables
+
+        def report_structural(event: dict[str, Any]) -> None:
+            phase = str(event.get("phase") or "expand_table")
+            relative_path = str(
+                event.get("replacement_path")
+                or event.get("relative_path")
+                or ""
+            )
+            detail = phase.replace("_", " ")
+            if relative_path:
+                detail = f"{detail}: {Path(relative_path).name}"
+            local_tables = int(event.get("completed", 0))
+            reporter.update(
+                detail=detail,
+                completed_shards=shard_baseline_tables + local_tables,
+                total_shards=selected_count,
+                counters={
+                    "structural_tables_completed_live": (
+                        shard_baseline_tables + local_tables
+                    ),
+                    "entities_live": (
+                        emitted_entities + int(event.get("entities", 0))
+                    ),
+                },
+            )
+
         result = expand_selected_shard(
             records,
             output_root=structural_root,
@@ -3919,12 +4583,15 @@ def _run_selection_and_structural(
             min_rows=1,
             min_cols=1,
             pre_write_guard=pre_write_guard,
+            progress_callback=report_structural,
         )
         results.append(result)
         validated_tables += result.tables
         emitted_entities += result.entities_count
         reporter.update(
-            completed_shards=index + 1,
+            detail="structural shard complete",
+            completed_shards=validated_tables,
+            total_shards=selected_count,
             counters={
                 "validated_tables": validated_tables,
                 "entities": emitted_entities,
@@ -3957,7 +4624,9 @@ def _run_selection_and_structural(
         pre_write_guard=pre_write_guard,
     )
     reporter.update(
-        completed_shards=total_shards,
+        detail="structural expansion complete",
+        completed_shards=selected_count,
+        total_shards=selected_count,
         counters=counters,
         known_work_bytes=counters["structural_output_bytes"],
     )
@@ -4086,7 +4755,28 @@ def _run_sampling(
     *,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> SamplingResult:
-    reporter.update(stage="sampling", completed_shards=0, total_shards=1)
+    total_shards = len(structural)
+    reporter.update(
+        stage="sampling",
+        detail="sample structural shards",
+        completed_shards=0,
+        total_shards=total_shards,
+    )
+    expansion = _load_sampling_expansion_state(config)
+    if expansion.round_index != config.sampling_expansion_round_index:
+        raise ValueError("sampling expansion/config round mismatch")
+
+    def report_sampling(event: dict[str, Any]) -> None:
+        reporter.update(
+            detail="sample structural shards",
+            completed_shards=int(event["completed"]),
+            total_shards=int(event["total"]),
+            counters={
+                "sampling_shards_completed": int(event["completed"]),
+                "sampling_shards_total": int(event["total"]),
+            },
+        )
+
     result = sample_structural_artifacts(
         structural_output_root=config.work_dir / "structural",
         structural_manifests=tuple(item.manifest for item in structural),
@@ -4101,6 +4791,8 @@ def _run_sampling(
             min_rows_per_output_table=config.min_rows_per_output_table,
             global_entity_budget=config.global_entity_budget,
         ),
+        per_table_entity_limits=expansion.limits,
+        progress_callback=report_sampling,
         pre_write_guard=pre_write_guard,
     )
     counters = {
@@ -4109,6 +4801,8 @@ def _run_sampling(
         "sampled_entities": result.sampled_entities,
         "sampled_page_references": result.sampled_page_refs,
         "sampled_direct_image_references": result.sampled_direct_image_refs,
+        "progressively_expanded_tables": len(expansion.limits),
+        "sampling_expansion_round": expansion.round_index,
         **{
             f"sampled_{stratum}_entities": count
             for stratum, count in result.strata.items()
@@ -4122,7 +4816,12 @@ def _run_sampling(
         upstream_identity=_registry_identity(config, "structural"),
         pre_write_guard=pre_write_guard,
     )
-    reporter.update(completed_shards=1, total_shards=1, counters=counters)
+    reporter.update(
+        detail="sampling complete",
+        completed_shards=total_shards,
+        total_shards=total_shards,
+        counters=counters,
+    )
     return result
 
 
@@ -4212,7 +4911,12 @@ def _run_pages(
     }
     network_manifest = _publish_network_manifest(
         root / "network",
-        iter_page_outcomes(result.outcomes_path, result.policy_fingerprint),
+        iter_page_outcomes(
+            result.outcomes_path,
+            result.policy_fingerprint,
+            job_store_path=result.job_store_path,
+            job_kind=result.job_kind,
+        ),
         policy_fingerprint=result.policy_fingerprint,
         unique=result.unique,
         success=result.success,
@@ -4262,8 +4966,14 @@ def _run_asset_planning(
     *,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[AssetPlanShards, str]:
+    page_work = sampling.sampled_page_refs
+    entity_work = sampling.sampled_entities
+    total_work = page_work + entity_work
     reporter.update(
-        stage="asset_planning", completed_shards=0, total_shards=1
+        stage="asset_planning",
+        detail="index page fanout",
+        completed_shards=0,
+        total_shards=total_work,
     )
     structural_identity = _sha256_path(sampling.manifest_path)
     planning_input = asset_planning_input_fingerprint(
@@ -4275,12 +4985,32 @@ def _run_asset_planning(
     )
     if pre_write_guard is not None:
         pre_write_guard(entity_page_join, 0)
+    page_fanout = iter_page_fanout(
+        page_result.outcomes_path,
+        page_result.policy_fingerprint,
+        job_store_path=page_result.job_store_path,
+    )
+
+    def tracked_page_fanout() -> Iterator[dict[str, Any]]:
+        completed = 0
+        for record in page_fanout:
+            yield record
+            completed += 1
+            if completed % 1_000 == 0:
+                reporter.update(
+                    detail="index page fanout",
+                    completed_shards=completed,
+                    counters={"asset_page_refs_indexed": completed},
+                )
+        reporter.update(
+            detail="index page fanout",
+            completed_shards=completed,
+            counters={"asset_page_refs_indexed": completed},
+        )
+
     entity_pages = iter_entity_page_join(
         sampling.artifact_paths["sampled_entities"],
-        iter_page_fanout(
-            page_result.outcomes_path,
-            page_result.policy_fingerprint,
-        ),
+        tracked_page_fanout(),
         join_path=entity_page_join,
         pre_write_guard=pre_write_guard,
     )
@@ -4288,12 +5018,27 @@ def _run_asset_planning(
         attempts_per_entity=config.max_image_attempts_per_entity,
         retained_per_entity=config.max_images_per_entity,
     )
+
+    def report_asset_planning(event: dict[str, Any]) -> None:
+        completed_entities = int(event["completed"])
+        reporter.update(
+            detail="plan entity assets",
+            completed_shards=page_work + completed_entities,
+            total_shards=total_work,
+            counters={
+                "asset_entities_planned_live": completed_entities,
+                "asset_entities_total": entity_work,
+            },
+        )
+
     planned = persist_entity_asset_plans(
         entity_pages,
         output_root=config.work_dir / "asset_planning",
         input_fingerprint=planning_input,
         budget=budget,
         records_per_shard=config.records_per_shard,
+        total_entities=entity_work,
+        progress_callback=report_asset_planning,
         pre_write_guard=pre_write_guard,
     )
     validate_asset_plan_shards(
@@ -4313,8 +5058,9 @@ def _run_asset_planning(
         pre_write_guard=pre_write_guard,
     )
     reporter.update(
-        completed_shards=1,
-        total_shards=1,
+        detail="asset planning complete",
+        completed_shards=total_work,
+        total_shards=total_work,
         counters=counters,
     )
     return planned, planning_input
@@ -4438,6 +5184,8 @@ def _run_images(
         iter_image_outcomes(
             image_result.outcomes_path,
             image_result.policy_fingerprint,
+            job_store_path=image_result.job_store_path,
+            job_kind=image_result.job_kind,
         ),
         policy_fingerprint=image_result.policy_fingerprint,
         unique=image_result.unique,
@@ -4517,7 +5265,7 @@ def _run_models(
         sampling_manifest=sampling.manifest_path,
     )
     reporter.update(completed_shards=1, total_shards=2)
-    model_jobs_path = config.work_dir / "model_outputs" / "jobs.sqlite3"
+    model_jobs_path = _model_jobs_path(config)
     if pre_write_guard is not None:
         pre_write_guard(model_jobs_path, 0)
     store = SqliteJobStore(
@@ -4594,6 +5342,17 @@ def _run_models(
         "model_success": result.success,
         "model_terminal": result.terminal,
     }
+    auto_check = join_builder.summarize_model_auto_check_records(
+        result.extraction_paths
+    )
+    counters.update(
+        {
+            "model_auto_check_reviewed": int(auto_check["reviewed"]),
+            "model_auto_check_supported": int(auto_check["supported"]),
+            "model_auto_check_filtered": int(auto_check["filtered"]),
+            "model_auto_check_errors": int(auto_check["errors"]),
+        }
+    )
     _write_stage_registry(
         config,
         "models",
@@ -4627,10 +5386,19 @@ def _run_materialize(
     model_result: ModelStageResult,
     authority: ModelStageAuthority,
     args: argparse.Namespace,
+    extractor: Any,
     *,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> MaterializationResult:
-    reporter.update(stage="materialize", completed_shards=0, total_shards=1)
+    table_total = config.max_source_tables
+    finalize_steps = 15
+    total_work = table_total * 3 + finalize_steps
+    reporter.update(
+        stage="materialize",
+        detail="validate upstream",
+        completed_shards=0,
+        total_shards=total_work,
+    )
 
     def report_validation(event: dict[str, Any]) -> None:
         scope = str(
@@ -4653,7 +5421,62 @@ def _run_materialize(
             counters["materialization_resumed_source_units"] = int(
                 resumed_units
             )
-        reporter.update(counters=counters)
+        reporter.update(
+            detail=f"validate upstream: {scope}",
+            completed_shards=(
+                table_total + int(resumed_units)
+                if resumed_units is not None
+                else None
+            ),
+            counters=counters,
+        )
+
+    def report_materialization(event: dict[str, Any]) -> None:
+        phase = str(event.get("phase") or "materialize")
+        completed = int(event.get("completed", 0))
+        total = int(event.get("total", 0))
+        if phase == "catalog_sources":
+            overall = completed
+            detail = "catalog source tables"
+        elif phase == "query_auto_check":
+            overall = table_total + completed
+            detail = "auto-check selected query evidence"
+        elif phase == "materialize_tables":
+            overall = table_total * 2 + completed
+            detail = "materialize source tables"
+        elif phase == "balance_explicit_joins":
+            overall = table_total * 3
+            detail = "balance explicit joins"
+        elif phase == "publish_artifacts":
+            overall = table_total * 3 + completed
+            detail = "publish dataset artifacts"
+        else:
+            overall = 0
+            detail = phase.replace("_", " ")
+        counters = {
+            "materialization_phase_completed": completed,
+            "materialization_phase_total": total,
+        }
+        counters.update(
+            {
+                f"materialization_{key}": int(event[key])
+                for key in (
+                    "plans",
+                    "cached_checks",
+                    "migrated_legacy_checks",
+                )
+                if event.get(key) is not None
+            }
+        )
+        item = event.get("item")
+        if item:
+            detail = f"{detail}: {item}"
+        reporter.update(
+            detail=detail,
+            completed_shards=overall,
+            total_shards=total_work,
+            counters=counters,
+        )
 
     result = materialize_dataset(
         MaterializationInputs(
@@ -4680,9 +5503,11 @@ def _run_materialize(
         ),
         output_root=config.output_dir,
         args=args,
+        extractor=extractor,
         records_per_shard=config.records_per_shard,
         pre_write_guard=pre_write_guard,
         validation_progress_callback=report_validation,
+        progress_callback=report_materialization,
     )
     counters = {
         str(key): int(value)
@@ -4698,15 +5523,16 @@ def _run_materialize(
         pre_write_guard=pre_write_guard,
     )
     reporter.update(
-        completed_shards=1,
-        total_shards=1,
+        detail="materialization complete",
+        completed_shards=total_work,
+        total_shards=total_work,
         counters=counters,
     )
     _refresh_known_disk(reporter, config, output=True)
     return result
 
 
-def run_pipeline(
+def _run_pipeline_once(
     config: PipelineConfig,
     *,
     page_transport: Any | None = None,
@@ -4758,6 +5584,7 @@ def run_pipeline(
                     archives=archives,
                     inputs=fast_inputs,
                     args=fast_args,
+                    extractor=extractor,
                 )
         if (
             _allow_fast_model_resume
@@ -5007,6 +5834,7 @@ def run_pipeline(
             model_result,
             authority,
             args,
+            extractor,
             pre_write_guard=disk_guard,
         )
         return PipelineResult(
@@ -5025,6 +5853,612 @@ def run_pipeline(
         )
     finally:
         reporter.close()
+
+
+def _validated_active_selection_path(config: PipelineConfig) -> Path:
+    manifest_path = (
+        config.work_dir
+        / "structural"
+        / "stage_manifests"
+        / "validated-selection-global.json"
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    completed = payload.get("completed_shards") or []
+    if (
+        payload.get("stage") != "wdc200k_validated_selection"
+        or payload.get("complete") is not True
+        or not isinstance(completed, list)
+        or len(completed) != 1
+    ):
+        raise ValueError("validated recovery selection authority is invalid")
+    shard = _completed_shard_from_json(completed[0])
+    structural_root = config.work_dir / "structural"
+    if (
+        shard.records != config.max_source_tables
+        or not validate_completed_shard(shard, structural_root)
+    ):
+        raise ValueError("validated recovery selection shard is invalid")
+    return structural_root / shard.path
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"JSONL record is not an object: {path}")
+            records.append(value)
+    return records
+
+
+def _recovery_evaluation(
+    config: PipelineConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    active_records = _read_jsonl_records(
+        _validated_active_selection_path(config)
+    )
+    if len(active_records) != config.max_source_tables:
+        raise ValueError("recovery evaluation active-table count mismatch")
+    decisions_path = config.output_dir / "table_queryability_decisions.jsonl"
+    decisions = {
+        str(record["source_table_id"]): record
+        for record in _read_jsonl_records(decisions_path)
+    }
+    active_ids = {
+        str(record["source_table_id"]) for record in active_records
+    }
+    if set(decisions) != active_ids:
+        raise ValueError("recovery decisions do not match active source tables")
+    # Match EntiTables replacement semantics: only multimodal recovery keeps a
+    # slot during replacement passes.  Explicit joins are balanced from the
+    # terminal round's remaining recovery failures, not used to shield an
+    # otherwise unrecoverable candidate from replacement.
+    queryable_reasons = {"queryable"}
+    failures = [
+        record
+        for record in active_records
+        if str(decisions[str(record["source_table_id"])].get("reason") or "")
+        not in queryable_reasons
+    ]
+    reasons: dict[str, int] = {}
+    for record in failures:
+        reason = str(
+            decisions[str(record["source_table_id"])].get("reason")
+            or "unknown"
+        )
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return active_records, failures, reasons
+
+
+def _sampling_prefilter_decisions(
+    config: PipelineConfig,
+) -> dict[str, dict[str, Any]]:
+    authority = validate_sampling_artifacts(
+        config.work_dir / "sampling" / "manifest.json"
+    )
+    decisions: dict[str, dict[str, Any]] = {}
+    for path in authority.artifact_paths["prefilter_tables"]:
+        for record in _read_jsonl_records(path):
+            table_id = str(record["source_table_id"])
+            if table_id in decisions:
+                raise ValueError("duplicate sampling prefilter decision")
+            decisions[table_id] = record
+    return decisions
+
+
+def _plan_sampling_expansion(
+    config: PipelineConfig,
+    *,
+    state: SamplingExpansionState,
+    failures: Sequence[dict[str, Any]],
+) -> tuple[dict[str, int], list[str], dict[str, int]]:
+    """Increase only rejected tables that have untried evidence rows."""
+    limits = dict(state.limits)
+    failure_ids = {
+        str(record["source_table_id"]) for record in failures
+    }
+    decisions = _sampling_prefilter_decisions(config)
+    expanded: list[str] = []
+    eligible_failures = 0
+    exhausted_failures = 0
+    for table_id in sorted(failure_ids):
+        decision = decisions.get(table_id)
+        if not decision or decision.get("eligible") is not True:
+            exhausted_failures += 1
+            continue
+        eligible_failures += 1
+        sampled = int(decision.get("sampled_entities", 0))
+        attemptable = int(decision.get("attemptable_entities", sampled))
+        current_cap = int(
+            decision.get(
+                "sample_limit",
+                limits.get(table_id, config.sampled_entities_per_table),
+            )
+        )
+        if attemptable <= sampled:
+            exhausted_failures += 1
+            continue
+        next_limit: int | None = None
+        for scheduled_limit in config.sampled_entity_expansion_schedule:
+            if scheduled_limit <= current_cap:
+                continue
+            candidate_limit = min(scheduled_limit, attemptable)
+            if candidate_limit > sampled:
+                next_limit = candidate_limit
+                break
+        if next_limit is None:
+            exhausted_failures += 1
+            continue
+        limits[table_id] = next_limit
+        expanded.append(table_id)
+    return limits, expanded, {
+        "failed_tables": len(failure_ids),
+        "eligible_failed_tables": eligible_failures,
+        "expanded_tables": len(expanded),
+        "sampling_exhausted_failed_tables": exhausted_failures,
+    }
+
+
+def _sampling_registry_matches_expansion(
+    config: PipelineConfig,
+) -> bool:
+    path = _producer_registry_path(config, "sampling")
+    if not path.is_file():
+        return False
+    try:
+        registry = _load_stage_registry(path)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return registry.config_fingerprint == _stage_config_fingerprint(
+        config, "sampling"
+    )
+
+
+def _drop_recovery_failure(
+    config: PipelineConfig,
+    *,
+    round_index: int,
+    relative_path: str,
+) -> bool:
+    probability = config.unrecoverable_drop_probability
+    if probability <= 0.0:
+        return False
+    if probability >= 1.0:
+        return True
+    rank = int(
+        stable_hash(
+            "wdc200k-recovery-drop-v1",
+            config.selection_seed,
+            round_index,
+            relative_path,
+            length=16,
+        ),
+        16,
+    )
+    return rank / float(1 << 64) < probability
+
+
+def _replacement_selection_record(
+    candidate: TableCandidate,
+    *,
+    config: PipelineConfig,
+    invalid: dict[str, Any],
+    round_index: int,
+) -> dict[str, Any]:
+    return {
+        "schema_class": candidate.schema_class,
+        "subset": candidate.subset,
+        "host": candidate.host,
+        "relative_path": candidate.relative_path,
+        "rows": candidate.rows,
+        "columns": candidate.columns,
+        "rank": stable_hash(config.selection_seed, candidate.relative_path),
+        "selection_seed": config.selection_seed,
+        "recovery_replaces_path": str(invalid["relative_path"]),
+        "recovery_replaces_source_table_id": str(
+            invalid["source_table_id"]
+        ),
+        "recovery_replacement_round": round_index,
+    }
+
+
+def _write_active_recovery_selection(
+    config: PipelineConfig,
+    *,
+    round_index: int,
+    records: Sequence[dict[str, Any]],
+    previous_selection_path: Path,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> ActiveRecoverySelection:
+    if len(records) != config.max_source_tables:
+        raise ValueError("active recovery selection must fill every slot")
+    round_root = _recovery_root(config) / f"round-{round_index:05d}"
+    shard_path = round_root / "active_selection.jsonl"
+    manifest_path = round_root / "manifest.json"
+    expected_records_fingerprint = stable_hash(
+        "wdc200k-recovery-active-records-v1",
+        *(json.dumps(record, sort_keys=True) for record in records),
+        length=40,
+    )
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        completed = manifest.get("completed_shards") or []
+        if (
+            manifest.get("records_fingerprint")
+            != expected_records_fingerprint
+            or len(completed) != 1
+        ):
+            raise ValueError("conflicting persisted recovery selection round")
+        shard = _completed_shard_from_json(completed[0])
+        if not validate_completed_shard(shard, round_root):
+            raise ValueError("persisted recovery selection shard is invalid")
+    else:
+        writer = AtomicJsonlShard(
+            shard_path,
+            pre_write_guard=pre_write_guard,
+        )
+        try:
+            for record in records:
+                writer.write(record)
+            shard = writer.commit()
+        except BaseException:
+            writer.abort()
+            raise
+        _atomic_json(
+            manifest_path,
+            {
+                "stage": "wdc200k_selection",
+                "schema_version": "wdc200k-recovery-selection-v1",
+                "input_fingerprint": _sha256_path(previous_selection_path),
+                "parameter_fingerprint": stable_hash(
+                    _recovery_policy_identity(config),
+                    round_index,
+                    length=40,
+                ),
+                "policy_identity": _recovery_policy_identity(config),
+                "round_index": round_index,
+                "records_fingerprint": expected_records_fingerprint,
+                "completed_shards": [asdict(shard)],
+                "complete": True,
+            },
+            pre_write_guard=pre_write_guard,
+        )
+    _atomic_json(
+        _recovery_root(config) / "current.json",
+        {
+            "schema_version": "wdc200k-recovery-selection-pointer-v1",
+            "policy_identity": _recovery_policy_identity(config),
+            "round_index": round_index,
+            "manifest_path": str(manifest_path.resolve()),
+        },
+        pre_write_guard=pre_write_guard,
+    )
+    return ActiveRecoverySelection(
+        round_index=round_index,
+        path=shard_path,
+        manifest_path=manifest_path,
+        records=len(records),
+    )
+
+
+def _claim_recovery_replacements(
+    config: PipelineConfig,
+    *,
+    round_index: int,
+    active_records: Sequence[dict[str, Any]],
+    failures: Sequence[dict[str, Any]],
+    pre_write_guard: PreWriteGuard | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    policy = SelectionPolicy(
+        target_tables=config.max_source_tables,
+        seed=config.selection_seed,
+        top100_policy=config.top100_policy,
+        top100_per_class=config.top100_per_class,
+        include_rest=config.include_rest,
+        min_candidate_rows=config.min_candidate_rows,
+        min_candidate_columns=config.min_candidate_columns,
+        minimum3_fraction=config.minimum3_fraction,
+        rest_base_per_class=0,
+        class_cap=config.class_max_tables,
+    )
+    manager = ReserveManager.open(
+        config.work_dir / "selection" / "reserve.sqlite3",
+        policy,
+        pre_write_guard=pre_write_guard,
+    )
+    failures_by_path = {
+        str(record["relative_path"]): record for record in failures
+    }
+    output: list[dict[str, Any]] = []
+    replaced = 0
+    retained_by_probability = 0
+    reserve_exhausted = 0
+    for record in active_records:
+        path = str(record["relative_path"])
+        invalid = failures_by_path.get(path)
+        if invalid is None:
+            output.append(dict(record))
+            continue
+        if not _drop_recovery_failure(
+            config,
+            round_index=round_index,
+            relative_path=path,
+        ):
+            retained_by_probability += 1
+            output.append(dict(record))
+            continue
+        operation_key = stable_hash(
+            "wdc200k-recovery-replacement-v1",
+            round_index,
+            path,
+            length=40,
+        )
+        persisted_candidate = manager.active_candidate(path)
+        if persisted_candidate is None:
+            raise ValueError(
+                "recovery failure is not an active selection: " + path
+            )
+        try:
+            claim = manager.claim_replacement(
+                operation_key=operation_key,
+                invalid_candidate=persisted_candidate,
+                reason=f"unrecoverable_after_auto_check_round_{round_index - 1}",
+                retain_on_exhaustion=True,
+            )
+        except ReserveExhaustedError:
+            reserve_exhausted += 1
+            output.append(dict(record))
+            continue
+        if claim.replacement is None:
+            raise RuntimeError("recovery replacement claim has no candidate")
+        output.append(
+            {
+                **_replacement_selection_record(
+                claim.replacement,
+                config=config,
+                invalid=invalid,
+                round_index=round_index,
+                ),
+                # Structural publication is the durable acknowledgment point
+                # for both structural and post-recovery reserve claims.
+                "replacement_operation_key": claim.operation_key,
+            }
+        )
+        replaced += 1
+    return output, {
+        "failed": len(failures),
+        "replaced": replaced,
+        "retained_by_probability": retained_by_probability,
+        "reserve_exhausted": reserve_exhausted,
+    }
+
+
+def _selection_registry_references_active(
+    config: PipelineConfig,
+    active: ActiveRecoverySelection,
+) -> bool:
+    path = _producer_registry_path(config, "selection")
+    if not path.is_file():
+        return False
+    try:
+        registry = _load_stage_registry(path)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    expected = active.manifest_path.resolve()
+    return any(reference.path.resolve() == expected for reference in registry.producer_manifests)
+
+
+def _write_recovery_round_evaluation(
+    config: PipelineConfig,
+    *,
+    round_index: int,
+    failures: Sequence[dict[str, Any]],
+    reasons: dict[str, int],
+    replacement: dict[str, int] | None,
+    evaluated: int | None = None,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    _atomic_json(
+        _recovery_root(config) / f"evaluation-{round_index:05d}.json",
+        {
+            "schema_version": "wdc200k-recovery-evaluation-v1",
+            "policy_identity": _recovery_policy_identity(config),
+            "round_index": round_index,
+            "evaluated": (
+                config.max_source_tables if evaluated is None else evaluated
+            ),
+            "unrecoverable": len(failures),
+            "failure_reasons": dict(sorted(reasons.items())),
+            "replacement": replacement,
+            "failed_source_table_ids": sorted(
+                str(record["source_table_id"]) for record in failures
+            ),
+            "complete": True,
+        },
+        pre_write_guard=pre_write_guard,
+    )
+
+
+def run_pipeline(
+    config: PipelineConfig,
+    *,
+    page_transport: Any | None = None,
+    image_transport: Any | None = None,
+    extractor: Any | None = None,
+    after_page_cache_write: Any | None = None,
+    _allow_fast_model_resume: bool = True,
+) -> PipelineResult:
+    """Expand rejected evidence samples, then replace exhausted failures."""
+    if (
+        not config.dry_run
+        and config.stop_after in {None, "models", "materialize"}
+    ):
+        _promote_legacy_model_cache(
+            config,
+            pre_write_guard=DiskGuard(config.min_free_disk_bytes),
+        )
+    if (
+        config.dry_run
+        or config.stop_after is not None
+        or (
+            not config.sampled_entity_expansion_schedule
+            and config.unrecoverable_replacement_rounds == 0
+        )
+    ):
+        return _run_pipeline_once(
+            config,
+            page_transport=page_transport,
+            image_transport=image_transport,
+            extractor=extractor,
+            after_page_cache_write=after_page_cache_write,
+            _allow_fast_model_resume=_allow_fast_model_resume,
+        )
+
+    active = _load_active_recovery_selection(config)
+    expansion = _load_sampling_expansion_state(config)
+    round_index = 0 if active is None else active.round_index
+    effective = replace(
+        config,
+        recovery_replacement_round_index=round_index,
+        sampling_expansion_round_index=expansion.round_index,
+    )
+    if (
+        active is not None
+        and effective.from_stage is None
+        and not _selection_registry_references_active(effective, active)
+    ):
+        # The next active selection was committed after the preceding dataset.
+        # Archive that preceding structural/output generation before resuming.
+        effective = replace(effective, from_stage="structural")
+    elif (
+        expansion.round_index > 0
+        and effective.from_stage is None
+        and not _sampling_registry_matches_expansion(effective)
+    ):
+        # The next per-table cap state was committed after the preceding
+        # dataset. URL and model caches remain outside the archived stages.
+        effective = replace(effective, from_stage="sampling")
+
+    disk_guard = DiskGuard(config.min_free_disk_bytes)
+    while True:
+        result = _run_pipeline_once(
+            effective,
+            page_transport=page_transport,
+            image_transport=image_transport,
+            extractor=extractor,
+            after_page_cache_write=after_page_cache_write,
+            _allow_fast_model_resume=_allow_fast_model_resume,
+        )
+        if result.status != "complete" or result.stage != "materialize":
+            return result
+
+        active_records, failures, reasons = _recovery_evaluation(effective)
+        if failures and config.sampled_entity_expansion_schedule:
+            next_limits, expanded_ids, _expansion_stats = (
+                _plan_sampling_expansion(
+                    effective,
+                    state=expansion,
+                    failures=failures,
+                )
+            )
+            if expanded_ids:
+                expansion = _write_sampling_expansion_state(
+                    effective,
+                    previous=expansion,
+                    limits=next_limits,
+                    expanded_table_ids=expanded_ids,
+                    pre_write_guard=disk_guard,
+                )
+                effective = replace(
+                    config,
+                    recovery_replacement_round_index=round_index,
+                    sampling_expansion_round_index=expansion.round_index,
+                    resume=True,
+                    from_stage="sampling",
+                )
+                continue
+        if round_index >= config.unrecoverable_replacement_rounds or not failures:
+            _write_recovery_round_evaluation(
+                effective,
+                round_index=round_index,
+                failures=failures,
+                reasons=reasons,
+                replacement=None,
+                pre_write_guard=disk_guard,
+            )
+            return replace(
+                result,
+                counters={
+                    **result.counters,
+                    "recovery_replacement_round": round_index,
+                    "recovery_unrecoverable_tables": len(failures),
+                    "sampling_expansion_round": expansion.round_index,
+                    "progressively_expanded_tables": len(expansion.limits),
+                },
+            )
+
+        evaluated = config.max_source_tables
+        while True:
+            next_round = round_index + 1
+            next_records, replacement_stats = _claim_recovery_replacements(
+                effective,
+                round_index=next_round,
+                active_records=active_records,
+                failures=failures,
+                pre_write_guard=disk_guard,
+            )
+            _write_recovery_round_evaluation(
+                effective,
+                round_index=round_index,
+                failures=failures,
+                reasons=reasons,
+                replacement=replacement_stats,
+                evaluated=evaluated,
+                pre_write_guard=disk_guard,
+            )
+            if replacement_stats["replaced"]:
+                break
+            # Match EntiTables: a pass where the probability draw retains all
+            # failures still consumes one round, but does not reevaluate the
+            # unchanged slots before the next seeded draw.
+            round_index = next_round
+            evaluated = 0
+            if (
+                round_index >= config.unrecoverable_replacement_rounds
+                or replacement_stats["reserve_exhausted"] == len(failures)
+                or config.unrecoverable_drop_probability == 0.0
+            ):
+                return replace(
+                    result,
+                    counters={
+                        **result.counters,
+                        "recovery_replacement_round": round_index,
+                        "recovery_unrecoverable_tables": len(failures),
+                        "sampling_expansion_round": expansion.round_index,
+                        "progressively_expanded_tables": len(
+                            expansion.limits
+                        ),
+                    },
+                )
+
+        active = _write_active_recovery_selection(
+            effective,
+            round_index=next_round,
+            records=next_records,
+            previous_selection_path=_validated_active_selection_path(effective),
+            pre_write_guard=disk_guard,
+        )
+        round_index = next_round
+        effective = replace(
+            config,
+            recovery_replacement_round_index=round_index,
+            sampling_expansion_round_index=expansion.round_index,
+            resume=True,
+            from_stage="structural",
+        )
 
 
 def parse_args(
@@ -5053,8 +6487,20 @@ def parse_args(
         help="Compatibility option; only an omitted value is accepted.",
     )
     parser.add_argument("--selection_seed", type=int, default=13)
-    parser.add_argument("--top100_policy", choices=("all",), default="all")
-    parser.add_argument("--minimum3_fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--top100_policy",
+        choices=("all", "bounded", "exclude"),
+        default="bounded",
+    )
+    parser.add_argument("--top100_per_class", type=int, default=10)
+    parser.add_argument(
+        "--include_rest",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--min_candidate_rows", type=int, default=5)
+    parser.add_argument("--min_candidate_columns", type=int, default=3)
+    parser.add_argument("--minimum3_fraction", type=float, default=1.0)
     parser.add_argument("--class_max_tables", type=int, default=40_000)
     parser.add_argument("--page_attempts", type=int, default=1)
     parser.add_argument("--image_attempts", type=int, default=1)
@@ -5067,6 +6513,17 @@ def parse_args(
     )
     parser.add_argument("--max_images_per_entity", type=int, default=3)
     parser.add_argument("--sampled_entities_per_table", type=int, default=8)
+    parser.add_argument(
+        "--sampled_entity_expansion_schedule",
+        type=int,
+        nargs="*",
+        default=(12, 20, 25),
+        metavar="N",
+        help=(
+            "Per-table sample caps tried after a model/auto-check rejection; "
+            "an empty list disables progressive expansion."
+        ),
+    )
     parser.add_argument("--entity_sampling_seed", type=int, default=20260720)
     parser.add_argument("--global_entity_budget", type=int)
     parser.add_argument("--min_free_disk_bytes", type=int, default=1_000_000_000)
@@ -5142,18 +6599,52 @@ def parse_args(
     parser.add_argument(
         "--model_retry_sleep_seconds", type=float, default=2.0
     )
+    parser.add_argument(
+        "--model_cache_database_path",
+        help=(
+            "Persistent model/auto-check SQLite cache. Keeping this outside "
+            "the work directory lets recovery-replacement rounds reuse all "
+            "previous model judgments."
+        ),
+    )
+    parser.add_argument(
+        "--unrecoverable_replacement_rounds",
+        type=int,
+        default=0,
+        help=(
+            "Post-recovery replacement passes; zero preserves the legacy "
+            "single-pass WDC behavior."
+        ),
+    )
+    parser.add_argument(
+        "--unrecoverable_drop_probability",
+        type=float,
+        default=0.5,
+        help="Seeded fraction of current recovery failures replaced per pass.",
+    )
     parser.add_argument("--model_text_done_marker")
     parser.add_argument("--model_image_done_marker")
+    parser.add_argument("--model_endpoint_config")
     parser.add_argument("--text_model_base_url", default="http://localhost:8001/v1")
     parser.add_argument("--text_model_base_urls", nargs="*", default=None)
     parser.add_argument("--text_model_base_urls_file")
+    parser.add_argument("--remote_text_model_base_url")
+    parser.add_argument("--remote_text_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--remote_text_model_base_urls_file")
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
     parser.add_argument("--text_model_api_key")
+    parser.add_argument("--remote_text_model_api_key")
     parser.add_argument("--image_model_base_url", default="http://localhost:8000/v1")
     parser.add_argument("--image_model_base_urls", nargs="*", default=None)
     parser.add_argument("--image_model_base_urls_file")
-    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--remote_image_model_base_url")
+    parser.add_argument("--remote_image_model_base_urls", nargs="*", default=None)
+    parser.add_argument("--remote_image_model_base_urls_file")
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Instruct")
     parser.add_argument("--image_model_api_key")
+    parser.add_argument("--remote_image_model_api_key")
+    parser.add_argument("--remote_text_model_workers", type=int, default=0)
+    parser.add_argument("--remote_image_model_workers", type=int, default=0)
     parser.add_argument(
         "--remote_layout_control_url",
         default=None,
@@ -5237,6 +6728,7 @@ def parse_args(
             "each SQLite writer uses an independent validation database."
         ),
     )
+    join_builder.add_model_auto_check_arguments(parser)
     if configure_parser is not None:
         configure_parser(parser)
     args = parser.parse_args(argv)
@@ -5256,6 +6748,11 @@ def parse_args(
         parser.error("text asset chunk limits must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
+    if min(
+        args.remote_text_model_workers,
+        args.remote_image_model_workers,
+    ) < 0:
+        parser.error("remote model worker counts must be non-negative")
     remote_layout_required = (
         args.remote_layout_control_token_file,
         args.remote_layout_primary_image_url,
@@ -5328,6 +6825,15 @@ def parse_args(
         parser.error("--model_timeout_seconds must be positive")
     if args.model_max_retries < 0:
         parser.error("--model_max_retries must be non-negative")
+    if args.unrecoverable_replacement_rounds < 0:
+        parser.error("--unrecoverable_replacement_rounds must be non-negative")
+    if not (
+        math.isfinite(args.unrecoverable_drop_probability)
+        and 0.0 <= args.unrecoverable_drop_probability <= 1.0
+    ):
+        parser.error(
+            "--unrecoverable_drop_probability must be between zero and one"
+        )
     if (
         not math.isfinite(args.model_retry_sleep_seconds)
         or args.model_retry_sleep_seconds < 0

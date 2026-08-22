@@ -260,6 +260,71 @@ def test_structural_expansion_preserves_all_rows_and_removes_image(
     assert baseline.entities == entities
 
 
+def test_structural_progress_reports_each_table_and_shard_commit(
+    tmp_path: Path,
+) -> None:
+    table_path = write_wdc_gzip(
+        tmp_path,
+        rows=[
+            {"name": "A", "page_url": "https://example.test/a"},
+            {"name": "B", "page_url": "https://example.test/b"},
+        ],
+    )
+    events: list[dict[str, Any]] = []
+
+    result = expand_selected_shard(
+        [selection_record(table_path, tmp_path, rows=2, columns=2)],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+        progress_callback=events.append,
+    )
+
+    assert result.tables == 1
+    assert [event["phase"] for event in events] == [
+        "expand_table",
+        "table_complete",
+        "commit_structural_shard",
+        "structural_shard_complete",
+    ]
+    assert [event["completed"] for event in events] == [0, 1, 1, 1]
+    assert events[0]["relative_path"] == table_path.relative_to(
+        tmp_path
+    ).as_posix()
+    assert events[1]["entities"] == 2
+
+
+def test_structural_progress_reports_completed_shard_resume(
+    tmp_path: Path,
+) -> None:
+    table_path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    records = [selection_record(table_path, tmp_path, rows=1, columns=2)]
+    output_root = tmp_path / "structural"
+    expand_selected_shard(
+        records,
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+    events: list[dict[str, Any]] = []
+
+    result = expand_selected_shard(
+        records,
+        output_root=output_root,
+        input_root=tmp_path,
+        progress_callback=events.append,
+    )
+
+    assert result.tables == 1
+    assert [event["phase"] for event in events] == [
+        "validate_completed_shard",
+        "structural_shard_complete",
+    ]
+    assert [event["completed"] for event in events] == [0, 1]
+    assert events[-1]["resumed"] is True
+
+
 def test_iter_wdc_rows_has_no_implicit_row_limit(tmp_path: Path) -> None:
     path = write_wdc_gzip(
         tmp_path,
@@ -947,6 +1012,88 @@ def test_invalid_selected_table_uses_reserve_and_records_provenance(
     assert validated["replacement_reason"].startswith("JSONDecodeError:")
     assert [claim.status for claim in manager.terminal_claims()] == ["acked"]
     assert manager.pending_claims() == []
+
+
+def test_structural_progress_reports_invalid_candidate_replacement(
+    tmp_path: Path,
+) -> None:
+    bad = write_wdc_gzip(tmp_path, host="bad.test", rows=["{bad-json"])
+    good = write_wdc_gzip(
+        tmp_path,
+        host="good.test",
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    selected = candidate(bad, tmp_path, rows=1)
+    reserve = candidate(good, tmp_path, rows=1)
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite3",
+        reserve=[reserve],
+        selected=[selected],
+        policy=SelectionPolicy(target_tables=1),
+    )
+    events: list[dict[str, Any]] = []
+
+    expand_selected_shard(
+        [selection_record(bad, tmp_path, rows=1, columns=2)],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+        reserve_manager=manager,
+        progress_callback=events.append,
+    )
+
+    replacement = next(
+        event
+        for event in events
+        if event["phase"] == "replace_invalid_candidate"
+    )
+    assert replacement["relative_path"] == selected.relative_path
+    assert replacement["replacement_path"] == reserve.relative_path
+    assert replacement["completed"] == 0
+    assert replacement["reason"].startswith("JSONDecodeError:")
+
+
+def test_structural_acknowledges_preclaimed_recovery_replacement(
+    tmp_path: Path,
+) -> None:
+    original = write_wdc_gzip(
+        tmp_path,
+        host="original.test",
+        rows=[{"name": "old", "page_url": "https://example.test/old"}],
+    )
+    replacement = write_wdc_gzip(
+        tmp_path,
+        host="replacement.test",
+        rows=[{"name": "new", "page_url": "https://example.test/new"}],
+    )
+    selected = candidate(original, tmp_path, rows=1)
+    reserve = candidate(replacement, tmp_path, rows=1)
+    manager = ReserveManager.create(
+        tmp_path / "reserve.sqlite3",
+        reserve=[reserve],
+        selected=[selected],
+        policy=SelectionPolicy(target_tables=1),
+    )
+    claim = manager.claim_replacement(
+        operation_key="recovery-round-1",
+        invalid_candidate=selected,
+        reason="unrecoverable after auto-check",
+        retain_on_exhaustion=True,
+    )
+    record = selection_record(replacement, tmp_path, rows=1, columns=2)
+    record["replacement_operation_key"] = claim.operation_key
+
+    result = expand_selected_shard(
+        [record],
+        output_root=tmp_path / "structural",
+        input_root=tmp_path,
+        reserve_manager=manager,
+    )
+
+    assert read_records(result.validated_selection)[0][
+        "replacement_operation_key"
+    ] == claim.operation_key
+    assert manager.pending_claims() == []
+    assert manager.terminal_claims()[0].status == "acked"
 
 
 def test_replacement_chain_supersedes_broken_replacement(

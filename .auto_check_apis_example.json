@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "profiles": {
+    "luna_only_provider": {
+      "max_concurrency": 12,
+      "response": true,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://initial-provider.example/v1",
+        "api_key": "replace-with-initial-api-key"
+      },
+      "final_judge": null
+    },
+    "mixed_model_provider": {
+      "max_concurrency": 20,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://initial-provider.example/v1",
+        "api_key": "replace-with-initial-api-key"
+      },
+      "final_judge": {
+        "model": "grok-4.5",
+        "base_url": "https://final-provider.example/v1",
+        "api_key": "replace-with-final-judge-api-key"
+      }
+    },
+    "final_judge_only_provider": {
+      "max_concurrency": 12,
+      "initial": null,
+      "final_judge": {
+        "model": "gemini-3.0-pro",
+        "base_url": "https://final-only-provider.example/v1",
+        "api_key": "replace-with-final-judge-api-key"
+      }
+    }
+  }
+}

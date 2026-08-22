@@ -367,7 +367,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir dataset/tables_redi2_1 \
   --output_dir output_mm_joinability \
   --text_model_path hf_models/Qwen3.5-9B \
-  --image_model_path hf_models/Qwen3-VL-8B-Thinking \
+  --image_model_path hf_models/Qwen3-VL-8B-Instruct \
   --gpu_coordination_dir work_gpu_priority/local \
   --remote_layout_control_url http://127.0.0.1:18999 \
   --remote_layout_control_token_file layout-control-token \
@@ -490,7 +490,7 @@ python scripts/build_mm_table_dataset.py `
 output_wdc_200k/   只放最终 canonical dataset artifacts
 work_wdc_200k/     selection、shards、durable jobs、checkpoints、
                    stage manifests、runtime markers、progress.json
-cache/wdc_200k/    可复用的网络、媒体、模型成功及失败结果
+cache/wdc_webtable/    可复用的网络、媒体、模型成功及失败结果
 ```
 
 不要让三者互相嵌套，也不要复用同一路径。只有 `output_dir` 包含 source/query/data
@@ -509,7 +509,7 @@ conda run -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --dry_run
@@ -524,7 +524,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --web_max_retries 0 \
@@ -546,7 +546,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --resume \
@@ -563,7 +563,7 @@ conda run --no-capture-output -n MMDD python \
   --input_dir wdc_schemaorg_2023 \
   --output_dir output_wdc_200k \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --from_stage pages \
   --stop_after pages
@@ -624,7 +624,7 @@ conda run --no-capture-output -n MMDD python \
   --text_model_path /path/to/text-model \
   --image_model_path /path/to/vision-model \
   --work_dir work_wdc_200k \
-  --cache_dir cache/wdc_200k \
+  --cache_dir cache/wdc_webtable \
   --max_source_tables 200000 \
   --selection_seed 13 \
   --resume
@@ -638,7 +638,7 @@ structural tmux preflight 应让进程 stdout 直接显示在 pane 中，并用�
 
 ```bash
 tmux new-session -d -s wdc_200k \
-  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_200k --max_source_tables 200000 --selection_seed 13 --stop_after structural'
+  'conda run --no-capture-output -n MMDD python scripts/build_wdc200k_mm_joinability_dataset.py --input_dir wdc_schemaorg_2023 --output_dir output_wdc_200k --work_dir work_wdc_200k --cache_dir cache/wdc_webtable --max_source_tables 200000 --selection_seed 13 --stop_after structural'
 tmux new-window -t wdc_200k -n progress \
   "watch -n 5 'conda run -n MMDD python -m json.tool work_wdc_200k/progress.json'"
 tmux attach-session -t wdc_200k
@@ -736,7 +736,53 @@ conda run --no-capture-output -n MMDD python \
   --cache_path cache/mm_joinability/auto_checker.sqlite3
 ```
 
-auto checker 对每个 `(row, evidence, attribute)` 做独立的 leave-one-attribute-out 抽取：从原始完整 row 中只移除当前 attribute，模型只看到剩余 row、一个 evidence 和 attribute 名称；模型看不到数据集声称的 value，也看不到 target row。模型只返回 `extracted_value`，checker 再用数据集 builder 相同的归一化规则在本地比较：匹配为 `supported`，非空但不匹配为 `contradicted`，空抽取为 `insufficient`。本地模型优先；只有本地结果为 `contradicted` 或 `insufficient` 时，才会交给 `gpt-5.6-terra` 以 `medium` 思考强度做相同的盲抽取，OpenAI 二次筛查最大并发固定不超过 5。最终 verdict 仍由 checker 对二次抽取值做本地比较得到，而不是让模型自己判定。
+auto checker 对每个 `(row, evidence, attribute)` 做独立的 leave-one-attribute-out 抽取：从原始完整 row 中只移除当前 attribute，模型只看到剩余 row、一个 evidence 和 attribute 名称；模型看不到数据集声称的 value，也看不到 target row。模型只返回 `extracted_value`，checker 再用数据集 builder 相同的归一化规则在本地比较：匹配为 `supported`，非空但不匹配为 `contradicted`，空抽取为 `insufficient`。本地模型优先；只有本地结果为 `contradicted` 或 `insufficient` 时，才会交给 `gpt-5.6-terra` 在关闭思考的情况下做相同的盲抽取，OpenAI 二次筛查最大并发固定不超过 5。最终 verdict 仍由 checker 对二次抽取值做本地比较得到，而不是让模型自己判定。
+
+EntiTables、旧版 WDC 和分阶段 WDC-200K builder 现在也会把这套单属性盲抽取作为模型分析后的强制门禁。批量模型分析结果保存在 `model_attributes`；随后逐个物理移除待检属性，只基于剩余 row 和单条 evidence 重新抽取。只有 `supported` 项会写入下游实际消费的 `attributes`，空抽取、值不一致以及 checker 调用失败都会 fail-closed 过滤，因此不会参与 recovery 覆盖率或 qrels 构造。此次策略同时更新了 prompt/model cache identity，旧的未检查模型输出不会被静默复用。构造阶段先复用 builder 当前配置的文本/图片模型，再用 Luna 做盲抽取初审，并由单独配置的模型进行最终裁决。未完成的 checker 结果不会作为成功缓存复用，恢复运行时会自动重试；只有明确需要纯本地构造时才使用 `--no_auto_check_secondary_openai`。独立 checker 仍可用于抽样复审。
+
+auto-check API profile 推荐写在一个受保护的 JSON 文件中。可从根目录的 `.auto_check_apis.example.json` 开始配置；builder 默认读取 `./.auto_check_apis.json`，也可用 `--auto_check_api_config_file` 指定其他路径，实际配置文件权限必须是 `0600`。profile 名表示供应商及其共享并发预算，不绑定具体模型厂商：
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "gateway_a": {
+      "max_concurrency": 12,
+      "response": true,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://gateway-a.example/v1",
+        "api_key": "fake-example-key-a"
+      },
+      "final_judge": null
+    },
+    "gateway_b": {
+      "max_concurrency": 20,
+      "initial": {
+        "model": "gpt-5.6-luna",
+        "base_url": "https://gateway-b-initial.example/v1",
+        "api_key": "fake-example-initial-key-b"
+      },
+      "final_judge": {
+        "model": "grok-4.5",
+        "base_url": "https://gateway-b-final.example/v1",
+        "api_key": "fake-example-final-key-b"
+      }
+    },
+    "gateway_c": {
+      "max_concurrency": 12,
+      "initial": null,
+      "final_judge": {
+        "model": "gemini-3.0-pro",
+        "base_url": "https://gateway-c-final.example/v1",
+        "api_key": "fake-example-final-key-c"
+      }
+    }
+  }
+}
+```
+
+带有 `initial` 对象的 profile 参与稳定的初审路由；`initial: null` 表示该供应商只提供最终裁判。`final_judge: null` 的 profile 永远不会收到最终裁判请求。整份配置必须至少有一个初审端点，同一 profile 的两个阶段不能同时为 `null`。若没有任何最终裁判，本地与初审模型的冲突会保持 incomplete 并 fail closed。每个 profile 只有一个自适应并发控制器：从 5 开始，连续成功 20 次后加 1，最高不超过 `max_concurrency`；发生 API 或传输错误时把当前并发减半。如果同一 profile 同时配置初审和终审，即使使用不同 key、URL 和模型，它们仍共享这个 profile 的并发额度。默认使用 OpenAI-compatible Chat Completions；在 profile 上写 `"response": true` 会让两个阶段都走 Responses API，也可以把该字段写进 `initial` 或 `final_judge`，只覆盖对应阶段。两种传输都要求结构化 JSON 输出。builder 运行期间会在每次供应商请求前检查 JSON 文件；只有整份新配置通过读取、权限和结构校验后才会原子切换，新增的初审或终审供应商无需重启即可参与路由。若更新不可读、处于写到一半的状态、权限错误或内容无效，builder 会针对该文件版本输出一次 warning，并继续使用上一份有效的供应商配置。旧的命名 dotenv profile 格式和 `--auto_check_openai_env_file` 仍为兼容保留，但 JSON 是推荐配置。
 
 默认报告写入 `<output_dir>/auto_checker_reviews/`，包括 path 级的本地/二次抽取、query 级覆盖、汇总、失败记录和用于后续数据清理的 `patch_candidates-*.jsonl`。两阶段成功抽取都会按 `(row, evidence, attribute, model identity)` 写入 SQLite cache，失败不会缓存。同一 seed 使用稳定哈希前缀抽样，因此以后把 `--sample_rate` 从 `0.10` 提高到 `0.20` 时会完整复用原 10% 的结果，只审阅新增部分。模型、prompt 或单条抽取输入变化时，对应 cache key 会自动变化。二次筛查从 `OPENAI_API_KEY` 读取密钥并沿用 OpenAI builder 的受限 dotenv 约定；密钥不会写入 cache 或报告。可用 `--no_secondary_openai` 关闭二次筛查。每个模型请求严格只包含一个 `masked row + evidence + attribute name`；同一 evidence 声称能抽取多个 attribute 时会分别请求。
 

@@ -1335,6 +1335,9 @@ def persist_entity_asset_plans(
     input_fingerprint: str,
     budget: ImageBudget = ImageBudget(),
     records_per_shard: int = 10_000,
+    total_entities: int | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_every: int = 1_000,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> AssetPlanShards:
     """Persist entity/page inputs and all selected URL mappings in shards."""
@@ -1342,6 +1345,22 @@ def persist_entity_asset_plans(
         raise ValueError("input_fingerprint must not be empty")
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be positive")
+    if total_entities is not None and total_entities < 0:
+        raise ValueError("total_entities must be non-negative")
+    if progress_every <= 0:
+        raise ValueError("progress_every must be positive")
+
+    def report(completed: int, total: int, *, resumed: bool = False) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "plan_entity_assets",
+                    "completed": completed,
+                    "total": total,
+                    "resumed": resumed,
+                }
+            )
+
     output_root = Path(output_root)
     manifest_path = output_root / "asset-planning-manifest.json"
     resumed = _load_completed_plan(
@@ -1352,7 +1371,14 @@ def persist_entity_asset_plans(
         records_per_shard=records_per_shard,
     )
     if resumed is not None:
+        report(
+            resumed.entities,
+            resumed.entities if total_entities is None else total_entities,
+            resumed=True,
+        )
         return resumed
+
+    report(0, 0 if total_entities is None else total_entities)
 
     entity_writer = _BoundedShardWriter(
         output_root / "entity_plans",
@@ -1365,6 +1391,7 @@ def persist_entity_asset_plans(
         pre_write_guard,
     )
     try:
+        processed = 0
         for entity, page_outcome in entity_pages:
             plan = plan_entity_assets(entity, page_outcome, budget)
             entity_writer.write(
@@ -1376,6 +1403,16 @@ def persist_entity_asset_plans(
             )
             for reference in plan.image_refs:
                 mapping_writer.write(reference.as_record())
+            processed += 1
+            if processed % progress_every == 0:
+                report(
+                    processed,
+                    processed if total_entities is None else total_entities,
+                )
+        report(
+            processed,
+            processed if total_entities is None else total_entities,
+        )
         entity_completed = entity_writer.close()
         mapping_completed = mapping_writer.close()
     except BaseException:
@@ -2808,11 +2845,45 @@ def fetch_unique_images(
 def iter_image_outcomes(
     outcomes_path: Path,
     policy_fingerprint: str,
+    *,
+    job_store_path: Path | None = None,
+    job_kind: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream durable unique image outcomes without all-result loading."""
-    yield from ImageOutcomeStore(Path(outcomes_path)).iter(
-        policy_fingerprint
-    )
+    if (job_store_path is None) != (job_kind is None):
+        raise ValueError(
+            "job_store_path and job_kind must be provided together"
+        )
+    outcome_store = ImageOutcomeStore(Path(outcomes_path))
+    if job_store_path is None:
+        yield from outcome_store.iter(policy_fingerprint)
+        return
+
+    connection = outcome_store._connect()
+    try:
+        connection.execute(
+            "ATTACH DATABASE ? AS scoped_image_jobs",
+            (str(Path(job_store_path)),),
+        )
+        cursor = connection.execute(
+            """
+            SELECT outcomes.outcome_json, outcomes.payload_sha256
+            FROM image_outcomes AS outcomes
+            WHERE outcomes.policy_fingerprint = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM scoped_image_jobs.jobs AS job
+                  WHERE job.kind = ?
+                    AND job.job_id = ? || ':' || outcomes.url_key
+              )
+            ORDER BY outcomes.url_key
+            """,
+            (policy_fingerprint, job_kind, job_kind),
+        )
+        for row in cursor:
+            yield outcome_store._decode(row)
+    finally:
+        connection.close()
 
 
 def iter_image_failures(

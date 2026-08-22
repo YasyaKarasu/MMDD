@@ -72,26 +72,60 @@ class CudaReadinessError(RuntimeError):
     """Raised when a target GPU cannot initialize CUDA before vLLM startup."""
 
 
-def default_vllm_extra_args(args: argparse.Namespace) -> list[str]:
+def _role_vllm_value(
+    args: argparse.Namespace,
+    model_kind: str | None,
+    name: str,
+) -> object:
+    role_value = (
+        getattr(args, f"{model_kind}_vllm_{name}", None)
+        if model_kind is not None
+        else None
+    )
+    return (
+        role_value
+        if role_value is not None
+        else getattr(args, f"vllm_{name}")
+    )
+
+
+def default_vllm_extra_args(
+    args: argparse.Namespace,
+    model_kind: str | None = None,
+) -> list[str]:
     if getattr(args, "no_default_vllm_memory_args", False):
-        return []
-    return [
-        "--trust-remote-code",
-        "--dtype",
-        clean_arg_value(args.vllm_dtype),
-        "--max-model-len",
-        str(args.vllm_max_model_len),
-        "--gpu-memory-utilization",
-        clean_arg_value(args.vllm_gpu_memory_utilization),
-        "--enforce-eager",
-        "--skip-mm-profiling",
-        "--mm-processor-cache-gb",
-        clean_arg_value(args.vllm_mm_processor_cache_gb),
-        "--max-num-batched-tokens",
-        str(args.vllm_max_num_batched_tokens),
-        "--max-num-seqs",
-        str(args.vllm_max_num_seqs),
-    ]
+        result: list[str] = []
+    else:
+        result = [
+            "--trust-remote-code",
+            "--dtype",
+            clean_arg_value(args.vllm_dtype),
+            "--max-model-len",
+            str(args.vllm_max_model_len),
+            "--gpu-memory-utilization",
+            clean_arg_value(
+                _role_vllm_value(
+                    args, model_kind, "gpu_memory_utilization"
+                )
+            ),
+            "--enforce-eager",
+            "--skip-mm-profiling",
+            "--mm-processor-cache-gb",
+            clean_arg_value(args.vllm_mm_processor_cache_gb),
+            "--max-num-batched-tokens",
+            str(
+                _role_vllm_value(
+                    args, model_kind, "max_num_batched_tokens"
+                )
+            ),
+            "--max-num-seqs",
+            str(_role_vllm_value(args, model_kind, "max_num_seqs")),
+        ]
+    if model_kind == "text" and getattr(
+        args, "text_language_model_only", False
+    ):
+        result.append("--language-model-only")
+    return result
 
 
 def clean_arg_value(value: object) -> str:
@@ -158,6 +192,10 @@ def build_builder_command(
 
 def process_env(gpu: str) -> dict[str, str]:
     env = dict(os.environ)
+    # The builder may use VLLM_API_KEY as a fallback for a remote endpoint.
+    # Locally managed vLLM servers are probed without authentication, so do not
+    # accidentally enable auth on them by inheriting that remote credential.
+    env.pop("VLLM_API_KEY", None)
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return env
@@ -990,13 +1028,21 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     )
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--text_model_path", required=True)
+    parser.add_argument(
+        "--model_path",
+        help="Unified model path used by both local text and image servers.",
+    )
+    parser.add_argument(
+        "--model_name",
+        help="Unified served model name used by both modalities.",
+    )
+    parser.add_argument("--text_model_path")
     parser.add_argument("--text_model_name", default="Qwen3.5-9B")
     parser.add_argument("--text_gpu", default="1")
     parser.add_argument("--text_port", type=int, default=8001)
     parser.add_argument("--secondary_text_port", type=int, default=8003)
-    parser.add_argument("--image_model_path", required=True)
-    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Thinking")
+    parser.add_argument("--image_model_path")
+    parser.add_argument("--image_model_name", default="Qwen3-VL-8B-Instruct")
     parser.add_argument("--primary_image_gpu", default="0")
     parser.add_argument("--primary_image_port", type=int, default=8000)
     parser.add_argument("--secondary_image_gpu", default="1")
@@ -1135,12 +1181,37 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90)
     parser.add_argument("--vllm_max_num_batched_tokens", type=int, default=1024)
     parser.add_argument("--vllm_max_num_seqs", type=int, default=1)
+    parser.add_argument("--text_vllm_gpu_memory_utilization", type=float)
+    parser.add_argument("--image_vllm_gpu_memory_utilization", type=float)
+    parser.add_argument("--text_vllm_max_num_batched_tokens", type=int)
+    parser.add_argument("--image_vllm_max_num_batched_tokens", type=int)
+    parser.add_argument("--text_vllm_max_num_seqs", type=int)
+    parser.add_argument("--image_vllm_max_num_seqs", type=int)
+    parser.add_argument(
+        "--text_language_model_only",
+        action="store_true",
+        help=(
+            "Do not load the vision tower on the local text-role server. "
+            "The image-role and remote servers remain multimodal."
+        ),
+    )
     parser.add_argument("--vllm_mm_processor_cache_gb", type=float, default=0)
     parser.add_argument("--no_default_vllm_memory_args", action="store_true", help="Do not apply the conservative vLLM memory defaults copied from the known-good manual sessions.")
     parser.add_argument("--vllm_extra_arg", action="append", default=[], help="Extra argument applied to all vLLM serve commands. Repeat for multiple tokens.")
     parser.add_argument("--text_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to the text vLLM server.")
     parser.add_argument("--image_vllm_extra_arg", action="append", default=[], help="Extra argument applied only to both image vLLM servers.")
     args, passthrough = parser.parse_known_args(argv)
+    if args.model_path:
+        args.text_model_path = args.model_path
+        args.image_model_path = args.model_path
+    if not args.text_model_path or not args.image_model_path:
+        parser.error(
+            "provide --model_path, or provide both --text_model_path and "
+            "--image_model_path"
+        )
+    if args.model_name:
+        args.text_model_name = args.model_name
+        args.image_model_name = args.model_name
     if (
         args.server_start_attempts <= 0
         or not math.isfinite(args.server_start_retry_backoff_seconds)
@@ -1181,6 +1252,10 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
             "--remote_dynamic_model_workers was replaced by "
             "--remote_text_model_workers and --remote_image_model_workers"
         )
+    if passthrough_has_arg(passthrough, "--enable_thinking"):
+        parser.error(
+            "thinking mode is always disabled for text and image requests"
+        )
     if min(args.text_model_workers, args.image_model_workers) < 0:
         parser.error("local model worker counts must be non-negative")
     if min(
@@ -1188,6 +1263,24 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         args.remote_image_model_workers,
     ) < 0:
         parser.error("remote model worker counts must be non-negative")
+    role_memory_values = (
+        args.text_vllm_gpu_memory_utilization,
+        args.image_vllm_gpu_memory_utilization,
+    )
+    if any(
+        value is not None
+        and (not math.isfinite(value) or value <= 0 or value > 1)
+        for value in role_memory_values
+    ):
+        parser.error("role-specific vLLM GPU utilization must be in (0, 1]")
+    role_integer_values = (
+        args.text_vllm_max_num_batched_tokens,
+        args.image_vllm_max_num_batched_tokens,
+        args.text_vllm_max_num_seqs,
+        args.image_vllm_max_num_seqs,
+    )
+    if any(value is not None and value <= 0 for value in role_integer_values):
+        parser.error("role-specific vLLM token and sequence limits must be positive")
     if (
         args.remote_layout_control_url
         and args.remote_text_model_workers == 0
@@ -1254,7 +1347,16 @@ def main(argv: list[str] | None = None) -> int:
     if first_done_timeout is None:
         first_done_timeout = args.text_done_timeout_seconds
 
-    common_extra = [*default_vllm_extra_args(args), *args.vllm_extra_arg]
+    text_extra = [
+        *default_vllm_extra_args(args, "text"),
+        *args.vllm_extra_arg,
+        *args.text_vllm_extra_arg,
+    ]
+    image_extra = [
+        *default_vllm_extra_args(args, "image"),
+        *args.vllm_extra_arg,
+        *args.image_vllm_extra_arg,
+    ]
     startup_resilience = {
         "startup_attempts": args.server_start_attempts,
         "startup_retry_backoff_seconds": args.server_start_retry_backoff_seconds,
@@ -1268,7 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.text_port,
         host=args.host,
         vllm_bin=args.vllm_bin,
-        extra_args=[*common_extra, *args.text_vllm_extra_arg],
+        extra_args=list(text_extra),
         **startup_resilience,
     )
     primary_image_server = VllmServerSpec(
@@ -1279,7 +1381,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.primary_image_port,
         host=args.host,
         vllm_bin=args.vllm_bin,
-        extra_args=[*common_extra, *args.image_vllm_extra_arg],
+        extra_args=list(image_extra),
         **startup_resilience,
     )
     secondary_image_server = VllmServerSpec(
@@ -1290,7 +1392,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.secondary_image_port,
         host=args.host,
         vllm_bin=args.vllm_bin,
-        extra_args=[*common_extra, *args.image_vllm_extra_arg],
+        extra_args=list(image_extra),
         **startup_resilience,
     )
     secondary_text_server = VllmServerSpec(
@@ -1301,7 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.secondary_text_port,
         host=args.host,
         vllm_bin=args.vllm_bin,
-        extra_args=[*common_extra, *args.text_vllm_extra_arg],
+        extra_args=list(text_extra),
         **startup_resilience,
     )
     gpu_priority_owner = (
@@ -1358,13 +1460,13 @@ def main(argv: list[str] | None = None) -> int:
             text_workers=args.text_model_workers,
             image_workers=args.image_model_workers,
         )
+        builder_passthrough_args = with_remote_model_workers(
+            builder_passthrough_args,
+            text_workers=args.remote_text_model_workers,
+            image_workers=args.remote_image_model_workers,
+        )
         remote_layout_args: list[str] = []
         if args.remote_layout_control_url:
-            builder_passthrough_args = with_remote_model_workers(
-                builder_passthrough_args,
-                text_workers=args.remote_text_model_workers,
-                image_workers=args.remote_image_model_workers,
-            )
             remote_layout_args = [
                 "--remote_model_routing_manifest",
                 str(remote_routing_manifest),

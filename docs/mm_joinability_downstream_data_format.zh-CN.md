@@ -34,6 +34,35 @@
 `stats.json`、`table_queryability_decisions.jsonl` 和 WDC 的 failure JSONL
 主要用于构建审计与错误分析，不应作为模型输入。
 
+### 1.1 下游是否需要读取 cache
+
+需要按任务区分：
+
+| 下游任务 | 是否依赖 cache | 原因 |
+| --- | --- | --- |
+| 纯 query-to-table 训练/评测 | 否 | 表格、qrels、split 都已写入 dataset output |
+| 文本 evidence 训练/评测 | 否 | 文本正文已写入 `bridge_assets[].content` |
+| 图片 evidence 训练/评测 | **是，当前需要图片目录** | `bridge_assets` 只保存图片路径和元数据，图片二进制仍在 cache image directory |
+| 断点续跑或重新构建数据集 | 是 | 页面、下载和模型 cache 用于恢复构建 |
+
+这里的“需要 cache”不等于下游要读取整个构建缓存。下游不应读取 Wikipedia/page
+cache、WDC SQLite、model extraction cache 或 auto-check cache 来补充 JSON 记录；
+canonical shard 已经包含训练和评测需要的结构化记录。图片是当前唯一需要额外保留的
+大文件依赖，常见位置为：
+
+- EntiTables：`<cache_dir>/images/`；
+- 直接 WDC builder：`<cache_dir>/wdc_images/`；
+- WDC 200K staged pipeline：`<cache_dir>/images/`。
+
+实际路径必须以每条 image asset 的 `local_path` 为准。`dataset_manifest.json` 中的
+`cache` 或 `web_cache` 段是构建 provenance，不是下游扫描 cache 的接口。
+
+因此，当前 dataset output 对表格和文本任务是自包含的；对图片任务是“记录
+自包含、图片文件外置”。如果数据要迁移到另一台机器，应同时迁移图片目录并保持
+`local_path` 可解析，或者通过正式的打包步骤把图片复制/硬链接到
+`<dataset_root>/images/`，同步更新 image asset 的 `local_path`、`relative_path` 和
+相应 manifest 校验信息。不要只复制 output 目录后删除 cache。
+
 典型目录如下：
 
 ```text
@@ -294,6 +323,14 @@ set(query.source_row_indices) ⊆ set(target.source_row_indices)
 - `asset_type = "image"`：图片位置在 `local_path` 或 `relative_path`，并可能带
   `image_url`、`sha256`、`width`、`height`、`mime_type`、`metadata`。
 
+当前构建中，`local_path` 通常是 cache image directory 内的绝对路径。
+`relative_path` 的基准在不同 builder/历史版本间并不完全一致，不能假定它总是相对
+dataset root。推荐的解析顺序是：
+
+1. 使用存在且哈希匹配的 `local_path`；
+2. 若数据经过正式打包，再尝试 `<dataset_root>/<relative_path>`；
+3. 文件仍不存在时，将该图片记为 missing asset，而不是重新抓取网络资源。
+
 EntiTables 的常见 `source` 是 `wikipedia_extract_chunk` 和
 `wikipedia_image_download`；WDC 常见的是 `wdc_page_text_chunk`、
 `wdc_image_column` 和 `wdc_page_image`。下游应根据 `asset_type` 处理模态，不应
@@ -437,27 +474,7 @@ query-to-table retriever，不应把正例 evidence 或 recovered value 拼入 q
 因此，schema 校验应采用“必需共同字段 + 允许来源扩展字段”的方式，不应使用严格的
 整条 object key 相等判断。
 
-## 13. 与现有 Stage-1 格式的关系
-
-当前 `stage1_prepare_data.py` 从 canonical 数据的 `source_tables` 重新构造
-`logic_fragments.jsonl`、`logic_pairs.jsonl` 和 Stage-1 自己的 `qrels.jsonl`。
-这套派生 qrel 使用：
-
-```json
-{
-  "query_id": "frag_...",
-  "target_id": "frag_...",
-  "query_role": "left_visible",
-  "target_role": "right_target"
-}
-```
-
-canonical joinability qrel 使用的是 `query_table_id` 和 `target_table_id`。两者不能
-直接互换，也不要把 canonical `qrels.jsonl` 直接传给当前
-`eval_stage1_recall.py`。如果目标是评测 builder 已生成的 joinability query，应按
-本文第 11 节直接评测，或先实现一个显式的 schema adapter。
-
-## 14. 发布前校验清单
+## 13. 发布前校验清单
 
 - manifest 列出的所有 shard 都存在，记录数与 manifest 相符；
 - `table_id`、`source_table_id`、`asset_id`、`recovery_id` 在各自主表中唯一；

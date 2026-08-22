@@ -676,6 +676,99 @@ def test_page_transport_summary_is_scoped_to_current_job_store(
     assert resumed.transport_attempt_summary["transport_attempts"] == 1
 
 
+def test_shared_page_cache_counts_validation_and_fanout_are_job_scoped(
+    tmp_path: Path,
+) -> None:
+    current_url = "https://current.test/page"
+    unrelated_url = "https://unrelated.test/page"
+    current_refs = [
+        {
+            **page_ref("current-entity", current_url),
+            "source_table_id": "current-table",
+            "row_id": 3,
+        }
+    ]
+    unrelated_refs = [
+        {
+            **page_ref("unrelated-entity", unrelated_url),
+            "source_table_id": "unrelated-table",
+            "row_id": 9,
+        }
+    ]
+    outcomes_path = tmp_path / "shared-outcomes.sqlite3"
+    current_jobs = SqliteJobStore(tmp_path / "current-jobs.sqlite3")
+    unrelated_jobs = SqliteJobStore(tmp_path / "unrelated-jobs.sqlite3")
+    policy = FetchPolicy()
+    transport = CountingTransport(
+        {
+            current_url: {"text": "current"},
+            unrelated_url: TimeoutError("unrelated timeout"),
+        }
+    )
+
+    fetch_unique_pages(
+        current_refs,
+        current_jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    fetch_unique_pages(
+        unrelated_refs,
+        unrelated_jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+    resumed = fetch_unique_pages(
+        current_refs,
+        current_jobs,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+
+    assert resumed.complete
+    assert (resumed.unique, resumed.success, resumed.terminal) == (1, 1, 0)
+    progress = json.loads(resumed.progress_path.read_text(encoding="utf-8"))
+    assert progress["complete"] is True
+    assert (progress["unique"], progress["success"], progress["terminal"]) == (
+        1,
+        1,
+        0,
+    )
+    assert resumed.failure_path.read_text(encoding="utf-8") == ""
+    snapshot = validate_complete_page_fetch(
+        resumed,
+        current_refs,
+        validation_database=tmp_path / "current-validation.sqlite3",
+    )
+    assert (snapshot["unique"], snapshot["success"], snapshot["terminal"]) == (
+        1,
+        1,
+        0,
+    )
+    scoped_outcomes = list(
+        iter_page_outcomes(
+            resumed.outcomes_path,
+            resumed.policy_fingerprint,
+            job_store_path=resumed.job_store_path,
+            job_kind=resumed.job_kind,
+        )
+    )
+    assert [record["page_url"] for record in scoped_outcomes] == [current_url]
+    scoped_fanout = list(
+        iter_page_fanout(
+            resumed.outcomes_path,
+            resumed.policy_fingerprint,
+            job_store_path=resumed.job_store_path,
+        )
+    )
+    assert [record["entity_id"] for record in scoped_fanout] == [
+        "current-entity"
+    ]
+
+
 def test_page_transport_attempt_summary_counts_anomalies(
     tmp_path: Path,
 ) -> None:

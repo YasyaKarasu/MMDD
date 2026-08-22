@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -380,6 +381,65 @@ def _find_recoverable_journal(
     return matching[0] if matching else None
 
 
+def _completed_archive_journals(
+    journal_dir: Path,
+) -> list[tuple[Path, dict[str, object]]]:
+    if not journal_dir.is_dir():
+        return []
+    completed: list[tuple[Path, dict[str, object]]] = []
+    for path in sorted(journal_dir.glob("*.json")):
+        payload = _load_journal(path)
+        if payload.get("complete") is not True:
+            continue
+        transaction_id = payload.get("transaction_id")
+        if (
+            not isinstance(transaction_id, str)
+            or not transaction_id
+            or Path(transaction_id).name != transaction_id
+            or path.stem != transaction_id
+        ):
+            raise ArchiveJournalError(
+                f"invalid completed archive transaction id: {path}"
+            )
+        completed.append((path, payload))
+    return completed
+
+
+def _prune_completed_archives(
+    *,
+    work_dir: Path,
+    output_dir: Path,
+    cache_dir: Path,
+) -> tuple[str, ...]:
+    """Remove superseded rollback generations, never incomplete journals."""
+    journal_dir = work_dir / ".archive-transactions"
+    removed: list[str] = []
+    for journal_path, payload in _completed_archive_journals(journal_dir):
+        transaction_id = str(payload["transaction_id"])
+        transaction_roots = (
+            _stale_root(work_dir) / transaction_id,
+            _stale_root(output_dir) / transaction_id,
+            _stale_root(cache_dir) / transaction_id,
+        )
+        for root in transaction_roots:
+            if root.is_symlink():
+                raise ArchiveJournalError(
+                    f"refusing to prune symlinked archive root: {root}"
+                )
+            if not root.exists():
+                continue
+            if not root.is_dir():
+                raise ArchiveJournalError(
+                    f"archive transaction root is not a directory: {root}"
+                )
+            shutil.rmtree(root)
+            _fsync_directory(root.parent)
+        journal_path.unlink()
+        _fsync_directory(journal_dir)
+        removed.append(transaction_id)
+    return tuple(removed)
+
+
 def _validate_move_payload(item: object, *, journal_path: Path) -> dict[str, str]:
     if not isinstance(item, dict):
         raise ArchiveJournalError(f"invalid move in archive journal: {journal_path}")
@@ -538,6 +598,15 @@ def archive_pipeline_state(
             page_cache_paths=page_cache_paths,
             image_cache_paths=image_cache_paths,
         )
+        # A newly archived active generation supersedes all completed rollback
+        # generations. Prune before moving it, while every active source still
+        # exists; incomplete transactions remain available for recovery.
+        if any(item["status"] == "pending" for item in moves):
+            _prune_completed_archives(
+                work_dir=work_dir,
+                output_dir=output_dir,
+                cache_dir=cache_dir,
+            )
         payload = {
             "schema_version": JOURNAL_SCHEMA_VERSION,
             "transaction_id": transaction_id,

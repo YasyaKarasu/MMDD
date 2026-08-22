@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -1138,6 +1138,7 @@ def expand_selected_shard(
     min_rows: int = 1,
     min_cols: int = 1,
     pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> StructuralExpansionResult:
     """Expand one provisional-selection shard with durable replacement recovery."""
     if not shard_id or any(
@@ -1150,6 +1151,22 @@ def expand_selected_shard(
     output_root = Path(output_root)
     input_root = Path(input_root)
     paths = _paths(output_root, shard_id)
+
+    def report(
+        phase: str,
+        completed: int,
+        **details: Any,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": phase,
+                    "completed": completed,
+                    "shard_id": shard_id,
+                    **details,
+                }
+            )
+
     spool_root = output_root / ".structural_spool" / shard_id
     if pre_write_guard is not None:
         pre_write_guard(spool_root, 0)
@@ -1192,6 +1209,7 @@ def expand_selected_shard(
         raise
     if manifest.complete:
         try:
+            report("validate_completed_shard", 0)
             if not manifest.completed_shards or not all(
                 validate_completed_shard(shard, output_root)
                 for shard in manifest.completed_shards
@@ -1203,7 +1221,16 @@ def expand_selected_shard(
                 paths.validated_selection,
                 reserve_manager,
             )
-            return _completed_result(paths)
+            result = _completed_result(paths)
+            report(
+                "structural_shard_complete",
+                result.tables,
+                resumed=True,
+                entities=result.entities_count,
+                page_references=result.page_references,
+                direct_image_references=result.direct_image_references,
+            )
+            return result
         finally:
             if selection_spool_path is not None:
                 selection_spool_path.unlink(missing_ok=True)
@@ -1255,9 +1282,22 @@ def expand_selected_shard(
             )
             lineage: list[str] = []
             reasons: list[str] = []
-            final_operation_key: str | None = None
+            final_operation_key: str | None = (
+                clean_text(selected_record.get("replacement_operation_key"))
+                if isinstance(selected_record, dict)
+                else None
+            )
             while True:
                 path = input_root / current.relative_path
+                report(
+                    "expand_table",
+                    successful_tables,
+                    relative_path=current.relative_path,
+                    selected=selected_count,
+                    entities=entities_count,
+                    page_references=page_references,
+                    direct_image_references=direct_image_references,
+                )
                 try:
                     expanded = _read_table_once(
                         path,
@@ -1295,6 +1335,17 @@ def expand_selected_shard(
                         )
                     current = claim.replacement
                     final_operation_key = claim.operation_key
+                    report(
+                        "replace_invalid_candidate",
+                        successful_tables,
+                        relative_path=lineage[-1],
+                        replacement_path=current.relative_path,
+                        reason=reason,
+                        selected=selected_count,
+                        entities=entities_count,
+                        page_references=page_references,
+                        direct_image_references=direct_image_references,
+                    )
 
             source = expanded.source_table
             try:
@@ -1382,6 +1433,15 @@ def expand_selected_shard(
                         operation_key=final_operation_key,
                     )
                 )
+                report(
+                    "table_complete",
+                    successful_tables,
+                    relative_path=current.relative_path,
+                    selected=selected_count,
+                    entities=entities_count,
+                    page_references=page_references,
+                    direct_image_references=direct_image_references,
+                )
             finally:
                 expanded.raw_rows_path.unlink(missing_ok=True)
 
@@ -1392,6 +1452,13 @@ def expand_selected_shard(
                 f"{expected_tables}"
             )
 
+        report(
+            "commit_structural_shard",
+            successful_tables,
+            entities=entities_count,
+            page_references=page_references,
+            direct_image_references=direct_image_references,
+        )
         completed: list[tuple[CompletedShard, Path]] = []
         for name in (
             "source_tables",
@@ -1408,6 +1475,13 @@ def expand_selected_shard(
                 _relative_completed(shard, path, output_root)
             )
         manifest.mark_complete()
+        report(
+            "structural_shard_complete",
+            successful_tables,
+            entities=entities_count,
+            page_references=page_references,
+            direct_image_references=direct_image_references,
+        )
     except BaseException:
         for writer in writers.values():
             writer.abort()
