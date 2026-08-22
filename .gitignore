@@ -30,6 +30,7 @@ cache/
 output/
 output_*/
 /.output_*/
+/output_*.tar.gz
 output_stage1_logic/
 output_medium/
 
@@ -68,7 +69,9 @@ human_labels_filled_round_*.jsonl
 # Local WDC pipeline runtime and generated evidence
 /evidence_wdc_*/
 /runtime_gpu_share/
+/runtime_gpu_share_*/
 /work_wdc_*/
+/work_mm_joinability_openai/openai_model_runs/
 /.work_*/
 /*.wdc200k-stale/
 
