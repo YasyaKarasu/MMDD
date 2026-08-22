@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import gzip
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin
 
 from .utils import clean_text, stable_hash
 
@@ -24,7 +22,6 @@ NON_ENTITY_NAMESPACES = {
     "user",
     "wikipedia",
 }
-WDC_ENTITY_COLUMNS = ("name", "headline", "title", "identifier", "page_url")
 
 
 @dataclass
@@ -237,121 +234,6 @@ def prepare_entitables(
     return PreparedData(tables, _entitables_entities(tables), skipped)
 
 
-def _image_urls(value: Any, page_url: str) -> list[str]:
-    values = value if isinstance(value, list) else [value]
-    urls: list[str] = []
-    for item in values:
-        if isinstance(item, dict):
-            item = item.get("url") or item.get("contentUrl")
-        raw_url = clean_text(item)
-        if not raw_url:
-            continue
-        url = urljoin(page_url, raw_url)
-        if url.startswith(("http://", "https://")) and url not in urls:
-            urls.append(url)
-    return urls
-
-
-def _wdc_table(
-    path: Path, input_dir: Path, min_rows: int, min_cols: int, max_rows: int | None
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
-    raw_rows: list[dict[str, Any]] = []
-    malformed_rows = 0
-    with gzip.open(path, "rb") as handle:
-        for line in handle:
-            try:
-                row = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                malformed_rows += 1
-                continue
-            if isinstance(row, dict):
-                raw_rows.append(row)
-            else:
-                malformed_rows += 1
-            if max_rows and len(raw_rows) >= max_rows:
-                break
-    if len(raw_rows) < min_rows:
-        return None, [], "too_few_rows"
-
-    names: list[str] = []
-    for row in raw_rows:
-        for name in row:
-            if name not in {"row_id", "image"} and name not in names:
-                names.append(name)
-    if len(names) < min_cols:
-        return None, [], "too_few_columns"
-    entity_name = next((name for name in WDC_ENTITY_COLUMNS if name in names), None)
-    if entity_name is None:
-        return None, [], "missing_entity_column"
-
-    entity_col = names.index(entity_name)
-    relative_source = path.relative_to(input_dir).as_posix()
-    source_id = f"st_wdc_{stable_hash(relative_source, length=20)}"
-    columns = [
-        {"column_index": index, "column_name": name, "is_numeric_column": False}
-        for index, name in enumerate(names)
-    ]
-    rows: list[dict[str, Any]] = []
-    entities: list[dict[str, Any]] = []
-    for fallback, raw_row in enumerate(raw_rows):
-        row_id = int(raw_row.get("row_id", fallback))
-        page_url = clean_text(raw_row.get("page_url"))
-        entity_key = f"wdc_{stable_hash(relative_source, row_id, page_url)}"
-        cells = []
-        for column_index, name in enumerate(names):
-            is_entity = column_index == entity_col
-            cells.append(
-                {
-                    "column_index": column_index,
-                    "column_name": name,
-                    "raw": raw_row.get(name),
-                    "text": clean_text(raw_row.get(name)),
-                    "wiki_title": entity_key if is_entity else None,
-                    "has_wiki_link": is_entity,
-                }
-            )
-        rows.append({"row_id": row_id, "cells": cells})
-        entities.append(
-            {
-                "entity_id": f"ent_{stable_hash(entity_key)}",
-                "wiki_title": entity_key,
-                "display_texts": [clean_text(raw_row.get(entity_name))],
-                "appears_in": [
-                    {
-                        "source_table_id": source_id,
-                        "row_id": row_id,
-                        "column_index": entity_col,
-                        "column_name": entity_name,
-                    }
-                ],
-                "source": "wdc",
-                "page_url": page_url,
-                "image_urls": _image_urls(raw_row.get("image"), page_url),
-            }
-        )
-
-    profiles, _ = column_profiles(rows, columns, 1.0)
-    for column, profile in zip(columns, profiles):
-        column["is_numeric_column"] = profile["numeric_ratio"] >= 0.8
-    table = {
-        "source_table_id": source_id,
-        "source_file": relative_source,
-        "page_title": path.parent.name,
-        "caption": "",
-        "section_title": "",
-        "num_rows": len(rows),
-        "num_cols": len(columns),
-        "columns": columns,
-        "rows": rows,
-        "metadata": {
-            "column_profiles": profiles,
-            "candidate_entity_columns": [entity_col],
-            "malformed_rows": malformed_rows,
-        },
-    }
-    return table, entities, None
-
-
 def prepare_wdc(
     input_dir: Path,
     *,
@@ -360,16 +242,27 @@ def prepare_wdc(
     max_tables: int | None = None,
     max_rows: int | None = None,
 ) -> PreparedData:
+    """Compatibility wrapper over the standalone WDC adapter."""
+    from .wdc_adapter import adapt_table, iter_gzip_paths
+
     tables: list[dict[str, Any]] = []
     entities: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
-    for path in sorted(input_dir.rglob("*.json.gz")):
-        table, table_entities, reason = _wdc_table(path, input_dir, min_rows, min_cols, max_rows)
-        if table is None:
-            skipped[reason or "invalid_table"] = skipped.get(reason or "invalid_table", 0) + 1
+    for path in iter_gzip_paths(input_dir):
+        try:
+            adapted = adapt_table(
+                path,
+                input_dir,
+                min_rows=min_rows,
+                min_cols=min_cols,
+                max_rows=max_rows,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            reason = clean_text(error) or "invalid_table"
+            skipped[reason] = skipped.get(reason, 0) + 1
             continue
-        tables.append(table)
-        entities.extend(table_entities)
+        tables.append(adapted.table)
+        entities.extend(adapted.entities)
         if max_tables and len(tables) >= max_tables:
             break
     return PreparedData(tables, entities, skipped)

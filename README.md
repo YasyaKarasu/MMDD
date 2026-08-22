@@ -6,6 +6,11 @@ The goal is dataset construction only: source tables, projected query views, ent
 
 It does not construct joinability benchmark labels. It does not generate positive pairs, negative pairs, joinable/not-joinable fields, augmentation targets, or query-target pairs.
 
+The current resumable WDC joinability builder lives in `src/` and is
+documented in [`src/README.md`](src/README.md). Use
+`src/build_wdc_dataset.py` for new WDC runs. The large `scripts_old/wdc200k_*`
+pipeline is retained only as a behavior reference.
+
 ## Input Format
 
 Each EntiTables JSON file is expected to be a top-level dictionary:

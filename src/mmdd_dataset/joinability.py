@@ -363,6 +363,121 @@ def _materialize_join(
     return query, target, qrel, recoveries
 
 
+def _build_joinability_for_table(
+    table: dict[str, Any],
+    *,
+    assets_by_id: dict[str, dict[str, Any]],
+    extraction_index: dict[tuple[str, int, str], list[dict[str, Any]]],
+    split: str,
+    config: BuildConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    queries: list[dict[str, Any]] = []
+    targets: list[dict[str, Any]] = []
+    qrels: list[dict[str, Any]] = []
+    recoveries: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+
+    entity_col = _entity_column(table, config.query_rows)
+    if entity_col is None:
+        decisions.append(
+            {"source_table_id": table["source_table_id"], "reason": "no_entity_column"}
+        )
+        return {
+            "query_tables": queries,
+            "data_lake_tables": targets,
+            "qrels": qrels,
+            "evidence_recoveries": recoveries,
+            "table_queryability_decisions": decisions,
+        }
+    qualified = _qualified_columns(table, entity_col, extraction_index, config)
+    if not qualified:
+        decisions.append(
+            {"source_table_id": table["source_table_id"], "reason": "no_recoverable_column"}
+        )
+        return {
+            "query_tables": queries,
+            "data_lake_tables": targets,
+            "qrels": qrels,
+            "evidence_recoveries": recoveries,
+            "table_queryability_decisions": decisions,
+        }
+
+    emitted = 0
+    visible_queries: set[str] = set()
+    for candidate, query_context, target_context in _context_layouts(
+        table, entity_col, qualified, config
+    ):
+        if sum(
+            bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
+            for row in table["rows"]
+        ) < config.min_target_rows:
+            continue
+        query, target, qrel, paths = _materialize_join(
+            table,
+            split,
+            entity_col,
+            candidate,
+            assets_by_id,
+            config,
+            query_context,
+            target_context,
+        )
+        visible_key = stable_hash(
+            query["columns"],
+            [[cell["text"] for cell in row["cells"]] for row in query["rows"]],
+            length=40,
+        )
+        if visible_key in visible_queries:
+            continue
+        visible_queries.add(visible_key)
+        queries.append(query)
+        targets.append(target)
+        qrels.append(qrel)
+        recoveries.extend(paths)
+        emitted += 1
+    decisions.append(
+        {
+            "source_table_id": table["source_table_id"],
+            "reason": "queryable" if emitted else "target_too_small",
+            "entity_column_index": entity_col,
+            "qualified_columns": [
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key not in {"valid_rows", "recoveries"}
+                }
+                for candidate in qualified
+            ],
+        }
+    )
+    return {
+        "query_tables": queries,
+        "data_lake_tables": targets,
+        "qrels": qrels,
+        "evidence_recoveries": recoveries,
+        "table_queryability_decisions": decisions,
+    }
+
+
+def build_joinability_for_table(
+    table: dict[str, Any],
+    assets: list[dict[str, Any]],
+    extractions: list[dict[str, Any]],
+    split: str,
+    config: BuildConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    """Run the shared joinability algorithm for one normalized source table."""
+    assets_by_id = {asset["asset_id"]: asset for asset in assets}
+    extraction_index = _extraction_index(extractions, set(assets_by_id))
+    return _build_joinability_for_table(
+        table,
+        assets_by_id=assets_by_id,
+        extraction_index=extraction_index,
+        split=split,
+        config=config,
+    )
+
+
 def build_joinability_dataset(
     tables: list[dict[str, Any]],
     assets: list[dict[str, Any]],
@@ -372,79 +487,24 @@ def build_joinability_dataset(
 ) -> dict[str, list[dict[str, Any]]]:
     assets_by_id = {asset["asset_id"]: asset for asset in assets}
     extraction_index = _extraction_index(extractions, set(assets_by_id))
-    queries: list[dict[str, Any]] = []
-    targets: list[dict[str, Any]] = []
-    qrels: list[dict[str, Any]] = []
-    recoveries: list[dict[str, Any]] = []
-    decisions: list[dict[str, Any]] = []
-
-    for table in tables:
-        entity_col = _entity_column(table, config.query_rows)
-        if entity_col is None:
-            decisions.append({"source_table_id": table["source_table_id"], "reason": "no_entity_column"})
-            continue
-        qualified = _qualified_columns(table, entity_col, extraction_index, config)
-        if not qualified:
-            decisions.append(
-                {"source_table_id": table["source_table_id"], "reason": "no_recoverable_column"}
-            )
-            continue
-
-        emitted = 0
-        visible_queries: set[str] = set()
-        for candidate, query_context, target_context in _context_layouts(
-            table, entity_col, qualified, config
-        ):
-            if sum(
-                bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
-                for row in table["rows"]
-            ) < config.min_target_rows:
-                continue
-            query, target, qrel, paths = _materialize_join(
-                table,
-                split_of[table["source_table_id"]],
-                entity_col,
-                candidate,
-                assets_by_id,
-                config,
-                query_context,
-                target_context,
-            )
-            visible_key = stable_hash(
-                query["columns"],
-                [[cell["text"] for cell in row["cells"]] for row in query["rows"]],
-                length=40,
-            )
-            if visible_key in visible_queries:
-                continue
-            visible_queries.add(visible_key)
-            queries.append(query)
-            targets.append(target)
-            qrels.append(qrel)
-            recoveries.extend(paths)
-            emitted += 1
-        decisions.append(
-            {
-                "source_table_id": table["source_table_id"],
-                "reason": "queryable" if emitted else "target_too_small",
-                "entity_column_index": entity_col,
-                "qualified_columns": [
-                    {
-                        key: value
-                        for key, value in candidate.items()
-                        if key not in {"valid_rows", "recoveries"}
-                    }
-                    for candidate in qualified
-                ],
-            }
-        )
-    return {
-        "query_tables": queries,
-        "data_lake_tables": targets,
-        "qrels": qrels,
-        "evidence_recoveries": recoveries,
-        "table_queryability_decisions": decisions,
+    artifacts = {
+        "query_tables": [],
+        "data_lake_tables": [],
+        "qrels": [],
+        "evidence_recoveries": [],
+        "table_queryability_decisions": [],
     }
+    for table in tables:
+        table_artifacts = _build_joinability_for_table(
+            table,
+            assets_by_id=assets_by_id,
+            extraction_index=extraction_index,
+            split=split_of[table["source_table_id"]],
+            config=config,
+        )
+        for artifact, records in table_artifacts.items():
+            artifacts[artifact].extend(records)
+    return artifacts
 
 
 def table_asset_links(

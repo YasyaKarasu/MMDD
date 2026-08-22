@@ -5,6 +5,10 @@
 EntiTables 与 WDC canonical joinability 输出的共同下游训练、负例采样和评测格式，
 见 [`docs/mm_joinability_downstream_data_format.zh-CN.md`](docs/mm_joinability_downstream_data_format.zh-CN.md)。
 
+当前可续跑、分片化的 WDC joinability 构建器位于 `src/`，使用说明见
+[`src/README.md`](src/README.md)。新的 WDC 构建应使用
+`src/build_wdc_dataset.py`；`scripts_old/wdc200k_*` 仅保留为旧行为参考。
+
 这个脚本只负责构造数据集本体和 query views，不负责构造 joinability benchmark labels。它不会生成正样本、负样本、joinable/not joinable 标签、augmentation target 或 query-target pairs。
 
 ## 输入格式
