@@ -35,6 +35,7 @@ output_stage1_logic/
 output_medium/
 
 # Local input datasets and downloaded assets
+/references/
 /data/
 /data_*/
 /data-*/
