@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from string import ascii_uppercase
 from typing import Any, Iterator, Sequence
 
 import torch
@@ -231,10 +232,10 @@ class QwenStage2Backend:
             candidate = LocalizedEvidence(
                 evidence_id=str(evidence["asset_id"]),
                 evidence_type="text",
-                relevance=float(relevance[start:end].sum()),
+                localization_score=float(relevance[start:end].sum()),
                 text=span,
             )
-            if best is None or candidate.relevance > best.relevance:
+            if best is None or candidate.localization_score > best.localization_score:
                 best = candidate
         return best or LocalizedEvidence(str(evidence["asset_id"]), "text", 0.0, text="")
 
@@ -273,7 +274,7 @@ class QwenStage2Backend:
         return LocalizedEvidence(
             evidence_id=str(evidence["asset_id"]),
             evidence_type="image",
-            relevance=confidence,
+            localization_score=confidence,
             image=crop,
             box=region.box,
         )
@@ -289,6 +290,73 @@ class QwenStage2Backend:
         if evidence.get("asset_type") == "image":
             return self._localize_image(row, entity_column, attribute_name, evidence)
         return self._localize_text(row, entity_column, attribute_name, evidence)
+
+    def _candidate_labels(self, count: int) -> tuple[list[str], list[int]]:
+        if not 0 < count <= len(ascii_uppercase):
+            raise ValueError(f"Evidence reranking supports 1-{len(ascii_uppercase)} candidates per row")
+        labels = list(ascii_uppercase[:count])
+        token_ids = []
+        for label in labels:
+            encoded = self.processor.tokenizer.encode(label, add_special_tokens=False)
+            if len(encoded) != 1:
+                raise ValueError(f"Evidence reranker label must be one token: {label!r}")
+            token_ids.append(int(encoded[0]))
+        if len(set(token_ids)) != len(token_ids):
+            raise ValueError("Evidence reranker labels must map to unique tokens")
+        return labels, token_ids
+
+    @torch.inference_mode()
+    def evidence_logits(
+        self,
+        row: dict[str, str],
+        *,
+        entity_column: str,
+        attribute_name: str,
+        candidates: Sequence[LocalizedEvidence],
+    ) -> torch.Tensor:
+        """Score all row candidates in one multimodal next-token decision."""
+
+        labels, label_ids = self._candidate_labels(len(candidates))
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Select the single localized evidence candidate that most directly and explicitly supplies "
+                    "the requested attribute value for the example row.\n"
+                    f"Example row: {json.dumps(row, ensure_ascii=False)}\n"
+                    f"Entity column: {entity_column}\nRequested attribute: {attribute_name}"
+                ),
+            }
+        ]
+        for label, candidate in zip(labels, candidates):
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"\nCandidate {label} ({candidate.evidence_type}, {candidate.evidence_id}):",
+                }
+            )
+            if candidate.image is not None:
+                content.append({"type": "image", "image": candidate.image})
+            else:
+                content.append({"type": "text", "text": candidate.text or ""})
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    "\nReturn only the single-letter label of the best candidate, with no other text. "
+                    f"Valid labels: {', '.join(labels)}."
+                ),
+            }
+        )
+        inputs = self._inputs(content, generation_prompt=True)
+        logits = self.model(
+            **inputs,
+            use_cache=False,
+            logits_to_keep=1,
+            return_dict=True,
+        ).logits[0, -1].float()
+        indices = torch.tensor(label_ids, device=logits.device)
+        return logits.index_select(0, indices).cpu()
 
     @torch.inference_mode()
     def _presence_confidence(self, image: Image.Image, entity: str, attribute: str) -> float:

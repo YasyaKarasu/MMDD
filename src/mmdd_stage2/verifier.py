@@ -14,23 +14,11 @@ from mmdd_dataset.utils import values_match
 
 
 @dataclass(frozen=True)
-class EvidenceRef:
-    evidence_id: str
-    evidence_type: str
-    path_score: float
-    weight: float
-
-
-@dataclass(frozen=True)
 class EvidenceBundle:
     target_id: str
     retrieval_score: float
-    evidence: tuple[EvidenceRef, ...]
+    evidence_ids: tuple[str, ...]
     paths: tuple[dict[str, Any], ...]
-
-    @property
-    def evidence_ids(self) -> tuple[str, ...]:
-        return tuple(item.evidence_id for item in self.evidence)
 
 
 @dataclass(frozen=True)
@@ -58,7 +46,7 @@ def build_evidence_bundles(
     *,
     top_k_evidence: int,
 ) -> list[EvidenceBundle]:
-    """Group one-hop paths by target and weight unique evidence with LogSumExp."""
+    """Group one-hop paths by target and rank unique evidence with LogSumExp."""
 
     if top_k_evidence < 0:
         raise ValueError("top_k_evidence must be non-negative")
@@ -73,30 +61,21 @@ def build_evidence_bundles(
             continue
         paths.sort(key=lambda path: float(path["path_score"]), reverse=True)
         scores_by_evidence: dict[str, list[float]] = {}
-        type_by_evidence: dict[str, str] = {}
         for path in paths:
             evidence_id = str(path["evidence_id"])
             scores_by_evidence.setdefault(evidence_id, []).append(float(path["path_score"]))
-            type_by_evidence.setdefault(evidence_id, str(path.get("evidence_type", "")))
         ranked = sorted(
-            (
-                (evidence_id, type_by_evidence[evidence_id], _logsumexp(scores))
-                for evidence_id, scores in scores_by_evidence.items()
-            ),
-            key=lambda item: item[2],
+            ((evidence_id, _logsumexp(scores)) for evidence_id, scores in scores_by_evidence.items()),
+            key=lambda item: item[1],
             reverse=True,
         )[:top_k_evidence]
         if not ranked:
             continue
-        weights = torch.softmax(torch.tensor([item[2] for item in ranked]), dim=0).tolist()
         bundles.append(
             EvidenceBundle(
                 target_id=str(result["target_id"]),
                 retrieval_score=_logsumexp([float(path["path_score"]) for path in paths]),
-                evidence=tuple(
-                    EvidenceRef(evidence_id, evidence_type, score, float(weight))
-                    for (evidence_id, evidence_type, score), weight in zip(ranked, weights)
-                ),
+                evidence_ids=tuple(evidence_id for evidence_id, _ in ranked),
                 paths=tuple(paths),
             )
         )

@@ -11,7 +11,6 @@ from .pipeline import (
 from .verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
-    EvidenceRef,
     RegionOfInterest,
     SemanticJoinability,
     best_image_region,
@@ -31,7 +30,6 @@ __all__ = [
     "ColumnSelection",
     "DirectVerification",
     "EvidenceBundle",
-    "EvidenceRef",
     "LocalizedEvidence",
     "RegionOfInterest",
     "RowPrediction",

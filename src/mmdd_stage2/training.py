@@ -59,7 +59,7 @@ def load_column_training_data(
             examples.append(example)
             query_ids.add(query_id)
             target_ids.update(bundle.target_id for bundle in bundles)
-            evidence_ids.update(item.evidence_id for bundle in bundles for item in bundle.evidence)
+            evidence_ids.update(evidence_id for bundle in bundles for evidence_id in bundle.evidence_ids)
     if not examples:
         raise ValueError("No Stage-2 training examples have a retrieved positive evidence path")
     return examples, load_stage2_index(

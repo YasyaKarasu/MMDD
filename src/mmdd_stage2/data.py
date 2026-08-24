@@ -114,7 +114,7 @@ def load_stage2_objects(
     extra_target_ids: Sequence[str] = (),
 ) -> Stage2Objects:
     target_ids = {bundle.target_id for bundle in bundles} | set(extra_target_ids)
-    evidence_ids = {item.evidence_id for bundle in bundles for item in bundle.evidence}
+    evidence_ids = {evidence_id for bundle in bundles for evidence_id in bundle.evidence_ids}
     index = load_stage2_index(
         output_dir,
         query_ids={query_id},

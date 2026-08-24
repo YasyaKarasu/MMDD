@@ -13,7 +13,6 @@ from .routing import EvidenceRowAssignment
 from .verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
-    EvidenceRef,
     SemanticJoinability,
     joint_candidate_probabilities,
     semantic_joinability,
@@ -24,16 +23,18 @@ from .verifier import (
 class LocalizedEvidence:
     evidence_id: str
     evidence_type: str
-    relevance: float
+    localization_score: float
     text: str | None = None
     image: Any | None = None
     box: tuple[float, float, float, float] | None = None
+    selection_logit: float | None = None
 
     def record(self) -> dict[str, Any]:
         return {
             "evidence_id": self.evidence_id,
             "evidence_type": self.evidence_type,
-            "relevance": self.relevance,
+            "localization_score": self.localization_score,
+            "selection_logit": self.selection_logit,
             "text": self.text,
             "box": self.box,
         }
@@ -98,6 +99,15 @@ class Stage2Backend(Protocol):
         evidence: dict[str, Any],
     ) -> LocalizedEvidence: ...
 
+    def evidence_logits(
+        self,
+        row: dict[str, str],
+        *,
+        entity_column: str,
+        attribute_name: str,
+        candidates: Sequence[LocalizedEvidence],
+    ) -> torch.Tensor: ...
+
     def generate_value(
         self,
         row: dict[str, str],
@@ -148,7 +158,7 @@ class Stage2Verifier:
         logits = []
         for bundle in bundles:
             target = targets[bundle.target_id]
-            selected_evidence = [evidence[item.evidence_id] for item in bundle.evidence]
+            selected_evidence = [evidence[evidence_id] for evidence_id in bundle.evidence_ids]
             open_states, close_states = self.backend.reader_states(query, target, selected_evidence)
             if open_states.shape[0] != len(target["columns"]):
                 raise ValueError(f"{bundle.target_id}: reader did not return one marker pair per column")
@@ -278,17 +288,17 @@ class Stage2Verifier:
         )
         assignment_by_evidence = {assignment.evidence_id: assignment for assignment in assignments}
         if set(assignment_by_evidence) != set(selected_bundle.evidence_ids) or len(assignments) != len(
-            selected_bundle.evidence
+            selected_bundle.evidence_ids
         ):
             raise ValueError("Evidence router must assign every selected evidence exactly once")
-        references_by_row: list[list[tuple[EvidenceRef, EvidenceRowAssignment]]] = [
+        evidence_by_row: list[list[tuple[str, EvidenceRowAssignment]]] = [
             [] for _ in query["rows"]
         ]
-        for reference in selected_bundle.evidence:
-            assignment = assignment_by_evidence[reference.evidence_id]
+        for evidence_id in selected_bundle.evidence_ids:
+            assignment = assignment_by_evidence[evidence_id]
             if not 0 <= assignment.row_position < len(query["rows"]):
                 raise ValueError(f"Evidence router returned invalid row position {assignment.row_position}")
-            references_by_row[assignment.row_position].append((reference, assignment))
+            evidence_by_row[assignment.row_position].append((evidence_id, assignment))
 
         if "query_entity_col" in query:
             entity_index = local_column_index(query, int(query["query_entity_col"]))
@@ -298,7 +308,7 @@ class Stage2Verifier:
         predictions = []
         for row_position, row in enumerate(query["rows"]):
             visible_row = row_values(query, row)
-            routed = references_by_row[row_position]
+            routed = evidence_by_row[row_position]
             if not routed:
                 predictions.append(
                     RowPrediction(
@@ -312,16 +322,28 @@ class Stage2Verifier:
                 continue
 
             localized = []
-            for reference, assignment in routed:
+            for evidence_id, assignment in routed:
                 item = self.backend.localize_evidence(
                     visible_row,
                     entity_column=entity_name,
                     attribute_name=selection.column_name,
-                    evidence=evidence[reference.evidence_id],
+                    evidence=evidence[evidence_id],
                 )
-                item.relevance *= reference.weight
                 localized.append((item, assignment))
-            best, best_assignment = max(localized, key=lambda pair: pair[0].relevance)
+            if len(localized) == 1:
+                best, best_assignment = localized[0]
+            else:
+                evidence_logits = self.backend.evidence_logits(
+                    visible_row,
+                    entity_column=entity_name,
+                    attribute_name=selection.column_name,
+                    candidates=[item for item, _ in localized],
+                )
+                if evidence_logits.shape != (len(localized),):
+                    raise ValueError("Evidence reranker must return one logit per localized candidate")
+                for (item, _), logit in zip(localized, evidence_logits):
+                    item.selection_logit = float(logit.detach())
+                best, best_assignment = localized[int(evidence_logits.argmax())]
             value = self.backend.generate_value(
                 visible_row,
                 attribute_name=selection.column_name,

@@ -12,7 +12,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from mmdd_stage2.verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
-    EvidenceRef,
     best_image_region,
     best_text_span,
     build_evidence_bundles,
@@ -39,9 +38,9 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
                 "target_id": "t1",
                 "score": 4.0,
                 "paths": [
-                    {"kind": "evidence", "evidence_id": "e2", "evidence_type": "image", "path_score": 1.0},
+                    {"kind": "evidence", "evidence_id": "e2", "evidence_type": "image", "path_score": 2.0},
                     {"kind": "direct", "path_score": 3.0},
-                    {"kind": "evidence", "evidence_id": "e1", "evidence_type": "text", "path_score": 2.0},
+                    {"kind": "evidence", "evidence_id": "e1", "evidence_type": "text", "path_score": 1.5},
                     {"kind": "evidence", "evidence_id": "e1", "evidence_type": "text", "path_score": 1.5},
                 ],
             }
@@ -51,9 +50,7 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
 
     assert bundles[0].target_id == "t1"
     assert bundles[0].evidence_ids == ("e1", "e2")
-    assert [path["path_score"] for path in bundles[0].paths] == [2.0, 1.5, 1.0]
-    assert sum(item.weight for item in bundles[0].evidence) == pytest.approx(1.0)
-    assert bundles[0].evidence[0].path_score > 2.0
+    assert [path["path_score"] for path in bundles[0].paths] == [2.0, 1.5, 1.5]
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():
@@ -158,6 +155,9 @@ class FakeBackend:
         self.localization_calls = []
         self.generation_calls = []
         self.reader_evidence_batches = []
+        self.evidence_logit_calls = []
+        self.localization_score_by_id = {}
+        self.evidence_logit_by_id = {}
 
     def reader_states(self, query, target, evidence):
         self.reader_evidence_batches.append(tuple(item["asset_id"] for item in evidence))
@@ -165,7 +165,18 @@ class FakeBackend:
 
     def localize_evidence(self, row, *, entity_column, attribute_name, evidence):
         self.localization_calls.append((row[entity_column], evidence["asset_id"]))
-        return LocalizedEvidence(evidence["asset_id"], evidence["asset_type"], 0.9, text=evidence["content"])
+        return LocalizedEvidence(
+            evidence["asset_id"],
+            evidence["asset_type"],
+            self.localization_score_by_id.get(evidence["asset_id"], 0.9),
+            text=evidence["content"],
+        )
+
+    def evidence_logits(self, row, *, entity_column, attribute_name, candidates):
+        self.evidence_logit_calls.append(
+            (row[entity_column], attribute_name, tuple(item.evidence_id for item in candidates))
+        )
+        return torch.tensor([self.evidence_logit_by_id.get(item.evidence_id, 0.0) for item in candidates])
 
     def generate_value(self, row, *, attribute_name, evidence):
         self.generation_calls.append((row["Player"], evidence.evidence_id))
@@ -231,10 +242,7 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     bundle = EvidenceBundle(
         "t1",
         2.0,
-        (
-            EvidenceRef("e1", "text", 2.0, 0.5),
-            EvidenceRef("e2", "text", 1.5, 0.5),
-        ),
+        ("e1", "e2"),
         (),
     )
     scorer = CandidateColumnScorer(2)
@@ -266,6 +274,7 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     assert result.augmented_query["rows"][0]["cells"][-1]["text"] == "Barcelona"
     assert result.semantic_joinability.joinable
     assert backend.localization_calls == [("Messi", "e1"), ("Mbappe", "e2")]
+    assert backend.evidence_logit_calls == []
     assert backend.generation_calls == [("Messi", "e1"), ("Mbappe", "e2")]
     assert result.rows[0].evidence["routing_similarity"] == pytest.approx(0.8)
     assert len(backend.embed_batches) == 2
@@ -303,7 +312,7 @@ def test_stage2_skips_rows_without_assigned_evidence():
     bundle = EvidenceBundle(
         "t1",
         2.0,
-        (EvidenceRef("e1", "text", 2.0, 0.6), EvidenceRef("e2", "text", 1.0, 0.4)),
+        ("e1", "e2"),
         (),
     )
     scorer = CandidateColumnScorer(2)
@@ -327,9 +336,53 @@ def test_stage2_skips_rows_without_assigned_evidence():
     )
 
     assert backend.localization_calls == [("Messi", "e1"), ("Messi", "e2")]
+    assert backend.evidence_logit_calls == [("Messi", "Club", ("e1", "e2"))]
     assert backend.generation_calls == [("Messi", "e1")]
     assert result.rows[1].value == ""
     assert result.rows[1].evidence is None
+
+
+def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
+    query = _table(
+        "q1",
+        ["Player", "Country"],
+        [["Messi", "Argentina"], ["Mbappe", "France"]],
+        query_entity_col=0,
+    )
+    target = _table("t1", ["Country", "Club"], [["Argentina", "Barcelona"], ["France", "PSG"]])
+    bundle = EvidenceBundle(
+        "t1",
+        2.0,
+        ("text", "image"),
+        (),
+    )
+    scorer = CandidateColumnScorer(2)
+    with torch.no_grad():
+        scorer.weight.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+        scorer.weight.bias.zero_()
+    backend = FakeBackend()
+    backend.localization_score_by_id = {"text": 0.99, "image": 0.01}
+    backend.evidence_logit_by_id = {"text": -1.0, "image": 2.0}
+
+    result = Stage2Verifier(
+        backend,
+        scorer,
+        evidence_router=FakeRouter({"text": 0, "image": 0}),
+    ).verify(
+        query,
+        [bundle],
+        {"t1": target},
+        {
+            "text": {"asset_id": "text", "asset_type": "text", "content": "text support"},
+            "image": {"asset_id": "image", "asset_type": "image", "content": "image support"},
+        },
+    )
+
+    assert backend.evidence_logit_calls == [("Messi", "Club", ("text", "image"))]
+    assert backend.generation_calls == [("Messi", "image")]
+    assert result.rows[0].evidence["evidence_id"] == "image"
+    assert result.rows[0].evidence["localization_score"] == pytest.approx(0.01)
+    assert result.rows[0].evidence["selection_logit"] == pytest.approx(2.0)
 
 
 def test_qwen_reader_places_all_evidence_in_one_forward():
@@ -370,6 +423,58 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     assert "Evidence 2 (e2)" in rendered_text
 
 
+def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    captured_content = []
+
+    class Tokenizer:
+        @staticmethod
+        def encode(value, *, add_special_tokens):
+            assert not add_special_tokens
+            return {"A": [3], "B": [7]}[value]
+
+    backend.processor = type("Processor", (), {"tokenizer": Tokenizer()})()
+
+    def inputs(content, *, generation_prompt):
+        assert generation_prompt
+        captured_content.extend(content)
+        return {"input_ids": torch.tensor([[1, 2]])}
+
+    class RerankerModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, **kwargs):
+            assert kwargs["logits_to_keep"] == 1
+            self.calls += 1
+            logits = torch.zeros(1, 1, 8)
+            logits[0, 0, 3] = -1.0
+            logits[0, 0, 7] = 2.0
+            return type("Output", (), {"logits": logits})()
+
+    backend._inputs = inputs
+    backend.model = RerankerModel()
+    image = object()
+
+    logits = backend.evidence_logits(
+        {"Player": "Messi", "Country": "Argentina"},
+        entity_column="Player",
+        attribute_name="Club",
+        candidates=[
+            LocalizedEvidence("text", "text", 0.99, text="Messi played for Barcelona."),
+            LocalizedEvidence("image", "image", 0.01, image=image),
+        ],
+    )
+
+    assert backend.model.calls == 1
+    assert logits.tolist() == [-1.0, 2.0]
+    assert [item["image"] for item in captured_content if item["type"] == "image"] == [image]
+    rendered_text = "\n".join(item.get("text", "") for item in captured_content)
+    assert "Candidate A (text, text)" in rendered_text
+    assert "Candidate B (image, image)" in rendered_text
+    assert "Valid labels: A, B" in rendered_text
+
+
 def test_qwen35_focus_hooks_only_full_attention_layers():
     class FullAttentionLayer(torch.nn.Module):
         def __init__(self):
@@ -396,7 +501,7 @@ def test_qwen35_focus_hooks_only_full_attention_layers():
 def test_candidate_head_training_updates_only_the_small_rata_scorer():
     query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
-    bundle = EvidenceBundle("t1", 2.0, (EvidenceRef("e1", "text", 2.0, 1.0),), ())
+    bundle = EvidenceBundle("t1", 2.0, ("e1",), ())
     example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
     objects = Stage2ObjectIndex(
         {"q1": query},

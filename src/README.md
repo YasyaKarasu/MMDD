@@ -229,8 +229,15 @@ relevance maps over text or image tokens, multiplies and normalizes them, and
 averages the maps over layers. Text evidence is processed in overlapping token
 windows and reduced to a coherent high-relevance span. Image maps are
 Gaussian-smoothed; FOCUS-style separated anchors, adaptive ROI expansion, NMS,
-and an existence confidence pass select the crop. The best selected span/crop
-per row is then used to generate the bridge value. The augmented query column
+and an existence confidence pass select the crop. These localization scores are
+modality-local and are never compared across evidence objects. All localized
+text spans and image crops routed to one row are instead placed in one
+multimodal prompt with fixed single-letter labels. The Qwen next-token logits
+for those labels form one row-local listwise decision, and the highest-logit
+candidate is used to generate the bridge value. Rows with one candidate skip
+the redundant reranker forward. Aggregated retrieval path scores determine the
+top-k evidence set but do not modify this final selection. Candidate order and
+labels remain fixed; no order rotation is applied. The augmented query column
 is accepted only when enough query rows semantically match values in the
 selected target column. The output contains both row-level provenance and the
 materialized `augmented_query` table.
