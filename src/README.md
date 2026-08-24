@@ -27,15 +27,23 @@ from an unspecified external list later.
 `cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores both feature
 granularities required by the method: pooling-before hidden states for the
 Teacher and the normalized final object embedding for the Student. Its input
-is JSONL. Text and image objects use `text` and/or a local `image` path. A
-table additionally supplies `table_parts`, with schema text first and one
+is JSONL. Text and image objects use `text` and/or a local `image` path. Every
+object also carries its retrieval identity in `embedding_role`: query tables
+use `query`, candidate tables use `target`, and bridge assets use `evidence`.
+A table additionally supplies `table_parts`, with schema text first and one
 entry per example row after it. Every part must occur in order within `text`:
 
 ```json
-{"object_id":"q1","object_type":"table","text":"Columns: player | country\nRow: Messi | Argentina","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
-{"object_id":"e1","object_type":"text","text":"Lionel Messi represents Argentina."}
-{"object_id":"i1","object_type":"image","image":"images/i1.jpg","text":"independent evidence image"}
+{"object_id":"q1","object_type":"table","embedding_role":"query","text":"Columns: player | country\nRow: Messi | Argentina","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
+{"object_id":"e1","object_type":"text","embedding_role":"evidence","text":"Lionel Messi represents Argentina."}
+{"object_id":"i1","object_type":"image","embedding_role":"evidence","image":"images/i1.jpg","text":"independent evidence image"}
 ```
+
+The encoder uses separate instructions for query tables, query-row routing
+views, target tables, text evidence, and image evidence. They emphasize join
+keys and row identity on the query side, attributes offered by target tables,
+explicitly stated facts in text, and visually grounded facts in images.
+`--instruction` remains available as an explicit global override.
 
 Each table is encoded once for its Teacher/Student features. The cache uses
 tokenizer offsets to retain the schema/row tokens from that same sequence and

@@ -77,6 +77,7 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
 
     assert set(artifacts) == {"stage1_objects", "edge_lists", "target_lists", "stage1_corpus"}
     table_object = next(record for record in artifacts["stage1_objects"] if record["object_id"] == "q")
+    assert table_object["embedding_role"] == "query"
     assert table_object["text"] == "\n".join(table_object["table_parts"])
     assert table_object["row_routing_texts"] == [
         "Columns: Player | Country\nRow: Messi | Argentina",
@@ -85,7 +86,12 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     target_object = next(
         record for record in artifacts["stage1_objects"] if record["object_id"] == "positive"
     )
+    assert target_object["embedding_role"] == "target"
     assert "row_routing_texts" not in target_object
+    evidence_object = next(
+        record for record in artifacts["stage1_objects"] if record["object_id"] == "e_positive"
+    )
+    assert evidence_object["embedding_role"] == "evidence"
     candidates = artifacts["target_lists"][0]["candidates"]
     negatives = {candidate["negative_source"]: candidate for candidate in candidates[1:]}
     assert set(negatives) == {

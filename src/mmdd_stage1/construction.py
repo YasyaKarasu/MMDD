@@ -58,12 +58,14 @@ def _table_object(
     table: dict[str, Any],
     max_rows: int,
     *,
+    embedding_role: str,
     cache_row_embeddings: bool = False,
 ) -> dict[str, Any]:
     parts = serialize_table_parts(table, max_rows)
     record = {
         "object_id": str(table.get("table_id") or table["object_id"]),
         "object_type": "table",
+        "embedding_role": embedding_role,
         "text": "\n".join(parts),
         "table_parts": parts,
     }
@@ -75,7 +77,11 @@ def _table_object(
 def _asset_object(asset: dict[str, Any], dataset_root: Path) -> dict[str, Any]:
     asset_id = str(asset["asset_id"])
     asset_type = str(asset["asset_type"])
-    record = {"object_id": asset_id, "object_type": asset_type}
+    record = {
+        "object_id": asset_id,
+        "object_type": asset_type,
+        "embedding_role": "evidence",
+    }
     if asset_type == "text":
         record["text"] = clean_text(asset.get("content"))
     elif asset_type == "image":
@@ -261,10 +267,18 @@ def build_stage1_training_artifacts(
             positives_by_query[query_id].append(target_id)
 
     query_objects = {
-        query_id: _table_object(table, max_rows, cache_row_embeddings=True)
+        query_id: _table_object(
+            table,
+            max_rows,
+            embedding_role="query",
+            cache_row_embeddings=True,
+        )
         for query_id, table in queries.items()
     }
-    target_objects = {target_id: _table_object(table, max_rows) for target_id, table in targets.items()}
+    target_objects = {
+        target_id: _table_object(table, max_rows, embedding_role="target")
+        for target_id, table in targets.items()
+    }
     asset_objects = [_asset_object(asset, dataset_root) for asset in assets]
     object_ids = [*query_objects, *target_objects, *(record["object_id"] for record in asset_objects)]
     if len(object_ids) != len(set(object_ids)):

@@ -17,6 +17,84 @@ from torch.nn import functional as F
 from mmdd_stage1.features import normalize_object_type
 
 
+PROMPT_VERSION = "role_modality_v1"
+EMBEDDING_INSTRUCTIONS = {
+    ("query", "table"): (
+        "Represent this query table for directed multimodal joinability retrieval. "
+        "Emphasize its visible entity and key columns, row values, schema, and context "
+        "that identify what each row is about, so compatible target tables and bridge "
+        "evidence can be found. Do not infer missing attributes or relationships not "
+        "present in the table."
+    ),
+    ("query_row", "table"): (
+        "Represent this single query row together with its table schema and context for "
+        "assigning relevant multimodal evidence to that row. Emphasize the row's entity "
+        "identity, key values, qualifiers, and disambiguating context. Do not infer "
+        "missing attributes."
+    ),
+    ("target", "table"): (
+        "Represent this candidate target table for directed joinability retrieval. "
+        "Emphasize the entities and join-key values it covers, its schema and context, "
+        "and the factual attributes it can provide to a compatible query table. Preserve "
+        "distinctions between columns and do not assume a relationship to any particular "
+        "query."
+    ),
+    ("evidence", "text"): (
+        "Represent this text as independent bridge evidence for directed multimodal "
+        "joinability retrieval. Emphasize explicitly stated entities, aliases, attributes, "
+        "values, and relations that can connect a query-table row to a compatible target "
+        "table. Do not assume a relationship to any particular table or add facts not "
+        "expressed in the text."
+    ),
+    ("evidence", "image"): (
+        "Represent this image as independent bridge evidence for directed multimodal "
+        "joinability retrieval. Emphasize visually grounded entities, objects, scenes, "
+        "text, attributes, and relations that can connect a query-table row to a "
+        "compatible target table. Do not infer identities or facts that are not visible "
+        "in the image or supplied label."
+    ),
+}
+
+
+def embedding_instructions(
+    record: dict[str, Any],
+    object_type: str,
+    instruction_override: str | None = None,
+) -> tuple[str, str | None, str]:
+    """Return the object instruction, optional query-row instruction, and role."""
+
+    role = record.get("embedding_role")
+    if role is None:
+        if object_type == "table":
+            role = "query" if record.get("row_routing_texts") is not None else "target"
+        else:
+            role = "evidence"
+    role = str(role)
+    key = (role, object_type)
+    if key not in EMBEDDING_INSTRUCTIONS:
+        expected = ", ".join(
+            f"{expected_role}/{expected_type}"
+            for expected_role, expected_type in EMBEDDING_INSTRUCTIONS
+            if expected_role != "query_row"
+        )
+        raise ValueError(
+            f"{record.get('object_id')}: unsupported embedding role/modality "
+            f"{role}/{object_type}; expected one of: {expected}"
+        )
+
+    object_instruction = str(
+        record.get("instruction") or instruction_override or EMBEDDING_INSTRUCTIONS[key]
+    )
+    row_instruction = None
+    if role == "query" and object_type == "table":
+        row_instruction = str(
+            record.get("row_instruction")
+            or instruction_override
+            or EMBEDDING_INSTRUCTIONS[("query_row", "table")]
+        )
+    return object_instruction, row_instruction, role
+
+
 def _load_embedder_class(model_dir: Path):
     script = model_dir / "scripts" / "qwen3_vl_embedding.py"
     if not script.is_file():
@@ -141,14 +219,17 @@ def build_object_features(
     record: dict[str, Any],
     *,
     input_dir: Path,
-    instruction: str,
+    instruction: str | None,
     storage_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     object_type = normalize_object_type(str(record["object_type"]))
+    object_instruction, row_instruction, _ = embedding_instructions(
+        record, object_type, instruction
+    )
     item = {
         "text": record.get("text"),
         "image": _resolve_image(record, input_dir),
-        "instruction": record.get("instruction", instruction),
+        "instruction": object_instruction,
     }
     embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
     payload = {
@@ -182,7 +263,7 @@ def build_object_features(
                 [
                     {
                         "text": text,
-                        "instruction": record.get("instruction", instruction),
+                        "instruction": row_instruction,
                     }
                     for text in row_routing_texts
                 ],
@@ -220,10 +301,15 @@ def run(args: argparse.Namespace) -> None:
 
     model_dir = Path(args.model_dir).resolve()
     metadata = {
-        "format_version": 3,
+        "format_version": 4,
         "model_dir": str(model_dir),
         "dtype": args.dtype,
-        "instruction": args.instruction,
+        "prompt_version": PROMPT_VERSION,
+        "embedding_instructions": {
+            f"{role}_{object_type}": instruction
+            for (role, object_type), instruction in EMBEDDING_INSTRUCTIONS.items()
+        },
+        "instruction_override": getattr(args, "instruction", None),
         "table_pooling": "single_forward_token_groups",
     }
     metadata_path = output_dir / "metadata.json"
@@ -285,12 +371,15 @@ def run(args: argparse.Namespace) -> None:
             if object_id not in pending_ids:
                 continue
             object_type = normalize_object_type(str(record["object_type"]))
+            _, _, embedding_role = embedding_instructions(
+                record, object_type, getattr(args, "instruction", None)
+            )
             source_fingerprint = _source_fingerprint(record)
             payload = build_object_features(
                 embedder,
                 record,
                 input_dir=input_path.parent,
-                instruction=args.instruction,
+                instruction=getattr(args, "instruction", None),
                 storage_dtype=torch_dtype,
             )
             name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
@@ -302,6 +391,7 @@ def run(args: argparse.Namespace) -> None:
             manifest_record = {
                 "object_id": object_id,
                 "object_type": object_type,
+                "embedding_role": embedding_role,
                 "feature_path": relative_path.as_posix(),
                 "source_fingerprint": source_fingerprint,
             }
@@ -323,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument(
         "--instruction",
-        default="Represent this object for directed logical joinability discovery.",
+        help="Explicitly override all role- and modality-specific embedding instructions.",
     )
     return parser.parse_args()
 

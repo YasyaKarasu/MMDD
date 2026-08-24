@@ -28,7 +28,7 @@ from mmdd_stage1.training import (
     train_teacher_edges,
     train_teacher_paths,
 )
-from cache_stage1_features import build_object_features
+from cache_stage1_features import EMBEDDING_INSTRUCTIONS, build_object_features, embedding_instructions
 
 
 def feature(object_id: str, object_type: str, value: float) -> ObjectFeatures:
@@ -290,10 +290,12 @@ class FakeQwenEmbedder:
 
     def __init__(self):
         self.forward_calls = 0
+        self.instructions = []
         self.processor = self.Processor()
 
     def format_model_input(self, *, text=None, image=None, instruction=None):
-        del image, instruction
+        del image
+        self.instructions.append(instruction)
         return text or "image"
 
     def _preprocess_inputs(self, conversations):
@@ -345,6 +347,7 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
         {
             "object_id": "q",
             "object_type": "table",
+            "embedding_role": "query",
             "text": "schema player country\nrow Messi Argentina\nrow Mbappe France",
             "table_parts": [
                 "schema player country",
@@ -357,13 +360,43 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
             ],
         },
         input_dir=tmp_path,
-        instruction="represent",
+        instruction=None,
         storage_dtype=torch.float16,
     )
 
     assert embedder.forward_calls == 2
     assert payload["row_embeddings"].shape == (2, 4)
     assert torch.allclose(payload["row_embeddings"].norm(dim=-1), torch.ones(2))
+    assert embedder.instructions == [
+        EMBEDDING_INSTRUCTIONS[("query", "table")],
+        EMBEDDING_INSTRUCTIONS[("query", "table")],
+        EMBEDDING_INSTRUCTIONS[("query_row", "table")],
+        EMBEDDING_INSTRUCTIONS[("query_row", "table")],
+    ]
+
+
+def test_embedding_instructions_distinguish_role_modality_and_query_rows():
+    query, query_row, role = embedding_instructions(
+        {"object_id": "q", "embedding_role": "query"}, "table"
+    )
+    target, target_row, _ = embedding_instructions(
+        {"object_id": "t", "embedding_role": "target"}, "table"
+    )
+    text, text_row, _ = embedding_instructions(
+        {"object_id": "e1", "embedding_role": "evidence"}, "text"
+    )
+    image, image_row, _ = embedding_instructions(
+        {"object_id": "e2", "embedding_role": "evidence"}, "image"
+    )
+
+    assert role == "query"
+    assert query == EMBEDDING_INSTRUCTIONS[("query", "table")]
+    assert query_row == EMBEDDING_INSTRUCTIONS[("query_row", "table")]
+    assert target == EMBEDDING_INSTRUCTIONS[("target", "table")]
+    assert text == EMBEDDING_INSTRUCTIONS[("evidence", "text")]
+    assert image == EMBEDDING_INSTRUCTIONS[("evidence", "image")]
+    assert target_row is text_row is image_row is None
+    assert len({query, query_row, target, text, image}) == 5
 
 
 def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
