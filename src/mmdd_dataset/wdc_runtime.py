@@ -221,16 +221,6 @@ def manifest_shards(
     return tuple(shard_root / record["path"] for record in records)
 
 
-def iter_manifest_artifact(
-    manifest_path: Path,
-    artifact: str,
-    *,
-    root: Path | None = None,
-) -> Iterator[dict[str, Any]]:
-    for path in manifest_shards(manifest_path, artifact, root=root):
-        yield from iter_jsonl(path)
-
-
 def check_disk_space(path: Path, estimated_bytes: int, reserve_bytes: int) -> None:
     probe = path.resolve()
     while not probe.exists() and probe != probe.parent:

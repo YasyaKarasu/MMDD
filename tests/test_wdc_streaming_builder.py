@@ -39,7 +39,7 @@ from mmdd_dataset.utils import get_cell  # noqa: E402
 from mmdd_dataset.wdc_runtime import (  # noqa: E402
     iter_dataset_artifact,
     iter_jsonl,
-    iter_manifest_artifact,
+    manifest_shards,
 )
 
 
@@ -96,11 +96,8 @@ def config_for(
 
 
 def selected_records(config: WdcPipelineConfig, artifact: str) -> list[dict[str, Any]]:
-    return list(
-        iter_manifest_artifact(
-            config.work_dir / "select_sample" / "manifest.json", artifact
-        )
-    )
+    manifest = config.work_dir / "select_sample" / "manifest.json"
+    return [record for path in manifest_shards(manifest, artifact) for record in iter_jsonl(path)]
 
 
 def test_selection_streams_catalog_and_seed_is_stable(
