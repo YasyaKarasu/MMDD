@@ -9,9 +9,11 @@ from typing import Any, Protocol, Sequence
 import torch
 
 from .data import column_name, column_values, local_column_index, row_values
+from .routing import EvidenceRowAssignment
 from .verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
+    EvidenceRef,
     SemanticJoinability,
     joint_candidate_probabilities,
     semantic_joinability,
@@ -84,7 +86,7 @@ class Stage2Backend(Protocol):
         self,
         query: dict[str, Any],
         target: dict[str, Any],
-        evidence: Sequence[tuple[dict[str, Any], float]],
+        evidence: Sequence[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     def localize_evidence(
@@ -107,12 +109,23 @@ class Stage2Backend(Protocol):
     def embed_texts(self, values: Sequence[str]) -> torch.Tensor: ...
 
 
+class EvidenceRowRouter(Protocol):
+    def assign(
+        self,
+        query_id: str,
+        evidence_ids: Sequence[str],
+        *,
+        row_count: int,
+    ) -> tuple[EvidenceRowAssignment, ...]: ...
+
+
 class Stage2Verifier:
     def __init__(
         self,
         backend: Stage2Backend,
         scorer: CandidateColumnScorer,
         *,
+        evidence_router: EvidenceRowRouter | None = None,
         similarity_threshold: float = 0.8,
         min_row_coverage: float = 0.6,
     ) -> None:
@@ -120,6 +133,7 @@ class Stage2Verifier:
             raise ValueError("Candidate scorer and Stage-2 backend dimensions disagree")
         self.backend = backend
         self.scorer = scorer
+        self.evidence_router = evidence_router
         self.similarity_threshold = similarity_threshold
         self.min_row_coverage = min_row_coverage
 
@@ -134,8 +148,8 @@ class Stage2Verifier:
         logits = []
         for bundle in bundles:
             target = targets[bundle.target_id]
-            weighted_evidence = [(evidence[item.evidence_id], item.weight) for item in bundle.evidence]
-            open_states, close_states = self.backend.reader_states(query, target, weighted_evidence)
+            selected_evidence = [evidence[item.evidence_id] for item in bundle.evidence]
+            open_states, close_states = self.backend.reader_states(query, target, selected_evidence)
             if open_states.shape[0] != len(target["columns"]):
                 raise ValueError(f"{bundle.target_id}: reader did not return one marker pair per column")
             logits.append(self.scorer(open_states.to(device), close_states.to(device)))
@@ -191,16 +205,48 @@ class Stage2Verifier:
         targets: dict[str, dict[str, Any]],
         target_ids: Sequence[str],
     ) -> tuple[DirectVerification, ...]:
+        if not target_ids:
+            return ()
+        query_columns = [
+            (int(column["column_index"]), column_values(query, int(column["column_index"])))
+            for column in query["columns"]
+        ]
+        target_columns = {
+            target_id: [
+                (int(column["column_index"]), column_values(targets[target_id], int(column["column_index"])))
+                for column in targets[target_id]["columns"]
+            ]
+            for target_id in target_ids
+        }
+        ordered_columns = [values for _, values in query_columns]
+        ordered_columns.extend(values for target_id in target_ids for _, values in target_columns[target_id])
+        flat_values = [value for values in ordered_columns for value in values]
+        all_embeddings = self.backend.embed_texts(flat_values)
+        embeddings = []
+        offset = 0
+        for values in ordered_columns:
+            embeddings.append(all_embeddings[offset : offset + len(values)])
+            offset += len(values)
+        query_embeddings = embeddings[: len(query_columns)]
+        target_embeddings = iter(embeddings[len(query_columns) :])
+        embedded_targets = {
+            target_id: [(column, values, next(target_embeddings)) for column, values in target_columns[target_id]]
+            for target_id in target_ids
+        }
+
         verified = []
         for target_id in target_ids:
-            target = targets[target_id]
             candidates = []
-            for query_column in query["columns"]:
-                query_index = int(query_column["column_index"])
-                query_column_values = column_values(query, query_index)
-                for target_column in target["columns"]:
-                    target_index = int(target_column["column_index"])
-                    result = self._semantic_check(query_column_values, column_values(target, target_index))
+            for (query_index, query_values), query_vectors in zip(query_columns, query_embeddings):
+                for target_index, target_values, target_vectors in embedded_targets[target_id]:
+                    result = semantic_joinability(
+                        query_values,
+                        target_values,
+                        query_embeddings=query_vectors,
+                        target_embeddings=target_vectors,
+                        similarity_threshold=self.similarity_threshold,
+                        min_coverage=self.min_row_coverage,
+                    )
                     candidates.append((result.coverage, result.mean_similarity, query_index, target_index, result))
             _, _, query_index, target_index, result = max(candidates, key=lambda item: item[:2])
             if result.joinable:
@@ -223,16 +269,50 @@ class Stage2Verifier:
 
         selection = self.select_column(query, bundles, targets, evidence)
         selected_bundle = next(bundle for bundle in bundles if bundle.target_id == selection.target_id)
+        if self.evidence_router is None:
+            raise ValueError("Stage-2 row filling requires an evidence router")
+        assignments = self.evidence_router.assign(
+            query_id,
+            selected_bundle.evidence_ids,
+            row_count=len(query["rows"]),
+        )
+        assignment_by_evidence = {assignment.evidence_id: assignment for assignment in assignments}
+        if set(assignment_by_evidence) != set(selected_bundle.evidence_ids) or len(assignments) != len(
+            selected_bundle.evidence
+        ):
+            raise ValueError("Evidence router must assign every selected evidence exactly once")
+        references_by_row: list[list[tuple[EvidenceRef, EvidenceRowAssignment]]] = [
+            [] for _ in query["rows"]
+        ]
+        for reference in selected_bundle.evidence:
+            assignment = assignment_by_evidence[reference.evidence_id]
+            if not 0 <= assignment.row_position < len(query["rows"]):
+                raise ValueError(f"Evidence router returned invalid row position {assignment.row_position}")
+            references_by_row[assignment.row_position].append((reference, assignment))
+
         if "query_entity_col" in query:
             entity_index = local_column_index(query, int(query["query_entity_col"]))
         else:
             entity_index = int(query["columns"][0]["column_index"])
         entity_name = column_name(query, entity_index)
         predictions = []
-        for row in query["rows"]:
+        for row_position, row in enumerate(query["rows"]):
             visible_row = row_values(query, row)
+            routed = references_by_row[row_position]
+            if not routed:
+                predictions.append(
+                    RowPrediction(
+                        row_id=int(row["row_id"]),
+                        entity=visible_row[entity_name],
+                        attribute=selection.column_name,
+                        value="",
+                        evidence=None,
+                    )
+                )
+                continue
+
             localized = []
-            for reference in selected_bundle.evidence:
+            for reference, assignment in routed:
                 item = self.backend.localize_evidence(
                     visible_row,
                     entity_column=entity_name,
@@ -240,20 +320,22 @@ class Stage2Verifier:
                     evidence=evidence[reference.evidence_id],
                 )
                 item.relevance *= reference.weight
-                localized.append(item)
-            best = max(localized, key=lambda item: item.relevance)
+                localized.append((item, assignment))
+            best, best_assignment = max(localized, key=lambda pair: pair[0].relevance)
             value = self.backend.generate_value(
                 visible_row,
                 attribute_name=selection.column_name,
                 evidence=best,
             )
+            evidence_record = best.record()
+            evidence_record["routing_similarity"] = best_assignment.similarity
             predictions.append(
                 RowPrediction(
                     row_id=int(row["row_id"]),
                     entity=visible_row[entity_name],
                     attribute=selection.column_name,
                     value=value,
-                    evidence=best.record(),
+                    evidence=evidence_record,
                 )
             )
 

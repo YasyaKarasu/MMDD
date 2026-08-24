@@ -24,6 +24,9 @@ from mmdd_stage2.verifier import (
     semantic_joinability,
 )
 from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
+from mmdd_stage2.qwen import QwenStage2Backend
+from mmdd_stage2.routing import EvidenceRowAssignment, SimilarityEvidenceRouter
+from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage2.data import Stage2ObjectIndex
 from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
 from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
@@ -150,17 +153,26 @@ def test_semantic_joinability_requires_row_coverage():
 class FakeBackend:
     hidden_dim = 2
 
+    def __init__(self):
+        self.embed_batches = []
+        self.localization_calls = []
+        self.generation_calls = []
+        self.reader_evidence_batches = []
+
     def reader_states(self, query, target, evidence):
-        assert sum(weight for _, weight in evidence) == pytest.approx(1.0)
+        self.reader_evidence_batches.append(tuple(item["asset_id"] for item in evidence))
         return torch.tensor([[0.0, 0.0], [4.0, 0.0]]), torch.zeros(2, 2)
 
     def localize_evidence(self, row, *, entity_column, attribute_name, evidence):
+        self.localization_calls.append((row[entity_column], evidence["asset_id"]))
         return LocalizedEvidence(evidence["asset_id"], evidence["asset_type"], 0.9, text=evidence["content"])
 
     def generate_value(self, row, *, attribute_name, evidence):
+        self.generation_calls.append((row["Player"], evidence.evidence_id))
         return {"Messi": "Barcelona", "Mbappe": "PSG"}[row["Player"]]
 
     def embed_texts(self, values):
+        self.embed_batches.append(tuple(values))
         vectors = {
             "Barcelona": [1.0, 0.0],
             "PSG": [0.0, 1.0],
@@ -168,6 +180,19 @@ class FakeBackend:
             "France": [0.6, 0.8],
         }
         return torch.tensor([vectors.get(value, [0.0, 0.0]) for value in values])
+
+
+class FakeRouter:
+    def __init__(self, row_by_evidence):
+        self.row_by_evidence = row_by_evidence
+
+    def assign(self, query_id, evidence_ids, *, row_count):
+        assert query_id == "q1"
+        assert row_count == 2
+        return tuple(
+            EvidenceRowAssignment(evidence_id, self.row_by_evidence[evidence_id], 0.8)
+            for evidence_id in evidence_ids
+        )
 
 
 def _table(table_id, columns, rows, **extra):
@@ -203,17 +228,34 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
         ["Country", "Club"],
         [["Argentina", "Barcelona"], ["France", "PSG"]],
     )
-    bundle = EvidenceBundle("t1", 2.0, (EvidenceRef("e1", "text", 2.0, 1.0),), ())
+    bundle = EvidenceBundle(
+        "t1",
+        2.0,
+        (
+            EvidenceRef("e1", "text", 2.0, 0.5),
+            EvidenceRef("e2", "text", 1.5, 0.5),
+        ),
+        (),
+    )
     scorer = CandidateColumnScorer(2)
     with torch.no_grad():
         scorer.weight.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
         scorer.weight.bias.zero_()
 
-    result = Stage2Verifier(FakeBackend(), scorer, min_row_coverage=1.0).verify(
+    backend = FakeBackend()
+    result = Stage2Verifier(
+        backend,
+        scorer,
+        evidence_router=FakeRouter({"e1": 0, "e2": 1}),
+        min_row_coverage=1.0,
+    ).verify(
         query,
         [bundle],
         {"t1": target},
-        {"e1": {"asset_id": "e1", "asset_type": "text", "content": "support"}},
+        {
+            "e1": {"asset_id": "e1", "asset_type": "text", "content": "Messi support"},
+            "e2": {"asset_id": "e2", "asset_type": "text", "content": "Mbappe support"},
+        },
         direct_target_ids=["t1"],
     )
 
@@ -223,6 +265,132 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     assert result.augmented_query["columns"][-1]["column_name"] == "Club"
     assert result.augmented_query["rows"][0]["cells"][-1]["text"] == "Barcelona"
     assert result.semantic_joinability.joinable
+    assert backend.localization_calls == [("Messi", "e1"), ("Mbappe", "e2")]
+    assert backend.generation_calls == [("Messi", "e1"), ("Mbappe", "e2")]
+    assert result.rows[0].evidence["routing_similarity"] == pytest.approx(0.8)
+    assert len(backend.embed_batches) == 2
+    assert len(backend.embed_batches[0]) == 8
+
+
+def test_similarity_router_assigns_each_evidence_to_its_nearest_row():
+    store = FeatureStore(
+        {
+            "q1": ObjectFeatures(
+                "q1",
+                "table",
+                torch.tensor([1.0, 1.0]),
+                row_embeddings=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            ),
+            "e1": ObjectFeatures("e1", "text", torch.tensor([0.9, 0.1])),
+            "e2": ObjectFeatures("e2", "image", torch.tensor([0.1, 0.9])),
+        }
+    )
+
+    assignments = SimilarityEvidenceRouter(store).assign("q1", ["e1", "e2"], row_count=2)
+
+    assert [(item.evidence_id, item.row_position) for item in assignments] == [("e1", 0), ("e2", 1)]
+    assert all(item.similarity > 0.99 for item in assignments)
+
+
+def test_stage2_skips_rows_without_assigned_evidence():
+    query = _table(
+        "q1",
+        ["Player", "Country"],
+        [["Messi", "Argentina"], ["Mbappe", "France"]],
+        query_entity_col=0,
+    )
+    target = _table("t1", ["Country", "Club"], [["Argentina", "Barcelona"], ["France", "PSG"]])
+    bundle = EvidenceBundle(
+        "t1",
+        2.0,
+        (EvidenceRef("e1", "text", 2.0, 0.6), EvidenceRef("e2", "text", 1.0, 0.4)),
+        (),
+    )
+    scorer = CandidateColumnScorer(2)
+    with torch.no_grad():
+        scorer.weight.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+        scorer.weight.bias.zero_()
+    backend = FakeBackend()
+
+    result = Stage2Verifier(
+        backend,
+        scorer,
+        evidence_router=FakeRouter({"e1": 0, "e2": 0}),
+    ).verify(
+        query,
+        [bundle],
+        {"t1": target},
+        {
+            "e1": {"asset_id": "e1", "asset_type": "text", "content": "first"},
+            "e2": {"asset_id": "e2", "asset_type": "text", "content": "second"},
+        },
+    )
+
+    assert backend.localization_calls == [("Messi", "e1"), ("Messi", "e2")]
+    assert backend.generation_calls == [("Messi", "e1")]
+    assert result.rows[1].value == ""
+    assert result.rows[1].evidence is None
+
+
+def test_qwen_reader_places_all_evidence_in_one_forward():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    backend.marker_ids = {"<|object_ref_start|>": 10, "<|object_ref_end|>": 11}
+    captured_content = []
+
+    def inputs(content, *, generation_prompt):
+        assert not generation_prompt
+        captured_content.extend(content)
+        return {"input_ids": torch.tensor([[10, 1, 11, 10, 2, 11]])}
+
+    class ReaderModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return type("Output", (), {"last_hidden_state": torch.arange(12).reshape(1, 6, 2)})()
+
+    reader_model = ReaderModel()
+    backend._inputs = inputs
+    backend.model = type("Model", (), {"model": reader_model})()
+    query = _table("q", ["Player"], [["Messi"]])
+    target = _table("t", ["Country", "Club"], [["Argentina", "Barcelona"]])
+    evidence = [
+        {"asset_id": "e1", "asset_type": "text", "content": "first"},
+        {"asset_id": "e2", "asset_type": "text", "content": "second"},
+    ]
+
+    open_states, close_states = backend.reader_states(query, target, evidence)
+
+    assert reader_model.calls == 1
+    assert open_states.shape == close_states.shape == (2, 2)
+    rendered_text = "\n".join(item.get("text", "") for item in captured_content)
+    assert "Evidence 1 (e1)" in rendered_text
+    assert "Evidence 2 (e2)" in rendered_text
+
+
+def test_qwen35_focus_hooks_only_full_attention_layers():
+    class FullAttentionLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = torch.nn.Module()
+            self.self_attn.v_proj = torch.nn.Linear(2, 2, bias=False)
+
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    layers = torch.nn.ModuleList(
+        [torch.nn.Module(), FullAttentionLayer(), torch.nn.Module(), FullAttentionLayer()]
+    )
+    language_model = type("LanguageModel", (), {"layers": layers})()
+    backend.model = type("Model", (), {"model": type("Base", (), {"language_model": language_model})()})()
+    backend.focus_start_layer = 1
+
+    with backend._capture_values() as captured:
+        layers[1].self_attn.v_proj(torch.tensor([[[1.0, 2.0]]]))
+        layers[3].self_attn.v_proj(torch.tensor([[[3.0, 4.0]]]))
+
+    assert len(captured) == 2
+    assert all(value is not None for value in captured)
 
 
 def test_candidate_head_training_updates_only_the_small_rata_scorer():
@@ -256,9 +424,21 @@ def test_candidate_head_training_updates_only_the_small_rata_scorer():
 def test_candidate_scorer_checkpoint_round_trip(tmp_path):
     scorer = CandidateColumnScorer(2)
     path = tmp_path / "stage2.pt"
-    save_candidate_scorer(path, scorer, metadata={"model": "fake"})
+    model_dir = tmp_path / "qwen35"
+    save_candidate_scorer(path, scorer, metadata={"model_dir": str(model_dir)})
 
-    restored = load_candidate_scorer(path, torch.device("cpu"))
+    restored = load_candidate_scorer(
+        path,
+        torch.device("cpu"),
+        expected_model_dir=model_dir,
+    )
 
     assert torch.equal(restored.weight.weight, scorer.weight.weight)
     assert torch.equal(restored.weight.bias, scorer.weight.bias)
+
+    with pytest.raises(ValueError, match="retrain it for the selected Stage-2 backbone"):
+        load_candidate_scorer(
+            path,
+            torch.device("cpu"),
+            expected_model_dir=tmp_path / "old_qwen",
+        )

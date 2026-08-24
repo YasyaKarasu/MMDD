@@ -1,4 +1,4 @@
-"""Local Qwen3-VL backend for the Stage-2 research pipeline."""
+"""Local Qwen3.5 backend for the Stage-2 research pipeline."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from .verifier import best_text_span, focus_relevance, propose_image_regions
 
 
 class QwenStage2Backend:
-    """Expose reader states, FOCUS value features, generation, and embeddings."""
+    """Expose Qwen3.5 reader states, FOCUS features, generation, and embeddings."""
 
     def __init__(
         self,
@@ -45,7 +45,7 @@ class QwenStage2Backend:
         roi_candidates: int = 4,
         max_new_tokens: int = 64,
     ) -> None:
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
         if max_text_evidence_tokens <= 0 or not 0 <= text_overlap_tokens < max_text_evidence_tokens:
             raise ValueError("Text evidence width must be positive and exceed its overlap")
@@ -54,7 +54,7 @@ class QwenStage2Backend:
         self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         self.processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_dir,
             local_files_only=True,
             dtype=dtype_map[dtype],
@@ -105,15 +105,23 @@ class QwenStage2Backend:
 
     @contextmanager
     def _capture_values(self) -> Iterator[list[torch.Tensor | None]]:
-        # v_proj outputs are the value features stored in the autoregressive KV cache.
+        # Qwen3.5 interleaves linear-attention and full-attention layers. FOCUS
+        # uses v_proj features from the later full-attention layers only.
         layers = self.model.model.language_model.layers
-        captured: list[torch.Tensor | None] = [None] * (len(layers) - self.focus_start_layer)
+        value_projections = [
+            layer.self_attn.v_proj
+            for layer in layers[self.focus_start_layer :]
+            if hasattr(layer, "self_attn")
+        ]
+        if not value_projections:
+            raise ValueError("No Qwen3.5 full-attention layers remain after focus_start_layer")
+        captured: list[torch.Tensor | None] = [None] * len(value_projections)
         handles = []
-        for output_index, layer in enumerate(layers[self.focus_start_layer :]):
+        for output_index, projection in enumerate(value_projections):
             def hook(_module: Any, _inputs: Any, output: torch.Tensor, index: int = output_index) -> None:
                 captured[index] = output.detach()[0].float().cpu()
 
-            handles.append(layer.self_attn.v_proj.register_forward_hook(hook))
+            handles.append(projection.register_forward_hook(hook))
         try:
             yield captured
         finally:
@@ -132,12 +140,16 @@ class QwenStage2Backend:
         return [layer for layer in captured if layer is not None], inputs["input_ids"][0].cpu(), inputs
 
     @torch.inference_mode()
-    def _reader_states_one(
+    def reader_states(
         self,
         query: dict[str, Any],
         target: dict[str, Any],
-        evidence: dict[str, Any],
+        evidence: Sequence[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read query, all selected evidence, and target in one context."""
+
+        if not evidence:
+            raise ValueError("Candidate-column reading requires at least one evidence object")
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
@@ -147,14 +159,16 @@ class QwenStage2Backend:
                 ),
             }
         ]
-        label = f"Evidence {evidence['asset_id']}:"
-        if evidence.get("asset_type") == "image":
-            content.extend(
-                [{"type": "text", "text": label}, {"type": "image", "image": self._image_path(evidence)}]
-            )
-        else:
-            text = clean_text(evidence.get("content"))[:12000]
-            content.append({"type": "text", "text": f"{label}\n{text}"})
+        text_limit = max(1, 12000 // len(evidence))
+        for index, item in enumerate(evidence, 1):
+            label = f"\nEvidence {index} ({item['asset_id']}):"
+            if item.get("asset_type") == "image":
+                content.extend(
+                    [{"type": "text", "text": label}, {"type": "image", "image": self._image_path(item)}]
+                )
+            else:
+                text = clean_text(item.get("content"))[:text_limit]
+                content.append({"type": "text", "text": f"{label}\n{text}"})
         content.append(
             {
                 "type": "text",
@@ -170,19 +184,6 @@ class QwenStage2Backend:
             raise ValueError("Candidate marker count changed during Qwen preprocessing")
         hidden = outputs.last_hidden_state[0]
         return hidden[open_positions].float().cpu(), hidden[close_positions].float().cpu()
-
-    def reader_states(
-        self,
-        query: dict[str, Any],
-        target: dict[str, Any],
-        evidence: Sequence[tuple[dict[str, Any], float]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Weight evidence-conditioned RATA states by their Stage-1 path support."""
-
-        states = [(self._reader_states_one(query, target, item), weight) for item, weight in evidence]
-        open_states = sum(weight * pair[0] for pair, weight in states)
-        close_states = sum(weight * pair[1] for pair, weight in states)
-        return open_states, close_states
 
     @staticmethod
     def _image_path(evidence: dict[str, Any]) -> str:

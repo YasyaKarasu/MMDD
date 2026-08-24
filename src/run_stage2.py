@@ -7,10 +7,14 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
+
+from mmdd_stage1.features import FeatureStore
 from mmdd_stage2.checkpoints import load_candidate_scorer
 from mmdd_stage2.data import direct_target_ids, iter_retrieval_results, load_stage2_objects
 from mmdd_stage2.pipeline import Stage2Verifier
 from mmdd_stage2.qwen import QwenStage2Backend
+from mmdd_stage2.routing import SimilarityEvidenceRouter
 from mmdd_stage2.verifier import build_evidence_bundles
 
 
@@ -30,6 +34,11 @@ def run(args: argparse.Namespace) -> dict:
         bundles,
         extra_target_ids=direct_ids,
     )
+    scorer = load_candidate_scorer(
+        Path(args.scorer_checkpoint),
+        torch.device("cpu"),
+        expected_model_dir=Path(args.model_dir),
+    )
     backend = QwenStage2Backend(
         Path(args.model_dir),
         device=args.device,
@@ -40,10 +49,12 @@ def run(args: argparse.Namespace) -> dict:
         max_span_tokens=args.max_span_tokens,
         roi_candidates=args.roi_candidates,
     )
-    scorer = load_candidate_scorer(Path(args.scorer_checkpoint), backend.device)
+    scorer.to(backend.device)
+    evidence_router = SimilarityEvidenceRouter(FeatureStore.from_path(Path(args.stage1_features)))
     verifier = Stage2Verifier(
         backend,
         scorer,
+        evidence_router=evidence_router,
         similarity_threshold=args.similarity_threshold,
         min_row_coverage=args.min_row_coverage,
     )
@@ -69,13 +80,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--retrieval-results", required=True)
     parser.add_argument("--scorer-checkpoint", required=True)
+    parser.add_argument(
+        "--stage1-features",
+        required=True,
+        help="Feature cache containing query row_embeddings and retrieved evidence embeddings.",
+    )
     parser.add_argument("--query-id")
     parser.add_argument("--output")
-    parser.add_argument("--model-dir", default="hf_models/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--model-dir", default="hf_models/Qwen3.5-9B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--focus-start-layer", type=int, default=14)
-    parser.add_argument("--top-k-evidence", type=int, default=3)
+    parser.add_argument("--top-k-evidence", type=int, default=10)
     parser.add_argument("--max-targets", type=int, default=10)
     parser.add_argument("--max-direct-targets", type=int, default=5)
     parser.add_argument("--max-text-evidence-tokens", type=int, default=1024)

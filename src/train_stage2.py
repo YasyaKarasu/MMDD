@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the Stage-2 RATA candidate-column head with a frozen Qwen3-VL."""
+"""Train the Stage-2 RATA candidate-column head with a frozen Qwen3.5."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def run(args: argparse.Namespace) -> None:
         Path(args.output),
         scorer,
         metadata={
-            "model_dir": str(Path(args.model_dir)),
+            "model_dir": str(Path(args.model_dir).resolve()),
             "top_k_evidence": args.top_k_evidence,
             "max_targets": args.max_targets,
             "history": history,
@@ -58,11 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--retrieval-results", nargs="+", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model-dir", default="hf_models/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--model-dir", default="hf_models/Qwen3.5-9B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--focus-start-layer", type=int, default=14)
-    parser.add_argument("--top-k-evidence", type=int, default=3)
+    parser.add_argument("--top-k-evidence", type=int, default=10)
     parser.add_argument("--max-targets", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
