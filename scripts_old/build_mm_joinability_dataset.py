@@ -2040,6 +2040,19 @@ def normalize_model_base_urls(values: Iterable[str] | str | None) -> list[str]:
 class TransientModelEndpointError(RuntimeError):
     """A model endpoint failure that may succeed when retried later."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_endpoint: str = "",
+        model_kind: str = "",
+        failure_type: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.model_endpoint = clean_text(model_endpoint)
+        self.model_kind = clean_text(model_kind)
+        self.failure_type = clean_text(failure_type)
+
 
 def model_api_key(explicit_value: Any, modality_environment_variable: str) -> str | None:
     for value in (
@@ -3615,7 +3628,12 @@ class LocalAttributeExtractor:
                     body = clean_text(getattr(response, "text", ""))[:500]
                     error_message = f"HTTP {status_code}: {body}"
                     if status_code == 429 or status_code >= 500:
-                        raise TransientModelEndpointError(error_message)
+                        raise TransientModelEndpointError(
+                            error_message,
+                            model_endpoint=base_url,
+                            model_kind=model_kind,
+                            failure_type=f"HTTP{status_code}",
+                        )
                     raise RuntimeError(error_message)
                 response.raise_for_status()
                 data = response.json()
@@ -3629,7 +3647,10 @@ class LocalAttributeExtractor:
                 if is_transient_request_exception(exc):
                     last_error = TransientModelEndpointError(
                         f"{model_kind} model endpoint {base_url} request failed "
-                        f"({type(exc).__name__})"
+                        f"({type(exc).__name__})",
+                        model_endpoint=base_url,
+                        model_kind=model_kind,
+                        failure_type=type(exc).__name__,
                     )
                 else:
                     last_error = exc
@@ -3645,7 +3666,15 @@ class LocalAttributeExtractor:
                 return content
         message = f"Local {model_kind} model call to {base_url} failed: {last_error}"
         if isinstance(last_error, TransientModelEndpointError):
-            raise TransientModelEndpointError(message) from last_error
+            raise TransientModelEndpointError(
+                message,
+                model_endpoint=last_error.model_endpoint or base_url,
+                model_kind=last_error.model_kind or model_kind,
+                failure_type=(
+                    last_error.failure_type
+                    or type(last_error).__name__
+                ),
+            ) from last_error
         raise RuntimeError(message) from last_error
 
     def extraction_prompt(
@@ -4974,6 +5003,13 @@ def extraction_record_from_result(task: ExtractionTask, result: dict[str, Any]) 
     }
     if "error_class" in result:
         record["error_class"] = clean_text(result.get("error_class"))
+    for field_name in (
+        "model_endpoint",
+        "model_kind",
+        "model_failure_type",
+    ):
+        if clean_text(result.get(field_name)):
+            record[field_name] = clean_text(result[field_name])
     return record
 
 
@@ -5002,13 +5038,25 @@ def run_extraction_task(
                 task.candidate_attribute_names,
                 endpoint_pool=endpoint_pool,
             )
-    except TransientModelEndpointError:
+    except TransientModelEndpointError as error:
         result = {
             "attributes": [],
             "raw_response": "",
             "error": "model endpoint temporarily unavailable",
             "error_class": "model_endpoint_transient",
         }
+        diagnostics = {
+            "model_endpoint": error.model_endpoint,
+            "model_kind": error.model_kind,
+            "model_failure_type": error.failure_type,
+        }
+        result.update(
+            {
+                field_name: value
+                for field_name, value in diagnostics.items()
+                if value
+            }
+        )
     except Exception as exc:
         result = {"attributes": [], "raw_response": "", "error": str(exc)}
     record = extraction_record_from_result(task, result)

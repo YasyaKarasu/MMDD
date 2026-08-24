@@ -5,7 +5,6 @@ import sqlite3
 import sys
 import threading
 import time
-import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -556,11 +555,15 @@ class EndpointAwareExtractor(CountingExtractor):
         readiness_error: BaseException | None = None,
         transient_asset_ids: set[str] | None = None,
         transient_error: str = "model endpoint request failed: HTTP 503",
+        transient_endpoint: str = "",
+        transient_failure_type: str = "",
     ) -> None:
         super().__init__()
         self.readiness_error = readiness_error
         self.transient_asset_ids = transient_asset_ids or set()
         self.transient_error = transient_error
+        self.transient_endpoint = transient_endpoint
+        self.transient_failure_type = transient_failure_type
         self.readiness_calls: list[tuple[set[str], float]] = []
 
     def ensure_endpoints_ready(self, *, modalities, timeout_seconds):
@@ -573,7 +576,10 @@ class EndpointAwareExtractor(CountingExtractor):
             with self.lock:
                 self.asset_ids.append(current_asset["asset_id"])
             raise TransientModelEndpointError(
-                self.transient_error
+                self.transient_error,
+                model_endpoint=self.transient_endpoint,
+                model_kind="text",
+                failure_type=self.transient_failure_type,
             )
         return super().extract(current_asset, entity, candidate_attributes)
 
@@ -1116,24 +1122,22 @@ def test_transient_model_error_is_retryable_without_durable_result(
         transient_error="request used Authorization: Bearer SUPERSECRET",
     )
 
-    with pytest.raises(RuntimeError, match="transient model endpoint") as caught:
-        run_model_stage(
-            store,
-            extractor,
-            jobset=jobset,
-            output_root=tmp_path / "outputs",
-        )
-
-    assert "SUPERSECRET" not in str(caught.value)
-    assert "SUPERSECRET" not in "".join(
-        traceback.format_exception(
-            type(caught.value),
-            caught.value,
-            caught.value.__traceback__,
-        )
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        stop_after=1,
+        output_root=tmp_path / "outputs",
     )
+
+    assert result.complete is False
     assert _job_rows(store) == [(jobset.jobs[0].job_id, "retryable")]
     with sqlite3.connect(store.path) as connection:
+        stored_result = connection.execute(
+            "SELECT result_json FROM jobs WHERE job_id = ?",
+            (jobset.jobs[0].job_id,),
+        ).fetchone()[0]
+        assert "SUPERSECRET" not in stored_result
         assert connection.execute(
             "SELECT COUNT(*) FROM model_results"
         ).fetchone() == (0,)
@@ -1169,15 +1173,16 @@ def test_transient_retry_clears_only_stale_uncommitted_prepared_result(
         transient_asset_ids={"stale", "committed"}
     )
 
-    with pytest.raises(RuntimeError, match="transient model endpoint"):
-        run_model_stage(
-            store,
-            extractor,
-            jobset=jobset,
-            group_size=2,
-            output_root=tmp_path / "outputs",
-        )
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        stop_after=2,
+        group_size=2,
+        output_root=tmp_path / "outputs",
+    )
 
+    assert result.complete is False
     assert all(status == "retryable" for _, status in _job_rows(store))
     with sqlite3.connect(store.path) as connection:
         rows = connection.execute(
@@ -1242,15 +1247,16 @@ def test_transient_lease_loss_does_not_abort_other_group_callbacks(
         lose_transient_then_deliver_success,
     )
 
-    with pytest.raises(RuntimeError, match="transient model endpoint"):
-        run_model_stage(
-            store,
-            CountingExtractor(),
-            jobset=jobset,
-            group_size=2,
-            output_root=tmp_path / "outputs",
-        )
+    result = run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=jobset,
+        stop_after=2,
+        group_size=2,
+        output_root=tmp_path / "outputs",
+    )
 
+    assert result.complete is False
     assert dict(_job_rows(store)) == {
         jobs_by_asset["transient"]: "leased",
         jobs_by_asset["success"]: "success",
@@ -1318,16 +1324,17 @@ def test_transient_group_keeps_prefetched_success_and_healthy_resume_succeeds(
     prefetched_success = claim_order[2]
     failing = EndpointAwareExtractor(transient_asset_ids={transient[1]})
 
-    with pytest.raises(RuntimeError, match="transient model endpoint"):
-        run_model_stage(
-            store,
-            failing,
-            jobset=jobset,
-            group_size=2,
-            workers=2,
-            output_root=tmp_path / "outputs",
-        )
+    first_result = run_model_stage(
+        store,
+        failing,
+        jobset=jobset,
+        stop_after=3,
+        group_size=2,
+        workers=2,
+        output_root=tmp_path / "outputs",
+    )
 
+    assert first_result.complete is False
     assert set(failing.asset_ids) == {
         first_success[1],
         transient[1],
@@ -1358,6 +1365,85 @@ def test_transient_group_keeps_prefetched_success_and_healthy_resume_succeeds(
     assert result.complete is True
     assert set(healthy.asset_ids) == {transient[1]}
     assert all(status == "success" for _job_id, status in _job_rows(store))
+
+
+def test_transient_model_job_retries_without_restarting_stage(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("flaky")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+
+    class FailsOnce(CountingExtractor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def extract(self, current_asset, entity, candidate_attributes):
+            if not self.failed:
+                self.failed = True
+                raise TransientModelEndpointError("temporary timeout")
+            return super().extract(
+                current_asset,
+                entity,
+                candidate_attributes,
+            )
+
+    extractor = FailsOnce()
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        group_size=1,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert extractor.asset_ids == ["flaky"]
+    assert _job_rows(store) == [(jobset.jobs[0].job_id, "success")]
+
+
+def test_transient_model_job_persists_safe_diagnostics(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset("slow")],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    extractor = EndpointAwareExtractor(
+        transient_asset_ids={"slow"},
+        transient_error="request contained SECRET",
+        transient_endpoint="http://127.0.0.1:18001/v1",
+        transient_failure_type="ReadTimeout",
+    )
+
+    result = run_model_stage(
+        store,
+        extractor,
+        jobset=jobset,
+        stop_after=1,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is False
+    with sqlite3.connect(store.path) as connection:
+        record = json.loads(
+            connection.execute(
+                "SELECT result_json FROM jobs WHERE job_id = ?",
+                (jobset.jobs[0].job_id,),
+            ).fetchone()[0]
+        )
+    assert record["model_endpoint"] == "http://127.0.0.1:18001/v1"
+    assert record["model_kind"] == "text"
+    assert record["model_failure_type"] == "ReadTimeout"
+    assert "SECRET" not in json.dumps(record)
 
 
 def test_enqueue_staging_database_uses_guarded_controlled_directory(
@@ -2942,6 +3028,49 @@ def test_model_stage_uses_one_rolling_dynamic_capacity_group(
     assert result.complete is True
     assert observed == [(11, 5)]
     assert extractor.capacity_reads == 2
+
+
+def test_model_stage_worker_limit_caps_endpoint_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_workers: list[int] = []
+    authoritative = models.run_extraction_task_group
+
+    def recording_group(**kwargs):
+        observed_workers.append(kwargs["workers"])
+        return authoritative(**kwargs)
+
+    monkeypatch.setattr(
+        models,
+        "run_extraction_task_group",
+        recording_group,
+    )
+
+    class CapacityExtractor(CountingExtractor):
+        def routing_capacity(self, modality: str) -> int:
+            assert modality == "text"
+            return 5
+
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    jobset = enqueue_model_tasks(
+        [asset(str(index)) for index in range(4)],
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+
+    result = run_model_stage(
+        store,
+        CapacityExtractor(),
+        jobset=jobset,
+        group_size=4,
+        workers_by_kind={"text": 2, "image": 1},
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert observed_workers == [2]
 
 
 def test_model_stage_refills_executor_across_claim_groups(

@@ -1991,7 +1991,7 @@ def _process_claimed_group(
     job_by_key: dict[str, Any] = {}
     handled = 0
     state_lock = threading.Lock()
-    transient_errors: list[str] = []
+    transient_jobs = 0
     with _LeaseHeartbeat(
         store.path,
         claimed,
@@ -2074,12 +2074,12 @@ def _process_claimed_group(
             model_call_key: str,
             record: dict[str, Any],
         ) -> None:
-            nonlocal handled
+            nonlocal handled, transient_jobs
             job = job_by_key[model_call_key]
             payload = job.payload
             if record.get("error_class") == "model_endpoint_transient":
                 with state_lock:
-                    transient_errors.append(clean_text(record.get("error")))
+                    transient_jobs += 1
                 retried = _fenced_retry_model_job(
                     store.path,
                     job=job,
@@ -2162,13 +2162,12 @@ def _process_claimed_group(
                 apply_auto_check_gate=False,
                 on_record=process_local_record,
             )
-        if transient_errors:
-            errors = sorted(set(error for error in transient_errors if error))
-            detail = f": {'; '.join(errors)}" if errors else ""
-            raise RuntimeError(
-                "transient model endpoint failure encountered; owned jobs "
-                "were left retryable"
-                f"{detail}"
+        if transient_jobs:
+            logging.warning(
+                "Deferred %d transient %s model job(s); older pending jobs "
+                "remain ahead of them in the durable queue",
+                transient_jobs,
+                modality,
             )
     return handled
 
@@ -3224,7 +3223,9 @@ def run_model_stage(
         )
         model_workers = max(
             1,
-            int(current_capacity or configured_workers),
+            min(configured_workers, int(current_capacity))
+            if current_capacity is not None
+            else configured_workers,
         )
         reserved = 0
         no_more_claims = False
