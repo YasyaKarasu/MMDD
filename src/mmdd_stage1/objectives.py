@@ -40,7 +40,8 @@ class PathAggregator(nn.Module):
         has_evidence = evidence_mask.any(dim=-1)
 
         if self.evidence_aggregation == "logsumexp":
-            evidence_scores = torch.logsumexp(masked_paths, dim=-1)
+            safe_paths = masked_paths.masked_fill(~has_evidence.unsqueeze(-1), 0.0)
+            evidence_scores = torch.logsumexp(safe_paths, dim=-1)
         else:
             count = min(self.top_k, path_scores.shape[-1])
             values = torch.topk(masked_paths, k=count, dim=-1).values

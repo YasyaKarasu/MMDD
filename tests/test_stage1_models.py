@@ -115,6 +115,22 @@ def test_path_aggregator_accumulates_direct_and_multiple_evidence_paths():
     assert score.item() == pytest.approx(torch.logsumexp(torch.tensor([1.0, 5.0, 1.0]), dim=0).item())
 
 
+def test_path_aggregator_all_mask_has_finite_gradients():
+    direct = torch.tensor([[1.0]], requires_grad=True)
+    query_evidence = torch.tensor([[[2.0, 0.0]]], requires_grad=True)
+    evidence_target = torch.tensor([[[3.0, 1.0]]], requires_grad=True)
+    mask = torch.zeros_like(query_evidence, dtype=torch.bool)
+
+    with torch.autograd.set_detect_anomaly(True):
+        score = PathAggregator("logsumexp")(direct, query_evidence, evidence_target, mask)
+        score.sum().backward()
+
+    assert score.item() == pytest.approx(direct.item())
+    assert torch.equal(direct.grad, torch.ones_like(direct))
+    assert torch.equal(query_evidence.grad, torch.zeros_like(query_evidence))
+    assert torch.equal(evidence_target.grad, torch.zeros_like(evidence_target))
+
+
 def test_target_scoring_and_listwise_loss_backpropagate_through_paths():
     torch.manual_seed(7)
     model = StudentJoinabilityModel(input_dim=4, student_dim=3)
@@ -397,6 +413,8 @@ def test_embedding_instructions_distinguish_role_modality_and_query_rows():
     assert image == EMBEDDING_INSTRUCTIONS[("evidence", "image")]
     assert target_row is text_row is image_row is None
     assert len({query, query_row, target, text, image}) == 5
+    assert all("context" not in value.casefold() for value in (query, query_row, target, text, image))
+    assert "label" not in image.casefold()
 
 
 def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
