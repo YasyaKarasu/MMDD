@@ -109,8 +109,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         min_recovered_rows=args.min_recovered_rows,
         min_column_non_empty_ratio=args.min_column_non_empty_ratio,
         max_queries_per_source=args.max_queries_per_source,
-        max_query_context_columns=args.max_query_context_columns,
-        max_target_context_columns=args.max_target_context_columns,
+        max_query_additional_columns=args.max_query_additional_columns,
+        max_target_additional_columns=args.max_target_additional_columns,
     )
     artifacts = build_joinability_dataset(
         prepared.source_tables, assets, extractions, split_of, config
@@ -172,7 +172,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-rows-per-table", type=int)
     result.add_argument("--wiki-link-threshold", type=float, default=0.3)
     result.add_argument("--seed", type=int, default=13)
-    result.add_argument("--split-by", choices=("page_title", "source_table_id"), default="page_title")
+    result.add_argument("--split-by", choices=("source_table_id",), default="source_table_id")
     result.add_argument("--train-ratio", type=float, default=0.8)
     result.add_argument("--dev-ratio", type=float, default=0.1)
     result.add_argument("--test-ratio", type=float, default=0.1)
@@ -201,8 +201,8 @@ def parser() -> argparse.ArgumentParser:
     algorithm.add_argument("--min-recovered-rows", type=int, default=3)
     algorithm.add_argument("--min-column-non-empty-ratio", type=float, default=0.5)
     algorithm.add_argument("--max-queries-per-source", type=int, default=1)
-    algorithm.add_argument("--max-query-context-columns", type=int, default=1)
-    algorithm.add_argument("--max-target-context-columns", type=int, default=2)
+    algorithm.add_argument("--max-query-additional-columns", type=int, default=1)
+    algorithm.add_argument("--max-target-additional-columns", type=int, default=2)
     return result
 
 

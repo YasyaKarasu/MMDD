@@ -36,8 +36,6 @@ def _query_view(
     return {
         "query_view_id": query_view_id,
         "source_table_id": table["source_table_id"],
-        "page_title": table.get("page_title", ""),
-        "caption": table.get("caption", ""),
         "derivation_type": strategy,
         "selected_column_indices": column_indices,
         "selected_column_names": [

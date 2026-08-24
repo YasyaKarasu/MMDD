@@ -82,6 +82,8 @@ def source_splits(
     ratios: tuple[float, float, float],
     seed: int,
 ) -> tuple[dict[str, Any], dict[str, str]]:
+    if split_by != "source_table_id":
+        raise ValueError("split_by must be 'source_table_id'")
     ratio_sum = sum(ratios)
     if ratio_sum <= 0:
         raise ValueError("split ratios must have a positive sum")
@@ -90,8 +92,7 @@ def source_splits(
     groups: dict[str, list[str]] = {}
     for table in tables:
         source_id = table["source_table_id"]
-        key = clean_text(table.get("page_title")) if split_by == "page_title" else source_id
-        groups.setdefault(key or source_id, []).append(source_id)
+        groups.setdefault(source_id, []).append(source_id)
 
     keys = list(groups)
     random.Random(seed).shuffle(keys)

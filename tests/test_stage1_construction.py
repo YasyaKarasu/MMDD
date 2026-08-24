@@ -40,6 +40,11 @@ def _table(table_id: str, headers: list[str], values: list[list[str]]) -> dict:
 
 def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp_path):
     query = _table("q", ["Player", "Country"], [["Messi", "Argentina"], ["Mbappe", "France"]])
+    query.update(
+        page_title="SECRET_PAGE_TITLE",
+        caption="SECRET_CAPTION",
+        section_title="SECRET_SECTION",
+    )
     targets = [
         _table("positive", ["Country", "Club"], [["Argentina", "Barcelona"]]),
         _table("semantic", ["Player", "Country"], [["Messi", "Spain"]]),
@@ -51,6 +56,17 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
         {"asset_id": f"e_{target['table_id']}", "asset_type": "text", "content": target["table_id"]}
         for target in targets
     ]
+    image_path = tmp_path / "e_image.bin"
+    image_path.write_bytes(b"image")
+    assets.append(
+        {
+            "asset_id": "e_image",
+            "asset_type": "image",
+            "local_path": str(image_path),
+            "entity_wiki_title": "SECRET_IMAGE_LABEL",
+            "source": "SECRET_IMAGE_SOURCE",
+        }
+    )
     recoveries = [
         {
             "target_table_id": target["table_id"],
@@ -79,6 +95,7 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     table_object = next(record for record in artifacts["stage1_objects"] if record["object_id"] == "q")
     assert table_object["embedding_role"] == "query"
     assert table_object["text"] == "\n".join(table_object["table_parts"])
+    assert "SECRET_" not in table_object["text"]
     assert table_object["row_routing_texts"] == [
         "Columns: Player | Country\nRow: Messi | Argentina",
         "Columns: Player | Country\nRow: Mbappe | France",
@@ -92,6 +109,10 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
         record for record in artifacts["stage1_objects"] if record["object_id"] == "e_positive"
     )
     assert evidence_object["embedding_role"] == "evidence"
+    image_object = next(
+        record for record in artifacts["stage1_objects"] if record["object_id"] == "e_image"
+    )
+    assert "text" not in image_object
     candidates = artifacts["target_lists"][0]["candidates"]
     negatives = {candidate["negative_source"]: candidate for candidate in candidates[1:]}
     assert set(negatives) == {

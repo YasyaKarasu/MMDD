@@ -12,7 +12,7 @@ import requests
 from .utils import clean_text, get_cell, get_column_name, stable_hash
 
 
-PROMPT_VERSION = "leave_one_attribute_out_v1"
+PROMPT_VERSION = "leave_one_attribute_out_v2_table_cells"
 
 
 class OpenAICompatibleExtractor:
@@ -39,16 +39,16 @@ class OpenAICompatibleExtractor:
         *,
         entity: str,
         attribute: str,
-        context: list[dict[str, str]],
+        visible_cells: list[dict[str, str]],
         asset: dict[str, Any],
     ) -> dict[str, str]:
         prompt = (
             "Extract one attribute from the evidence. The target attribute is omitted "
-            "from the row context, so do not infer it from a supplied answer. Return JSON "
+            "from the supplied table cells, so do not infer it from a supplied answer. Return JSON "
             "only as {\"value\": \"...\", \"evidence\": \"...\"}. Use an empty value "
             "when the evidence does not state the answer.\n\n"
             f"Entity: {entity}\nTarget attribute: {attribute}\n"
-            f"Other row attributes: {json.dumps(context, ensure_ascii=False)}\n"
+            f"Other visible table cells: {json.dumps(visible_cells, ensure_ascii=False)}\n"
         )
         content: str | list[dict[str, Any]] = prompt + "Evidence:\n" + clean_text(asset.get("content"))
         if asset["asset_type"] == "image":
@@ -126,7 +126,7 @@ def build_extractions(
                 row_assets = assets_by_entity.get(entity["entity_id"], [])
                 for attribute_col in attribute_cols:
                     attribute_name = get_column_name(table, attribute_col)
-                    context = [
+                    visible_cells = [
                         {
                             "name": get_column_name(table, column["column_index"]),
                             "value": clean_text(get_cell(row, column["column_index"]).get("text")),
@@ -146,7 +146,7 @@ def build_extractions(
                         result = extractor.extract(
                             entity=clean_text(entity_cell.get("text")),
                             attribute=attribute_name,
-                            context=context,
+                            visible_cells=visible_cells,
                             asset=asset,
                         )
                         records.append(

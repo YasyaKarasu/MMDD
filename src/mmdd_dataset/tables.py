@@ -160,9 +160,6 @@ def _entitable(
     return {
         "source_table_id": source_id,
         "source_file": relative_source,
-        "page_title": clean_text(raw_table.get("pgTitle")),
-        "caption": clean_text(raw_table.get("caption")),
-        "section_title": clean_text(raw_table.get("secondTitle")),
         "num_rows": len(rows),
         "num_cols": num_cols,
         "columns": columns,

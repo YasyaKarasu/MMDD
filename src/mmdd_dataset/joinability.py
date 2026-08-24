@@ -23,8 +23,8 @@ class BuildConfig:
     min_recovered_rows: int = 3
     min_column_non_empty_ratio: float = 0.5
     max_queries_per_source: int = 1
-    max_query_context_columns: int = 1
-    max_target_context_columns: int = 2
+    max_query_additional_columns: int = 1
+    max_target_additional_columns: int = 2
 
 
 def _profiles(table: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -92,9 +92,6 @@ def _table_record(
         "role": role,
         "split": split,
         "source_table_id": table["source_table_id"],
-        "page_title": table.get("page_title", ""),
-        "caption": table.get("caption", ""),
-        "section_title": table.get("section_title", ""),
         "columns": [
             {
                 "column_index": local_index,
@@ -110,7 +107,7 @@ def _table_record(
     }
 
 
-def _rank_context_columns(
+def _rank_additional_columns(
     table: dict[str, Any], excluded: set[int]
 ) -> list[int]:
     profiles = _profiles(table)
@@ -129,7 +126,7 @@ def _rank_context_columns(
     )
 
 
-def _context_layouts(
+def _column_layouts(
     table: dict[str, Any],
     entity_col: int,
     qualified: list[dict[str, Any]],
@@ -137,23 +134,29 @@ def _context_layouts(
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
     selected = qualified[: max(1, config.max_queries_per_source)]
     bridge_columns = {candidate["column_index"] for candidate in qualified}
-    ordinary = _rank_context_columns(table, {entity_col, *bridge_columns})
+    ordinary = _rank_additional_columns(table, {entity_col, *bridge_columns})
 
-    query_width = config.max_query_context_columns
-    target_context = ordinary[: config.max_target_context_columns]
-    query_pool = ordinary[config.max_target_context_columns :]
-    query_contexts = list(combinations(query_pool, query_width)) if query_width else [()]
-    if len(selected) > 1 and query_contexts:
+    query_width = config.max_query_additional_columns
+    target_additional = ordinary[: config.max_target_additional_columns]
+    query_pool = ordinary[config.max_target_additional_columns :]
+    query_additional_sets = list(combinations(query_pool, query_width)) if query_width else [()]
+    if len(selected) > 1 and query_additional_sets:
         return [
-            (candidate, list(query_contexts[index % len(query_contexts)]), target_context)
+            (
+                candidate,
+                list(query_additional_sets[index % len(query_additional_sets)]),
+                target_additional,
+            )
             for index, candidate in enumerate(selected)
         ]
 
     best = qualified[0]
-    contexts = _rank_context_columns(table, {entity_col, best["column_index"]})
-    query_context = contexts[:query_width]
-    target_context = contexts[query_width : query_width + config.max_target_context_columns]
-    return [(best, query_context, target_context)]
+    additional = _rank_additional_columns(table, {entity_col, best["column_index"]})
+    query_additional = additional[:query_width]
+    target_additional = additional[
+        query_width : query_width + config.max_target_additional_columns
+    ]
+    return [(best, query_additional, target_additional)]
 
 
 def _extraction_index(
@@ -250,12 +253,12 @@ def _materialize_join(
     qualified: dict[str, Any],
     assets_by_id: dict[str, dict[str, Any]],
     config: BuildConfig,
-    query_context: list[int],
-    target_context: list[int],
+    query_additional: list[int],
+    target_additional: list[int],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     join_col = qualified["column_index"]
-    query_columns = [entity_col, *query_context]
-    target_columns = [join_col, *target_context]
+    query_columns = [entity_col, *query_additional]
+    target_columns = [join_col, *target_additional]
 
     query_source_rows = _select_query_rows(qualified, config.query_rows)
     target_source_rows = [
@@ -404,7 +407,7 @@ def _build_joinability_for_table(
 
     emitted = 0
     visible_queries: set[str] = set()
-    for candidate, query_context, target_context in _context_layouts(
+    for candidate, query_additional, target_additional in _column_layouts(
         table, entity_col, qualified, config
     ):
         if sum(
@@ -419,8 +422,8 @@ def _build_joinability_for_table(
             candidate,
             assets_by_id,
             config,
-            query_context,
-            target_context,
+            query_additional,
+            target_additional,
         )
         visible_key = stable_hash(
             query["columns"],

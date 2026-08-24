@@ -89,8 +89,8 @@ class WdcPipelineConfig:
     min_recovered_rows: int = 3
     min_column_non_empty_ratio: float = 0.5
     max_queries_per_source: int = 1
-    max_query_context_columns: int = 1
-    max_target_context_columns: int = 2
+    max_query_additional_columns: int = 1
+    max_target_additional_columns: int = 2
     split_by: str = "source_table_id"
     train_ratio: float = 0.8
     dev_ratio: float = 0.1
@@ -838,7 +838,7 @@ def _model_tasks_for_shard(
                 if not clean_text(get_cell(row, attribute_col).get("text")):
                     continue
                 attribute_name = get_column_name(table, attribute_col)
-                context = [
+                visible_cells = [
                     {
                         "name": get_column_name(table, int(column["column_index"])),
                         "value": clean_text(
@@ -874,7 +874,7 @@ def _model_tasks_for_shard(
                             "attribute_name": attribute_name,
                             "asset_id": asset["asset_id"],
                             "asset_type": asset["asset_type"],
-                            "context": context,
+                            "visible_cells": visible_cells,
                             "asset": task_asset,
                             "prompt_version": PROMPT_VERSION,
                         }
@@ -956,7 +956,7 @@ def _run_model_tasks(
             result = extractor.extract(
                 entity=task["entity"],
                 attribute=task["attribute_name"],
-                context=task["context"],
+                visible_cells=task["visible_cells"],
                 asset=task["asset"],
             )
         except Exception as error:
@@ -1192,8 +1192,8 @@ def _build_config(config: WdcPipelineConfig) -> BuildConfig:
         min_recovered_rows=config.min_recovered_rows,
         min_column_non_empty_ratio=config.min_column_non_empty_ratio,
         max_queries_per_source=config.max_queries_per_source,
-        max_query_context_columns=config.max_query_context_columns,
-        max_target_context_columns=config.max_target_context_columns,
+        max_query_additional_columns=config.max_query_additional_columns,
+        max_target_additional_columns=config.max_target_additional_columns,
     )
 
 
@@ -1370,8 +1370,8 @@ def run_materialize(
             "min_recovered_rows",
             "min_column_non_empty_ratio",
             "max_queries_per_source",
-            "max_query_context_columns",
-            "max_target_context_columns",
+            "max_query_additional_columns",
+            "max_target_additional_columns",
             "split_by",
             "train_ratio",
             "dev_ratio",
@@ -1553,11 +1553,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-recovered-rows", type=int, default=3)
     result.add_argument("--min-column-non-empty-ratio", type=float, default=0.5)
     result.add_argument("--max-queries-per-source", type=int, default=1)
-    result.add_argument("--max-query-context-columns", type=int, default=1)
-    result.add_argument("--max-target-context-columns", type=int, default=2)
-    result.add_argument(
-        "--split-by", choices=("source_table_id", "page_title"), default="source_table_id"
-    )
+    result.add_argument("--max-query-additional-columns", type=int, default=1)
+    result.add_argument("--max-target-additional-columns", type=int, default=2)
+    result.add_argument("--split-by", choices=("source_table_id",), default="source_table_id")
     result.add_argument("--train-ratio", type=float, default=0.8)
     result.add_argument("--dev-ratio", type=float, default=0.1)
     result.add_argument("--test-ratio", type=float, default=0.1)
@@ -1602,8 +1600,8 @@ def _config_from_args(args: argparse.Namespace) -> WdcPipelineConfig:
         min_recovered_rows=args.min_recovered_rows,
         min_column_non_empty_ratio=args.min_column_non_empty_ratio,
         max_queries_per_source=args.max_queries_per_source,
-        max_query_context_columns=args.max_query_context_columns,
-        max_target_context_columns=args.max_target_context_columns,
+        max_query_additional_columns=args.max_query_additional_columns,
+        max_target_additional_columns=args.max_target_additional_columns,
         split_by=args.split_by,
         train_ratio=args.train_ratio,
         dev_ratio=args.dev_ratio,

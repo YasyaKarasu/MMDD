@@ -192,7 +192,6 @@ def _entity_record(
     source_table_id: str,
     entity_column: int,
     column_names: list[str],
-    cells: list[dict[str, Any]],
 ) -> dict[str, Any]:
     row_id = _source_row_id(raw_row, fallback)
     display_text = cell_text(raw_row.get(column_names[entity_column]))
@@ -201,16 +200,10 @@ def _entity_record(
         schema_class, relative_source, row_id, page_url, display_text, length=20
     )
     entity_id = "ent_" + stable_hash(entity_key, length=16)
-    context = [
-        clean_text(cell.get("text")) or clean_text(cell.get("column_name"))
-        for cell in cells
-        if cell["column_index"] != entity_column and clean_text(cell.get("text"))
-    ]
     return {
         "entity_id": entity_id,
         "wiki_title": entity_key,
         "display_texts": [display_text] if display_text else [],
-        "context_terms": context,
         "appears_in": [
             {
                 "source_table_id": source_table_id,
@@ -284,7 +277,6 @@ def adapt_table(
             source_table_id=source_table_id,
             entity_column=entity_column,
             column_names=column_names,
-            cells=cells,
         )
         cells[entity_column]["wiki_title"] = entity["wiki_title"]
         rows.append({"row_id": row_id, "cells": cells})
@@ -296,9 +288,6 @@ def adapt_table(
     table = {
         "source_table_id": source_table_id,
         "source_file": relative_source,
-        "page_title": schema_class,
-        "caption": "",
-        "section_title": "",
         "num_rows": len(rows),
         "num_cols": len(columns),
         "columns": columns,
@@ -346,14 +335,6 @@ def sample_entities(
     )
     selected: list[tuple[str, str, dict[str, Any]]] = []
     for fallback, raw_row in enumerate(iter_rows(path, max_rows)):
-        cells = [
-            {
-                "column_index": index,
-                "column_name": name,
-                "text": cell_text(raw_row.get(name)),
-            }
-            for index, name in enumerate(column_names)
-        ]
         entity = _entity_record(
             raw_row,
             fallback=fallback,
@@ -362,7 +343,6 @@ def sample_entities(
             source_table_id=source_table_id,
             entity_column=entity_column,
             column_names=column_names,
-            cells=cells,
         )
         selected.append(
             (

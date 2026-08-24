@@ -176,11 +176,13 @@ targets = iter_manifest_records(root, "data_lake_tables")
 | --- | --- |
 | `source_table_id` | source table 主键 |
 | `source_file` | 输入文件相对路径或来源标识 |
-| `page_title`、`caption`、`section_title` | 表格外部文本上下文 |
 | `num_rows`、`num_cols` | 完整源表大小 |
 | `columns`、`rows` | 完整表格内容 |
 | `metadata.candidate_entity_columns` | 候选 entity 列的 source column index |
 | `metadata.column_profiles` | 非空率、唯一率、数值率等构建期统计 |
+
+规范化 source table 不保存页面标题、caption 或 section。下游表格表示只能使用
+`columns[].column_name` 和 `rows[].cells[].text`，不能从 provenance 补充表外文本。
 
 WDC 会把输入的 `image` 属性用于寻找素材，但不会把它写入 source、query 或
 target 的 `columns`。WDC source table 还会带有
@@ -244,7 +246,8 @@ query table 的通用字段如下：
 | `columns`、`rows` | target 的可见内容 |
 | `join_col`、`join_col_name` | join 列在 source table 中的位置和名称 |
 | `queryable_source_table` | 当前为 `true` |
-| `target_context_col_names` | target 侧额外上下文列 |
+
+target 的所有可见列都是表格自身内容；格式中不定义或附加表外上下文字段。
 
 target 通常保留列投影后所有满足最低要求的 source rows，而 query 只包含选中的
 row view。因此同一 chain 应满足：
@@ -354,7 +357,7 @@ query_table_id/query_row_id
 | `query_table_id`、`query_row_id` | 路径起点 |
 | `target_table_id`、`target_row_ids` | 路径终点 |
 | `source_table_id`、`source_row_id` | 对应原表位置 |
-| `query_entity` | query row 中的 entity 及可审计上下文 |
+| `query_entity` | query row 中的 entity 及可审计来源信息 |
 | `recovered_attribute` | 属性名、期望值、模型值及隐藏状态 |
 | `evidence.asset_id` | 引用的 `bridge_assets.asset_id` |
 | `evidence.asset_type` | `text` 或 `image` |
@@ -414,7 +417,8 @@ recovery 当作正路径，但应按 `query_table_id`、`query_row_id` 和 `asse
 2. 从相同 split 的 `data_lake_table_ids` 中采样负例。
 3. 排除该 query 的所有 qrel target；同时建议排除同一 `source_table_id` 的其他投影，
    以减少伪负例。
-4. query 与 candidate 都只序列化可见的列名和 cell `text`。
+4. query 与 candidate 都只序列化可见的列名和 cell `text`；文本资产只序列化
+   `content`，图片资产只输入图片文件。不要附加页面、caption、section、实体标签或来源描述。
 
 ### 10.2 Multimodal path retrieval
 

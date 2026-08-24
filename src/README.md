@@ -27,7 +27,10 @@ from an unspecified external list later.
 `cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores both feature
 granularities required by the method: pooling-before hidden states for the
 Teacher and the normalized final object embedding for the Student. Its input
-is JSONL. Text and image objects use `text` and/or a local `image` path. Every
+is JSONL. A text object uses only its body in `text`, and an image object uses
+only its local `image` file. Tables use only column names and cell values.
+Page titles, captions, sections, entity labels, source names, and provenance
+fields are never serialized into model input. Every
 object also carries its retrieval identity in `embedding_role`: query tables
 use `query`, candidate tables use `target`, and bridge assets use `evidence`.
 A table additionally supplies `table_parts`, with schema text first and one
@@ -36,7 +39,7 @@ entry per example row after it. Every part must occur in order within `text`:
 ```json
 {"object_id":"q1","object_type":"table","embedding_role":"query","text":"Columns: player | country\nRow: Messi | Argentina","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
 {"object_id":"e1","object_type":"text","embedding_role":"evidence","text":"Lionel Messi represents Argentina."}
-{"object_id":"i1","object_type":"image","embedding_role":"evidence","image":"images/i1.jpg","text":"independent evidence image"}
+{"object_id":"i1","object_type":"image","embedding_role":"evidence","image":"images/i1.jpg"}
 ```
 
 The encoder uses separate instructions for query tables, query-row routing
@@ -200,15 +203,18 @@ verification and checks direct `Q -> T` results separately. Repeated paths to
 one evidence object and repeated evidence paths to one target are aggregated
 with LogSumExp for evidence selection. For each candidate target, the query,
 target, and all selected top-k evidence objects are placed in one transformer
-context and produce one set of RATA boundary states.
+input and produce one set of RATA boundary states.
 
 The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
 `<|object_ref_end|>` tokens around every target header. Qwen is frozen; only
-the linear candidate head is trained. The loss is the negative log of
-`softmax(r_T) * rho_(T,c)` for the gold target column. Training retrieval
-files contain one JSON object or JSONL record per query in the format emitted
-by `retrieve_stage1.py`; records whose positive target has no retrieved
-evidence path are skipped:
+the linear candidate head is trained. Because the Stage-1 table distribution
+`softmax(r_T)` is fixed, training runs the reader only for the gold target and
+optimizes the column loss `-log rho_(T,c)`. History records the fixed Stage-1
+term as `table_loss` and their sum as `joint_loss`, while inference still ranks
+all candidate pairs with `softmax(r_T) * rho_(T,c)`. Training retrieval files
+contain one JSON object or JSONL record per query in the format emitted by
+`retrieve_stage1.py`; records whose positive target has no retrieved evidence
+path are skipped:
 
 ```bash
 conda run -n MMDD python src/train_stage2.py \
@@ -222,6 +228,9 @@ After the target column is fixed, each selected evidence object's original
 Qwen embedding is compared with the cached query-row routing embeddings and
 assigned to exactly one row by cosine argmax. A row may receive zero or many
 evidence objects, but each evidence object runs through FOCUS at most once.
+The routing embeddings contain only `Columns: ...` plus the current `Row: ...`
+for a query row, only `content` for text evidence, and only pixels for image
+evidence. No external table or asset metadata participates in routing.
 Rows with no assigned evidence produce an empty value without localization or
 generation. For assigned evidence, the Qwen backend captures the later
 full-attention layers' `v_proj` outputs. It builds separate entity and attribute
@@ -262,8 +271,8 @@ The two source families share one joinability algorithm in
 
 1. choose a candidate entity column;
 2. test whether evidence-backed extraction recovers a hidden attribute;
-3. project the visible entity/context columns into a query;
-4. project the recovered attribute/context columns into a target;
+3. project the visible entity and selected additional table columns into a query;
+4. project the recovered attribute and selected additional table columns into a target;
 5. emit the query, target, qrel, recovery path, and table decision.
 
 `build_joinability_for_table()` is the streaming boundary. The compact

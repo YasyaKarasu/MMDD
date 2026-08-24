@@ -34,17 +34,8 @@ def _artifact_records(root: Path, name: str, *, required: bool = True) -> list[d
 
 
 def serialize_table_parts(table: dict[str, Any], max_rows: int) -> list[str]:
-    context = [
-        clean_text(table.get("page_title")),
-        clean_text(table.get("caption")),
-        clean_text(table.get("section_title")),
-    ]
     headers = [clean_text(column.get("column_name")) for column in table["columns"]]
-    schema = []
-    if any(context):
-        schema.append("Context: " + " | ".join(value for value in context if value))
-    schema.append("Columns: " + " | ".join(headers))
-    parts = ["\n".join(schema)]
+    parts = ["Columns: " + " | ".join(headers)]
     for row in table["rows"][:max_rows]:
         values = [
             clean_text(get_cell(row, int(column["column_index"])).get("text"))
@@ -93,9 +84,6 @@ def _asset_object(asset: dict[str, Any], dataset_root: Path) -> dict[str, Any]:
         if not image_path.is_file():
             raise FileNotFoundError(f"{asset_id}: image artifact has no local file")
         record["image"] = str(image_path.resolve())
-        label = clean_text(asset.get("entity_wiki_title") or asset.get("page_title") or asset.get("source"))
-        if label:
-            record["text"] = label
     else:
         raise ValueError(f"{asset_id}: unsupported asset_type {asset_type!r}")
     return record

@@ -17,24 +17,24 @@ from torch.nn import functional as F
 from mmdd_stage1.features import normalize_object_type
 
 
-PROMPT_VERSION = "role_modality_v1"
+PROMPT_VERSION = "role_modality_v2_object_only"
 EMBEDDING_INSTRUCTIONS = {
     ("query", "table"): (
         "Represent this query table for directed multimodal joinability retrieval. "
-        "Emphasize its visible entity and key columns, row values, schema, and context "
+        "Emphasize its visible entity and key columns, row values, and schema "
         "that identify what each row is about, so compatible target tables and bridge "
         "evidence can be found. Do not infer missing attributes or relationships not "
         "present in the table."
     ),
     ("query_row", "table"): (
-        "Represent this single query row together with its table schema and context for "
+        "Represent this single query row together with its table schema for "
         "assigning relevant multimodal evidence to that row. Emphasize the row's entity "
-        "identity, key values, qualifiers, and disambiguating context. Do not infer "
+        "identity, key values, and qualifiers present in the cells. Do not infer "
         "missing attributes."
     ),
     ("target", "table"): (
         "Represent this candidate target table for directed joinability retrieval. "
-        "Emphasize the entities and join-key values it covers, its schema and context, "
+        "Emphasize the entities and join-key values it covers, its schema and cell values, "
         "and the factual attributes it can provide to a compatible query table. Preserve "
         "distinctions between columns and do not assume a relationship to any particular "
         "query."
@@ -51,7 +51,7 @@ EMBEDDING_INSTRUCTIONS = {
         "joinability retrieval. Emphasize visually grounded entities, objects, scenes, "
         "text, attributes, and relations that can connect a query-table row to a "
         "compatible target table. Do not infer identities or facts that are not visible "
-        "in the image or supplied label."
+        "in the image."
     ),
 }
 

@@ -180,12 +180,7 @@ def serialize_table(
     mark_candidates: bool = False,
     max_rows: int = 12,
 ) -> str:
-    context = [
-        clean_text(table.get("page_title")),
-        clean_text(table.get("caption")),
-        clean_text(table.get("section_title")),
-    ]
-    lines = ["Context: " + " | ".join(value for value in context if value)] if any(context) else []
+    lines = []
     headers = []
     for column in table["columns"]:
         name = clean_text(column.get("column_name"))

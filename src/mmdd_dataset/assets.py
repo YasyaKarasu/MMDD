@@ -73,7 +73,6 @@ def _text_asset(entity: dict[str, Any], content: str, source: str, page_url: str
     return {
         "asset_id": f"asset_txt_{stable_hash(entity_id, page_url, content)}",
         "entity_id": entity_id,
-        "entity_wiki_title": entity["wiki_title"],
         "asset_type": "text",
         "source": source,
         "page_url": page_url,

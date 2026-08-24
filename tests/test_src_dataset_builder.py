@@ -78,6 +78,7 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     table = prepared.source_tables[0]
 
     assert table["metadata"]["candidate_entity_columns"] == [0]
+    assert not {"page_title", "caption", "section_title"} & table.keys()
     result = build_joinability_dataset(
         prepared.source_tables,
         assets,
@@ -95,6 +96,8 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     assert len(result["data_lake_tables"]) == 1
     assert len(result["qrels"]) == 1
     query, target = result["query_tables"][0], result["data_lake_tables"][0]
+    assert not {"page_title", "caption", "section_title"} & query.keys()
+    assert not {"page_title", "caption", "section_title"} & target.keys()
     assert "Founded" not in [column["column_name"] for column in query["columns"]]
     assert target["columns"][0]["column_name"] == "Founded"
     assert len(result["evidence_recoveries"]) == 3
@@ -164,8 +167,8 @@ def test_extraction_masks_the_requested_attribute(tmp_path: Path) -> None:
 
     assert calls
     for call in calls:
-        context_names = {item["name"] for item in call["context"]}
-        assert call["attribute"] not in context_names
+        visible_names = {item["name"] for item in call["visible_cells"]}
+        assert call["attribute"] not in visible_names
 
 
 def test_recovery_threshold_is_defined_on_query_size(tmp_path: Path) -> None:
