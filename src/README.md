@@ -8,18 +8,41 @@ service orchestration remain outside `src/`.
 
 ## Directed joinability Teacher/Student
 
+Build the initial Stage-1 files directly from a completed dataset artifact:
+
+```bash
+conda run -n MMDD python src/build_stage1_training_data.py \
+  --dataset-root output_mm_joinability_v15 \
+  --output-dir work/stage1_v15 \
+  --max-evidence-per-target 8
+```
+
+This writes `stage1_objects.jsonl`, `edge_lists.jsonl`, `target_lists.jsonl`,
+and `stage1_corpus.jsonl`. Initial target lists contain separately marked
+random, TF-IDF-similar non-joinable, type/structure-matched, and
+corrupted-path negatives. Candidate evidence comes from recovery or source
+provenance and is capped while constructing the list, rather than truncated
+from an unspecified external list later.
+
 `cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores both feature
 granularities required by the method: pooling-before hidden states for the
 Teacher and the normalized final object embedding for the Student. Its input
 is JSONL. Text and image objects use `text` and/or a local `image` path. A
 table additionally supplies `table_parts`, with schema text first and one
-entry per example row after it:
+entry per example row after it. Every part must occur in order within `text`:
 
 ```json
-{"object_id":"q1","object_type":"table","text":"full serialized table","table_parts":["schema: player, country","row: Messi | Argentina"]}
+{"object_id":"q1","object_type":"table","text":"Columns: player | country\nRow: Messi | Argentina","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
 {"object_id":"e1","object_type":"text","text":"Lionel Messi represents Argentina."}
 {"object_id":"i1","object_type":"image","image":"images/i1.jpg","text":"independent evidence image"}
 ```
+
+Each table is encoded once for its Teacher/Student features. The cache uses
+tokenizer offsets to retain the schema/row tokens from that same sequence and
+stores their `token_groups`; the Teacher pools those groups while the Student
+uses the final embedding from the identical forward pass. Query objects also
+carry one `schema + row` routing view per example row. Those short views are
+embedded in one additional batch and cached for Stage-2 evidence assignment.
 
 Build a lazy per-object feature cache with the local 8B encoder:
 
@@ -29,6 +52,9 @@ conda run -n MMDD python src/cache_stage1_features.py \
   --output-dir cache/stage1_qwen8b \
   --model-dir hf_models/Qwen3-VL-Embedding-8B
 ```
+
+Feature caches created before the row-routing format must be rebuilt; Stage 2
+fails explicitly when a selected query has no cached `row_embeddings`.
 
 Edge warm-up data contains a query, an unordered candidate list, and its one
 positive object:
@@ -71,8 +97,11 @@ conda run -n MMDD python src/train_stage1.py student-path \
 The Teacher uses one shared Relation Transformer with modality, direction,
 and ordered type-pair identities. The Student learns one projection per type
 and one relation matrix per ordered type pair. Target scoring combines direct
-`Q -> T` and evidence `Q -> E -> T` paths; the default aggregation is
-LogSumExp. Student relation queries and projected target vectors preserve the
+`Q -> T` and evidence `Q -> E -> T` paths. Evidence paths first use the
+configured LogSumExp, top-k mean, or top-k sum aggregation; that score and the
+direct score are then combined with LogSumExp. The path checkpoint stores
+this configuration so online retrieval uses the training definition by
+default. Student relation queries and projected target vectors preserve the
 bilinear score exactly as an inner product for ANN indexing.
 
 `--train-data` accepts multiple files. Every record should carry `dataset`;
@@ -107,7 +136,8 @@ conda run -n MMDD python src/retrieve_stage1.py \
 ```
 
 Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
-on each path, and applies LogSumExp to all paths ending at the same target.
+on each path, and restores the two-level path aggregation from the Student
+checkpoint. Explicit retrieval flags may override that saved configuration.
 
 ### Hard-negative refresh
 
@@ -129,10 +159,12 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
 The refresh runs current-Student `Q -> T` and `Q -> E -> T` retrieval, removes
 every ID in `positive_target_ids`, retains high-ranked wrong targets, extracts
 their evidence objects and complete wrong paths, and asks the frozen Teacher
-to rescore both target/path and mixed-type edge lists. The output stores
-aligned `teacher_logits`; `student-edge` and `student-path` consume these
-cached soft labels directly. The loader also checks the Teacher checkpoint,
-evidence truncation, and path-aggregation configuration before reuse:
+to rescore target/path lists and a separate table-to-table edge list. Mined
+evidence remains latent inside wrong target paths; it is not labeled as a
+direct query-to-evidence negative. The output stores aligned
+`teacher_logits`; `student-edge` and `student-path` consume these cached soft
+labels directly. The loader also checks the Teacher checkpoint, evidence
+truncation, and path-aggregation configuration before reuse:
 
 ```bash
 conda run -n MMDD python src/train_stage1.py student-edge \
@@ -158,10 +190,11 @@ Stage 2 is an executable RATA/FOCUS pipeline over canonical dataset artifacts
 and Stage-1 retrieval JSON. It keeps only `Q -> E -> T` paths for multimodal
 verification and checks direct `Q -> T` results separately. Repeated paths to
 one evidence object and repeated evidence paths to one target are aggregated
-with LogSumExp. The resulting evidence weights are used to average the
-evidence-conditioned RATA boundary states.
+with LogSumExp for evidence selection. For each candidate target, the query,
+target, and all selected top-k evidence objects are placed in one transformer
+context and produce one set of RATA boundary states.
 
-The RATA reader uses Qwen3-VL's existing `<|object_ref_start|>` and
+The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
 `<|object_ref_end|>` tokens around every target header. Qwen is frozen; only
 the linear candidate head is trained. The loss is the negative log of
 `softmax(r_T) * rho_(T,c)` for the gold target column. Training retrieval
@@ -173,28 +206,34 @@ evidence path are skipped:
 conda run -n MMDD python src/train_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_train.jsonl \
-  --model-dir hf_models/Qwen3-VL-8B-Instruct \
+  --model-dir hf_models/Qwen3.5-9B \
   --output checkpoints/stage2_candidate.pt
 ```
 
-For each query row, the Qwen backend captures the later attention layers'
-`v_proj` outputs. It builds separate entity and attribute relevance maps over
-text or image tokens, multiplies and normalizes them, and averages the maps
-over layers. Text evidence is processed in overlapping token windows and
-reduced to a coherent high-relevance span. Image maps are Gaussian-smoothed;
-FOCUS-style separated anchors, adaptive ROI expansion, NMS, and an existence
-confidence pass select the crop. The selected span/crop is then used to
-generate the bridge value. The augmented query column is accepted only when
-enough query rows semantically match values in the selected target column.
-The output contains both row-level provenance and the materialized
-`augmented_query` table.
+After the target column is fixed, each selected evidence object's original
+Qwen embedding is compared with the cached query-row routing embeddings and
+assigned to exactly one row by cosine argmax. A row may receive zero or many
+evidence objects, but each evidence object runs through FOCUS at most once.
+Rows with no assigned evidence produce an empty value without localization or
+generation. For assigned evidence, the Qwen backend captures the later
+full-attention layers' `v_proj` outputs. It builds separate entity and attribute
+relevance maps over text or image tokens, multiplies and normalizes them, and
+averages the maps over layers. Text evidence is processed in overlapping token
+windows and reduced to a coherent high-relevance span. Image maps are
+Gaussian-smoothed; FOCUS-style separated anchors, adaptive ROI expansion, NMS,
+and an existence confidence pass select the crop. The best selected span/crop
+per row is then used to generate the bridge value. The augmented query column
+is accepted only when enough query rows semantically match values in the
+selected target column. The output contains both row-level provenance and the
+materialized `augmented_query` table.
 
 ```bash
 conda run -n MMDD python src/run_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_q1.json \
+  --stage1-features cache/stage1_qwen8b \
   --scorer-checkpoint checkpoints/stage2_candidate.pt \
-  --model-dir hf_models/Qwen3-VL-8B-Instruct \
+  --model-dir hf_models/Qwen3.5-9B \
   --output stage2_q1.json
 ```
 
