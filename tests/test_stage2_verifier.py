@@ -12,10 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from mmdd_stage2.verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
-    best_image_region,
     best_text_span,
     build_evidence_bundles,
-    build_row_evidence_query,
     focus_relevance,
     joint_candidate_probabilities,
     joint_relevance,
@@ -50,7 +48,6 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
 
     assert bundles[0].target_id == "t1"
     assert bundles[0].evidence_ids == ("e1", "e2")
-    assert [path["path_score"] for path in bundles[0].paths] == [2.0, 1.5, 1.5]
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():
@@ -81,28 +78,16 @@ def test_candidate_column_scorer_uses_both_boundary_states():
     assert scorer.weight.weight.grad is not None
 
 
-def test_row_query_and_joint_relevance_localize_text_and_image():
-    query = build_row_evidence_query(
-        {"Player": "Messi", "Country": "Argentina"},
-        entity_column="Player",
-        attribute_name="club",
-    )
+def test_joint_relevance_localizes_text_span():
     evidence = torch.tensor(
         [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
     )
     entity = torch.tensor([[1.0, 0.0]])
     attribute = torch.tensor([[0.8, 0.2]])
     relevance = joint_relevance(entity, attribute, evidence)
-    boxes = torch.tensor(
-        [[0.0, 0.0, 10.0, 10.0], [10.0, 0.0, 20.0, 10.0], [0.0, 10.0, 10.0, 20.0], [10.0, 10.0, 20.0, 20.0]]
-    )
 
-    assert query["entity_anchor"] == "Messi"
-    assert query["attribute_name"] == "club"
     assert relevance.sum().item() == pytest.approx(1.0)
     assert best_text_span(relevance, 2) == (0, 2)
-    best_patch = boxes[relevance.argmax()]
-    assert best_image_region(relevance, boxes, top_fraction=0.25) == tuple(float(value) for value in best_patch)
 
 
 def test_focus_relevance_and_roi_proposal_use_later_layer_value_features():
@@ -243,7 +228,6 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
         "t1",
         2.0,
         ("e1", "e2"),
-        (),
     )
     scorer = CandidateColumnScorer(2)
     with torch.no_grad():
@@ -313,7 +297,6 @@ def test_stage2_skips_rows_without_assigned_evidence():
         "t1",
         2.0,
         ("e1", "e2"),
-        (),
     )
     scorer = CandidateColumnScorer(2)
     with torch.no_grad():
@@ -354,7 +337,6 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
         "t1",
         2.0,
         ("text", "image"),
-        (),
     )
     scorer = CandidateColumnScorer(2)
     with torch.no_grad():
@@ -409,6 +391,8 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     backend.model = type("Model", (), {"model": reader_model})()
     query = _table("q", ["Player"], [["Messi"]])
     target = _table("t", ["Country", "Club"], [["Argentina", "Barcelona"]])
+    query.update(page_title="SECRET_QUERY_PAGE", caption="SECRET_QUERY_CAPTION")
+    target.update(section_title="SECRET_TARGET_SECTION")
     evidence = [
         {"asset_id": "e1", "asset_type": "text", "content": "first"},
         {"asset_id": "e2", "asset_type": "text", "content": "second"},
@@ -421,6 +405,7 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     rendered_text = "\n".join(item.get("text", "") for item in captured_content)
     assert "Evidence 1 (e1)" in rendered_text
     assert "Evidence 2 (e2)" in rendered_text
+    assert "SECRET_" not in rendered_text
 
 
 def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():
@@ -501,7 +486,7 @@ def test_qwen35_focus_hooks_only_full_attention_layers():
 def test_candidate_head_training_updates_only_the_small_rata_scorer():
     query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
-    bundle = EvidenceBundle("t1", 2.0, ("e1",), ())
+    bundle = EvidenceBundle("t1", 2.0, ("e1",))
     example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
     objects = Stage2ObjectIndex(
         {"q1": query},
@@ -524,6 +509,87 @@ def test_candidate_head_training_updates_only_the_small_rata_scorer():
 
     assert history[0]["examples"] == 1
     assert not torch.equal(before, scorer.weight.weight)
+
+
+def test_candidate_head_training_accepts_inference_mode_reader_states():
+    class InferenceBackend(FakeBackend):
+        @torch.inference_mode()
+        def reader_states(self, query, target, evidence):
+            return super().reader_states(query, target, evidence)
+
+    query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
+    target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
+    bundle = EvidenceBundle("t1", 2.0, ("e1",))
+    example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
+    objects = Stage2ObjectIndex(
+        {"q1": query},
+        {"t1": target},
+        {"e1": {"asset_id": "e1", "asset_type": "text", "content": "support"}},
+    )
+    backend = InferenceBackend()
+    open_states, close_states = backend.reader_states(query, target, [objects.evidence["e1"]])
+    assert torch.is_inference(open_states)
+    assert torch.is_inference(close_states)
+    scorer = CandidateColumnScorer(2)
+    before = scorer.weight.weight.detach().clone()
+
+    train_candidate_scorer(
+        backend,
+        scorer,
+        [example],
+        objects,
+        epochs=1,
+        learning_rate=0.1,
+        weight_decay=0.0,
+        seed=1,
+    )
+
+    assert not torch.equal(before, scorer.weight.weight)
+
+
+def test_candidate_head_training_reads_only_the_positive_target():
+    query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
+    negative = _table("t0", ["Country", "City"], [["Spain", "Madrid"]])
+    positive = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
+    bundles = (
+        EvidenceBundle("t0", 2.0, ("negative_evidence",)),
+        EvidenceBundle("t1", 1.0, ("positive_evidence",)),
+    )
+    example = ColumnTrainingExample("q1", bundles, "t1", 1)
+    objects = Stage2ObjectIndex(
+        {"q1": query},
+        {"t0": negative, "t1": positive},
+        {
+            "negative_evidence": {
+                "asset_id": "negative_evidence",
+                "asset_type": "text",
+                "content": "negative support",
+            },
+            "positive_evidence": {
+                "asset_id": "positive_evidence",
+                "asset_type": "text",
+                "content": "positive support",
+            },
+        },
+    )
+    backend = FakeBackend()
+
+    history = train_candidate_scorer(
+        backend,
+        CandidateColumnScorer(2),
+        [example],
+        objects,
+        epochs=1,
+        learning_rate=0.1,
+        weight_decay=0.0,
+        seed=1,
+    )
+
+    assert backend.reader_evidence_batches == [("positive_evidence",)]
+    assert history[0]["loss"] == history[0]["column_loss"]
+    expected_table_loss = -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
+    assert history[0]["table_loss"] == pytest.approx(expected_table_loss)
+    assert history[0]["joint_loss"] == pytest.approx(history[0]["table_loss"] + history[0]["column_loss"])
 
 
 def test_candidate_scorer_checkpoint_round_trip(tmp_path):

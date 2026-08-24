@@ -48,7 +48,8 @@ def load_column_training_data(
                 continue
             bundles = build_evidence_bundles(record["results"][:max_targets], top_k_evidence=top_k_evidence)
             positive_target = str(qrel.get("target_table_id", qrel.get("data_lake_table_id")))
-            if positive_target not in {bundle.target_id for bundle in bundles}:
+            positive_bundle = next((bundle for bundle in bundles if bundle.target_id == positive_target), None)
+            if positive_bundle is None:
                 continue
             example = ColumnTrainingExample(
                 query_id=query_id,
@@ -58,8 +59,8 @@ def load_column_training_data(
             )
             examples.append(example)
             query_ids.add(query_id)
-            target_ids.update(bundle.target_id for bundle in bundles)
-            evidence_ids.update(evidence_id for bundle in bundles for evidence_id in bundle.evidence_ids)
+            target_ids.add(positive_target)
+            evidence_ids.update(positive_bundle.evidence_ids)
     if not examples:
         raise ValueError("No Stage-2 training examples have a retrieved positive evidence path")
     return examples, load_stage2_index(
@@ -83,38 +84,51 @@ def train_candidate_scorer(
 ) -> list[dict[str, Any]]:
     optimizer = torch.optim.AdamW(scorer.parameters(), lr=learning_rate, weight_decay=weight_decay)
     verifier = Stage2Verifier(backend, scorer)
-    device = scorer.weight.weight.device
     order = list(range(len(examples)))
     generator = random.Random(seed)
     history = []
     scorer.train()
     for epoch in range(epochs):
         generator.shuffle(order)
-        total_loss = 0.0
+        total_column_loss = 0.0
+        total_table_loss = 0.0
         for example_index in order:
             example = examples[example_index]
-            logits = verifier.candidate_logits(
-                objects.queries[example.query_id],
-                example.bundles,
-                objects.targets,
-                objects.evidence,
-            )
             target_position = next(
                 index for index, bundle in enumerate(example.bundles) if bundle.target_id == example.positive_target_id
             )
+            positive_bundle = example.bundles[target_position]
+            logits = verifier.candidate_logits(
+                objects.queries[example.query_id],
+                (positive_bundle,),
+                objects.targets,
+                objects.evidence,
+            )[0]
             target = objects.targets[example.positive_target_id]
             local_index = local_column_index(target, example.positive_source_column)
             column_position = next(
                 index for index, column in enumerate(target["columns"]) if int(column["column_index"]) == local_index
             )
             table_scores = torch.tensor(
-                [bundle.retrieval_score for bundle in example.bundles], device=device, dtype=torch.float32
+                [bundle.retrieval_score for bundle in example.bundles], dtype=torch.float32
             )
-            loss = -torch.log_softmax(table_scores, dim=0)[target_position]
-            loss = loss - torch.log_softmax(logits[target_position], dim=0)[column_position]
+            table_loss = -torch.log_softmax(table_scores, dim=0)[target_position]
+            column_loss = -torch.log_softmax(logits, dim=0)[column_position]
             optimizer.zero_grad()
-            loss.backward()
+            column_loss.backward()
             optimizer.step()
-            total_loss += float(loss.detach())
-        history.append({"epoch": epoch + 1, "loss": total_loss / len(examples), "examples": len(examples)})
+            total_column_loss += float(column_loss.detach())
+            total_table_loss += float(table_loss.detach())
+        mean_column_loss = total_column_loss / len(examples)
+        mean_table_loss = total_table_loss / len(examples)
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "loss": mean_column_loss,
+                "column_loss": mean_column_loss,
+                "table_loss": mean_table_loss,
+                "joint_loss": mean_table_loss + mean_column_loss,
+                "examples": len(examples),
+            }
+        )
     return history

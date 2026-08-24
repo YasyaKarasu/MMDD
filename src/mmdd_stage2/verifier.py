@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import torch
 from torch import nn
@@ -18,7 +18,6 @@ class EvidenceBundle:
     target_id: str
     retrieval_score: float
     evidence_ids: tuple[str, ...]
-    paths: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ def build_evidence_bundles(
         ]
         if not paths:
             continue
-        paths.sort(key=lambda path: float(path["path_score"]), reverse=True)
         scores_by_evidence: dict[str, list[float]] = {}
         for path in paths:
             evidence_id = str(path["evidence_id"])
@@ -76,7 +74,6 @@ def build_evidence_bundles(
                 target_id=str(result["target_id"]),
                 retrieval_score=_logsumexp([float(path["path_score"]) for path in paths]),
                 evidence_ids=tuple(evidence_id for evidence_id, _ in ranked),
-                paths=tuple(paths),
             )
         )
     return bundles
@@ -117,22 +114,6 @@ def joint_candidate_probabilities(
     joint = table_probabilities.unsqueeze(-1) * column_probabilities
     joint = joint.masked_fill(~column_mask | ~target_mask.unsqueeze(-1), 0.0)
     return table_probabilities, column_probabilities, joint
-
-
-def build_row_evidence_query(
-    row: Mapping[str, Any],
-    *,
-    entity_column: str,
-    attribute_name: str,
-) -> dict[str, str]:
-    if entity_column not in row:
-        raise ValueError(f"Row has no entity column {entity_column!r}")
-    serialized_row = " | ".join(f"{name}={value}" for name, value in row.items() if value is not None)
-    return {
-        "entity_anchor": str(row[entity_column]),
-        "attribute_name": attribute_name,
-        "serialized_row": serialized_row,
-    }
 
 
 def _relevance(query_states: torch.Tensor, evidence_states: torch.Tensor) -> torch.Tensor:
@@ -282,30 +263,6 @@ def best_text_span(relevance: torch.Tensor, max_span_tokens: int) -> tuple[int, 
         else:
             end += 1
     return start, end
-
-
-def best_image_region(
-    relevance: torch.Tensor,
-    patch_boxes: torch.Tensor,
-    *,
-    top_fraction: float = 0.2,
-) -> tuple[float, float, float, float]:
-    """Return the union box of the most relevant image patches."""
-
-    if relevance.ndim != 1 or patch_boxes.shape != (relevance.shape[0], 4):
-        raise ValueError("patch_boxes must have shape [evidence tokens, 4]")
-    if relevance.shape[0] == 0:
-        raise ValueError("relevance must be non-empty")
-    if not 0 < top_fraction <= 1:
-        raise ValueError("top_fraction must be in (0, 1]")
-    count = max(1, math.ceil(relevance.shape[0] * top_fraction))
-    selected = patch_boxes[torch.topk(relevance, k=count).indices]
-    return (
-        float(selected[:, 0].min()),
-        float(selected[:, 1].min()),
-        float(selected[:, 2].max()),
-        float(selected[:, 3].max()),
-    )
 
 
 def semantic_joinability(

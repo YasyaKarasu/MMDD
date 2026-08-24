@@ -147,7 +147,7 @@ class QwenStage2Backend:
         target: dict[str, Any],
         evidence: Sequence[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read query, all selected evidence, and target in one context."""
+        """Read the query table, selected evidence objects, and target table together."""
 
         if not evidence:
             raise ValueError("Candidate-column reading requires at least one evidence object")
