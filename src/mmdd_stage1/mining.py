@@ -41,15 +41,14 @@ def build_hard_candidate_set(
     retrieval_results: Sequence[dict[str, Any]],
     *,
     hard_targets_per_query: int,
-    hard_evidence_per_query: int,
     max_evidence_per_target: int,
 ) -> HardCandidateSet:
     """Exclude all GT targets and retain the highest-ranked Student errors."""
 
     if hard_targets_per_query <= 0:
         raise ValueError("hard_targets_per_query must be positive")
-    if hard_evidence_per_query < 0 or max_evidence_per_target < 0:
-        raise ValueError("Evidence limits must be non-negative")
+    if max_evidence_per_target < 0:
+        raise ValueError("max_evidence_per_target must be non-negative")
     positive = example.candidates[example.positive_index]
     known_positive_ids = example.positive_target_ids or (positive.target_id,)
     known_positives = set(known_positive_ids)
@@ -84,7 +83,7 @@ def build_hard_candidate_set(
         evidence_ids = _path_evidence_ids(result, max_evidence_per_target)
         hard_path_count += sum(path.get("kind") == "evidence" for path in result.get("paths", []))
         for evidence_id in evidence_ids:
-            if evidence_id not in hard_evidence_ids and len(hard_evidence_ids) < hard_evidence_per_query:
+            if evidence_id not in hard_evidence_ids:
                 hard_evidence_ids.append(evidence_id)
         candidates.append(TargetCandidate(target_id, evidence_ids))
         candidate_records.append(
@@ -111,10 +110,7 @@ def build_hard_candidate_set(
     if len(candidates) < 2:
         raise ValueError(f"{example.query_id}: retrieval and existing data produced no negative target")
 
-    edge_candidate_ids = [positive.target_id]
-    for object_id in (*hard_evidence_ids, *(candidate.target_id for candidate in candidates[1:])):
-        if object_id not in edge_candidate_ids:
-            edge_candidate_ids.append(object_id)
+    edge_candidate_ids = [positive.target_id, *(candidate.target_id for candidate in candidates[1:])]
     target_example = TargetExample(
         query_id=example.query_id,
         candidates=tuple(candidates),
@@ -145,13 +141,14 @@ def retrieve_hard_candidate_sets(
     indices: StudentANNIndices,
     *,
     hard_targets_per_query: int,
-    hard_evidence_per_query: int,
     max_evidence_per_target: int,
     retrieval_k: int,
     direct_k: int,
     evidence_k: int,
     targets_per_evidence: int,
     evidence_types: tuple[str, ...] = ("text", "image"),
+    evidence_aggregation: str = "logsumexp",
+    evidence_top_k: int = 4,
 ) -> list[HardCandidateSet]:
     candidate_sets = []
     for example in examples:
@@ -163,13 +160,14 @@ def retrieve_hard_candidate_sets(
             targets_per_evidence=targets_per_evidence,
             result_k=retrieval_k,
             evidence_types=evidence_types,
+            evidence_aggregation=evidence_aggregation,
+            evidence_top_k=evidence_top_k,
         )
         candidate_sets.append(
             build_hard_candidate_set(
                 example,
                 results,
                 hard_targets_per_query=hard_targets_per_query,
-                hard_evidence_per_query=hard_evidence_per_query,
                 max_evidence_per_target=max_evidence_per_target,
             )
         )
@@ -229,6 +227,7 @@ def score_hard_candidate_sets(
                 "query_id": item.edge_example.query_id,
                 "positive_id": item.edge_example.candidate_ids[0],
                 "candidate_ids": list(item.edge_example.candidate_ids),
+                "destination_type": "table",
                 "teacher_logits": teacher_edges.logits[index, :edge_count].cpu().tolist(),
                 "student_logits": student_edges.logits[index, :edge_count].cpu().tolist(),
                 "dataset": item.edge_example.dataset,

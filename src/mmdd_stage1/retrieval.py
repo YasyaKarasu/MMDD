@@ -14,6 +14,7 @@ import torch
 
 from .features import OBJECT_TYPES, FeatureStore, normalize_object_type
 from .models import StudentJoinabilityModel
+from .objectives import PathAggregator
 
 
 def checkpoint_fingerprint(path: Path) -> str:
@@ -162,6 +163,22 @@ def _logsumexp(values: Iterable[float]) -> float:
     return maximum + math.log(sum(math.exp(value - maximum) for value in values))
 
 
+def _aggregate_paths(paths: list[dict[str, Any]], aggregator: PathAggregator) -> float:
+    direct_scores = [float(path["path_score"]) for path in paths if path["kind"] == "direct"]
+    evidence_scores = [float(path["path_score"]) for path in paths if path["kind"] == "evidence"]
+    if not evidence_scores:
+        return _logsumexp(direct_scores)
+    direct_score = _logsumexp(direct_scores) if direct_scores else -math.inf
+    evidence = torch.tensor(evidence_scores, dtype=torch.float32).reshape(1, 1, -1)
+    score = aggregator(
+        torch.tensor([[direct_score]], dtype=torch.float32),
+        evidence,
+        torch.zeros_like(evidence),
+        torch.ones_like(evidence, dtype=torch.bool),
+    )
+    return float(score.item())
+
+
 def retrieve_zero_one_hop(
     query_id: str,
     indices: StudentANNIndices,
@@ -171,11 +188,14 @@ def retrieve_zero_one_hop(
     targets_per_evidence: int = 50,
     result_k: int = 100,
     evidence_types: tuple[str, ...] = ("text", "image"),
+    evidence_aggregation: str = "logsumexp",
+    evidence_top_k: int = 4,
 ) -> list[dict[str, Any]]:
     """Retrieve only Q->T and Q->E->T paths, then aggregate per target."""
 
     if min(direct_k, evidence_k, targets_per_evidence, result_k) < 0:
         raise ValueError("Retrieval k values must be non-negative")
+    aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
     paths_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for target_id, score in indices.search(query_id, "table", direct_k):
         paths_by_target[target_id].append({"kind": "direct", "path_score": score})
@@ -200,7 +220,7 @@ def retrieve_zero_one_hop(
         results.append(
             {
                 "target_id": target_id,
-                "score": _logsumexp(path["path_score"] for path in paths),
+                "score": _aggregate_paths(paths, aggregator),
                 "paths": paths,
             }
         )

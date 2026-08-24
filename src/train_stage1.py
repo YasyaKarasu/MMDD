@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from mmdd_stage1.checkpoints import load_student, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
 from mmdd_stage1.data import load_edge_examples, load_target_examples
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.models import StudentJoinabilityModel, TeacherJoinabilityModel
@@ -92,7 +92,15 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("All training stages require hidden_states so the frozen Teacher can score candidates")
     split = None if args.split == "all" else args.split
     training_paths = _training_paths(args.train_data)
-    aggregator = PathAggregator(args.evidence_aggregation, args.evidence_top_k).to(device)
+    aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
+    saved_aggregation, saved_top_k = (
+        load_path_aggregation(Path(aggregation_checkpoint))
+        if aggregation_checkpoint
+        else ("logsumexp", 4)
+    )
+    evidence_aggregation = args.evidence_aggregation or saved_aggregation
+    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
+    aggregator = PathAggregator(evidence_aggregation, evidence_top_k).to(device)
 
     teacher: TeacherJoinabilityModel | None = None
     student: StudentJoinabilityModel | None = None
@@ -172,7 +180,8 @@ def run(args: argparse.Namespace) -> None:
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint(model, args.stage), output)
+    saved_aggregator = aggregator if args.stage != "teacher-edge" else None
+    torch.save(checkpoint(model, args.stage, saved_aggregator), output)
     history_path = output.with_suffix(output.suffix + ".history.json")
     history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"stage": args.stage, "examples": len(examples), "checkpoint": str(output), "history": history}, indent=2))
@@ -217,9 +226,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
     parser.add_argument(
-        "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"], default="logsumexp"
+        "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
     )
-    parser.add_argument("--evidence-top-k", type=int, default=4)
+    parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--max-evidence-per-target", type=int, default=8)
     return parser.parse_args()
 

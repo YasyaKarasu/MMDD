@@ -13,13 +13,11 @@ from .features import OBJECT_TYPES, ObjectFeatures, normalize_object_type
 TYPE_TO_ID = {name: index for index, name in enumerate(OBJECT_TYPES)}
 
 
-def structural_table_pool(hidden_states: torch.Tensor, token_groups: torch.Tensor | None) -> torch.Tensor:
+def structural_table_pool(hidden_states: torch.Tensor, token_groups: torch.Tensor) -> torch.Tensor:
     """Return one token per table schema/example-row group."""
 
     if hidden_states.shape[0] == 0:
         raise ValueError("A table must contain at least one hidden-state token")
-    if token_groups is None:
-        return hidden_states
     groups = torch.unique(token_groups, sorted=True)
     return torch.stack([hidden_states[token_groups == group].mean(dim=0) for group in groups])
 
@@ -128,6 +126,8 @@ class TeacherJoinabilityModel(nn.Module):
             raise ValueError(f"{features.object_id}: Teacher requires hidden_states")
         hidden = self.adapters[object_type](features.hidden_states)
         if object_type == "table":
+            if features.token_groups is None:
+                raise ValueError(f"{features.object_id}: table hidden_states require token_groups")
             tokens = structural_table_pool(hidden, features.token_groups)
             token_kinds = torch.ones(tokens.shape[0], dtype=torch.long, device=tokens.device)
             token_kinds[0] = 0

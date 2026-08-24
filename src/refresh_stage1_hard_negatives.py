@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 import torch
 
-from mmdd_stage1.checkpoints import load_student, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.mining import retrieve_hard_candidate_sets, score_hard_candidate_sets
@@ -30,8 +30,8 @@ def _write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
 def run(args: argparse.Namespace) -> None:
     if args.hard_targets_per_query <= 0 or args.teacher_batch_size <= 0:
         raise ValueError("Hard-target and batch sizes must be positive")
-    if min(args.hard_evidence_per_query, args.max_evidence_per_target) < 0:
-        raise ValueError("Evidence limits must be non-negative")
+    if args.max_evidence_per_target < 0:
+        raise ValueError("--max-evidence-per-target must be non-negative")
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     split = None if args.split == "all" else args.split
     target_paths = [Path(value) for value in args.target_lists]
@@ -53,6 +53,9 @@ def run(args: argparse.Namespace) -> None:
     teacher_sha256 = checkpoint_fingerprint(Path(args.teacher_checkpoint))
     student_path = Path(args.student_checkpoint)
     student = load_student(student_path, device)
+    saved_aggregation, saved_top_k = load_path_aggregation(student_path)
+    evidence_aggregation = args.evidence_aggregation or saved_aggregation
+    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
     if teacher.input_dim != hidden_dim or student.input_dim != embedding_dim:
         raise ValueError("Checkpoint input dimensions do not match the feature cache")
     student_sha256 = checkpoint_fingerprint(student_path)
@@ -63,18 +66,19 @@ def run(args: argparse.Namespace) -> None:
         device=device,
         checkpoint_sha256=student_sha256,
     )
-    aggregator = PathAggregator(args.evidence_aggregation, args.evidence_top_k).to(device)
+    aggregator = PathAggregator(evidence_aggregation, evidence_top_k).to(device)
     candidate_sets = retrieve_hard_candidate_sets(
         examples,
         indices,
         hard_targets_per_query=args.hard_targets_per_query,
-        hard_evidence_per_query=args.hard_evidence_per_query,
         max_evidence_per_target=args.max_evidence_per_target,
         retrieval_k=args.retrieval_k,
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
         evidence_types=tuple(args.evidence_types),
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
     )
     target_records, edge_records = score_hard_candidate_sets(
         candidate_sets,
@@ -119,7 +123,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-batch-size", type=int, default=4)
     parser.add_argument("--mining-round", type=int, default=1)
     parser.add_argument("--hard-targets-per-query", type=int, default=16)
-    parser.add_argument("--hard-evidence-per-query", type=int, default=32)
     parser.add_argument("--max-evidence-per-target", type=int, default=8)
     parser.add_argument("--retrieval-k", type=int, default=200)
     parser.add_argument("--direct-k", type=int, default=200)
@@ -127,9 +130,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets-per-evidence", type=int, default=100)
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
     parser.add_argument(
-        "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"], default="logsumexp"
+        "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
     )
-    parser.add_argument("--evidence-top-k", type=int, default=4)
+    parser.add_argument("--evidence-top-k", type=int)
     return parser.parse_args()
 
 

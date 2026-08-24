@@ -255,12 +255,22 @@ def train_student_paths(
     return history
 
 
-def checkpoint(model: TeacherJoinabilityModel | StudentJoinabilityModel, stage: str) -> dict[str, Any]:
+def checkpoint(
+    model: TeacherJoinabilityModel | StudentJoinabilityModel,
+    stage: str,
+    aggregator: PathAggregator | None = None,
+) -> dict[str, Any]:
     model_kind = "teacher" if isinstance(model, TeacherJoinabilityModel) else "student"
-    return {
+    payload = {
         "format_version": 1,
         "model_kind": model_kind,
         "completed_stage": stage,
         "config": model.config(),
         "state_dict": model.state_dict(),
     }
+    if aggregator is not None:
+        payload["path_aggregation"] = {
+            "evidence_aggregation": aggregator.evidence_aggregation,
+            "evidence_top_k": aggregator.top_k,
+        }
+    return payload

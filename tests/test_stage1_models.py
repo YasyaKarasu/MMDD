@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample, load_edge_examples, load_target_examples
+from mmdd_stage1.checkpoints import load_path_aggregation
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage1.mining import build_hard_candidate_set, score_hard_candidate_sets
 from mmdd_stage1.models import StudentJoinabilityModel, TeacherJoinabilityModel, structural_table_pool
@@ -20,6 +21,7 @@ from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
 from mmdd_stage1.retrieval import StudentANNIndices, build_indices, retrieve_zero_one_hop
 from mmdd_stage1.scoring import score_target_batch
 from mmdd_stage1.training import (
+    checkpoint,
     sample_balanced_epoch,
     train_student_edges,
     train_student_paths,
@@ -218,6 +220,7 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
             "embedding": cached.embedding,
             "hidden_states": cached.hidden_states,
             "token_groups": cached.token_groups,
+            "row_embeddings": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
         },
         feature_dir / "q.pt",
     )
@@ -249,6 +252,7 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
     examples = load_target_examples(data_path, max_evidence=1)
 
     assert store.get("q").object_type == "table"
+    assert store.get("q").row_embeddings.shape == (1, 4)
     assert examples[0].positive_index == 0
     assert examples[0].candidates[0].evidence_ids == ("e1",)
     assert examples[0].dataset == "2k"
@@ -262,19 +266,46 @@ class FakeQwenModel:
 
 class FakeQwenEmbedder:
     model = FakeQwenModel()
+    max_length = 128
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            del kwargs
+            matches = list(__import__("re").finditer(r"\S+", text))
+            return {
+                "input_ids": list(range(1, len(matches) + 1)),
+                "offset_mapping": [match.span() for match in matches],
+            }
+
+    class Processor:
+        tokenizer = None
+
+        def __init__(self):
+            self.tokenizer = FakeQwenEmbedder.Tokenizer()
+
+        @staticmethod
+        def apply_chat_template(conversation, **kwargs):
+            del kwargs
+            return f"system prompt user {conversation} assistant"
+
+    def __init__(self):
+        self.forward_calls = 0
+        self.processor = self.Processor()
 
     def format_model_input(self, *, text=None, image=None, instruction=None):
         del image, instruction
         return text or "image"
 
     def _preprocess_inputs(self, conversations):
-        lengths = [len(value.split()) + 1 for value in conversations]
+        rendered = [self.processor.apply_chat_template(value) for value in conversations]
+        lengths = [len(self.processor.tokenizer(value)["input_ids"]) for value in rendered]
         width = max(lengths)
         input_ids = torch.arange(1, width + 1).repeat(len(lengths), 1)
         attention_mask = torch.arange(width).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
         return {"input_ids": input_ids, "attention_mask": attention_mask.long()}
 
     def forward(self, inputs):
+        self.forward_calls += 1
         hidden = inputs["input_ids"].float().unsqueeze(-1).repeat(1, 1, 4)
         return {"last_hidden_state": hidden, "attention_mask": inputs["attention_mask"]}
 
@@ -285,24 +316,54 @@ class FakeQwenEmbedder:
 
 
 def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
+    embedder = FakeQwenEmbedder()
     payload = build_object_features(
-        FakeQwenEmbedder(),
+        embedder,
         {
             "object_id": "q",
             "object_type": "table",
-            "text": "full table serialization",
+            "text": "schema player country\nrow Messi Argentina",
             "table_parts": ["schema player country", "row Messi Argentina"],
         },
         input_dir=tmp_path,
         instruction="represent",
-        table_part_batch_size=2,
         storage_dtype=torch.float16,
     )
 
+    assert embedder.forward_calls == 1
     assert payload["embedding"].shape == (4,)
     assert payload["embedding"].norm().item() == pytest.approx(1.0)
-    assert payload["hidden_states"].shape == (2, 4)
+    assert payload["hidden_states"].shape == (6, 4)
     assert payload["hidden_states"].dtype == torch.float16
+    assert payload["token_groups"].tolist() == [0, 0, 0, 1, 1, 1]
+
+
+def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
+    embedder = FakeQwenEmbedder()
+    payload = build_object_features(
+        embedder,
+        {
+            "object_id": "q",
+            "object_type": "table",
+            "text": "schema player country\nrow Messi Argentina\nrow Mbappe France",
+            "table_parts": [
+                "schema player country",
+                "row Messi Argentina",
+                "row Mbappe France",
+            ],
+            "row_routing_texts": [
+                "schema player country\nrow Messi Argentina",
+                "schema player country\nrow Mbappe France",
+            ],
+        },
+        input_dir=tmp_path,
+        instruction="represent",
+        storage_dtype=torch.float16,
+    )
+
+    assert embedder.forward_calls == 2
+    assert payload["row_embeddings"].shape == (2, 4)
+    assert torch.allclose(payload["row_embeddings"].norm(dim=-1), torch.ones(2))
 
 
 def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
@@ -354,6 +415,46 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
         assert score == pytest.approx(expected[target_id], abs=1e-5)
     assert {result["target_id"] for result in results} == {"positive", "negative"}
     assert all({path["kind"] for path in result["paths"]} == {"direct", "evidence"} for result in results)
+
+
+def test_online_retrieval_uses_configured_two_level_path_aggregation():
+    class StaticIndices:
+        def search(self, source_id, destination_type, k):
+            del k
+            values = {
+                ("q", "table"): [("t", 1.0)],
+                ("q", "text"): [("e1", 2.0), ("e2", 1.0)],
+                ("e1", "table"): [("t", 2.0)],
+                ("e2", "table"): [("t", 1.0)],
+            }
+            return values.get((source_id, destination_type), [])
+
+    results = retrieve_zero_one_hop(
+        "q",
+        StaticIndices(),
+        direct_k=1,
+        evidence_k=2,
+        targets_per_evidence=1,
+        evidence_types=("text",),
+        evidence_aggregation="topk_mean",
+        evidence_top_k=1,
+    )
+
+    assert results[0]["score"] == pytest.approx(torch.logaddexp(torch.tensor(1.0), torch.tensor(4.0)).item())
+
+
+def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):
+    path = tmp_path / "student.pt"
+    torch.save(
+        checkpoint(
+            StudentJoinabilityModel(input_dim=4, student_dim=3),
+            "student-path",
+            PathAggregator("topk_sum", 2),
+        ),
+        path,
+    )
+
+    assert load_path_aggregation(path) == ("topk_sum", 2)
 
 
 def test_dataset_sampling_alpha_balances_or_preserves_natural_mass():
@@ -437,7 +538,6 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
         original,
         retrieval_results,
         hard_targets_per_query=2,
-        hard_evidence_per_query=2,
         max_evidence_per_target=2,
     )
 
@@ -449,7 +549,7 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
     assert candidate_set.hard_target_ids == ("hard_1", "hard_2")
     assert candidate_set.hard_evidence_ids == ("e1", "e2")
     assert candidate_set.hard_path_count == 2
-    assert candidate_set.edge_example.candidate_ids == ("positive", "e1", "e2", "hard_1", "hard_2")
+    assert candidate_set.edge_example.candidate_ids == ("positive", "hard_1", "hard_2")
 
 
 def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
@@ -477,7 +577,6 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
             }
         ],
         hard_targets_per_query=1,
-        hard_evidence_per_query=1,
         max_evidence_per_target=1,
     )
 
@@ -494,7 +593,8 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
 
     assert len(target_records[0]["teacher_logits"]) == 2
     assert len(target_records[0]["student_logits"]) == 2
-    assert len(edge_records[0]["teacher_logits"]) == 3
+    assert len(edge_records[0]["teacher_logits"]) == 2
+    assert edge_records[0]["destination_type"] == "table"
     assert target_records[0]["mining"]["hard_target_ids"] == ["hard"]
     assert target_records[0]["mining"]["hard_evidence_ids"] == ["evidence"]
     assert target_records[0]["mining"]["mining_round"] == 2

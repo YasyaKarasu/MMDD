@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from mmdd_stage1.checkpoints import load_student
+from mmdd_stage1.checkpoints import load_path_aggregation, load_student
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.retrieval import StudentANNIndices, checkpoint_fingerprint, retrieve_zero_one_hop
 
@@ -18,6 +18,9 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint_path = Path(args.student_checkpoint)
     model = load_student(checkpoint_path, device)
+    saved_aggregation, saved_top_k = load_path_aggregation(checkpoint_path)
+    evidence_aggregation = args.evidence_aggregation or saved_aggregation
+    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
     model.eval()
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
     indices = StudentANNIndices(
@@ -35,8 +38,21 @@ def run(args: argparse.Namespace) -> None:
         targets_per_evidence=args.targets_per_evidence,
         result_k=args.result_k,
         evidence_types=tuple(args.evidence_types),
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
     )
-    payload = json.dumps({"query_id": args.query_id, "results": results}, ensure_ascii=False, indent=2)
+    payload = json.dumps(
+        {
+            "query_id": args.query_id,
+            "path_aggregation": {
+                "evidence_aggregation": evidence_aggregation,
+                "evidence_top_k": evidence_top_k,
+            },
+            "results": results,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets-per-evidence", type=int, default=50)
     parser.add_argument("--result-k", type=int, default=100)
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
+    parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
+    parser.add_argument("--evidence-top-k", type=int)
     return parser.parse_args()
 
 

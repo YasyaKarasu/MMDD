@@ -31,8 +31,10 @@ def _load_embedder_class(model_dir: Path):
 
 
 @torch.inference_mode()
-def encode_inputs(embedder: Any, items: list[dict[str, Any]]) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Return normalized final embeddings and unpooled valid hidden states."""
+def encode_inputs(
+    embedder: Any, items: list[dict[str, Any]]
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Return embeddings, unpooled valid hidden states, and their token IDs."""
 
     conversations = [
         embedder.format_model_input(
@@ -50,9 +52,75 @@ def encode_inputs(embedder: Any, items: list[dict[str, Any]]) -> list[tuple[torc
     pooled = embedder._pooling_last(hidden_states, attention_mask)
     embeddings = F.normalize(pooled.float(), p=2, dim=-1)
     return [
-        (embeddings[index].cpu(), hidden_states[index][attention_mask[index]].cpu())
+        (
+            embeddings[index].cpu(),
+            hidden_states[index][attention_mask[index]].cpu(),
+            inputs["input_ids"][index][attention_mask[index]].cpu(),
+        )
         for index in range(hidden_states.shape[0])
     ]
+
+
+def _table_token_groups(
+    embedder: Any,
+    item: dict[str, Any],
+    parts: list[str],
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    text = item.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("A table requires non-empty text containing all table_parts")
+
+    part_spans = []
+    cursor = 0
+    for part in parts:
+        start = text.find(part, cursor)
+        if start < 0:
+            raise ValueError("table_parts must occur in order within the table text")
+        part_spans.append((start, start + len(part)))
+        cursor = start + len(part)
+
+    conversation = embedder.format_model_input(
+        text=text,
+        image=item.get("image"),
+        instruction=item.get("instruction"),
+    )
+    rendered = embedder.processor.apply_chat_template(
+        conversation, add_generation_prompt=True, tokenize=False
+    )
+    text_start = rendered.rfind(text)
+    if text_start < 0:
+        raise ValueError("Qwen chat template did not preserve the serialized table text")
+    rendered_spans = [(text_start + start, text_start + end) for start, end in part_spans]
+
+    tokenized = None
+    for add_special_tokens in (False, True):
+        candidate = embedder.processor.tokenizer(
+            rendered,
+            add_special_tokens=add_special_tokens,
+            truncation=True,
+            max_length=embedder.max_length,
+            return_offsets_mapping=True,
+        )
+        if list(candidate["input_ids"]) == input_ids.tolist():
+            tokenized = candidate
+            break
+    if tokenized is None:
+        raise ValueError("Tokenizer offsets do not align with Qwen preprocessing")
+
+    selected_indices = []
+    groups = []
+    for token_index, (start, end) in enumerate(tokenized["offset_mapping"]):
+        if end <= start:
+            continue
+        for group, (part_start, part_end) in enumerate(rendered_spans):
+            if end > part_start and start < part_end:
+                selected_indices.append(token_index)
+                groups.append(group)
+                break
+    if set(groups) != set(range(len(parts))):
+        raise ValueError("Table truncation removed all tokens from at least one schema/row group")
+    return torch.tensor(selected_indices, dtype=torch.long), torch.tensor(groups, dtype=torch.long)
 
 
 def _resolve_image(record: dict[str, Any], input_dir: Path) -> str | None:
@@ -74,7 +142,6 @@ def build_object_features(
     *,
     input_dir: Path,
     instruction: str,
-    table_part_batch_size: int,
     storage_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     object_type = normalize_object_type(str(record["object_type"]))
@@ -83,7 +150,11 @@ def build_object_features(
         "image": _resolve_image(record, input_dir),
         "instruction": record.get("instruction", instruction),
     }
-    embedding, hidden_states = encode_inputs(embedder, [item])[0]
+    embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
+    payload = {
+        "embedding": embedding.float(),
+        "hidden_states": hidden_states.to(dtype=storage_dtype),
+    }
 
     if object_type == "table":
         parts = record.get("table_parts")
@@ -91,20 +162,34 @@ def build_object_features(
             raise ValueError(
                 f"{record.get('object_id')}: table_parts must contain schema text followed by example-row texts"
             )
-        structural_tokens = []
-        for start in range(0, len(parts), table_part_batch_size):
-            batch = [
-                {"text": part, "instruction": record.get("instruction", instruction)}
-                for part in parts[start : start + table_part_batch_size]
-            ]
-            outputs = encode_inputs(embedder, batch)
-            structural_tokens.extend(part_hidden[-1] for _, part_hidden in outputs)
-        hidden_states = torch.stack(structural_tokens)
+        indices, groups = _table_token_groups(embedder, item, parts, input_ids)
+        payload["hidden_states"] = hidden_states.index_select(0, indices).to(dtype=storage_dtype)
+        payload["token_groups"] = groups
 
-    return {
-        "embedding": embedding.float(),
-        "hidden_states": hidden_states.to(dtype=storage_dtype),
-    }
+        row_routing_texts = record.get("row_routing_texts")
+        if row_routing_texts is not None:
+            if (
+                not isinstance(row_routing_texts, list)
+                or not row_routing_texts
+                or len(row_routing_texts) != len(parts) - 1
+                or not all(isinstance(text, str) and text.strip() for text in row_routing_texts)
+            ):
+                raise ValueError(
+                    f"{record.get('object_id')}: row_routing_texts must contain one non-empty text per query row"
+                )
+            routing_outputs = encode_inputs(
+                embedder,
+                [
+                    {
+                        "text": text,
+                        "instruction": record.get("instruction", instruction),
+                    }
+                    for text in row_routing_texts
+                ],
+            )
+            payload["row_embeddings"] = torch.stack([embedding for embedding, _, _ in routing_outputs])
+
+    return payload
 
 
 def _completed_records(manifest: Path) -> dict[str, dict[str, Any]]:
@@ -126,8 +211,6 @@ def _source_fingerprint(record: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> None:
-    if args.table_part_batch_size <= 0:
-        raise ValueError("--table-part-batch-size must be positive")
     input_path = Path(args.input_jsonl).resolve()
     output_dir = Path(args.output_dir)
     object_dir = output_dir / "objects"
@@ -137,11 +220,11 @@ def run(args: argparse.Namespace) -> None:
 
     model_dir = Path(args.model_dir).resolve()
     metadata = {
-        "format_version": 1,
+        "format_version": 3,
         "model_dir": str(model_dir),
         "dtype": args.dtype,
         "instruction": args.instruction,
-        "table_part_batch_size": args.table_part_batch_size,
+        "table_pooling": "single_forward_token_groups",
     }
     metadata_path = output_dir / "metadata.json"
     if metadata_path.exists():
@@ -208,7 +291,6 @@ def run(args: argparse.Namespace) -> None:
                 record,
                 input_dir=input_path.parent,
                 instruction=args.instruction,
-                table_part_batch_size=args.table_part_batch_size,
                 storage_dtype=torch_dtype,
             )
             name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
@@ -239,7 +321,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default="hf_models/Qwen3-VL-Embedding-8B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--table-part-batch-size", type=int, default=8)
     parser.add_argument(
         "--instruction",
         default="Represent this object for directed logical joinability discovery.",

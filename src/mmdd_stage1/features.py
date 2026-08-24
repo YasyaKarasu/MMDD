@@ -35,8 +35,7 @@ class ObjectFeatures:
 
     ``hidden_states`` contains pooling-before hidden states. For tables,
     ``token_groups`` assigns each token to schema group 0 or an example-row
-    group greater than 0. A table cache may instead store already pooled
-    schema/row tokens and omit ``token_groups``.
+    group greater than 0 from the same encoder forward pass.
     """
 
     object_id: str
@@ -44,6 +43,7 @@ class ObjectFeatures:
     embedding: torch.Tensor
     hidden_states: torch.Tensor | None = None
     token_groups: torch.Tensor | None = None
+    row_embeddings: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "object_type", normalize_object_type(self.object_type))
@@ -53,6 +53,8 @@ class ObjectFeatures:
             raise ValueError(f"{self.object_id}: hidden_states must have shape [tokens, D]")
         if self.hidden_states is not None and self.hidden_states.shape[1] != self.embedding.shape[0]:
             raise ValueError(f"{self.object_id}: embedding and hidden-state dimensions must match")
+        if self.object_type == "table" and self.hidden_states is not None and self.token_groups is None:
+            raise ValueError(f"{self.object_id}: table hidden_states require token_groups")
         if self.token_groups is not None:
             if self.hidden_states is None:
                 raise ValueError(f"{self.object_id}: token_groups require hidden_states")
@@ -64,10 +66,16 @@ class ObjectFeatures:
             expected = torch.arange(len(groups), device=groups.device)
             if not torch.equal(groups, expected):
                 raise ValueError(f"{self.object_id}: token_groups must be contiguous and start at schema group 0")
+        if self.row_embeddings is not None:
+            if self.object_type != "table":
+                raise ValueError(f"{self.object_id}: only tables can have row_embeddings")
+            if self.row_embeddings.ndim != 2 or self.row_embeddings.shape[1] != self.embedding.shape[0]:
+                raise ValueError(f"{self.object_id}: row_embeddings must have shape [rows, D]")
 
     def to(self, device: torch.device, *, include_hidden: bool) -> ObjectFeatures:
         hidden = self.hidden_states
         groups = self.token_groups
+        row_embeddings = self.row_embeddings
         if include_hidden:
             if hidden is None:
                 raise ValueError(f"{self.object_id}: Teacher training requires hidden_states")
@@ -76,12 +84,15 @@ class ObjectFeatures:
         else:
             hidden = None
             groups = None
+        if row_embeddings is not None:
+            row_embeddings = row_embeddings.to(device=device, dtype=torch.float32)
         return ObjectFeatures(
             object_id=self.object_id,
             object_type=self.object_type,
             embedding=self.embedding.to(device=device, dtype=torch.float32),
             hidden_states=hidden,
             token_groups=groups,
+            row_embeddings=row_embeddings,
         )
 
 
@@ -89,18 +100,22 @@ def _feature_from_payload(object_id: str, object_type: str, payload: Mapping[str
     embedding = payload.get("embedding")
     hidden_states = payload.get("hidden_states")
     token_groups = payload.get("token_groups")
+    row_embeddings = payload.get("row_embeddings")
     if not isinstance(embedding, torch.Tensor):
         raise ValueError(f"{object_id}: feature payload has no tensor embedding")
     if hidden_states is not None and not isinstance(hidden_states, torch.Tensor):
         raise ValueError(f"{object_id}: hidden_states must be a tensor")
     if token_groups is not None and not isinstance(token_groups, torch.Tensor):
         raise ValueError(f"{object_id}: token_groups must be a tensor")
+    if row_embeddings is not None and not isinstance(row_embeddings, torch.Tensor):
+        raise ValueError(f"{object_id}: row_embeddings must be a tensor")
     return ObjectFeatures(
         object_id=object_id,
         object_type=object_type,
         embedding=embedding.detach().cpu().float(),
         hidden_states=hidden_states.detach().cpu().float() if hidden_states is not None else None,
         token_groups=token_groups.detach().cpu().long() if token_groups is not None else None,
+        row_embeddings=row_embeddings.detach().cpu().float() if row_embeddings is not None else None,
     )
 
 
