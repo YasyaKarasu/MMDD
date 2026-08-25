@@ -131,6 +131,92 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     assert {"positive", "e_positive"} <= corpus_ids
 
 
+def test_stage1_constructor_builds_cross_modal_edge_lists(tmp_path):
+    query = _table("q", ["Entity"], [["A"]])
+    positive = _table("positive", ["Value"], [["1"]])
+    negative = _table("negative", ["Value"], [["2"]])
+    positive_image = tmp_path / "positive.bin"
+    negative_image = tmp_path / "negative.bin"
+    positive_image.write_bytes(b"positive")
+    negative_image.write_bytes(b"negative")
+    assets = [
+        {"asset_id": "positive_text", "asset_type": "text", "content": "positive"},
+        {
+            "asset_id": "positive_text_extra",
+            "asset_type": "text",
+            "content": "positive extra",
+        },
+        {
+            "asset_id": "positive_image",
+            "asset_type": "image",
+            "local_path": str(positive_image),
+        },
+        {"asset_id": "negative_text", "asset_type": "text", "content": "negative"},
+        {
+            "asset_id": "negative_text_extra",
+            "asset_type": "text",
+            "content": "negative extra",
+        },
+        {
+            "asset_id": "negative_image",
+            "asset_type": "image",
+            "local_path": str(negative_image),
+        },
+    ]
+    recoveries = [
+        {"target_table_id": "positive", "evidence": {"asset_id": "positive_text"}},
+        {
+            "target_table_id": "positive",
+            "evidence": {"asset_id": "positive_text_extra"},
+        },
+        {"target_table_id": "positive", "evidence": {"asset_id": "positive_image"}},
+        {"target_table_id": "negative", "evidence": {"asset_id": "negative_text"}},
+        {
+            "target_table_id": "negative",
+            "evidence": {"asset_id": "negative_text_extra"},
+        },
+        {"target_table_id": "negative", "evidence": {"asset_id": "negative_image"}},
+    ]
+    _write_jsonl(tmp_path / "query_tables.jsonl", [query])
+    _write_jsonl(tmp_path / "data_lake_tables.jsonl", [positive, negative])
+    _write_jsonl(tmp_path / "bridge_assets.jsonl", assets)
+    _write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [{"query_table_id": "q", "target_table_id": "positive", "split": "train"}],
+    )
+    _write_jsonl(tmp_path / "evidence_recoveries.jsonl", recoveries)
+
+    artifacts = build_stage1_training_artifacts(
+        tmp_path,
+        dataset_name="synthetic",
+        max_evidence_per_target=2,
+    )
+
+    edges = {
+        (record["source_type"], record["destination_type"]): record
+        for record in artifacts["edge_lists"]
+    }
+    assert set(edges) == {
+        ("table", "table"),
+        ("table", "text"),
+        ("text", "table"),
+        ("table", "image"),
+        ("image", "table"),
+    }
+    assert edges[("table", "text")]["candidate_ids"] == [
+        "positive_text",
+        "negative_text",
+    ]
+    assert edges[("table", "image")]["candidate_ids"] == [
+        "positive_image",
+        "negative_image",
+    ]
+    assert edges[("text", "table")]["query_id"] == "positive_text"
+    assert edges[("text", "table")]["candidate_ids"] == ["positive", "negative"]
+    assert edges[("image", "table")]["query_id"] == "positive_image"
+    assert edges[("image", "table")]["candidate_ids"] == ["positive", "negative"]
+
+
 def test_stage1_constructor_resolves_raw_data_lake_source_references(tmp_path):
     query = _table("q", ["Entity"], [["A"]])
     positive = _table("positive", ["Value"], [["1"]])

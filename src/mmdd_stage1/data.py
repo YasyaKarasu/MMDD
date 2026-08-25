@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .features import normalize_object_type
+
 
 @dataclass(frozen=True)
 class EdgeExample:
@@ -18,6 +20,9 @@ class EdgeExample:
     split: str | None = None
     teacher_logits: tuple[float, ...] | None = None
     teacher_checkpoint_sha256: str | None = None
+    source_type: str | None = None
+    destination_type: str | None = None
+    edge_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,17 @@ def load_edge_examples(
                 split=record.get("split"),
                 teacher_logits=_teacher_logits(path, line_number, record, len(candidate_ids)),
                 teacher_checkpoint_sha256=record.get("teacher_checkpoint_sha256"),
+                source_type=(
+                    normalize_object_type(str(record["source_type"]))
+                    if record.get("source_type") is not None
+                    else None
+                ),
+                destination_type=(
+                    normalize_object_type(str(record["destination_type"]))
+                    if record.get("destination_type") is not None
+                    else None
+                ),
+                edge_kind=record.get("edge_kind"),
             )
         )
     if not examples:

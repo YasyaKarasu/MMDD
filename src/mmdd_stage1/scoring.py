@@ -9,7 +9,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from .data import EdgeExample, TargetExample
-from .features import FeatureStore, ObjectFeatures
+from .features import FeatureStore, ObjectFeatures, normalize_object_type
 from .models import StudentJoinabilityModel, TeacherJoinabilityModel
 from .objectives import PathAggregator
 
@@ -53,10 +53,32 @@ def score_edge_batch(
     lengths = []
     for example in examples:
         query = _device_features(example.query_id, store, feature_cache, device, include_hidden)
+        source_type = (
+            normalize_object_type(example.source_type) if example.source_type is not None else None
+        )
+        destination_type = (
+            normalize_object_type(example.destination_type)
+            if example.destination_type is not None
+            else None
+        )
+        if source_type is not None and query.object_type != source_type:
+            raise ValueError(
+                f"{example.query_id}: declared source_type {example.source_type!r} "
+                f"does not match cached type {query.object_type!r}"
+            )
         lengths.append(len(example.candidate_ids))
         for candidate_id in example.candidate_ids:
+            destination = _device_features(candidate_id, store, feature_cache, device, include_hidden)
+            if (
+                destination_type is not None
+                and destination.object_type != destination_type
+            ):
+                raise ValueError(
+                    f"{candidate_id}: declared destination_type {example.destination_type!r} "
+                    f"does not match cached type {destination.object_type!r}"
+                )
             sources.append(query)
-            destinations.append(_device_features(candidate_id, store, feature_cache, device, include_hidden))
+            destinations.append(destination)
     flat_scores = model.score_pairs(sources, destinations)
     rows = pad_sequence(list(flat_scores.split(lengths)), batch_first=True, padding_value=0.0)
     candidate_mask = _mask(lengths, rows.shape[1], device)

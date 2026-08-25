@@ -188,6 +188,35 @@ def _evidence_by_target(
     return result
 
 
+def _edge_evidence_ids(
+    evidence_ids: Iterable[str],
+    asset_types: dict[str, str],
+    limit: int,
+) -> list[str]:
+    """Retain modality coverage before filling the remaining edge-positive budget."""
+
+    if limit == 0:
+        return []
+    values = list(evidence_ids)
+    selected = []
+    for evidence_type in dict.fromkeys(asset_types[evidence_id] for evidence_id in values):
+        selected.append(
+            next(
+                evidence_id
+                for evidence_id in values
+                if asset_types[evidence_id] == evidence_type
+            )
+        )
+        if len(selected) >= limit:
+            return selected
+    for evidence_id in values:
+        if evidence_id not in selected:
+            selected.append(evidence_id)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def _resolve_target_references(
     dataset_root: Path, records: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -275,6 +304,7 @@ def build_stage1_training_artifacts(
     target_text = {target_id: record["text"] for target_id, record in target_objects.items()}
     postings, inverse_document_frequency = _semantic_index(target_text)
     evidence_by_target = _evidence_by_target(targets, assets, recoveries)
+    asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
     targets_by_split: dict[str, list[str]] = defaultdict(list)
     target_sets_by_split: dict[str, set[str]] = defaultdict(set)
     structure_buckets: dict[tuple[str, int, int], list[str]] = defaultdict(list)
@@ -284,8 +314,19 @@ def build_stage1_training_artifacts(
         target_sets_by_split[split].add(target_id)
         structure_buckets[(split, len(target["columns"]), len(target["rows"]))].append(target_id)
 
+    targets_by_evidence: dict[str, set[str]] = defaultdict(set)
+    evidence_by_split_type: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for target_id, evidence_ids in evidence_by_target.items():
+        split = str(targets[target_id].get("split", "train"))
+        for evidence_id in evidence_ids:
+            targets_by_evidence[evidence_id].add(target_id)
+            bucket = evidence_by_split_type[(split, asset_types[evidence_id])]
+            if evidence_id not in bucket:
+                bucket.append(evidence_id)
+
     edge_lists = []
     target_lists = []
+    emitted_evidence_target_edges: set[tuple[str, str]] = set()
     for query_id, positive_ids in positives_by_query.items():
         query = queries[query_id]
         split = str(query.get("split", "train"))
@@ -354,17 +395,122 @@ def build_stage1_training_artifacts(
                 }
             )
 
-        edge_lists.append(
-            {
-                "query_id": query_id,
-                "positive_id": positive_ids[0],
-                "candidate_ids": [positive_ids[0], *negative_ids],
-                "destination_type": "table",
-                "negative_sources": {target_id: source for source, target_id in selected.items()},
-                "dataset": dataset_name,
-                "split": split,
-            }
-        )
+        target_negative_sources = {
+            target_id: source for source, target_id in selected.items()
+        }
+        for positive_id in positive_ids:
+            edge_lists.append(
+                {
+                    "query_id": query_id,
+                    "source_type": "table",
+                    "positive_id": positive_id,
+                    "candidate_ids": [positive_id, *negative_ids],
+                    "destination_type": "table",
+                    "edge_kind": "query_to_target",
+                    "negative_sources": target_negative_sources,
+                    "dataset": dataset_name,
+                    "split": split,
+                }
+            )
+
+        positive_evidence_ids = []
+        for positive_id in positive_ids:
+            for evidence_id in _edge_evidence_ids(
+                evidence_by_target[positive_id], asset_types, max_evidence_per_target
+            ):
+                if evidence_id not in positive_evidence_ids:
+                    positive_evidence_ids.append(evidence_id)
+        positive_evidence_set = set(positive_evidence_ids)
+
+        evidence_negatives: dict[str, list[str]] = defaultdict(list)
+        evidence_negative_sources: dict[str, str] = {}
+        for source in ordered_sources:
+            negative_target_id = selected.get(source)
+            if negative_target_id is None:
+                continue
+            seen_type = set()
+            for evidence_id in _edge_evidence_ids(
+                evidence_by_target[negative_target_id], asset_types, max_evidence_per_target
+            ):
+                evidence_type = asset_types[evidence_id]
+                if (
+                    evidence_type in seen_type
+                    or evidence_id in positive_evidence_set
+                    or evidence_id in evidence_negatives[evidence_type]
+                ):
+                    continue
+                seen_type.add(evidence_type)
+                evidence_negatives[evidence_type].append(evidence_id)
+                evidence_negative_sources[evidence_id] = source
+
+        for evidence_type in {asset_types[evidence_id] for evidence_id in positive_evidence_ids}:
+            if evidence_negatives[evidence_type]:
+                continue
+            fallback_id = _pick_random(
+                evidence_by_split_type[(split, evidence_type)],
+                positive_evidence_set,
+                rng,
+            )
+            if fallback_id is not None:
+                evidence_negatives[evidence_type].append(fallback_id)
+                evidence_negative_sources[fallback_id] = "random"
+
+        for positive_evidence_id in positive_evidence_ids:
+            evidence_type = asset_types[positive_evidence_id]
+            negative_evidence_ids = evidence_negatives[evidence_type]
+            if not negative_evidence_ids:
+                continue
+            edge_lists.append(
+                {
+                    "query_id": query_id,
+                    "source_type": "table",
+                    "positive_id": positive_evidence_id,
+                    "candidate_ids": [positive_evidence_id, *negative_evidence_ids],
+                    "destination_type": evidence_type,
+                    "edge_kind": "query_to_evidence",
+                    "negative_sources": {
+                        evidence_id: evidence_negative_sources[evidence_id]
+                        for evidence_id in negative_evidence_ids
+                    },
+                    "dataset": dataset_name,
+                    "split": split,
+                }
+            )
+
+        for positive_target_id in positive_ids:
+            for evidence_id in _edge_evidence_ids(
+                evidence_by_target[positive_target_id], asset_types, max_evidence_per_target
+            ):
+                edge_key = (evidence_id, positive_target_id)
+                if edge_key in emitted_evidence_target_edges:
+                    continue
+                excluded_targets = targets_by_evidence[evidence_id]
+                evidence_target_negatives = [
+                    target_id for target_id in negative_ids if target_id not in excluded_targets
+                ]
+                if not evidence_target_negatives:
+                    fallback_id = _pick_random(split_targets, excluded_targets, rng)
+                    if fallback_id is not None:
+                        evidence_target_negatives.append(fallback_id)
+                if not evidence_target_negatives:
+                    continue
+                emitted_evidence_target_edges.add(edge_key)
+                edge_lists.append(
+                    {
+                        "query_id": evidence_id,
+                        "source_type": asset_types[evidence_id],
+                        "positive_id": positive_target_id,
+                        "candidate_ids": [positive_target_id, *evidence_target_negatives],
+                        "destination_type": "table",
+                        "edge_kind": "evidence_to_target",
+                        "negative_sources": {
+                            target_id: target_negative_sources.get(target_id, "random")
+                            for target_id in evidence_target_negatives
+                        },
+                        "dataset": dataset_name,
+                        "split": split,
+                    }
+                )
         target_lists.append(
             {
                 "query_id": query_id,

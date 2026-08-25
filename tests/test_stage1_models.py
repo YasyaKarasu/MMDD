@@ -16,10 +16,15 @@ from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample, load_e
 from mmdd_stage1.checkpoints import load_path_aggregation
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage1.mining import build_hard_candidate_set, score_hard_candidate_sets
-from mmdd_stage1.models import StudentJoinabilityModel, TeacherJoinabilityModel, structural_table_pool
+from mmdd_stage1.models import (
+    TYPE_TO_ID,
+    StudentJoinabilityModel,
+    TeacherJoinabilityModel,
+    structural_table_pool,
+)
 from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
 from mmdd_stage1.retrieval import StudentANNIndices, build_indices, retrieve_zero_one_hop
-from mmdd_stage1.scoring import score_target_batch
+from mmdd_stage1.scoring import score_edge_batch, score_target_batch
 from mmdd_stage1.training import (
     checkpoint,
     sample_balanced_epoch,
@@ -153,6 +158,92 @@ def test_target_scoring_and_listwise_loss_backpropagate_through_paths():
     assert torch.isfinite(loss)
     assert model.relations["table_to_text"].grad is not None
     assert model.relations["text_to_table"].grad is not None
+
+
+def test_cross_modal_edge_warmup_backpropagates_through_all_path_relations():
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.2),
+            "negative": feature("negative", "table", 0.8),
+            "positive_text": feature("positive_text", "text", 0.3),
+            "negative_text": feature("negative_text", "text", 0.7),
+            "positive_image": feature("positive_image", "image", 0.4),
+            "negative_image": feature("negative_image", "image", 0.6),
+        }
+    )
+    examples = [
+        EdgeExample(
+            "q", ("positive_text", "negative_text"), 0,
+            source_type="table", destination_type="text",
+        ),
+        EdgeExample(
+            "positive_text", ("positive", "negative"), 0,
+            source_type="text", destination_type="table",
+        ),
+        EdgeExample(
+            "q", ("positive_image", "negative_image"), 0,
+            source_type="table", destination_type="image",
+        ),
+        EdgeExample(
+            "positive_image", ("positive", "negative"), 0,
+            source_type="image", destination_type="table",
+        ),
+    ]
+    device = torch.device("cpu")
+
+    teacher_model = teacher()
+    teacher_scores = score_edge_batch(teacher_model, examples, store, device)
+    listwise_cross_entropy(
+        teacher_scores.logits,
+        teacher_scores.positive_indices,
+        teacher_scores.candidate_mask,
+    ).backward()
+    type_count = len(TYPE_TO_ID)
+    for source_type, destination_type in (
+        ("table", "text"),
+        ("text", "table"),
+        ("table", "image"),
+        ("image", "table"),
+    ):
+        index = TYPE_TO_ID[source_type] * type_count + TYPE_TO_ID[destination_type]
+        gradient = teacher_model.type_pair_embeddings.weight.grad[index]
+        assert torch.count_nonzero(gradient) > 0
+
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    student_scores = score_edge_batch(student_model, examples, store, device)
+    listwise_cross_entropy(
+        student_scores.logits,
+        student_scores.positive_indices,
+        student_scores.candidate_mask,
+    ).backward()
+    for relation_key in (
+        "table_to_text",
+        "text_to_table",
+        "table_to_image",
+        "image_to_table",
+    ):
+        gradient = student_model.relations[relation_key].grad
+        assert gradient is not None
+        assert torch.count_nonzero(gradient) > 0
+
+
+def test_edge_scoring_validates_declared_destination_type():
+    example = EdgeExample(
+        "q",
+        ("positive", "negative"),
+        0,
+        source_type="table",
+        destination_type="text",
+    )
+
+    with pytest.raises(ValueError, match="declared destination_type"):
+        score_edge_batch(
+            StudentJoinabilityModel(input_dim=4, student_dim=3),
+            [example],
+            feature_store(),
+            torch.device("cpu"),
+        )
 
 
 def test_all_four_training_stages_run_on_synthetic_features():
@@ -600,7 +691,6 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
     assert candidate_set.hard_target_ids == ("hard_1", "hard_2")
     assert candidate_set.hard_evidence_ids == ("e1", "e2")
     assert candidate_set.hard_path_count == 2
-    assert candidate_set.edge_example.candidate_ids == ("positive", "hard_1", "hard_2")
 
 
 def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
@@ -661,3 +751,75 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     assert loaded_target.teacher_logits == pytest.approx(target_records[0]["teacher_logits"])
     assert loaded_target.teacher_score_config.evidence_aggregation == "logsumexp"
     assert loaded_edge.teacher_logits == pytest.approx(edge_records[0]["teacher_logits"])
+
+
+def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.2),
+            "hard": feature("hard", "table", 0.8),
+            "positive_text": feature("positive_text", "text", 0.3),
+            "hard_text": feature("hard_text", "text", 0.7),
+            "positive_image": feature("positive_image", "image", 0.4),
+            "hard_image": feature("hard_image", "image", 0.6),
+        }
+    )
+    original = TargetExample(
+        "q",
+        (
+            TargetCandidate("positive", ("positive_text", "positive_image")),
+            TargetCandidate("hard", ()),
+        ),
+        positive_index=0,
+        dataset="2k",
+        split="train",
+    )
+    candidate_set = build_hard_candidate_set(
+        original,
+        [
+            {
+                "target_id": "hard",
+                "score": 4.0,
+                "paths": [
+                    {"kind": "evidence", "evidence_id": "hard_text", "path_score": 4.0},
+                    {"kind": "evidence", "evidence_id": "hard_image", "path_score": 3.0},
+                ],
+            }
+        ],
+        hard_targets_per_query=1,
+        max_evidence_per_target=2,
+    )
+
+    _target_records, edge_records = score_hard_candidate_sets(
+        [candidate_set],
+        teacher(),
+        StudentJoinabilityModel(input_dim=4, student_dim=3),
+        store,
+        PathAggregator(),
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+
+    edges = {
+        (record["source_type"], record["destination_type"]): record
+        for record in edge_records
+    }
+    assert set(edges) == {
+        ("table", "table"),
+        ("table", "text"),
+        ("text", "table"),
+        ("table", "image"),
+        ("image", "table"),
+    }
+    assert edges[("table", "text")]["candidate_ids"] == [
+        "positive_text",
+        "hard_text",
+    ]
+    assert edges[("table", "image")]["candidate_ids"] == [
+        "positive_image",
+        "hard_image",
+    ]
+    assert edges[("text", "table")]["candidate_ids"] == ["positive", "hard"]
+    assert edges[("image", "table")]["candidate_ids"] == ["positive", "hard"]
+    assert all(len(record["teacher_logits"]) == 2 for record in edge_records)

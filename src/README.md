@@ -67,12 +67,20 @@ conda run -n MMDD python src/cache_stage1_features.py \
 Feature caches created before the row-routing format must be rebuilt; Stage 2
 fails explicitly when a selected query has no cached `row_embeddings`.
 
-Edge warm-up data contains a query, an unordered candidate list, and its one
-positive object:
+Edge warm-up data contains a source object, an unordered same-destination-type
+candidate list, and its one positive object. The historical `query_id` field
+identifies the source for every edge kind, including evidence-to-target edges:
 
 ```json
-{"query_id":"q1","candidate_ids":["t1","t2","t3"],"positive_id":"t1","dataset":"2k","split":"train"}
+{"query_id":"q1","source_type":"table","candidate_ids":["e1","e2"],"positive_id":"e1","destination_type":"text","edge_kind":"query_to_evidence","dataset":"2k","split":"train"}
 ```
+
+Construction emits query-to-target edges plus query-to-evidence and
+evidence-to-target edges for retained text/image recoveries whenever a valid
+negative exists. The edge budget retains one recovery from each available
+modality before filling its remaining slots. Each positive edge gets its own
+list; other known positives are excluded from its negatives. `source_type` and
+`destination_type` are checked against the feature cache during scoring.
 
 Path-level data groups evidence by candidate target. Evidence order is the
 retrieval-score order; `--max-evidence-per-target` retains its prefix:
@@ -168,18 +176,22 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
 ```
 
 The refresh runs current-Student `Q -> T` and `Q -> E -> T` retrieval, removes
-every ID in `positive_target_ids`, retains high-ranked wrong targets, extracts
-their evidence objects and complete wrong paths, and asks the frozen Teacher
-to rescore target/path lists and a separate table-to-table edge list. Mined
-evidence remains latent inside wrong target paths; it is not labeled as a
-direct query-to-evidence negative. The output stores aligned
-`teacher_logits`; `student-edge` and `student-path` consume these cached soft
-labels directly. The loader also checks the Teacher checkpoint, evidence
-truncation, and path-aggregation configuration before reuse:
+every ID in `positive_target_ids`, retains high-ranked wrong targets, and
+extracts their evidence objects and complete wrong paths. The frozen Teacher
+then rescores the target/path lists and their directly supervised edge lists:
+query-to-target, evidence-to-target, and query-to-evidence whenever a
+same-modality negative evidence object was mined. Under the dataset's
+closed-world labels, evidence retained only on a non-GT target path is a hard
+query-to-evidence negative; it remains latent in the target/path objective as
+well. The output stores aligned `teacher_logits`; `student-edge` and
+`student-path` consume these cached soft labels directly. The loader also
+checks declared edge types, the Teacher checkpoint, evidence truncation, and
+path-aggregation configuration before reuse:
 
 ```bash
 conda run -n MMDD python src/train_stage1.py student-edge \
-  --features cache/stage1_qwen8b --train-data hard_edges_round1.jsonl \
+  --features cache/stage1_qwen8b \
+  --train-data edge_lists.jsonl hard_edges_round1.jsonl \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --student-checkpoint checkpoints/student_path_round0.pt \
   --output checkpoints/student_edge_round1.pt
