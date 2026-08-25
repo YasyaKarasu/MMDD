@@ -130,13 +130,13 @@ least one negative have evidence. The two channel losses are added; their
 scores are never combined into one training logit. The path checkpoint stores
 the evidence aggregation configuration.
 
-Online retrieval keeps `direct_score` and `evidence_score` separate and ranks
-each target in both channels. Reciprocal Rank Fusion (RRF) combines the two
-ranks into the single `score` used for global top-k truncation and
-Recall@k evaluation. `--rrf-k` controls the rank constant (default 60). Each
-result also records both channel scores and ranks. Student relation queries and
-projected target vectors preserve the bilinear score exactly as an inner
-product for ANN indexing.
+Online retrieval computes `direct_score` and `evidence_score` separately and
+ranks each target in both channels. Reciprocal Rank Fusion (RRF) combines the
+two ranks into the single `score` used for global top-k truncation and Recall@k
+evaluation. `--rrf-k` controls the rank constant (default 60). The channel
+ranks and `direct_score` are intermediate values and are not written to the
+retrieval results. Student relation queries and projected target vectors
+preserve the bilinear score exactly as an inner product for ANN indexing.
 
 `--train-data` accepts multiple files. Every record should carry `dataset`;
 when it does not, the input filename stem is used. Sampling assigns dataset
@@ -172,8 +172,8 @@ conda run -n MMDD python src/retrieve_stage1.py \
 Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
 on each path, and restores the two-level path aggregation from the Student
 checkpoint. Explicit retrieval flags may override that saved configuration.
-Each target keeps only its final fusion `score`, the Stage-2-required
-`evidence_score`, and minimal paths: `{"kind":"direct"}` or
+Each target keeps only its final fusion `score`, a non-null `evidence_score`
+when available for Stage 2, and minimal paths: `{"kind":"direct"}` or
 `{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
 
 ### Hard-negative refresh
@@ -190,21 +190,29 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
   --target-lists target_lists_2k.jsonl target_lists_20k.jsonl \
   --output-target-lists hard_targets_round1.jsonl \
   --output-edge-lists hard_edges_round1.jsonl \
+  --hard-targets-per-query 16 \
+  --hard-evidence-per-type 16 \
+  --hard-paths-per-query 16 \
   --mining-round 1
 ```
 
-The refresh runs current-Student `Q -> T` and `Q -> E -> T` retrieval, removes
-every ID in `positive_target_ids`, retains high-ranked wrong targets, and
-extracts their evidence objects. Shared mining provenance is written once to
-the corresponding `.jsonl.metadata.json` sidecars instead of repeated on every
-record. The frozen Teacher
-then rescores the target/path lists and their directly supervised edge lists:
-query-to-target, evidence-to-target, and query-to-evidence whenever a
-same-modality negative evidence object was mined. Under the dataset's
-closed-world labels, evidence retained only on a non-GT target path is a hard
-query-to-evidence negative; it remains latent in the target/path objective as
-well. Edge outputs store aligned `teacher_logits`; target outputs separately
-store aligned `teacher_direct_logits` and `teacher_evidence_logits`.
+The refresh mines three independent current-Student distributions. `Q -> T`
+ANN returns hard targets outside `positive_target_ids`. Per-modality `Q -> E`
+ANN returns hard evidence outside the query-scoped positive evidence set,
+whether or not that evidence reaches a selected target. Finally, every `Q -> E`
+ANN hit is expanded through `E -> T`; complete paths ending at a non-GT
+target are ranked directly by `s(Q,E) + s(E,T)` to obtain path-hard negatives.
+Path mining does not use target aggregation or RRF. A target found by both the
+direct and path channels is deduplicated while retaining its mined evidence.
+
+Shared mining provenance and the three quotas are written once to the
+corresponding `.jsonl.metadata.json` sidecars instead of repeated on every
+record. The frozen Teacher then rescores the target/path lists and their
+directly supervised edge lists. Independently mined same-modality evidence is
+used for query-to-evidence lists; path evidence remains attached to its wrong
+target for the Evidence target channel. Edge outputs store aligned
+`teacher_logits`; target outputs separately store aligned
+`teacher_direct_logits` and `teacher_evidence_logits`.
 `student-edge` and `student-path` consume these cached soft labels directly.
 The loader rejects the obsolete merged target `teacher_logits` format and also
 checks declared edge types, the Teacher checkpoint, evidence truncation, and
@@ -249,8 +257,9 @@ The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
 the linear candidate head is trained. Because the Stage-1 evidence-channel
 distribution `softmax(r_T)` is fixed, training runs the reader only for the
 gold target and optimizes the column loss `-log rho_(T,c)`. History records the
-fixed Stage-1 term as `table_loss` and their sum as `joint_loss`, while inference still ranks
-all candidate pairs with `softmax(r_T) * rho_(T,c)`. Training retrieval files
+optimized term as `column_loss` and the fixed Stage-1 term as `table_loss`,
+while inference still ranks all candidate pairs with
+`softmax(r_T) * rho_(T,c)`. Training retrieval files
 contain one JSON object or JSONL record per query in the format emitted by
 `retrieve_stage1.py`; records whose positive target has no retrieved evidence
 path are skipped:
