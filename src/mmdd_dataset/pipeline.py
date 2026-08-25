@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from .assets import fetch_assets
-from .extraction import OpenAICompatibleExtractor, build_extractions
+from .extraction import (
+    OpenAICompatibleExtractor,
+    auto_check_recoveries,
+    build_extractions,
+)
 from .joinability import BuildConfig, build_joinability_dataset, table_asset_links
 from .tables import prepare_entitables, prepare_wdc
 from .utils import read_jsonl, source_splits, write_json, write_jsonl
@@ -68,6 +72,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     else:
         assets = []
 
+    text_extractor = None
+    image_extractor = None
     if args.extractions_jsonl:
         extractions = list(read_jsonl(Path(args.extractions_jsonl)))
     elif args.text_model_base_url or args.image_model_base_url:
@@ -115,6 +121,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     artifacts = build_joinability_dataset(
         prepared.source_tables, assets, extractions, split_of, config
     )
+    if text_extractor is not None or image_extractor is not None:
+        artifacts = auto_check_recoveries(
+            artifacts,
+            assets,
+            text_extractor,
+            image_extractor=image_extractor,
+        )
     artifacts.update(
         {
             "source_tables": prepared.source_tables,

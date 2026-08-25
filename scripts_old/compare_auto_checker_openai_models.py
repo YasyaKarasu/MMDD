@@ -247,18 +247,27 @@ class CachedWikipediaAssetResolver:
 
 
 def replay_task(record: dict[str, Any], asset: dict[str, Any]) -> ExtractionTask:
-    row_attributes = list(record.get("row_attributes") or [])
+    complete_row_attributes = list(record.get("row_attributes") or [])
     entity_index = next(
         (
             index
-            for index, item in enumerate(row_attributes)
+            for index, item in enumerate(complete_row_attributes)
             if isinstance(item, dict) and bool(item.get("is_entity"))
         ),
         0,
     )
     entity_name = ""
-    if row_attributes and isinstance(row_attributes[entity_index], dict):
-        entity_name = clean_text(row_attributes[entity_index].get("name"))
+    if complete_row_attributes and isinstance(
+        complete_row_attributes[entity_index], dict
+    ):
+        entity_name = clean_text(
+            complete_row_attributes[entity_index].get("name")
+        )
+    row_attributes = [
+        dict(item)
+        for item in complete_row_attributes
+        if isinstance(item, dict) and bool(item.get("is_entity"))
+    ]
     cache_key = clean_text(record.get("cache_key"))
     return ExtractionTask(
         order=0,

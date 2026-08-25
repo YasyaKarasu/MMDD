@@ -411,6 +411,12 @@ def build_query_auto_check_fixture(
             self.model_auto_check_stats = ModelAutoCheckStats()
 
         def review_auto_check_attribute(self, *, task, claimed_value, **_kwargs):
+            visible_names = {
+                item["name"]
+                for item in task.entity.get("row_attributes") or []
+            }
+            assert visible_names == {"Entity", "Context"}
+            assert "Bridge" not in visible_names
             self.calls.append(task.source_row_id)
             supported = task.source_row_id in supported_rows
             return {
@@ -585,7 +591,6 @@ def _make_query_recovery_candidate(
             "cell_text": "Entity",
             "row_attributes": [
                 {"name": "Entity", "value": "Entity", "is_entity": True},
-                {"name": "State", "value": "Alabama", "is_entity": False},
             ],
         },
         asset={
@@ -614,11 +619,18 @@ def _make_query_recovery_candidate(
 
 
 def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
+    candidate = _make_query_recovery_candidate()
     return {
         "cache_key": cache_key,
         "extraction_cache_key": "extraction-cache-key",
+        "query_row_attributes": candidate.task.entity["row_attributes"],
         "attribute_name": "State",
         "claimed_value": "Alabama",
+        "evidence_identity": (
+            joinability_dataset.query_recovery_remote_evidence_identity(
+                candidate
+            )
+        ),
         "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
         "supported": True,
         "auto_check": {
@@ -773,9 +785,13 @@ def test_query_recovery_cache_aliases_legacy_pool_dependent_key(
     )
     candidate = _make_query_recovery_candidate()
     canonical_key = joinability_dataset.query_recovery_auto_check_key(candidate, None)
+    remote_key = joinability_dataset.query_recovery_remote_evidence_key(candidate)
 
     assert cache.get(legacy_key) == legacy_record
-    assert cache.get(canonical_key) == legacy_record
+    assert cache.get(remote_key) == legacy_record
+    assert joinability_dataset.query_recovery_cached_check(
+        canonical_key, cache, candidate
+    ) == legacy_record
 
 
 def test_changed_reviewer_pool_reuses_completed_legacy_recovery(

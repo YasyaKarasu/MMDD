@@ -4487,6 +4487,11 @@ def _legacy_query_auto_check_record(
         return {
             "cache_key": key,
             "extraction_cache_key": candidate.task.cache_key,
+            "query_row_attributes": (
+                join_builder.canonical_extraction_row_attributes(
+                    candidate.task.entity.get("row_attributes")
+                )
+            ),
             "attribute_name": recovered.get("column_name"),
             "claimed_value": target_value,
             "evidence_identity": (

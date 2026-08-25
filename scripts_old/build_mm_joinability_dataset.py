@@ -31,7 +31,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from itertools import combinations
 from pathlib import Path
@@ -103,10 +103,10 @@ from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 
 PROMPT_VERSION = "entity_attribute_extraction_v5_batched_leave_one_out"
 MODEL_AUTO_CHECK_SCHEMA_VERSION = (
-    "model-output-auto-check-v3-contextual-equivalence-canonical-value"
+    "model-output-auto-check-v5-entity-evidence-grounding"
 )
 QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION = (
-    "query-recovery-remote-evidence-v1"
+    "query-recovery-remote-evidence-v2-query-visible"
 )
 DEFAULT_AUTO_CHECK_LUNA_MODEL = "gpt-5.6-luna"
 DEFAULT_AUTO_CHECK_TERRA_MODEL = "gpt-5.6-terra"
@@ -3868,11 +3868,16 @@ class LocalAttributeExtractor:
         claimed_value: str,
     ) -> dict[str, Any]:
         target_name = normalize(attribute_name)
+        query_row_attributes = canonical_extraction_row_attributes(
+            task.entity.get("row_attributes")
+        )
+        attribute_was_present = any(
+            normalize(item.get("name")) == target_name
+            for item in query_row_attributes
+        )
         masked_row = [
             dict(item)
-            for item in canonical_extraction_row_attributes(
-                task.entity.get("row_attributes")
-            )
+            for item in query_row_attributes
             if normalize(item.get("name")) != target_name
         ]
         review_id = "model_check_" + stable_hash(
@@ -3881,8 +3886,6 @@ class LocalAttributeExtractor:
             claimed_value,
             length=20,
         )
-        query_entity = dict(task.entity)
-        query_entity.pop("row_attributes", None)
         return {
             "query_table_id": (
                 f"model_check:{task.source_table_id}:{task.source_row_id}"
@@ -3898,8 +3901,7 @@ class LocalAttributeExtractor:
                     "path_id": "",
                     "query_row_id": str(task.source_row_id),
                     "masked_row": masked_row,
-                    "masked_attribute_was_present": True,
-                    "query_entity": query_entity,
+                    "masked_attribute_was_present": attribute_was_present,
                     "attribute": {
                         "name": attribute_name,
                         # review_messages intentionally omits this value.
@@ -3908,8 +3910,6 @@ class LocalAttributeExtractor:
                     "evidence": {
                         "asset_id": clean_text(task.asset.get("asset_id")),
                         "asset_type": clean_text(task.asset.get("asset_type")),
-                        "title": clean_text(task.asset.get("title")),
-                        "source": clean_text(task.asset.get("source")),
                         "content": clean_text(task.asset.get("content"))[:6000],
                         "image_sha256": clean_text(task.asset.get("sha256")),
                     },
@@ -4435,6 +4435,7 @@ def apply_model_auto_check(
     endpoint_pool: str = "local",
     defer_remote: bool = False,
     existing_reviews: dict[str, dict[str, Any]] | None = None,
+    source_row_attributes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Keep only model attributes confirmed by an independent blind check.
 
@@ -4462,9 +4463,12 @@ def apply_model_auto_check(
         task.candidate_attribute_names,
     )
     source_values: dict[str, tuple[str, str]] = {}
-    for item in canonical_extraction_row_attributes(
-        task.entity.get("row_attributes")
-    ):
+    comparison_attributes = (
+        source_row_attributes
+        if source_row_attributes is not None
+        else task.entity.get("row_attributes")
+    )
+    for item in canonical_extraction_row_attributes(comparison_attributes):
         normalized_name = normalize(item.get("name"))
         if normalized_name and normalized_name not in source_values:
             source_values[normalized_name] = (
@@ -4809,6 +4813,7 @@ def complete_deferred_model_auto_check(
     extractor: Any,
     task: ExtractionTask,
     record: dict[str, Any],
+    source_row_attributes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Complete pending OpenAI reviews without repeating model analysis/checks."""
     auto_check = record.get("auto_check")
@@ -4826,6 +4831,7 @@ def complete_deferred_model_auto_check(
         task=task,
         record=analysis_record,
         existing_reviews=existing_reviews,
+        source_row_attributes=source_row_attributes,
     )
 
 
@@ -5470,12 +5476,20 @@ def _query_recovery_auto_check_key_fields(
     *,
     schema_version: str,
     extraction_cache_key: Any,
+    query_row_attributes: Any,
     attribute_name: Any,
     claimed_value: Any,
 ) -> str:
+    query_row = json.dumps(
+        canonical_extraction_row_attributes(query_row_attributes),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return stable_hash(
         schema_version,
         extraction_cache_key,
+        query_row,
         attribute_name,
         claimed_value,
         length=32,
@@ -5486,9 +5500,6 @@ def _query_recovery_evidence_identity_fields(
     *,
     asset_id: Any,
     asset_type: Any,
-    entity_id: Any,
-    entity_text: Any,
-    entity_wiki_title: Any,
     row_attributes: Any,
     attribute_name: Any,
     claimed_value: Any,
@@ -5505,9 +5516,6 @@ def _query_recovery_evidence_identity_fields(
         "auto_check_schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
         "asset_id": clean_text(asset_id),
         "asset_type": clean_text(asset_type),
-        "entity_id": clean_text(entity_id),
-        "entity_text": clean_text(entity_text),
-        "entity_wiki_title": clean_text(entity_wiki_title),
         "masked_row": masked_row,
         "attribute_name": target_name,
         # The remote model never sees the claimed value, but the cached final
@@ -5538,9 +5546,6 @@ def query_recovery_remote_evidence_identity(
     return _query_recovery_evidence_identity_fields(
         asset_id=task.asset.get("asset_id"),
         asset_type=task.asset.get("asset_type"),
-        entity_id=task.entity.get("entity_id"),
-        entity_text=task.entity.get("cell_text"),
-        entity_wiki_title=task.entity.get("wiki_title"),
         row_attributes=task.entity.get("row_attributes"),
         attribute_name=recovered.get("column_name"),
         claimed_value=recovered.get("value"),
@@ -5594,6 +5599,7 @@ def query_recovery_auto_check_key(
     return _query_recovery_auto_check_key_fields(
         schema_version=MODEL_AUTO_CHECK_SCHEMA_VERSION,
         extraction_cache_key=candidate.task.cache_key,
+        query_row_attributes=candidate.task.entity.get("row_attributes"),
         attribute_name=recovered.get("column_name"),
         claimed_value=recovered.get("value"),
     )
@@ -5625,22 +5631,16 @@ def query_recovery_auto_check_record_key(
         return None
     if query_recovery_remote_review_is_complete(record):
         identity = record.get("evidence_identity")
-        if not isinstance(identity, dict) and isinstance(extraction_record, dict):
-            identity = _query_recovery_evidence_identity_fields(
-                asset_id=extraction_record.get("asset_id"),
-                asset_type=extraction_record.get("asset_type"),
-                entity_id=extraction_record.get("entity_id"),
-                entity_text=extraction_record.get("entity_text"),
-                entity_wiki_title=extraction_record.get("entity_wiki_title"),
-                row_attributes=extraction_record.get("row_attributes"),
-                attribute_name=record.get("attribute_name"),
-                claimed_value=record.get("claimed_value"),
-            )
         if isinstance(identity, dict):
             return _query_recovery_evidence_identity_key(identity)
+        return None
+    query_row_attributes = record.get("query_row_attributes")
+    if not isinstance(query_row_attributes, list):
+        return None
     return _query_recovery_auto_check_key_fields(
         schema_version=schema_version,
         extraction_cache_key=extraction_cache_key,
+        query_row_attributes=query_row_attributes,
         attribute_name=record.get("attribute_name"),
         claimed_value=record.get("claimed_value"),
     )
@@ -5794,6 +5794,13 @@ def check_query_recovery_candidate(
         "attributes": [predicted],
         "error": "",
     }
+    source_row_attributes = [
+        {
+            "name": recovered["column_name"],
+            "value": recovered["value"],
+            "is_entity": False,
+        }
+    ]
     if local_result is None:
         checked = apply_model_auto_check(
             extractor=extractor,
@@ -5801,6 +5808,7 @@ def check_query_recovery_candidate(
             record=analysis_record,
             endpoint_pool=endpoint_pool,
             defer_remote=defer_remote,
+            source_row_attributes=source_row_attributes,
         )
     else:
         pending_record = {
@@ -5812,6 +5820,7 @@ def check_query_recovery_candidate(
             extractor=extractor,
             task=candidate.task,
             record=pending_record,
+            source_row_attributes=source_row_attributes,
         )
     return {
         "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
@@ -6190,6 +6199,9 @@ def resolve_query_recovery_auto_check_plans(
         record = {
             "cache_key": key,
             "extraction_cache_key": candidate.task.cache_key,
+            "query_row_attributes": canonical_extraction_row_attributes(
+                candidate.task.entity.get("row_attributes")
+            ),
             "attribute_name": candidate.recovery["recovered_attribute"][
                 "column_name"
             ],
@@ -6563,6 +6575,72 @@ def project_selected_rows(
         rows.append({"row_id": len(rows), "source_row_id": source_row_id, "cells": cells})
         source_rows.append(source_row_id)
     return rows, source_rows
+
+
+def query_visible_row_attributes(
+    query_row: dict[str, Any],
+    *,
+    entity_col: int,
+) -> list[dict[str, Any]]:
+    """Return only cells physically present in one materialized query row."""
+    attributes: list[dict[str, Any]] = []
+    for cell in query_row.get("cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        name = sanitize_cell_text_for_model(cell.get("column_name"))
+        value = sanitize_cell_text_for_model(cell.get("text"))
+        if not name or not value:
+            continue
+        try:
+            source_column_index = int(cell.get("source_column_index"))
+        except (TypeError, ValueError):
+            source_column_index = -1
+        attributes.append(
+            {
+                "name": name,
+                "value": value,
+                "is_entity": source_column_index == entity_col,
+            }
+        )
+    return attributes
+
+
+def query_visible_recovery_candidates(
+    candidates: Iterable[QueryRecoveryCandidate],
+    *,
+    query_rows: Iterable[dict[str, Any]],
+    entity_col: int,
+) -> list[QueryRecoveryCandidate]:
+    """Bind recovery checks to their final query-row projection.
+
+    Discovery tasks retain the complete source row for the high-recall first
+    pass.  The independent auto-check must instead receive exactly the columns
+    visible in the materialized query and no target-only source columns.
+    """
+    attributes_by_source_row = {
+        int(row["source_row_id"]): query_visible_row_attributes(
+            row,
+            entity_col=entity_col,
+        )
+        for row in query_rows
+    }
+    visible_candidates: list[QueryRecoveryCandidate] = []
+    for candidate in candidates:
+        source_row_id = int(candidate.recovery["source_row_id"])
+        if source_row_id not in attributes_by_source_row:
+            continue
+        entity = {
+            **candidate.task.entity,
+            "row_attributes": attributes_by_source_row[source_row_id],
+        }
+        visible_candidates.append(
+            QueryRecoveryCandidate(
+                task=replace(candidate.task, entity=entity),
+                extraction=candidate.extraction,
+                recovery=candidate.recovery,
+            )
+        )
+    return visible_candidates
 
 
 def table_record(
@@ -9228,12 +9306,16 @@ def build_table_join_records(
                 # Only one hidden target may own an identical visible query.
                 continue
             claimed_query_fingerprints.add(query_fingerprint)
-            view_candidates = [
-                candidate
-                for candidate in recoveries_by_col.get(join_col, [])
-                if int(candidate.recovery["source_row_id"])
-                in selected_source_row_set
-            ]
+            view_candidates = query_visible_recovery_candidates(
+                (
+                    candidate
+                    for candidate in recoveries_by_col.get(join_col, [])
+                    if int(candidate.recovery["source_row_id"])
+                    in selected_source_row_set
+                ),
+                query_rows=query_rows,
+                entity_col=entity_col,
+            )
             if query_recovery_candidates_out is not None:
                 query_recovery_candidates_out.extend(view_candidates)
             auto_check_plan = QueryRecoveryAutoCheckPlan(

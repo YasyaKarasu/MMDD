@@ -166,7 +166,8 @@ class FakeExtractor:
         item = batches[0]["items"][0]
         masked_names = {cell["name"] for cell in item["masked_row"]}
         assert item["attribute"]["name"] not in masked_names
-        assert {"Entity", "Category"} <= masked_names
+        assert masked_names == {"Entity"}
+        assert "Category" not in masked_names
         self.calls.append([batch["query_table_id"] for batch in batches])
         return {
             batch["query_table_id"]: [
@@ -272,6 +273,8 @@ def test_review_prompt_omits_target_rows_and_parser_requires_exact_ids() -> None
                 "evidence": {
                     "asset_id": "text-1",
                     "asset_type": "text",
+                    "title": "SECRET EVIDENCE TITLE",
+                    "source": "SECRET EVIDENCE SOURCE",
                     "content": "Alpha has a country stated in the source.",
                 },
                 "image_path": "",
@@ -281,7 +284,15 @@ def test_review_prompt_omits_target_rows_and_parser_requires_exact_ids() -> None
     rendered = json.dumps(review_messages([batch]), ensure_ascii=False)
     assert "secret-target" not in rendered
     assert "France" not in rendered
+    assert "query-1" not in rendered
+    assert "recovery-1" not in rendered
+    assert "text-1" not in rendered
+    assert "SECRET EVIDENCE TITLE" not in rendered
+    assert "SECRET EVIDENCE SOURCE" not in rendered
+    assert "is_entity" not in rendered
     assert "Country" in rendered
+    assert "evidence may be unrelated to the entity" in rendered
+    assert "merely assuming the entity-evidence relationship" in rendered
     assert "pretrained, memorized, and outside knowledge as unavailable" in rendered
     assert "leaves multiple candidates" in rendered
 

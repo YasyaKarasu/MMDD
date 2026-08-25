@@ -9,7 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mmdd_dataset.extraction import build_extractions
+from mmdd_dataset.extraction import (
+    OpenAICompatibleExtractor,
+    auto_check_recoveries,
+    build_extractions,
+)
 from mmdd_dataset.joinability import BuildConfig, build_joinability_dataset
 from mmdd_dataset.pipeline import main as pipeline_main
 from mmdd_dataset.tables import prepare_entitables, prepare_wdc
@@ -169,6 +173,147 @@ def test_extraction_masks_the_requested_attribute(tmp_path: Path) -> None:
     for call in calls:
         visible_names = {item["name"] for item in call["visible_cells"]}
         assert call["attribute"] not in visible_names
+
+
+def test_src_auto_check_uses_only_materialized_query_columns(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_entitables(input_dir / "tables.json")
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = synthetic_materials(prepared)
+    table = prepared.source_tables[0]
+    artifacts = build_joinability_dataset(
+        prepared.source_tables,
+        assets,
+        extractions,
+        {table["source_table_id"]: "train"},
+        BuildConfig(
+            query_rows=5,
+            min_target_rows=5,
+            min_recovered_ratio=0.6,
+            min_recovered_rows=3,
+        ),
+    )
+    calls: list[dict] = []
+
+    class Extractor:
+        def extract(self, **kwargs):
+            calls.append(kwargs)
+            visible = {
+                item["name"]: item["value"]
+                for item in kwargs["visible_cells"]
+            }
+            row = int(visible["Entity"].rsplit(" ", 1)[1])
+            return {"value": str(1900 + row), "evidence": ""}
+
+    checked = auto_check_recoveries(
+        artifacts,
+        assets,
+        Extractor(),
+    )
+
+    assert len(checked["evidence_recoveries"]) == 3
+    assert calls
+    assert all(
+        {cell["name"] for cell in call["visible_cells"]}
+        == {"Entity", "Category"}
+        for call in calls
+    )
+    assert all(
+        "Founded" not in {cell["name"] for cell in call["visible_cells"]}
+        for call in calls
+    )
+
+
+def test_src_model_message_omits_asset_metadata(monkeypatch) -> None:
+    sent: dict = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": '{"value":"1900","evidence":""}'}}
+                ]
+            }
+
+    extractor = OpenAICompatibleExtractor("http://model.test/v1", "model")
+
+    def post(_url, *, json, timeout):
+        sent.update(json)
+        return Response()
+
+    monkeypatch.setattr(extractor.session, "post", post)
+    extractor.extract(
+        attribute="Founded",
+        visible_cells=[{"name": "Entity", "value": "Alpha"}],
+        asset={
+            "asset_type": "text",
+            "asset_id": "SECRET ASSET ID",
+            "title": "SECRET TITLE",
+            "source": "SECRET SOURCE",
+            "url": "https://secret.example",
+            "content": "Alpha was founded in 1900.",
+        },
+    )
+
+    rendered = json.dumps(sent["messages"], ensure_ascii=False)
+    assert "Alpha was founded in 1900." in rendered
+    assert "evidence may be unrelated to the entity" in rendered
+    assert "merely assuming the entity-evidence relationship" in rendered
+    assert "SECRET ASSET ID" not in rendered
+    assert "SECRET TITLE" not in rendered
+    assert "SECRET SOURCE" not in rendered
+    assert "secret.example" not in rendered
+
+
+def test_src_image_message_uses_only_table_and_image(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sent: dict = {}
+    image_path = tmp_path / "evidence.png"
+    image_path.write_bytes(b"synthetic-image-bytes")
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": '{"value":"1900","evidence":""}'}}
+                ]
+            }
+
+    extractor = OpenAICompatibleExtractor("http://model.test/v1", "model")
+
+    def post(_url, *, json, timeout):
+        sent.update(json)
+        return Response()
+
+    monkeypatch.setattr(extractor.session, "post", post)
+    extractor.extract(
+        attribute="Founded",
+        visible_cells=[{"name": "Entity", "value": "Alpha"}],
+        asset={
+            "asset_type": "image",
+            "asset_id": "SECRET IMAGE ID",
+            "title": "SECRET IMAGE TITLE",
+            "source": "SECRET IMAGE SOURCE",
+            "content": "SECRET IMAGE CAPTION",
+            "local_path": str(image_path),
+        },
+    )
+
+    rendered = json.dumps(sent["messages"], ensure_ascii=False)
+    assert "data:image/png;base64," in rendered
+    assert "SECRET IMAGE ID" not in rendered
+    assert "SECRET IMAGE TITLE" not in rendered
+    assert "SECRET IMAGE SOURCE" not in rendered
+    assert "SECRET IMAGE CAPTION" not in rendered
+    assert str(image_path) not in rendered
 
 
 def test_recovery_threshold_is_defined_on_query_size(tmp_path: Path) -> None:
