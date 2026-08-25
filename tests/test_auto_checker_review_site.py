@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.build_auto_checker_review_site import (
+from scripts_old.build_auto_checker_review_site import (
     reclassify_review_rows,
     render_review_html,
     select_review_rows,
 )
-from scripts.serve_auto_checker_review import validate_review_payload
+from scripts_old.serve_auto_checker_review import validate_review_payload
 
 
 def _row(key: str, terra: str, luna: str, asset_type: str = "text") -> dict:

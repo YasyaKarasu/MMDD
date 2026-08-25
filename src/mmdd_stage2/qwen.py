@@ -212,7 +212,7 @@ class QwenStage2Backend:
     def _text_chunks(self, text: str) -> Iterator[str]:
         token_ids = self.processor.tokenizer.encode(text, add_special_tokens=False)
         width = self.max_text_evidence_tokens
-        step = max(1, width - self.text_overlap_tokens)
+        step = width - self.text_overlap_tokens
         for start in range(0, len(token_ids), step):
             chunk = token_ids[start : start + width]
             if chunk:

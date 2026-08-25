@@ -9,7 +9,7 @@ from typing import Any, TextIO
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import wdc200k_io as wdc200k_io_module  # noqa: E402
 from wdc200k_io import (  # noqa: E402
@@ -27,7 +27,7 @@ def test_module_supports_package_import() -> None:
         [
             sys.executable,
             "-c",
-            "from scripts.wdc200k_io import StageFingerprint",
+            "from scripts_old.wdc200k_io import StageFingerprint",
         ],
         cwd=ROOT,
         check=False,

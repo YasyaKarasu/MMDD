@@ -42,7 +42,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     ]
     splits, split_of = source_splits(
         prepared.source_tables,
-        split_by=args.split_by,
         ratios=(args.train_ratio, args.dev_ratio, args.test_ratio),
         seed=args.seed,
     )
@@ -116,7 +115,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--wiki-link-threshold", type=float, default=0.3)
     result.add_argument("--max-query-views-per-table", type=int, default=5)
     result.add_argument("--seed", type=int, default=13)
-    result.add_argument("--split-by", choices=("source_table_id",), default="source_table_id")
     result.add_argument("--train-ratio", type=float, default=0.8)
     result.add_argument("--dev-ratio", type=float, default=0.1)
     result.add_argument("--test-ratio", type=float, default=0.1)

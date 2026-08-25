@@ -12,7 +12,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import wdc200k_io as wdc200k_io_module  # noqa: E402
 import wdc200k_structural as structural_module  # noqa: E402
@@ -440,7 +440,7 @@ def test_structural_module_imports_through_scripts_package() -> None:
         [
             sys.executable,
             "-c",
-            "from scripts.wdc200k_structural import expand_selected_shard",
+            "from scripts_old.wdc200k_structural import expand_selected_shard",
         ],
         cwd=ROOT,
         check=False,

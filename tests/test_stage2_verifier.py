@@ -19,7 +19,7 @@ from mmdd_stage2.data import (
 )
 from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
 from mmdd_stage2.qwen import QwenStage2Backend
-from mmdd_stage2.routing import EvidenceRowAssignment, SimilarityEvidenceRouter
+from mmdd_stage2.routing import SimilarityEvidenceRouter
 from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
 from mmdd_stage2.verifier import (
     CandidateColumnScorer,
@@ -92,17 +92,19 @@ def test_stage2_preserves_global_rrf_order_while_using_route_scores():
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():
-    retrieval_scores = torch.tensor([[2.0, 1.0]])
-    column_logits = torch.tensor([[[0.0, 1.0], [2.0, -5.0]]])
-    target_mask = torch.tensor([[True, True]])
-    column_mask = torch.tensor([[[True, True], [True, False]]])
+    retrieval_scores = torch.tensor([2.0, 1.0])
+    column_logits = torch.tensor([[0.0, 1.0], [2.0, -5.0]])
+    column_mask = torch.tensor([[True, True], [True, False]])
 
-    table_probabilities, column_probabilities, joint = joint_candidate_probabilities(
-        retrieval_scores, column_logits, target_mask, column_mask
+    joint = joint_candidate_probabilities(
+        retrieval_scores, column_logits, column_mask
     )
 
-    assert torch.allclose(table_probabilities, torch.softmax(retrieval_scores, dim=-1))
-    assert column_probabilities[0, 1].tolist() == [1.0, 0.0]
+    table_probabilities = torch.softmax(retrieval_scores, dim=-1)
+    column_probabilities = torch.softmax(
+        column_logits.masked_fill(~column_mask, -torch.inf), dim=-1
+    ).masked_fill(~column_mask, 0.0)
+    assert column_probabilities[1].tolist() == [1.0, 0.0]
     assert joint.sum().item() == pytest.approx(1.0)
     assert torch.allclose(joint, table_probabilities.unsqueeze(-1) * column_probabilities)
 
@@ -263,10 +265,10 @@ class FakeRouter:
     def assign(self, query_id, evidence_ids, *, row_count):
         assert query_id == "q1"
         assert row_count == 2
-        return tuple(
-            EvidenceRowAssignment(evidence_id, self.row_by_evidence[evidence_id])
+        return {
+            evidence_id: self.row_by_evidence[evidence_id]
             for evidence_id in evidence_ids
-        )
+        }
 
 
 def _table(table_id, columns, rows, **extra):
@@ -378,7 +380,7 @@ def test_similarity_router_assigns_each_evidence_to_its_nearest_row():
 
     assignments = SimilarityEvidenceRouter(store).assign("q1", ["e1", "e2"], row_count=2)
 
-    assert [(item.evidence_id, item.row_position) for item in assignments] == [("e1", 0), ("e2", 1)]
+    assert assignments == {"e1": 0, "e2": 1}
 
 
 def test_stage2_skips_rows_without_assigned_evidence():

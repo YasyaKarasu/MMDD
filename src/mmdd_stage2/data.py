@@ -38,10 +38,8 @@ class Stage2ObjectIndex:
 
 
 def _record_id(record: dict[str, Any], artifact: str) -> str:
-    if artifact == "query_tables":
-        return str(record.get("table_id", record.get("object_id")))
-    if artifact == "data_lake_tables":
-        return str(record.get("table_id", record.get("object_id")))
+    if artifact in {"query_tables", "data_lake_tables"}:
+        return str(record["table_id"])
     if artifact == "bridge_assets":
         return str(record["asset_id"])
     raise ValueError(f"Unsupported artifact: {artifact}")
@@ -83,7 +81,6 @@ def _resolve_targets(output_dir: Path, targets: dict[str, dict[str, Any]]) -> No
             targets[target_id] = {
                 **source,
                 **{key: value for key, value in record.items() if key != "source_table_ref"},
-                "object_id": target_id,
             }
 
 
@@ -169,9 +166,9 @@ def row_values(table: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def column_values(table: dict[str, Any], column_index: int, *, include_empty: bool = False) -> list[str]:
+def column_values(table: dict[str, Any], column_index: int) -> list[str]:
     values = [clean_text(get_cell(row, column_index).get("text")) for row in table["rows"]]
-    return values if include_empty else [value for value in values if value]
+    return [value for value in values if value]
 
 
 def serialize_table(

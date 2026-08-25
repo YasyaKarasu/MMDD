@@ -231,6 +231,10 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     evidence_manifest = json.loads(
         (config.work_dir / "fetch_evidence" / "manifest.json").read_text(encoding="utf-8")
     )
+    assert "page_tasks" not in evidence_manifest["outputs"]
+    assert "image_tasks" not in evidence_manifest["outputs"]
+    assert evidence_manifest["outputs"]["page_results"]
+    assert evidence_manifest["outputs"]["image_results"]
     sampled_shards = pipeline_module._sampled_entity_shards(config)
     imported = []
     for index, table_record in enumerate(normalize_manifest["outputs"]["source_tables"]):
@@ -369,6 +373,56 @@ def test_evidence_cache_reuses_duplicate_url_across_runs(tmp_path: Path) -> None
 
     assert calls == 1
     assert first == second
+
+
+def test_online_extraction_uses_the_extractor_contract(tmp_path: Path) -> None:
+    calls: list[tuple[str, list[dict[str, str]], dict[str, str]]] = []
+
+    class StrictExtractor:
+        def extract(
+            self,
+            *,
+            attribute: str,
+            visible_cells: list[dict[str, str]],
+            asset: dict[str, str],
+        ) -> dict[str, str]:
+            calls.append((attribute, visible_cells, asset))
+            return {"value": "red", "evidence": "The item is red."}
+
+    task = {
+        "task_id": "ext_1",
+        "source_table_id": "source_1",
+        "source_row_id": 2,
+        "entity_id": "entity_1",
+        "attribute_name": "color",
+        "asset_id": "asset_1",
+        "asset_type": "text",
+        "visible_cells": [{"name": "item", "value": "hammer"}],
+        "asset": {"asset_type": "text", "content": "The item is red."},
+        "prompt_version": "test-v1",
+    }
+
+    results, skipped = pipeline_module._run_model_tasks(
+        [task],
+        cache=ResultCache(tmp_path / "extractions.sqlite3"),
+        namespace="test",
+        workers=1,
+        text_extractor=StrictExtractor(),
+        image_extractor=None,
+    )
+
+    assert calls == [
+        (
+            "color",
+            [{"name": "item", "value": "hammer"}],
+            {"asset_type": "text", "content": "The item is red."},
+        )
+    ]
+    assert skipped == 0
+    assert results[0]["extraction_id"] == "ext_1"
+    assert "task_id" not in results[0]
+    assert results[0]["value"] == "red"
+    assert results[0]["error"] is None
 
 
 def test_wdc_and_entitables_entrypoints_share_one_joinability_core(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Any
 
 from .utils import (
@@ -22,7 +21,6 @@ class BuildConfig:
     min_recovered_ratio: float = 0.6
     min_recovered_rows: int = 3
     min_column_non_empty_ratio: float = 0.5
-    max_queries_per_source: int = 1
     max_query_additional_columns: int = 1
     max_target_additional_columns: int = 2
 
@@ -87,8 +85,6 @@ def _table_record(
 ) -> dict[str, Any]:
     return {
         "table_id": table_id,
-        "object_id": table_id,
-        "object_type": "table",
         "role": role,
         "split": split,
         "source_table_id": table["source_table_id"],
@@ -124,39 +120,6 @@ def _rank_additional_columns(
             index,
         ),
     )
-
-
-def _column_layouts(
-    table: dict[str, Any],
-    entity_col: int,
-    qualified: list[dict[str, Any]],
-    config: BuildConfig,
-) -> list[tuple[dict[str, Any], list[int], list[int]]]:
-    selected = qualified[: max(1, config.max_queries_per_source)]
-    bridge_columns = {candidate["column_index"] for candidate in qualified}
-    ordinary = _rank_additional_columns(table, {entity_col, *bridge_columns})
-
-    query_width = config.max_query_additional_columns
-    target_additional = ordinary[: config.max_target_additional_columns]
-    query_pool = ordinary[config.max_target_additional_columns :]
-    query_additional_sets = list(combinations(query_pool, query_width)) if query_width else [()]
-    if len(selected) > 1 and query_additional_sets:
-        return [
-            (
-                candidate,
-                list(query_additional_sets[index % len(query_additional_sets)]),
-                target_additional,
-            )
-            for index, candidate in enumerate(selected)
-        ]
-
-    best = qualified[0]
-    additional = _rank_additional_columns(table, {entity_col, best["column_index"]})
-    query_additional = additional[:query_width]
-    target_additional = additional[
-        query_width : query_width + config.max_target_additional_columns
-    ]
-    return [(best, query_additional, target_additional)]
 
 
 def _extraction_index(
@@ -318,7 +281,6 @@ def _materialize_join(
     qrel = {
         "query_table_id": query_id,
         "target_table_id": target_id,
-        "data_lake_table_id": target_id,
         "rel": 3,
         "split": split,
         "chain_id": chain_id,
@@ -405,16 +367,19 @@ def _build_joinability_for_table(
             "table_queryability_decisions": decisions,
         }
 
-    emitted = 0
-    visible_queries: set[str] = set()
-    for candidate, query_additional, target_additional in _column_layouts(
-        table, entity_col, qualified, config
-    ):
-        if sum(
-            bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
-            for row in table["rows"]
-        ) < config.min_target_rows:
-            continue
+    candidate = qualified[0]
+    if sum(
+        bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
+        for row in table["rows"]
+    ) >= config.min_target_rows:
+        additional = _rank_additional_columns(
+            table, {entity_col, candidate["column_index"]}
+        )
+        query_width = config.max_query_additional_columns
+        query_additional = additional[:query_width]
+        target_additional = additional[
+            query_width : query_width + config.max_target_additional_columns
+        ]
         query, target, qrel, paths = _materialize_join(
             table,
             split,
@@ -425,23 +390,14 @@ def _build_joinability_for_table(
             query_additional,
             target_additional,
         )
-        visible_key = stable_hash(
-            query["columns"],
-            [[cell["text"] for cell in row["cells"]] for row in query["rows"]],
-            length=40,
-        )
-        if visible_key in visible_queries:
-            continue
-        visible_queries.add(visible_key)
         queries.append(query)
         targets.append(target)
         qrels.append(qrel)
         recoveries.extend(paths)
-        emitted += 1
     decisions.append(
         {
             "source_table_id": table["source_table_id"],
-            "reason": "queryable" if emitted else "target_too_small",
+            "reason": "queryable" if queries else "target_too_small",
             "entity_column_index": entity_col,
             "qualified_columns": [
                 {

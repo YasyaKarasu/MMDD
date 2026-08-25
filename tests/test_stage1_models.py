@@ -75,6 +75,11 @@ def feature_store() -> FeatureStore:
     )
 
 
+def test_object_features_rejects_obsolete_type_aliases():
+    with pytest.raises(ValueError, match="Unknown object type"):
+        ObjectFeatures("legacy", "table_fragment", torch.ones(4))
+
+
 def teacher() -> TeacherJoinabilityModel:
     return TeacherJoinabilityModel(
         input_dim=4,
@@ -394,7 +399,7 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
         feature_dir / "q.pt",
     )
     (feature_dir / "manifest.jsonl").write_text(
-        json.dumps({"object_id": "q", "object_type": "table_fragment", "feature_path": "q.pt"}) + "\n",
+        json.dumps({"object_id": "q", "object_type": "table", "feature_path": "q.pt"}) + "\n",
         encoding="utf-8",
     )
     data_path = tmp_path / "targets.jsonl"
@@ -424,6 +429,10 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
 
     assert store.get("q").object_type == "table"
     assert store.get("q").row_embeddings.shape == (1, 4)
+    scoring_copy = store.get("q").for_scoring(
+        torch.device("cpu"), include_hidden=True
+    )
+    assert scoring_copy.row_embeddings is None
     assert examples[0].direct_positive_index == 0
     assert examples[0].evidence_positive_index == 0
     assert examples[0].candidates[0].evidence_ids == ("e1",)

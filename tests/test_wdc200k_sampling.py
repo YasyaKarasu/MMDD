@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts_old"
 sys.path.insert(0, str(SCRIPTS))
 
 from wdc200k_io import AtomicJsonlShard, StageFingerprint, StageManifest

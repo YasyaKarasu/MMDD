@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import scripts.wdc200k_archive as archive_module
-from scripts.wdc200k_archive import (
+import scripts_old.wdc200k_archive as archive_module
+from scripts_old.wdc200k_archive import (
     ArchiveConflictError,
     ArchiveCrossDeviceError,
     archive_pipeline_state,

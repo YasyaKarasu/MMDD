@@ -9,7 +9,6 @@ from typing import Any, Protocol
 import torch
 
 from .data import column_name, column_values, row_values
-from .routing import EvidenceRowAssignment
 from .verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
@@ -80,10 +79,7 @@ class Stage2Result:
     semantic_joinability: SemanticJoinability | None
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "query_id": self.query_id,
-            "rows": [],
-        }
+        payload: dict[str, Any] = {"query_id": self.query_id}
         if self.direct_candidates:
             payload["direct_matches"] = [
                 {
@@ -160,7 +156,7 @@ class EvidenceRowRouter(Protocol):
         evidence_ids: Sequence[str],
         *,
         row_count: int,
-    ) -> tuple[EvidenceRowAssignment, ...]: ...
+    ) -> dict[str, int]: ...
 
 
 class Stage2Verifier:
@@ -209,15 +205,16 @@ class Stage2Verifier:
         logits = self.candidate_logits(query, bundles, targets, evidence)
         device = logits[0].device
         max_columns = max(values.shape[0] for values in logits)
-        column_logits = torch.full((1, len(logits), max_columns), -torch.inf, device=device)
+        column_logits = torch.full((len(logits), max_columns), -torch.inf, device=device)
         column_mask = torch.zeros_like(column_logits, dtype=torch.bool)
         for target_index, values in enumerate(logits):
-            column_logits[0, target_index, : values.shape[0]] = values
-            column_mask[0, target_index, : values.shape[0]] = True
-        retrieval_scores = torch.tensor([[bundle.retrieval_score for bundle in bundles]], device=device)
-        target_mask = torch.ones_like(retrieval_scores, dtype=torch.bool)
-        _, _, joint = joint_candidate_probabilities(
-            retrieval_scores, column_logits, target_mask, column_mask
+            column_logits[target_index, : values.shape[0]] = values
+            column_mask[target_index, : values.shape[0]] = True
+        retrieval_scores = torch.tensor(
+            [bundle.retrieval_score for bundle in bundles], device=device
+        )
+        joint = joint_candidate_probabilities(
+            retrieval_scores, column_logits, column_mask
         )
         flat_index = int(joint.reshape(-1).argmax())
         target_index, column_position = divmod(flat_index, max_columns)
@@ -303,7 +300,7 @@ class Stage2Verifier:
         *,
         direct_target_ids: Sequence[str] = (),
     ) -> Stage2Result:
-        query_id = str(query.get("table_id", query.get("object_id")))
+        query_id = str(query["table_id"])
         direct = self.verify_direct(query, targets, direct_target_ids)
         if not bundles:
             return Stage2Result(query_id, direct, None, (), None)
@@ -312,22 +309,21 @@ class Stage2Verifier:
         selected_bundle = next(bundle for bundle in bundles if bundle.target_id == selection.target_id)
         if self.evidence_router is None:
             raise ValueError("Stage-2 row filling requires an evidence router")
-        assignments = self.evidence_router.assign(
+        assignment_by_evidence = self.evidence_router.assign(
             query_id,
             selected_bundle.evidence_ids,
             row_count=len(query["rows"]),
         )
-        assignment_by_evidence = {assignment.evidence_id: assignment for assignment in assignments}
-        if set(assignment_by_evidence) != set(selected_bundle.evidence_ids) or len(assignments) != len(
-            selected_bundle.evidence_ids
-        ):
+        if set(assignment_by_evidence) != set(selected_bundle.evidence_ids):
             raise ValueError("Evidence router must assign every selected evidence exactly once")
         evidence_by_row: list[list[str]] = [[] for _ in query["rows"]]
         for evidence_id in selected_bundle.evidence_ids:
-            assignment = assignment_by_evidence[evidence_id]
-            if not 0 <= assignment.row_position < len(query["rows"]):
-                raise ValueError(f"Evidence router returned invalid row position {assignment.row_position}")
-            evidence_by_row[assignment.row_position].append(evidence_id)
+            row_position = assignment_by_evidence[evidence_id]
+            if not 0 <= row_position < len(query["rows"]):
+                raise ValueError(
+                    f"Evidence router returned invalid row position {row_position}"
+                )
+            evidence_by_row[row_position].append(evidence_id)
 
         predictions = []
         for row_position, row in enumerate(query["rows"]):

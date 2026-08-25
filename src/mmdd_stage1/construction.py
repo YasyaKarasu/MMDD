@@ -53,7 +53,7 @@ def _table_object(
 ) -> dict[str, Any]:
     parts = serialize_table_parts(table, max_rows)
     record = {
-        "object_id": str(table.get("table_id") or table["object_id"]),
+        "object_id": str(table["table_id"]),
         "object_type": "table",
         "embedding_role": embedding_role,
         "table_parts": parts,
@@ -257,7 +257,6 @@ def _resolve_target_references(
         {
             **sources[str(record["source_table_ref"]["source_table_id"])],
             **{key: value for key, value in record.items() if key != "source_table_ref"},
-            "object_id": str(record.get("table_id") or record["object_id"]),
         }
         if "source_table_ref" in record
         else record
@@ -276,14 +275,14 @@ def build_stage1_training_artifacts(
     if max_rows <= 0 or max_evidence_per_target < 0:
         raise ValueError("max_rows must be positive and max_evidence_per_target must be non-negative")
     queries = {
-        str(record.get("table_id") or record["object_id"]): record
+        str(record["table_id"]): record
         for record in _artifact_records(dataset_root, "query_tables")
     }
     target_records = _resolve_target_references(
         dataset_root, _artifact_records(dataset_root, "data_lake_tables")
     )
     targets = {
-        str(record.get("table_id") or record["object_id"]): record
+        str(record["table_id"]): record
         for record in target_records
     }
     assets = _artifact_records(dataset_root, "bridge_assets")
@@ -294,8 +293,8 @@ def build_stage1_training_artifacts(
     for qrel in qrels:
         if float(qrel.get("rel", 1)) <= 0:
             continue
-        query_id = str(qrel.get("query_table_id", qrel.get("query_id")))
-        target_id = str(qrel.get("target_table_id", qrel.get("data_lake_table_id")))
+        query_id = str(qrel["query_table_id"])
+        target_id = str(qrel["target_table_id"])
         if query_id not in queries or target_id not in targets:
             raise KeyError(f"qrel references missing objects: {query_id} -> {target_id}")
         if target_id not in positives_by_query[query_id]:

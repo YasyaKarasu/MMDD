@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import build_mm_joinability_dataset as joinability_dataset
 import run_mm_joinability_dynamic_vllm as dynamic_vllm_runner

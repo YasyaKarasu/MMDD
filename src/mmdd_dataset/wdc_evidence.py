@@ -178,15 +178,6 @@ class ResultCache:
                 (namespace, cache_key, payload),
             )
 
-    def count(self, namespace: str) -> int:
-        with self._connect() as connection:
-            return int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM results WHERE namespace = ?", (namespace,)
-                ).fetchone()[0]
-            )
-
-
 class EvidenceClient:
     def __init__(
         self,
@@ -198,7 +189,6 @@ class EvidenceClient:
         max_image_bytes: int,
         max_redirects: int = 3,
     ) -> None:
-        self.cache_dir = cache_dir
         self.image_dir = cache_dir / "images"
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
@@ -332,7 +322,7 @@ def execute_tasks(
         return url, result
 
     outcomes = dict(
-        bounded_map(get_or_fetch, unique_urls, workers=workers, max_pending=workers * 2)
+        bounded_map(get_or_fetch, unique_urls, workers=workers)
     )
     return [
         {

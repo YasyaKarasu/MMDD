@@ -47,7 +47,7 @@ def load_column_training_data(
             if qrel is None:
                 continue
             bundles = build_evidence_bundles(record["results"][:max_targets], top_k_evidence=top_k_evidence)
-            positive_target = str(qrel.get("target_table_id", qrel.get("data_lake_table_id")))
+            positive_target = str(qrel["target_table_id"])
             positive_bundle = next((bundle for bundle in bundles if bundle.target_id == positive_target), None)
             if positive_bundle is None:
                 continue

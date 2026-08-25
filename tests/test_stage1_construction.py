@@ -17,8 +17,6 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 def _table(table_id: str, headers: list[str], values: list[list[str]]) -> dict:
     return {
         "table_id": table_id,
-        "object_id": table_id,
-        "object_type": "table",
         "split": "train",
         "source_table_id": f"source_{table_id}",
         "columns": [
@@ -291,12 +289,9 @@ def test_stage1_constructor_resolves_raw_data_lake_source_references(tmp_path):
     positive = _table("positive", ["Value"], [["1"]])
     source = _table("unused", ["Entity", "Other"], [["B", "2"]])
     source.pop("table_id")
-    source.pop("object_id")
     source["source_table_id"] = "source_raw"
     raw_target = {
         "table_id": "raw",
-        "object_id": "raw",
-        "object_type": "table",
         "split": "train",
         "source_table_id": "source_raw",
         "source_table_ref": {"artifact": "source_tables", "source_table_id": "source_raw"},

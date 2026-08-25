@@ -78,43 +78,33 @@ def get_column_name(table: dict[str, Any], column_index: int) -> str:
 def source_splits(
     tables: list[dict[str, Any]],
     *,
-    split_by: str,
     ratios: tuple[float, float, float],
     seed: int,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    if split_by != "source_table_id":
-        raise ValueError("split_by must be 'source_table_id'")
     ratio_sum = sum(ratios)
     if ratio_sum <= 0:
         raise ValueError("split ratios must have a positive sum")
     train_ratio, dev_ratio, _ = (ratio / ratio_sum for ratio in ratios)
 
-    groups: dict[str, list[str]] = {}
-    for table in tables:
-        source_id = table["source_table_id"]
-        groups.setdefault(source_id, []).append(source_id)
-
-    keys = list(groups)
-    random.Random(seed).shuffle(keys)
-    train_end = int(len(keys) * train_ratio)
-    dev_end = train_end + int(len(keys) * dev_ratio)
+    source_ids = list(dict.fromkeys(table["source_table_id"] for table in tables))
+    random.Random(seed).shuffle(source_ids)
+    train_end = int(len(source_ids) * train_ratio)
+    dev_end = train_end + int(len(source_ids) * dev_ratio)
     split_keys = {
-        "train": keys[:train_end],
-        "dev": keys[train_end:dev_end],
-        "test": keys[dev_end:],
+        "train": source_ids[:train_end],
+        "dev": source_ids[train_end:dev_end],
+        "test": source_ids[dev_end:],
     }
 
     split_of: dict[str, str] = {}
     splits: dict[str, Any] = {}
-    for split, selected_keys in split_keys.items():
-        source_ids = sorted(
-            source_id for key in selected_keys for source_id in groups[key]
-        )
+    for split, selected_source_ids in split_keys.items():
+        selected_source_ids.sort()
         splits[split] = {
-            "source_table_ids": source_ids,
+            "source_table_ids": selected_source_ids,
             "query_table_ids": [],
             "data_lake_table_ids": [],
         }
-        split_of.update({source_id: split for source_id in source_ids})
-    splits["split_key"] = split_by
+        split_of.update({source_id: split for source_id in selected_source_ids})
+    splits["split_key"] = "source_table_id"
     return splits, split_of

@@ -19,7 +19,7 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import build_wdc_mm_joinability_dataset as wdc_builder  # noqa: E402
 import wdc200k_fetch as fetch_module  # noqa: E402

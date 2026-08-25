@@ -208,13 +208,11 @@ def add_stage_shard(
 def manifest_shards(
     manifest_path: Path,
     artifact: str,
-    *,
-    root: Path | None = None,
 ) -> tuple[Path, ...]:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if payload.get("complete") is not True:
         raise ValueError(f"stage is incomplete: {manifest_path}")
-    shard_root = manifest_path.parent if root is None else root
+    shard_root = manifest_path.parent
     records = payload.get("outputs", {}).get(artifact, [])
     if not all(valid_shard(shard_root, record) for record in records):
         raise ValueError(f"artifact has an invalid shard: {artifact}")
@@ -238,11 +236,10 @@ def bounded_map(
     values: Iterable[T],
     *,
     workers: int,
-    max_pending: int | None = None,
 ) -> Iterator[R]:
     """Map in deterministic input order with a bounded number of futures."""
     worker_count = max(1, int(workers))
-    batch_size = max(worker_count, int(max_pending or worker_count * 2))
+    batch_size = worker_count * 2
     iterator = iter(values)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         while True:

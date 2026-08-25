@@ -99,25 +99,26 @@ class CandidateColumnScorer(nn.Module):
 def joint_candidate_probabilities(
     retrieval_scores: torch.Tensor,
     column_logits: torch.Tensor,
-    target_mask: torch.Tensor,
     column_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Compute softmax(r_T) * rho_(T,c) from the verifier formulation."""
 
-    if retrieval_scores.shape != target_mask.shape:
-        raise ValueError("target_mask must match retrieval_scores")
-    if column_logits.shape != column_mask.shape or column_logits.shape[:2] != retrieval_scores.shape:
-        raise ValueError("Column tensors must have shape [batch, targets, columns]")
-    if not torch.all(target_mask.any(dim=-1)):
-        raise ValueError("Every batch item must have at least one valid target")
-    if not torch.all(column_mask.any(dim=-1) | ~target_mask):
-        raise ValueError("Every valid target must have at least one candidate column")
-    table_probabilities = torch.softmax(retrieval_scores.masked_fill(~target_mask, -torch.inf), dim=-1)
-    column_probabilities = torch.softmax(column_logits.masked_fill(~column_mask, -torch.inf), dim=-1)
+    if retrieval_scores.ndim != 1:
+        raise ValueError("retrieval_scores must have shape [targets]")
+    if (
+        column_logits.ndim != 2
+        or column_logits.shape != column_mask.shape
+        or column_logits.shape[0] != retrieval_scores.shape[0]
+    ):
+        raise ValueError("Column tensors must have shape [targets, columns]")
+    if not torch.all(column_mask.any(dim=-1)):
+        raise ValueError("Every target must have at least one candidate column")
+    table_probabilities = torch.softmax(retrieval_scores, dim=-1)
+    column_probabilities = torch.softmax(
+        column_logits.masked_fill(~column_mask, -torch.inf), dim=-1
+    )
     column_probabilities = column_probabilities.masked_fill(~column_mask, 0.0)
-    joint = table_probabilities.unsqueeze(-1) * column_probabilities
-    joint = joint.masked_fill(~column_mask | ~target_mask.unsqueeze(-1), 0.0)
-    return table_probabilities, column_probabilities, joint
+    return table_probabilities.unsqueeze(-1) * column_probabilities
 
 
 def _relevance(query_states: torch.Tensor, evidence_states: torch.Tensor) -> torch.Tensor:

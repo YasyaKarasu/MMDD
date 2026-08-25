@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts_old"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import create_wdc200k_scale_gate_input as gate_module  # noqa: E402

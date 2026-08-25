@@ -37,7 +37,9 @@ def _device_features(
     include_hidden: bool,
 ) -> ObjectFeatures:
     if object_id not in cache:
-        cache[object_id] = store.get(object_id).to(device, include_hidden=include_hidden)
+        cache[object_id] = store.get(object_id).for_scoring(
+            device, include_hidden=include_hidden
+        )
     return cache[object_id]
 
 

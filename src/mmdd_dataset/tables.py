@@ -96,12 +96,10 @@ def column_profiles(
         profiles.append(
             {
                 "column_index": index,
-                "column_name": column["column_name"],
                 "non_empty_ratio": round(non_empty_ratio, 6),
                 "wiki_link_ratio": round(wiki_ratio, 6),
                 "unique_ratio": round(unique_ratio, 6),
                 "numeric_ratio": round(numeric_ratio, 6),
-                "is_candidate_entity_column": is_entity,
             }
         )
     return profiles, entity_columns
@@ -131,12 +129,10 @@ def _entitable(
         return None, "too_few_columns"
 
     names = _column_names(raw_titles, num_cols)
-    numeric_columns = set(raw_table.get("numericColumns") or [])
     columns = [
         {
             "column_index": index,
             "column_name": name,
-            "is_numeric_column": index in numeric_columns or name in numeric_columns,
         }
         for index, name in enumerate(names)
     ]

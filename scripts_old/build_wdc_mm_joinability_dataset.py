@@ -450,7 +450,7 @@ class WdcWebClient:
             try:
                 from wdc200k_io import GuardedWriteTracker
             except ModuleNotFoundError:
-                from scripts.wdc200k_io import GuardedWriteTracker
+                from scripts_old.wdc200k_io import GuardedWriteTracker
             write_tracker = GuardedWriteTracker(
                 self.database_path,
                 pre_write_guard,

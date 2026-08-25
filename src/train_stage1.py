@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
@@ -32,11 +30,6 @@ def _required_path(value: str | None, flag: str, stage: str) -> Path:
     if value is None:
         raise ValueError(f"{flag} is required for stage {stage}")
     return Path(value)
-
-
-def _training_paths(value: str | list[str]) -> list[Path]:
-    values = [value] if isinstance(value, str) else value
-    return [Path(item) for item in values]
 
 
 def _load_edge_training_data(paths: list[Path], split: str | None):
@@ -80,8 +73,6 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--distillation-weight must be non-negative")
     if not 0 <= args.dataset_sampling_alpha <= 1:
         raise ValueError("--dataset-sampling-alpha must be between 0 and 1")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -91,16 +82,22 @@ def run(args: argparse.Namespace) -> None:
     if hidden_dim is None:
         raise ValueError("All training stages require hidden_states so the frozen Teacher can score candidates")
     split = None if args.split == "all" else args.split
-    training_paths = _training_paths(args.train_data)
-    aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
-    saved_aggregation, saved_top_k = (
-        load_path_aggregation(Path(aggregation_checkpoint))
-        if aggregation_checkpoint
-        else ("logsumexp", 4)
-    )
-    evidence_aggregation = args.evidence_aggregation or saved_aggregation
-    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
-    aggregator = PathAggregator(evidence_aggregation, evidence_top_k).to(device)
+    training_paths = [Path(value) for value in args.train_data]
+    aggregator: PathAggregator | None = None
+    if args.stage != "teacher-edge":
+        aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
+        saved_aggregation, saved_top_k = (
+            load_path_aggregation(Path(aggregation_checkpoint))
+            if aggregation_checkpoint
+            else ("logsumexp", 4)
+        )
+        evidence_aggregation = args.evidence_aggregation or saved_aggregation
+        evidence_top_k = (
+            args.evidence_top_k
+            if args.evidence_top_k is not None
+            else saved_top_k
+        )
+        aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
 
     teacher: TeacherJoinabilityModel | None = None
     student: StudentJoinabilityModel | None = None
@@ -180,8 +177,7 @@ def run(args: argparse.Namespace) -> None:
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    saved_aggregator = aggregator if args.stage != "teacher-edge" else None
-    torch.save(checkpoint(model, args.stage, saved_aggregator), output)
+    torch.save(checkpoint(model, args.stage, aggregator), output)
     history_path = output.with_suffix(output.suffix + ".history.json")
     history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(

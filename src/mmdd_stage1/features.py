@@ -11,22 +11,13 @@ from typing import Any, Iterable, Mapping
 import torch
 
 OBJECT_TYPES = ("table", "text", "image")
-TYPE_ALIASES = {
-    "table": "table",
-    "table_fragment": "table",
-    "text": "text",
-    "text_asset": "text",
-    "image": "image",
-    "image_asset": "image",
-}
 
 
 def normalize_object_type(value: str) -> str:
-    try:
-        return TYPE_ALIASES[value]
-    except KeyError as exc:
-        choices = ", ".join(sorted(TYPE_ALIASES))
-        raise ValueError(f"Unknown object type {value!r}; expected one of: {choices}") from exc
+    if value not in OBJECT_TYPES:
+        choices = ", ".join(OBJECT_TYPES)
+        raise ValueError(f"Unknown object type {value!r}; expected one of: {choices}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -72,10 +63,11 @@ class ObjectFeatures:
             if self.row_embeddings.ndim != 2 or self.row_embeddings.shape[1] != self.embedding.shape[0]:
                 raise ValueError(f"{self.object_id}: row_embeddings must have shape [rows, D]")
 
-    def to(self, device: torch.device, *, include_hidden: bool) -> ObjectFeatures:
+    def for_scoring(
+        self, device: torch.device, *, include_hidden: bool
+    ) -> ObjectFeatures:
         hidden = self.hidden_states
         groups = self.token_groups
-        row_embeddings = self.row_embeddings
         if include_hidden:
             if hidden is None:
                 raise ValueError(f"{self.object_id}: Teacher training requires hidden_states")
@@ -84,15 +76,12 @@ class ObjectFeatures:
         else:
             hidden = None
             groups = None
-        if row_embeddings is not None:
-            row_embeddings = row_embeddings.to(device=device, dtype=torch.float32)
         return ObjectFeatures(
             object_id=self.object_id,
             object_type=self.object_type,
             embedding=self.embedding.to(device=device, dtype=torch.float32),
             hidden_states=hidden,
             token_groups=groups,
-            row_embeddings=row_embeddings,
         )
 
 
@@ -133,12 +122,10 @@ class FeatureStore:
         self,
         eager_features: Mapping[str, ObjectFeatures] | None = None,
         *,
-        root: Path | None = None,
         index: Mapping[str, tuple[str, Path]] | None = None,
         cache_size: int = 128,
     ) -> None:
         self._eager = dict(eager_features or {})
-        self._root = root
         self._index = dict(index or {})
         self._cache_size = max(0, cache_size)
         self._cache: OrderedDict[str, ObjectFeatures] = OrderedDict()
@@ -186,7 +173,7 @@ class FeatureStore:
                 if object_id in index:
                     raise ValueError(f"{manifest}:{line_number}: duplicate object_id {object_id!r}")
                 index[object_id] = (object_type, feature_path)
-        return cls(root=root, index=index, cache_size=cache_size)
+        return cls(index=index, cache_size=cache_size)
 
     def __contains__(self, object_id: str) -> bool:
         return object_id in self._eager or object_id in self._index

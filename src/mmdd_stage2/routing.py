@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Sequence
 
 import torch
 from torch.nn import functional as F
 
 from mmdd_stage1.features import FeatureStore
-
-
-@dataclass(frozen=True)
-class EvidenceRowAssignment:
-    evidence_id: str
-    row_position: int
 
 
 class SimilarityEvidenceRouter:
@@ -30,13 +23,13 @@ class SimilarityEvidenceRouter:
         evidence_ids: Sequence[str],
         *,
         row_count: int,
-    ) -> tuple[EvidenceRowAssignment, ...]:
+    ) -> dict[str, int]:
         if row_count <= 0:
             raise ValueError("Evidence routing requires at least one query row")
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("Evidence routing requires unique evidence IDs")
         if not evidence_ids:
-            return ()
+            return {}
 
         query = self.features.get(query_id)
         rows = query.row_embeddings
@@ -57,7 +50,7 @@ class SimilarityEvidenceRouter:
         )
         similarities = evidence_vectors @ row_vectors.T
         row_positions = similarities.argmax(dim=-1)
-        return tuple(
-            EvidenceRowAssignment(evidence_id, int(row_position))
+        return {
+            evidence_id: int(row_position)
             for evidence_id, row_position in zip(evidence_ids, row_positions)
-        )
+        }

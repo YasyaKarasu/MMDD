@@ -30,7 +30,7 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "wdc200k_selection":
         raise
-    from scripts.wdc200k_selection import (
+    from scripts_old.wdc200k_selection import (
         SUBSETS,
         TableCandidate,
         read_statistics_catalog,

@@ -7,8 +7,6 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-
 from mmdd_stage2.checkpoints import save_candidate_scorer
 from mmdd_stage2.qwen import QwenStage2Backend
 from mmdd_stage2.training import load_column_training_data, train_candidate_scorer
@@ -20,7 +18,6 @@ def run(args: argparse.Namespace) -> None:
         Path(args.model_dir),
         device=args.device,
         dtype=args.dtype,
-        focus_start_layer=args.focus_start_layer,
     )
     device = backend.device
     scorer = CandidateColumnScorer(backend.hidden_dim).to(device)
@@ -75,7 +72,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default="hf_models/Qwen3.5-9B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--focus-start-layer", type=int, default=14)
     parser.add_argument("--top-k-evidence", type=int, default=10)
     parser.add_argument("--max-targets", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=3)
@@ -86,5 +82,4 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    torch.set_grad_enabled(True)
     run(parse_args())

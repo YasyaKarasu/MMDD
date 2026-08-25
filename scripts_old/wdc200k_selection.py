@@ -33,7 +33,7 @@ try:
 except ModuleNotFoundError as error:
     if error.name != "wdc200k_io":
         raise
-    from scripts.wdc200k_io import (
+    from scripts_old.wdc200k_io import (
         AtomicJsonlShard,
         CompletedShard,
         GuardedWriteTracker,

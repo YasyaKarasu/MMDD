@@ -390,7 +390,6 @@ def run(args: argparse.Namespace) -> None:
             }
             manifest_handle.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
             manifest_handle.flush()
-            completed[object_id] = manifest_record
             written += 1
             print(json.dumps({"object_id": object_id, "written": written, "skipped": skipped}))
 

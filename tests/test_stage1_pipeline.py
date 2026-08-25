@@ -11,7 +11,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import build_mm_table_dataset as mm_table_dataset
 import build_mm_joinability_dataset as join_dataset

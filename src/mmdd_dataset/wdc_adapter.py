@@ -207,7 +207,6 @@ def _entity_record(
         "appears_in": [
             {
                 "source_table_id": source_table_id,
-                "query_view_id": None,
                 "row_id": row_id,
                 "column_index": entity_column,
                 "column_name": column_names[entity_column],
@@ -251,7 +250,7 @@ def adapt_table(
         schema_class, relative_source, length=16
     )
     columns = [
-        {"column_index": index, "column_name": name, "is_numeric_column": False}
+        {"column_index": index, "column_name": name}
         for index, name in enumerate(column_names)
     ]
     rows: list[dict[str, Any]] = []
@@ -283,8 +282,6 @@ def adapt_table(
         entities.append(entity)
 
     profiles, _ = column_profiles(rows, columns, 1.0)
-    for column, profile in zip(columns, profiles):
-        column["is_numeric_column"] = profile["numeric_ratio"] >= 0.8
     table = {
         "source_table_id": source_table_id,
         "source_file": relative_source,
@@ -292,7 +289,6 @@ def adapt_table(
         "num_cols": len(columns),
         "columns": columns,
         "rows": rows,
-        "provenance_builder": "mmdd_dataset.wdc_adapter",
         "metadata": {
             "candidate_entity_columns": [entity_column],
             "column_profiles": profiles,

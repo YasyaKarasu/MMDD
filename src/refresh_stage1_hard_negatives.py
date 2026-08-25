@@ -69,7 +69,7 @@ def run(args: argparse.Namespace) -> None:
         device=device,
         checkpoint_sha256=student_sha256,
     )
-    aggregator = PathAggregator(evidence_aggregation, evidence_top_k).to(device)
+    aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
     candidate_sets = retrieve_hard_candidate_sets(
         examples,
         indices,

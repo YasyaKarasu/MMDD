@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts_old"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import wdc200k_selection as selection_module  # noqa: E402
@@ -97,7 +97,7 @@ def test_selection_module_imports_through_scripts_package() -> None:
         [
             sys.executable,
             "-c",
-            "from scripts.wdc200k_selection import SelectionPolicy; "
+            "from scripts_old.wdc200k_selection import SelectionPolicy; "
             "assert SelectionPolicy().seed == 13",
         ],
         cwd=SCRIPTS_DIR.parent,

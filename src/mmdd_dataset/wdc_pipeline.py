@@ -88,10 +88,8 @@ class WdcPipelineConfig:
     min_recovered_ratio: float = 0.6
     min_recovered_rows: int = 3
     min_column_non_empty_ratio: float = 0.5
-    max_queries_per_source: int = 1
     max_query_additional_columns: int = 1
     max_target_additional_columns: int = 2
-    split_by: str = "source_table_id"
     train_ratio: float = 0.8
     dev_ratio: float = 0.1
     test_ratio: float = 0.1
@@ -548,28 +546,21 @@ def _image_tasks(
     return tasks, unsafe
 
 
-def _write_task_outcomes(
+def _write_outcomes(
     root: Path,
     manifest: dict[str, Any],
     *,
     index: int,
-    task_artifact: str,
-    result_artifact: str,
-    tasks: list[dict[str, Any]],
+    artifact: str,
     outcomes: list[dict[str, Any]],
 ) -> None:
-    task_writer = _new_shard(root, task_artifact, index)
-    result_writer = _new_shard(root, result_artifact, index)
+    writer = _new_shard(root, artifact, index)
     try:
-        for task in tasks:
-            task_writer.write(task)
         for outcome in outcomes:
-            result_writer.write(outcome)
-        add_stage_shard(root, manifest, task_writer.commit())
-        add_stage_shard(root, manifest, result_writer.commit())
+            writer.write(outcome)
+        add_stage_shard(root, manifest, writer.commit())
     except BaseException:
-        task_writer.abort()
-        result_writer.abort()
+        writer.abort()
         raise
 
 
@@ -626,7 +617,7 @@ def run_fetch_evidence(
     sampled_shards = _sampled_entity_shards(config)
 
     if evidence_kind in {"pages", "all"}:
-        completed = _completed_indices(manifest, "page_tasks", "page_results")
+        completed = _completed_indices(manifest, "page_results")
         for index, entity_path in enumerate(sampled_shards):
             if index in completed:
                 continue
@@ -640,13 +631,11 @@ def run_fetch_evidence(
                 fetch=page_fetch,
                 reuse=reuse,
             )
-            _write_task_outcomes(
+            _write_outcomes(
                 root,
                 manifest,
                 index=index,
-                task_artifact="page_tasks",
-                result_artifact="page_results",
-                tasks=tasks,
+                artifact="page_results",
                 outcomes=outcomes,
             )
             manifest["counts"]["unsafe_page_urls"] = (
@@ -667,7 +656,7 @@ def run_fetch_evidence(
         publish_stage_manifest(root, manifest)
 
     if evidence_kind in {"images", "all"}:
-        completed = _completed_indices(manifest, "image_tasks", "image_results")
+        completed = _completed_indices(manifest, "image_results")
         for index, entity_path in enumerate(sampled_shards):
             if index in completed:
                 continue
@@ -692,13 +681,11 @@ def run_fetch_evidence(
                 fetch=image_fetch,
                 reuse=reuse,
             )
-            _write_task_outcomes(
+            _write_outcomes(
                 root,
                 manifest,
                 index=index,
-                task_artifact="image_tasks",
-                result_artifact="image_results",
-                tasks=tasks,
+                artifact="image_results",
                 outcomes=outcomes,
             )
             manifest["counts"]["unsafe_image_urls"] = (
@@ -822,7 +809,6 @@ def _model_tasks_for_shard(
         sampled = sampled_by_table.get(source_table_id, {})
         if not sampled:
             continue
-        entity_col = int(table["metadata"]["candidate_entity_columns"][0])
         attributes = _candidate_attributes(
             table,
             maximum=config.max_attributes_per_table,
@@ -833,7 +819,6 @@ def _model_tasks_for_shard(
             entity = sampled.get(source_row_id)
             if entity is None:
                 continue
-            entity_cell = get_cell(row, entity_col)
             for attribute_col in attributes:
                 if not clean_text(get_cell(row, attribute_col).get("text")):
                     continue
@@ -870,7 +855,6 @@ def _model_tasks_for_shard(
                             "source_table_id": source_table_id,
                             "source_row_id": source_row_id,
                             "entity_id": entity["entity_id"],
-                            "entity": clean_text(entity_cell.get("text")),
                             "attribute_name": attribute_name,
                             "asset_id": asset["asset_id"],
                             "asset_type": asset["asset_type"],
@@ -921,7 +905,6 @@ def _canonical_extraction(
     task: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
     return {
-        "task_id": task["task_id"],
         "extraction_id": task["task_id"],
         "source_table_id": task["source_table_id"],
         "source_row_id": task["source_row_id"],
@@ -954,7 +937,6 @@ def _run_model_tasks(
             return None
         try:
             result = extractor.extract(
-                entity=task["entity"],
                 attribute=task["attribute_name"],
                 visible_cells=task["visible_cells"],
                 asset=task["asset"],
@@ -969,7 +951,7 @@ def _run_model_tasks(
         return _canonical_extraction(task, result)
 
     raw_results = list(
-        bounded_map(execute, tasks, workers=workers, max_pending=workers * 2)
+        bounded_map(execute, tasks, workers=workers)
     )
     return [result for result in raw_results if result is not None], sum(
         result is None for result in raw_results
@@ -1134,7 +1116,7 @@ def run_extract(
 
 
 def _split_for(table: dict[str, Any], config: WdcPipelineConfig) -> str:
-    key = clean_text(table.get(config.split_by)) or str(table["source_table_id"])
+    key = str(table["source_table_id"])
     value = int(stable_hash(config.seed, key, length=15), 16) / float(16**15)
     ratio_sum = config.train_ratio + config.dev_ratio + config.test_ratio
     train_end = config.train_ratio / ratio_sum
@@ -1191,7 +1173,6 @@ def _build_config(config: WdcPipelineConfig) -> BuildConfig:
         min_recovered_ratio=config.min_recovered_ratio,
         min_recovered_rows=config.min_recovered_rows,
         min_column_non_empty_ratio=config.min_column_non_empty_ratio,
-        max_queries_per_source=config.max_queries_per_source,
         max_query_additional_columns=config.max_query_additional_columns,
         max_target_additional_columns=config.max_target_additional_columns,
     )
@@ -1325,7 +1306,7 @@ def _final_manifest(
             "joinability": asdict(_build_config(config)),
             "extraction": extraction_identity,
             "split": {
-                "split_by": config.split_by,
+                "split_by": "source_table_id",
                 "train_ratio": config.train_ratio,
                 "dev_ratio": config.dev_ratio,
                 "test_ratio": config.test_ratio,
@@ -1369,10 +1350,8 @@ def run_materialize(
             "min_recovered_ratio",
             "min_recovered_rows",
             "min_column_non_empty_ratio",
-            "max_queries_per_source",
             "max_query_additional_columns",
             "max_target_additional_columns",
-            "split_by",
             "train_ratio",
             "dev_ratio",
             "test_ratio",
@@ -1437,7 +1416,7 @@ def run_materialize(
     atomic_write_json(
         config.output_dir / "splits.json",
         {
-            "split_key": config.split_by,
+            "split_key": "source_table_id",
             "source_table_counts": split_counts,
             "assignments_artifact": "split_assignments",
         },
@@ -1552,10 +1531,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-recovered-ratio", type=float, default=0.6)
     result.add_argument("--min-recovered-rows", type=int, default=3)
     result.add_argument("--min-column-non-empty-ratio", type=float, default=0.5)
-    result.add_argument("--max-queries-per-source", type=int, default=1)
     result.add_argument("--max-query-additional-columns", type=int, default=1)
     result.add_argument("--max-target-additional-columns", type=int, default=2)
-    result.add_argument("--split-by", choices=("source_table_id",), default="source_table_id")
     result.add_argument("--train-ratio", type=float, default=0.8)
     result.add_argument("--dev-ratio", type=float, default=0.1)
     result.add_argument("--test-ratio", type=float, default=0.1)
@@ -1599,10 +1576,8 @@ def _config_from_args(args: argparse.Namespace) -> WdcPipelineConfig:
         min_recovered_ratio=args.min_recovered_ratio,
         min_recovered_rows=args.min_recovered_rows,
         min_column_non_empty_ratio=args.min_column_non_empty_ratio,
-        max_queries_per_source=args.max_queries_per_source,
         max_query_additional_columns=args.max_query_additional_columns,
         max_target_additional_columns=args.max_target_additional_columns,
-        split_by=args.split_by,
         train_ratio=args.train_ratio,
         dev_ratio=args.dev_ratio,
         test_ratio=args.test_ratio,

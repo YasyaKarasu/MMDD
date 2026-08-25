@@ -82,6 +82,21 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     table = prepared.source_tables[0]
 
     assert table["metadata"]["candidate_entity_columns"] == [0]
+    assert all(
+        set(profile)
+        == {
+            "column_index",
+            "non_empty_ratio",
+            "wiki_link_ratio",
+            "unique_ratio",
+            "numeric_ratio",
+        }
+        for profile in table["metadata"]["column_profiles"]
+    )
+    assert all(
+        set(column) == {"column_index", "column_name"}
+        for column in table["columns"]
+    )
     assert not {"page_title", "caption", "section_title"} & table.keys()
     result = build_joinability_dataset(
         prepared.source_tables,
@@ -106,6 +121,9 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     assert target["columns"][0]["column_name"] == "Founded"
     assert len(result["evidence_recoveries"]) == 3
     assert result["qrels"][0]["target_table_id"] == target["table_id"]
+    assert "data_lake_table_id" not in result["qrels"][0]
+    assert "object_id" not in query
+    assert "object_type" not in query
 
 
 def test_table_workload_projects_reproducible_query_views(tmp_path: Path) -> None:

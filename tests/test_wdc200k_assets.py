@@ -14,7 +14,7 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts_old"))
 
 from wdc200k_assets import (  # noqa: E402
     ImageBudget,
@@ -66,7 +66,7 @@ def test_assets_module_supports_package_import() -> None:
         [
             sys.executable,
             "-c",
-            "from scripts.wdc200k_assets import ImageBudget",
+            "from scripts_old.wdc200k_assets import ImageBudget",
         ],
         cwd=ROOT,
         check=False,
