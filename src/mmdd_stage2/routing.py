@@ -15,7 +15,6 @@ from mmdd_stage1.features import FeatureStore
 class EvidenceRowAssignment:
     evidence_id: str
     row_position: int
-    similarity: float
 
 
 class SimilarityEvidenceRouter:
@@ -57,8 +56,8 @@ class SimilarityEvidenceRouter:
             dim=-1,
         )
         similarities = evidence_vectors @ row_vectors.T
-        scores, row_positions = similarities.max(dim=-1)
+        row_positions = similarities.argmax(dim=-1)
         return tuple(
-            EvidenceRowAssignment(evidence_id, int(row_position), float(score))
-            for evidence_id, row_position, score in zip(evidence_ids, row_positions, scores)
+            EvidenceRowAssignment(evidence_id, int(row_position))
+            for evidence_id, row_position in zip(evidence_ids, row_positions)
         )

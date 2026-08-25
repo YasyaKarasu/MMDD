@@ -229,7 +229,7 @@ class FakeRouter:
         assert query_id == "q1"
         assert row_count == 2
         return tuple(
-            EvidenceRowAssignment(evidence_id, self.row_by_evidence[evidence_id], 0.8)
+            EvidenceRowAssignment(evidence_id, self.row_by_evidence[evidence_id])
             for evidence_id in evidence_ids
         )
 
@@ -342,7 +342,6 @@ def test_similarity_router_assigns_each_evidence_to_its_nearest_row():
     assignments = SimilarityEvidenceRouter(store).assign("q1", ["e1", "e2"], row_count=2)
 
     assert [(item.evidence_id, item.row_position) for item in assignments] == [("e1", 0), ("e2", 1)]
-    assert all(item.similarity > 0.99 for item in assignments)
 
 
 def test_stage2_skips_rows_without_assigned_evidence():

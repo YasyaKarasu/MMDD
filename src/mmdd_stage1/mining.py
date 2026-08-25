@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Sequence
 
 import torch
@@ -13,12 +12,6 @@ from .models import TeacherJoinabilityModel
 from .objectives import PathAggregator
 from .retrieval import StudentANNIndices, retrieve_zero_one_hop
 from .scoring import score_edge_batch, score_target_batch
-
-
-@dataclass(frozen=True)
-class HardCandidateSet:
-    target_example: TargetExample
-
 
 def _path_evidence_ids(result: dict[str, Any], max_evidence: int) -> tuple[str, ...]:
     evidence_ids = []
@@ -38,7 +31,7 @@ def build_hard_candidate_set(
     *,
     hard_targets_per_query: int,
     max_evidence_per_target: int,
-) -> HardCandidateSet:
+) -> TargetExample:
     """Exclude all GT targets and retain the highest-ranked Student errors."""
 
     if hard_targets_per_query <= 0:
@@ -77,7 +70,7 @@ def build_hard_candidate_set(
     if len(candidates) < 2:
         raise ValueError(f"{example.query_id}: retrieval and existing data produced no negative target")
 
-    target_example = TargetExample(
+    return TargetExample(
         query_id=example.query_id,
         candidates=tuple(candidates),
         positive_index=0,
@@ -85,16 +78,14 @@ def build_hard_candidate_set(
         split=example.split,
         positive_target_ids=known_positive_ids,
     )
-    return HardCandidateSet(target_example)
 
 
 def _edge_examples_for_candidate_set(
-    candidate_set: HardCandidateSet,
+    target_example: TargetExample,
     store: FeatureStore,
 ) -> list[EdgeExample]:
     """Expand one mined target list into its directly supervised path edges."""
 
-    target_example = candidate_set.target_example
     positive = target_example.candidates[target_example.positive_index]
     negative_candidates = [
         candidate
@@ -168,7 +159,7 @@ def retrieve_hard_candidate_sets(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
-) -> list[HardCandidateSet]:
+) -> list[TargetExample]:
     candidate_sets = []
     for example in examples:
         results = retrieve_zero_one_hop(
@@ -196,7 +187,7 @@ def retrieve_hard_candidate_sets(
 
 @torch.no_grad()
 def score_hard_candidate_sets(
-    candidate_sets: Sequence[HardCandidateSet],
+    candidate_sets: Sequence[TargetExample],
     teacher: TeacherJoinabilityModel,
     store: FeatureStore,
     aggregator: PathAggregator,
@@ -211,34 +202,33 @@ def score_hard_candidate_sets(
     edge_records = []
     for start in range(0, len(candidate_sets), batch_size):
         batch = candidate_sets[start : start + batch_size]
-        target_examples = [item.target_example for item in batch]
         edge_examples_by_item = [
             _edge_examples_for_candidate_set(item, store) for item in batch
         ]
         edge_examples = [
             example for item_examples in edge_examples_by_item for example in item_examples
         ]
-        teacher_targets = score_target_batch(teacher, target_examples, store, device, aggregator)
+        teacher_targets = score_target_batch(teacher, batch, store, device, aggregator)
         teacher_edges = score_edge_batch(teacher, edge_examples, store, device)
         edge_offset = 0
         for index, (item, item_edge_examples) in enumerate(zip(batch, edge_examples_by_item)):
-            target_count = len(item.target_example.candidates)
+            target_count = len(item.candidates)
             target_record = {
-                "query_id": item.target_example.query_id,
-                "positive_target_id": item.target_example.candidates[0].target_id,
-                "positive_target_ids": list(item.target_example.positive_target_ids),
+                "query_id": item.query_id,
+                "positive_target_id": item.candidates[0].target_id,
+                "positive_target_ids": list(item.positive_target_ids),
                 "candidates": [
                     {
                         "target_id": candidate.target_id,
                         "evidence_ids": list(candidate.evidence_ids),
                     }
-                    for candidate in item.target_example.candidates
+                    for candidate in item.candidates
                 ],
                 "teacher_logits": teacher_targets.logits[index, :target_count].cpu().tolist(),
-                "dataset": item.target_example.dataset,
+                "dataset": item.dataset,
             }
-            if item.target_example.split is not None:
-                target_record["split"] = item.target_example.split
+            if item.split is not None:
+                target_record["split"] = item.split
             target_records.append(target_record)
             for edge_example in item_edge_examples:
                 edge_count = len(edge_example.candidate_ids)

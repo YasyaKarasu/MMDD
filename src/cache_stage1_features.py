@@ -66,7 +66,9 @@ def embedding_instructions(
     role = record.get("embedding_role")
     if role is None:
         if object_type == "table":
-            role = "query" if record.get("row_routing_texts") is not None else "target"
+            raise ValueError(
+                f"{record.get('object_id')}: table objects must declare embedding_role"
+            )
         else:
             role = "evidence"
     role = str(role)
@@ -236,7 +238,7 @@ def build_object_features(
             f"{record.get('object_id')}: table_parts must contain schema text followed by example-row texts"
         )
     item = {
-        "text": record.get("text") or ("\n".join(parts) if parts is not None else None),
+        "text": "\n".join(parts) if parts is not None else record.get("text"),
         "image": _resolve_image(record, input_dir),
         "instruction": object_instruction,
     }
@@ -252,19 +254,7 @@ def build_object_features(
         payload["hidden_states"] = hidden_states.index_select(0, indices).to(dtype=storage_dtype)
         payload["token_groups"] = groups
 
-        row_routing_texts = record.get("row_routing_texts")
-        if row_routing_texts is None and embedding_role == "query":
-            row_routing_texts = [f"{parts[0]}\n{row}" for row in parts[1:]]
-        if row_routing_texts is not None:
-            if (
-                not isinstance(row_routing_texts, list)
-                or not row_routing_texts
-                or len(row_routing_texts) != len(parts) - 1
-                or not all(isinstance(text, str) and text.strip() for text in row_routing_texts)
-            ):
-                raise ValueError(
-                    f"{record.get('object_id')}: row_routing_texts must contain one non-empty text per query row"
-                )
+        if embedding_role == "query":
             routing_outputs = encode_inputs(
                 embedder,
                 [
@@ -272,7 +262,7 @@ def build_object_features(
                         "text": text,
                         "instruction": row_instruction,
                     }
-                    for text in row_routing_texts
+                    for text in (f"{parts[0]}\n{row}" for row in parts[1:])
                 ],
             )
             payload["row_embeddings"] = torch.stack([embedding for embedding, _, _ in routing_outputs])

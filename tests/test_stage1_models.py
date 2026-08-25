@@ -454,6 +454,7 @@ def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
         {
             "object_id": "q",
             "object_type": "table",
+            "embedding_role": "target",
             "table_parts": ["schema player country", "row Messi Argentina"],
         },
         input_dir=tmp_path,
@@ -500,6 +501,9 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
 
 
 def test_embedding_instructions_distinguish_role_modality_and_query_rows():
+    with pytest.raises(ValueError, match="must declare embedding_role"):
+        embedding_instructions({"object_id": "legacy"}, "table")
+
     query, query_row, role = embedding_instructions(
         {"object_id": "q", "embedding_role": "query"}, "table"
     )
@@ -733,12 +737,12 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
         max_evidence_per_target=2,
     )
 
-    assert [candidate.target_id for candidate in candidate_set.target_example.candidates] == [
+    assert [candidate.target_id for candidate in candidate_set.candidates] == [
         "positive",
         "hard_1",
         "hard_2",
     ]
-    assert candidate_set.target_example.candidates[1:] == (
+    assert candidate_set.candidates[1:] == (
         TargetCandidate("hard_1", ("e1", "e2")),
         TargetCandidate("hard_2", ()),
     )

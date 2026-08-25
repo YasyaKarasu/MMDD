@@ -31,8 +31,6 @@ class SemanticJoinability:
     joinable: bool
     coverage: float
     mean_similarity: float
-    similarities: tuple[float, ...]
-    target_indices: tuple[int, ...]
 
 
 def _logsumexp(values: Sequence[float]) -> float:
@@ -283,7 +281,7 @@ def semantic_joinability(
     """Check whether augmented query values are semantically contained in a target column."""
 
     if not query_values or not target_values:
-        return SemanticJoinability(False, 0.0, 0.0, (), ())
+        return SemanticJoinability(False, 0.0, 0.0)
     if (query_embeddings is None) != (target_embeddings is None):
         raise ValueError("query_embeddings and target_embeddings must be supplied together")
     if query_embeddings is not None:
@@ -294,25 +292,18 @@ def semantic_joinability(
         similarities = torch.zeros((len(query_values), len(target_values)))
 
     best_scores = []
-    best_indices = []
     for query_index, query_value in enumerate(query_values):
         if not str(query_value).strip():
             best_scores.append(0.0)
-            best_indices.append(-1)
             continue
-        exact = next((index for index, value in enumerate(target_values) if values_match(query_value, value)), None)
-        if exact is not None:
+        if any(values_match(query_value, value) for value in target_values):
             best_scores.append(1.0)
-            best_indices.append(exact)
         else:
-            score, index = similarities[query_index].max(dim=0)
+            score = similarities[query_index].max()
             best_scores.append(float(score))
-            best_indices.append(int(index))
     coverage = sum(score >= similarity_threshold for score in best_scores) / len(best_scores)
     return SemanticJoinability(
         joinable=coverage >= min_coverage,
         coverage=coverage,
         mean_similarity=sum(best_scores) / len(best_scores),
-        similarities=tuple(best_scores),
-        target_indices=tuple(best_indices),
     )
