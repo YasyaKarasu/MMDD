@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import torch
 
-from .data import column_name, column_values, local_column_index, row_values
+from .data import column_name, column_values, row_values
 from .routing import EvidenceRowAssignment
 from .verifier import (
     CandidateColumnScorer,
@@ -129,7 +130,6 @@ class Stage2Backend(Protocol):
         self,
         row: dict[str, str],
         *,
-        entity_column: str,
         attribute_name: str,
         evidence: dict[str, Any],
     ) -> LocalizedEvidence: ...
@@ -138,7 +138,6 @@ class Stage2Backend(Protocol):
         self,
         row: dict[str, str],
         *,
-        entity_column: str,
         attribute_name: str,
         candidates: Sequence[LocalizedEvidence],
     ) -> torch.Tensor: ...
@@ -330,11 +329,6 @@ class Stage2Verifier:
                 raise ValueError(f"Evidence router returned invalid row position {assignment.row_position}")
             evidence_by_row[assignment.row_position].append(evidence_id)
 
-        if "query_entity_col" in query:
-            entity_index = local_column_index(query, int(query["query_entity_col"]))
-        else:
-            entity_index = int(query["columns"][0]["column_index"])
-        entity_name = column_name(query, entity_index)
         predictions = []
         for row_position, row in enumerate(query["rows"]):
             visible_row = row_values(query, row)
@@ -353,7 +347,6 @@ class Stage2Verifier:
             for evidence_id in routed:
                 item = self.backend.localize_evidence(
                     visible_row,
-                    entity_column=entity_name,
                     attribute_name=selection.column_name,
                     evidence=evidence[evidence_id],
                 )
@@ -363,7 +356,6 @@ class Stage2Verifier:
             else:
                 evidence_logits = self.backend.evidence_logits(
                     visible_row,
-                    entity_column=entity_name,
                     attribute_name=selection.column_name,
                     candidates=localized,
                 )

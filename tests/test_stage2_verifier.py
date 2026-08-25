@@ -9,6 +9,18 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mmdd_stage1.features import FeatureStore, ObjectFeatures
+from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
+from mmdd_stage2.data import (
+    Stage2ObjectIndex,
+    direct_target_ids,
+    serialize_image_presence_prompt,
+    serialize_localization_prompt,
+)
+from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
+from mmdd_stage2.qwen import QwenStage2Backend
+from mmdd_stage2.routing import EvidenceRowAssignment, SimilarityEvidenceRouter
+from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
 from mmdd_stage2.verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
@@ -20,13 +32,6 @@ from mmdd_stage2.verifier import (
     propose_image_regions,
     semantic_joinability,
 )
-from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
-from mmdd_stage2.qwen import QwenStage2Backend
-from mmdd_stage2.routing import EvidenceRowAssignment, SimilarityEvidenceRouter
-from mmdd_stage1.features import FeatureStore, ObjectFeatures
-from mmdd_stage2.data import Stage2ObjectIndex, direct_target_ids
-from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
-from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
 
 
 def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
@@ -118,9 +123,9 @@ def test_joint_relevance_localizes_text_span():
     evidence = torch.tensor(
         [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
     )
-    entity = torch.tensor([[1.0, 0.0]])
+    row_anchor = torch.tensor([[1.0, 0.0]])
     attribute = torch.tensor([[0.8, 0.2]])
-    relevance = joint_relevance(entity, attribute, evidence)
+    relevance = joint_relevance(row_anchor, attribute, evidence)
 
     assert relevance.sum().item() == pytest.approx(1.0)
     assert best_text_span(relevance, 2) == (0, 2)
@@ -168,6 +173,36 @@ def test_semantic_joinability_requires_row_coverage():
     assert not result.joinable
 
 
+def test_localization_prompt_uses_the_full_row_as_entity_anchor():
+    prompt = serialize_localization_prompt(
+        {"Player": "Messi", "Country": "Argentina", "Note": ""},
+        "Club",
+    )
+
+    assert (
+        "Query row (entity anchor): <|object_ref_start|>Player=Messi | Country=Argentina | "
+        "Note=<|object_ref_end|>"
+    ) in prompt
+    assert "Requested attribute: <|box_start|>Club<|box_end|>" in prompt
+    assert "All query-row attributes jointly identify the entity" in prompt
+    assert "An entity mention alone, an unlinked attribute value, or a value for another entity is not valid" in prompt
+    assert "do not fill the attribute from the query row or outside knowledge" in prompt
+
+
+def test_image_presence_prompt_requires_an_extractable_attribute_value():
+    prompt = serialize_image_presence_prompt(
+        {"Player": "Messi", "Country": "Argentina"},
+        "Club",
+    )
+
+    assert "Query row (entity identifier only): Player=Messi | Country=Argentina" in prompt
+    assert "Requested attribute: Club" in prompt
+    assert "links this same entity to an extractable value" in prompt
+    assert "attribute keyword or value not linked to the entity" in prompt
+    assert "information outside the crop" in prompt
+    assert "Answer exactly yes or no" in prompt
+
+
 class FakeBackend:
     hidden_dim = 2
 
@@ -184,8 +219,8 @@ class FakeBackend:
         self.reader_evidence_batches.append(tuple(item["asset_id"] for item in evidence))
         return torch.tensor([[0.0, 0.0], [4.0, 0.0]]), torch.zeros(2, 2)
 
-    def localize_evidence(self, row, *, entity_column, attribute_name, evidence):
-        self.localization_calls.append((row[entity_column], evidence["asset_id"]))
+    def localize_evidence(self, row, *, attribute_name, evidence):
+        self.localization_calls.append((dict(row), evidence["asset_id"]))
         score = self.localization_score_by_id.get(evidence["asset_id"], 0.9)
         if evidence["asset_type"] == "image":
             return LocalizedEvidence(
@@ -200,9 +235,9 @@ class FakeBackend:
             text_span_relevance=score,
         )
 
-    def evidence_logits(self, row, *, entity_column, attribute_name, candidates):
+    def evidence_logits(self, row, *, attribute_name, candidates):
         self.evidence_logit_calls.append(
-            (row[entity_column], attribute_name, tuple(item.evidence_id for item in candidates))
+            (dict(row), attribute_name, tuple(item.evidence_id for item in candidates))
         )
         return torch.tensor([self.evidence_logit_by_id.get(item.evidence_id, 0.0) for item in candidates])
 
@@ -260,7 +295,6 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
         "q1",
         ["Player", "Country"],
         [["Messi", "Argentina"], ["Mbappe", "France"]],
-        query_entity_col=0,
     )
     target = _table(
         "t1",
@@ -298,7 +332,10 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     assert result.selection.column_name == "Club"
     assert [row.value for row in result.rows] == ["Barcelona", "PSG"]
     assert result.semantic_joinability.joinable
-    assert backend.localization_calls == [("Messi", "e1"), ("Mbappe", "e2")]
+    assert backend.localization_calls == [
+        ({"Player": "Messi", "Country": "Argentina"}, "e1"),
+        ({"Player": "Mbappe", "Country": "France"}, "e2"),
+    ]
     assert backend.evidence_logit_calls == []
     assert backend.generation_calls == [("Messi", "e1"), ("Mbappe", "e2")]
     assert result.rows[0].evidence == {
@@ -349,7 +386,6 @@ def test_stage2_skips_rows_without_assigned_evidence():
         "q1",
         ["Player", "Country"],
         [["Messi", "Argentina"], ["Mbappe", "France"]],
-        query_entity_col=0,
     )
     target = _table("t1", ["Country", "Club"], [["Argentina", "Barcelona"], ["France", "PSG"]])
     bundle = EvidenceBundle(
@@ -377,8 +413,13 @@ def test_stage2_skips_rows_without_assigned_evidence():
         },
     )
 
-    assert backend.localization_calls == [("Messi", "e1"), ("Messi", "e2")]
-    assert backend.evidence_logit_calls == [("Messi", "Club", ("e1", "e2"))]
+    assert backend.localization_calls == [
+        ({"Player": "Messi", "Country": "Argentina"}, "e1"),
+        ({"Player": "Messi", "Country": "Argentina"}, "e2"),
+    ]
+    assert backend.evidence_logit_calls == [
+        ({"Player": "Messi", "Country": "Argentina"}, "Club", ("e1", "e2"))
+    ]
     assert backend.generation_calls == [("Messi", "e1")]
     assert result.rows[1].value == ""
     assert result.rows[1].evidence is None
@@ -389,7 +430,6 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
         "q1",
         ["Player", "Country"],
         [["Messi", "Argentina"], ["Mbappe", "France"]],
-        query_entity_col=0,
     )
     target = _table("t1", ["Country", "Club"], [["Argentina", "Barcelona"], ["France", "PSG"]])
     bundle = EvidenceBundle(
@@ -419,7 +459,9 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
         },
     )
 
-    assert backend.evidence_logit_calls == [("Messi", "Club", ("text", "image"))]
+    assert backend.evidence_logit_calls == [
+        ({"Player": "Messi", "Country": "Argentina"}, "Club", ("text", "image"))
+    ]
     assert backend.generation_calls == [("Messi", "image")]
     assert result.rows[0].evidence["evidence_id"] == "image"
     assert result.rows[0].evidence["image_presence_probability"] == pytest.approx(0.01)
@@ -464,6 +506,12 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     rendered_text = "\n".join(item.get("text", "") for item in captured_content)
     assert "Evidence 1 (e1)" in rendered_text
     assert "Evidence 2 (e2)" in rendered_text
+    assert "Each complete query row identifies one entity" in rendered_text
+    assert "retrieved evidence must explicitly support linking" in rendered_text
+    assert "Do not select a column based only on header similarity" in rendered_text
+    assert "BEGIN QUERY TABLE" in rendered_text
+    assert "END RETRIEVED EVIDENCE" in rendered_text
+    assert "BEGIN CANDIDATE TARGET TABLE" in rendered_text
     assert "SECRET_" not in rendered_text
 
 
@@ -502,7 +550,6 @@ def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():
 
     logits = backend.evidence_logits(
         {"Player": "Messi", "Country": "Argentina"},
-        entity_column="Player",
         attribute_name="Club",
         candidates=[
             LocalizedEvidence(
@@ -527,6 +574,43 @@ def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():
     assert "Candidate A (text, text)" in rendered_text
     assert "Candidate B (image, image)" in rendered_text
     assert "Valid labels: A, B" in rendered_text
+    assert '"Player": "Messi"' in rendered_text
+    assert '"Country": "Argentina"' in rendered_text
+    assert "Entity column" not in rendered_text
+    assert "A fully valid candidate must link this same entity" in rendered_text
+    assert "modality and evidence IDs are labels, not factual support" in rendered_text
+    assert "If no candidate is fully valid" in rendered_text
+
+
+def test_qwen_generation_prompt_uses_evidence_as_the_only_value_source():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    captured_content = []
+
+    def generate(content):
+        captured_content.extend(content)
+        return '{"value": "Barcelona"}'
+
+    backend._generate = generate
+    value = backend.generate_value(
+        {"Player": "Messi", "Country": "Argentina"},
+        attribute_name="Club",
+        evidence=LocalizedEvidence(
+            "text",
+            "text",
+            text="Messi plays for Barcelona.",
+            text_span_relevance=0.9,
+        ),
+    )
+
+    assert value == "Barcelona"
+    rendered_text = "\n".join(item.get("text", "") for item in captured_content)
+    assert 'Query row (entity identifier only): {"Player": "Messi", "Country": "Argentina"}' in rendered_text
+    assert "never copy or derive the output from the query row itself" in rendered_text
+    assert "localized evidence supplied with this prompt is the only source" in rendered_text
+    assert "belongs to another entity" in rendered_text
+    assert "cannot be resolved to one unambiguous cell value" in rendered_text
+    assert 'Return exactly one JSON object with no Markdown or explanation: {"value": "..."}' in rendered_text
+    assert "Localized evidence: Messi plays for Barcelona." in rendered_text
 
 
 def test_qwen35_focus_hooks_only_full_attention_layers():
@@ -553,7 +637,7 @@ def test_qwen35_focus_hooks_only_full_attention_layers():
 
 
 def test_candidate_head_training_updates_only_the_small_rata_scorer():
-    query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
+    query = _table("q1", ["Player"], [["Messi"]])
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
     bundle = EvidenceBundle("t1", 2.0, ("e1",))
     example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
@@ -586,7 +670,7 @@ def test_candidate_head_training_accepts_inference_mode_reader_states():
         def reader_states(self, query, target, evidence):
             return super().reader_states(query, target, evidence)
 
-    query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
+    query = _table("q1", ["Player"], [["Messi"]])
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
     bundle = EvidenceBundle("t1", 2.0, ("e1",))
     example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
@@ -617,7 +701,7 @@ def test_candidate_head_training_accepts_inference_mode_reader_states():
 
 
 def test_candidate_head_training_reads_only_the_positive_target():
-    query = _table("q1", ["Player"], [["Messi"]], query_entity_col=0)
+    query = _table("q1", ["Player"], [["Messi"]])
     negative = _table("t0", ["Country", "City"], [["Spain", "Madrid"]])
     positive = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
     bundles = (

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
+from mmdd_dataset.utils import values_match
 from torch import nn
 from torch.nn import functional as F
-
-from mmdd_dataset.utils import values_match
 
 
 @dataclass(frozen=True)
@@ -131,19 +131,19 @@ def _relevance(query_states: torch.Tensor, evidence_states: torch.Tensor) -> tor
 
 
 def joint_relevance(
-    entity_states: torch.Tensor,
+    row_anchor_states: torch.Tensor,
     attribute_states: torch.Tensor,
     evidence_states: torch.Tensor,
 ) -> torch.Tensor:
-    """Multiply normalized entity and attribute relevance maps for one layer."""
+    """Multiply normalized row-anchor and attribute relevance maps for one layer."""
 
-    combined = _relevance(entity_states, evidence_states) * _relevance(attribute_states, evidence_states)
+    combined = _relevance(row_anchor_states, evidence_states) * _relevance(attribute_states, evidence_states)
     return combined / combined.sum().clamp_min(torch.finfo(combined.dtype).tiny)
 
 
 def focus_relevance(
     value_layers: Sequence[torch.Tensor],
-    entity_indices: torch.Tensor,
+    row_anchor_indices: torch.Tensor,
     attribute_indices: torch.Tensor,
     evidence_indices: torch.Tensor,
 ) -> torch.Tensor:
@@ -153,7 +153,7 @@ def focus_relevance(
         raise ValueError("FOCUS requires at least one value-feature layer")
     maps = [
         joint_relevance(
-            layer.index_select(0, entity_indices),
+            layer.index_select(0, row_anchor_indices),
             layer.index_select(0, attribute_indices),
             layer.index_select(0, evidence_indices),
         )
