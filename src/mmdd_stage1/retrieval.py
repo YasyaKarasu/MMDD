@@ -220,9 +220,6 @@ def retrieve_zero_one_hop(
                     {
                         "kind": "evidence",
                         "evidence_id": evidence_id,
-                        "evidence_type": normalize_object_type(evidence_type),
-                        "query_evidence_score": query_evidence_score,
-                        "evidence_target_score": evidence_target_score,
                         "path_score": query_evidence_score + evidence_target_score,
                     }
                 )
@@ -245,10 +242,14 @@ def retrieve_zero_one_hop(
         target_id = str(result["target_id"])
         direct_rank = direct_ranks.get(target_id)
         evidence_rank = evidence_ranks.get(target_id)
-        result["direct_rank"] = direct_rank
-        result["evidence_rank"] = evidence_rank
         result["score"] = sum(
             1.0 / (rrf_k + rank) for rank in (direct_rank, evidence_rank) if rank is not None
         )
+        result.pop("direct_score")
+        if result["evidence_score"] is None:
+            result.pop("evidence_score")
+        for path in result["paths"]:
+            if path["kind"] == "direct":
+                path.pop("path_score")
     results.sort(key=lambda result: (-float(result["score"]), str(result["target_id"])))
     return results[:result_k]

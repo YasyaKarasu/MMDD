@@ -84,29 +84,37 @@ def run(args: argparse.Namespace) -> None:
     target_records, edge_records = score_hard_candidate_sets(
         candidate_sets,
         teacher,
-        student,
         store,
         aggregator,
         device=device,
         batch_size=args.teacher_batch_size,
-        mining_metadata={
-            "mining_round": args.mining_round,
-            "student_checkpoint_sha256": student_sha256,
-            "teacher_checkpoint_sha256": teacher_sha256,
-            "target_fusion": "rrf",
-            "rrf_k": args.rrf_k,
-        },
     )
     _write_jsonl(Path(args.output_target_lists), target_records)
     if args.output_edge_lists:
         _write_jsonl(Path(args.output_edge_lists), edge_records)
+    metadata = {
+        "mining_round": args.mining_round,
+        "student_checkpoint_sha256": student_sha256,
+        "teacher_checkpoint_sha256": teacher_sha256,
+        "evidence_aggregation": evidence_aggregation,
+        "evidence_top_k": evidence_top_k,
+        "target_fusion": "rrf",
+        "rrf_k": args.rrf_k,
+    }
+    output_paths = [Path(args.output_target_lists)]
+    if args.output_edge_lists:
+        output_paths.append(Path(args.output_edge_lists))
+    metadata_paths = [path.with_suffix(path.suffix + ".metadata.json") for path in output_paths]
+    for metadata_path in metadata_paths:
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     summary = {
         "queries": len(candidate_sets),
-        "hard_targets": sum(len(item.hard_target_ids) for item in candidate_sets),
-        "hard_evidence": sum(len(item.hard_evidence_ids) for item in candidate_sets),
-        "hard_paths": sum(item.hard_path_count for item in candidate_sets),
-        "output_target_lists": args.output_target_lists,
-        "output_edge_lists": args.output_edge_lists,
+        "target_lists": args.output_target_lists,
+        "edge_lists": args.output_edge_lists,
+        "metadata": str(metadata_paths[0]),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

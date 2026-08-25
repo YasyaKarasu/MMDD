@@ -94,39 +94,30 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     assert set(artifacts) == {"stage1_objects", "edge_lists", "target_lists", "stage1_corpus"}
     table_object = next(record for record in artifacts["stage1_objects"] if record["object_id"] == "q")
     assert table_object["embedding_role"] == "query"
-    assert table_object["text"] == "\n".join(table_object["table_parts"])
-    assert "SECRET_" not in table_object["text"]
-    assert table_object["row_routing_texts"] == [
-        "Columns: Player | Country\nRow: Messi | Argentina",
-        "Columns: Player | Country\nRow: Mbappe | France",
-    ]
+    assert set(table_object) == {"object_id", "object_type", "embedding_role", "table_parts"}
+    assert "SECRET_" not in "\n".join(table_object["table_parts"])
     target_object = next(
         record for record in artifacts["stage1_objects"] if record["object_id"] == "positive"
     )
     assert target_object["embedding_role"] == "target"
-    assert "row_routing_texts" not in target_object
     evidence_object = next(
         record for record in artifacts["stage1_objects"] if record["object_id"] == "e_positive"
     )
-    assert evidence_object["embedding_role"] == "evidence"
+    assert set(evidence_object) == {"object_id", "object_type", "text"}
     image_object = next(
         record for record in artifacts["stage1_objects"] if record["object_id"] == "e_image"
     )
     assert "text" not in image_object
     candidates = artifacts["target_lists"][0]["candidates"]
-    negatives = {candidate["negative_source"]: candidate for candidate in candidates[1:]}
-    assert set(negatives) == {
-        "random",
-        "semantic_similar_non_joinable",
-        "type_structure_matched",
-        "corrupted_path",
-    }
-    assert negatives["corrupted_path"]["evidence_ids"] == ["e_positive"]
+    assert all(set(candidate) == {"target_id", "evidence_ids"} for candidate in candidates)
+    by_target = {candidate["target_id"]: candidate for candidate in candidates}
+    assert by_target["corrupted"]["evidence_ids"] == ["e_positive"]
     assert all(len(candidate["evidence_ids"]) <= 1 for candidate in candidates)
     edge = artifacts["edge_lists"][0]
     assert edge["destination_type"] == "table"
     assert len(edge["candidate_ids"]) == 5
     corpus_ids = {record["object_id"] for record in artifacts["stage1_corpus"]}
+    assert all(set(record) == {"object_id"} for record in artifacts["stage1_corpus"])
     assert "q" not in corpus_ids
     assert {"positive", "e_positive"} <= corpus_ids
 

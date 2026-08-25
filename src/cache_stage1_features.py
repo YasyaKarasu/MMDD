@@ -223,11 +223,20 @@ def build_object_features(
     storage_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     object_type = normalize_object_type(str(record["object_type"]))
-    object_instruction, row_instruction, _ = embedding_instructions(
+    object_instruction, row_instruction, embedding_role = embedding_instructions(
         record, object_type, instruction
     )
+    parts = record.get("table_parts") if object_type == "table" else None
+    if object_type == "table" and (
+        not isinstance(parts, list)
+        or not parts
+        or not all(isinstance(part, str) and part.strip() for part in parts)
+    ):
+        raise ValueError(
+            f"{record.get('object_id')}: table_parts must contain schema text followed by example-row texts"
+        )
     item = {
-        "text": record.get("text"),
+        "text": record.get("text") or ("\n".join(parts) if parts is not None else None),
         "image": _resolve_image(record, input_dir),
         "instruction": object_instruction,
     }
@@ -238,16 +247,14 @@ def build_object_features(
     }
 
     if object_type == "table":
-        parts = record.get("table_parts")
-        if not isinstance(parts, list) or not parts or not all(isinstance(part, str) and part.strip() for part in parts):
-            raise ValueError(
-                f"{record.get('object_id')}: table_parts must contain schema text followed by example-row texts"
-            )
+        assert isinstance(parts, list)
         indices, groups = _table_token_groups(embedder, item, parts, input_ids)
         payload["hidden_states"] = hidden_states.index_select(0, indices).to(dtype=storage_dtype)
         payload["token_groups"] = groups
 
         row_routing_texts = record.get("row_routing_texts")
+        if row_routing_texts is None and embedding_role == "query":
+            row_routing_texts = [f"{parts[0]}\n{row}" for row in parts[1:]]
         if row_routing_texts is not None:
             if (
                 not isinstance(row_routing_texts, list)
@@ -371,9 +378,6 @@ def run(args: argparse.Namespace) -> None:
             if object_id not in pending_ids:
                 continue
             object_type = normalize_object_type(str(record["object_type"]))
-            _, _, embedding_role = embedding_instructions(
-                record, object_type, getattr(args, "instruction", None)
-            )
             source_fingerprint = _source_fingerprint(record)
             payload = build_object_features(
                 embedder,
@@ -391,7 +395,6 @@ def run(args: argparse.Namespace) -> None:
             manifest_record = {
                 "object_id": object_id,
                 "object_type": object_type,
-                "embedding_role": embedding_role,
                 "feature_path": relative_path.as_posix(),
                 "source_fingerprint": source_fingerprint,
             }

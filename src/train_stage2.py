@@ -47,10 +47,24 @@ def run(args: argparse.Namespace) -> None:
             "model_dir": str(Path(args.model_dir).resolve()),
             "top_k_evidence": args.top_k_evidence,
             "max_targets": args.max_targets,
-            "history": history,
         },
     )
-    print(json.dumps({"output": args.output, "history": history}, ensure_ascii=False, indent=2))
+    history_path = Path(args.output).with_suffix(Path(args.output).suffix + ".history.json")
+    history_path.write_text(
+        json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "checkpoint": args.output,
+                "history": str(history_path),
+                "examples": len(examples),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:

@@ -22,7 +22,6 @@ class EdgeExample:
     teacher_checkpoint_sha256: str | None = None
     source_type: str | None = None
     destination_type: str | None = None
-    edge_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +59,16 @@ def _records(path: Path, split: str | None) -> Iterable[tuple[int, dict[str, Any
                 raise ValueError(f"{path}:{line_number}: each line must contain a JSON object")
             if split is None or record.get("split") == split:
                 yield line_number, record
+
+
+def _metadata(path: Path) -> dict[str, Any]:
+    metadata_path = path.with_suffix(path.suffix + ".metadata.json")
+    if not metadata_path.is_file():
+        return {}
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{metadata_path}: metadata must be a JSON object")
+    return metadata
 
 
 def _positive_index(
@@ -106,6 +115,7 @@ def load_edge_examples(
     split: str | None = "train",
     dataset_name: str | None = None,
 ) -> list[EdgeExample]:
+    metadata = _metadata(path)
     examples = []
     for line_number, record in _records(path, split):
         query_id = str(record["query_id"])
@@ -123,7 +133,10 @@ def load_edge_examples(
                 dataset=str(record.get("dataset") or dataset_name or "default"),
                 split=record.get("split"),
                 teacher_logits=_teacher_logits(path, line_number, record, len(candidate_ids)),
-                teacher_checkpoint_sha256=record.get("teacher_checkpoint_sha256"),
+                teacher_checkpoint_sha256=(
+                    record.get("teacher_checkpoint_sha256")
+                    or metadata.get("teacher_checkpoint_sha256")
+                ),
                 source_type=(
                     normalize_object_type(str(record["source_type"]))
                     if record.get("source_type") is not None
@@ -134,7 +147,6 @@ def load_edge_examples(
                     if record.get("destination_type") is not None
                     else None
                 ),
-                edge_kind=record.get("edge_kind"),
             )
         )
     if not examples:
@@ -152,6 +164,7 @@ def load_target_examples(
 ) -> list[TargetExample]:
     if max_evidence < 0:
         raise ValueError("max_evidence must be non-negative")
+    metadata = _metadata(path)
     examples = []
     for line_number, record in _records(path, split):
         query_id = str(record["query_id"])
@@ -185,6 +198,14 @@ def load_target_examples(
                 f"{path}:{line_number}: cannot reuse teacher_logits after truncating candidate evidence"
             )
         raw_score_config = record.get("teacher_score_config")
+        if raw_score_config is None and {
+            "evidence_aggregation",
+            "evidence_top_k",
+        } <= metadata.keys():
+            raw_score_config = {
+                "evidence_aggregation": metadata["evidence_aggregation"],
+                "evidence_top_k": metadata["evidence_top_k"],
+            }
         teacher_score_config = None
         if raw_score_config is not None:
             if not isinstance(raw_score_config, dict):
@@ -207,7 +228,10 @@ def load_target_examples(
                 teacher_logits=teacher_logits,
                 positive_target_ids=positive_target_ids,
                 teacher_score_config=teacher_score_config,
-                teacher_checkpoint_sha256=record.get("teacher_checkpoint_sha256"),
+                teacher_checkpoint_sha256=(
+                    record.get("teacher_checkpoint_sha256")
+                    or metadata.get("teacher_checkpoint_sha256")
+                ),
             )
         )
     if not examples:

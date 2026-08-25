@@ -184,7 +184,16 @@ def run(args: argparse.Namespace) -> None:
     torch.save(checkpoint(model, args.stage, saved_aggregator), output)
     history_path = output.with_suffix(output.suffix + ".history.json")
     history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"stage": args.stage, "examples": len(examples), "checkpoint": str(output), "history": history}, indent=2))
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(output),
+                "history": str(history_path),
+                "examples": len(examples),
+            },
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:

@@ -50,18 +50,14 @@ def _table_object(
     max_rows: int,
     *,
     embedding_role: str,
-    cache_row_embeddings: bool = False,
 ) -> dict[str, Any]:
     parts = serialize_table_parts(table, max_rows)
     record = {
         "object_id": str(table.get("table_id") or table["object_id"]),
         "object_type": "table",
         "embedding_role": embedding_role,
-        "text": "\n".join(parts),
         "table_parts": parts,
     }
-    if cache_row_embeddings:
-        record["row_routing_texts"] = [f"{parts[0]}\n{row}" for row in parts[1:]]
     return record
 
 
@@ -71,7 +67,6 @@ def _asset_object(asset: dict[str, Any], dataset_root: Path) -> dict[str, Any]:
     record = {
         "object_id": asset_id,
         "object_type": asset_type,
-        "embedding_role": "evidence",
     }
     if asset_type == "text":
         record["text"] = clean_text(asset.get("content"))
@@ -288,7 +283,6 @@ def build_stage1_training_artifacts(
             table,
             max_rows,
             embedding_role="query",
-            cache_row_embeddings=True,
         )
         for query_id, table in queries.items()
     }
@@ -301,7 +295,10 @@ def build_stage1_training_artifacts(
     if len(object_ids) != len(set(object_ids)):
         raise ValueError("Stage-1 object IDs must be globally unique")
 
-    target_text = {target_id: record["text"] for target_id, record in target_objects.items()}
+    target_text = {
+        target_id: "\n".join(record["table_parts"])
+        for target_id, record in target_objects.items()
+    }
     postings, inverse_document_frequency = _semantic_index(target_text)
     evidence_by_target = _evidence_by_target(targets, assets, recoveries)
     asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
@@ -335,7 +332,7 @@ def build_stage1_training_artifacts(
         selected: dict[str, str] = {}
 
         semantic_id = _semantic_negative(
-            query_objects[query_id]["text"],
+            "\n".join(query_objects[query_id]["table_parts"]),
             target_sets_by_split[split],
             excluded,
             postings,
@@ -375,7 +372,6 @@ def build_stage1_training_artifacts(
             {
                 "target_id": positive_ids[0],
                 "evidence_ids": positive_evidence,
-                "negative_source": None,
             }
         ]
         for source in ordered_sources:
@@ -391,13 +387,9 @@ def build_stage1_training_artifacts(
                 {
                     "target_id": target_id,
                     "evidence_ids": candidate_evidence,
-                    "negative_source": source,
                 }
             )
 
-        target_negative_sources = {
-            target_id: source for source, target_id in selected.items()
-        }
         for positive_id in positive_ids:
             edge_lists.append(
                 {
@@ -406,8 +398,6 @@ def build_stage1_training_artifacts(
                     "positive_id": positive_id,
                     "candidate_ids": [positive_id, *negative_ids],
                     "destination_type": "table",
-                    "edge_kind": "query_to_target",
-                    "negative_sources": target_negative_sources,
                     "dataset": dataset_name,
                     "split": split,
                 }
@@ -423,7 +413,6 @@ def build_stage1_training_artifacts(
         positive_evidence_set = set(positive_evidence_ids)
 
         evidence_negatives: dict[str, list[str]] = defaultdict(list)
-        evidence_negative_sources: dict[str, str] = {}
         for source in ordered_sources:
             negative_target_id = selected.get(source)
             if negative_target_id is None:
@@ -441,7 +430,6 @@ def build_stage1_training_artifacts(
                     continue
                 seen_type.add(evidence_type)
                 evidence_negatives[evidence_type].append(evidence_id)
-                evidence_negative_sources[evidence_id] = source
 
         for evidence_type in {asset_types[evidence_id] for evidence_id in positive_evidence_ids}:
             if evidence_negatives[evidence_type]:
@@ -453,7 +441,6 @@ def build_stage1_training_artifacts(
             )
             if fallback_id is not None:
                 evidence_negatives[evidence_type].append(fallback_id)
-                evidence_negative_sources[fallback_id] = "random"
 
         for positive_evidence_id in positive_evidence_ids:
             evidence_type = asset_types[positive_evidence_id]
@@ -467,11 +454,6 @@ def build_stage1_training_artifacts(
                     "positive_id": positive_evidence_id,
                     "candidate_ids": [positive_evidence_id, *negative_evidence_ids],
                     "destination_type": evidence_type,
-                    "edge_kind": "query_to_evidence",
-                    "negative_sources": {
-                        evidence_id: evidence_negative_sources[evidence_id]
-                        for evidence_id in negative_evidence_ids
-                    },
                     "dataset": dataset_name,
                     "split": split,
                 }
@@ -502,11 +484,6 @@ def build_stage1_training_artifacts(
                         "positive_id": positive_target_id,
                         "candidate_ids": [positive_target_id, *evidence_target_negatives],
                         "destination_type": "table",
-                        "edge_kind": "evidence_to_target",
-                        "negative_sources": {
-                            target_id: target_negative_sources.get(target_id, "random")
-                            for target_id in evidence_target_negatives
-                        },
                         "dataset": dataset_name,
                         "split": split,
                     }
@@ -530,11 +507,11 @@ def build_stage1_training_artifacts(
         "target_lists": target_lists,
         "stage1_corpus": [
             *(
-                {"object_id": target_id, "object_type": "table"}
+                {"object_id": target_id}
                 for target_id in target_objects
             ),
             *(
-                {"object_id": record["object_id"], "object_type": record["object_type"]}
+                {"object_id": record["object_id"]}
                 for record in asset_objects
             ),
         ],

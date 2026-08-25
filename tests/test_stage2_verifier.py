@@ -186,11 +186,18 @@ class FakeBackend:
 
     def localize_evidence(self, row, *, entity_column, attribute_name, evidence):
         self.localization_calls.append((row[entity_column], evidence["asset_id"]))
+        score = self.localization_score_by_id.get(evidence["asset_id"], 0.9)
+        if evidence["asset_type"] == "image":
+            return LocalizedEvidence(
+                evidence["asset_id"],
+                "image",
+                image_presence_probability=score,
+            )
         return LocalizedEvidence(
             evidence["asset_id"],
-            evidence["asset_type"],
-            self.localization_score_by_id.get(evidence["asset_id"], 0.9),
+            "text",
             text=evidence["content"],
+            text_span_relevance=score,
         )
 
     def evidence_logits(self, row, *, entity_column, attribute_name, candidates):
@@ -290,15 +297,32 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     assert result.direct_candidates[0].target_id == "t1"
     assert result.selection.column_name == "Club"
     assert [row.value for row in result.rows] == ["Barcelona", "PSG"]
-    assert result.augmented_query["columns"][-1]["column_name"] == "Club"
-    assert result.augmented_query["rows"][0]["cells"][-1]["text"] == "Barcelona"
     assert result.semantic_joinability.joinable
     assert backend.localization_calls == [("Messi", "e1"), ("Mbappe", "e2")]
     assert backend.evidence_logit_calls == []
     assert backend.generation_calls == [("Messi", "e1"), ("Mbappe", "e2")]
-    assert result.rows[0].evidence["routing_similarity"] == pytest.approx(0.8)
+    assert result.rows[0].evidence == {
+        "evidence_id": "e1",
+        "evidence_type": "text",
+        "text_span": "Messi support",
+        "text_span_relevance": pytest.approx(0.9),
+    }
     assert len(backend.embed_batches) == 2
     assert len(backend.embed_batches[0]) == 8
+
+    payload = result.to_dict()
+    assert set(payload) == {"query_id", "direct_matches", "selection", "rows", "verification"}
+    assert payload["selection"] == {
+        "target_id": "t1",
+        "column_index": 1,
+        "column_name": "Club",
+    }
+    assert payload["rows"][0] == {
+        "row_id": 0,
+        "value": "Barcelona",
+        "evidence": result.rows[0].evidence,
+    }
+    assert "augmented_query" not in payload
 
 
 def test_similarity_router_assigns_each_evidence_to_its_nearest_row():
@@ -399,8 +423,8 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
     assert backend.evidence_logit_calls == [("Messi", "Club", ("text", "image"))]
     assert backend.generation_calls == [("Messi", "image")]
     assert result.rows[0].evidence["evidence_id"] == "image"
-    assert result.rows[0].evidence["localization_score"] == pytest.approx(0.01)
-    assert result.rows[0].evidence["selection_logit"] == pytest.approx(2.0)
+    assert result.rows[0].evidence["image_presence_probability"] == pytest.approx(0.01)
+    assert "text_span_relevance" not in result.rows[0].evidence
 
 
 def test_qwen_reader_places_all_evidence_in_one_forward():
@@ -482,8 +506,18 @@ def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():
         entity_column="Player",
         attribute_name="Club",
         candidates=[
-            LocalizedEvidence("text", "text", 0.99, text="Messi played for Barcelona."),
-            LocalizedEvidence("image", "image", 0.01, image=image),
+            LocalizedEvidence(
+                "text",
+                "text",
+                text="Messi played for Barcelona.",
+                text_span_relevance=0.99,
+            ),
+            LocalizedEvidence(
+                "image",
+                "image",
+                image=image,
+                image_presence_probability=0.01,
+            ),
         ],
     )
 
@@ -543,7 +577,7 @@ def test_candidate_head_training_updates_only_the_small_rata_scorer():
         seed=1,
     )
 
-    assert history[0]["examples"] == 1
+    assert set(history[0]) == {"epoch", "column_loss", "table_loss"}
     assert not torch.equal(before, scorer.weight.weight)
 
 
@@ -622,10 +656,8 @@ def test_candidate_head_training_reads_only_the_positive_target():
     )
 
     assert backend.reader_evidence_batches == [("positive_evidence",)]
-    assert history[0]["loss"] == history[0]["column_loss"]
     expected_table_loss = -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
     assert history[0]["table_loss"] == pytest.approx(expected_table_loss)
-    assert history[0]["joint_loss"] == pytest.approx(history[0]["table_loss"] + history[0]["column_loss"])
 
 
 def test_candidate_scorer_checkpoint_round_trip(tmp_path):

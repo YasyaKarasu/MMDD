@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
 import torch
@@ -23,21 +22,31 @@ from .verifier import (
 class LocalizedEvidence:
     evidence_id: str
     evidence_type: str
-    localization_score: float
     text: str | None = None
     image: Any | None = None
     box: tuple[float, float, float, float] | None = None
-    selection_logit: float | None = None
+    text_span_relevance: float | None = None
+    image_presence_probability: float | None = None
 
     def record(self) -> dict[str, Any]:
-        return {
+        record = {
             "evidence_id": self.evidence_id,
             "evidence_type": self.evidence_type,
-            "localization_score": self.localization_score,
-            "selection_logit": self.selection_logit,
-            "text": self.text,
-            "box": self.box,
         }
+        if self.evidence_type == "text":
+            if self.text_span_relevance is None:
+                raise ValueError("Localized text evidence requires text_span_relevance")
+            record["text_span"] = self.text or ""
+            record["text_span_relevance"] = self.text_span_relevance
+        elif self.evidence_type == "image":
+            if self.image_presence_probability is None:
+                raise ValueError("Localized image evidence requires image_presence_probability")
+            record["image_presence_probability"] = self.image_presence_probability
+            if self.box is not None:
+                record["image_box"] = self.box
+        else:
+            raise ValueError(f"Unsupported localized evidence type: {self.evidence_type!r}")
+        return record
 
 
 @dataclass(frozen=True)
@@ -45,9 +54,6 @@ class ColumnSelection:
     target_id: str
     column_index: int
     column_name: str
-    table_probability: float
-    column_probability: float
-    joint_probability: float
 
 
 @dataclass(frozen=True)
@@ -55,14 +61,11 @@ class DirectVerification:
     target_id: str
     query_column: int
     target_column: int
-    result: SemanticJoinability
 
 
 @dataclass(frozen=True)
 class RowPrediction:
     row_id: int
-    entity: str
-    attribute: str
     value: str
     evidence: dict[str, Any] | None
 
@@ -73,11 +76,43 @@ class Stage2Result:
     direct_candidates: tuple[DirectVerification, ...]
     selection: ColumnSelection | None
     rows: tuple[RowPrediction, ...]
-    augmented_query: dict[str, Any] | None
     semantic_joinability: SemanticJoinability | None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload: dict[str, Any] = {
+            "query_id": self.query_id,
+            "rows": [],
+        }
+        if self.direct_candidates:
+            payload["direct_matches"] = [
+                {
+                    "target_id": candidate.target_id,
+                    "query_column": candidate.query_column,
+                    "target_column": candidate.target_column,
+                }
+                for candidate in self.direct_candidates
+            ]
+        if self.selection is not None:
+            payload["selection"] = {
+                "target_id": self.selection.target_id,
+                "column_index": self.selection.column_index,
+                "column_name": self.selection.column_name,
+            }
+        payload["rows"] = [
+            {
+                "row_id": row.row_id,
+                "value": row.value,
+                **({"evidence": row.evidence} if row.evidence is not None else {}),
+            }
+            for row in self.rows
+        ]
+        if self.semantic_joinability is not None:
+            payload["verification"] = {
+                "joinable": self.semantic_joinability.joinable,
+                "coverage": self.semantic_joinability.coverage,
+                "mean_similarity": self.semantic_joinability.mean_similarity,
+            }
+        return payload
 
 
 class Stage2Backend(Protocol):
@@ -182,7 +217,7 @@ class Stage2Verifier:
             column_mask[0, target_index, : values.shape[0]] = True
         retrieval_scores = torch.tensor([[bundle.retrieval_score for bundle in bundles]], device=device)
         target_mask = torch.ones_like(retrieval_scores, dtype=torch.bool)
-        table_probabilities, column_probabilities, joint = joint_candidate_probabilities(
+        _, _, joint = joint_candidate_probabilities(
             retrieval_scores, column_logits, target_mask, column_mask
         )
         flat_index = int(joint.reshape(-1).argmax())
@@ -193,9 +228,6 @@ class Stage2Verifier:
             target_id=bundles[target_index].target_id,
             column_index=column_index,
             column_name=column_name(target, column_index),
-            table_probability=float(table_probabilities[0, target_index].detach()),
-            column_probability=float(column_probabilities[0, target_index, column_position].detach()),
-            joint_probability=float(joint[0, target_index, column_position].detach()),
         )
 
     def _semantic_check(self, query_values: Sequence[str], target_values: Sequence[str]) -> SemanticJoinability:
@@ -260,7 +292,7 @@ class Stage2Verifier:
                     candidates.append((result.coverage, result.mean_similarity, query_index, target_index, result))
             _, _, query_index, target_index, result = max(candidates, key=lambda item: item[:2])
             if result.joinable:
-                verified.append(DirectVerification(target_id, query_index, target_index, result))
+                verified.append(DirectVerification(target_id, query_index, target_index))
         return tuple(verified)
 
     def verify(
@@ -275,7 +307,7 @@ class Stage2Verifier:
         query_id = str(query.get("table_id", query.get("object_id")))
         direct = self.verify_direct(query, targets, direct_target_ids)
         if not bundles:
-            return Stage2Result(query_id, direct, None, (), None, None)
+            return Stage2Result(query_id, direct, None, (), None)
 
         selection = self.select_column(query, bundles, targets, evidence)
         selected_bundle = next(bundle for bundle in bundles if bundle.target_id == selection.target_id)
@@ -291,14 +323,12 @@ class Stage2Verifier:
             selected_bundle.evidence_ids
         ):
             raise ValueError("Evidence router must assign every selected evidence exactly once")
-        evidence_by_row: list[list[tuple[str, EvidenceRowAssignment]]] = [
-            [] for _ in query["rows"]
-        ]
+        evidence_by_row: list[list[str]] = [[] for _ in query["rows"]]
         for evidence_id in selected_bundle.evidence_ids:
             assignment = assignment_by_evidence[evidence_id]
             if not 0 <= assignment.row_position < len(query["rows"]):
                 raise ValueError(f"Evidence router returned invalid row position {assignment.row_position}")
-            evidence_by_row[assignment.row_position].append((evidence_id, assignment))
+            evidence_by_row[assignment.row_position].append(evidence_id)
 
         if "query_entity_col" in query:
             entity_index = local_column_index(query, int(query["query_entity_col"]))
@@ -313,8 +343,6 @@ class Stage2Verifier:
                 predictions.append(
                     RowPrediction(
                         row_id=int(row["row_id"]),
-                        entity=visible_row[entity_name],
-                        attribute=selection.column_name,
                         value="",
                         evidence=None,
                     )
@@ -322,67 +350,41 @@ class Stage2Verifier:
                 continue
 
             localized = []
-            for evidence_id, assignment in routed:
+            for evidence_id in routed:
                 item = self.backend.localize_evidence(
                     visible_row,
                     entity_column=entity_name,
                     attribute_name=selection.column_name,
                     evidence=evidence[evidence_id],
                 )
-                localized.append((item, assignment))
+                localized.append(item)
             if len(localized) == 1:
-                best, best_assignment = localized[0]
+                best = localized[0]
             else:
                 evidence_logits = self.backend.evidence_logits(
                     visible_row,
                     entity_column=entity_name,
                     attribute_name=selection.column_name,
-                    candidates=[item for item, _ in localized],
+                    candidates=localized,
                 )
                 if evidence_logits.shape != (len(localized),):
                     raise ValueError("Evidence reranker must return one logit per localized candidate")
-                for (item, _), logit in zip(localized, evidence_logits):
-                    item.selection_logit = float(logit.detach())
-                best, best_assignment = localized[int(evidence_logits.argmax())]
+                best = localized[int(evidence_logits.argmax())]
             value = self.backend.generate_value(
                 visible_row,
                 attribute_name=selection.column_name,
                 evidence=best,
             )
             evidence_record = best.record()
-            evidence_record["routing_similarity"] = best_assignment.similarity
             predictions.append(
                 RowPrediction(
                     row_id=int(row["row_id"]),
-                    entity=visible_row[entity_name],
-                    attribute=selection.column_name,
                     value=value,
                     evidence=evidence_record,
                 )
             )
 
-        prediction_by_row = {prediction.row_id: prediction.value for prediction in predictions}
-        augmented_query = deepcopy(query)
-        generated_index = max(int(column["column_index"]) for column in query["columns"]) + 1
-        augmented_query["columns"].append(
-            {
-                "column_index": generated_index,
-                "column_name": selection.column_name,
-                "generated": True,
-                "source_target_id": selection.target_id,
-                "source_target_column_index": selection.column_index,
-            }
-        )
-        for row in augmented_query["rows"]:
-            row["cells"].append(
-                {
-                    "column_index": generated_index,
-                    "column_name": selection.column_name,
-                    "text": prediction_by_row[int(row["row_id"])],
-                    "generated": True,
-                }
-            )
-        generated_values = column_values(augmented_query, generated_index, include_empty=True)
+        generated_values = [prediction.value for prediction in predictions]
         target_values = column_values(targets[selection.target_id], selection.column_index)
         check = self._semantic_check(generated_values, target_values)
-        return Stage2Result(query_id, direct, selection, tuple(predictions), augmented_query, check)
+        return Stage2Result(query_id, direct, selection, tuple(predictions), check)

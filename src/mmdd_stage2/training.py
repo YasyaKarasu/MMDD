@@ -124,11 +124,8 @@ def train_candidate_scorer(
         history.append(
             {
                 "epoch": epoch + 1,
-                "loss": mean_column_loss,
                 "column_loss": mean_column_loss,
                 "table_loss": mean_table_loss,
-                "joint_loss": mean_table_loss + mean_column_loss,
-                "examples": len(examples),
             }
         )
     return history

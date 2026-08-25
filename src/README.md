@@ -18,11 +18,11 @@ conda run -n MMDD python src/build_stage1_training_data.py \
 ```
 
 This writes `stage1_objects.jsonl`, `edge_lists.jsonl`, `target_lists.jsonl`,
-and `stage1_corpus.jsonl`. Initial target lists contain separately marked
-random, TF-IDF-similar non-joinable, type/structure-matched, and
-corrupted-path negatives. Candidate evidence comes from recovery or source
-provenance and is capped while constructing the list, rather than truncated
-from an unspecified external list later.
+and `stage1_corpus.jsonl`. Initial target lists draw from random,
+TF-IDF-similar non-joinable, type/structure-matched, and corrupted-path
+negatives without retaining those construction-only labels. Candidate evidence
+comes from recovery or source provenance and is capped while constructing the
+list, rather than truncated from an unspecified external list later.
 
 `cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores both feature
 granularities required by the method: pooling-before hidden states for the
@@ -30,16 +30,17 @@ Teacher and the normalized final object embedding for the Student. Its input
 is JSONL. A text object uses only its body in `text`, and an image object uses
 only its local `image` file. Tables use only column names and cell values.
 Page titles, captions, sections, entity labels, source names, and provenance
-fields are never serialized into model input. Every
-object also carries its retrieval identity in `embedding_role`: query tables
-use `query`, candidate tables use `target`, and bridge assets use `evidence`.
+fields are never serialized into model input. Tables carry their retrieval
+identity in `embedding_role`: query tables use `query` and candidate tables use
+`target`; text and image objects are evidence by definition.
 A table additionally supplies `table_parts`, with schema text first and one
-entry per example row after it. Every part must occur in order within `text`:
+entry per example row after it. The cache derives the complete table text and
+query-row routing views from this single list:
 
 ```json
-{"object_id":"q1","object_type":"table","embedding_role":"query","text":"Columns: player | country\nRow: Messi | Argentina","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
-{"object_id":"e1","object_type":"text","embedding_role":"evidence","text":"Lionel Messi represents Argentina."}
-{"object_id":"i1","object_type":"image","embedding_role":"evidence","image":"images/i1.jpg"}
+{"object_id":"q1","object_type":"table","embedding_role":"query","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
+{"object_id":"e1","object_type":"text","text":"Lionel Messi represents Argentina."}
+{"object_id":"i1","object_type":"image","image":"images/i1.jpg"}
 ```
 
 The encoder uses separate instructions for query tables, query-row routing
@@ -51,9 +52,10 @@ explicitly stated facts in text, and visually grounded facts in images.
 Each table is encoded once for its Teacher/Student features. The cache uses
 tokenizer offsets to retain the schema/row tokens from that same sequence and
 stores their `token_groups`; the Teacher pools those groups while the Student
-uses the final embedding from the identical forward pass. Query objects also
-carry one `schema + row` routing view per example row. Those short views are
-embedded in one additional batch and cached for Stage-2 evidence assignment.
+uses the final embedding from the identical forward pass. For query objects,
+the cache derives one `schema + row` routing view per example row. Those short
+views are embedded in one additional batch and cached for Stage-2 evidence
+assignment.
 
 Build a lazy per-object feature cache with the local 8B encoder:
 
@@ -69,10 +71,10 @@ fails explicitly when a selected query has no cached `row_embeddings`.
 
 Edge warm-up data contains a source object, an unordered same-destination-type
 candidate list, and its one positive object. The historical `query_id` field
-identifies the source for every edge kind, including evidence-to-target edges:
+identifies the source, including for evidence-to-target edges:
 
 ```json
-{"query_id":"q1","source_type":"table","candidate_ids":["e1","e2"],"positive_id":"e1","destination_type":"text","edge_kind":"query_to_evidence","dataset":"2k","split":"train"}
+{"query_id":"q1","source_type":"table","candidate_ids":["e1","e2"],"positive_id":"e1","destination_type":"text","dataset":"2k","split":"train"}
 ```
 
 Construction emits query-to-target edges plus query-to-evidence and
@@ -163,6 +165,9 @@ conda run -n MMDD python src/retrieve_stage1.py \
 Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
 on each path, and restores the two-level path aggregation from the Student
 checkpoint. Explicit retrieval flags may override that saved configuration.
+Each target keeps only its final fusion `score`, the Stage-2-required
+`evidence_score`, and minimal paths: `{"kind":"direct"}` or
+`{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
 
 ### Hard-negative refresh
 
@@ -183,7 +188,9 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
 
 The refresh runs current-Student `Q -> T` and `Q -> E -> T` retrieval, removes
 every ID in `positive_target_ids`, retains high-ranked wrong targets, and
-extracts their evidence objects and complete wrong paths. The frozen Teacher
+extracts their evidence objects. Shared mining provenance is written once to
+the corresponding `.jsonl.metadata.json` sidecars instead of repeated on every
+record. The frozen Teacher
 then rescores the target/path lists and their directly supervised edge lists:
 query-to-target, evidence-to-target, and query-to-evidence whenever a
 same-modality negative evidence object was mined. Under the dataset's
@@ -261,18 +268,20 @@ relevance maps over text or image tokens, multiplies and normalizes them, and
 averages the maps over layers. Text evidence is processed in overlapping token
 windows and reduced to a coherent high-relevance span. Image maps are
 Gaussian-smoothed; FOCUS-style separated anchors, adaptive ROI expansion, NMS,
-and an existence confidence pass select the crop. These localization scores are
-modality-local and are never compared across evidence objects. All localized
-text spans and image crops routed to one row are instead placed in one
-multimodal prompt with fixed single-letter labels. The Qwen next-token logits
+and an existence confidence pass select the crop. The output names the
+modality-local values explicitly as `text_span_relevance` or
+`image_presence_probability`; they are never compared across evidence objects.
+All localized text spans and image crops routed to one row are instead placed
+in one multimodal prompt with fixed single-letter labels. The Qwen next-token logits
 for those labels form one row-local listwise decision, and the highest-logit
 candidate is used to generate the bridge value. Rows with one candidate skip
 the redundant reranker forward. Aggregated retrieval path scores determine the
 top-k evidence set but do not modify this final selection. Candidate order and
-labels remain fixed; no order rotation is applied. The augmented query column
-is accepted only when enough query rows semantically match values in the
-selected target column. The output contains both row-level provenance and the
-materialized `augmented_query` table.
+labels remain fixed; no order rotation is applied. The generated column is
+accepted only when enough query rows semantically match values in the selected
+target column. The output keeps only the selected target/column,
+generated row values, compact evidence provenance, direct matches, and the
+final verification summary; it does not duplicate the full input table.
 
 ```bash
 conda run -n MMDD python src/run_stage2.py \
@@ -282,6 +291,12 @@ conda run -n MMDD python src/run_stage2.py \
   --scorer-checkpoint checkpoints/stage2_candidate.pt \
   --model-dir hf_models/Qwen3.5-9B \
   --output stage2_q1.json
+```
+
+The result schema is intentionally compact:
+
+```json
+{"query_id":"q1","selection":{"target_id":"t1","column_index":1,"column_name":"Club"},"rows":[{"row_id":0,"value":"Barcelona","evidence":{"evidence_id":"e1","evidence_type":"text","text_span":"Messi plays for Barcelona.","text_span_relevance":2.3}}],"verification":{"joinable":true,"coverage":1.0,"mean_similarity":0.91}}
 ```
 
 `mmdd_stage2/verifier.py` contains the paper-derived math,

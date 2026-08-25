@@ -454,7 +454,6 @@ def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
         {
             "object_id": "q",
             "object_type": "table",
-            "text": "schema player country\nrow Messi Argentina",
             "table_parts": ["schema player country", "row Messi Argentina"],
         },
         input_dir=tmp_path,
@@ -478,15 +477,10 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
             "object_id": "q",
             "object_type": "table",
             "embedding_role": "query",
-            "text": "schema player country\nrow Messi Argentina\nrow Mbappe France",
             "table_parts": [
                 "schema player country",
                 "row Messi Argentina",
                 "row Mbappe France",
-            ],
-            "row_routing_texts": [
-                "schema player country\nrow Messi Argentina",
-                "schema player country\nrow Mbappe France",
             ],
         },
         input_dir=tmp_path,
@@ -606,11 +600,11 @@ def test_online_retrieval_uses_configured_two_level_path_aggregation():
     )
 
     result = results[0]
-    assert result["direct_score"] == pytest.approx(1.0)
     assert result["evidence_score"] == pytest.approx(4.0)
-    assert result["direct_rank"] == 1
-    assert result["evidence_rank"] == 1
     assert result["score"] == pytest.approx(2.0 / 61.0)
+    assert "direct_score" not in result
+    assert "direct_rank" not in result
+    assert "evidence_rank" not in result
 
 
 def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
@@ -637,10 +631,7 @@ def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
 
     assert [result["target_id"] for result in results] == ["mixed", "evidence", "direct"]
     by_target = {result["target_id"]: result for result in results}
-    assert by_target["mixed"]["direct_score"] == pytest.approx(0.9)
     assert by_target["mixed"]["evidence_score"] == pytest.approx(0.1)
-    assert by_target["evidence"]["evidence_rank"] == 1
-    assert by_target["direct"]["direct_rank"] == 2
     assert by_target["mixed"]["score"] == pytest.approx(1.0 + 0.5)
 
 
@@ -747,9 +738,10 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
         "hard_1",
         "hard_2",
     ]
-    assert candidate_set.hard_target_ids == ("hard_1", "hard_2")
-    assert candidate_set.hard_evidence_ids == ("e1", "e2")
-    assert candidate_set.hard_path_count == 2
+    assert candidate_set.target_example.candidates[1:] == (
+        TargetCandidate("hard_1", ("e1", "e2")),
+        TargetCandidate("hard_2", ()),
+    )
 
 
 def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
@@ -783,33 +775,52 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     target_records, edge_records = score_hard_candidate_sets(
         [candidate_set],
         teacher(),
-        StudentJoinabilityModel(input_dim=4, student_dim=3),
         store,
         PathAggregator(),
         device=torch.device("cpu"),
         batch_size=1,
-        mining_metadata={"mining_round": 2},
     )
 
     assert len(target_records[0]["teacher_logits"]) == 2
-    assert len(target_records[0]["student_logits"]) == 2
     assert len(edge_records[0]["teacher_logits"]) == 2
     assert edge_records[0]["destination_type"] == "table"
-    assert target_records[0]["mining"]["hard_target_ids"] == ["hard"]
-    assert target_records[0]["mining"]["hard_evidence_ids"] == ["evidence"]
-    assert target_records[0]["mining"]["mining_round"] == 2
-    assert target_records[0]["candidates"][1]["retrieval_paths"][0]["evidence_id"] == "evidence"
+    assert set(target_records[0]) == {
+        "query_id",
+        "positive_target_id",
+        "positive_target_ids",
+        "candidates",
+        "teacher_logits",
+        "dataset",
+        "split",
+    }
+    assert target_records[0]["candidates"][1] == {
+        "target_id": "hard",
+        "evidence_ids": ["evidence"],
+    }
+    assert "student_logits" not in edge_records[0]
 
     target_path = tmp_path / "hard_targets.jsonl"
     edge_path = tmp_path / "hard_edges.jsonl"
     target_path.write_text(json.dumps(target_records[0]) + "\n", encoding="utf-8")
     edge_path.write_text(json.dumps(edge_records[0]) + "\n", encoding="utf-8")
+    metadata = {
+        "teacher_checkpoint_sha256": "synthetic",
+        "evidence_aggregation": "logsumexp",
+        "evidence_top_k": 4,
+    }
+    for path in (target_path, edge_path):
+        path.with_suffix(path.suffix + ".metadata.json").write_text(
+            json.dumps(metadata),
+            encoding="utf-8",
+        )
     loaded_target = load_target_examples(target_path, max_evidence=1)[0]
     loaded_edge = load_edge_examples(edge_path)[0]
 
     assert loaded_target.teacher_logits == pytest.approx(target_records[0]["teacher_logits"])
     assert loaded_target.teacher_score_config.evidence_aggregation == "logsumexp"
+    assert loaded_target.teacher_checkpoint_sha256 == "synthetic"
     assert loaded_edge.teacher_logits == pytest.approx(edge_records[0]["teacher_logits"])
+    assert loaded_edge.teacher_checkpoint_sha256 == "synthetic"
 
 
 def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
@@ -853,7 +864,6 @@ def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
     _target_records, edge_records = score_hard_candidate_sets(
         [candidate_set],
         teacher(),
-        StudentJoinabilityModel(input_dim=4, student_dim=3),
         store,
         PathAggregator(),
         device=torch.device("cpu"),

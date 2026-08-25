@@ -44,7 +44,7 @@ class SimilarityEvidenceRouter:
         if rows is None:
             raise ValueError(
                 f"{query_id}: feature cache has no row embeddings; rebuild it from Stage-1 objects with "
-                "row_routing_texts"
+                "embedding_role='query'"
             )
         if rows.shape[0] != row_count:
             raise ValueError(

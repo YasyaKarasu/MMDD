@@ -232,12 +232,17 @@ class QwenStage2Backend:
             candidate = LocalizedEvidence(
                 evidence_id=str(evidence["asset_id"]),
                 evidence_type="text",
-                localization_score=float(relevance[start:end].sum()),
                 text=span,
+                text_span_relevance=float(relevance[start:end].sum()),
             )
-            if best is None or candidate.localization_score > best.localization_score:
+            if best is None or candidate.text_span_relevance > best.text_span_relevance:
                 best = candidate
-        return best or LocalizedEvidence(str(evidence["asset_id"]), "text", 0.0, text="")
+        return best or LocalizedEvidence(
+            str(evidence["asset_id"]),
+            "text",
+            text="",
+            text_span_relevance=0.0,
+        )
 
     def _localize_image(
         self,
@@ -274,9 +279,9 @@ class QwenStage2Backend:
         return LocalizedEvidence(
             evidence_id=str(evidence["asset_id"]),
             evidence_type="image",
-            localization_score=confidence,
             image=crop,
             box=region.box,
+            image_presence_probability=confidence,
         )
 
     def localize_evidence(

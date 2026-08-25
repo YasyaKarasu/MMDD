@@ -9,7 +9,7 @@ import torch
 
 from .data import EdgeExample, TargetCandidate, TargetExample
 from .features import FeatureStore
-from .models import StudentJoinabilityModel, TeacherJoinabilityModel
+from .models import TeacherJoinabilityModel
 from .objectives import PathAggregator
 from .retrieval import StudentANNIndices, retrieve_zero_one_hop
 from .scoring import score_edge_batch, score_target_batch
@@ -18,18 +18,15 @@ from .scoring import score_edge_batch, score_target_batch
 @dataclass(frozen=True)
 class HardCandidateSet:
     target_example: TargetExample
-    target_candidates: tuple[dict[str, Any], ...]
-    hard_target_ids: tuple[str, ...]
-    hard_evidence_ids: tuple[str, ...]
-    hard_path_count: int
 
 
 def _path_evidence_ids(result: dict[str, Any], max_evidence: int) -> tuple[str, ...]:
     evidence_ids = []
-    for path in sorted(result.get("paths", []), key=lambda item: float(item["path_score"]), reverse=True):
-        evidence_id = path.get("evidence_id")
-        if evidence_id is not None and evidence_id not in evidence_ids:
-            evidence_ids.append(str(evidence_id))
+    evidence_paths = [path for path in result.get("paths", []) if path.get("evidence_id") is not None]
+    for path in sorted(evidence_paths, key=lambda item: float(item["path_score"]), reverse=True):
+        evidence_id = str(path["evidence_id"])
+        if evidence_id not in evidence_ids:
+            evidence_ids.append(evidence_id)
         if len(evidence_ids) >= max_evidence:
             break
     return tuple(evidence_ids)
@@ -67,45 +64,16 @@ def build_hard_candidate_set(
         for candidate in example.candidates
         if candidate.target_id not in known_positives and candidate.target_id not in selected_ids
     ]
-    candidate_records = [
-        {
-            "target_id": positive.target_id,
-            "evidence_ids": list(positive.evidence_ids),
-            "negative_source": None,
-        }
-    ]
     candidates = [positive]
-    hard_evidence_ids = []
-    hard_path_count = 0
     for result in selected_results:
         target_id = str(result["target_id"])
         evidence_ids = _path_evidence_ids(result, max_evidence_per_target)
-        hard_path_count += sum(path.get("kind") == "evidence" for path in result.get("paths", []))
-        for evidence_id in evidence_ids:
-            if evidence_id not in hard_evidence_ids:
-                hard_evidence_ids.append(evidence_id)
         candidates.append(TargetCandidate(target_id, evidence_ids))
-        candidate_records.append(
-            {
-                "target_id": target_id,
-                "evidence_ids": list(evidence_ids),
-                "negative_source": "student_ann",
-                "student_retrieval_score": float(result["score"]),
-                "retrieval_paths": result.get("paths", []),
-            }
-        )
 
     for candidate in original_negatives:
         if len(candidates) - 1 >= hard_targets_per_query:
             break
         candidates.append(candidate)
-        candidate_records.append(
-            {
-                "target_id": candidate.target_id,
-                "evidence_ids": list(candidate.evidence_ids),
-                "negative_source": "fallback_existing",
-            }
-        )
     if len(candidates) < 2:
         raise ValueError(f"{example.query_id}: retrieval and existing data produced no negative target")
 
@@ -117,13 +85,7 @@ def build_hard_candidate_set(
         split=example.split,
         positive_target_ids=known_positive_ids,
     )
-    return HardCandidateSet(
-        target_example=target_example,
-        target_candidates=tuple(candidate_records),
-        hard_target_ids=tuple(str(result["target_id"]) for result in selected_results),
-        hard_evidence_ids=tuple(hard_evidence_ids),
-        hard_path_count=hard_path_count,
-    )
+    return HardCandidateSet(target_example)
 
 
 def _edge_examples_for_candidate_set(
@@ -161,7 +123,6 @@ def _edge_examples_for_candidate_set(
             split=target_example.split,
             source_type="table",
             destination_type="table",
-            edge_kind="query_to_target",
         )
     ]
     for evidence_id in positive_evidence_ids:
@@ -177,7 +138,6 @@ def _edge_examples_for_candidate_set(
                     split=target_example.split,
                     source_type="table",
                     destination_type=evidence_type,
-                    edge_kind="query_to_evidence",
                 )
             )
         examples.append(
@@ -189,7 +149,6 @@ def _edge_examples_for_candidate_set(
                 split=target_example.split,
                 source_type=evidence_type,
                 destination_type="table",
-                edge_kind="evidence_to_target",
             )
         )
     return examples
@@ -239,18 +198,15 @@ def retrieve_hard_candidate_sets(
 def score_hard_candidate_sets(
     candidate_sets: Sequence[HardCandidateSet],
     teacher: TeacherJoinabilityModel,
-    student: StudentJoinabilityModel,
     store: FeatureStore,
     aggregator: PathAggregator,
     *,
     device: torch.device,
     batch_size: int,
-    mining_metadata: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     teacher.eval()
-    student.eval()
     target_records = []
     edge_records = []
     for start in range(0, len(candidate_sets), batch_size):
@@ -263,35 +219,24 @@ def score_hard_candidate_sets(
             example for item_examples in edge_examples_by_item for example in item_examples
         ]
         teacher_targets = score_target_batch(teacher, target_examples, store, device, aggregator)
-        student_targets = score_target_batch(student, target_examples, store, device, aggregator)
         teacher_edges = score_edge_batch(teacher, edge_examples, store, device)
-        student_edges = score_edge_batch(student, edge_examples, store, device)
         edge_offset = 0
         for index, (item, item_edge_examples) in enumerate(zip(batch, edge_examples_by_item)):
             target_count = len(item.target_example.candidates)
-            metadata = {
-                "hard_target_ids": list(item.hard_target_ids),
-                "hard_evidence_ids": list(item.hard_evidence_ids),
-                "hard_path_count": item.hard_path_count,
-                **(mining_metadata or {}),
-            }
             target_record = {
                 "query_id": item.target_example.query_id,
                 "positive_target_id": item.target_example.candidates[0].target_id,
                 "positive_target_ids": list(item.target_example.positive_target_ids),
-                "candidates": list(item.target_candidates),
+                "candidates": [
+                    {
+                        "target_id": candidate.target_id,
+                        "evidence_ids": list(candidate.evidence_ids),
+                    }
+                    for candidate in item.target_example.candidates
+                ],
                 "teacher_logits": teacher_targets.logits[index, :target_count].cpu().tolist(),
-                "student_logits": student_targets.logits[index, :target_count].cpu().tolist(),
-                "teacher_score_config": {
-                    "evidence_aggregation": aggregator.evidence_aggregation,
-                    "evidence_top_k": aggregator.top_k,
-                },
                 "dataset": item.target_example.dataset,
-                "mining": metadata,
             }
-            teacher_sha256 = metadata.get("teacher_checkpoint_sha256")
-            if teacher_sha256 is not None:
-                target_record["teacher_checkpoint_sha256"] = teacher_sha256
             if item.target_example.split is not None:
                 target_record["split"] = item.target_example.split
             target_records.append(target_record)
@@ -303,18 +248,11 @@ def score_hard_candidate_sets(
                     "positive_id": edge_example.candidate_ids[edge_example.positive_index],
                     "candidate_ids": list(edge_example.candidate_ids),
                     "destination_type": edge_example.destination_type,
-                    "edge_kind": edge_example.edge_kind,
                     "teacher_logits": teacher_edges.logits[
                         edge_offset, :edge_count
                     ].cpu().tolist(),
-                    "student_logits": student_edges.logits[
-                        edge_offset, :edge_count
-                    ].cpu().tolist(),
                     "dataset": edge_example.dataset,
-                    "mining": metadata,
                 }
-                if teacher_sha256 is not None:
-                    edge_record["teacher_checkpoint_sha256"] = teacher_sha256
                 if edge_example.split is not None:
                     edge_record["split"] = edge_example.split
                 edge_records.append(edge_record)

@@ -32,7 +32,16 @@ def run(args: argparse.Namespace) -> None:
         ef_construction=args.ef_construction,
         ef_search=args.ef_search,
     )
-    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "output_dir": args.output_dir,
+                "objects": sum(record["objects"] for record in manifest["types"].values()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
