@@ -1,15 +1,14 @@
-#!/usr/bin/env python
 """Refresh Student hard target/evidence/path candidates and Teacher scores."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import torch
-
 from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.features import FeatureStore
@@ -30,8 +29,12 @@ def _write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
 def run(args: argparse.Namespace) -> None:
     if args.hard_targets_per_query <= 0 or args.teacher_batch_size <= 0:
         raise ValueError("Hard-target and batch sizes must be positive")
-    if args.max_evidence_per_target < 0:
-        raise ValueError("--max-evidence-per-target must be non-negative")
+    if min(
+        args.hard_evidence_per_type,
+        args.hard_paths_per_query,
+        args.max_evidence_per_target,
+    ) < 0:
+        raise ValueError("Hard-evidence, hard-path, and evidence limits must be non-negative")
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     split = None if args.split == "all" else args.split
     target_paths = [Path(value) for value in args.target_lists]
@@ -71,15 +74,13 @@ def run(args: argparse.Namespace) -> None:
         examples,
         indices,
         hard_targets_per_query=args.hard_targets_per_query,
+        hard_evidence_per_type=args.hard_evidence_per_type,
+        hard_paths_per_query=args.hard_paths_per_query,
         max_evidence_per_target=args.max_evidence_per_target,
-        retrieval_k=args.retrieval_k,
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
         evidence_types=tuple(args.evidence_types),
-        evidence_aggregation=evidence_aggregation,
-        evidence_top_k=evidence_top_k,
-        rrf_k=args.rrf_k,
     )
     target_records, edge_records = score_hard_candidate_sets(
         candidate_sets,
@@ -98,9 +99,20 @@ def run(args: argparse.Namespace) -> None:
         "teacher_checkpoint_sha256": teacher_sha256,
         "evidence_aggregation": evidence_aggregation,
         "evidence_top_k": evidence_top_k,
-        "target_fusion": "rrf",
         "teacher_target_channels": ["direct", "evidence"],
-        "rrf_k": args.rrf_k,
+        "hard_negative_mining": {
+            "hard_evidence": "query_to_evidence_ann",
+            "hard_target": "query_to_target_ann",
+            "path_hard": "raw_query_evidence_target_path_score",
+        },
+        "hard_targets_per_query": args.hard_targets_per_query,
+        "hard_evidence_per_type": args.hard_evidence_per_type,
+        "hard_paths_per_query": args.hard_paths_per_query,
+        "max_evidence_per_target": args.max_evidence_per_target,
+        "direct_k": args.direct_k,
+        "evidence_k": args.evidence_k,
+        "targets_per_evidence": args.targets_per_evidence,
+        "evidence_types": args.evidence_types,
     }
     output_paths = [Path(args.output_target_lists)]
     if args.output_edge_lists:
@@ -135,8 +147,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-batch-size", type=int, default=4)
     parser.add_argument("--mining-round", type=int, default=1)
     parser.add_argument("--hard-targets-per-query", type=int, default=16)
+    parser.add_argument("--hard-evidence-per-type", type=int, default=16)
+    parser.add_argument("--hard-paths-per-query", type=int, default=16)
     parser.add_argument("--max-evidence-per-target", type=int, default=8)
-    parser.add_argument("--retrieval-k", type=int, default=200)
     parser.add_argument("--direct-k", type=int, default=200)
     parser.add_argument("--evidence-k", type=int, default=100)
     parser.add_argument("--targets-per-evidence", type=int, default=100)
@@ -145,7 +158,6 @@ def parse_args() -> argparse.Namespace:
         "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
     )
     parser.add_argument("--evidence-top-k", type=int)
-    parser.add_argument("--rrf-k", type=int, default=60)
     return parser.parse_args()
 
 

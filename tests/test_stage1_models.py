@@ -12,10 +12,26 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample, load_edge_examples, load_target_examples
+from cache_stage1_features import (
+    EMBEDDING_INSTRUCTIONS,
+    build_object_features,
+    embedding_instructions,
+)
 from mmdd_stage1.checkpoints import load_path_aggregation
+from mmdd_stage1.data import (
+    EdgeExample,
+    TargetCandidate,
+    TargetExample,
+    load_edge_examples,
+    load_target_examples,
+)
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
-from mmdd_stage1.mining import build_hard_candidate_set, score_hard_candidate_sets
+from mmdd_stage1.mining import (
+    HardPath,
+    build_hard_candidate_set,
+    retrieve_hard_candidate_sets,
+    score_hard_candidate_sets,
+)
 from mmdd_stage1.models import (
     TYPE_TO_ID,
     StudentJoinabilityModel,
@@ -23,7 +39,11 @@ from mmdd_stage1.models import (
     structural_table_pool,
 )
 from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
-from mmdd_stage1.retrieval import StudentANNIndices, build_indices, retrieve_zero_one_hop
+from mmdd_stage1.retrieval import (
+    StudentANNIndices,
+    build_indices,
+    retrieve_zero_one_hop,
+)
 from mmdd_stage1.scoring import score_edge_batch, score_target_batch
 from mmdd_stage1.training import (
     checkpoint,
@@ -33,7 +53,6 @@ from mmdd_stage1.training import (
     train_teacher_edges,
     train_teacher_paths,
 )
-from cache_stage1_features import EMBEDDING_INSTRUCTIONS, build_object_features, embedding_instructions
 
 
 def feature(object_id: str, object_type: str, value: float) -> ObjectFeatures:
@@ -816,7 +835,7 @@ def test_student_path_distillation_reuses_separate_cached_teacher_logits():
     assert history[0]["evidence_distillation_loss"] > 0
 
 
-def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
+def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
     original = TargetExample(
         "q",
         (
@@ -830,39 +849,118 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
         split="train",
         positive_target_ids=("direct_positive", "evidence_positive", "other_positive"),
     )
-    retrieval_results = [
-        {"target_id": "other_positive", "score": 10.0, "paths": [{"kind": "direct", "path_score": 10.0}]},
-        {
-            "target_id": "hard_1",
-            "score": 9.0,
-            "paths": [
-                {"kind": "evidence", "evidence_id": "e1", "path_score": 5.0},
-                {"kind": "evidence", "evidence_id": "e2", "path_score": 4.0},
-                {"kind": "direct", "path_score": 3.0},
-            ],
-        },
-        {"target_id": "hard_2", "score": 8.0, "paths": [{"kind": "direct", "path_score": 8.0}]},
-    ]
-
     candidate_set = build_hard_candidate_set(
         original,
-        retrieval_results,
+        ["other_positive", "hard_1", "hard_2"],
+        [],
+        [HardPath("e1", "hard_1", 5.0), HardPath("e2", "hard_1", 4.0)],
         hard_targets_per_query=2,
         max_evidence_per_target=2,
     )
+    target_example = candidate_set.target_example
 
-    assert [candidate.target_id for candidate in candidate_set.candidates] == [
+    assert [candidate.target_id for candidate in target_example.candidates] == [
         "direct_positive",
         "evidence_positive",
         "hard_1",
         "hard_2",
     ]
-    assert candidate_set.direct_positive_index == 0
-    assert candidate_set.evidence_positive_index == 1
-    assert candidate_set.candidates[2:] == (
+    assert target_example.direct_positive_index == 0
+    assert target_example.evidence_positive_index == 1
+    assert target_example.candidates[2:] == (
         TargetCandidate("hard_1", ("e1", "e2")),
         TargetCandidate("hard_2", ()),
     )
+
+
+def test_hard_negative_refresh_mines_three_independent_candidate_pools():
+    class StaticIndices:
+        def search(self, source_id, destination_type, k):
+            values = {
+                ("q", "table"): [
+                    ("direct_positive", 10.0),
+                    ("hard_target", 9.0),
+                ],
+                ("q", "text"): [
+                    ("positive_evidence", 5.0),
+                    ("evidence_only", 4.0),
+                    ("lower_path_evidence", 3.0),
+                ],
+                ("positive_evidence", "table"): [
+                    ("evidence_positive", 6.0),
+                    ("path_target", 3.0),
+                ],
+                ("evidence_only", "table"): [("evidence_positive", 2.0)],
+                ("lower_path_evidence", "table"): [("lower_path_target", 4.0)],
+            }
+            return values.get((source_id, destination_type), [])[:k]
+
+    original = TargetExample(
+        "q",
+        (
+            TargetCandidate("direct_positive", ()),
+            TargetCandidate("evidence_positive", ("positive_evidence",)),
+            TargetCandidate("fallback", ()),
+        ),
+        direct_positive_index=0,
+        evidence_positive_index=1,
+        dataset="20k",
+        split="train",
+        positive_target_ids=("direct_positive", "evidence_positive"),
+    )
+
+    mined = retrieve_hard_candidate_sets(
+        [original],
+        StaticIndices(),
+        hard_targets_per_query=1,
+        hard_evidence_per_type=1,
+        hard_paths_per_query=1,
+        max_evidence_per_target=2,
+        direct_k=2,
+        evidence_k=3,
+        targets_per_evidence=2,
+        evidence_types=("text",),
+    )[0]
+
+    assert mined.evidence_negative_ids == ("evidence_only",)
+    assert mined.target_example.candidates == (
+        TargetCandidate("direct_positive", ()),
+        TargetCandidate("evidence_positive", ("positive_evidence",)),
+        TargetCandidate("hard_target", ()),
+        TargetCandidate("path_target", ("positive_evidence",)),
+    )
+
+    store = FeatureStore(
+        {
+            object_id: feature(object_id, object_type, value)
+            for object_id, object_type, value in (
+                ("q", "table", 0.1),
+                ("direct_positive", "table", 0.2),
+                ("evidence_positive", "table", 0.3),
+                ("hard_target", "table", 0.7),
+                ("path_target", "table", 0.8),
+                ("positive_evidence", "text", 0.4),
+                ("evidence_only", "text", 0.6),
+            )
+        }
+    )
+    _target_records, edge_records = score_hard_candidate_sets(
+        [mined],
+        teacher(),
+        store,
+        PathAggregator(),
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+    query_evidence_edge = next(
+        record
+        for record in edge_records
+        if record["source_type"] == "table" and record["destination_type"] == "text"
+    )
+    assert query_evidence_edge["candidate_ids"] == [
+        "positive_evidence",
+        "evidence_only",
+    ]
 
 
 def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
@@ -883,13 +981,9 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     )
     candidate_set = build_hard_candidate_set(
         original,
-        [
-            {
-                "target_id": "hard",
-                "score": 3.0,
-                "paths": [{"kind": "evidence", "evidence_id": "evidence", "path_score": 3.0}],
-            }
-        ],
+        ["hard"],
+        [],
+        [HardPath("evidence", "hard", 3.0)],
         hard_targets_per_query=1,
         max_evidence_per_target=1,
     )
@@ -978,15 +1072,11 @@ def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
     )
     candidate_set = build_hard_candidate_set(
         original,
+        ["hard"],
+        ["hard_text", "hard_image"],
         [
-            {
-                "target_id": "hard",
-                "score": 4.0,
-                "paths": [
-                    {"kind": "evidence", "evidence_id": "hard_text", "path_score": 4.0},
-                    {"kind": "evidence", "evidence_id": "hard_image", "path_score": 3.0},
-                ],
-            }
+            HardPath("hard_text", "hard", 4.0),
+            HardPath("hard_image", "hard", 3.0),
         ],
         hard_targets_per_query=1,
         max_evidence_per_target=2,
