@@ -79,6 +79,7 @@ def run(args: argparse.Namespace) -> None:
         evidence_types=tuple(args.evidence_types),
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
+        rrf_k=args.rrf_k,
     )
     target_records, edge_records = score_hard_candidate_sets(
         candidate_sets,
@@ -92,6 +93,8 @@ def run(args: argparse.Namespace) -> None:
             "mining_round": args.mining_round,
             "student_checkpoint_sha256": student_sha256,
             "teacher_checkpoint_sha256": teacher_sha256,
+            "target_fusion": "rrf",
+            "rrf_k": args.rrf_k,
         },
     )
     _write_jsonl(Path(args.output_target_lists), target_records)
@@ -133,6 +136,7 @@ def parse_args() -> argparse.Namespace:
         "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
     )
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--rrf-k", type=int, default=60)
     return parser.parse_args()
 
 

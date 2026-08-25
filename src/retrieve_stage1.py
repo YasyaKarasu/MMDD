@@ -40,6 +40,7 @@ def run(args: argparse.Namespace) -> None:
         evidence_types=tuple(args.evidence_types),
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
+        rrf_k=args.rrf_k,
     )
     payload = json.dumps(
         {
@@ -47,6 +48,8 @@ def run(args: argparse.Namespace) -> None:
             "path_aggregation": {
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
+                "target_fusion": "rrf",
+                "rrf_k": args.rrf_k,
             },
             "results": results,
         },
@@ -77,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--rrf-k", type=int, default=60)
     return parser.parse_args()
 
 

@@ -77,6 +77,29 @@ def test_structural_table_pool_returns_schema_and_row_tokens():
     assert torch.equal(pooled, torch.tensor([[2.0, 2.0], [6.0, 4.0]]))
 
 
+def test_teacher_pools_table_groups_before_the_equivalent_adapter_projection():
+    model = teacher()
+    table = feature("table", "table", 0.2)
+    adapter_input_lengths = []
+    hook = model.adapters["table"].register_forward_pre_hook(
+        lambda _module, inputs: adapter_input_lengths.append(inputs[0].shape[0])
+    )
+
+    tokens = model.compress(table)
+    hook.remove()
+
+    assert adapter_input_lengths == [2]
+    pooled = structural_table_pool(table.hidden_states, table.token_groups)
+    token_kinds = torch.tensor([0, 1])
+    token_kind_embeddings = model.table_token_embeddings(token_kinds)
+    projected_after_pooling = model.adapters["table"](pooled)
+    projected_before_pooling = structural_table_pool(
+        model.adapters["table"](table.hidden_states), table.token_groups
+    )
+    assert torch.allclose(projected_after_pooling, projected_before_pooling)
+    assert torch.allclose(tokens, projected_after_pooling + token_kind_embeddings)
+
+
 def test_teacher_uses_ordered_type_pair_and_supports_gradients():
     torch.manual_seed(3)
     model = teacher()
@@ -582,7 +605,43 @@ def test_online_retrieval_uses_configured_two_level_path_aggregation():
         evidence_top_k=1,
     )
 
-    assert results[0]["score"] == pytest.approx(torch.logaddexp(torch.tensor(1.0), torch.tensor(4.0)).item())
+    result = results[0]
+    assert result["direct_score"] == pytest.approx(1.0)
+    assert result["evidence_score"] == pytest.approx(4.0)
+    assert result["direct_rank"] == 1
+    assert result["evidence_rank"] == 1
+    assert result["score"] == pytest.approx(2.0 / 61.0)
+
+
+def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
+    class StaticIndices:
+        def search(self, source_id, destination_type, k):
+            del k
+            values = {
+                ("q", "table"): [("mixed", 0.9), ("direct", 0.8)],
+                ("q", "text"): [("e", 0.0)],
+                ("e", "table"): [("evidence", 0.8), ("mixed", 0.1)],
+            }
+            return values.get((source_id, destination_type), [])
+
+    results = retrieve_zero_one_hop(
+        "q",
+        StaticIndices(),
+        direct_k=2,
+        evidence_k=1,
+        targets_per_evidence=2,
+        result_k=3,
+        evidence_types=("text",),
+        rrf_k=0,
+    )
+
+    assert [result["target_id"] for result in results] == ["mixed", "evidence", "direct"]
+    by_target = {result["target_id"]: result for result in results}
+    assert by_target["mixed"]["direct_score"] == pytest.approx(0.9)
+    assert by_target["mixed"]["evidence_score"] == pytest.approx(0.1)
+    assert by_target["evidence"]["evidence_rank"] == 1
+    assert by_target["direct"]["direct_rank"] == 2
+    assert by_target["mixed"]["score"] == pytest.approx(1.0 + 0.5)
 
 
 def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):

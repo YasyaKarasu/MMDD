@@ -208,6 +208,7 @@ def retrieve_hard_candidate_sets(
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
+    rrf_k: int = 60,
 ) -> list[HardCandidateSet]:
     candidate_sets = []
     for example in examples:
@@ -221,6 +222,7 @@ def retrieve_hard_candidate_sets(
             evidence_types=evidence_types,
             evidence_aggregation=evidence_aggregation,
             evidence_top_k=evidence_top_k,
+            rrf_k=rrf_k,
         )
         candidate_sets.append(
             build_hard_candidate_set(

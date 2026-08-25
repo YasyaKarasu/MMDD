@@ -163,20 +163,30 @@ def _logsumexp(values: Iterable[float]) -> float:
     return maximum + math.log(sum(math.exp(value - maximum) for value in values))
 
 
-def _aggregate_paths(paths: list[dict[str, Any]], aggregator: PathAggregator) -> float:
+def _aggregate_path_channels(
+    paths: list[dict[str, Any]], aggregator: PathAggregator
+) -> tuple[float | None, float | None]:
     direct_scores = [float(path["path_score"]) for path in paths if path["kind"] == "direct"]
     evidence_scores = [float(path["path_score"]) for path in paths if path["kind"] == "evidence"]
+    direct_score = _logsumexp(direct_scores) if direct_scores else None
     if not evidence_scores:
-        return _logsumexp(direct_scores)
-    direct_score = _logsumexp(direct_scores) if direct_scores else -math.inf
-    evidence = torch.tensor(evidence_scores, dtype=torch.float32).reshape(1, 1, -1)
-    score = aggregator(
-        torch.tensor([[direct_score]], dtype=torch.float32),
-        evidence,
-        torch.zeros_like(evidence),
-        torch.ones_like(evidence, dtype=torch.bool),
+        return direct_score, None
+    if aggregator.evidence_aggregation == "logsumexp":
+        evidence_score = _logsumexp(evidence_scores)
+    else:
+        selected = sorted(evidence_scores, reverse=True)[: aggregator.top_k]
+        evidence_score = sum(selected)
+        if aggregator.evidence_aggregation == "topk_mean":
+            evidence_score /= len(selected)
+    return direct_score, evidence_score
+
+
+def _channel_ranks(results: list[dict[str, Any]], score_key: str) -> dict[str, int]:
+    ranked = sorted(
+        (result for result in results if result[score_key] is not None),
+        key=lambda result: (-float(result[score_key]), str(result["target_id"])),
     )
-    return float(score.item())
+    return {str(result["target_id"]): rank for rank, result in enumerate(ranked, 1)}
 
 
 def retrieve_zero_one_hop(
@@ -190,11 +200,14 @@ def retrieve_zero_one_hop(
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
+    rrf_k: int = 60,
 ) -> list[dict[str, Any]]:
-    """Retrieve only Q->T and Q->E->T paths, then aggregate per target."""
+    """Retrieve direct and evidence paths, then fuse their target ranks."""
 
     if min(direct_k, evidence_k, targets_per_evidence, result_k) < 0:
         raise ValueError("Retrieval k values must be non-negative")
+    if rrf_k < 0:
+        raise ValueError("rrf_k must be non-negative")
     aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
     paths_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for target_id, score in indices.search(query_id, "table", direct_k):
@@ -217,12 +230,25 @@ def retrieve_zero_one_hop(
     results = []
     for target_id, paths in paths_by_target.items():
         paths.sort(key=lambda path: path["path_score"], reverse=True)
+        direct_score, evidence_score = _aggregate_path_channels(paths, aggregator)
         results.append(
             {
                 "target_id": target_id,
-                "score": _aggregate_paths(paths, aggregator),
+                "direct_score": direct_score,
+                "evidence_score": evidence_score,
                 "paths": paths,
             }
         )
-    results.sort(key=lambda result: result["score"], reverse=True)
+    direct_ranks = _channel_ranks(results, "direct_score")
+    evidence_ranks = _channel_ranks(results, "evidence_score")
+    for result in results:
+        target_id = str(result["target_id"])
+        direct_rank = direct_ranks.get(target_id)
+        evidence_rank = evidence_ranks.get(target_id)
+        result["direct_rank"] = direct_rank
+        result["evidence_rank"] = evidence_rank
+        result["score"] = sum(
+            1.0 / (rrf_k + rank) for rank in (direct_rank, evidence_rank) if rank is not None
+        )
+    results.sort(key=lambda result: (-float(result["score"]), str(result["target_id"])))
     return results[:result_k]

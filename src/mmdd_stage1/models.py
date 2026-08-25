@@ -124,14 +124,17 @@ class TeacherJoinabilityModel(nn.Module):
         object_type = normalize_object_type(features.object_type)
         if features.hidden_states is None:
             raise ValueError(f"{features.object_id}: Teacher requires hidden_states")
-        hidden = self.adapters[object_type](features.hidden_states)
         if object_type == "table":
             if features.token_groups is None:
                 raise ValueError(f"{features.object_id}: table hidden_states require token_groups")
-            tokens = structural_table_pool(hidden, features.token_groups)
+            # Group pooling is a mean, so it commutes with the affine adapter.
+            # Pool first to avoid projecting table-token detail that is discarded.
+            tokens = structural_table_pool(features.hidden_states, features.token_groups)
+            tokens = self.adapters[object_type](tokens)
             token_kinds = torch.ones(tokens.shape[0], dtype=torch.long, device=tokens.device)
             token_kinds[0] = 0
             return tokens + self.table_token_embeddings(token_kinds)
+        hidden = self.adapters[object_type](features.hidden_states)
         return self.poolers[object_type](hidden)
 
     def score_compressed_pairs(

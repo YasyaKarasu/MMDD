@@ -45,7 +45,7 @@ def build_evidence_bundles(
     *,
     top_k_evidence: int,
 ) -> list[EvidenceBundle]:
-    """Group one-hop paths by target and rank unique evidence with LogSumExp."""
+    """Build evidence-only target bundles using their Stage-1 channel scores."""
 
     if top_k_evidence < 0:
         raise ValueError("top_k_evidence must be non-negative")
@@ -69,10 +69,16 @@ def build_evidence_bundles(
         )[:top_k_evidence]
         if not ranked:
             continue
+        evidence_score = result.get("evidence_score")
+        if evidence_score is None:
+            raise ValueError(
+                f"{result['target_id']}: retrieval result has evidence paths but no evidence_score; "
+                "regenerate it with the current Stage-1 retriever"
+            )
         bundles.append(
             EvidenceBundle(
                 target_id=str(result["target_id"]),
-                retrieval_score=_logsumexp([float(path["path_score"]) for path in paths]),
+                retrieval_score=float(evidence_score),
                 evidence_ids=tuple(evidence_id for evidence_id, _ in ranked),
             )
         )

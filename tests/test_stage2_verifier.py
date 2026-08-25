@@ -24,7 +24,7 @@ from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
 from mmdd_stage2.qwen import QwenStage2Backend
 from mmdd_stage2.routing import EvidenceRowAssignment, SimilarityEvidenceRouter
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
-from mmdd_stage2.data import Stage2ObjectIndex
+from mmdd_stage2.data import Stage2ObjectIndex, direct_target_ids
 from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
 from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
 
@@ -35,6 +35,8 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
             {
                 "target_id": "t1",
                 "score": 4.0,
+                "direct_score": 3.0,
+                "evidence_score": 2.25,
                 "paths": [
                     {"kind": "evidence", "evidence_id": "e2", "evidence_type": "image", "path_score": 2.0},
                     {"kind": "direct", "path_score": 3.0},
@@ -47,7 +49,41 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
     )
 
     assert bundles[0].target_id == "t1"
+    assert bundles[0].retrieval_score == pytest.approx(2.25)
     assert bundles[0].evidence_ids == ("e1", "e2")
+
+
+def test_stage2_preserves_global_rrf_order_while_using_route_scores():
+    results = [
+        {
+            "target_id": "mixed",
+            "direct_score": 0.1,
+            "evidence_score": 0.9,
+            "paths": [
+                {"kind": "direct", "path_score": 0.1},
+                {"kind": "evidence", "evidence_id": "e1", "path_score": 0.9},
+            ],
+        },
+        {
+            "target_id": "direct",
+            "direct_score": 0.8,
+            "evidence_score": None,
+            "paths": [{"kind": "direct", "path_score": 0.8}],
+        },
+        {
+            "target_id": "evidence",
+            "direct_score": None,
+            "evidence_score": 1.0,
+            "paths": [{"kind": "evidence", "evidence_id": "e2", "path_score": 1.0}],
+        },
+    ]
+
+    global_top_k = results[:2]
+    bundles = build_evidence_bundles(global_top_k, top_k_evidence=1)
+
+    assert direct_target_ids(global_top_k) == ["mixed", "direct"]
+    assert [bundle.target_id for bundle in bundles] == ["mixed"]
+    assert bundles[0].retrieval_score == pytest.approx(0.9)
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():

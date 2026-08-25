@@ -115,13 +115,19 @@ conda run -n MMDD python src/train_stage1.py student-path \
 
 The Teacher uses one shared Relation Transformer with modality, direction,
 and ordered type-pair identities. The Student learns one projection per type
-and one relation matrix per ordered type pair. Target scoring combines direct
-`Q -> T` and evidence `Q -> E -> T` paths. Evidence paths first use the
-configured LogSumExp, top-k mean, or top-k sum aggregation; that score and the
-direct score are then combined with LogSumExp. The path checkpoint stores
-this configuration so online retrieval uses the training definition by
-default. Student relation queries and projected target vectors preserve the
-bilinear score exactly as an inner product for ANN indexing.
+and one relation matrix per ordered type pair. The differentiable target
+objective combines direct `Q -> T` and evidence `Q -> E -> T` paths. Evidence
+paths first use the configured LogSumExp, top-k mean, or top-k sum aggregation;
+that score and the direct score are then combined with LogSumExp. The path
+checkpoint stores the evidence aggregation configuration.
+
+Online retrieval keeps `direct_score` and `evidence_score` separate and ranks
+each target in both channels. Reciprocal Rank Fusion (RRF) combines the two
+ranks into the single `score` used for global top-k truncation and
+Recall@k evaluation. `--rrf-k` controls the rank constant (default 60). Each
+result also records both channel scores and ranks. Student relation queries and
+projected target vectors preserve the bilinear score exactly as an inner
+product for ANN indexing.
 
 `--train-data` accepts multiple files. Every record should carry `dataset`;
 when it does not, the input filename stem is used. Sampling assigns dataset
@@ -210,19 +216,24 @@ specified by the training scheme.
 ## Stage-2 verification
 
 Stage 2 is an executable RATA/FOCUS pipeline over canonical dataset artifacts
-and Stage-1 retrieval JSON. It keeps only `Q -> E -> T` paths for multimodal
-verification and checks direct `Q -> T` results separately. Repeated paths to
-one evidence object and repeated evidence paths to one target are aggregated
-with LogSumExp for evidence selection. For each candidate target, the query,
-target, and all selected top-k evidence objects are placed in one transformer
-input and produce one set of RATA boundary states.
+and Stage-1 retrieval JSON. It first truncates the single global target list by
+its RRF `score` order. Inside that fixed candidate pool, it keeps
+`Q -> E -> T` paths for multimodal verification and checks direct `Q -> T`
+paths separately. The evidence branch uses the Stage-1 `evidence_score` for
+`softmax(r_T)`, but this does not create a second retrieval queue or change
+which targets passed the global cutoff. Repeated paths to one evidence object
+are aggregated with LogSumExp for evidence selection. For each candidate
+target, the query, target, and all selected top-k evidence objects are placed
+in one transformer input and produce one set of RATA boundary states.
+Retrieval JSON created before these channel scores were added must be
+regenerated.
 
 The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
 `<|object_ref_end|>` tokens around every target header. Qwen is frozen; only
-the linear candidate head is trained. Because the Stage-1 table distribution
-`softmax(r_T)` is fixed, training runs the reader only for the gold target and
-optimizes the column loss `-log rho_(T,c)`. History records the fixed Stage-1
-term as `table_loss` and their sum as `joint_loss`, while inference still ranks
+the linear candidate head is trained. Because the Stage-1 evidence-channel
+distribution `softmax(r_T)` is fixed, training runs the reader only for the
+gold target and optimizes the column loss `-log rho_(T,c)`. History records the
+fixed Stage-1 term as `table_loss` and their sum as `joint_loss`, while inference still ranks
 all candidate pairs with `softmax(r_T) * rho_(T,c)`. Training retrieval files
 contain one JSON object or JSONL record per query in the format emitted by
 `retrieve_stage1.py`; records whose positive target has no retrieved evidence
