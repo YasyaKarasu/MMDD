@@ -38,8 +38,11 @@ def build_hard_candidate_set(
         raise ValueError("hard_targets_per_query must be positive")
     if max_evidence_per_target < 0:
         raise ValueError("max_evidence_per_target must be non-negative")
-    positive = example.candidates[example.positive_index]
-    known_positive_ids = example.positive_target_ids or (positive.target_id,)
+    direct_positive = example.candidates[example.direct_positive_index]
+    evidence_positive = example.candidates[example.evidence_positive_index]
+    known_positive_ids = example.positive_target_ids or tuple(
+        dict.fromkeys((direct_positive.target_id, evidence_positive.target_id))
+    )
     known_positives = set(known_positive_ids)
     selected_results = []
     selected_ids = set()
@@ -57,14 +60,15 @@ def build_hard_candidate_set(
         for candidate in example.candidates
         if candidate.target_id not in known_positives and candidate.target_id not in selected_ids
     ]
-    candidates = [positive]
+    candidates = list(dict.fromkeys((direct_positive, evidence_positive)))
+    positive_count = len(candidates)
     for result in selected_results:
         target_id = str(result["target_id"])
         evidence_ids = _path_evidence_ids(result, max_evidence_per_target)
         candidates.append(TargetCandidate(target_id, evidence_ids))
 
     for candidate in original_negatives:
-        if len(candidates) - 1 >= hard_targets_per_query:
+        if len(candidates) - positive_count >= hard_targets_per_query:
             break
         candidates.append(candidate)
     if len(candidates) < 2:
@@ -73,7 +77,8 @@ def build_hard_candidate_set(
     return TargetExample(
         query_id=example.query_id,
         candidates=tuple(candidates),
-        positive_index=0,
+        direct_positive_index=candidates.index(direct_positive),
+        evidence_positive_index=candidates.index(evidence_positive),
         dataset=example.dataset,
         split=example.split,
         positive_target_ids=known_positive_ids,
@@ -86,17 +91,17 @@ def _edge_examples_for_candidate_set(
 ) -> list[EdgeExample]:
     """Expand one mined target list into its directly supervised path edges."""
 
-    positive = target_example.candidates[target_example.positive_index]
-    negative_candidates = [
+    evidence_positive = target_example.candidates[target_example.evidence_positive_index]
+    evidence_negative_candidates = [
         candidate
         for index, candidate in enumerate(target_example.candidates)
-        if index != target_example.positive_index
+        if index != target_example.evidence_positive_index
     ]
-    negative_target_ids = tuple(candidate.target_id for candidate in negative_candidates)
-    positive_evidence_ids = tuple(dict.fromkeys(positive.evidence_ids))
+    negative_target_ids = tuple(candidate.target_id for candidate in evidence_negative_candidates)
+    positive_evidence_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
     positive_evidence_set = set(positive_evidence_ids)
     negative_evidence_by_type: dict[str, list[str]] = {}
-    for candidate in negative_candidates:
+    for candidate in evidence_negative_candidates:
         for evidence_id in candidate.evidence_ids:
             if evidence_id in positive_evidence_set:
                 continue
@@ -109,7 +114,7 @@ def _edge_examples_for_candidate_set(
         EdgeExample(
             query_id=target_example.query_id,
             candidate_ids=tuple(candidate.target_id for candidate in target_example.candidates),
-            positive_index=target_example.positive_index,
+            positive_index=target_example.direct_positive_index,
             dataset=target_example.dataset,
             split=target_example.split,
             source_type="table",
@@ -134,7 +139,7 @@ def _edge_examples_for_candidate_set(
         examples.append(
             EdgeExample(
                 query_id=evidence_id,
-                candidate_ids=(positive.target_id, *negative_target_ids),
+                candidate_ids=(evidence_positive.target_id, *negative_target_ids),
                 positive_index=0,
                 dataset=target_example.dataset,
                 split=target_example.split,
@@ -215,7 +220,12 @@ def score_hard_candidate_sets(
             target_count = len(item.candidates)
             target_record = {
                 "query_id": item.query_id,
-                "positive_target_id": item.candidates[0].target_id,
+                "direct_positive_target_id": item.candidates[
+                    item.direct_positive_index
+                ].target_id,
+                "evidence_positive_target_id": item.candidates[
+                    item.evidence_positive_index
+                ].target_id,
                 "positive_target_ids": list(item.positive_target_ids),
                 "candidates": [
                     {
@@ -224,7 +234,12 @@ def score_hard_candidate_sets(
                     }
                     for candidate in item.candidates
                 ],
-                "teacher_logits": teacher_targets.logits[index, :target_count].cpu().tolist(),
+                "teacher_direct_logits": teacher_targets.direct.logits[
+                    index, :target_count
+                ].cpu().tolist(),
+                "teacher_evidence_logits": teacher_targets.evidence.logits[
+                    index, :target_count
+                ].cpu().tolist(),
                 "dataset": item.dataset,
             }
             if item.split is not None:

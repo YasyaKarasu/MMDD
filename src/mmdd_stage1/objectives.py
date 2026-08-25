@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 
 class PathAggregator(nn.Module):
-    """Combine direct and Q->evidence->target paths into target scores."""
+    """Aggregate Q->evidence->target paths within the evidence channel."""
 
     def __init__(self, evidence_aggregation: str = "logsumexp", top_k: int = 4) -> None:
         super().__init__()
@@ -21,7 +21,6 @@ class PathAggregator(nn.Module):
 
     def forward(
         self,
-        direct_scores: torch.Tensor,
         query_evidence_scores: torch.Tensor,
         evidence_target_scores: torch.Tensor,
         evidence_mask: torch.Tensor,
@@ -30,10 +29,8 @@ class PathAggregator(nn.Module):
             raise ValueError("The two evidence-edge score tensors must have equal shapes")
         if evidence_mask.shape != query_evidence_scores.shape:
             raise ValueError("evidence_mask must match evidence-edge scores")
-        if direct_scores.shape != query_evidence_scores.shape[:2]:
-            raise ValueError("direct_scores must match the batch and target dimensions")
         if query_evidence_scores.shape[-1] == 0:
-            return direct_scores
+            return query_evidence_scores.new_zeros(query_evidence_scores.shape[:2])
 
         path_scores = query_evidence_scores + evidence_target_scores
         masked_paths = path_scores.masked_fill(~evidence_mask, -torch.inf)
@@ -50,7 +47,7 @@ class PathAggregator(nn.Module):
             if self.evidence_aggregation == "topk_mean":
                 evidence_scores = evidence_scores / valid.sum(dim=-1).clamp_min(1)
 
-        return torch.where(has_evidence, torch.logaddexp(direct_scores, evidence_scores), direct_scores)
+        return torch.where(has_evidence, evidence_scores, torch.zeros_like(evidence_scores))
 
 
 def listwise_cross_entropy(
@@ -92,15 +89,49 @@ def distillation_kl(
     return per_candidate.sum(dim=-1).mean() * temperature**2
 
 
-def student_path_loss(
+def _usable_list_rows(
+    logits: torch.Tensor,
+    positive_indices: torch.Tensor,
+    candidate_mask: torch.Tensor,
+) -> torch.Tensor:
+    if logits.shape != candidate_mask.shape:
+        raise ValueError("candidate_mask must match logits")
+    if positive_indices.shape != (logits.shape[0],):
+        raise ValueError("positive_indices must have shape [batch]")
+    rows = torch.arange(logits.shape[0], device=logits.device)
+    return candidate_mask[rows, positive_indices] & (candidate_mask.sum(dim=-1) >= 2)
+
+
+def optional_listwise_cross_entropy(
+    logits: torch.Tensor,
+    positive_indices: torch.Tensor,
+    candidate_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Listwise CE over rows with a positive and at least one negative."""
+
+    usable = _usable_list_rows(logits, positive_indices, candidate_mask)
+    if not usable.any().item():
+        return logits.sum() * 0.0
+    return listwise_cross_entropy(logits[usable], positive_indices[usable], candidate_mask[usable])
+
+
+def optional_distillation_kl(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     positive_indices: torch.Tensor,
     candidate_mask: torch.Tensor,
     temperature: float,
-    distillation_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    supervised = listwise_cross_entropy(student_logits, positive_indices, candidate_mask)
-    distillation = distillation_kl(student_logits, teacher_logits, candidate_mask, temperature)
-    total = supervised + distillation_weight * distillation
-    return total, supervised, distillation
+) -> torch.Tensor:
+    """Listwise distillation over rows with a usable supervised channel list."""
+
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError("Student and Teacher logits must have equal shapes")
+    usable = _usable_list_rows(student_logits, positive_indices, candidate_mask)
+    if not usable.any().item():
+        return student_logits.sum() * 0.0
+    return distillation_kl(
+        student_logits[usable],
+        teacher_logits[usable],
+        candidate_mask[usable],
+        temperature,
+    )

@@ -40,10 +40,12 @@ class TeacherScoreConfig:
 class TargetExample:
     query_id: str
     candidates: tuple[TargetCandidate, ...]
-    positive_index: int
+    direct_positive_index: int
+    evidence_positive_index: int
     dataset: str = "default"
     split: str | None = None
-    teacher_logits: tuple[float, ...] | None = None
+    teacher_direct_logits: tuple[float, ...] | None = None
+    teacher_evidence_logits: tuple[float, ...] | None = None
     positive_target_ids: tuple[str, ...] = ()
     teacher_score_config: TeacherScoreConfig | None = None
     teacher_checkpoint_sha256: str | None = None
@@ -97,15 +99,16 @@ def _teacher_logits(
     line_number: int,
     record: dict[str, Any],
     candidate_count: int,
+    key: str = "teacher_logits",
 ) -> tuple[float, ...] | None:
-    values = record.get("teacher_logits")
+    values = record.get(key)
     if values is None:
         return None
     if not isinstance(values, list) or len(values) != candidate_count:
-        raise ValueError(f"{path}:{line_number}: teacher_logits must align with candidates")
+        raise ValueError(f"{path}:{line_number}: {key} must align with candidates")
     logits = tuple(float(value) for value in values)
     if not all(math.isfinite(value) for value in logits):
-        raise ValueError(f"{path}:{line_number}: teacher_logits must be finite")
+        raise ValueError(f"{path}:{line_number}: {key} must be finite")
     return logits
 
 
@@ -185,17 +188,57 @@ def load_target_examples(
         target_ids = [candidate.target_id for candidate in candidates]
         if len(set(target_ids)) != len(target_ids):
             raise ValueError(f"{path}:{line_number}: target candidates contain duplicates")
-        positive_index = _positive_index(path, line_number, record, target_ids, "positive_target_id")
-        positive_target_ids = tuple(str(value) for value in record.get("positive_target_ids", []))
-        designated_positive = target_ids[positive_index]
-        if not positive_target_ids:
-            positive_target_ids = (designated_positive,)
-        elif designated_positive not in positive_target_ids:
-            raise ValueError(f"{path}:{line_number}: positive_target_ids omits the designated positive")
-        teacher_logits = _teacher_logits(path, line_number, record, len(candidates))
-        if teacher_logits is not None and evidence_was_truncated:
+        required_positive_keys = {
+            "direct_positive_target_id",
+            "evidence_positive_target_id",
+        }
+        if "positive_target_id" in record or not required_positive_keys <= record.keys():
             raise ValueError(
-                f"{path}:{line_number}: cannot reuse teacher_logits after truncating candidate evidence"
+                f"{path}:{line_number}: target lists require separate "
+                "direct_positive_target_id and evidence_positive_target_id; regenerate this file"
+            )
+        direct_positive_index = _positive_index(
+            path, line_number, record, target_ids, "direct_positive_target_id"
+        )
+        evidence_positive_index = _positive_index(
+            path, line_number, record, target_ids, "evidence_positive_target_id"
+        )
+        positive_target_ids = tuple(str(value) for value in record.get("positive_target_ids", []))
+        designated_positives = {
+            target_ids[direct_positive_index],
+            target_ids[evidence_positive_index],
+        }
+        if not positive_target_ids:
+            positive_target_ids = tuple(
+                dict.fromkeys(
+                    target_ids[index]
+                    for index in (direct_positive_index, evidence_positive_index)
+                )
+            )
+        elif not designated_positives <= set(positive_target_ids):
+            raise ValueError(f"{path}:{line_number}: positive_target_ids omits a designated positive")
+        if "teacher_logits" in record:
+            raise ValueError(
+                f"{path}:{line_number}: merged target teacher_logits are obsolete; "
+                "regenerate separate teacher_direct_logits and teacher_evidence_logits"
+            )
+        has_direct_logits = "teacher_direct_logits" in record
+        has_evidence_logits = "teacher_evidence_logits" in record
+        if has_direct_logits != has_evidence_logits:
+            raise ValueError(
+                f"{path}:{line_number}: cached target scores require both "
+                "teacher_direct_logits and teacher_evidence_logits"
+            )
+        teacher_direct_logits = _teacher_logits(
+            path, line_number, record, len(candidates), "teacher_direct_logits"
+        )
+        teacher_evidence_logits = _teacher_logits(
+            path, line_number, record, len(candidates), "teacher_evidence_logits"
+        )
+        if teacher_evidence_logits is not None and evidence_was_truncated:
+            raise ValueError(
+                f"{path}:{line_number}: cannot reuse teacher_evidence_logits after "
+                "truncating candidate evidence"
             )
         raw_score_config = record.get("teacher_score_config")
         if raw_score_config is None and {
@@ -222,10 +265,12 @@ def load_target_examples(
             TargetExample(
                 query_id,
                 tuple(candidates),
-                positive_index,
+                direct_positive_index,
+                evidence_positive_index,
                 dataset=str(record.get("dataset") or dataset_name or "default"),
                 split=record.get("split"),
-                teacher_logits=teacher_logits,
+                teacher_direct_logits=teacher_direct_logits,
+                teacher_evidence_logits=teacher_evidence_logits,
                 positive_target_ids=positive_target_ids,
                 teacher_score_config=teacher_score_config,
                 teacher_checkpoint_sha256=(

@@ -88,7 +88,7 @@ Path-level data groups evidence by candidate target. Evidence order is the
 retrieval-score order; `--max-evidence-per-target` retains its prefix:
 
 ```json
-{"query_id":"q1","positive_target_id":"t1","positive_target_ids":["t1"],"candidates":[{"target_id":"t1","evidence_ids":["e1","i1"]},{"target_id":"t2","evidence_ids":[]}],"dataset":"2k","split":"train"}
+{"query_id":"q1","direct_positive_target_id":"t1","evidence_positive_target_id":"t2","positive_target_ids":["t1","t2"],"candidates":[{"target_id":"t1","evidence_ids":[]},{"target_id":"t2","evidence_ids":["e1","i1"]}],"dataset":"2k","split":"train"}
 ```
 
 Run the four training stages explicitly:
@@ -117,11 +117,18 @@ conda run -n MMDD python src/train_stage1.py student-path \
 
 The Teacher uses one shared Relation Transformer with modality, direction,
 and ordered type-pair identities. The Student learns one projection per type
-and one relation matrix per ordered type pair. The differentiable target
-objective combines direct `Q -> T` and evidence `Q -> E -> T` paths. Evidence
-paths first use the configured LogSumExp, top-k mean, or top-k sum aggregation;
-that score and the direct score are then combined with LogSumExp. The path
-checkpoint stores the evidence aggregation configuration.
+and one relation matrix per ordered type pair. Target/path training keeps the
+direct `Q -> T` and evidence `Q -> E -> T` channels separate. The direct
+channel uses dataset qrels as its positives; a recovery target absent from
+those qrels is a direct hard negative. The evidence channel uses query-scoped
+recoveries as its positives, so the two listwise losses may use different
+positive target indices. The evidence channel
+first aggregates each target's paths with the configured LogSumExp, top-k
+mean, or top-k sum, then uses a separate listwise loss over targets that have
+evidence. A batch row contributes evidence loss only when its positive and at
+least one negative have evidence. The two channel losses are added; their
+scores are never combined into one training logit. The path checkpoint stores
+the evidence aggregation configuration.
 
 Online retrieval keeps `direct_score` and `evidence_score` separate and ranks
 each target in both channels. Reciprocal Rank Fusion (RRF) combines the two
@@ -196,8 +203,10 @@ query-to-target, evidence-to-target, and query-to-evidence whenever a
 same-modality negative evidence object was mined. Under the dataset's
 closed-world labels, evidence retained only on a non-GT target path is a hard
 query-to-evidence negative; it remains latent in the target/path objective as
-well. The output stores aligned `teacher_logits`; `student-edge` and
-`student-path` consume these cached soft labels directly. The loader also
+well. Edge outputs store aligned `teacher_logits`; target outputs separately
+store aligned `teacher_direct_logits` and `teacher_evidence_logits`.
+`student-edge` and `student-path` consume these cached soft labels directly.
+The loader rejects the obsolete merged target `teacher_logits` format and also
 checks declared edge types, the Teacher checkpoint, evidence truncation, and
 path-aggregation configuration before reuse:
 

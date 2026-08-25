@@ -131,30 +131,27 @@ def test_student_score_is_exact_ann_inner_product():
     assert not torch.allclose(score, model.score_pairs([target], [query])[0])
 
 
-def test_path_aggregator_accumulates_direct_and_multiple_evidence_paths():
+def test_path_aggregator_accumulates_only_evidence_paths():
     aggregator = PathAggregator("logsumexp")
-    direct = torch.tensor([[1.0]])
     query_evidence = torch.tensor([[[2.0, 0.0]]])
     evidence_target = torch.tensor([[[3.0, 1.0]]])
     mask = torch.tensor([[[True, True]]])
 
-    score = aggregator(direct, query_evidence, evidence_target, mask)
+    score = aggregator(query_evidence, evidence_target, mask)
 
-    assert score.item() == pytest.approx(torch.logsumexp(torch.tensor([1.0, 5.0, 1.0]), dim=0).item())
+    assert score.item() == pytest.approx(torch.logsumexp(torch.tensor([5.0, 1.0]), dim=0).item())
 
 
 def test_path_aggregator_all_mask_has_finite_gradients():
-    direct = torch.tensor([[1.0]], requires_grad=True)
     query_evidence = torch.tensor([[[2.0, 0.0]]], requires_grad=True)
     evidence_target = torch.tensor([[[3.0, 1.0]]], requires_grad=True)
     mask = torch.zeros_like(query_evidence, dtype=torch.bool)
 
     with torch.autograd.set_detect_anomaly(True):
-        score = PathAggregator("logsumexp")(direct, query_evidence, evidence_target, mask)
+        score = PathAggregator("logsumexp")(query_evidence, evidence_target, mask)
         score.sum().backward()
 
-    assert score.item() == pytest.approx(direct.item())
-    assert torch.equal(direct.grad, torch.ones_like(direct))
+    assert score.item() == 0.0
     assert torch.equal(query_evidence.grad, torch.zeros_like(query_evidence))
     assert torch.equal(evidence_target.grad, torch.zeros_like(evidence_target))
 
@@ -167,17 +164,39 @@ def test_target_scoring_and_listwise_loss_backpropagate_through_paths():
             "q",
             (
                 TargetCandidate("positive", ("evidence",)),
-                TargetCandidate("negative", ()),
+                TargetCandidate("negative", ("evidence",)),
             ),
-            positive_index=0,
+            direct_positive_index=0,
+            evidence_positive_index=1,
         )
     ]
 
-    scores = score_target_batch(model, examples, feature_store(), torch.device("cpu"), PathAggregator())
-    loss = listwise_cross_entropy(scores.logits, scores.positive_indices, scores.candidate_mask)
+    store = feature_store()
+    scores = score_target_batch(model, examples, store, torch.device("cpu"), PathAggregator())
+    with torch.no_grad():
+        expected_direct = model.score_pairs(
+            [store.get("q"), store.get("q")],
+            [store.get("positive"), store.get("negative")],
+        ).reshape(1, 2)
+    direct_loss = listwise_cross_entropy(
+        scores.direct.logits,
+        scores.direct.positive_indices,
+        scores.direct.candidate_mask,
+    )
+    evidence_loss = listwise_cross_entropy(
+        scores.evidence.logits,
+        scores.evidence.positive_indices,
+        scores.evidence.candidate_mask,
+    )
+    loss = direct_loss + evidence_loss
     loss.backward()
 
-    assert scores.logits.shape == (1, 2)
+    assert scores.direct.logits.shape == (1, 2)
+    assert scores.evidence.logits.shape == (1, 2)
+    assert scores.direct.positive_indices.tolist() == [0]
+    assert scores.evidence.positive_indices.tolist() == [1]
+    assert torch.allclose(scores.direct.logits, expected_direct)
+    assert torch.equal(scores.evidence.candidate_mask, torch.tensor([[True, True]]))
     assert torch.isfinite(loss)
     assert model.relations["table_to_text"].grad is not None
     assert model.relations["text_to_table"].grad is not None
@@ -278,9 +297,10 @@ def test_all_four_training_stages_run_on_synthetic_features():
             "q",
             (
                 TargetCandidate("positive", ("evidence",)),
-                TargetCandidate("negative", ()),
+                TargetCandidate("negative", ("evidence",)),
             ),
-            positive_index=0,
+            direct_positive_index=0,
+            evidence_positive_index=0,
         )
     ]
     teacher_model = teacher()
@@ -363,13 +383,15 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
         json.dumps(
             {
                 "query_id": "q",
-                "positive_target_id": "positive",
+                "direct_positive_target_id": "positive",
+                "evidence_positive_target_id": "positive",
                 "candidates": [
                     {"target_id": "positive", "evidence_ids": ["e1"]},
                     {"target_id": "negative", "evidence_ids": []},
                 ],
                 "positive_target_ids": ["positive", "another_positive"],
-                "teacher_logits": [2.0, -1.0],
+                "teacher_direct_logits": [2.0, -1.0],
+                "teacher_evidence_logits": [1.5, 0.0],
                 "dataset": "2k",
                 "split": "train",
             }
@@ -383,11 +405,59 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
 
     assert store.get("q").object_type == "table"
     assert store.get("q").row_embeddings.shape == (1, 4)
-    assert examples[0].positive_index == 0
+    assert examples[0].direct_positive_index == 0
+    assert examples[0].evidence_positive_index == 0
     assert examples[0].candidates[0].evidence_ids == ("e1",)
     assert examples[0].dataset == "2k"
-    assert examples[0].teacher_logits == (2.0, -1.0)
+    assert examples[0].teacher_direct_logits == (2.0, -1.0)
+    assert examples[0].teacher_evidence_logits == (1.5, 0.0)
     assert examples[0].positive_target_ids == ("positive", "another_positive")
+
+
+def test_target_loader_rejects_obsolete_merged_teacher_logits(tmp_path):
+    path = tmp_path / "targets.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "direct_positive_target_id": "positive",
+                "evidence_positive_target_id": "positive",
+                "candidates": [
+                    {"target_id": "positive", "evidence_ids": ["evidence"]},
+                    {"target_id": "negative", "evidence_ids": []},
+                ],
+                "teacher_logits": [2.0, -1.0],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="merged target teacher_logits are obsolete"):
+        load_target_examples(path)
+
+
+def test_target_loader_rejects_shared_channel_positive(tmp_path):
+    path = tmp_path / "targets.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "positive_target_id": "positive",
+                "candidates": [
+                    {"target_id": "positive", "evidence_ids": ["evidence"]},
+                    {"target_id": "negative", "evidence_ids": []},
+                ],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="require separate"):
+        load_target_examples(path)
 
 
 class FakeQwenModel:
@@ -704,17 +774,61 @@ def test_student_edge_distillation_reuses_cached_teacher_logits():
     assert history[0]["dataset_samples"] == {"2k": 1}
 
 
+def test_student_path_distillation_reuses_separate_cached_teacher_logits():
+    store = feature_store()
+    teacher_model = teacher()
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    example = TargetExample(
+        "q",
+        (
+            TargetCandidate("positive", ("evidence",)),
+            TargetCandidate("negative", ("evidence",)),
+        ),
+        0,
+        1,
+        dataset="2k",
+        teacher_direct_logits=(3.0, -2.0),
+        teacher_evidence_logits=(-1.0, 2.0),
+    )
+
+    def unexpected_teacher_call(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("cached Teacher channel logits were not used")
+
+    teacher_model.score_pairs = unexpected_teacher_call
+    history = train_student_paths(
+        student_model,
+        teacher_model,
+        [example],
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        PathAggregator(),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.5,
+    )
+
+    assert history[0]["dataset_samples"] == {"2k": 1}
+    assert history[0]["direct_distillation_loss"] > 0
+    assert history[0]["evidence_distillation_loss"] > 0
+
+
 def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
     original = TargetExample(
         "q",
         (
-            TargetCandidate("positive", ("positive_evidence",)),
+            TargetCandidate("direct_positive", ()),
+            TargetCandidate("evidence_positive", ("positive_evidence",)),
             TargetCandidate("fallback", ()),
         ),
-        positive_index=0,
+        direct_positive_index=0,
+        evidence_positive_index=1,
         dataset="20k",
         split="train",
-        positive_target_ids=("positive", "other_positive"),
+        positive_target_ids=("direct_positive", "evidence_positive", "other_positive"),
     )
     retrieval_results = [
         {"target_id": "other_positive", "score": 10.0, "paths": [{"kind": "direct", "path_score": 10.0}]},
@@ -738,11 +852,14 @@ def test_hard_negative_refresh_excludes_gt_and_keeps_hard_evidence_paths():
     )
 
     assert [candidate.target_id for candidate in candidate_set.candidates] == [
-        "positive",
+        "direct_positive",
+        "evidence_positive",
         "hard_1",
         "hard_2",
     ]
-    assert candidate_set.candidates[1:] == (
+    assert candidate_set.direct_positive_index == 0
+    assert candidate_set.evidence_positive_index == 1
+    assert candidate_set.candidates[2:] == (
         TargetCandidate("hard_1", ("e1", "e2")),
         TargetCandidate("hard_2", ()),
     )
@@ -759,7 +876,8 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     original = TargetExample(
         "q",
         (TargetCandidate("positive", ()), TargetCandidate("hard", ())),
-        positive_index=0,
+        direct_positive_index=0,
+        evidence_positive_index=0,
         dataset="2k",
         split="train",
     )
@@ -785,15 +903,18 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
         batch_size=1,
     )
 
-    assert len(target_records[0]["teacher_logits"]) == 2
+    assert len(target_records[0]["teacher_direct_logits"]) == 2
+    assert len(target_records[0]["teacher_evidence_logits"]) == 2
     assert len(edge_records[0]["teacher_logits"]) == 2
     assert edge_records[0]["destination_type"] == "table"
     assert set(target_records[0]) == {
         "query_id",
-        "positive_target_id",
+        "direct_positive_target_id",
+        "evidence_positive_target_id",
         "positive_target_ids",
         "candidates",
-        "teacher_logits",
+        "teacher_direct_logits",
+        "teacher_evidence_logits",
         "dataset",
         "split",
     }
@@ -820,7 +941,12 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     loaded_target = load_target_examples(target_path, max_evidence=1)[0]
     loaded_edge = load_edge_examples(edge_path)[0]
 
-    assert loaded_target.teacher_logits == pytest.approx(target_records[0]["teacher_logits"])
+    assert loaded_target.teacher_direct_logits == pytest.approx(
+        target_records[0]["teacher_direct_logits"]
+    )
+    assert loaded_target.teacher_evidence_logits == pytest.approx(
+        target_records[0]["teacher_evidence_logits"]
+    )
     assert loaded_target.teacher_score_config.evidence_aggregation == "logsumexp"
     assert loaded_target.teacher_checkpoint_sha256 == "synthetic"
     assert loaded_edge.teacher_logits == pytest.approx(edge_records[0]["teacher_logits"])
@@ -845,7 +971,8 @@ def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
             TargetCandidate("positive", ("positive_text", "positive_image")),
             TargetCandidate("hard", ()),
         ),
-        positive_index=0,
+        direct_positive_index=0,
+        evidence_positive_index=0,
         dataset="2k",
         split="train",
     )

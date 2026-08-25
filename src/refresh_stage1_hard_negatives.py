@@ -99,6 +99,7 @@ def run(args: argparse.Namespace) -> None:
         "evidence_aggregation": evidence_aggregation,
         "evidence_top_k": evidence_top_k,
         "target_fusion": "rrf",
+        "teacher_target_channels": ["direct", "evidence"],
         "rrf_k": args.rrf_k,
     }
     output_paths = [Path(args.output_target_lists)]

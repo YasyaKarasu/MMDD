@@ -23,6 +23,12 @@ class ListScores:
     positive_indices: torch.Tensor
 
 
+@dataclass(frozen=True)
+class TargetScores:
+    direct: ListScores
+    evidence: ListScores
+
+
 def _device_features(
     object_id: str,
     store: FeatureStore,
@@ -92,7 +98,7 @@ def score_target_batch(
     store: FeatureStore,
     device: torch.device,
     aggregator: PathAggregator,
-) -> ListScores:
+) -> TargetScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
     feature_cache: dict[str, ObjectFeatures] = {}
     direct_sources = []
@@ -120,30 +126,58 @@ def score_target_batch(
     direct_scores = model.score_pairs(direct_sources, direct_destinations)
     if evidence_sources:
         query_evidence_scores = model.score_pairs(evidence_sources, evidence_destinations)
-        evidence_target_scores = model.score_pairs(target_sources, target_destinations)
+        evidence_target_edge_scores = model.score_pairs(target_sources, target_destinations)
     else:
         query_evidence_scores = direct_scores.new_empty(0)
-        evidence_target_scores = direct_scores.new_empty(0)
+        evidence_target_edge_scores = direct_scores.new_empty(0)
 
-    target_scores = []
+    evidence_scores = []
     evidence_offset = 0
-    for direct_score, evidence_count in zip(direct_scores, evidence_lengths):
+    for evidence_count in evidence_lengths:
         if evidence_count:
             query_evidence = query_evidence_scores[evidence_offset : evidence_offset + evidence_count]
-            evidence_target = evidence_target_scores[evidence_offset : evidence_offset + evidence_count]
+            evidence_target = evidence_target_edge_scores[
+                evidence_offset : evidence_offset + evidence_count
+            ]
             evidence_offset += evidence_count
-            combined = aggregator(
-                direct_score.reshape(1, 1),
+            evidence_score = aggregator(
                 query_evidence.reshape(1, 1, evidence_count),
                 evidence_target.reshape(1, 1, evidence_count),
                 torch.ones((1, 1, evidence_count), dtype=torch.bool, device=device),
             ).squeeze()
         else:
-            combined = direct_score
-        target_scores.append(combined)
+            evidence_score = direct_scores.new_zeros(())
+        evidence_scores.append(evidence_score)
 
     candidate_lengths = [len(example.candidates) for example in examples]
-    rows = pad_sequence(list(torch.stack(target_scores).split(candidate_lengths)), batch_first=True, padding_value=0.0)
-    candidate_mask = _mask(candidate_lengths, rows.shape[1], device)
-    positive_indices = torch.tensor([example.positive_index for example in examples], device=device)
-    return ListScores(rows, candidate_mask, positive_indices)
+    direct_rows = pad_sequence(
+        list(direct_scores.split(candidate_lengths)), batch_first=True, padding_value=0.0
+    )
+    evidence_rows = pad_sequence(
+        list(torch.stack(evidence_scores).split(candidate_lengths)),
+        batch_first=True,
+        padding_value=0.0,
+    )
+    candidate_mask = _mask(candidate_lengths, direct_rows.shape[1], device)
+    evidence_mask = pad_sequence(
+        [
+            torch.tensor(
+                [bool(candidate.evidence_ids) for candidate in example.candidates],
+                dtype=torch.bool,
+                device=device,
+            )
+            for example in examples
+        ],
+        batch_first=True,
+        padding_value=False,
+    )
+    direct_positive_indices = torch.tensor(
+        [example.direct_positive_index for example in examples], device=device
+    )
+    evidence_positive_indices = torch.tensor(
+        [example.evidence_positive_index for example in examples], device=device
+    )
+    return TargetScores(
+        direct=ListScores(direct_rows, candidate_mask, direct_positive_indices),
+        evidence=ListScores(evidence_rows, evidence_mask, evidence_positive_indices),
+    )

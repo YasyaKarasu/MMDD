@@ -183,6 +183,29 @@ def _evidence_by_target(
     return result
 
 
+def _recovery_evidence(
+    queries: dict[str, dict[str, Any]],
+    targets: dict[str, dict[str, Any]],
+    assets: list[dict[str, Any]],
+    recoveries: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], list[str]]:
+    asset_ids = {str(asset["asset_id"]) for asset in assets}
+    result: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for recovery in recoveries:
+        query_id = str(recovery.get("query_table_id", ""))
+        target_id = str(recovery.get("target_table_id", ""))
+        evidence_id = str(recovery.get("evidence", {}).get("asset_id", ""))
+        key = (query_id, target_id)
+        if (
+            query_id in queries
+            and target_id in targets
+            and evidence_id in asset_ids
+            and evidence_id not in result[key]
+        ):
+            result[key].append(evidence_id)
+    return result
+
+
 def _edge_evidence_ids(
     evidence_ids: Iterable[str],
     asset_types: dict[str, str],
@@ -301,6 +324,7 @@ def build_stage1_training_artifacts(
     }
     postings, inverse_document_frequency = _semantic_index(target_text)
     evidence_by_target = _evidence_by_target(targets, assets, recoveries)
+    recovery_evidence = _recovery_evidence(queries, targets, assets, recoveries)
     asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
     targets_by_split: dict[str, list[str]] = defaultdict(list)
     target_sets_by_split: dict[str, set[str]] = defaultdict(set)
@@ -324,10 +348,29 @@ def build_stage1_training_artifacts(
     edge_lists = []
     target_lists = []
     emitted_evidence_target_edges: set[tuple[str, str]] = set()
-    for query_id, positive_ids in positives_by_query.items():
+    for query_id, direct_positive_ids in positives_by_query.items():
         query = queries[query_id]
         split = str(query.get("split", "train"))
         split_targets = targets_by_split[split]
+        evidence_positive_ids = [
+            target_id
+            for recovery_query_id, target_id in recovery_evidence
+            if recovery_query_id == query_id
+            if str(targets[target_id].get("split", "train")) == split
+        ]
+        if not evidence_positive_ids:
+            evidence_positive_ids = [
+                target_id
+                for target_id in direct_positive_ids
+                if evidence_by_target[target_id]
+            ]
+        if not evidence_positive_ids:
+            evidence_positive_ids = [direct_positive_ids[0]]
+        positive_evidence_by_target = {
+            target_id: recovery_evidence.get((query_id, target_id), evidence_by_target[target_id])
+            for target_id in evidence_positive_ids
+        }
+        positive_ids = list(dict.fromkeys([*direct_positive_ids, *evidence_positive_ids]))
         excluded = set(positive_ids)
         selected: dict[str, str] = {}
 
@@ -349,7 +392,9 @@ def build_stage1_training_artifacts(
 
         rng = random.Random(f"{seed}:{query_id}")
         corrupted_id = _pick_random(split_targets, excluded, rng)
-        positive_evidence = evidence_by_target[positive_ids[0]][:max_evidence_per_target]
+        positive_evidence = positive_evidence_by_target[evidence_positive_ids[0]][
+            :max_evidence_per_target
+        ]
         if corrupted_id is not None and positive_evidence:
             selected["corrupted_path"] = corrupted_id
             excluded.add(corrupted_id)
@@ -365,38 +410,39 @@ def build_stage1_training_artifacts(
             "corrupted_path",
         )
         negative_ids = [selected[source] for source in ordered_sources if source in selected]
-        if not negative_ids:
+        candidate_ids = list(
+            dict.fromkeys([direct_positive_ids[0], evidence_positive_ids[0], *negative_ids])
+        )
+        if len(candidate_ids) < 2:
             continue
 
-        candidates = [
-            {
-                "target_id": positive_ids[0],
-                "evidence_ids": positive_evidence,
-            }
-        ]
-        for source in ordered_sources:
-            target_id = selected.get(source)
-            if target_id is None:
-                continue
-            candidate_evidence = (
-                positive_evidence
-                if source == "corrupted_path"
-                else evidence_by_target[target_id][:max_evidence_per_target]
-            )
+        candidates = []
+        for target_id in candidate_ids:
+            source = next((name for name, value in selected.items() if value == target_id), None)
             candidates.append(
                 {
                     "target_id": target_id,
-                    "evidence_ids": candidate_evidence,
+                    "evidence_ids": (
+                        positive_evidence
+                        if source == "corrupted_path"
+                        else positive_evidence_by_target.get(
+                            target_id, evidence_by_target[target_id]
+                        )[:max_evidence_per_target]
+                    ),
                 }
             )
 
-        for positive_id in positive_ids:
+        direct_hard_ids = [
+            target_id for target_id in evidence_positive_ids if target_id not in direct_positive_ids
+        ]
+        direct_negative_ids = list(dict.fromkeys([*direct_hard_ids, *negative_ids]))
+        for positive_id in direct_positive_ids:
             edge_lists.append(
                 {
                     "query_id": query_id,
                     "source_type": "table",
                     "positive_id": positive_id,
-                    "candidate_ids": [positive_id, *negative_ids],
+                    "candidate_ids": [positive_id, *direct_negative_ids],
                     "destination_type": "table",
                     "dataset": dataset_name,
                     "split": split,
@@ -404,23 +450,22 @@ def build_stage1_training_artifacts(
             )
 
         positive_evidence_ids = []
-        for positive_id in positive_ids:
+        for positive_id in evidence_positive_ids:
             for evidence_id in _edge_evidence_ids(
-                evidence_by_target[positive_id], asset_types, max_evidence_per_target
+                positive_evidence_by_target[positive_id],
+                asset_types,
+                max_evidence_per_target,
             ):
                 if evidence_id not in positive_evidence_ids:
                     positive_evidence_ids.append(evidence_id)
         positive_evidence_set = set(positive_evidence_ids)
 
         evidence_negatives: dict[str, list[str]] = defaultdict(list)
-        for source in ordered_sources:
-            negative_target_id = selected.get(source)
-            if negative_target_id is None:
+        for candidate in candidates:
+            if candidate["target_id"] in evidence_positive_ids:
                 continue
             seen_type = set()
-            for evidence_id in _edge_evidence_ids(
-                evidence_by_target[negative_target_id], asset_types, max_evidence_per_target
-            ):
+            for evidence_id in candidate["evidence_ids"]:
                 evidence_type = asset_types[evidence_id]
                 if (
                     evidence_type in seen_type
@@ -459,16 +504,19 @@ def build_stage1_training_artifacts(
                 }
             )
 
-        for positive_target_id in positive_ids:
+        evidence_positive_set = set(evidence_positive_ids)
+        for positive_target_id in evidence_positive_ids:
             for evidence_id in _edge_evidence_ids(
-                evidence_by_target[positive_target_id], asset_types, max_evidence_per_target
+                positive_evidence_by_target[positive_target_id],
+                asset_types,
+                max_evidence_per_target,
             ):
                 edge_key = (evidence_id, positive_target_id)
                 if edge_key in emitted_evidence_target_edges:
                     continue
-                excluded_targets = targets_by_evidence[evidence_id]
+                excluded_targets = targets_by_evidence[evidence_id] | evidence_positive_set
                 evidence_target_negatives = [
-                    target_id for target_id in negative_ids if target_id not in excluded_targets
+                    target_id for target_id in candidate_ids if target_id not in excluded_targets
                 ]
                 if not evidence_target_negatives:
                     fallback_id = _pick_random(split_targets, excluded_targets, rng)
@@ -491,7 +539,8 @@ def build_stage1_training_artifacts(
         target_lists.append(
             {
                 "query_id": query_id,
-                "positive_target_id": positive_ids[0],
+                "direct_positive_target_id": direct_positive_ids[0],
+                "evidence_positive_target_id": evidence_positive_ids[0],
                 "positive_target_ids": positive_ids,
                 "candidates": candidates,
                 "dataset": dataset_name,

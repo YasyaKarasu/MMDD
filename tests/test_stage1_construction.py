@@ -109,6 +109,8 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     )
     assert "text" not in image_object
     candidates = artifacts["target_lists"][0]["candidates"]
+    assert artifacts["target_lists"][0]["direct_positive_target_id"] == "positive"
+    assert artifacts["target_lists"][0]["evidence_positive_target_id"] == "positive"
     assert all(set(candidate) == {"target_id", "evidence_ids"} for candidate in candidates)
     by_target = {candidate["target_id"]: candidate for candidate in candidates}
     assert by_target["corrupted"]["evidence_ids"] == ["e_positive"]
@@ -206,6 +208,82 @@ def test_stage1_constructor_builds_cross_modal_edge_lists(tmp_path):
     assert edges[("text", "table")]["candidate_ids"] == ["positive", "negative"]
     assert edges[("image", "table")]["query_id"] == "positive_image"
     assert edges[("image", "table")]["candidate_ids"] == ["positive", "negative"]
+
+
+def test_stage1_constructor_uses_path_only_target_as_direct_hard_negative(tmp_path):
+    query = _table("q", ["Entity"], [["A"]])
+    direct = _table("direct", ["Key"], [["A"]])
+    path_only = _table("path_only", ["Value"], [["1"]])
+    negative = _table("negative", ["Other"], [["2"]])
+    assets = [
+        {"asset_id": "path_evidence", "asset_type": "text", "content": "A has value 1"},
+        {"asset_id": "direct_evidence", "asset_type": "text", "content": "direct context"},
+    ]
+    recoveries = [
+        {
+            "query_table_id": "q",
+            "target_table_id": "path_only",
+            "evidence": {"asset_id": "path_evidence"},
+        },
+        {"target_table_id": "direct", "evidence": {"asset_id": "direct_evidence"}},
+    ]
+    _write_jsonl(tmp_path / "query_tables.jsonl", [query])
+    _write_jsonl(tmp_path / "data_lake_tables.jsonl", [direct, path_only, negative])
+    _write_jsonl(tmp_path / "bridge_assets.jsonl", assets)
+    _write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [{"query_table_id": "q", "target_table_id": "direct", "split": "train"}],
+    )
+    _write_jsonl(tmp_path / "evidence_recoveries.jsonl", recoveries)
+
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="synthetic")
+
+    target_list = artifacts["target_lists"][0]
+    assert target_list["direct_positive_target_id"] == "direct"
+    assert target_list["evidence_positive_target_id"] == "path_only"
+    assert target_list["positive_target_ids"] == ["direct", "path_only"]
+    direct_edge = next(
+        edge
+        for edge in artifacts["edge_lists"]
+        if edge["query_id"] == "q" and edge["destination_type"] == "table"
+    )
+    assert direct_edge["positive_id"] == "direct"
+    assert direct_edge["candidate_ids"][1] == "path_only"
+    evidence_target_edge = next(
+        edge
+        for edge in artifacts["edge_lists"]
+        if edge["query_id"] == "path_evidence" and edge["destination_type"] == "table"
+    )
+    assert evidence_target_edge["positive_id"] == "path_only"
+    assert "direct" in evidence_target_edge["candidate_ids"]
+
+
+def test_stage1_constructor_keeps_direct_training_without_recovery(tmp_path):
+    query = _table("q", ["Entity"], [["A"]])
+    direct = _table("direct", ["Key"], [["A"]])
+    negative = _table("negative", ["Key"], [["B"]])
+    _write_jsonl(tmp_path / "query_tables.jsonl", [query])
+    _write_jsonl(tmp_path / "data_lake_tables.jsonl", [direct, negative])
+    _write_jsonl(
+        tmp_path / "bridge_assets.jsonl",
+        [{"asset_id": "unused", "asset_type": "text", "content": "unrelated"}],
+    )
+    _write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [{"query_table_id": "q", "target_table_id": "direct", "split": "train"}],
+    )
+
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="synthetic")
+
+    target_list = artifacts["target_lists"][0]
+    assert target_list["direct_positive_target_id"] == "direct"
+    assert target_list["candidates"][0]["evidence_ids"] == []
+    direct_edge = next(
+        edge
+        for edge in artifacts["edge_lists"]
+        if edge["query_id"] == "q" and edge["destination_type"] == "table"
+    )
+    assert direct_edge["positive_id"] == "direct"
 
 
 def test_stage1_constructor_resolves_raw_data_lake_source_references(tmp_path):
