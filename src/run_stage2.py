@@ -8,10 +8,14 @@ import json
 from pathlib import Path
 
 import torch
-
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage2.checkpoints import load_candidate_scorer
-from mmdd_stage2.data import direct_target_ids, iter_retrieval_results, load_stage2_objects
+from mmdd_stage2.data import (
+    direct_target_ids,
+    iter_retrieval_results,
+    load_stage2_objects,
+    validate_retrieval_path_budget,
+)
 from mmdd_stage2.pipeline import Stage2Verifier
 from mmdd_stage2.qwen import QwenStage2Backend
 from mmdd_stage2.routing import SimilarityEvidenceRouter
@@ -19,12 +23,23 @@ from mmdd_stage2.verifier import build_evidence_bundles
 
 
 def run(args: argparse.Namespace) -> dict:
+    if args.max_targets <= 0:
+        raise ValueError("--max-targets must be positive")
+    if args.top_k_evidence < 0 or args.max_direct_targets < 0:
+        raise ValueError(
+            "--top-k-evidence and --max-direct-targets must be non-negative"
+        )
     records = list(iter_retrieval_results(Path(args.retrieval_results)))
     if args.query_id:
         records = [record for record in records if str(record["query_id"]) == args.query_id]
     if len(records) != 1:
         raise ValueError("Select exactly one retrieval record with --query-id")
     record = records[0]
+    validate_retrieval_path_budget(
+        record,
+        max_targets=args.max_targets,
+        top_k_evidence=args.top_k_evidence,
+    )
     results = record["results"][: args.max_targets]
     bundles = build_evidence_bundles(results, top_k_evidence=args.top_k_evidence)
     direct_ids = direct_target_ids(results)[: args.max_direct_targets]
@@ -91,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--focus-start-layer", type=int, default=14)
-    parser.add_argument("--top-k-evidence", type=int, default=10)
+    parser.add_argument("--top-k-evidence", type=int, default=4)
     parser.add_argument("--max-targets", type=int, default=10)
     parser.add_argument("--max-direct-targets", type=int, default=5)
     parser.add_argument("--max-text-evidence-tokens", type=int, default=1024)

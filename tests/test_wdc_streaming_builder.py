@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import sys
 from dataclasses import replace
@@ -98,6 +99,136 @@ def config_for(
 def selected_records(config: WdcPipelineConfig, artifact: str) -> list[dict[str, Any]]:
     manifest = config.work_dir / "select_sample" / "manifest.json"
     return [record for path in manifest_shards(manifest, artifact) for record in iter_jsonl(path)]
+
+
+def test_iter_dataset_artifact_reads_published_single_file(tmp_path: Path) -> None:
+    record = {"query_table_id": "q1", "target_table_id": "t1", "rel": 3}
+    data = (json.dumps(record) + "\n").encode("utf-8")
+    (tmp_path / "qrels.jsonl").write_bytes(data)
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "artifacts": {},
+                "single_files": {"qrels": "qrels.jsonl"},
+                "published_single_files": {
+                    "qrels.jsonl": {
+                        "path": "qrels.jsonl",
+                        "records": 1,
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list(iter_dataset_artifact(tmp_path, "qrels")) == [record]
+
+
+def test_iter_dataset_artifact_reads_legacy_shards_and_single_files(
+    tmp_path: Path,
+) -> None:
+    query = {"table_id": "q1"}
+    qrel = {"query_table_id": "q1", "target_table_id": "t1", "rel": 3}
+    shard = tmp_path / "query_tables" / "part-00000.jsonl"
+    shard.parent.mkdir()
+    shard.write_text(json.dumps(query) + "\n", encoding="utf-8")
+    (tmp_path / "qrels.jsonl").write_text(
+        json.dumps(qrel) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "sharded_jsonl",
+                "artifacts": {
+                    "query_tables": {
+                        "directory": "query_tables",
+                        "total_records": 1,
+                        "shards": [
+                            {
+                                "path": "query_tables/part-00000.jsonl",
+                                "records": 1,
+                            }
+                        ],
+                    }
+                },
+                "single_files": {"qrels": "qrels.jsonl"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list(iter_dataset_artifact(tmp_path, "query_tables")) == [query]
+    assert list(iter_dataset_artifact(tmp_path, "qrels")) == [qrel]
+
+
+def test_iter_dataset_artifact_reads_compact_artifact_path(tmp_path: Path) -> None:
+    query = {"table_id": "q1"}
+    (tmp_path / "query_tables.jsonl").write_text(
+        json.dumps(query) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "mmdd_joinability_research_v1",
+                "artifacts": {
+                    "query_tables": {
+                        "path": "query_tables.jsonl",
+                        "records": 1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list(iter_dataset_artifact(tmp_path, "query_tables")) == [query]
+
+
+@pytest.mark.parametrize("complete", [False, None, 0, "true"])
+def test_iter_dataset_artifact_rejects_invalid_explicit_completion_state(
+    tmp_path: Path, complete: Any,
+) -> None:
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps({"complete": complete, "artifacts": {}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dataset is incomplete"):
+        list(iter_dataset_artifact(tmp_path, "query_tables"))
+
+
+def test_iter_dataset_artifact_enforces_available_checksum(tmp_path: Path) -> None:
+    shard = tmp_path / "query_tables" / "part-00000.jsonl"
+    shard.parent.mkdir()
+    shard.write_text('{"table_id":"q1"}\n', encoding="utf-8")
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "artifacts": {
+                    "query_tables": {
+                        "shards": [
+                            {
+                                "path": "query_tables/part-00000.jsonl",
+                                "records": 1,
+                                "bytes": shard.stat().st_size,
+                                "sha256": "invalid",
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid file"):
+        list(iter_dataset_artifact(tmp_path, "query_tables"))
 
 
 def test_selection_streams_catalog_and_seed_is_stable(

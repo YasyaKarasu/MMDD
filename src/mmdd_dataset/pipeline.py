@@ -14,7 +14,6 @@ from .joinability import BuildConfig, build_joinability_dataset, table_asset_lin
 from .tables import prepare_entitables, prepare_wdc
 from .utils import read_jsonl, source_splits, write_json, write_jsonl
 
-
 ARTIFACTS = (
     "source_tables",
     "entities",
@@ -73,6 +72,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     text_extractor = None
     image_extractor = None
+    luna_extractor = None
+    terra_extractor = None
     if args.extractions_jsonl:
         extractions = list(read_jsonl(Path(args.extractions_jsonl)))
     elif args.text_model_base_url or args.image_model_base_url:
@@ -96,6 +97,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             if args.image_model_base_url
             else None
         )
+        if args.auto_check_mode == "cascade":
+            luna_extractor = OpenAICompatibleExtractor(
+                args.auto_check_luna_base_url,
+                args.auto_check_luna_model,
+                api_key_env=args.auto_check_api_key_env,
+                timeout=args.model_timeout,
+            )
+            terra_extractor = OpenAICompatibleExtractor(
+                args.auto_check_terra_base_url,
+                args.auto_check_terra_model,
+                api_key_env=args.auto_check_api_key_env,
+                timeout=args.model_timeout,
+            )
         extractions = build_extractions(
             prepared.source_tables,
             prepared.entities,
@@ -125,6 +139,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             assets,
             text_extractor,
             image_extractor=image_extractor,
+            review_mode=args.auto_check_mode,
+            luna_extractor=luna_extractor,
+            terra_extractor=terra_extractor,
         )
     artifacts.update(
         {
@@ -203,6 +220,26 @@ def parser() -> argparse.ArgumentParser:
     model.add_argument("--image-model-name", default="Qwen3-VL-8B-Instruct")
     model.add_argument("--image-model-api-key-env", default="VLLM_API_KEY")
     model.add_argument("--model-timeout", type=float, default=120)
+    model.add_argument(
+        "--auto-check-mode",
+        choices=("cascade", "local"),
+        default="cascade",
+        help=(
+            "Use local+Luna+Terra consensus checking, or local-only checking "
+            "for builds that must not call a remote API."
+        ),
+    )
+    model.add_argument(
+        "--auto-check-luna-base-url",
+        default="https://api.openai.com/v1",
+    )
+    model.add_argument("--auto-check-luna-model", default="gpt-5.6-luna")
+    model.add_argument(
+        "--auto-check-terra-base-url",
+        default="https://api.openai.com/v1",
+    )
+    model.add_argument("--auto-check-terra-model", default="gpt-5.6-terra")
+    model.add_argument("--auto-check-api-key-env", default="OPENAI_API_KEY")
 
     algorithm = result.add_argument_group("joinability algorithm")
     algorithm.add_argument("--query-rows", type=int, default=5)

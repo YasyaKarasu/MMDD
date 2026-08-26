@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -37,7 +37,9 @@ def _device_features(
     include_hidden: bool,
 ) -> ObjectFeatures:
     if object_id not in cache:
-        cache[object_id] = store.get(object_id).for_scoring(
+        cache[object_id] = store.get(
+            object_id, include_hidden=include_hidden
+        ).for_scoring(
             device, include_hidden=include_hidden
         )
     return cache[object_id]

@@ -29,10 +29,7 @@ def load_candidate_scorer(
     *,
     expected_model_dir: Path | None = None,
 ) -> CandidateColumnScorer:
-    try:
-        payload = torch.load(path, map_location=device, weights_only=True)
-    except TypeError:  # pragma: no cover - compatibility with older PyTorch.
-        payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=True)
     if payload.get("format_version") != 1:
         raise ValueError(f"{path}: unsupported Stage-2 checkpoint")
     if expected_model_dir is not None:

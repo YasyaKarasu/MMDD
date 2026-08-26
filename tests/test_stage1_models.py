@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import random
 import sys
@@ -12,10 +14,14 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import cache_stage1_features as stage1_cache
+import compact_stage1_feature_cache as compact_cache
+import refresh_stage1_hard_negatives as hard_negative_refresh
 from cache_stage1_features import (
     EMBEDDING_INSTRUCTIONS,
     build_object_features,
     embedding_instructions,
+    teacher_object_ids,
 )
 from mmdd_stage1.checkpoints import load_path_aggregation
 from mmdd_stage1.data import (
@@ -29,6 +35,7 @@ from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage1.mining import (
     HardPath,
     build_hard_candidate_set,
+    hard_candidate_records,
     retrieve_hard_candidate_sets,
     score_hard_candidate_sets,
 )
@@ -75,9 +82,42 @@ def feature_store() -> FeatureStore:
     )
 
 
-def test_object_features_rejects_obsolete_type_aliases():
-    with pytest.raises(ValueError, match="Unknown object type"):
-        ObjectFeatures("legacy", "table_fragment", torch.ones(4))
+@pytest.mark.parametrize(
+    ("legacy_type", "object_type"),
+    [
+        ("table_fragment", "table"),
+        ("text_asset", "text"),
+        ("image_asset", "image"),
+    ],
+)
+def test_object_features_normalizes_historical_type_aliases(
+    legacy_type, object_type
+):
+    assert ObjectFeatures("legacy", legacy_type, torch.ones(4)).object_type == object_type
+
+
+def test_consolidated_store_loads_prepooled_legacy_table_without_groups(tmp_path):
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    cache = tmp_path / "features.pt"
+    torch.save(
+        {
+            "objects": {
+                "legacy": {
+                    "object_type": "table_fragment",
+                    "embedding": torch.ones(4),
+                    "hidden_states": hidden_states,
+                }
+            }
+        },
+        cache,
+    )
+
+    features = FeatureStore.from_path(cache).get("legacy")
+
+    assert features.object_type == "table"
+    assert torch.equal(features.hidden_states, hidden_states)
+    assert features.token_groups is None
+    assert teacher().compress(features).shape == (3, 8)
 
 
 def teacher() -> TeacherJoinabilityModel:
@@ -442,6 +482,200 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
     assert examples[0].positive_target_ids == ("positive", "another_positive")
 
 
+def test_lazy_feature_store_loads_teacher_tier_only_when_requested(tmp_path):
+    feature_dir = tmp_path / "features"
+    (feature_dir / "objects").mkdir(parents=True)
+    (feature_dir / "teacher_objects").mkdir()
+    torch.save(
+        {
+            "embedding": torch.ones(4),
+            "row_embeddings": torch.ones(1, 4),
+        },
+        feature_dir / "objects" / "q.pt",
+    )
+    torch.save(
+        {
+            "hidden_states": torch.ones(2, 4),
+            "token_groups": torch.tensor([0, 1]),
+            "embedding": torch.zeros(4),
+            "row_embeddings": torch.zeros(1, 4),
+        },
+        feature_dir / "teacher_objects" / "q.pt",
+    )
+    (feature_dir / "manifest.jsonl").write_text(
+        json.dumps(
+            {
+                "object_id": "q",
+                "object_type": "table",
+                "feature_path": "objects/q.pt",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (feature_dir / "teacher_manifest.jsonl").write_text(
+        json.dumps(
+            {
+                "object_id": "q",
+                "object_type": "table",
+                "teacher_feature_path": "teacher_objects/q.pt",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = FeatureStore.from_path(feature_dir)
+    base = store.get("q", include_hidden=False)
+    teacher_features = store.get("q", include_hidden=True)
+
+    assert base.hidden_states is None
+    assert base.row_embeddings.shape == (1, 4)
+    assert teacher_features.hidden_states.shape == (2, 4)
+    assert teacher_features.token_groups.tolist() == [0, 1]
+    assert torch.equal(teacher_features.embedding, torch.ones(4))
+    assert torch.equal(teacher_features.row_embeddings, torch.ones(1, 4))
+    assert store.dimensions() == (4, 4)
+
+    torch.save(
+        {"token_groups": torch.tensor([0, 1])},
+        feature_dir / "teacher_objects" / "q.pt",
+    )
+    with pytest.raises(ValueError, match="has no hidden_states"):
+        FeatureStore.from_path(feature_dir).get("q", include_hidden=True)
+
+
+def test_legacy_feature_cache_conversion_pools_tables_and_drops_unneeded_hidden(
+    tmp_path,
+):
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    records = []
+    legacy_table_hidden = None
+    for object_id, object_type, cached_type in (
+        ("q", "table", "table"),
+        ("t", "table_fragment", "table"),
+        ("e", "text_asset", "text"),
+    ):
+        cached = feature(object_id, cached_type, 0.2)
+        payload = {
+            "embedding": cached.embedding,
+            "hidden_states": cached.hidden_states,
+        }
+        if object_id == "q":
+            payload["token_groups"] = cached.token_groups
+        if object_id == "t":
+            legacy_table_hidden = cached.hidden_states
+        torch.save(payload, legacy / f"{object_id}.pt")
+        records.append(
+            {
+                "object_id": object_id,
+                "object_type": object_type,
+                "feature_path": f"{object_id}.pt",
+            }
+        )
+    (legacy / "manifest.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    teacher_data = tmp_path / "teacher.jsonl"
+    teacher_data.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "candidate_ids": ["t"],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "compact"
+    args = argparse.Namespace(
+        input_dir=str(legacy),
+        output_dir=str(output),
+        teacher_data=[str(teacher_data)],
+        teacher_split="train",
+    )
+
+    compact_cache.run(args)
+    compact_cache.run(args)
+
+    store = FeatureStore.from_path(output)
+    assert store.get("q").hidden_states.shape == (2, 4)
+    assert store.get("q").token_groups.tolist() == [0, 1]
+    assert torch.equal(store.get("t").hidden_states, legacy_table_hidden)
+    assert store.get("t").token_groups.tolist() == [0, 1, 2, 3]
+    assert store.get("e").hidden_states is None
+    assert len((output / "manifest.jsonl").read_text().splitlines()) == 3
+    assert len((output / "teacher_manifest.jsonl").read_text().splitlines()) == 2
+
+    first_record = json.loads(
+        (output / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    (output / first_record["feature_path"]).unlink()
+    with pytest.raises(FileNotFoundError, match="missing feature file"):
+        compact_cache.run(args)
+
+
+def test_compact_resume_validates_existing_payload_content_and_path(tmp_path):
+    output = tmp_path / "compact"
+    (output / "objects").mkdir(parents=True)
+    (output / "teacher_objects").mkdir()
+    object_id = "q"
+    name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
+    source = {
+        "object_id": object_id,
+        "object_type": "table",
+        "source_fingerprint": "source-v1",
+    }
+    base_record = {
+        **source,
+        "feature_path": f"objects/{name}",
+    }
+    base_path = output / base_record["feature_path"]
+
+    def validate_base(record=base_record):
+        compact_cache._validate_completed_record(
+            output,
+            record,
+            source,
+            path_field="feature_path",
+            directory="objects",
+            required_tensor="embedding",
+        )
+
+    base_path.write_bytes(b"")
+    with pytest.raises(ValueError, match="payload is empty"):
+        validate_base()
+
+    torch.save(torch.ones(4), base_path)
+    with pytest.raises(ValueError, match="expected a feature mapping"):
+        validate_base()
+
+    torch.save({}, base_path)
+    with pytest.raises(ValueError, match="no tensor embedding"):
+        validate_base()
+
+    wrong_path_record = {**base_record, "feature_path": "objects/wrong.pt"}
+    with pytest.raises(ValueError, match="cached feature_path must be"):
+        validate_base(wrong_path_record)
+
+    teacher_record = {
+        **source,
+        "teacher_feature_path": f"teacher_objects/{name}",
+    }
+    torch.save({}, output / teacher_record["teacher_feature_path"])
+    with pytest.raises(ValueError, match="no tensor hidden_states"):
+        compact_cache._validate_completed_record(
+            output,
+            teacher_record,
+            source,
+            path_field="teacher_feature_path",
+            directory="teacher_objects",
+            required_tensor="hidden_states",
+        )
+
+
 def test_target_loader_rejects_obsolete_merged_teacher_logits(tmp_path):
     path = tmp_path / "targets.jsonl"
     path.write_text(
@@ -491,6 +725,13 @@ def test_target_loader_rejects_shared_channel_positive(tmp_path):
 class FakeQwenModel:
     device = torch.device("cpu")
 
+    def to(self, device):
+        self.device = device
+        return self
+
+    def eval(self):
+        return self
+
 
 class FakeQwenEmbedder:
     model = FakeQwenModel()
@@ -516,7 +757,8 @@ class FakeQwenEmbedder:
             del kwargs
             return f"system prompt user {conversation} assistant"
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
         self.forward_calls = 0
         self.instructions = []
         self.processor = self.Processor()
@@ -541,6 +783,7 @@ class FakeQwenEmbedder:
 
     @staticmethod
     def _pooling_last(hidden_states, attention_mask):
+        assert attention_mask.dtype == torch.long
         indices = attention_mask.sum(dim=1) - 1
         return hidden_states[torch.arange(hidden_states.shape[0]), indices]
 
@@ -563,9 +806,111 @@ def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
     assert embedder.forward_calls == 1
     assert payload["embedding"].shape == (4,)
     assert payload["embedding"].norm().item() == pytest.approx(1.0)
-    assert payload["hidden_states"].shape == (6, 4)
-    assert payload["hidden_states"].dtype == torch.float16
-    assert payload["token_groups"].tolist() == [0, 0, 0, 1, 1, 1]
+    assert payload["hidden_states"].shape == (2, 4)
+    assert payload["hidden_states"].dtype == torch.float32
+    assert payload["token_groups"].tolist() == [0, 1]
+
+
+def test_qwen_cache_builder_skips_table_teacher_features_for_base_only(
+    tmp_path, monkeypatch
+):
+    embedder = FakeQwenEmbedder()
+    monkeypatch.setattr(
+        stage1_cache,
+        "_table_token_groups",
+        lambda *_args, **_kwargs: pytest.fail("base-only build grouped table tokens"),
+    )
+    monkeypatch.setattr(
+        stage1_cache,
+        "structural_table_pool",
+        lambda *_args, **_kwargs: pytest.fail("base-only build pooled table tokens"),
+    )
+
+    payload = build_object_features(
+        embedder,
+        {
+            "object_id": "t",
+            "object_type": "table",
+            "embedding_role": "target",
+            "table_parts": ["schema player country", "row Messi Argentina"],
+        },
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+        include_hidden=False,
+    )
+
+    assert set(payload) == {"embedding"}
+    assert embedder.forward_calls == 1
+
+
+def test_qwen_cache_builder_skips_query_rows_for_teacher_only(tmp_path):
+    embedder = FakeQwenEmbedder()
+
+    payload = build_object_features(
+        embedder,
+        {
+            "object_id": "q",
+            "object_type": "table",
+            "embedding_role": "query",
+            "table_parts": ["schema player country", "row Messi Argentina"],
+        },
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+        include_row_embeddings=False,
+    )
+
+    assert "hidden_states" in payload
+    assert "row_embeddings" not in payload
+    assert embedder.forward_calls == 1
+
+
+def test_teacher_object_ids_collects_only_the_selected_split(tmp_path):
+    edges = tmp_path / "edges.jsonl"
+    targets = tmp_path / "targets.jsonl"
+    edges.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "query_id": "q",
+                        "candidate_ids": ["positive", "negative"],
+                        "split": "train",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "query_id": "held_out",
+                        "candidate_ids": ["test_target"],
+                        "split": "test",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    targets.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "candidates": [
+                    {"target_id": "positive", "evidence_ids": ["evidence"]}
+                ],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert teacher_object_ids([edges, targets]) == {
+        "q",
+        "positive",
+        "negative",
+        "evidence",
+    }
 
 
 def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
@@ -596,6 +941,128 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
         EMBEDDING_INSTRUCTIONS[("query_row", "table")],
         EMBEDDING_INSTRUCTIONS[("query_row", "table")],
     ]
+
+
+def test_qwen_cache_builder_truncates_oversized_table_parts_without_dropping_groups(tmp_path):
+    class TruncatingFakeQwenEmbedder(FakeQwenEmbedder):
+        max_length = 80
+
+        def _preprocess_inputs(self, conversations):
+            inputs = super()._preprocess_inputs(conversations)
+            return {
+                name: tensor[:, : self.max_length]
+                for name, tensor in inputs.items()
+            }
+
+        class Tokenizer(FakeQwenEmbedder.Tokenizer):
+            def __call__(self, text, **kwargs):
+                tokenized = super().__call__(text, **kwargs)
+                max_length = kwargs.get("max_length")
+                if kwargs.get("truncation") and max_length is not None:
+                    tokenized = {
+                        name: values[:max_length]
+                        for name, values in tokenized.items()
+                    }
+                return tokenized
+
+        class Processor(FakeQwenEmbedder.Processor):
+            def __init__(self):
+                self.tokenizer = TruncatingFakeQwenEmbedder.Tokenizer()
+
+    embedder = TruncatingFakeQwenEmbedder()
+    payload = build_object_features(
+        embedder,
+        {
+            "object_id": "q",
+            "object_type": "table",
+            "embedding_role": "query",
+            "table_parts": [
+                "schema",
+                "row " + "x " * 5000,
+                "row retained",
+            ],
+        },
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+    )
+
+    assert torch.unique(payload["token_groups"]).tolist() == [0, 1, 2]
+    assert payload["row_embeddings"].shape == (2, 4)
+
+
+def test_qwen_cache_run_writes_base_tier_and_incremental_teacher_tier(
+    tmp_path, monkeypatch
+):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in [
+                {
+                    "object_id": "q",
+                    "object_type": "table",
+                    "embedding_role": "query",
+                    "table_parts": ["schema", "row q"],
+                },
+                {
+                    "object_id": "t",
+                    "object_type": "table",
+                    "embedding_role": "target",
+                    "table_parts": ["schema", "row t"],
+                },
+                {"object_id": "e", "object_type": "text", "text": "evidence"},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    initial = tmp_path / "initial.jsonl"
+    initial.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "candidate_ids": ["e"],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hard = tmp_path / "hard.jsonl"
+    hard.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "candidate_ids": ["t"],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "features"
+    args = argparse.Namespace(
+        input_jsonl=str(objects),
+        output_dir=str(output),
+        model_dir=str(tmp_path / "model"),
+        device="cpu",
+        dtype="fp16",
+        instruction=None,
+        teacher_data=[str(initial)],
+        teacher_split="train",
+    )
+    monkeypatch.setattr(stage1_cache, "_load_embedder_class", lambda _path: FakeQwenEmbedder)
+
+    stage1_cache.run(args)
+    args.teacher_data = [str(hard)]
+    stage1_cache.run(args)
+
+    assert len((output / "manifest.jsonl").read_text().splitlines()) == 3
+    assert len((output / "teacher_manifest.jsonl").read_text().splitlines()) == 3
+    store = FeatureStore.from_path(output)
+    assert store.get("t", include_hidden=False).hidden_states is None
+    assert store.get("t", include_hidden=True).hidden_states.shape == (2, 4)
 
 
 def test_embedding_instructions_distinguish_role_modality_and_query_rows():
@@ -678,7 +1145,7 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
     assert all({path["kind"] for path in result["paths"]} == {"direct", "evidence"} for result in results)
 
 
-def test_online_retrieval_uses_configured_two_level_path_aggregation():
+def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
     class StaticIndices:
         def search(self, source_id, destination_type, k):
             del k
@@ -696,7 +1163,7 @@ def test_online_retrieval_uses_configured_two_level_path_aggregation():
         direct_k=1,
         evidence_k=2,
         targets_per_evidence=1,
-        evidence_types=("text",),
+        evidence_types=("text", "text"),
         evidence_aggregation="topk_mean",
         evidence_top_k=1,
     )
@@ -707,6 +1174,43 @@ def test_online_retrieval_uses_configured_two_level_path_aggregation():
     assert "direct_score" not in result
     assert "direct_rank" not in result
     assert "evidence_rank" not in result
+
+
+def test_online_retrieval_scores_all_paths_before_compacting_stage2_detail():
+    class StaticIndices:
+        def search(self, source_id, destination_type, k):
+            del k
+            values = {
+                ("q", "table"): [("t1", 1.0), ("t2", 0.5)],
+                ("q", "text"): [("e1", 3.0), ("e2", 2.0), ("e3", 1.0)],
+                ("e1", "table"): [("t1", 1.0)],
+                ("e2", "table"): [("t1", 1.0)],
+                ("e3", "table"): [("t1", 1.0)],
+            }
+            return values.get((source_id, destination_type), [])
+
+    results = retrieve_zero_one_hop(
+        "q",
+        StaticIndices(),
+        direct_k=2,
+        evidence_k=3,
+        targets_per_evidence=1,
+        result_k=2,
+        evidence_types=("text",),
+        path_result_k=1,
+        evidence_path_k=2,
+    )
+
+    assert results[0]["target_id"] == "t1"
+    assert results[0]["evidence_score"] == pytest.approx(
+        torch.logsumexp(torch.tensor([4.0, 3.0, 2.0]), dim=0).item()
+    )
+    assert results[0]["paths"] == [
+        {"kind": "direct"},
+        {"kind": "evidence", "evidence_id": "e1", "path_score": 4.0},
+        {"kind": "evidence", "evidence_id": "e2", "path_score": 3.0},
+    ]
+    assert "paths" not in results[1]
 
 
 def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
@@ -930,8 +1434,21 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         targets_per_evidence=2,
         evidence_types=("text",),
     )[0]
+    duplicate_modality = retrieve_hard_candidate_sets(
+        [original],
+        StaticIndices(),
+        hard_targets_per_query=1,
+        hard_evidence_per_type=1,
+        hard_paths_per_query=1,
+        max_evidence_per_target=2,
+        direct_k=2,
+        evidence_k=3,
+        targets_per_evidence=2,
+        evidence_types=("text", "text"),
+    )[0]
 
     assert mined.evidence_negative_ids == ("evidence_only",)
+    assert duplicate_modality == mined
     assert mined.target_example.candidates == (
         TargetCandidate("direct_positive", ()),
         TargetCandidate("evidence_positive", ("positive_evidence",)),
@@ -972,6 +1489,15 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
     ]
 
 
+def test_mine_only_requires_edge_output_before_loading_inputs():
+    with pytest.raises(
+        ValueError, match="--output-edge-lists is required with --mine-only"
+    ):
+        hard_negative_refresh.run(
+            argparse.Namespace(mine_only=True, output_edge_lists=None)
+        )
+
+
 def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     features = {
         "q": feature("q", "table", 0.1),
@@ -996,6 +1522,14 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
         hard_targets_per_query=1,
         max_evidence_per_target=1,
     )
+
+    pending_targets, pending_edges = hard_candidate_records([candidate_set], store)
+    assert "teacher_direct_logits" not in pending_targets[0]
+    assert "teacher_logits" not in pending_edges[0]
+    assert pending_targets[0]["candidates"][1] == {
+        "target_id": "hard",
+        "evidence_ids": ["evidence"],
+    }
 
     target_records, edge_records = score_hard_candidate_sets(
         [candidate_set],

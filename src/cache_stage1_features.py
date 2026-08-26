@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Cache frozen Qwen3-VL hidden states and object embeddings for Stage-1."""
+"""Cache frozen Qwen3-VL features in separate retrieval and Teacher tiers."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mmdd_stage1.features import normalize_object_type
+from mmdd_stage1.models import structural_table_pool
 from torch.nn import functional as F
 
-from mmdd_stage1.features import normalize_object_type
-
-
 PROMPT_VERSION = "role_modality_v2_object_only"
+TEACHER_MANIFEST = "teacher_manifest.jsonl"
 EMBEDDING_INSTRUCTIONS = {
     ("query", "table"): (
         "Represent this query table for directed multimodal joinability retrieval. "
@@ -129,7 +129,10 @@ def encode_inputs(
     outputs = embedder.forward(inputs)
     hidden_states = outputs["last_hidden_state"]
     attention_mask = outputs["attention_mask"].bool()
-    pooled = embedder._pooling_last(hidden_states, attention_mask)
+    pooled = embedder._pooling_last(
+        hidden_states,
+        attention_mask.to(dtype=torch.long),
+    )
     embeddings = F.normalize(pooled.float(), p=2, dim=-1)
     return [
         (
@@ -223,6 +226,8 @@ def build_object_features(
     input_dir: Path,
     instruction: str | None,
     storage_dtype: torch.dtype,
+    include_hidden: bool = True,
+    include_row_embeddings: bool = True,
 ) -> dict[str, torch.Tensor]:
     object_type = normalize_object_type(str(record["object_type"]))
     object_instruction, row_instruction, embedding_role = embedding_instructions(
@@ -243,31 +248,104 @@ def build_object_features(
         "instruction": object_instruction,
     }
     embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
-    payload = {
-        "embedding": embedding.float(),
-        "hidden_states": hidden_states.to(dtype=storage_dtype),
-    }
+    payload = {"embedding": embedding.float()}
 
-    if object_type == "table":
-        assert isinstance(parts, list)
-        indices, groups = _table_token_groups(embedder, item, parts, input_ids)
-        payload["hidden_states"] = hidden_states.index_select(0, indices).to(dtype=storage_dtype)
-        payload["token_groups"] = groups
+    if object_type != "table":
+        if include_hidden:
+            payload["hidden_states"] = hidden_states.to(dtype=storage_dtype)
+        return payload
 
-        if embedding_role == "query":
-            routing_outputs = encode_inputs(
-                embedder,
-                [
-                    {
-                        "text": text,
-                        "instruction": row_instruction,
-                    }
-                    for text in (f"{parts[0]}\n{row}" for row in parts[1:])
-                ],
-            )
-            payload["row_embeddings"] = torch.stack([embedding for embedding, _, _ in routing_outputs])
+    assert isinstance(parts, list)
+    encoded_parts = parts
+    if include_hidden:
+        try:
+            indices, groups = _table_token_groups(embedder, item, encoded_parts, input_ids)
+        except ValueError as error:
+            if str(error) != "Table truncation removed all tokens from at least one schema/row group":
+                raise
+            for max_chars in (4096, 2048, 1024, 512, 256, 128):
+                encoded_parts = [part[:max_chars].rstrip() for part in parts]
+                if encoded_parts == parts:
+                    continue
+                item["text"] = "\n".join(encoded_parts)
+                embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
+                try:
+                    indices, groups = _table_token_groups(
+                        embedder, item, encoded_parts, input_ids
+                    )
+                except ValueError as retry_error:
+                    if str(retry_error) == str(error):
+                        continue
+                    raise
+                print(
+                    json.dumps(
+                        {
+                            "object_id": str(record["object_id"]),
+                            "event": "table_parts_truncated",
+                            "max_chars_per_part": max_chars,
+                        }
+                    )
+                )
+                break
+            else:
+                raise
+            payload["embedding"] = embedding.float()
+        # Legacy caches loaded storage-dtype tokens as float32 before pooling.
+        # Preserve that numerical order, then keep the much smaller pooled table
+        # representation in float32 so no second quantization is introduced.
+        selected_hidden = hidden_states.index_select(0, indices).to(
+            dtype=storage_dtype
+        ).float()
+        pooled_hidden = structural_table_pool(selected_hidden, groups)
+        payload["hidden_states"] = pooled_hidden
+        payload["token_groups"] = torch.arange(len(pooled_hidden), dtype=torch.long)
+
+    if embedding_role == "query" and include_row_embeddings:
+        routing_outputs = encode_inputs(
+            embedder,
+            [
+                {
+                    "text": text,
+                    "instruction": row_instruction,
+                }
+                for text in (
+                    f"{encoded_parts[0]}\n{row}" for row in encoded_parts[1:]
+                )
+            ],
+        )
+        payload["row_embeddings"] = torch.stack(
+            [embedding for embedding, _, _ in routing_outputs]
+        )
 
     return payload
+
+
+def teacher_object_ids(
+    paths: list[Path], *, split: str | None = "train"
+) -> set[str]:
+    """Collect every object referenced by edge-list or target-list JSONL files."""
+
+    object_ids: set[str] = set()
+    for path in paths:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise TypeError(f"{path}:{line_number}: expected a JSON object")
+                if split is not None and record.get("split") != split:
+                    continue
+                object_ids.add(str(record["query_id"]))
+                if "candidate_ids" in record:
+                    object_ids.update(str(value) for value in record["candidate_ids"])
+                    continue
+                for candidate in record.get("candidates", []):
+                    object_ids.add(str(candidate["target_id"]))
+                    object_ids.update(
+                        str(value) for value in candidate.get("evidence_ids", [])
+                    )
+    return object_ids
 
 
 def _completed_records(manifest: Path) -> dict[str, dict[str, Any]]:
@@ -275,10 +353,15 @@ def _completed_records(manifest: Path) -> dict[str, dict[str, Any]]:
         return {}
     records = {}
     with manifest.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, 1):
             if line.strip():
                 record = json.loads(line)
-                records[str(record["object_id"])] = record
+                object_id = str(record["object_id"])
+                if object_id in records:
+                    raise ValueError(
+                        f"{manifest}:{line_number}: duplicate object_id {object_id!r}"
+                    )
+                records[object_id] = record
     return records
 
 
@@ -295,10 +378,24 @@ def run(args: argparse.Namespace) -> None:
     object_dir.mkdir(parents=True, exist_ok=True)
     manifest = output_dir / "manifest.jsonl"
     completed = _completed_records(manifest)
+    teacher_dir = output_dir / "teacher_objects"
+    teacher_manifest = output_dir / TEACHER_MANIFEST
+    completed_teacher = _completed_records(teacher_manifest)
+    teacher_paths = [Path(value).resolve() for value in args.teacher_data]
+    selected_teacher_ids = teacher_object_ids(
+        teacher_paths,
+        split=(
+            None
+            if args.teacher_split == "all"
+            else args.teacher_split
+        ),
+    )
+    if selected_teacher_ids:
+        teacher_dir.mkdir(parents=True, exist_ok=True)
 
     model_dir = Path(args.model_dir).resolve()
     metadata = {
-        "format_version": 4,
+        "format_version": 5,
         "model_dir": str(model_dir),
         "dtype": args.dtype,
         "prompt_version": PROMPT_VERSION,
@@ -306,8 +403,9 @@ def run(args: argparse.Namespace) -> None:
             f"{role}_{object_type}": instruction
             for (role, object_type), instruction in EMBEDDING_INSTRUCTIONS.items()
         },
-        "instruction_override": getattr(args, "instruction", None),
-        "table_pooling": "single_forward_token_groups",
+        "instruction_override": args.instruction,
+        "feature_tiers": ["retrieval", "teacher"],
+        "table_pooling": "prepooled_schema_rows",
     }
     metadata_path = output_dir / "metadata.json"
     if metadata_path.exists():
@@ -316,8 +414,10 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError(f"{metadata_path}: cache settings differ from this run")
     else:
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    pending_ids = set()
-    skipped = 0
+    pending_base_ids = set()
+    pending_teacher_ids = set()
+    base_skipped = 0
+    teacher_skipped = 0
     seen = set()
     with input_path.open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, 1):
@@ -339,12 +439,47 @@ def run(args: argparse.Namespace) -> None:
                     raise ValueError(f"{object_id}: input changed after this feature was cached")
                 if completed_record.get("object_type") != object_type:
                     raise ValueError(f"{object_id}: object type changed after this feature was cached")
-                skipped += 1
-                continue
-            pending_ids.add(object_id)
+                base_skipped += 1
+            else:
+                pending_base_ids.add(object_id)
+            if object_id in selected_teacher_ids:
+                if object_id in completed_teacher:
+                    completed_record = completed_teacher[object_id]
+                    completed_path = output_dir / completed_record["teacher_feature_path"]
+                    if not completed_path.is_file():
+                        raise FileNotFoundError(
+                            f"Teacher manifest references a missing feature file: {completed_path}"
+                        )
+                    if completed_record.get("source_fingerprint") != source_fingerprint:
+                        raise ValueError(
+                            f"{object_id}: input changed after its Teacher feature was cached"
+                        )
+                    if completed_record.get("object_type") != object_type:
+                        raise ValueError(
+                            f"{object_id}: object type changed after its Teacher feature was cached"
+                        )
+                    teacher_skipped += 1
+                else:
+                    pending_teacher_ids.add(object_id)
 
-    if not pending_ids:
-        print(json.dumps({"objects_written": 0, "objects_skipped": skipped, "output_dir": str(output_dir)}, indent=2))
+    missing_teacher_ids = selected_teacher_ids - seen
+    if missing_teacher_ids:
+        preview = ", ".join(sorted(missing_teacher_ids)[:10])
+        raise KeyError(f"Teacher data references objects absent from {input_path}: {preview}")
+
+    if not pending_base_ids and not pending_teacher_ids:
+        print(
+            json.dumps(
+                {
+                    "base_objects_written": 0,
+                    "base_objects_skipped": base_skipped,
+                    "teacher_objects_written": 0,
+                    "teacher_objects_skipped": teacher_skipped,
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+            )
+        )
         return
 
     embedder_class = _load_embedder_class(model_dir)
@@ -358,14 +493,21 @@ def run(args: argparse.Namespace) -> None:
     embedder.model.to(torch.device(device))
     embedder.model.eval()
 
-    written = 0
-    with input_path.open(encoding="utf-8") as source, manifest.open("a", encoding="utf-8") as manifest_handle:
+    base_written = 0
+    teacher_written = 0
+    with (
+        input_path.open(encoding="utf-8") as source,
+        manifest.open("a", encoding="utf-8") as manifest_handle,
+        teacher_manifest.open("a", encoding="utf-8") as teacher_manifest_handle,
+    ):
         for line in source:
             if not line.strip():
                 continue
             record = json.loads(line)
             object_id = str(record["object_id"])
-            if object_id not in pending_ids:
+            needs_base = object_id in pending_base_ids
+            needs_teacher = object_id in pending_teacher_ids
+            if not needs_base and not needs_teacher:
                 continue
             object_type = normalize_object_type(str(record["object_type"]))
             source_fingerprint = _source_fingerprint(record)
@@ -373,27 +515,76 @@ def run(args: argparse.Namespace) -> None:
                 embedder,
                 record,
                 input_dir=input_path.parent,
-                instruction=getattr(args, "instruction", None),
+                instruction=args.instruction,
                 storage_dtype=torch_dtype,
+                include_hidden=needs_teacher,
+                include_row_embeddings=needs_base,
             )
             name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
-            relative_path = Path("objects") / name
-            destination = output_dir / relative_path
-            temporary = destination.with_suffix(".pt.tmp")
-            torch.save(payload, temporary)
-            temporary.replace(destination)
-            manifest_record = {
-                "object_id": object_id,
-                "object_type": object_type,
-                "feature_path": relative_path.as_posix(),
-                "source_fingerprint": source_fingerprint,
-            }
-            manifest_handle.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
-            manifest_handle.flush()
-            written += 1
-            print(json.dumps({"object_id": object_id, "written": written, "skipped": skipped}))
+            if needs_base:
+                base_payload = {"embedding": payload["embedding"]}
+                if "row_embeddings" in payload:
+                    base_payload["row_embeddings"] = payload["row_embeddings"]
+                relative_path = Path("objects") / name
+                destination = output_dir / relative_path
+                temporary = destination.with_suffix(".pt.tmp")
+                torch.save(base_payload, temporary)
+                temporary.replace(destination)
+                manifest_record = {
+                    "object_id": object_id,
+                    "object_type": object_type,
+                    "feature_path": relative_path.as_posix(),
+                    "source_fingerprint": source_fingerprint,
+                }
+                manifest_handle.write(
+                    json.dumps(manifest_record, ensure_ascii=False) + "\n"
+                )
+                manifest_handle.flush()
+                base_written += 1
+            if needs_teacher:
+                teacher_payload = {"hidden_states": payload["hidden_states"]}
+                if "token_groups" in payload:
+                    teacher_payload["token_groups"] = payload["token_groups"]
+                relative_path = Path("teacher_objects") / name
+                destination = output_dir / relative_path
+                temporary = destination.with_suffix(".pt.tmp")
+                torch.save(teacher_payload, temporary)
+                temporary.replace(destination)
+                manifest_record = {
+                    "object_id": object_id,
+                    "object_type": object_type,
+                    "teacher_feature_path": relative_path.as_posix(),
+                    "source_fingerprint": source_fingerprint,
+                }
+                teacher_manifest_handle.write(
+                    json.dumps(manifest_record, ensure_ascii=False) + "\n"
+                )
+                teacher_manifest_handle.flush()
+                teacher_written += 1
+            print(
+                json.dumps(
+                    {
+                        "object_id": object_id,
+                        "base_written": base_written,
+                        "base_skipped": base_skipped,
+                        "teacher_written": teacher_written,
+                        "teacher_skipped": teacher_skipped,
+                    }
+                )
+            )
 
-    print(json.dumps({"objects_written": written, "objects_skipped": skipped, "output_dir": str(output_dir)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "base_objects_written": base_written,
+                "base_objects_skipped": base_skipped,
+                "teacher_objects_written": teacher_written,
+                "teacher_objects_skipped": teacher_skipped,
+                "output_dir": str(output_dir),
+            },
+            indent=2,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -403,6 +594,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default="hf_models/Qwen3-VL-Embedding-8B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument(
+        "--teacher-data",
+        nargs="+",
+        default=[],
+        help=(
+            "Edge-list and target-list JSONL files whose referenced objects need "
+            "Teacher hidden features. Re-run with new hard-negative files to add this tier."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-split",
+        default="train",
+        help="Only cache Teacher features referenced by this split; use 'all' for every record.",
+    )
     parser.add_argument(
         "--instruction",
         help="Explicitly override all role- and modality-specific embedding instructions.",

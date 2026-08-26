@@ -288,6 +288,14 @@ class _CachedQueryAutoCheckExtractor:
 
     auto_check_enabled = True
 
+    def __init__(self, review_policy: str) -> None:
+        self.auto_check_luna_reviewer = (
+            object()
+            if review_policy
+            == join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE
+            else None
+        )
+
     def extract_auto_check_value(self, **_kwargs: Any) -> str:
         raise RuntimeError(
             "query auto-check cache is incomplete during final materialization"
@@ -2281,7 +2289,17 @@ def _validate_materialization_index_closures(
     )
 
 
-def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
+def _materialization_review_policy(extractor: Any | None) -> str:
+    if not join_builder.auto_check_required(extractor):
+        return "disabled"
+    return join_builder.model_auto_check_review_policy(extractor)
+
+
+def _parameter_payload(
+    args: argparse.Namespace,
+    *,
+    review_policy: str,
+) -> dict[str, Any]:
     return {
         "seed": int(args.seed),
         "split_by": str(args.split_by),
@@ -2330,6 +2348,10 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
         "identical_visible_query_policy": (
             "keep_best_recovery_single_target"
         ),
+        "auto_check_schema_version": (
+            join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
+        ),
+        "auto_check_review_policy": review_policy,
         "reparse_cached_model_outputs": bool(
             args.reparse_cached_model_outputs
         ),
@@ -2348,10 +2370,16 @@ def _parameter_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _parameter_fingerprint(args: argparse.Namespace) -> str:
+def _parameter_fingerprint(
+    args: argparse.Namespace,
+    *,
+    review_policy: str,
+) -> str:
     return stable_hash(
         MATERIALIZATION_SCHEMA_VERSION,
-        _canonical_json(_parameter_payload(args)),
+        _canonical_json(
+            _parameter_payload(args, review_policy=review_policy)
+        ),
         length=40,
     )
 
@@ -2359,10 +2387,12 @@ def _parameter_fingerprint(args: argparse.Namespace) -> str:
 def _certificate_config_fingerprint(
     args: argparse.Namespace,
     records_per_shard: int,
+    *,
+    review_policy: str,
 ) -> str:
     return stable_hash(
         UPSTREAM_CERTIFICATE_SCHEMA_VERSION,
-        _parameter_fingerprint(args),
+        _parameter_fingerprint(args, review_policy=review_policy),
         int(records_per_shard),
         length=40,
     )
@@ -2841,11 +2871,16 @@ def _load_fast_resume_state(
     *,
     args: argparse.Namespace,
     records_per_shard: int,
+    review_policy: str,
 ) -> _FastResumeState:
-    parameter_fingerprint = _parameter_fingerprint(args)
+    parameter_fingerprint = _parameter_fingerprint(
+        args,
+        review_policy=review_policy,
+    )
     config_fingerprint = _certificate_config_fingerprint(
         args,
         records_per_shard,
+        review_policy=review_policy,
     )
     path = _certificate_path(inputs.work_root, config_fingerprint)
     if not path.is_file():
@@ -2912,6 +2947,7 @@ def _persist_upstream_certificate(
     *,
     args: argparse.Namespace,
     records_per_shard: int,
+    review_policy: str,
     database_path: Path,
     manifest_hashes: list[dict[str, str]],
     input_files: list[dict[str, Any]],
@@ -2920,6 +2956,7 @@ def _persist_upstream_certificate(
     config_fingerprint = _certificate_config_fingerprint(
         args,
         records_per_shard,
+        review_policy=review_policy,
     )
     payload = {
         "schema_version": UPSTREAM_CERTIFICATE_SCHEMA_VERSION,
@@ -3218,11 +3255,14 @@ def load_certified_materialization_inputs(
     *,
     args: argparse.Namespace,
     records_per_shard: int,
+    extractor: Any | None = None,
 ) -> MaterializationInputs:
     """Load inputs only after the certificate and resume index verify."""
+    review_policy = _materialization_review_policy(extractor)
     config_fingerprint = _certificate_config_fingerprint(
         args,
         records_per_shard,
+        review_policy=review_policy,
     )
     certificate = _certificate_path(work_root, config_fingerprint)
     try:
@@ -3253,6 +3293,7 @@ def load_certified_materialization_inputs(
         inputs,
         args=args,
         records_per_shard=records_per_shard,
+        review_policy=review_policy,
     )
     return inputs
 
@@ -3871,7 +3912,9 @@ def _materialize_from_index(
         entity_to_assets=entity_to_assets,
         wiki_to_entity_id=wiki_to_entity_id,
         extractor=(
-            _CachedQueryAutoCheckExtractor()
+            _CachedQueryAutoCheckExtractor(
+                str(materialize_args._query_auto_check_review_policy)
+            )
             if query_auto_check_required
             else None
         ),
@@ -4451,6 +4494,8 @@ def _query_auto_check_plans_for_table(
 def _legacy_query_auto_check_record(
     candidate: Any,
     extraction: dict[str, Any] | None,
+    *,
+    extractor: Any,
 ) -> dict[str, Any] | None:
     """Split one completed eager Task-6 review into a query-level record."""
     if not isinstance(extraction, dict):
@@ -4462,6 +4507,8 @@ def _legacy_query_auto_check_record(
         != join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
     ):
         return None
+    requested_policy = join_builder.model_auto_check_review_policy(extractor)
+    recorded_policy = clean_text(auto_check.get("review_policy"))
     recovered = candidate.recovery["recovered_attribute"]
     target_name = join_builder.normalize(recovered.get("column_name"))
     target_value = clean_text(recovered.get("value"))
@@ -4482,11 +4529,28 @@ def _legacy_query_auto_check_record(
             or clean_text(review.get("error_code"))
         ):
             continue
+        if not recorded_policy:
+            if join_builder.query_recovery_remote_review_is_complete(
+                {
+                    "auto_check": {
+                        "schema_version": (
+                            join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
+                        ),
+                        "reviewed_attributes": 1,
+                        "reviews": [review],
+                    }
+                }
+            ):
+                continue
+            recorded_policy = join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL
+        if recorded_policy != requested_policy:
+            continue
         supported = clean_text(review.get("verdict")) == "supported"
-        key = join_builder.query_recovery_auto_check_key(candidate, None)
+        key = join_builder.query_recovery_auto_check_key(candidate, extractor)
         return {
             "cache_key": key,
             "extraction_cache_key": candidate.task.cache_key,
+            "review_policy": recorded_policy,
             "query_row_attributes": (
                 join_builder.canonical_extraction_row_attributes(
                     candidate.task.entity.get("row_attributes")
@@ -4503,6 +4567,7 @@ def _legacy_query_auto_check_record(
                 "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
                 "policy": auto_check.get("policy")
                 or "keep_source_canonical_supported_only_fail_closed",
+                "review_policy": recorded_policy,
                 "reviewed_attributes": 1,
                 "supported_attributes": int(supported),
                 "filtered_attributes": int(not supported),
@@ -4516,14 +4581,22 @@ def _migrate_legacy_query_auto_checks(
     plans: Iterable[Any],
     extraction_records: dict[str, dict[str, Any]],
     cache: Any,
+    *,
+    extractor: Any,
 ) -> int:
     migrated = 0
     for plan in plans:
         for candidate in plan.candidates:
-            key = join_builder.query_recovery_auto_check_key(candidate, None)
+            key = join_builder.query_recovery_auto_check_key(
+                candidate,
+                extractor,
+            )
             if (
                 join_builder.query_recovery_cached_check(
-                    key, cache, candidate
+                    key,
+                    cache,
+                    candidate,
+                    extractor=extractor,
                 )
                 is not None
             ):
@@ -4531,6 +4604,7 @@ def _migrate_legacy_query_auto_checks(
             record = _legacy_query_auto_check_record(
                 candidate,
                 extraction_records.get(candidate.task.cache_key),
+                extractor=extractor,
             )
             if record is None:
                 continue
@@ -4544,6 +4618,7 @@ def _persist_query_auto_check_batch(
     units: list[tuple[_MaterializationWorkItem, list[Any]]],
     *,
     cache: Any,
+    extractor: Any,
     pre_write_guard: PreWriteGuard | None = None,
 ) -> tuple[int, int]:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
@@ -4556,10 +4631,14 @@ def _persist_query_auto_check_batch(
             for plan in plans:
                 for candidate in plan.candidates:
                     key = join_builder.query_recovery_auto_check_key(
-                        candidate, None
+                        candidate,
+                        extractor,
                     )
                     record = join_builder.query_recovery_cached_check(
-                        key, cache, candidate
+                        key,
+                        cache,
+                        candidate,
+                        extractor=extractor,
                     )
                     if record is None:
                         continue
@@ -4709,6 +4788,7 @@ def _run_query_auto_check_prepass(
                 table_plans,
                 extraction_records,
                 cache,
+                extractor=extractor,
             )
             units.append((item, table_plans))
             plans.extend(table_plans)
@@ -4723,6 +4803,7 @@ def _run_query_auto_check_prepass(
             database_path,
             units,
             cache=cache,
+            extractor=extractor,
             pre_write_guard=pre_write_guard,
         )
         completed += persisted_units
@@ -5995,6 +6076,7 @@ def _finalize_dataset(
     output_root: Path,
     upstream: _ValidatedUpstream,
     args: argparse.Namespace,
+    review_policy: str,
     parameter_fingerprint: str,
     records_per_shard: int,
     after_finalize_commit: Callable[[str], None] | None = None,
@@ -6222,7 +6304,10 @@ def _finalize_dataset(
             }
             for name, shard in single_shards.items()
         },
-        "query_construction": _parameter_payload(args),
+        "query_construction": _parameter_payload(
+            args,
+            review_policy=review_policy,
+        ),
         "wdc_sampling": {
             "validated_source_tables": upstream.expected_tables,
             "source_rows_capped": False,
@@ -6280,7 +6365,12 @@ def materialize_dataset(
         raise ValueError("work_root and output_root must be separate")
     if pre_write_guard is not None:
         pre_write_guard(work_root / "upstream-validation", 0)
-    parameter_fingerprint = _parameter_fingerprint(args)
+    query_auto_check_required = join_builder.auto_check_required(extractor)
+    review_policy = _materialization_review_policy(extractor)
+    parameter_fingerprint = _parameter_fingerprint(
+        args,
+        review_policy=review_policy,
+    )
     validation_workers = _materialization_validation_workers(args)
     fast_resume: _FastResumeState | None = None
     try:
@@ -6288,6 +6378,7 @@ def materialize_dataset(
             inputs,
             args=args,
             records_per_shard=records_per_shard,
+            review_policy=review_policy,
         )
     except _CertificateMismatch as error:
         logging.info(
@@ -6444,14 +6535,15 @@ def materialize_dataset(
             upstream,
             args=args,
             records_per_shard=records_per_shard,
+            review_policy=review_policy,
             database_path=database_path,
             manifest_hashes=strict_manifest_hashes,
             input_files=strict_input_files,
             pre_write_guard=pre_write_guard,
         )
     materialize_args = copy.copy(args)
-    query_auto_check_required = join_builder.auto_check_required(extractor)
     materialize_args._query_auto_check_required = query_auto_check_required
+    materialize_args._query_auto_check_review_policy = review_policy
     if query_auto_check_required:
         query_auto_check_cache = join_builder.ExtractionCache(
             Path(args.cache_dir).expanduser().resolve()
@@ -6502,6 +6594,7 @@ def materialize_dataset(
         output_root=output_root,
         upstream=upstream,
         args=materialize_args,
+        review_policy=review_policy,
         parameter_fingerprint=parameter_fingerprint,
         records_per_shard=records_per_shard,
         after_finalize_commit=after_finalize_commit,

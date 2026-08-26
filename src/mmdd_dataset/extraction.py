@@ -11,9 +11,10 @@ import requests
 
 from .utils import clean_text, get_cell, get_column_name, stable_hash, values_match
 
-
 PROMPT_VERSION = "leave_one_attribute_out_v4_entity_evidence_grounding"
 AUTO_CHECK_PROMPT_VERSION = "query_visible_row_raw_evidence_only_v2"
+AUTO_CHECK_CASCADE_POLICY = "local_luna_consensus_terra_adjudication_v1"
+AUTO_CHECK_LOCAL_POLICY = "local_only"
 
 
 class OpenAICompatibleExtractor:
@@ -182,8 +183,25 @@ def auto_check_recoveries(
     text_extractor: OpenAICompatibleExtractor | None,
     *,
     image_extractor: OpenAICompatibleExtractor | None = None,
+    review_mode: str = "cascade",
+    luna_extractor: OpenAICompatibleExtractor | None = None,
+    terra_extractor: OpenAICompatibleExtractor | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Fail closed using only final query cells and raw evidence content."""
+    """Fail closed using local-only or local/Luna/Terra review."""
+    if review_mode not in {"cascade", "local"}:
+        raise ValueError("review_mode must be 'cascade' or 'local'")
+    if review_mode == "cascade" and (
+        luna_extractor is None or terra_extractor is None
+    ):
+        raise ValueError("cascade review requires both Luna and Terra extractors")
+
+    def results_agree(left: str, right: str) -> bool:
+        left = clean_text(left)
+        right = clean_text(right)
+        if not left or not right:
+            return not left and not right
+        return values_match(left, right)
+
     query_by_id = {
         query["table_id"]: query for query in artifacts["query_tables"]
     }
@@ -224,12 +242,38 @@ def auto_check_recoveries(
         if extractor is None:
             continue
         recovered = recovery["recovered_attribute"]
-        result = extractor.extract(
+        local_result = extractor.extract(
             attribute=clean_text(recovered.get("column_name")),
             visible_cells=visible_cells,
             asset=asset,
         )
-        extracted_value = clean_text(result.get("value"))
+        local_value = clean_text(local_result.get("value"))
+        luna_value: str | None = None
+        terra_value: str | None = None
+        terra_triggered = False
+        if review_mode == "local":
+            extracted_value = local_value
+            decision_source = "primary_local"
+        else:
+            luna_result = luna_extractor.extract(
+                attribute=clean_text(recovered.get("column_name")),
+                visible_cells=visible_cells,
+                asset=asset,
+            )
+            luna_value = clean_text(luna_result.get("value"))
+            if results_agree(local_value, luna_value):
+                extracted_value = luna_value
+                decision_source = "local_luna_consensus"
+            else:
+                terra_triggered = True
+                terra_result = terra_extractor.extract(
+                    attribute=clean_text(recovered.get("column_name")),
+                    visible_cells=visible_cells,
+                    asset=asset,
+                )
+                terra_value = clean_text(terra_result.get("value"))
+                extracted_value = terra_value
+                decision_source = "terra_adjudication"
         claimed_value = clean_text(recovered.get("value"))
         if not values_match(extracted_value, claimed_value):
             continue
@@ -239,7 +283,23 @@ def auto_check_recoveries(
                 "auto_check": {
                     "prompt_version": AUTO_CHECK_PROMPT_VERSION,
                     "input_policy": "query_visible_row_and_raw_evidence_only",
+                    "review_policy": (
+                        AUTO_CHECK_CASCADE_POLICY
+                        if review_mode == "cascade"
+                        else AUTO_CHECK_LOCAL_POLICY
+                    ),
+                    "decision_source": decision_source,
                     "extracted_value": extracted_value,
+                    "primary_extracted_value": local_value,
+                    "luna_triggered": review_mode == "cascade",
+                    "luna_extracted_value": luna_value,
+                    "luna_agrees_with_local": (
+                        results_agree(local_value, luna_value)
+                        if luna_value is not None
+                        else None
+                    ),
+                    "terra_triggered": terra_triggered,
+                    "terra_extracted_value": terra_value,
                     "verdict": "supported",
                 },
             }

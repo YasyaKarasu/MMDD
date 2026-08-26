@@ -27,6 +27,7 @@ tmp/
 
 # Generated Stage-1 / dataset outputs
 cache/
+/work/
 output/
 output_*/
 /.output_*/

@@ -1021,7 +1021,7 @@ class ProgressReporter:
     @classmethod
     def _restore_v1_sample(cls, raw: dict[str, Any]) -> dict[str, Any]:
         try:
-            timestamp = cls._finite(raw["timestamp"], "v1 timestamp")
+            cls._finite(raw["timestamp"], "v1 timestamp")
             completed = cls._uint(raw["completed_units"], "v1 completed")
             total = cls._uint(raw["total_units"], "v1 total")
             rate = cls._finite(raw["rate"], "v1 rate")
@@ -5567,10 +5567,16 @@ def _run_pipeline_once(
                     archives,
                 )
                 fast_args = _runtime_args(config)
+                fast_extractor = extractor
+                if fast_extractor is None:
+                    fast_extractor = join_builder.LocalAttributeExtractor(
+                        fast_args
+                    )
                 fast_inputs = load_certified_materialization_inputs(
                     config.work_dir,
                     args=fast_args,
                     records_per_shard=config.records_per_shard,
+                    extractor=fast_extractor,
                 )
             except (OSError, ValueError) as error:
                 logging.info(
@@ -5584,7 +5590,7 @@ def _run_pipeline_once(
                     archives=archives,
                     inputs=fast_inputs,
                     args=fast_args,
-                    extractor=extractor,
+                    extractor=fast_extractor,
                 )
         if (
             _allow_fast_model_resume

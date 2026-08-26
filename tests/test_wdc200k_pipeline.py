@@ -1577,7 +1577,7 @@ def test_materialization_certificate_bypasses_strict_stage_replay(
         fake_fast_resume,
     )
 
-    resumed = run_pipeline(config)
+    resumed = run_pipeline(config, extractor=_PipelineExtractor())
 
     assert resumed.status == "complete"
     assert len(fast_calls) == 1

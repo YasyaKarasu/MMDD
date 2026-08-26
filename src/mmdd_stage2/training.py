@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
-
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
 
-from .data import Stage2ObjectIndex, iter_retrieval_results, load_stage2_index, local_column_index
+from .data import (
+    Stage2ObjectIndex,
+    iter_retrieval_results,
+    load_stage2_index,
+    local_column_index,
+    validate_retrieval_path_budget,
+)
 from .pipeline import Stage2Backend, Stage2Verifier
 from .verifier import CandidateColumnScorer, EvidenceBundle, build_evidence_bundles
 
@@ -19,9 +25,9 @@ from .verifier import CandidateColumnScorer, EvidenceBundle, build_evidence_bund
 @dataclass(frozen=True)
 class ColumnTrainingExample:
     query_id: str
-    bundles: tuple[EvidenceBundle, ...]
-    positive_target_id: str
+    positive_bundle: EvidenceBundle
     positive_source_column: int
+    table_loss: float
 
 
 def load_column_training_data(
@@ -31,6 +37,8 @@ def load_column_training_data(
     top_k_evidence: int,
     max_targets: int,
 ) -> tuple[list[ColumnTrainingExample], Stage2ObjectIndex]:
+    if max_targets <= 0 or top_k_evidence <= 0:
+        raise ValueError("Stage-2 training target and evidence limits must be positive")
     qrels = {
         str(record["query_table_id"]): record
         for record in iter_dataset_artifact(output_dir, "qrels")
@@ -46,16 +54,34 @@ def load_column_training_data(
             qrel = qrels.get(query_id)
             if qrel is None:
                 continue
+            validate_retrieval_path_budget(
+                record,
+                max_targets=max_targets,
+                top_k_evidence=top_k_evidence,
+            )
             bundles = build_evidence_bundles(record["results"][:max_targets], top_k_evidence=top_k_evidence)
             positive_target = str(qrel["target_table_id"])
-            positive_bundle = next((bundle for bundle in bundles if bundle.target_id == positive_target), None)
-            if positive_bundle is None:
+            positive = next(
+                (
+                    (index, bundle)
+                    for index, bundle in enumerate(bundles)
+                    if bundle.target_id == positive_target
+                ),
+                None,
+            )
+            if positive is None:
                 continue
+            positive_index, positive_bundle = positive
+            retrieval_scores = torch.tensor(
+                [bundle.retrieval_score for bundle in bundles], dtype=torch.float32
+            )
             example = ColumnTrainingExample(
                 query_id=query_id,
-                bundles=tuple(bundles),
-                positive_target_id=positive_target,
+                positive_bundle=positive_bundle,
                 positive_source_column=int(qrel["join_attribute"]["source_column_index"]),
+                table_loss=float(
+                    -torch.log_softmax(retrieval_scores, dim=0)[positive_index]
+                ),
             )
             examples.append(example)
             query_ids.add(query_id)
@@ -94,31 +120,24 @@ def train_candidate_scorer(
         total_table_loss = 0.0
         for example_index in order:
             example = examples[example_index]
-            target_position = next(
-                index for index, bundle in enumerate(example.bundles) if bundle.target_id == example.positive_target_id
-            )
-            positive_bundle = example.bundles[target_position]
+            positive_bundle = example.positive_bundle
             logits = verifier.candidate_logits(
                 objects.queries[example.query_id],
                 (positive_bundle,),
                 objects.targets,
                 objects.evidence,
             )[0]
-            target = objects.targets[example.positive_target_id]
+            target = objects.targets[positive_bundle.target_id]
             local_index = local_column_index(target, example.positive_source_column)
             column_position = next(
                 index for index, column in enumerate(target["columns"]) if int(column["column_index"]) == local_index
             )
-            table_scores = torch.tensor(
-                [bundle.retrieval_score for bundle in example.bundles], dtype=torch.float32
-            )
-            table_loss = -torch.log_softmax(table_scores, dim=0)[target_position]
             column_loss = -torch.log_softmax(logits, dim=0)[column_position]
             optimizer.zero_grad()
             column_loss.backward()
             optimizer.step()
             total_column_loss += float(column_loss.detach())
-            total_table_loss += float(table_loss.detach())
+            total_table_loss += example.table_loss
         mean_column_loss = total_column_loss / len(examples)
         mean_table_loss = total_table_loss / len(examples)
         history.append(

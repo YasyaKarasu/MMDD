@@ -6,8 +6,9 @@ import hashlib
 import json
 import math
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,7 +38,7 @@ def load_corpus_ids(path: Path, store: FeatureStore) -> dict[str, list[str]]:
             if object_id in seen:
                 raise ValueError(f"{path}:{line_number}: duplicate object_id {object_id!r}")
             seen.add(object_id)
-            features = store.get(object_id)
+            features = store.get(object_id, include_hidden=False)
             if "object_type" in record:
                 declared_type = normalize_object_type(str(record["object_type"]))
                 if declared_type != features.object_type:
@@ -76,7 +77,12 @@ def build_indices(
             for start in range(0, len(object_ids), batch_size):
                 batch_ids = object_ids[start : start + batch_size]
                 embeddings = torch.stack(
-                    [store.get(object_id).embedding.to(device=device, dtype=torch.float32) for object_id in batch_ids]
+                    [
+                        store.get(object_id, include_hidden=False).embedding.to(
+                            device=device, dtype=torch.float32
+                        )
+                        for object_id in batch_ids
+                    ]
                 )
                 vectors = model.index_vector(embeddings, object_type).detach().cpu().numpy().astype("float32")
                 labels = np.arange(start, start + len(batch_ids))
@@ -145,7 +151,7 @@ class StudentANNIndices:
         destination_type = normalize_object_type(destination_type)
         if k <= 0 or destination_type not in self.indices:
             return []
-        source = self.store.get(source_id)
+        source = self.store.get(source_id, include_hidden=False)
         embedding = source.embedding.to(device=self.device, dtype=torch.float32)
         query = self.model.relation_query(embedding, source.object_type, destination_type)
         query_array = query.detach().cpu().numpy().astype("float32").reshape(1, -1)
@@ -189,6 +195,36 @@ def _channel_ranks(results: list[dict[str, Any]], score_key: str) -> dict[str, i
     return {str(result["target_id"]): rank for rank, result in enumerate(ranked, 1)}
 
 
+def _compact_result_paths(
+    paths: list[dict[str, Any]], *, evidence_limit: int
+) -> list[dict[str, Any]]:
+    compact = []
+    if any(path["kind"] == "direct" for path in paths):
+        compact.append({"kind": "direct"})
+    scores_by_evidence: dict[str, list[float]] = defaultdict(list)
+    for path in paths:
+        if path["kind"] != "evidence":
+            continue
+        scores_by_evidence[str(path["evidence_id"])].append(float(path["path_score"]))
+    ranked = sorted(
+        (
+            (evidence_id, _logsumexp(scores))
+            for evidence_id, scores in scores_by_evidence.items()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:evidence_limit]
+    compact.extend(
+        {
+            "kind": "evidence",
+            "evidence_id": evidence_id,
+            "path_score": score,
+        }
+        for evidence_id, score in ranked
+    )
+    return compact
+
+
 def retrieve_zero_one_hop(
     query_id: str,
     indices: StudentANNIndices,
@@ -201,11 +237,15 @@ def retrieve_zero_one_hop(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
+    path_result_k: int = 10,
+    evidence_path_k: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Retrieve direct and evidence paths, then fuse their target ranks."""
+    """Retrieve and rank with all paths, then retain only Stage-2 path detail."""
 
-    if min(direct_k, evidence_k, targets_per_evidence, result_k) < 0:
+    if min(direct_k, evidence_k, targets_per_evidence, result_k, path_result_k) < 0:
         raise ValueError("Retrieval k values must be non-negative")
+    if evidence_path_k is not None and evidence_path_k < 0:
+        raise ValueError("evidence_path_k must be non-negative")
     if rrf_k < 0:
         raise ValueError("rrf_k must be non-negative")
     aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
@@ -213,7 +253,7 @@ def retrieve_zero_one_hop(
     for target_id, score in indices.search(query_id, "table", direct_k):
         paths_by_target[target_id].append({"kind": "direct", "path_score": score})
 
-    for evidence_type in evidence_types:
+    for evidence_type in dict.fromkeys(evidence_types):
         for evidence_id, query_evidence_score in indices.search(query_id, evidence_type, evidence_k):
             for target_id, evidence_target_score in indices.search(evidence_id, "table", targets_per_evidence):
                 paths_by_target[target_id].append(
@@ -248,8 +288,13 @@ def retrieve_zero_one_hop(
         result.pop("direct_score")
         if result["evidence_score"] is None:
             result.pop("evidence_score")
-        for path in result["paths"]:
-            if path["kind"] == "direct":
-                path.pop("path_score")
     results.sort(key=lambda result: (-float(result["score"]), str(result["target_id"])))
-    return results[:result_k]
+    results = results[:result_k]
+    retained_evidence = evidence_top_k if evidence_path_k is None else evidence_path_k
+    for result_index, result in enumerate(results):
+        paths = result.pop("paths")
+        if result_index < path_result_k:
+            result["paths"] = _compact_result_paths(
+                paths, evidence_limit=retained_evidence
+            )
+    return results

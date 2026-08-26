@@ -212,11 +212,16 @@ def test_src_auto_check_uses_only_materialized_query_columns(tmp_path: Path) -> 
             min_recovered_rows=3,
         ),
     )
-    calls: list[dict] = []
+    local_calls: list[dict] = []
+    luna_calls: list[dict] = []
+    terra_calls: list[dict] = []
 
     class Extractor:
+        def __init__(self, calls):
+            self.calls = calls
+
         def extract(self, **kwargs):
-            calls.append(kwargs)
+            self.calls.append(kwargs)
             visible = {
                 item["name"]: item["value"]
                 for item in kwargs["visible_cells"]
@@ -227,19 +232,97 @@ def test_src_auto_check_uses_only_materialized_query_columns(tmp_path: Path) -> 
     checked = auto_check_recoveries(
         artifacts,
         assets,
-        Extractor(),
+        Extractor(local_calls),
+        luna_extractor=Extractor(luna_calls),
+        terra_extractor=Extractor(terra_calls),
     )
 
     assert len(checked["evidence_recoveries"]) == 3
-    assert calls
+    assert local_calls
+    assert len(luna_calls) == len(local_calls)
+    assert terra_calls == []
     assert all(
         {cell["name"] for cell in call["visible_cells"]}
         == {"Entity", "Category"}
-        for call in calls
+        for call in local_calls + luna_calls
     )
     assert all(
         "Founded" not in {cell["name"] for cell in call["visible_cells"]}
-        for call in calls
+        for call in local_calls + luna_calls
+    )
+    assert all(
+        recovery["auto_check"]["decision_source"]
+        == "local_luna_consensus"
+        for recovery in checked["evidence_recoveries"]
+    )
+
+
+def test_src_auto_check_supports_local_only_and_terra_adjudication(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_entitables(input_dir / "tables.json")
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = synthetic_materials(prepared)
+    table = prepared.source_tables[0]
+    artifacts = build_joinability_dataset(
+        prepared.source_tables,
+        assets,
+        extractions,
+        {table["source_table_id"]: "train"},
+        BuildConfig(
+            query_rows=5,
+            min_target_rows=5,
+            min_recovered_ratio=0.6,
+            min_recovered_rows=3,
+        ),
+    )
+
+    class Extractor:
+        def __init__(self, mode: str):
+            self.mode = mode
+            self.calls = 0
+
+        def extract(self, **kwargs):
+            self.calls += 1
+            if self.mode == "wrong":
+                return {"value": "wrong", "evidence": ""}
+            visible = {
+                item["name"]: item["value"]
+                for item in kwargs["visible_cells"]
+            }
+            row = int(visible["Entity"].rsplit(" ", 1)[1])
+            return {"value": str(1900 + row), "evidence": ""}
+
+    local_only = Extractor("correct")
+    local_checked = auto_check_recoveries(
+        artifacts,
+        assets,
+        local_only,
+        review_mode="local",
+    )
+    assert len(local_checked["evidence_recoveries"]) == 3
+    assert all(
+        recovery["auto_check"]["decision_source"] == "primary_local"
+        for recovery in local_checked["evidence_recoveries"]
+    )
+
+    local = Extractor("correct")
+    luna = Extractor("wrong")
+    terra = Extractor("correct")
+    cascade_checked = auto_check_recoveries(
+        artifacts,
+        assets,
+        local,
+        luna_extractor=luna,
+        terra_extractor=terra,
+    )
+    assert len(cascade_checked["evidence_recoveries"]) == 3
+    assert local.calls == luna.calls == terra.calls
+    assert all(
+        recovery["auto_check"]["decision_source"] == "terra_adjudication"
+        for recovery in cascade_checked["evidence_recoveries"]
     )
 
 

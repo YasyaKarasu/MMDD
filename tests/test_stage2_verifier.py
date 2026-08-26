@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import train_stage2 as stage2_train
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
 from mmdd_stage2.data import (
@@ -16,11 +18,16 @@ from mmdd_stage2.data import (
     direct_target_ids,
     serialize_image_presence_prompt,
     serialize_localization_prompt,
+    validate_retrieval_path_budget,
 )
 from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
 from mmdd_stage2.qwen import QwenStage2Backend
 from mmdd_stage2.routing import SimilarityEvidenceRouter
-from mmdd_stage2.training import ColumnTrainingExample, train_candidate_scorer
+from mmdd_stage2.training import (
+    ColumnTrainingExample,
+    load_column_training_data,
+    train_candidate_scorer,
+)
 from mmdd_stage2.verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
@@ -89,6 +96,109 @@ def test_stage2_preserves_global_rrf_order_while_using_route_scores():
     assert direct_target_ids(global_top_k) == ["mixed", "direct"]
     assert [bundle.target_id for bundle in bundles] == ["mixed"]
     assert bundles[0].retrieval_score == pytest.approx(0.9)
+
+
+def test_stage2_rejects_settings_above_compact_retrieval_path_budget():
+    record = {
+        "path_aggregation": {"path_result_k": 1, "evidence_path_k": 1},
+        "results": [
+            {
+                "target_id": "evidence",
+                "evidence_score": 1.0,
+                "paths": [
+                    {"kind": "evidence", "evidence_id": "e1", "path_score": 1.0}
+                ],
+            }
+        ],
+    }
+
+    validate_retrieval_path_budget(record, max_targets=10, top_k_evidence=1)
+    record["results"].append({"target_id": "without_paths"})
+    with pytest.raises(ValueError, match="larger --path-result-k"):
+        validate_retrieval_path_budget(record, max_targets=2, top_k_evidence=1)
+    with pytest.raises(ValueError, match="larger --evidence-path-k"):
+        validate_retrieval_path_budget(record, max_targets=1, top_k_evidence=2)
+
+    record["path_aggregation"]["evidence_path_k"] = 0
+    record["results"] = [{"target_id": "pruned", "evidence_score": 1.0, "paths": []}]
+    with pytest.raises(ValueError, match="larger --evidence-path-k"):
+        validate_retrieval_path_budget(record, max_targets=1, top_k_evidence=1)
+
+    record["results"] = [{"target_id": "direct", "paths": [{"kind": "direct"}]}]
+    validate_retrieval_path_budget(record, max_targets=1, top_k_evidence=1)
+
+
+def test_stage2_training_skips_path_budget_validation_without_a_matching_qrel(monkeypatch):
+    qrel = {
+        "query_table_id": "train",
+        "target_table_id": "positive",
+        "reason": "model_recoverable_join_column",
+        "join_attribute": {"source_column_index": 1},
+    }
+    records = [
+        {
+            "query_id": "irrelevant",
+            "path_aggregation": {"path_result_k": 0, "evidence_path_k": 0},
+            "results": [
+                {
+                    "target_id": "ignored",
+                    "evidence_score": 1.0,
+                    "paths": [
+                        {"kind": "evidence", "evidence_id": "ignored", "path_score": 1.0}
+                    ],
+                }
+            ],
+        },
+        {
+            "query_id": "train",
+            "path_aggregation": {"path_result_k": 2, "evidence_path_k": 1},
+            "results": [
+                {
+                    "target_id": "negative",
+                    "evidence_score": 2.0,
+                    "paths": [
+                        {
+                            "kind": "evidence",
+                            "evidence_id": "negative_evidence",
+                            "path_score": 2.0,
+                        }
+                    ],
+                },
+                {
+                    "target_id": "positive",
+                    "evidence_score": 1.0,
+                    "paths": [
+                        {"kind": "evidence", "evidence_id": "e1", "path_score": 1.0}
+                    ],
+                }
+            ],
+        },
+    ]
+    loaded_index = Stage2ObjectIndex({}, {}, {})
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_dataset_artifact",
+        lambda _output_dir, artifact: iter([qrel]) if artifact == "qrels" else iter(()),
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_retrieval_results", lambda _path: iter(records)
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.load_stage2_index", lambda *_args, **_kwargs: loaded_index
+    )
+
+    examples, objects = load_column_training_data(
+        Path("dataset"),
+        [Path("retrieval.jsonl")],
+        max_targets=2,
+        top_k_evidence=1,
+    )
+
+    assert [example.query_id for example in examples] == ["train"]
+    assert examples[0].positive_bundle.target_id == "positive"
+    assert examples[0].table_loss == pytest.approx(
+        -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
+    )
+    assert objects is loaded_index
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():
@@ -378,7 +488,14 @@ def test_similarity_router_assigns_each_evidence_to_its_nearest_row():
         }
     )
 
-    assignments = SimilarityEvidenceRouter(store).assign("q1", ["e1", "e2"], row_count=2)
+    class TrackingStore:
+        def get(self, object_id, *, include_hidden):
+            assert include_hidden is False
+            return store.get(object_id, include_hidden=include_hidden)
+
+    assignments = SimilarityEvidenceRouter(TrackingStore()).assign(
+        "q1", ["e1", "e2"], row_count=2
+    )
 
     assert assignments == {"e1": 0, "e2": 1}
 
@@ -638,11 +755,108 @@ def test_qwen35_focus_hooks_only_full_attention_layers():
     assert all(value is not None for value in captured)
 
 
+def _train_stage2_args(tmp_path: Path, **overrides) -> argparse.Namespace:
+    values = {
+        "dataset_root": "dataset",
+        "retrieval_results": ["retrieval.jsonl"],
+        "output": str(tmp_path / "stage2.pt"),
+        "model_dir": "qwen",
+        "device": "cpu",
+        "dtype": "fp32",
+        "top_k_evidence": 1,
+        "max_targets": 1,
+        "epochs": 1,
+        "learning_rate": 0.1,
+        "weight_decay": 0.0,
+        "seed": 17,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"epochs": 0}, "--epochs"),
+        ({"max_targets": -1}, "--max-targets"),
+        ({"max_targets": 0}, "--max-targets"),
+        ({"top_k_evidence": -1}, "--top-k-evidence"),
+        ({"top_k_evidence": 0}, "--top-k-evidence"),
+    ],
+)
+def test_train_stage2_rejects_invalid_limits_before_other_work(
+    tmp_path, monkeypatch, overrides, message
+):
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("Stage-2 validation must run before seeding or loading data")
+
+    monkeypatch.setattr(stage2_train.torch, "manual_seed", unexpected)
+    monkeypatch.setattr(stage2_train, "load_column_training_data", unexpected)
+    monkeypatch.setattr(stage2_train, "QwenStage2Backend", unexpected)
+
+    with pytest.raises(ValueError, match=message):
+        stage2_train.run(_train_stage2_args(tmp_path, **overrides))
+
+
+def test_train_stage2_loads_data_before_seeded_model_initialization(tmp_path, monkeypatch):
+    events = []
+    scorer_weights = []
+    cpu_seeds = []
+    cuda_seeds = []
+
+    def manual_seed(seed):
+        cpu_seeds.append(seed)
+        return torch.random.default_generator.manual_seed(seed)
+
+    def load_data(*_args, **_kwargs):
+        events.append("data")
+        return [object()], object()
+
+    class Backend:
+        hidden_dim = 2
+        device = torch.device("cpu")
+
+        def __init__(self, *_args, **_kwargs):
+            events.append("backend")
+
+    def build_scorer(hidden_dim):
+        events.append("scorer")
+        scorer = CandidateColumnScorer(hidden_dim)
+        scorer_weights.append(scorer.weight.weight.detach().clone())
+        return scorer
+
+    def train(*_args, **_kwargs):
+        events.append("train")
+        return []
+
+    def save(*_args, **_kwargs):
+        events.append("save")
+
+    monkeypatch.setattr(stage2_train.torch, "manual_seed", manual_seed)
+    monkeypatch.setattr(stage2_train.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(stage2_train.torch.cuda, "manual_seed_all", cuda_seeds.append)
+    monkeypatch.setattr(stage2_train, "load_column_training_data", load_data)
+    monkeypatch.setattr(stage2_train, "QwenStage2Backend", Backend)
+    monkeypatch.setattr(stage2_train, "CandidateColumnScorer", build_scorer)
+    monkeypatch.setattr(stage2_train, "train_candidate_scorer", train)
+    monkeypatch.setattr(stage2_train, "save_candidate_scorer", save)
+
+    args = _train_stage2_args(tmp_path)
+    stage2_train.run(args)
+    args.output = str(tmp_path / "stage2_second.pt")
+    stage2_train.run(args)
+
+    assert events == ["data", "backend", "scorer", "train", "save"] * 2
+    assert cpu_seeds == [17, 17]
+    assert cuda_seeds == [17, 17]
+    assert torch.equal(scorer_weights[0], scorer_weights[1])
+
+
 def test_candidate_head_training_updates_only_the_small_rata_scorer():
     query = _table("q1", ["Player"], [["Messi"]])
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
     bundle = EvidenceBundle("t1", 2.0, ("e1",))
-    example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
+    example = ColumnTrainingExample("q1", bundle, 1, 0.0)
     objects = Stage2ObjectIndex(
         {"q1": query},
         {"t1": target},
@@ -675,7 +889,7 @@ def test_candidate_head_training_accepts_inference_mode_reader_states():
     query = _table("q1", ["Player"], [["Messi"]])
     target = _table("t1", ["Country", "Club"], [["Spain", "Barcelona"]])
     bundle = EvidenceBundle("t1", 2.0, ("e1",))
-    example = ColumnTrainingExample("q1", (bundle,), "t1", 1)
+    example = ColumnTrainingExample("q1", bundle, 1, 0.0)
     objects = Stage2ObjectIndex(
         {"q1": query},
         {"t1": target},
@@ -710,7 +924,8 @@ def test_candidate_head_training_reads_only_the_positive_target():
         EvidenceBundle("t0", 2.0, ("negative_evidence",)),
         EvidenceBundle("t1", 1.0, ("positive_evidence",)),
     )
-    example = ColumnTrainingExample("q1", bundles, "t1", 1)
+    expected_table_loss = -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
+    example = ColumnTrainingExample("q1", bundles[1], 1, expected_table_loss)
     objects = Stage2ObjectIndex(
         {"q1": query},
         {"t0": negative, "t1": positive},
@@ -741,7 +956,6 @@ def test_candidate_head_training_reads_only_the_positive_target():
     )
 
     assert backend.reader_evidence_batches == [("positive_evidence",)]
-    expected_table_loss = -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
     assert history[0]["table_loss"] == pytest.approx(expected_table_loss)
 
 

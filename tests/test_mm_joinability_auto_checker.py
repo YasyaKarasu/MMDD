@@ -380,10 +380,10 @@ def test_local_mismatch_runs_luna_and_disagreement_runs_terra(
     assert all(row["review_complete"] for row in rows)
 
 
-def test_supported_local_extraction_skips_luna_and_terra(tmp_path: Path) -> None:
+def test_supported_local_extraction_is_confirmed_by_luna(tmp_path: Path) -> None:
     _write_auto_check_dataset(tmp_path, query_count=1)
     primary = FakeExtractor(identity_version="local")
-    luna = FakeExtractor(identity_version="luna", value_override="1999")
+    luna = FakeExtractor(identity_version="luna")
     terra = FakeExtractor(identity_version="terra", value_override="1999")
 
     summary = run_auto_check(
@@ -394,11 +394,59 @@ def test_supported_local_extraction_skips_luna_and_terra(tmp_path: Path) -> None
     )
 
     assert len(primary.calls) == 1
-    assert luna.calls == []
+    assert len(luna.calls) == 1
     assert terra.calls == []
-    assert summary["execution"]["secondary_candidates"] == 0
-    assert summary["execution"]["secondary_model_calls"] == 0
+    assert summary["execution"]["secondary_candidates"] == 1
+    assert summary["execution"]["secondary_model_calls"] == 1
     assert summary["execution"]["terra_model_calls"] == 0
+    assert summary["path_judgments"]["supported"] == 1
+    rows = [
+        json.loads(line)
+        for line in Path(summary["artifacts"]["path_reviews"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows[0]["decision_source"] == "local_luna_consensus"
+
+
+def test_supported_local_luna_disagreement_runs_terra(tmp_path: Path) -> None:
+    _write_auto_check_dataset(tmp_path, query_count=1)
+    primary = FakeExtractor(identity_version="local")
+    luna = FakeExtractor(identity_version="luna", value_override="1999")
+    terra = FakeExtractor(identity_version="terra")
+
+    summary = run_auto_check(
+        _config(tmp_path, 1.0),
+        primary,
+        luna,
+        terra,
+    )
+
+    assert len(primary.calls) == 1
+    assert len(luna.calls) == 1
+    assert len(terra.calls) == 1
+    rows = [
+        json.loads(line)
+        for line in Path(summary["artifacts"]["path_reviews"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows[0]["primary_verdict"] == "supported"
+    assert rows[0]["luna_agrees_with_local"] is False
+    assert rows[0]["decision_source"] == "terra_adjudication"
+    assert rows[0]["verdict"] == "supported"
+
+
+def test_local_only_interface_does_not_call_remote_reviewers(tmp_path: Path) -> None:
+    _write_auto_check_dataset(tmp_path, query_count=1)
+    primary = FakeExtractor(identity_version="local")
+
+    summary = run_auto_check(_config(tmp_path, 1.0), primary)
+
+    assert len(primary.calls) == 1
+    assert summary["review_policy"] == "local_only"
+    assert summary["execution"]["luna_candidates"] == 0
+    assert summary["execution"]["terra_candidates"] == 0
     assert summary["path_judgments"]["supported"] == 1
 
 

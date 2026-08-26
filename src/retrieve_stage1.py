@@ -8,10 +8,13 @@ import json
 from pathlib import Path
 
 import torch
-
 from mmdd_stage1.checkpoints import load_path_aggregation, load_student
 from mmdd_stage1.features import FeatureStore
-from mmdd_stage1.retrieval import StudentANNIndices, checkpoint_fingerprint, retrieve_zero_one_hop
+from mmdd_stage1.retrieval import (
+    StudentANNIndices,
+    checkpoint_fingerprint,
+    retrieve_zero_one_hop,
+)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -41,6 +44,8 @@ def run(args: argparse.Namespace) -> None:
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
         rrf_k=args.rrf_k,
+        path_result_k=args.path_result_k,
+        evidence_path_k=args.evidence_path_k,
     )
     payload = json.dumps(
         {
@@ -50,6 +55,12 @@ def run(args: argparse.Namespace) -> None:
                 "evidence_top_k": evidence_top_k,
                 "target_fusion": "rrf",
                 "rrf_k": args.rrf_k,
+                "path_result_k": args.path_result_k,
+                "evidence_path_k": (
+                    evidence_top_k
+                    if args.evidence_path_k is None
+                    else args.evidence_path_k
+                ),
             },
             "results": results,
         },
@@ -77,6 +88,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-k", type=int, default=50)
     parser.add_argument("--targets-per-evidence", type=int, default=50)
     parser.add_argument("--result-k", type=int, default=100)
+    parser.add_argument(
+        "--path-result-k",
+        type=int,
+        default=10,
+        help="Keep Stage-2 path detail only for this many globally ranked targets.",
+    )
+    parser.add_argument(
+        "--evidence-path-k",
+        type=int,
+        help="Evidence paths retained per target; defaults to the saved evidence top-k.",
+    )
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)

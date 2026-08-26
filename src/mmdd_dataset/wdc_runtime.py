@@ -4,11 +4,11 @@ import hashlib
 import json
 import os
 import shutil
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, TypeVar
-
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -277,10 +277,34 @@ def iter_dataset_artifact(output_dir: Path, artifact: str) -> Iterator[dict[str,
     """Read a final dataset using only paths relative to its own manifest."""
     manifest_path = output_dir / "dataset_manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if payload.get("complete") is not True:
+    if "complete" in payload and payload["complete"] is not True:
         raise ValueError(f"dataset is incomplete: {output_dir}")
-    shards = payload.get("artifacts", {}).get(artifact, {}).get("shards", [])
-    if not all(valid_shard(output_dir, shard) for shard in shards):
-        raise ValueError(f"dataset artifact has an invalid shard: {artifact}")
-    for shard in shards:
-        yield from iter_jsonl(output_dir / shard["path"])
+
+    artifact_record = payload.get("artifacts", {}).get(artifact)
+    if artifact_record is not None:
+        files = (
+            list(artifact_record.get("shards", []))
+            if "shards" in artifact_record
+            else [artifact_record]
+        )
+    else:
+        single_file = payload.get("single_files", {}).get(artifact)
+        if single_file is None:
+            return
+        if isinstance(single_file, str):
+            metadata = payload.get("published_single_files", {}).get(
+                Path(single_file).name,
+                {},
+            )
+            files = [{**metadata, "path": single_file}]
+        else:
+            files = [single_file]
+
+    for record in files:
+        path = output_dir / str(record["path"])
+        if "bytes" in record or "sha256" in record:
+            if not valid_shard(output_dir, record):
+                raise ValueError(f"dataset artifact has an invalid file: {artifact}")
+        elif not path.is_file():
+            raise FileNotFoundError(f"dataset artifact is missing: {path}")
+        yield from iter_jsonl(path)

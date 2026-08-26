@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mmdd_stage1.construction import build_stage1_training_artifacts
+from mmdd_stage1.construction import _artifact_records, build_stage1_training_artifacts
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -34,6 +34,35 @@ def _table(table_id: str, headers: list[str], values: list[list[str]]) -> dict:
             for row_index, row in enumerate(values)
         ],
     }
+
+
+def test_artifact_records_prefers_manifest_over_stale_flat_file(tmp_path: Path):
+    stale = {"table_id": "stale"}
+    listed = {"table_id": "listed"}
+    _write_jsonl(tmp_path / "query_tables.jsonl", [stale])
+    shard = tmp_path / "query_tables" / "part-00000.jsonl"
+    shard.parent.mkdir()
+    _write_jsonl(shard, [listed])
+    (tmp_path / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "sharded_jsonl",
+                "artifacts": {
+                    "query_tables": {
+                        "shards": [
+                            {
+                                "path": "query_tables/part-00000.jsonl",
+                                "records": 1,
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _artifact_records(tmp_path, "query_tables") == [listed]
 
 
 def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp_path):

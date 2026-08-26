@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import random
 import re
@@ -13,21 +12,18 @@ from typing import Any, Iterable
 from mmdd_dataset.utils import clean_text, get_cell, read_jsonl
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
 
-
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 
 
 def _artifact_records(root: Path, name: str, *, required: bool = True) -> list[dict[str, Any]]:
+    manifest = root / "dataset_manifest.json"
     path = root / f"{name}.jsonl"
-    if path.is_file():
+    if manifest.is_file():
+        records = list(iter_dataset_artifact(root, name))
+    elif path.is_file():
         records = list(read_jsonl(path))
     else:
-        manifest = root / "dataset_manifest.json"
-        if not manifest.is_file():
-            records = []
-        else:
-            metadata = json.loads(manifest.read_text(encoding="utf-8"))
-            records = list(iter_dataset_artifact(root, name)) if metadata.get("complete") is True else []
+        records = []
     if required and not records:
         raise ValueError(f"Dataset artifact is empty or missing: {name}")
     return records

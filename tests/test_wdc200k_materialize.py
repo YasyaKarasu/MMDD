@@ -11,6 +11,7 @@ import threading
 import tracemalloc
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2975,7 +2976,7 @@ def test_query_auto_check_exhausts_final_query_evidence_after_threshold_selectio
         ).fetchone()[0] == 1
 
 
-def test_legacy_remote_review_migrates_to_query_auto_check_cache() -> None:
+def _query_recovery_candidate() -> join_builder.QueryRecoveryCandidate:
     task = join_builder.ExtractionTask(
         order=0,
         cache_key="legacy-extraction",
@@ -2995,7 +2996,7 @@ def test_legacy_remote_review_migrates_to_query_auto_check_cache() -> None:
         asset={"asset_id": "asset-alpha", "asset_type": "text"},
         candidate_attribute_names=["State"],
     )
-    candidate = join_builder.QueryRecoveryCandidate(
+    return join_builder.QueryRecoveryCandidate(
         task=task,
         extraction={"cache_key": task.cache_key},
         recovery={
@@ -3006,6 +3007,15 @@ def test_legacy_remote_review_migrates_to_query_auto_check_cache() -> None:
                 "model_value": "Texas",
             },
         },
+    )
+
+
+def test_legacy_remote_review_requires_matching_policy_to_migrate() -> None:
+    candidate = _query_recovery_candidate()
+    task = candidate.task
+    cascade = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=object(),
     )
     review = {
         "attribute_name": "State",
@@ -3018,21 +3028,179 @@ def test_legacy_remote_review_migrates_to_query_auto_check_cache() -> None:
         "terra_triggered": True,
     }
 
+    extraction = {
+        "cache_key": task.cache_key,
+        "auto_check": {
+            "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "reviews": [review],
+        },
+    }
+
+    assert materializer._legacy_query_auto_check_record(
+        candidate,
+        extraction,
+        extractor=cascade,
+    ) is None
+
+    extraction["auto_check"]["review_policy"] = (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE
+    )
     migrated = materializer._legacy_query_auto_check_record(
         candidate,
-        {
-            "cache_key": task.cache_key,
-            "auto_check": {
-                "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
-                "reviews": [review],
-            },
-        },
+        extraction,
+        extractor=cascade,
     )
 
     assert migrated is not None
     assert migrated["supported"] is True
+    assert migrated["review_policy"] == (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE
+    )
     assert migrated["auto_check"]["reviews"] == [review]
     assert join_builder.query_recovery_remote_review_is_complete(migrated)
+
+
+def test_query_auto_check_persistence_uses_cascade_key_over_stale_local(
+    tmp_path: Path,
+) -> None:
+    candidate = _query_recovery_candidate()
+    local = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=None,
+    )
+    cascade = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=object(),
+    )
+    local_key = join_builder.query_recovery_auto_check_key(candidate, local)
+    cascade_key = join_builder.query_recovery_auto_check_key(
+        candidate,
+        cascade,
+    )
+
+    def record(key: str, policy: str, marker: str) -> dict[str, Any]:
+        remote = policy == join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE
+        return {
+            "cache_key": key,
+            "extraction_cache_key": candidate.task.cache_key,
+            "review_policy": policy,
+            "query_row_attributes": candidate.task.entity["row_attributes"],
+            "attribute_name": "State",
+            "claimed_value": "Texas",
+            "evidence_identity": (
+                join_builder.query_recovery_remote_evidence_identity(candidate)
+            ),
+            "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "supported": True,
+            "marker": marker,
+            "auto_check": {
+                "schema_version": join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "review_policy": policy,
+                "reviewed_attributes": 1,
+                "reviews": [
+                    {
+                        "review_complete": True,
+                        "error_code": "",
+                        "decision_source": (
+                            "local_luna_consensus" if remote else "primary_local"
+                        ),
+                        "luna_triggered": remote,
+                    }
+                ],
+            },
+        }
+
+    cache = join_builder.ExtractionCache(
+        tmp_path / "query-checks.jsonl",
+        reuse=False,
+        record_key_alias=join_builder.query_recovery_auto_check_record_key,
+    )
+    cache.put(
+        local_key,
+        record(
+            local_key,
+            join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL,
+            "stale-local",
+        ),
+    )
+    cache.put(
+        cascade_key,
+        record(
+            cascade_key,
+            join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE,
+            "current-cascade",
+        ),
+    )
+    database = tmp_path / "materialize.sqlite3"
+    materializer._initialize_index(database)
+    plan = join_builder.QueryRecoveryAutoCheckPlan(
+        query_key="query-1",
+        required_recovered_rows=1,
+        source_row_order=(0,),
+        candidates=(candidate,),
+    )
+    item = materializer._MaterializationWorkItem(
+        source_table_id="source-1",
+        source_ordinal=0,
+        source_sha256="source-sha",
+        split="train",
+    )
+
+    materializer._persist_query_auto_check_batch(
+        database,
+        [(item, [plan])],
+        cache=cache,
+        extractor=cascade,
+    )
+
+    with materializer._connect(database) as connection:
+        row = connection.execute(
+            "SELECT cache_key, record_json FROM query_auto_checks"
+        ).fetchone()
+    assert row["cache_key"] == cascade_key
+    assert json.loads(row["record_json"])["marker"] == "current-cascade"
+
+
+def test_materialization_identity_tracks_actual_auto_check_policy(
+    tmp_path: Path,
+) -> None:
+    args = _args(tmp_path)
+    local = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=None,
+    )
+    cascade = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=object(),
+    )
+    policies = {
+        materializer._materialization_review_policy(extractor)
+        for extractor in (None, local, cascade)
+    }
+    fingerprints = {
+        materializer._parameter_fingerprint(
+            args,
+            review_policy=policy,
+        )
+        for policy in policies
+    }
+
+    assert policies == {
+        "disabled",
+        join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL,
+        join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE,
+    }
+    assert len(fingerprints) == len(policies)
+    payload = materializer._parameter_payload(
+        args,
+        review_policy=join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE,
+    )
+    assert payload["auto_check_schema_version"] == (
+        join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
+    )
+    assert payload["auto_check_review_policy"] == (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE
+    )
 
 
 def test_partial_source_catalog_import_resumes_after_committed_batch(

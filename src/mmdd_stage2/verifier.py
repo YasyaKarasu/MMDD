@@ -274,8 +274,8 @@ def semantic_joinability(
     query_values: Sequence[str],
     target_values: Sequence[str],
     *,
-    query_embeddings: torch.Tensor | None = None,
-    target_embeddings: torch.Tensor | None = None,
+    query_embeddings: torch.Tensor,
+    target_embeddings: torch.Tensor,
     similarity_threshold: float = 0.8,
     min_coverage: float = 0.6,
 ) -> SemanticJoinability:
@@ -283,14 +283,14 @@ def semantic_joinability(
 
     if not query_values or not target_values:
         return SemanticJoinability(False, 0.0, 0.0)
-    if (query_embeddings is None) != (target_embeddings is None):
-        raise ValueError("query_embeddings and target_embeddings must be supplied together")
-    if query_embeddings is not None:
-        if query_embeddings.shape[0] != len(query_values) or target_embeddings.shape[0] != len(target_values):
-            raise ValueError("Embedding rows must match their values")
-        similarities = F.normalize(query_embeddings.float(), dim=-1) @ F.normalize(target_embeddings.float(), dim=-1).T
-    else:
-        similarities = torch.zeros((len(query_values), len(target_values)))
+    if (
+        query_embeddings.shape[0] != len(query_values)
+        or target_embeddings.shape[0] != len(target_values)
+    ):
+        raise ValueError("Embedding rows must match their values")
+    similarities = F.normalize(query_embeddings.float(), dim=-1) @ F.normalize(
+        target_embeddings.float(), dim=-1
+    ).T
 
     best_scores = []
     for query_index, query_value in enumerate(query_values):

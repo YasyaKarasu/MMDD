@@ -55,7 +55,6 @@ from build_mm_table_dataset import (
     default_wikipedia_user_agent,
     finalize_entities,
     iter_jsonl_records,
-    iter_with_progress,
     is_useful_image,
     normalize_title,
     parse_source_table,
@@ -104,6 +103,10 @@ from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 PROMPT_VERSION = "entity_attribute_extraction_v5_batched_leave_one_out"
 MODEL_AUTO_CHECK_SCHEMA_VERSION = (
     "model-output-auto-check-v5-entity-evidence-grounding"
+)
+AUTO_CHECK_REVIEW_POLICY_LOCAL = "local_only"
+AUTO_CHECK_REVIEW_POLICY_CASCADE = (
+    "local_luna_consensus_terra_adjudication_v1"
 )
 QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION = (
     "query-recovery-remote-evidence-v2-query-visible"
@@ -2343,8 +2346,8 @@ def add_model_auto_check_arguments(parser: argparse.ArgumentParser) -> None:
         dest="auto_check_secondary_openai",
         action="store_false",
         help=(
-            "Disable Luna review of non-matching local extractions and Terra "
-            "adjudication of local/Luna disagreements."
+            "Use the local auto-check model only. By default Luna reviews every "
+            "local extraction and Terra adjudicates local/Luna disagreements."
         ),
     )
     group.add_argument(
@@ -2444,7 +2447,7 @@ def add_model_auto_check_arguments(parser: argparse.ArgumentParser) -> None:
 def prepare_model_auto_check_reviewers(
     args: argparse.Namespace,
 ) -> tuple[Any | None, Any | None]:
-    """Create Luna recovery and final-judge reviewer pools."""
+    """Create Luna consensus-review and final-judge reviewer pools."""
     if not bool(getattr(args, "auto_check_secondary_openai", False)):
         return None, None
 
@@ -3984,7 +3987,7 @@ class LocalAttributeExtractor:
         defer_remote: bool = False,
         local_review: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run local -> Luna recovery -> Terra adjudication, fail closed."""
+        """Run local -> Luna consensus -> Terra adjudication, fail closed."""
         from mm_joinability_dataset_auto_checker import _safe_error_code
 
         def classify(value: str) -> tuple[str, str]:
@@ -4007,11 +4010,6 @@ class LocalAttributeExtractor:
             return values_match(
                 left_value,
                 right_value,
-                attribute_name=attribute_name,
-                entity_column_name=task.entity_column_name,
-            ) or values_match(
-                right_value,
-                left_value,
                 attribute_name=attribute_name,
                 entity_column_name=task.entity_column_name,
             )
@@ -4128,15 +4126,6 @@ class LocalAttributeExtractor:
                     local_review.get("primary_error_code")
                 ),
             )
-        if primary_verdict == "supported":
-            return finish(
-                value=primary_value,
-                verdict=primary_verdict,
-                comparison=primary_comparison,
-                source="primary_local",
-                complete=True,
-            )
-
         luna = getattr(self, "auto_check_luna_reviewer", None)
         if luna is None:
             return finish(
@@ -4785,6 +4774,7 @@ def apply_model_auto_check(
     updated["auto_check"] = {
         "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
         "policy": "keep_source_canonical_supported_only_fail_closed",
+        "review_policy": model_auto_check_review_policy(extractor),
         "reviewed_attributes": len(reviews),
         "supported_attributes": len(kept),
         "filtered_attributes": len(reviews) - len(kept),
@@ -5445,6 +5435,25 @@ def auto_check_required(extractor: Any | None) -> bool:
     return bool(extractor is not None and getattr(extractor, "auto_check_enabled", False))
 
 
+def model_auto_check_review_policy(extractor: Any | None) -> str:
+    """Return the cache-visible policy used for final auto-check decisions."""
+    if extractor is not None and getattr(
+        extractor,
+        "auto_check_luna_reviewer",
+        None,
+    ) is not None:
+        return AUTO_CHECK_REVIEW_POLICY_CASCADE
+    return AUTO_CHECK_REVIEW_POLICY_LOCAL
+
+
+def model_auto_check_cache_schema_version(extractor: Any | None) -> str:
+    """Keep legacy local-only keys while isolating the new cascade policy."""
+    policy = model_auto_check_review_policy(extractor)
+    if policy == AUTO_CHECK_REVIEW_POLICY_LOCAL:
+        return MODEL_AUTO_CHECK_SCHEMA_VERSION
+    return f"{MODEL_AUTO_CHECK_SCHEMA_VERSION}:{policy}"
+
+
 def cached_extraction_is_reusable(
     record: dict[str, Any],
     args: argparse.Namespace,
@@ -5514,6 +5523,7 @@ def _query_recovery_evidence_identity_fields(
     return {
         "cache_version": QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION,
         "auto_check_schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "review_policy": AUTO_CHECK_REVIEW_POLICY_CASCADE,
         "asset_id": clean_text(asset_id),
         "asset_type": clean_text(asset_type),
         "masked_row": masked_row,
@@ -5593,11 +5603,11 @@ def query_recovery_remote_review_is_complete(
 
 def query_recovery_auto_check_key(
     candidate: QueryRecoveryCandidate,
-    _extractor: Any,
+    extractor: Any,
 ) -> str:
     recovered = candidate.recovery["recovered_attribute"]
     return _query_recovery_auto_check_key_fields(
-        schema_version=MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        schema_version=model_auto_check_cache_schema_version(extractor),
         extraction_cache_key=candidate.task.cache_key,
         query_row_attributes=candidate.task.entity.get("row_attributes"),
         attribute_name=recovered.get("column_name"),
@@ -5607,7 +5617,6 @@ def query_recovery_auto_check_key(
 
 def query_recovery_auto_check_record_key(
     record: dict[str, Any],
-    extraction_record: dict[str, Any] | None = None,
 ) -> str | None:
     """Derive a reusable alias for a completed recovery review.
 
@@ -5637,8 +5646,16 @@ def query_recovery_auto_check_record_key(
     query_row_attributes = record.get("query_row_attributes")
     if not isinstance(query_row_attributes, list):
         return None
+    review_policy = (
+        clean_text(record.get("review_policy"))
+        or clean_text(auto_check.get("review_policy"))
+        or AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    cache_schema_version = schema_version
+    if review_policy != AUTO_CHECK_REVIEW_POLICY_LOCAL:
+        cache_schema_version = f"{schema_version}:{review_policy}"
     return _query_recovery_auto_check_key_fields(
-        schema_version=schema_version,
+        schema_version=cache_schema_version,
         extraction_cache_key=extraction_cache_key,
         query_row_attributes=query_row_attributes,
         attribute_name=record.get("attribute_name"),
@@ -5674,6 +5691,8 @@ def query_recovery_cached_check(
     key: str,
     cache: ExtractionCache,
     candidate: QueryRecoveryCandidate | None = None,
+    *,
+    extractor: Any | None = None,
 ) -> dict[str, Any] | None:
     transient = cache.get_transient(key)
     if transient is not None:
@@ -5683,7 +5702,11 @@ def query_recovery_cached_check(
         {"auto_check": cached.get("auto_check")}, required=True
     ):
         return cached
-    if candidate is not None:
+    if (
+        candidate is not None
+        and model_auto_check_review_policy(extractor)
+        == AUTO_CHECK_REVIEW_POLICY_CASCADE
+    ):
         remote_key = query_recovery_remote_evidence_key(candidate)
         remote_cached = cache.get(remote_key)
         if remote_cached and query_recovery_remote_review_is_complete(
@@ -5706,6 +5729,7 @@ def query_recovery_plan_needs_model_check(
                 query_recovery_auto_check_key(candidate, extractor),
                 cache,
                 candidate,
+                extractor=extractor,
             )
             is None
             for _row_id, row_candidates in query_recovery_plan_row_groups(
@@ -5724,7 +5748,7 @@ def query_recovery_plan_needs_model_check(
         for candidate in row_candidates:
             key = query_recovery_auto_check_key(candidate, extractor)
             record = query_recovery_cached_check(
-                key, cache, candidate
+                key, cache, candidate, extractor=extractor
             )
             if record is None:
                 has_pending = True
@@ -5764,6 +5788,7 @@ def query_recovery_plan_is_supported(
                         query_recovery_auto_check_key(candidate, extractor),
                         cache,
                         candidate,
+                        extractor=extractor,
                     )
                     or {}
                 ).get("supported")
@@ -5824,6 +5849,7 @@ def check_query_recovery_candidate(
         )
     return {
         "schema_version": MODEL_AUTO_CHECK_SCHEMA_VERSION,
+        "review_policy": model_auto_check_review_policy(extractor),
         "supported": bool(checked.get("attributes")),
         "auto_check": checked.get("auto_check"),
     }
@@ -6159,7 +6185,7 @@ def resolve_query_recovery_auto_check_plans(
                 for candidate in row_candidates:
                     key = query_recovery_auto_check_key(candidate, extractor)
                     record = query_recovery_cached_check(
-                        key, cache, candidate
+                        key, cache, candidate, extractor=extractor
                     )
                     if record is None:
                         state.pending_candidates.append(candidate)
@@ -6180,7 +6206,9 @@ def resolve_query_recovery_auto_check_plans(
             candidate = state.pending_candidates[state.candidate_index]
             state.candidate_index += 1
             key = query_recovery_auto_check_key(candidate, extractor)
-            cached = query_recovery_cached_check(key, cache, candidate)
+            cached = query_recovery_cached_check(
+                key, cache, candidate, extractor=extractor
+            )
             if cached is not None:
                 resolved[key] = cached
                 if cached.get("supported") and not exhaustive:
@@ -6199,6 +6227,7 @@ def resolve_query_recovery_auto_check_plans(
         record = {
             "cache_key": key,
             "extraction_cache_key": candidate.task.cache_key,
+            "review_policy": model_auto_check_review_policy(extractor),
             "query_row_attributes": canonical_extraction_row_attributes(
                 candidate.task.entity.get("row_attributes")
             ),
@@ -8719,7 +8748,9 @@ def run_query_recovery_auto_check_round(
     for plan in active_plans:
         for candidate in plan.candidates:
             key = query_recovery_auto_check_key(candidate, extractor)
-            if query_recovery_cached_check(key, cache, candidate) is None:
+            if query_recovery_cached_check(
+                key, cache, candidate, extractor=extractor
+            ) is None:
                 pending_candidates.setdefault(key, candidate)
     counts = Counter(
         model_kind_for_asset(candidate.task.asset)
@@ -9381,7 +9412,10 @@ def build_table_join_records(
                             candidate, extractor
                         )
                         record = query_recovery_cached_check(
-                            key, query_auto_check_cache, candidate
+                            key,
+                            query_auto_check_cache,
+                            candidate,
+                            extractor=extractor,
                         )
                         if record is None:
                             raise RuntimeError(
@@ -9831,17 +9865,10 @@ def _build_dataset(
     query_recovery_alias_stats: Counter[str] = Counter()
 
     def query_recovery_record_alias(record: dict[str, Any]) -> str | None:
-        extraction_key = clean_text(record.get("extraction_cache_key"))
-        extraction_record = cache.get(extraction_key) if extraction_key else None
-        alias = query_recovery_auto_check_record_key(
-            record,
-            extraction_record=extraction_record,
-        )
+        alias = query_recovery_auto_check_record_key(record)
         if query_recovery_remote_review_is_complete(record):
             if isinstance(record.get("evidence_identity"), dict):
                 query_recovery_alias_stats["remote_native"] += 1
-            elif extraction_record is not None:
-                query_recovery_alias_stats["remote_migrated"] += 1
             else:
                 query_recovery_alias_stats["remote_unmapped"] += 1
         else:
@@ -9856,9 +9883,8 @@ def _build_dataset(
     if not args.no_reuse_model_cache:
         logging.info(
             "Query recovery cache aliases: remote_native=%d, "
-            "remote_migrated=%d, remote_unmapped=%d, local_model_specific=%d",
+            "remote_unmapped=%d, local_model_specific=%d",
             query_recovery_alias_stats["remote_native"],
-            query_recovery_alias_stats["remote_migrated"],
             query_recovery_alias_stats["remote_unmapped"],
             query_recovery_alias_stats["local_model_specific"],
         )
@@ -10461,7 +10487,7 @@ def _build_dataset(
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
-            "every local-positive evidence candidate for a final accepted query receives an exhaustive auto-check before evidence_recoveries are materialized",
+            "every local-positive evidence candidate for a final accepted query receives exhaustive local/Luna consensus review, with final-judge adjudication on disagreement, before evidence_recoveries are materialized",
             "evidence_recoveries contain supported paths only; omitted evidence is an implicit negative",
             "api_failures is retained for backward compatibility; use manifest.wikimedia_media for media transfer counters",
             "each replacement pass draws from every currently failed slot; retained_failed slots are deferred to the next pass unless the pass is terminal",

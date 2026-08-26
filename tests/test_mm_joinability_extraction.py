@@ -666,18 +666,14 @@ def test_query_recovery_auto_check_key_ignores_reviewer_pool_identity() -> None:
     ) == joinability_dataset.query_recovery_auto_check_key(candidate, changed_pool)
 
 
-def _extraction_record_for_candidate(
-    candidate: joinability_dataset.QueryRecoveryCandidate,
-) -> dict[str, object]:
-    return {
-        "cache_key": candidate.task.cache_key,
-        "asset_id": candidate.task.asset["asset_id"],
-        "asset_type": candidate.task.asset["asset_type"],
-        "entity_id": candidate.task.entity["entity_id"],
-        "entity_text": candidate.task.entity["cell_text"],
-        "entity_wiki_title": candidate.task.entity["wiki_title"],
-        "row_attributes": candidate.task.entity["row_attributes"],
-    }
+def test_query_recovery_cache_key_separates_local_and_cascade_policies() -> None:
+    candidate = _make_query_recovery_candidate()
+    local_only = SimpleNamespace(auto_check_luna_reviewer=None)
+    cascade = SimpleNamespace(auto_check_luna_reviewer=object())
+
+    assert joinability_dataset.query_recovery_auto_check_key(
+        candidate, local_only
+    ) != joinability_dataset.query_recovery_auto_check_key(candidate, cascade)
 
 
 def test_remote_review_cache_survives_local_model_change(
@@ -699,7 +695,7 @@ def test_remote_review_cache_survives_local_model_change(
         old_candidate, None
     )
     new_key = joinability_dataset.query_recovery_auto_check_key(
-        new_candidate, None
+        new_candidate, Extractor()
     )
     assert old_key != new_key
     assert joinability_dataset.query_recovery_remote_evidence_key(
@@ -710,20 +706,9 @@ def test_remote_review_cache_survives_local_model_change(
     legacy_record["extraction_cache_key"] = old_candidate.task.cache_key
     cache_path = tmp_path / "query-auto-check-cache.jsonl"
     cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
-    old_extraction = _extraction_record_for_candidate(old_candidate)
     cache = ExtractionCache(
         cache_path,
-        record_key_alias=lambda record: (
-            joinability_dataset.query_recovery_auto_check_record_key(
-                record,
-                extraction_record=(
-                    old_extraction
-                    if record.get("extraction_cache_key")
-                    == old_candidate.task.cache_key
-                    else None
-                ),
-            )
-        ),
+        record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
     )
 
     results = joinability_dataset.resolve_query_recovery_auto_checks(
@@ -736,6 +721,38 @@ def test_remote_review_cache_survives_local_model_change(
     )
 
     assert results == {new_key: legacy_record}
+
+
+def test_remote_evidence_cache_invalidates_previous_review_policy(
+    tmp_path: Path,
+) -> None:
+    candidate = _make_query_recovery_candidate()
+    identity = joinability_dataset.query_recovery_remote_evidence_identity(candidate)
+    identity_without_policy = dict(identity)
+    identity_without_policy.pop("review_policy")
+    legacy_key = joinability_dataset._query_recovery_evidence_identity_key(
+        identity_without_policy
+    )
+    legacy_record = _completed_query_recovery_record(legacy_key)
+    legacy_record["evidence_identity"] = identity_without_policy
+    cache_path = tmp_path / "query-auto-check-cache.jsonl"
+    cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
+    cache = ExtractionCache(
+        cache_path,
+        record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
+    )
+    current_key = joinability_dataset.query_recovery_auto_check_key(
+        candidate,
+        SimpleNamespace(auto_check_luna_reviewer=object()),
+    )
+    cascade = SimpleNamespace(auto_check_luna_reviewer=object())
+
+    assert joinability_dataset.query_recovery_cached_check(
+        current_key,
+        cache,
+        candidate,
+        extractor=cascade,
+    ) is None
 
 
 def test_local_only_review_cache_remains_local_model_specific(
@@ -753,25 +770,23 @@ def test_local_only_review_cache_remains_local_model_specific(
     review["decision_source"] = "primary_local"
     cache_path = tmp_path / "query-auto-check-cache.jsonl"
     cache_path.write_text(json.dumps(local_record) + "\n", encoding="utf-8")
-    old_extraction = _extraction_record_for_candidate(old_candidate)
     cache = ExtractionCache(
         cache_path,
-        record_key_alias=lambda record: (
-            joinability_dataset.query_recovery_auto_check_record_key(
-                record, extraction_record=old_extraction
-            )
-        ),
+        record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
     )
     new_key = joinability_dataset.query_recovery_auto_check_key(
         new_candidate, None
     )
 
     assert joinability_dataset.query_recovery_cached_check(
-        new_key, cache, new_candidate
+        new_key,
+        cache,
+        new_candidate,
+        extractor=None,
     ) is None
 
 
-def test_query_recovery_cache_aliases_legacy_pool_dependent_key(
+def test_remote_cache_alias_is_available_only_to_cascade_policy(
     tmp_path: Path,
 ) -> None:
     cache_path = tmp_path / "query-auto-check-cache.jsonl"
@@ -784,14 +799,28 @@ def test_query_recovery_cache_aliases_legacy_pool_dependent_key(
         record_key_alias=joinability_dataset.query_recovery_auto_check_record_key,
     )
     candidate = _make_query_recovery_candidate()
-    canonical_key = joinability_dataset.query_recovery_auto_check_key(candidate, None)
+    cascade = SimpleNamespace(auto_check_luna_reviewer=object())
+    cascade_key = joinability_dataset.query_recovery_auto_check_key(
+        candidate,
+        cascade,
+    )
+    local_key = joinability_dataset.query_recovery_auto_check_key(candidate, None)
     remote_key = joinability_dataset.query_recovery_remote_evidence_key(candidate)
 
     assert cache.get(legacy_key) == legacy_record
     assert cache.get(remote_key) == legacy_record
     assert joinability_dataset.query_recovery_cached_check(
-        canonical_key, cache, candidate
+        cascade_key,
+        cache,
+        candidate,
+        extractor=cascade,
     ) == legacy_record
+    assert joinability_dataset.query_recovery_cached_check(
+        local_key,
+        cache,
+        candidate,
+        extractor=None,
+    ) is None
 
 
 def test_changed_reviewer_pool_reuses_completed_legacy_recovery(
@@ -3370,6 +3399,155 @@ def test_local_auto_check_escalates_luna_disagreement_to_terra(monkeypatch):
     assert review["terra_extracted_value"] == "Alabama"
     assert luna.calls == 1
     assert terra.calls == 1
+
+
+def test_supported_local_auto_check_still_runs_luna(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Georgia")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Alabama",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["verdict"] == "supported"
+    assert review["decision_source"] == "local_luna_consensus"
+    assert review["luna_agrees_with_local"] is True
+    assert luna.calls == 1
+    assert terra.calls == 0
+
+
+def test_supported_local_luna_disagreement_runs_final_judge(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Georgia")
+    terra = Reviewer("Alabama")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Alabama",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["primary_verdict"] == "supported"
+    assert review["luna_agrees_with_local"] is False
+    assert review["decision_source"] == "terra_adjudication"
+    assert review["verdict"] == "supported"
+    assert luna.calls == 1
+    assert terra.calls == 1
+
+
+def test_supported_deferred_auto_check_waits_for_luna(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Georgia")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Alabama",
+    )
+
+    pending = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+        defer_remote=True,
+    )
+    assert pending["decision_source"] == "remote_review_pending"
+    assert pending["review_complete"] is False
+    assert luna.calls == 0
+
+    completed = extractor.complete_auto_check_attribute_review(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+        local_review=pending,
+    )
+    assert completed["decision_source"] == "local_luna_consensus"
+    assert completed["verdict"] == "supported"
+    assert luna.calls == 1
+    assert terra.calls == 0
+
+
+def test_local_only_auto_check_keeps_primary_result(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+    extractor.auto_check_luna_reviewer = None
+    extractor.auto_check_terra_reviewer = None
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: "Alabama",
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["verdict"] == "supported"
+    assert review["decision_source"] == "primary_local"
+    assert review["luna_triggered"] is False
+    assert review["terra_triggered"] is False
 
 
 def test_local_and_luna_matching_mismatch_skips_terra(monkeypatch):

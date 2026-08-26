@@ -4,9 +4,9 @@
 The audit samples implicit queries, extracts every claimed attribute independently,
 and caches successful model extractions at attribute granularity. Sampling is a
 stable hash prefix, so increasing ``--sample_rate`` preserves the earlier sample
-and reuses its cache. A local extractor runs first. Luna reviews only local
-results that do not match the earlier analysis, and Terra adjudicates only when
-Luna and the local extractor disagree.
+and reuses its cache. A local extractor runs first, Luna independently reviews
+every result, and Terra adjudicates only when Luna and the local extractor
+disagree.
 """
 
 from __future__ import annotations
@@ -54,6 +54,8 @@ from stage1_io import write_json, write_jsonl
 LOG = logging.getLogger("mm_joinability_auto_checker")
 AUTO_CHECKER_SCHEMA_VERSION = "mm-joinability-auto-checker-cache-v7"
 PROMPT_VERSION = "mm-joinability-query-visible-evidence-only-v5"
+CASCADE_REVIEW_POLICY = "local_luna_consensus_terra_adjudication_v1"
+LOCAL_REVIEW_POLICY = "local_only"
 VALID_VERDICTS = frozenset({"supported", "contradicted", "insufficient"})
 DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
 DEFAULT_LUNA_OPENAI_MODEL = "gpt-5.6-luna"
@@ -893,11 +895,6 @@ def _extracted_results_agree(
         right_value,
         attribute_name=attribute_name,
         entity_column_name=entity_column_name,
-    ) or join_builder.values_match(
-        right_value,
-        left_value,
-        attribute_name=attribute_name,
-        entity_column_name=entity_column_name,
     )
 
 
@@ -1090,14 +1087,7 @@ def _flatten_results(
                 luna_extraction is not None
                 and _extracted_results_agree(item, primary_value, luna_value)
             )
-            if primary_verdict == "supported":
-                verdict = primary_verdict
-                comparison = primary_comparison
-                extracted_value = primary_value
-                decision_source = "primary_local"
-                complete = True
-                chosen_cache_hit = primary_key in primary.cache_hits
-            elif not luna_requested and primary_verdict is not None:
+            if not luna_requested and primary_verdict is not None:
                 verdict = primary_verdict
                 comparison = primary_comparison
                 extracted_value = primary_value
@@ -1275,12 +1265,15 @@ def _summary(
         for item in batch.get("items") or []
     }
     return {
-        "schema_version": "mm-joinability-auto-check-report-v5",
+        "schema_version": "mm-joinability-auto-check-report-v6",
         "run_id": run_id,
         "completed_at": _now_iso(),
         "dataset": str(config.output_dir.resolve()),
         "dataset_signature": query_population_signature(population_ids),
         "prompt_version": PROMPT_VERSION,
+        "review_policy": (
+            CASCADE_REVIEW_POLICY if luna_identity else LOCAL_REVIEW_POLICY
+        ),
         "reviewer_identity": primary_identity,
         "reviewers": {
             "primary": primary_identity,
@@ -1452,13 +1445,9 @@ def run_auto_check(
     luna_requests: list[dict[str, Any]] = []
     if luna_reviewer is not None:
         for request_batch in all_requests:
-            item = request_batch["items"][0]
             primary_key = attribute_cache_key(request_batch, reviewer.identity)
-            extraction = _single_extraction(primary.results.get(primary_key))
-            if extraction is not None:
-                verdict, _comparison, _value = _extraction_comparison(item, extraction)
-                if verdict != "supported":
-                    luna_requests.append(request_batch)
+            if _single_extraction(primary.results.get(primary_key)) is not None:
+                luna_requests.append(request_batch)
 
     luna = (
         _run_extraction_stage(
@@ -1533,13 +1522,21 @@ def run_auto_check(
         "luna": luna_reviewer.identity if luna_reviewer else None,
         "terra": terra_reviewer.identity if terra_reviewer else None,
     }
-    reviewer_fingerprint = _sha256_json(pipeline_identity)[:16]
+    review_policy = (
+        CASCADE_REVIEW_POLICY
+        if luna_reviewer is not None
+        else LOCAL_REVIEW_POLICY
+    )
+    reviewer_fingerprint = _sha256_json(
+        {"review_policy": review_policy, "reviewers": pipeline_identity}
+    )[:16]
     run_id = _sha256_json(
         {
             "dataset_signature": dataset_signature,
             "sample_rate": config.sample_rate,
             "seed": config.seed,
             "prompt_version": PROMPT_VERSION,
+            "review_policy": review_policy,
             "reviewers": pipeline_identity,
         }
     )[:24]
@@ -1620,8 +1617,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Audit a stable sample of implicit query-row -> evidence -> attribute "
-            "recoveries with local-first blind extraction, Luna recovery of empty "
-            "results, and Terra adjudication of Luna recoveries."
+            "recoveries with local-first blind extraction, mandatory Luna review, "
+            "and Terra adjudication of local/Luna disagreements."
         )
     )
     parser.add_argument("--output_dir", default="output_mm_joinability_v15")
@@ -1691,7 +1688,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no_secondary_openai",
         action="store_true",
-        help="Disable both Luna recovery and Terra adjudication.",
+        help="Use only the local checker; disable Luna and Terra review.",
     )
     parser.add_argument(
         "--luna_openai_model",
@@ -1719,7 +1716,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="luna_openai_max_inflight",
         type=int,
         default=MAX_SECONDARY_OPENAI_CONCURRENCY,
-        help="Luna recovery concurrency; must be between 1 and 5.",
+        help="Luna review concurrency; must be between 1 and 5.",
     )
     parser.add_argument(
         "--terra_openai_model",

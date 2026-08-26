@@ -143,6 +143,36 @@ def iter_retrieval_results(path: Path) -> Iterator[dict[str, Any]]:
                 yield json.loads(line)
 
 
+def validate_retrieval_path_budget(
+    record: dict[str, Any], *, max_targets: int, top_k_evidence: int
+) -> None:
+    """Reject Stage-2 settings that exceed serialized Stage-1 path detail."""
+
+    metadata = record.get("path_aggregation", {})
+    if not isinstance(metadata, dict):
+        return
+    selected_results = record.get("results", [])[:max_targets]
+    path_result_k = metadata.get("path_result_k")
+    if path_result_k is not None and len(selected_results) > int(path_result_k):
+        raise ValueError(
+            f"Stage 2 requests paths for {len(selected_results)} targets but retrieval retained them for "
+            f"only {path_result_k}; regenerate with a larger --path-result-k"
+        )
+    evidence_path_k = metadata.get("evidence_path_k")
+    has_evidence_channel = any(
+        result.get("evidence_score") is not None for result in selected_results
+    )
+    if (
+        has_evidence_channel
+        and evidence_path_k is not None
+        and top_k_evidence > int(evidence_path_k)
+    ):
+        raise ValueError(
+            f"Stage 2 requests {top_k_evidence} evidence objects per target but retrieval "
+            f"retained only {evidence_path_k}; regenerate with a larger --evidence-path-k"
+        )
+
+
 def column_name(table: dict[str, Any], column_index: int) -> str:
     for column in table["columns"]:
         if int(column["column_index"]) == column_index:
@@ -159,7 +189,7 @@ def local_column_index(table: dict[str, Any], source_column_index: int) -> int:
 
 def row_values(table: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
     return {
-        column_name(table, int(column["column_index"])): clean_text(
+        clean_text(column.get("column_name")): clean_text(
             get_cell(row, int(column["column_index"])).get("text")
         )
         for column in table["columns"]

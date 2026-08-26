@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
-from torch.nn import functional as F
-
 from mmdd_stage1.features import FeatureStore
+from torch.nn import functional as F
 
 
 class SimilarityEvidenceRouter:
@@ -31,7 +30,7 @@ class SimilarityEvidenceRouter:
         if not evidence_ids:
             return {}
 
-        query = self.features.get(query_id)
+        query = self.features.get(query_id, include_hidden=False)
         rows = query.row_embeddings
         if rows is None:
             raise ValueError(
@@ -45,7 +44,12 @@ class SimilarityEvidenceRouter:
 
         row_vectors = F.normalize(rows.float(), dim=-1)
         evidence_vectors = F.normalize(
-            torch.stack([self.features.get(evidence_id).embedding for evidence_id in evidence_ids]).float(),
+            torch.stack(
+                [
+                    self.features.get(evidence_id, include_hidden=False).embedding
+                    for evidence_id in evidence_ids
+                ]
+            ).float(),
             dim=-1,
         )
         similarities = evidence_vectors @ row_vectors.T

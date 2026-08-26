@@ -4,29 +4,40 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import torch
 
 OBJECT_TYPES = ("table", "text", "image")
+TYPE_ALIASES = {
+    "table": "table",
+    "table_fragment": "table",
+    "text": "text",
+    "text_asset": "text",
+    "image": "image",
+    "image_asset": "image",
+}
 
 
 def normalize_object_type(value: str) -> str:
-    if value not in OBJECT_TYPES:
-        choices = ", ".join(OBJECT_TYPES)
-        raise ValueError(f"Unknown object type {value!r}; expected one of: {choices}")
-    return value
+    try:
+        return TYPE_ALIASES[value]
+    except KeyError as exc:
+        choices = ", ".join(sorted(TYPE_ALIASES))
+        raise ValueError(f"Unknown object type {value!r}; expected one of: {choices}") from exc
 
 
 @dataclass(frozen=True)
 class ObjectFeatures:
     """The two frozen feature granularities consumed by Teacher and Student.
 
-    ``hidden_states`` contains pooling-before hidden states. For tables,
-    ``token_groups`` assigns each token to schema group 0 or an example-row
-    group greater than 0 from the same encoder forward pass.
+    ``hidden_states`` contains the frozen states consumed by the Teacher.
+    Current table caches store one vector per schema/example-row group and
+    identify them with ``token_groups``. Historical caches may omit the groups
+    because their table states were already pooled.
     """
 
     object_id: str
@@ -44,8 +55,6 @@ class ObjectFeatures:
             raise ValueError(f"{self.object_id}: hidden_states must have shape [tokens, D]")
         if self.hidden_states is not None and self.hidden_states.shape[1] != self.embedding.shape[0]:
             raise ValueError(f"{self.object_id}: embedding and hidden-state dimensions must match")
-        if self.object_type == "table" and self.hidden_states is not None and self.token_groups is None:
-            raise ValueError(f"{self.object_id}: table hidden_states require token_groups")
         if self.token_groups is not None:
             if self.hidden_states is None:
                 raise ValueError(f"{self.object_id}: token_groups require hidden_states")
@@ -109,26 +118,25 @@ def _feature_from_payload(object_id: str, object_type: str, payload: Mapping[str
 
 
 def _load_tensor_file(path: Path) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:  # pragma: no cover - compatibility with older PyTorch.
-        return torch.load(path, map_location="cpu")
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 class FeatureStore:
-    """Read a consolidated feature file or a lazy per-object feature directory."""
+    """Read consolidated features or a lazy two-tier per-object cache."""
 
     def __init__(
         self,
         eager_features: Mapping[str, ObjectFeatures] | None = None,
         *,
         index: Mapping[str, tuple[str, Path]] | None = None,
+        teacher_index: Mapping[str, Path] | None = None,
         cache_size: int = 128,
     ) -> None:
         self._eager = dict(eager_features or {})
         self._index = dict(index or {})
+        self._teacher_index = dict(teacher_index or {})
         self._cache_size = max(0, cache_size)
-        self._cache: OrderedDict[str, ObjectFeatures] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, bool], ObjectFeatures] = OrderedDict()
         if not self._eager and not self._index:
             raise ValueError("Feature store is empty")
 
@@ -173,24 +181,59 @@ class FeatureStore:
                 if object_id in index:
                     raise ValueError(f"{manifest}:{line_number}: duplicate object_id {object_id!r}")
                 index[object_id] = (object_type, feature_path)
-        return cls(index=index, cache_size=cache_size)
-
-    def __contains__(self, object_id: str) -> bool:
-        return object_id in self._eager or object_id in self._index
-
-    def __len__(self) -> int:
-        return len(self._eager) + len(self._index)
+        teacher_index: dict[str, Path] = {}
+        teacher_manifest = root / "teacher_manifest.jsonl"
+        if teacher_manifest.is_file():
+            with teacher_manifest.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    object_id = str(record["object_id"])
+                    if object_id not in index:
+                        raise ValueError(
+                            f"{teacher_manifest}:{line_number}: Teacher object {object_id!r} "
+                            "is absent from the base manifest"
+                        )
+                    declared_type = normalize_object_type(str(record["object_type"]))
+                    if declared_type != index[object_id][0]:
+                        raise ValueError(
+                            f"{teacher_manifest}:{line_number}: object type disagrees with "
+                            "the base manifest"
+                        )
+                    relative_path = Path(record["teacher_feature_path"])
+                    feature_path = (root / relative_path).resolve()
+                    if not feature_path.is_relative_to(root):
+                        raise ValueError(
+                            f"{teacher_manifest}:{line_number}: teacher_feature_path escapes "
+                            "the feature directory"
+                        )
+                    if object_id in teacher_index:
+                        raise ValueError(
+                            f"{teacher_manifest}:{line_number}: duplicate object_id {object_id!r}"
+                        )
+                    teacher_index[object_id] = feature_path
+        return cls(index=index, teacher_index=teacher_index, cache_size=cache_size)
 
     def object_ids(self) -> Iterable[str]:
         yield from self._eager
         yield from self._index
 
-    def get(self, object_id: str) -> ObjectFeatures:
+    def get(self, object_id: str, *, include_hidden: bool = True) -> ObjectFeatures:
         if object_id in self._eager:
-            return self._eager[object_id]
-        if object_id in self._cache:
-            value = self._cache.pop(object_id)
-            self._cache[object_id] = value
+            value = self._eager[object_id]
+            if include_hidden or value.hidden_states is None:
+                return value
+            return ObjectFeatures(
+                object_id=value.object_id,
+                object_type=value.object_type,
+                embedding=value.embedding,
+                row_embeddings=value.row_embeddings,
+            )
+        cache_key = (object_id, include_hidden)
+        if cache_key in self._cache:
+            value = self._cache.pop(cache_key)
+            self._cache[cache_key] = value
             return value
         try:
             object_type, path = self._index[object_id]
@@ -199,15 +242,48 @@ class FeatureStore:
         payload = _load_tensor_file(path)
         if not isinstance(payload, Mapping):
             raise ValueError(f"{path}: expected a feature mapping")
+        if include_hidden and object_id in self._teacher_index:
+            teacher_path = self._teacher_index[object_id]
+            teacher_payload = _load_tensor_file(teacher_path)
+            if not isinstance(teacher_payload, Mapping):
+                raise ValueError(f"{teacher_path}: expected a Teacher feature mapping")
+            if "hidden_states" not in teacher_payload:
+                raise ValueError(
+                    f"{teacher_path}: Teacher feature mapping has no hidden_states"
+                )
+            payload = dict(payload)
+            for key in ("hidden_states", "token_groups"):
+                if key in teacher_payload:
+                    payload[key] = teacher_payload[key]
+        elif not include_hidden:
+            payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"hidden_states", "token_groups"}
+            }
         feature = _feature_from_payload(object_id, object_type, payload)
         if self._cache_size:
-            self._cache[object_id] = feature
+            self._cache[cache_key] = feature
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         return feature
 
     def dimensions(self) -> tuple[int, int | None]:
         first_id = next(iter(self.object_ids()))
-        first = self.get(first_id)
-        hidden_dim = first.hidden_states.shape[1] if first.hidden_states is not None else None
+        first = self.get(first_id, include_hidden=False)
+        hidden = next(
+            (
+                feature.hidden_states
+                for feature in self._eager.values()
+                if feature.hidden_states is not None
+            ),
+            None,
+        )
+        if hidden is None and self._teacher_index:
+            teacher_id = next(iter(self._teacher_index))
+            hidden = self.get(teacher_id, include_hidden=True).hidden_states
+        if hidden is None and not self._teacher_index:
+            # Legacy directory caches kept both tiers in the base object file.
+            hidden = self.get(first_id, include_hidden=True).hidden_states
+        hidden_dim = hidden.shape[1] if hidden is not None else None
         return int(first.embedding.shape[0]), int(hidden_dim) if hidden_dim is not None else None

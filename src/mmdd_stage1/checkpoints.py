@@ -11,10 +11,7 @@ from .models import StudentJoinabilityModel, TeacherJoinabilityModel
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
-    try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:  # pragma: no cover - compatibility with older PyTorch.
-        payload = torch.load(path, map_location="cpu")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or payload.get("format_version") != 1:
         raise ValueError(f"{path}: unsupported Stage-1 checkpoint")
     return payload

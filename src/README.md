@@ -24,11 +24,14 @@ negatives without retaining those construction-only labels. Candidate evidence
 comes from recovery or source provenance and is capped while constructing the
 list, rather than truncated from an unspecified external list later.
 
-`cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores both feature
-granularities required by the method: pooling-before hidden states for the
-Teacher and the normalized final object embedding for the Student. Its input
-is JSONL. A text object uses only its body in `text`, and an image object uses
-only its local `image` file. Tables use only column names and cell values.
+`cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores the two
+feature granularities in separate tiers. The base `objects/` tier contains the
+normalized final embedding for every object plus query-row routing embeddings;
+Student training, ANN indexing, retrieval, and Stage 2 read only this tier.
+The optional `teacher_objects/` tier contains pooling-before states only for
+objects referenced by the supplied training lists. Its input is JSONL. A text
+object uses only its body in `text`, and an image object uses only its local
+`image` file. Tables use only column names and cell values.
 Page titles, captions, sections, entity labels, source names, and provenance
 fields are never serialized into model input. Tables carry their retrieval
 identity in `embedding_role`: query tables use `query` and candidate tables use
@@ -51,11 +54,12 @@ explicitly stated facts in text, and visually grounded facts in images.
 
 Each table is encoded once for its Teacher/Student features. The cache uses
 tokenizer offsets to retain the schema/row tokens from that same sequence and
-stores their `token_groups`; the Teacher pools those groups while the Student
-uses the final embedding from the identical forward pass. For query objects,
-the cache derives one `schema + row` routing view per example row. Those short
-views are embedded in one additional batch and cached for Stage-2 evidence
-assignment.
+immediately mean-pools them to one float32 vector per schema/example-row group.
+This is the exact first operation performed by the Teacher and avoids retaining
+the much larger token matrix. The Student uses the final embedding from the
+same forward pass. For query objects, the cache derives one `schema + row`
+routing view per example row. Those short views are embedded in one additional
+batch and cached in the base tier for Stage-2 evidence assignment.
 
 Build a lazy per-object feature cache with the local 8B encoder:
 
@@ -63,10 +67,28 @@ Build a lazy per-object feature cache with the local 8B encoder:
 conda run -n MMDD python src/cache_stage1_features.py \
   --input-jsonl stage1_objects.jsonl \
   --output-dir cache/stage1_qwen8b \
-  --model-dir hf_models/Qwen3-VL-Embedding-8B
+  --model-dir hf_models/Qwen3-VL-Embedding-8B \
+  --teacher-data edge_lists.jsonl target_lists.jsonl
 ```
 
-Feature caches created before the row-routing format must be rebuilt; Stage 2
+Omit `--teacher-data` for a base-only retrieval/Stage-2 cache. Re-running the
+same command with additional hard-negative files writes only missing Teacher
+objects; already cached base objects are not encoded again. `--teacher-split`
+defaults to `train` and accepts `all` when all record splits are needed.
+
+Convert an existing all-hidden-state cache without running Qwen again:
+
+```bash
+conda run -n MMDD python src/compact_stage1_feature_cache.py \
+  --input-dir cache/stage1_qwen8b_legacy \
+  --output-dir cache/stage1_qwen8b \
+  --teacher-data edge_lists.jsonl target_lists.jsonl
+```
+
+The conversion is resumable and can also prune an existing two-tier cache into
+a new directory containing only the Teacher objects referenced by the current
+lists. Verify the new cache before removing the legacy directory. Feature
+caches created before the row-routing format still need to be rebuilt; Stage 2
 fails explicitly when a selected query has no cached `row_embeddings`.
 
 Edge warm-up data contains a source object, an unordered same-destination-type
@@ -172,8 +194,14 @@ conda run -n MMDD python src/retrieve_stage1.py \
 Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
 on each path, and restores the two-level path aggregation from the Student
 checkpoint. Explicit retrieval flags may override that saved configuration.
-Each target keeps only its final fusion `score`, a non-null `evidence_score`
-when available for Stage 2, and minimal paths: `{"kind":"direct"}` or
+All paths participate in channel aggregation and RRF ranking, but they are not
+all serialized. By default, Recall@100 keeps 100 ranked target IDs/scores while
+only the first 10 targets retain a direct marker and the top four aggregated
+evidence paths. `--path-result-k` and `--evidence-path-k` control those two
+limits; they must be at least the corresponding Stage-2 `--max-targets` and
+`--top-k-evidence` values. Each target keeps only its final fusion `score`, a non-null
+`evidence_score` when available for Stage 2, and compact paths:
+`{"kind":"direct"}` or
 `{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
 
 ### Hard-negative refresh
@@ -194,6 +222,27 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
   --hard-evidence-per-type 16 \
   --hard-paths-per-query 16 \
   --mining-round 1
+```
+
+With a two-tier cache, first mine without Teacher scoring, supplement only the
+newly referenced Teacher objects, then rerun the same refresh command without
+`--mine-only` to write logits:
+
+```bash
+conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
+  --mine-only --features cache/stage1_qwen8b \
+  --student-checkpoint checkpoints/student_path_round0.pt \
+  --index-dir indices/stage1_round0 --target-lists target_lists.jsonl \
+  --output-target-lists hard_targets_round1.jsonl \
+  --output-edge-lists hard_edges_round1.jsonl
+
+conda run -n MMDD python src/cache_stage1_features.py \
+  --input-jsonl stage1_objects.jsonl --output-dir cache/stage1_qwen8b \
+  --model-dir hf_models/Qwen3-VL-Embedding-8B \
+  --teacher-data hard_targets_round1.jsonl hard_edges_round1.jsonl
+
+# Rerun the first refresh command without --mine-only and add:
+# --teacher-checkpoint checkpoints/teacher_path.pt
 ```
 
 The refresh mines three independent current-Student distributions. `Q -> T`
@@ -314,7 +363,7 @@ conda run -n MMDD python src/run_stage2.py \
 The result schema is intentionally compact:
 
 ```json
-{"query_id":"q1","selection":{"target_id":"t1","column_index":1,"column_name":"Club"},"rows":[{"row_id":0,"value":"Barcelona","evidence":{"evidence_id":"e1","evidence_type":"text","text_span":"Messi plays for Barcelona.","text_span_relevance":2.3}}],"verification":{"joinable":true,"coverage":1.0,"mean_similarity":0.91}}
+{"query_id":"q1","selection":{"target_id":"t1","column_index":1,"column_name":"Club"},"rows":[{"row_id":0,"value":"Barcelona","evidence":{"evidence_id":"e1","evidence_type":"text","text_span":"Messi plays for Barcelona.","text_span_relevance":0.93}}],"verification":{"joinable":true,"coverage":1.0,"mean_similarity":0.91}}
 ```
 
 `mmdd_stage2/verifier.py` contains the paper-derived math,
@@ -516,7 +565,23 @@ conda run -n MMDD python src/build_dataset.py \
   --source entitables \
   --input-dir dataset/tables_redi2_1 \
   --output-dir output_joinability \
-  --max-tables 100
+  --max-tables 100 \
+  --text-model-base-url http://127.0.0.1:8001/v1
+```
+
+Its default auto-check policy sends every local blind extraction to Luna. A
+matching local/Luna result is final; a disagreement is sent to Terra. Provide
+the remote endpoint/model flags when they differ from their OpenAI-compatible
+defaults. For large builds that must never call a remote checker, select the
+preserved local-only interface explicitly:
+
+```bash
+conda run -n MMDD python src/build_dataset.py \
+  --source entitables \
+  --input-dir dataset/tables_redi2_1 \
+  --output-dir output_joinability_local_only \
+  --text-model-base-url http://127.0.0.1:8001/v1 \
+  --auto-check-mode local
 ```
 
 It intentionally keeps its simple in-memory orchestration. Use the WDC entry

@@ -155,7 +155,7 @@ def _edge_examples_for_candidate_set(
     positive_evidence_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
     negative_evidence_by_type: dict[str, list[str]] = {}
     for evidence_id in evidence_negative_ids:
-        evidence_type = store.get(evidence_id).object_type
+        evidence_type = store.get(evidence_id, include_hidden=False).object_type
         negative_evidence_by_type.setdefault(evidence_type, []).append(evidence_id)
 
     examples = [
@@ -170,7 +170,7 @@ def _edge_examples_for_candidate_set(
         )
     ]
     for evidence_id in positive_evidence_ids:
-        evidence_type = store.get(evidence_id).object_type
+        evidence_type = store.get(evidence_id, include_hidden=False).object_type
         negative_evidence_ids = negative_evidence_by_type.get(evidence_type, [])
         if negative_evidence_ids:
             examples.append(
@@ -196,6 +196,62 @@ def _edge_examples_for_candidate_set(
             )
         )
     return examples
+
+
+def _target_record(example: TargetExample) -> dict[str, Any]:
+    record = {
+        "query_id": example.query_id,
+        "direct_positive_target_id": example.candidates[
+            example.direct_positive_index
+        ].target_id,
+        "evidence_positive_target_id": example.candidates[
+            example.evidence_positive_index
+        ].target_id,
+        "positive_target_ids": list(example.positive_target_ids),
+        "candidates": [
+            {
+                "target_id": candidate.target_id,
+                "evidence_ids": list(candidate.evidence_ids),
+            }
+            for candidate in example.candidates
+        ],
+        "dataset": example.dataset,
+    }
+    if example.split is not None:
+        record["split"] = example.split
+    return record
+
+
+def _edge_record(example: EdgeExample) -> dict[str, Any]:
+    record = {
+        "query_id": example.query_id,
+        "source_type": example.source_type,
+        "positive_id": example.candidate_ids[example.positive_index],
+        "candidate_ids": list(example.candidate_ids),
+        "destination_type": example.destination_type,
+        "dataset": example.dataset,
+    }
+    if example.split is not None:
+        record["split"] = example.split
+    return record
+
+
+def hard_candidate_records(
+    candidate_sets: Sequence[HardCandidateSet],
+    store: FeatureStore,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Serialize mined candidates without Teacher logits for tier supplementation."""
+
+    target_records = []
+    edge_records = []
+    for item in candidate_sets:
+        example = item.target_example
+        target_records.append(_target_record(example))
+        for edge in _edge_examples_for_candidate_set(
+            example, store, item.evidence_negative_ids
+        ):
+            edge_records.append(_edge_record(edge))
+    return target_records, edge_records
 
 
 def retrieve_hard_candidate_sets(
@@ -232,7 +288,7 @@ def retrieve_hard_candidate_sets(
         positive_evidence_ids = set(evidence_positive.evidence_ids)
         hard_evidence_ids = []
         hard_paths = []
-        for evidence_type in evidence_types:
+        for evidence_type in dict.fromkeys(evidence_types):
             evidence_hits = indices.search(example.query_id, evidence_type, evidence_k)
             evidence_negatives_for_type = 0
             for evidence_id, query_evidence_score in evidence_hits:
@@ -313,48 +369,22 @@ def score_hard_candidate_sets(
         edge_offset = 0
         for index, (item, item_edge_examples) in enumerate(zip(batch, edge_examples_by_item)):
             target_count = len(item.candidates)
-            target_record = {
-                "query_id": item.query_id,
-                "direct_positive_target_id": item.candidates[
-                    item.direct_positive_index
-                ].target_id,
-                "evidence_positive_target_id": item.candidates[
-                    item.evidence_positive_index
-                ].target_id,
-                "positive_target_ids": list(item.positive_target_ids),
-                "candidates": [
-                    {
-                        "target_id": candidate.target_id,
-                        "evidence_ids": list(candidate.evidence_ids),
-                    }
-                    for candidate in item.candidates
-                ],
-                "teacher_direct_logits": teacher_targets.direct.logits[
+            target_record = _target_record(item)
+            target_record.update(
+                teacher_direct_logits=teacher_targets.direct.logits[
                     index, :target_count
                 ].cpu().tolist(),
-                "teacher_evidence_logits": teacher_targets.evidence.logits[
+                teacher_evidence_logits=teacher_targets.evidence.logits[
                     index, :target_count
                 ].cpu().tolist(),
-                "dataset": item.dataset,
-            }
-            if item.split is not None:
-                target_record["split"] = item.split
+            )
             target_records.append(target_record)
             for edge_example in item_edge_examples:
                 edge_count = len(edge_example.candidate_ids)
-                edge_record = {
-                    "query_id": edge_example.query_id,
-                    "source_type": edge_example.source_type,
-                    "positive_id": edge_example.candidate_ids[edge_example.positive_index],
-                    "candidate_ids": list(edge_example.candidate_ids),
-                    "destination_type": edge_example.destination_type,
-                    "teacher_logits": teacher_edges.logits[
-                        edge_offset, :edge_count
-                    ].cpu().tolist(),
-                    "dataset": edge_example.dataset,
-                }
-                if edge_example.split is not None:
-                    edge_record["split"] = edge_example.split
+                edge_record = _edge_record(edge_example)
+                edge_record["teacher_logits"] = teacher_edges.logits[
+                    edge_offset, :edge_count
+                ].cpu().tolist()
                 edge_records.append(edge_record)
                 edge_offset += 1
     return target_records, edge_records

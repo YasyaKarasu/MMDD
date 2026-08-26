@@ -2951,18 +2951,10 @@ def build_dataset(
     )
     query_auto_check_cache_path = cache_dir / "query_recovery_auto_checks.jsonl"
 
-    def query_recovery_record_alias(record: dict[str, Any]) -> str | None:
-        extraction_key = clean_text(record.get("extraction_cache_key"))
-        extraction_record = cache.get(extraction_key) if extraction_key else None
-        return join_builder.query_recovery_auto_check_record_key(
-            record,
-            extraction_record=extraction_record,
-        )
-
     query_auto_check_cache = join_builder.ExtractionCache(
         query_auto_check_cache_path,
         reuse=not args.no_reuse_model_cache,
-        record_key_alias=query_recovery_record_alias,
+        record_key_alias=join_builder.query_recovery_auto_check_record_key,
     )
     concurrency_state = join_builder.ModelConcurrencyState.from_args(args)
     progress: Any | None = None
