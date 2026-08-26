@@ -10,10 +10,17 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import mmdd_stage2.qwen as stage2_qwen
 import train_stage2 as stage2_train
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
 from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
 from mmdd_stage2.data import (
+    ATTRIBUTE_CLOSE,
+    ATTRIBUTE_OPEN,
+    EVIDENCE_CLOSE,
+    EVIDENCE_OPEN,
+    ROW_ANCHOR_CLOSE,
+    ROW_ANCHOR_OPEN,
     Stage2ObjectIndex,
     direct_target_ids,
     serialize_image_presence_prompt,
@@ -34,8 +41,9 @@ from mmdd_stage2.verifier import (
     best_text_span,
     build_evidence_bundles,
     focus_relevance,
+    focus_relevance_from_logits,
     joint_candidate_probabilities,
-    joint_relevance,
+    joint_relevance_logits,
     propose_image_regions,
     semantic_joinability,
 )
@@ -237,10 +245,38 @@ def test_joint_relevance_localizes_text_span():
     )
     row_anchor = torch.tensor([[1.0, 0.0]])
     attribute = torch.tensor([[0.8, 0.2]])
-    relevance = joint_relevance(row_anchor, attribute, evidence)
+    relevance = torch.softmax(
+        joint_relevance_logits(row_anchor, attribute, evidence), dim=0
+    )
 
     assert relevance.sum().item() == pytest.approx(1.0)
     assert best_text_span(relevance, 2) == (0, 2)
+
+
+def test_joint_relevance_logits_preserve_the_existing_normalized_map():
+    evidence = torch.tensor(
+        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
+    )
+    row_anchor = torch.tensor([[1.0, 0.0]])
+    attribute = torch.tensor([[0.8, 0.2]])
+
+    logits = joint_relevance_logits(row_anchor, attribute, evidence)
+    relevance = torch.softmax(logits, dim=0)
+    normalized_evidence = torch.nn.functional.normalize(evidence, dim=-1)
+    row_map = torch.softmax(normalized_evidence @ row_anchor[0], dim=0)
+    attribute_map = torch.softmax(
+        normalized_evidence
+        @ torch.nn.functional.normalize(attribute.mean(dim=0), dim=0),
+        dim=0,
+    )
+    previous_relevance = row_map * attribute_map
+    previous_relevance /= previous_relevance.sum()
+
+    assert torch.allclose(relevance, previous_relevance)
+    assert torch.allclose(
+        focus_relevance_from_logits([logits, logits]),
+        relevance,
+    )
 
 
 def test_focus_relevance_and_roi_proposal_use_later_layer_value_features():
@@ -279,6 +315,7 @@ def test_semantic_joinability_requires_row_coverage():
         target_embeddings=target_embeddings,
         similarity_threshold=0.8,
         min_coverage=1.0,
+        similarity_batch_size=1,
     )
 
     assert result.coverage == pytest.approx(0.5)
@@ -456,8 +493,24 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
         "text_span": "Messi support",
         "text_span_relevance": pytest.approx(0.9),
     }
-    assert len(backend.embed_batches) == 2
-    assert len(backend.embed_batches[0]) == 8
+    assert backend.embed_batches == [
+        (
+            "Messi",
+            "Mbappe",
+            "Argentina",
+            "France",
+            "Argentina",
+            "France",
+            "Barcelona",
+            "PSG",
+        ),
+        (
+            "Barcelona",
+            "PSG",
+            "Barcelona",
+            "PSG",
+        ),
+    ]
 
     payload = result.to_dict()
     assert set(payload) == {"query_id", "direct_matches", "selection", "rows", "verification"}
@@ -632,6 +685,224 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     assert "END RETRIEVED EVIDENCE" in rendered_text
     assert "BEGIN CANDIDATE TARGET TABLE" in rendered_text
     assert "SECRET_" not in rendered_text
+
+
+def test_qwen_reader_escapes_marker_literals_in_evidence():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    backend.marker_ids = {"<|object_ref_start|>": 10, "<|object_ref_end|>": 11}
+    captured_content = []
+
+    def inputs(content, *, generation_prompt):
+        assert not generation_prompt
+        captured_content.extend(content)
+        return {"input_ids": torch.tensor([[10, 1, 11]])}
+
+    class ReaderModel:
+        def __call__(self, **kwargs):
+            del kwargs
+            return type("Output", (), {"last_hidden_state": torch.zeros(1, 3, 2)})()
+
+    backend._inputs = inputs
+    backend.model = type("Model", (), {"model": ReaderModel()})()
+
+    backend.reader_states(
+        _table("q", ["Player"], [["Messi"]]),
+        _table("t", ["Club"], [["Barcelona"]]),
+        [
+            {
+                "asset_id": "e1",
+                "asset_type": "text",
+                "content": "literal <|object_ref_start|> marker <|object_ref_end|>",
+            }
+        ],
+    )
+
+    rendered_text = "\n".join(item.get("text", "") for item in captured_content)
+    evidence_text = rendered_text.split("BEGIN RETRIEVED EVIDENCE", 1)[1].split(
+        "END RETRIEVED EVIDENCE", 1
+    )[0]
+    assert "<|object_ref_start|>" not in evidence_text
+    assert "<|object_ref_end|>" not in evidence_text
+    assert "&lt;|object_ref_start|>" in evidence_text
+    assert "&lt;|object_ref_end|>" in evidence_text
+
+
+def test_qwen_marker_range_uses_closing_marker_for_an_empty_field():
+    indices = QwenStage2Backend._marker_range(torch.tensor([10, 11]), 10, 11)
+
+    assert torch.equal(indices, torch.tensor([1]))
+
+
+def test_qwen_text_localization_normalizes_after_merging_windows(monkeypatch):
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    backend.max_text_evidence_tokens = 4
+    backend.text_overlap_tokens = 1
+    backend.max_span_tokens = 1
+    backend.marker_ids = {
+        ROW_ANCHOR_OPEN: 100,
+        ROW_ANCHOR_CLOSE: 101,
+        ATTRIBUTE_OPEN: 102,
+        ATTRIBUTE_CLOSE: 103,
+        EVIDENCE_OPEN: 104,
+        EVIDENCE_CLOSE: 105,
+    }
+
+    class Tokenizer:
+        @staticmethod
+        def encode(value, *, add_special_tokens):
+            assert not add_special_tokens
+            assert value == "0 1 2 3 4"
+            return [10, 11, 12, 13, 14]
+
+        @staticmethod
+        def decode(token_ids, *, skip_special_tokens):
+            assert skip_special_tokens
+            return " ".join(str(int(token_id) - 10) for token_id in token_ids)
+
+    backend.processor = type("Processor", (), {"tokenizer": Tokenizer()})()
+    windows = iter(
+        [
+            ([10, 11, 12, 13], [0.5, 0.0, 0.0, 1.0]),
+            ([13, 14], [-1.0, 0.0]),
+        ]
+    )
+    seen_windows = []
+
+    def value_forward(_content):
+        chunk_ids, logits = next(windows)
+        seen_windows.append(chunk_ids)
+        input_ids = torch.tensor(
+            [100, 20, 101, 102, 21, 103, 104, *chunk_ids, 105]
+        )
+        layer = torch.zeros((input_ids.numel(), 1))
+        layer[7 : 7 + len(chunk_ids), 0] = torch.tensor(logits)
+        return [layer], input_ids, {}
+
+    backend._value_forward = value_forward
+    monkeypatch.setattr(
+        stage2_qwen,
+        "joint_relevance_logits",
+        lambda _row, _attribute, evidence: evidence[:, 0],
+    )
+
+    localized = backend._localize_text(
+        {"Player": "Messi"},
+        "Club",
+        {"asset_id": "e1", "content": "0 1 2 3 4"},
+    )
+
+    expected = torch.softmax(torch.tensor([0.5, 0.0, 0.0, 0.0, 0.0]), dim=0)[0]
+    assert seen_windows == [[10, 11, 12, 13], [13, 14]]
+    assert localized.text == "0"
+    assert localized.text_span_relevance == pytest.approx(float(expected))
+
+
+def test_qwen_embeddings_are_batched_and_truncated():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    backend.device = torch.device("cpu")
+    backend.hidden_dim = 2
+    backend.embedding_batch_size = 2
+    backend.max_embedding_tokens = 7
+
+    class Processor:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(
+            self,
+            *,
+            text,
+            padding,
+            truncation,
+            max_length,
+            return_tensors,
+        ):
+            self.calls.append(tuple(text))
+            assert padding
+            assert truncation
+            assert max_length == 7
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[int(value)] for value in text]),
+                "attention_mask": torch.ones(len(text), 1, dtype=torch.long),
+            }
+
+    class EmbeddingModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, *, input_ids, attention_mask, use_cache, return_dict):
+            assert attention_mask.shape == input_ids.shape
+            assert not use_cache
+            assert return_dict
+            self.calls += 1
+            hidden = torch.stack(
+                (input_ids.float(), torch.ones_like(input_ids, dtype=torch.float32)),
+                dim=-1,
+            )
+            return type("Output", (), {"last_hidden_state": hidden})()
+
+    processor = Processor()
+    model = EmbeddingModel()
+    backend.processor = processor
+    backend.model = type("Model", (), {"model": model})()
+
+    embeddings = backend.embed_texts(["1", "2", "3", "4", "5"])
+
+    assert processor.calls == [("1", "2"), ("3", "4"), ("5",)]
+    assert model.calls == 3
+    assert embeddings.shape == (5, 2)
+    assert torch.allclose(embeddings.norm(dim=-1), torch.ones(5))
+
+
+def test_qwen_embeddings_leave_blank_values_zero():
+    backend = QwenStage2Backend.__new__(QwenStage2Backend)
+    backend.device = torch.device("cpu")
+    backend.hidden_dim = 2
+    backend.embedding_batch_size = 4
+    backend.max_embedding_tokens = 7
+
+    class Processor:
+        def __call__(
+            self,
+            *,
+            text,
+            padding,
+            truncation,
+            max_length,
+            return_tensors,
+        ):
+            assert text == ["left", "right"]
+            assert padding and truncation
+            assert max_length == 7
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[1, 2, 0], [0, 3, 4]]),
+                "attention_mask": torch.tensor([[1, 1, 0], [0, 1, 1]]),
+            }
+
+    class EmbeddingModel:
+        def __call__(self, *, input_ids, attention_mask, use_cache, return_dict):
+            assert not use_cache and return_dict
+            hidden = torch.stack(
+                (input_ids.float(), torch.ones_like(input_ids, dtype=torch.float32)),
+                dim=-1,
+            )
+            return type("Output", (), {"last_hidden_state": hidden})()
+
+    backend.processor = Processor()
+    backend.model = type("Model", (), {"model": EmbeddingModel()})()
+
+    embeddings = backend.embed_texts(["", "left", "   ", "right"])
+
+    assert torch.equal(embeddings[0], torch.zeros(2))
+    assert torch.equal(embeddings[2], torch.zeros(2))
+    assert torch.allclose(
+        embeddings[1], torch.nn.functional.normalize(torch.tensor([2.0, 1.0]), dim=0)
+    )
+    assert torch.allclose(
+        embeddings[3], torch.nn.functional.normalize(torch.tensor([4.0, 1.0]), dim=0)
+    )
 
 
 def test_qwen_evidence_logits_compare_text_and_image_in_one_forward():

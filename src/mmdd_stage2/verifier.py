@@ -105,25 +105,46 @@ def joint_candidate_probabilities(
     return table_probabilities.unsqueeze(-1) * column_probabilities
 
 
-def _relevance(query_states: torch.Tensor, evidence_states: torch.Tensor) -> torch.Tensor:
+def _relevance_logits(
+    query_states: torch.Tensor,
+    evidence_states: torch.Tensor,
+) -> torch.Tensor:
     if query_states.ndim != 2 or evidence_states.ndim != 2:
         raise ValueError("Query and evidence states must have shape [tokens, hidden]")
     if query_states.shape[1] != evidence_states.shape[1] or query_states.shape[0] == 0 or evidence_states.shape[0] == 0:
         raise ValueError("Hidden dimensions must match and token sequences cannot be empty")
     query = F.normalize(query_states.mean(dim=0).float(), dim=0)
     evidence = F.normalize(evidence_states.float(), dim=-1)
-    return torch.softmax(evidence @ query, dim=0)
+    return evidence @ query
 
 
-def joint_relevance(
+def joint_relevance_logits(
     row_anchor_states: torch.Tensor,
     attribute_states: torch.Tensor,
     evidence_states: torch.Tensor,
 ) -> torch.Tensor:
-    """Multiply normalized row-anchor and attribute relevance maps for one layer."""
+    """Return unnormalized joint row-anchor and attribute relevance."""
 
-    combined = _relevance(row_anchor_states, evidence_states) * _relevance(attribute_states, evidence_states)
-    return combined / combined.sum().clamp_min(torch.finfo(combined.dtype).tiny)
+    return _relevance_logits(
+        row_anchor_states, evidence_states
+    ) + _relevance_logits(attribute_states, evidence_states)
+
+
+def focus_relevance_from_logits(
+    layer_logits: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize joint logits per layer and average the resulting maps."""
+
+    if not layer_logits:
+        raise ValueError("FOCUS requires at least one value-feature layer")
+    shape = layer_logits[0].shape
+    if len(shape) != 1 or shape[0] == 0:
+        raise ValueError("FOCUS layer logits must be non-empty vectors")
+    if any(logits.shape != shape for logits in layer_logits):
+        raise ValueError("FOCUS layer logits must share one token axis")
+    return torch.stack(
+        [torch.softmax(logits.float(), dim=0) for logits in layer_logits]
+    ).mean(dim=0)
 
 
 def focus_relevance(
@@ -134,18 +155,15 @@ def focus_relevance(
 ) -> torch.Tensor:
     """Aggregate FOCUS-style value-feature maps over later MLLM layers."""
 
-    if not value_layers:
-        raise ValueError("FOCUS requires at least one value-feature layer")
-    maps = [
-        joint_relevance(
+    logits = [
+        joint_relevance_logits(
             layer.index_select(0, row_anchor_indices),
             layer.index_select(0, attribute_indices),
             layer.index_select(0, evidence_indices),
         )
         for layer in value_layers
     ]
-    relevance = torch.stack(maps).mean(dim=0)
-    return relevance / relevance.sum().clamp_min(torch.finfo(relevance.dtype).tiny)
+    return focus_relevance_from_logits(logits)
 
 
 def gaussian_smooth(relevance_map: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
@@ -262,9 +280,12 @@ def semantic_joinability(
     target_embeddings: torch.Tensor,
     similarity_threshold: float = 0.8,
     min_coverage: float = 0.6,
+    similarity_batch_size: int = 1024,
 ) -> SemanticJoinability:
     """Check whether augmented query values are semantically contained in a target column."""
 
+    if similarity_batch_size <= 0:
+        raise ValueError("similarity_batch_size must be positive")
     if not query_values or not target_values:
         return SemanticJoinability(False, 0.0, 0.0)
     if (
@@ -272,9 +293,29 @@ def semantic_joinability(
         or target_embeddings.shape[0] != len(target_values)
     ):
         raise ValueError("Embedding rows must match their values")
-    similarities = F.normalize(query_embeddings.float(), dim=-1) @ F.normalize(
-        target_embeddings.float(), dim=-1
-    ).T
+    query_vectors = F.normalize(query_embeddings.float(), dim=-1)
+    target_vectors = F.normalize(target_embeddings.float(), dim=-1)
+    semantic_scores = torch.empty(len(query_values), dtype=torch.float32)
+    for query_start in range(0, len(query_values), similarity_batch_size):
+        query_batch = query_vectors[
+            query_start : query_start + similarity_batch_size
+        ]
+        batch_scores = torch.full(
+            (query_batch.shape[0],),
+            -torch.inf,
+            device=query_batch.device,
+        )
+        for target_start in range(0, len(target_values), similarity_batch_size):
+            target_batch = target_vectors[
+                target_start : target_start + similarity_batch_size
+            ]
+            batch_scores = torch.maximum(
+                batch_scores,
+                (query_batch @ target_batch.T).max(dim=1).values,
+            )
+        semantic_scores[
+            query_start : query_start + query_batch.shape[0]
+        ] = batch_scores.cpu()
 
     best_scores = []
     for query_index, query_value in enumerate(query_values):
@@ -284,8 +325,7 @@ def semantic_joinability(
         if any(values_match(query_value, value) for value in target_values):
             best_scores.append(1.0)
         else:
-            score = similarities[query_index].max()
-            best_scores.append(float(score))
+            best_scores.append(float(semantic_scores[query_index]))
     coverage = sum(score >= similarity_threshold for score in best_scores) / len(best_scores)
     return SemanticJoinability(
         joinable=coverage >= min_coverage,

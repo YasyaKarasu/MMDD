@@ -21,6 +21,23 @@ ATTRIBUTE_OPEN = "<|box_start|>"
 ATTRIBUTE_CLOSE = "<|box_end|>"
 EVIDENCE_OPEN = "<|quad_start|>"
 EVIDENCE_CLOSE = "<|quad_end|>"
+_MARKER_TOKENS = (
+    CANDIDATE_OPEN,
+    CANDIDATE_CLOSE,
+    ATTRIBUTE_OPEN,
+    ATTRIBUTE_CLOSE,
+    EVIDENCE_OPEN,
+    EVIDENCE_CLOSE,
+)
+
+
+def escape_marker_literals(value: Any) -> str:
+    """Keep marker-like dataset text from becoming Qwen control tokens."""
+
+    text = clean_text(value)
+    for marker in _MARKER_TOKENS:
+        text = text.replace(marker, marker.replace("<", "&lt;", 1))
+    return text
 
 
 @dataclass(frozen=True)
@@ -210,23 +227,30 @@ def serialize_table(
     lines = []
     headers = []
     for column in table["columns"]:
-        name = clean_text(column.get("column_name"))
+        name = escape_marker_literals(column.get("column_name"))
         if mark_candidates:
             name = f"{CANDIDATE_OPEN}{name}{CANDIDATE_CLOSE}"
         headers.append(name)
     lines.append("Columns: " + " | ".join(headers))
     for row in table["rows"][:max_rows]:
-        values = [clean_text(get_cell(row, int(column["column_index"])).get("text")) for column in table["columns"]]
+        values = [
+            escape_marker_literals(get_cell(row, int(column["column_index"])).get("text"))
+            for column in table["columns"]
+        ]
         lines.append("Row: " + " | ".join(values))
     return "\n".join(lines)
 
 
 def serialize_row_anchor(row: dict[str, str]) -> str:
-    return " | ".join(f"{name}={value}" for name, value in row.items())
+    return " | ".join(
+        f"{escape_marker_literals(name)}={escape_marker_literals(value)}"
+        for name, value in row.items()
+    )
 
 
 def serialize_localization_prompt(row: dict[str, str], attribute_name: str) -> str:
     row_anchor = serialize_row_anchor(row)
+    attribute_name = escape_marker_literals(attribute_name)
     return (
         "Task: localize the part of the supplied evidence that explicitly supports one value of the requested "
         "attribute for the entity identified by the query row.\n"
@@ -242,6 +266,7 @@ def serialize_localization_prompt(row: dict[str, str], attribute_name: str) -> s
 
 def serialize_image_presence_prompt(row: dict[str, str], attribute_name: str) -> str:
     row_anchor = serialize_row_anchor(row)
+    attribute_name = escape_marker_literals(attribute_name)
     return (
         "Task: verify whether this candidate crop is usable evidence for extracting one requested attribute "
         "value for the entity identified by the complete query row.\n"

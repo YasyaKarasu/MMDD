@@ -63,6 +63,8 @@ def run(args: argparse.Namespace) -> dict:
         text_overlap_tokens=args.text_overlap_tokens,
         max_span_tokens=args.max_span_tokens,
         roi_candidates=args.roi_candidates,
+        embedding_batch_size=args.embedding_batch_size,
+        max_embedding_tokens=args.max_embedding_tokens,
     )
     scorer.to(backend.device)
     evidence_router = SimilarityEvidenceRouter(FeatureStore.from_path(Path(args.stage1_features)))
@@ -72,6 +74,7 @@ def run(args: argparse.Namespace) -> dict:
         evidence_router=evidence_router,
         similarity_threshold=args.similarity_threshold,
         min_row_coverage=args.min_row_coverage,
+        similarity_batch_size=args.similarity_batch_size,
     )
     payload = verifier.verify(
         objects.query,
@@ -113,6 +116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-overlap-tokens", type=int, default=128)
     parser.add_argument("--max-span-tokens", type=int, default=192)
     parser.add_argument("--roi-candidates", type=int, default=4)
+    parser.add_argument("--embedding-batch-size", type=int, default=64)
+    parser.add_argument("--max-embedding-tokens", type=int, default=128)
+    parser.add_argument("--similarity-batch-size", type=int, default=1024)
     parser.add_argument("--similarity-threshold", type=float, default=0.8)
     parser.add_argument("--min-row-coverage", type=float, default=0.6)
     return parser.parse_args()

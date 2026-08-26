@@ -168,14 +168,18 @@ class Stage2Verifier:
         evidence_router: EvidenceRowRouter | None = None,
         similarity_threshold: float = 0.8,
         min_row_coverage: float = 0.6,
+        similarity_batch_size: int = 1024,
     ) -> None:
         if scorer.weight.in_features != backend.hidden_dim * 2:
             raise ValueError("Candidate scorer and Stage-2 backend dimensions disagree")
+        if similarity_batch_size <= 0:
+            raise ValueError("similarity_batch_size must be positive")
         self.backend = backend
         self.scorer = scorer
         self.evidence_router = evidence_router
         self.similarity_threshold = similarity_threshold
         self.min_row_coverage = min_row_coverage
+        self.similarity_batch_size = similarity_batch_size
 
     def candidate_logits(
         self,
@@ -235,6 +239,7 @@ class Stage2Verifier:
             target_embeddings=embeddings[len(query_values) :],
             similarity_threshold=self.similarity_threshold,
             min_coverage=self.min_row_coverage,
+            similarity_batch_size=self.similarity_batch_size,
         )
 
     def verify_direct(
@@ -246,37 +251,53 @@ class Stage2Verifier:
         if not target_ids:
             return ()
         query_columns = [
-            (int(column["column_index"]), column_values(query, int(column["column_index"])))
+            (
+                int(column["column_index"]),
+                column_values(query, int(column["column_index"])),
+            )
             for column in query["columns"]
         ]
         target_columns = {
             target_id: [
-                (int(column["column_index"]), column_values(targets[target_id], int(column["column_index"])))
+                (
+                    int(column["column_index"]),
+                    column_values(
+                        targets[target_id], int(column["column_index"])
+                    ),
+                )
                 for column in targets[target_id]["columns"]
             ]
             for target_id in target_ids
         }
         ordered_columns = [values for _, values in query_columns]
-        ordered_columns.extend(values for target_id in target_ids for _, values in target_columns[target_id])
-        flat_values = [value for values in ordered_columns for value in values]
-        all_embeddings = self.backend.embed_texts(flat_values)
-        embeddings = []
-        offset = 0
-        for values in ordered_columns:
-            embeddings.append(all_embeddings[offset : offset + len(values)])
-            offset += len(values)
-        query_embeddings = embeddings[: len(query_columns)]
-        target_embeddings = iter(embeddings[len(query_columns) :])
+        ordered_columns.extend(
+            values
+            for target_id in target_ids
+            for _, values in target_columns[target_id]
+        )
+        embeddings = iter(
+            self.backend.embed_texts(
+                [value for values in ordered_columns for value in values]
+            ).split([len(values) for values in ordered_columns])
+        )
+        query_embeddings = [next(embeddings) for _ in query_columns]
         embedded_targets = {
-            target_id: [(column, values, next(target_embeddings)) for column, values in target_columns[target_id]]
+            target_id: [
+                (column_index, values, next(embeddings))
+                for column_index, values in target_columns[target_id]
+            ]
             for target_id in target_ids
         }
 
         verified = []
         for target_id in target_ids:
             candidates = []
-            for (query_index, query_values), query_vectors in zip(query_columns, query_embeddings):
-                for target_index, target_values, target_vectors in embedded_targets[target_id]:
+            for (query_index, query_values), query_vectors in zip(
+                query_columns, query_embeddings
+            ):
+                for target_index, target_values, target_vectors in embedded_targets[
+                    target_id
+                ]:
                     result = semantic_joinability(
                         query_values,
                         target_values,
@@ -284,11 +305,24 @@ class Stage2Verifier:
                         target_embeddings=target_vectors,
                         similarity_threshold=self.similarity_threshold,
                         min_coverage=self.min_row_coverage,
+                        similarity_batch_size=self.similarity_batch_size,
                     )
-                    candidates.append((result.coverage, result.mean_similarity, query_index, target_index, result))
-            _, _, query_index, target_index, result = max(candidates, key=lambda item: item[:2])
+                    candidates.append(
+                        (
+                            result.coverage,
+                            result.mean_similarity,
+                            query_index,
+                            target_index,
+                            result,
+                        )
+                    )
+            _, _, query_index, target_index, result = max(
+                candidates, key=lambda item: item[:2]
+            )
             if result.joinable:
-                verified.append(DirectVerification(target_id, query_index, target_index))
+                verified.append(
+                    DirectVerification(target_id, query_index, target_index)
+                )
         return tuple(verified)
 
     def verify(

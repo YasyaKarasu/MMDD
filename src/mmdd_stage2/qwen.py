@@ -23,12 +23,19 @@ from .data import (
     EVIDENCE_OPEN,
     ROW_ANCHOR_CLOSE,
     ROW_ANCHOR_OPEN,
+    escape_marker_literals,
     serialize_image_presence_prompt,
     serialize_localization_prompt,
     serialize_table,
 )
 from .pipeline import LocalizedEvidence
-from .verifier import best_text_span, focus_relevance, propose_image_regions
+from .verifier import (
+    best_text_span,
+    focus_relevance,
+    focus_relevance_from_logits,
+    joint_relevance_logits,
+    propose_image_regions,
+)
 
 
 class QwenStage2Backend:
@@ -46,13 +53,21 @@ class QwenStage2Backend:
         max_span_tokens: int = 192,
         roi_candidates: int = 4,
         max_new_tokens: int = 64,
+        embedding_batch_size: int = 64,
+        max_embedding_tokens: int = 128,
     ) -> None:
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
         if max_text_evidence_tokens <= 0 or not 0 <= text_overlap_tokens < max_text_evidence_tokens:
             raise ValueError("Text evidence width must be positive and exceed its overlap")
-        if min(max_span_tokens, roi_candidates, max_new_tokens) <= 0:
-            raise ValueError("Span, ROI, and generation limits must be positive")
+        if min(
+            max_span_tokens,
+            roi_candidates,
+            max_new_tokens,
+            embedding_batch_size,
+            max_embedding_tokens,
+        ) <= 0:
+            raise ValueError("Span, ROI, generation, and embedding limits must be positive")
         self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         self.processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
@@ -73,6 +88,8 @@ class QwenStage2Backend:
         self.max_span_tokens = max_span_tokens
         self.roi_candidates = roi_candidates
         self.max_new_tokens = max_new_tokens
+        self.embedding_batch_size = embedding_batch_size
+        self.max_embedding_tokens = max_embedding_tokens
         tokenizer = self.processor.tokenizer
         self.marker_ids = {
             marker: tokenizer.convert_tokens_to_ids(marker)
@@ -101,8 +118,10 @@ class QwenStage2Backend:
     def _marker_range(input_ids: torch.Tensor, open_id: int, close_id: int) -> torch.Tensor:
         opens = (input_ids == open_id).nonzero().flatten()
         closes = (input_ids == close_id).nonzero().flatten()
-        if opens.numel() != 1 or closes.numel() != 1 or int(opens[0]) >= int(closes[0]) - 1:
-            raise ValueError("Expected exactly one non-empty marked token range")
+        if opens.numel() != 1 or closes.numel() != 1 or int(opens[0]) >= int(closes[0]):
+            raise ValueError("Expected exactly one correctly ordered marked token range")
+        if int(opens[0]) + 1 == int(closes[0]):
+            return closes
         return torch.arange(int(opens[0]) + 1, int(closes[0]), dtype=torch.long)
 
     @contextmanager
@@ -174,13 +193,13 @@ class QwenStage2Backend:
         ]
         text_limit = max(1, 12000 // len(evidence))
         for index, item in enumerate(evidence, 1):
-            label = f"\nEvidence {index} ({item['asset_id']}):"
+            label = f"\nEvidence {index} ({escape_marker_literals(item['asset_id'])}):"
             if item.get("asset_type") == "image":
                 content.extend(
                     [{"type": "text", "text": label}, {"type": "image", "image": self._image_path(item)}]
                 )
             else:
-                text = clean_text(item.get("content"))[:text_limit]
+                text = escape_marker_literals(item.get("content"))[:text_limit]
                 content.append({"type": "text", "text": f"{label}\n{text}"})
         content.append(
             {
@@ -209,14 +228,16 @@ class QwenStage2Backend:
             raise FileNotFoundError(f"Missing evidence image: {path}")
         return str(path)
 
-    def _text_chunks(self, text: str) -> Iterator[str]:
-        token_ids = self.processor.tokenizer.encode(text, add_special_tokens=False)
+    def _text_chunks(
+        self,
+        token_ids: Sequence[int],
+    ) -> Iterator[tuple[int, list[int]]]:
         width = self.max_text_evidence_tokens
         step = width - self.text_overlap_tokens
         for start in range(0, len(token_ids), step):
-            chunk = token_ids[start : start + width]
+            chunk = list(token_ids[start : start + width])
             if chunk:
-                yield self.processor.tokenizer.decode(chunk, skip_special_tokens=True)
+                yield start, chunk
             if start + width >= len(token_ids):
                 break
 
@@ -226,9 +247,27 @@ class QwenStage2Backend:
         attribute_name: str,
         evidence: dict[str, Any],
     ) -> LocalizedEvidence:
-        best: LocalizedEvidence | None = None
+        evidence_id = str(evidence["asset_id"])
+        token_ids = self.processor.tokenizer.encode(
+            escape_marker_literals(evidence.get("content")),
+            add_special_tokens=False,
+        )
+        if not token_ids:
+            return LocalizedEvidence(
+                evidence_id,
+                "text",
+                text="",
+                text_span_relevance=0.0,
+            )
+
         prompt = serialize_localization_prompt(row, attribute_name)
-        for chunk in self._text_chunks(clean_text(evidence.get("content"))):
+        layer_logit_sums: list[torch.Tensor] | None = None
+        coverage = torch.zeros(len(token_ids), dtype=torch.float32)
+        for chunk_start, chunk_ids in self._text_chunks(token_ids):
+            chunk = self.processor.tokenizer.decode(
+                chunk_ids,
+                skip_special_tokens=True,
+            )
             marked = f"{prompt}\nEvidence: {EVIDENCE_OPEN}{chunk}{EVIDENCE_CLOSE}"
             layers, input_ids, _ = self._value_forward([{"type": "text", "text": marked}])
             row_anchor_indices = self._marker_range(
@@ -240,23 +279,46 @@ class QwenStage2Backend:
             evidence_indices = self._marker_range(
                 input_ids, self.marker_ids[EVIDENCE_OPEN], self.marker_ids[EVIDENCE_CLOSE]
             )
-            relevance = focus_relevance(layers, row_anchor_indices, attribute_indices, evidence_indices)
-            start, end = best_text_span(relevance, self.max_span_tokens)
-            selected_ids = input_ids[evidence_indices[start:end]].tolist()
-            span = clean_text(self.processor.tokenizer.decode(selected_ids, skip_special_tokens=True))
-            candidate = LocalizedEvidence(
-                evidence_id=str(evidence["asset_id"]),
-                evidence_type="text",
-                text=span,
-                text_span_relevance=float(relevance[start:end].sum()),
+            if evidence_indices.numel() != len(chunk_ids):
+                raise ValueError(
+                    "Text evidence token count changed during Qwen preprocessing"
+                )
+            chunk_logits = [
+                joint_relevance_logits(
+                    layer.index_select(0, row_anchor_indices),
+                    layer.index_select(0, attribute_indices),
+                    layer.index_select(0, evidence_indices),
+                )
+                for layer in layers
+            ]
+            if layer_logit_sums is None:
+                layer_logit_sums = [
+                    torch.zeros(len(token_ids), dtype=logits.dtype)
+                    for logits in chunk_logits
+                ]
+            elif len(layer_logit_sums) != len(chunk_logits):
+                raise ValueError("FOCUS layer count changed between text windows")
+            chunk_end = chunk_start + len(chunk_ids)
+            for logit_sum, logits in zip(layer_logit_sums, chunk_logits):
+                logit_sum[chunk_start:chunk_end] += logits
+            coverage[chunk_start:chunk_end] += 1
+
+        assert layer_logit_sums is not None
+        relevance = focus_relevance_from_logits(
+            [logit_sum / coverage for logit_sum in layer_logit_sums]
+        )
+        start, end = best_text_span(relevance, self.max_span_tokens)
+        span = clean_text(
+            self.processor.tokenizer.decode(
+                token_ids[start:end],
+                skip_special_tokens=True,
             )
-            if best is None or candidate.text_span_relevance > best.text_span_relevance:
-                best = candidate
-        return best or LocalizedEvidence(
-            str(evidence["asset_id"]),
-            "text",
-            text="",
-            text_span_relevance=0.0,
+        )
+        return LocalizedEvidence(
+            evidence_id=evidence_id,
+            evidence_type="text",
+            text=span,
+            text_span_relevance=float(relevance[start:end].sum()),
         )
 
     def _localize_image(
@@ -448,9 +510,32 @@ class QwenStage2Backend:
     def embed_texts(self, values: Sequence[str]) -> torch.Tensor:
         if not values:
             return torch.empty((0, self.hidden_dim))
-        inputs = self.processor(text=list(values), padding=True, return_tensors="pt")
-        inputs = {name: value.to(self.device) for name, value in inputs.items()}
-        outputs = self.model.model(**inputs, use_cache=False, return_dict=True)
-        positions = inputs["attention_mask"].sum(dim=-1) - 1
-        pooled = outputs.last_hidden_state[torch.arange(len(values), device=self.device), positions]
-        return F.normalize(pooled.float(), dim=-1).cpu()
+        embeddings = torch.zeros((len(values), self.hidden_dim), dtype=torch.float32)
+        nonempty_values = [
+            (index, value) for index, value in enumerate(values) if value.strip()
+        ]
+        for start in range(0, len(nonempty_values), self.embedding_batch_size):
+            batch_items = nonempty_values[start : start + self.embedding_batch_size]
+            batch = [value for _, value in batch_items]
+            inputs = self.processor(
+                text=batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_embedding_tokens,
+                return_tensors="pt",
+            )
+            inputs = {name: value.to(self.device) for name, value in inputs.items()}
+            outputs = self.model.model(**inputs, use_cache=False, return_dict=True)
+            attention_mask = inputs["attention_mask"]
+            positions = (
+                attention_mask.shape[1]
+                - attention_mask.flip(dims=(-1,)).argmax(dim=-1)
+                - 1
+            )
+            pooled = outputs.last_hidden_state[
+                torch.arange(len(batch), device=self.device), positions
+            ]
+            embeddings[[index for index, _ in batch_items]] = F.normalize(
+                pooled.float(), dim=-1
+            ).cpu()
+        return embeddings
