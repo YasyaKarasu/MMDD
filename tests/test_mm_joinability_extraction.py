@@ -623,6 +623,9 @@ def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
     return {
         "cache_key": cache_key,
         "extraction_cache_key": "extraction-cache-key",
+        "review_policy": (
+            joinability_dataset.AUTO_CHECK_REVIEW_POLICY_CASCADE
+        ),
         "query_row_attributes": candidate.task.entity["row_attributes"],
         "attribute_name": "State",
         "claimed_value": "Alabama",
@@ -635,6 +638,9 @@ def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
         "supported": True,
         "auto_check": {
             "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            "review_policy": (
+                joinability_dataset.AUTO_CHECK_REVIEW_POLICY_CASCADE
+            ),
             "reviewed_attributes": 1,
             "reviews": [
                 {
@@ -723,7 +729,7 @@ def test_remote_review_cache_survives_local_model_change(
     assert results == {new_key: legacy_record}
 
 
-def test_remote_evidence_cache_invalidates_previous_review_policy(
+def test_remote_evidence_cache_reuses_previous_policy_model_stages(
     tmp_path: Path,
 ) -> None:
     candidate = _make_query_recovery_candidate()
@@ -734,7 +740,40 @@ def test_remote_evidence_cache_invalidates_previous_review_policy(
         identity_without_policy
     )
     legacy_record = _completed_query_recovery_record(legacy_key)
+    legacy_record.pop("review_policy")
     legacy_record["evidence_identity"] = identity_without_policy
+    legacy_record["supported"] = True
+    legacy_record["auto_check"].pop("review_policy")
+    legacy_record["auto_check"]["reviews"] = [
+        {
+            "attribute_name": "State",
+            "claimed_value": "Alabama",
+            "extracted_value": "Georgia",
+            "verdict": "supported",
+            "comparison": "stale_policy_decision",
+            "decision_source": "local_luna_consensus",
+            "review_complete": True,
+            "error_code": "",
+            "primary_extracted_value": "Georgia",
+            "primary_verdict": "contradicted",
+            "primary_comparison": "extracted_value_mismatch",
+            "primary_error_code": "",
+            "luna_triggered": True,
+            "luna_extracted_value": "Georgia",
+            "luna_verdict": "contradicted",
+            "luna_comparison": "extracted_value_mismatch",
+            "luna_agrees_with_local": True,
+            "luna_error_code": "",
+            "terra_triggered": False,
+            "terra_extracted_value": None,
+            "terra_verdict": None,
+            "terra_comparison": None,
+            "terra_error_code": "",
+            "secondary_triggered": True,
+            "secondary_extracted_value": "Georgia",
+            "secondary_verdict": "contradicted",
+        }
+    ]
     cache_path = tmp_path / "query-auto-check-cache.jsonl"
     cache_path.write_text(json.dumps(legacy_record) + "\n", encoding="utf-8")
     cache = ExtractionCache(
@@ -745,14 +784,47 @@ def test_remote_evidence_cache_invalidates_previous_review_policy(
         candidate,
         SimpleNamespace(auto_check_luna_reviewer=object()),
     )
-    cascade = SimpleNamespace(auto_check_luna_reviewer=object())
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def extract_batches(self, _batches):
+            self.calls += 1
+            raise AssertionError("completed model stages must be reused")
+
+    luna = Reviewer()
+    terra = Reviewer()
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
 
     assert joinability_dataset.query_recovery_cached_check(
         current_key,
         cache,
         candidate,
-        extractor=cascade,
+        extractor=extractor,
     ) is None
+    results = joinability_dataset.resolve_query_recovery_auto_checks(
+        candidates=[candidate],
+        extractor=extractor,
+        cache=cache,
+        args=argparse.Namespace(model_progress=False),
+        required_recovered_rows=1,
+        source_row_order=[0],
+    )
+
+    assert luna.calls == 0
+    assert terra.calls == 0
+    migrated = results[current_key]
+    assert migrated["review_policy"] == (
+        joinability_dataset.AUTO_CHECK_REVIEW_POLICY_CASCADE
+    )
+    assert migrated["supported"] is False
+    review = migrated["auto_check"]["reviews"][0]
+    assert review["verdict"] == "contradicted"
+    assert review["comparison"] == "extracted_value_mismatch"
+    assert review["decision_source"] == "local_luna_consensus"
 
 
 def test_local_only_review_cache_remains_local_model_specific(
@@ -3548,6 +3620,118 @@ def test_local_only_auto_check_keeps_primary_result(monkeypatch):
     assert review["decision_source"] == "primary_local"
     assert review["luna_triggered"] is False
     assert review["terra_triggered"] is False
+
+
+def test_cascade_reuses_previous_local_result_and_only_adds_luna(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Georgia")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the cached primary result must be reused")
+        ),
+    )
+    previous = {
+        "attribute_name": "State",
+        "claimed_value": "Alabama",
+        "extracted_value": "Alabama",
+        "verdict": "supported",
+        "comparison": "normalized_values_match",
+        "decision_source": "primary_local",
+        "review_complete": True,
+        "error_code": "",
+        "primary_extracted_value": "Alabama",
+        "primary_verdict": "supported",
+        "primary_comparison": "normalized_values_match",
+        "primary_error_code": "",
+        "luna_triggered": False,
+        "luna_extracted_value": None,
+        "luna_error_code": "",
+    }
+
+    review = extractor.complete_auto_check_attribute_review(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+        local_review=previous,
+    )
+
+    assert review["decision_source"] == "local_luna_consensus"
+    assert review["verdict"] == "supported"
+    assert luna.calls == 1
+    assert terra.calls == 0
+
+
+def test_cascade_reuses_previous_luna_and_terra_results(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def extract_batches(self, _batches):
+            self.calls += 1
+            raise AssertionError("the cached remote result must be reused")
+
+    luna = Reviewer()
+    terra = Reviewer()
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("the cached primary result must be reused")
+        ),
+    )
+    previous = {
+        "primary_extracted_value": "Alabama",
+        "primary_verdict": "supported",
+        "primary_comparison": "normalized_values_match",
+        "primary_error_code": "",
+        "luna_triggered": True,
+        "luna_extracted_value": "Georgia",
+        "luna_verdict": "contradicted",
+        "luna_comparison": "extracted_value_mismatch",
+        "luna_error_code": "",
+        "terra_triggered": True,
+        "terra_extracted_value": "Alabama",
+        "terra_verdict": "supported",
+        "terra_comparison": "normalized_values_match",
+        "terra_error_code": "",
+        "review_complete": True,
+        "error_code": "",
+    }
+
+    review = extractor.complete_auto_check_attribute_review(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+        local_review=previous,
+    )
+
+    assert review["decision_source"] == "terra_adjudication"
+    assert review["verdict"] == "supported"
+    assert luna.calls == 0
+    assert terra.calls == 0
 
 
 def test_local_and_luna_matching_mismatch_skips_terra(monkeypatch):

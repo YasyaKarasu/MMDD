@@ -105,6 +105,9 @@ MODEL_AUTO_CHECK_SCHEMA_VERSION = (
     "model-output-auto-check-v5-entity-evidence-grounding"
 )
 AUTO_CHECK_REVIEW_POLICY_LOCAL = "local_only"
+AUTO_CHECK_REVIEW_POLICY_LEGACY = (
+    "local_then_luna_on_nonmatch_terra_adjudication_v1"
+)
 AUTO_CHECK_REVIEW_POLICY_CASCADE = (
     "local_luna_consensus_terra_adjudication_v1"
 )
@@ -4104,10 +4107,12 @@ class LocalAttributeExtractor:
                 primary_comparison=primary_comparison,
             )
         else:
-            primary_value = clean_text(
+            raw_primary_value = (
                 local_review.get("primary_extracted_value")
-                or local_review.get("extracted_value")
+                if "primary_extracted_value" in local_review
+                else local_review.get("extracted_value")
             )
+            primary_value = clean_text(raw_primary_value)
             primary_verdict = clean_text(local_review.get("primary_verdict"))
             primary_comparison = clean_text(
                 local_review.get("primary_comparison")
@@ -4124,6 +4129,22 @@ class LocalAttributeExtractor:
                 primary_comparison=primary_comparison,
                 primary_error_code=clean_text(
                     local_review.get("primary_error_code")
+                ),
+                initial_reviewer_profile=(
+                    clean_text(local_review.get("initial_reviewer_profile"))
+                    or None
+                ),
+                initial_reviewer_model=(
+                    clean_text(local_review.get("initial_reviewer_model"))
+                    or None
+                ),
+                final_judge_profile=(
+                    clean_text(local_review.get("final_judge_profile"))
+                    or None
+                ),
+                final_judge_model=(
+                    clean_text(local_review.get("final_judge_model"))
+                    or None
                 ),
             )
         luna = getattr(self, "auto_check_luna_reviewer", None)
@@ -4157,24 +4178,49 @@ class LocalAttributeExtractor:
             state["initial_reviewer_model"] = clean_text(
                 initial_identity.get("model")
             ) or None
+        cached_luna_value: Any = None
+        cached_luna_available = False
+        if local_review is not None:
+            if local_review.get("luna_extracted_value") is not None:
+                cached_luna_value = local_review.get("luna_extracted_value")
+            elif local_review.get("secondary_extracted_value") is not None:
+                cached_luna_value = local_review.get("secondary_extracted_value")
+            cached_luna_verdict = clean_text(
+                local_review.get("luna_verdict")
+                or local_review.get("secondary_verdict")
+            )
+            cached_luna_available = bool(
+                (
+                    local_review.get("luna_triggered")
+                    or local_review.get("secondary_triggered")
+                )
+                and cached_luna_value is not None
+                and not clean_text(local_review.get("luna_error_code"))
+                and cached_luna_verdict
+                in {"supported", "contradicted", "insufficient"}
+            )
+
         state["luna_triggered"] = True
-        try:
-            luna_value = extract_with(
-                luna,
-                batch,
-                on_selected=record_initial_identity,
-            )
-        except Exception as error:
-            error_code = _safe_error_code(error)
-            state["luna_error_code"] = error_code
-            return finish(
-                value="",
-                verdict="insufficient",
-                comparison="luna_recovery_failed",
-                source="luna_recovery_incomplete",
-                complete=False,
-                error_code=error_code,
-            )
+        if cached_luna_available:
+            luna_value = clean_text(cached_luna_value)
+        else:
+            try:
+                luna_value = extract_with(
+                    luna,
+                    batch,
+                    on_selected=record_initial_identity,
+                )
+            except Exception as error:
+                error_code = _safe_error_code(error)
+                state["luna_error_code"] = error_code
+                return finish(
+                    value="",
+                    verdict="insufficient",
+                    comparison="luna_recovery_failed",
+                    source="luna_recovery_incomplete",
+                    complete=False,
+                    error_code=error_code,
+                )
 
         luna_verdict, luna_comparison = classify(luna_value)
         state.update(
@@ -4215,23 +4261,41 @@ class LocalAttributeExtractor:
             state["final_judge_model"] = clean_text(
                 final_identity.get("model")
             ) or None
-        try:
-            terra_value = extract_with(
-                terra,
-                batch,
-                on_selected=record_final_identity,
+        cached_terra_value: Any = None
+        cached_terra_available = False
+        if local_review is not None:
+            cached_terra_value = local_review.get("terra_extracted_value")
+            cached_terra_verdict = clean_text(local_review.get("terra_verdict"))
+            cached_terra_available = bool(
+                (
+                    local_review.get("terra_triggered")
+                    or local_review.get("final_judge_triggered")
+                )
+                and cached_terra_value is not None
+                and not clean_text(local_review.get("terra_error_code"))
+                and cached_terra_verdict
+                in {"supported", "contradicted", "insufficient"}
             )
-        except Exception as error:
-            error_code = _safe_error_code(error)
-            state["terra_error_code"] = error_code
-            return finish(
-                value="",
-                verdict="insufficient",
-                comparison="final_judge_failed",
-                source="final_judge_incomplete",
-                complete=False,
-                error_code=error_code,
-            )
+        if cached_terra_available:
+            terra_value = clean_text(cached_terra_value)
+        else:
+            try:
+                terra_value = extract_with(
+                    terra,
+                    batch,
+                    on_selected=record_final_identity,
+                )
+            except Exception as error:
+                error_code = _safe_error_code(error)
+                state["terra_error_code"] = error_code
+                return finish(
+                    value="",
+                    verdict="insufficient",
+                    comparison="final_judge_failed",
+                    source="final_judge_incomplete",
+                    complete=False,
+                    error_code=error_code,
+                )
 
         terra_verdict, terra_comparison = classify(terra_value)
         state.update(
@@ -4809,7 +4873,10 @@ def complete_deferred_model_auto_check(
     auto_check = record.get("auto_check")
     reviews = auto_check.get("reviews") if isinstance(auto_check, dict) else []
     existing_reviews = {
-        normalize(review.get("attribute_name")): review
+        normalize(review.get("attribute_name")): {
+            **review,
+            "review_complete": False,
+        }
         for review in reviews
         if isinstance(review, dict) and normalize(review.get("attribute_name"))
     }
@@ -5446,6 +5513,19 @@ def model_auto_check_review_policy(extractor: Any | None) -> str:
     return AUTO_CHECK_REVIEW_POLICY_LOCAL
 
 
+def cached_model_auto_check_review_policy(record: dict[str, Any]) -> str:
+    """Return the policy that produced a cached final decision."""
+    auto_check = record.get("auto_check")
+    recorded = clean_text(record.get("review_policy"))
+    if not recorded and isinstance(auto_check, dict):
+        recorded = clean_text(auto_check.get("review_policy"))
+    if recorded:
+        return recorded
+    if query_recovery_remote_review_is_complete(record):
+        return AUTO_CHECK_REVIEW_POLICY_LEGACY
+    return AUTO_CHECK_REVIEW_POLICY_LOCAL
+
+
 def model_auto_check_cache_schema_version(extractor: Any | None) -> str:
     """Keep legacy local-only keys while isolating the new cascade policy."""
     policy = model_auto_check_review_policy(extractor)
@@ -5646,11 +5726,7 @@ def query_recovery_auto_check_record_key(
     query_row_attributes = record.get("query_row_attributes")
     if not isinstance(query_row_attributes, list):
         return None
-    review_policy = (
-        clean_text(record.get("review_policy"))
-        or clean_text(auto_check.get("review_policy"))
-        or AUTO_CHECK_REVIEW_POLICY_LOCAL
-    )
+    review_policy = cached_model_auto_check_review_policy(record)
     cache_schema_version = schema_version
     if review_policy != AUTO_CHECK_REVIEW_POLICY_LOCAL:
         cache_schema_version = f"{schema_version}:{review_policy}"
@@ -5694,25 +5770,79 @@ def query_recovery_cached_check(
     *,
     extractor: Any | None = None,
 ) -> dict[str, Any] | None:
+    requested_policy = model_auto_check_review_policy(extractor)
     transient = cache.get_transient(key)
-    if transient is not None:
+    if (
+        transient is not None
+        and cached_model_auto_check_review_policy(transient) == requested_policy
+    ):
         return transient
     cached = cache.get(key)
-    if cached and model_auto_check_is_complete(
-        {"auto_check": cached.get("auto_check")}, required=True
+    if (
+        cached
+        and cached_model_auto_check_review_policy(cached) == requested_policy
+        and model_auto_check_is_complete(
+            {"auto_check": cached.get("auto_check")}, required=True
+        )
     ):
         return cached
     if (
         candidate is not None
-        and model_auto_check_review_policy(extractor)
-        == AUTO_CHECK_REVIEW_POLICY_CASCADE
+        and requested_policy == AUTO_CHECK_REVIEW_POLICY_CASCADE
     ):
         remote_key = query_recovery_remote_evidence_key(candidate)
         remote_cached = cache.get(remote_key)
-        if remote_cached and query_recovery_remote_review_is_complete(
+        if (
             remote_cached
+            and cached_model_auto_check_review_policy(remote_cached)
+            == requested_policy
+            and query_recovery_remote_review_is_complete(remote_cached)
         ):
             return remote_cached
+    return None
+
+
+def query_recovery_prior_auto_check(
+    candidate: QueryRecoveryCandidate,
+    extractor: Any,
+    cache: ExtractionCache,
+) -> dict[str, Any] | None:
+    """Return reusable model-stage outputs from an earlier review policy."""
+    if model_auto_check_review_policy(extractor) != AUTO_CHECK_REVIEW_POLICY_CASCADE:
+        return None
+    recovered = candidate.recovery["recovered_attribute"]
+    identity = query_recovery_remote_evidence_identity(candidate)
+    identity.pop("review_policy", None)
+    prior_keys = [
+        query_recovery_auto_check_key(candidate, extractor),
+        _query_recovery_evidence_identity_key(identity),
+        _query_recovery_auto_check_key_fields(
+            schema_version=MODEL_AUTO_CHECK_SCHEMA_VERSION,
+            extraction_cache_key=candidate.task.cache_key,
+            query_row_attributes=candidate.task.entity.get("row_attributes"),
+            attribute_name=recovered.get("column_name"),
+            claimed_value=recovered.get("value"),
+        ),
+    ]
+    seen: set[str] = set()
+    for prior_key in prior_keys:
+        if prior_key in seen:
+            continue
+        seen.add(prior_key)
+        record = cache.get(prior_key)
+        if not isinstance(record, dict):
+            continue
+        auto_check = record.get("auto_check")
+        reviews = auto_check.get("reviews") if isinstance(auto_check, dict) else []
+        for review in reviews or []:
+            if (
+                isinstance(review, dict)
+                and normalize(review.get("attribute_name"))
+                == normalize(recovered.get("column_name"))
+                and "primary_extracted_value" in review
+                and not clean_text(review.get("primary_error_code"))
+            ):
+                return record
     return None
 
 
@@ -6149,6 +6279,15 @@ def resolve_query_recovery_auto_check_plans(
             )
         )
 
+    def submit_prior(
+        key: str,
+        candidate: QueryRecoveryCandidate,
+        prior_result: dict[str, Any],
+    ) -> None:
+        begin_check()
+        in_flight[key] = candidate
+        submit_external(key, candidate, prior_result)
+
     def finish_row(state: PlanState, *, supported: bool) -> None:
         if supported:
             state.supported_rows += 1
@@ -6214,10 +6353,18 @@ def resolve_query_recovery_auto_check_plans(
                 if cached.get("supported") and not exhaustive:
                     finish_row(state, supported=True)
                 continue
+            prior_result = query_recovery_prior_auto_check(
+                candidate,
+                extractor,
+                cache,
+            )
             state.awaiting_key = key
             waiters[key].append(state)
             if key not in in_flight:
-                submit_local(key, candidate)
+                if prior_result is None:
+                    submit_local(key, candidate)
+                else:
+                    submit_prior(key, candidate, prior_result)
 
     def store_final_result(
         key: str,

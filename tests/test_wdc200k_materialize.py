@@ -3010,7 +3010,7 @@ def _query_recovery_candidate() -> join_builder.QueryRecoveryCandidate:
     )
 
 
-def test_legacy_remote_review_requires_matching_policy_to_migrate() -> None:
+def test_legacy_remote_review_is_migrated_as_reusable_model_stages() -> None:
     candidate = _query_recovery_candidate()
     task = candidate.task
     cascade = SimpleNamespace(
@@ -3036,11 +3036,19 @@ def test_legacy_remote_review_requires_matching_policy_to_migrate() -> None:
         },
     }
 
-    assert materializer._legacy_query_auto_check_record(
+    legacy = materializer._legacy_query_auto_check_record(
         candidate,
         extraction,
         extractor=cascade,
-    ) is None
+    )
+
+    assert legacy is not None
+    assert legacy["review_policy"] == (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_LEGACY
+    )
+    assert join_builder.cached_model_auto_check_review_policy(legacy) == (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_LEGACY
+    )
 
     extraction["auto_check"]["review_policy"] = (
         join_builder.AUTO_CHECK_REVIEW_POLICY_CASCADE

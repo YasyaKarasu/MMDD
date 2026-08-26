@@ -4507,7 +4507,6 @@ def _legacy_query_auto_check_record(
         != join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
     ):
         return None
-    requested_policy = join_builder.model_auto_check_review_policy(extractor)
     recorded_policy = clean_text(auto_check.get("review_policy"))
     recovered = candidate.recovery["recovered_attribute"]
     target_name = join_builder.normalize(recovered.get("column_name"))
@@ -4541,10 +4540,9 @@ def _legacy_query_auto_check_record(
                     }
                 }
             ):
-                continue
-            recorded_policy = join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL
-        if recorded_policy != requested_policy:
-            continue
+                recorded_policy = join_builder.AUTO_CHECK_REVIEW_POLICY_LEGACY
+            else:
+                recorded_policy = join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL
         supported = clean_text(review.get("verdict")) == "supported"
         key = join_builder.query_recovery_auto_check_key(candidate, extractor)
         return {
