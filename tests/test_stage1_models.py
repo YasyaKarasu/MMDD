@@ -266,6 +266,40 @@ def test_target_scoring_and_listwise_loss_backpropagate_through_paths():
     assert model.relations["text_to_table"].grad is not None
 
 
+def test_teacher_target_scoring_compresses_each_object_once(monkeypatch):
+    model = teacher()
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=1,
+        )
+    ]
+    compress_calls = Counter()
+    original_compress = model.compress
+
+    def counted_compress(features):
+        compress_calls[features.object_id] += 1
+        return original_compress(features)
+
+    monkeypatch.setattr(model, "compress", counted_compress)
+    scores = score_target_batch(
+        model,
+        examples,
+        feature_store(),
+        torch.device("cpu"),
+        PathAggregator(),
+    )
+    (scores.direct.logits.sum() + scores.evidence.logits.sum()).backward()
+
+    assert compress_calls == {"q": 1, "positive": 1, "negative": 1, "evidence": 1}
+    assert model.poolers["text"].queries.grad is not None
+
+
 def test_cross_modal_edge_warmup_backpropagates_through_all_path_relations():
     store = FeatureStore(
         {
@@ -450,7 +484,10 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
                 "direct_positive_target_id": "positive",
                 "evidence_positive_target_id": "positive",
                 "candidates": [
-                    {"target_id": "positive", "evidence_ids": ["e1"]},
+                    {
+                        "target_id": "positive",
+                        "evidence_ids": [f"e{index}" for index in range(10)],
+                    },
                     {"target_id": "negative", "evidence_ids": []},
                 ],
                 "positive_target_ids": ["positive", "another_positive"],
@@ -465,7 +502,7 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
     )
 
     store = FeatureStore.from_path(feature_dir)
-    examples = load_target_examples(data_path, max_evidence=1)
+    examples = load_target_examples(data_path)
 
     assert store.get("q").object_type == "table"
     assert store.get("q").row_embeddings.shape == (1, 4)
@@ -475,7 +512,9 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
     assert scoring_copy.row_embeddings is None
     assert examples[0].direct_positive_index == 0
     assert examples[0].evidence_positive_index == 0
-    assert examples[0].candidates[0].evidence_ids == ("e1",)
+    assert examples[0].candidates[0].evidence_ids == tuple(
+        f"e{index}" for index in range(10)
+    )
     assert examples[0].dataset == "2k"
     assert examples[0].teacher_direct_logits == (2.0, -1.0)
     assert examples[0].teacher_evidence_logits == (1.5, 0.0)
@@ -954,6 +993,23 @@ def test_qwen_cache_builder_truncates_oversized_table_parts_and_pools_each_group
                 for name, tensor in inputs.items()
             }
 
+        def forward(self, inputs):
+            self.forward_calls += 1
+            token_ids = inputs["input_ids"].float()
+            hidden = torch.stack(
+                [
+                    token_ids,
+                    token_ids.square(),
+                    token_ids.remainder(7),
+                    torch.ones_like(token_ids),
+                ],
+                dim=-1,
+            )
+            return {
+                "last_hidden_state": hidden,
+                "attention_mask": inputs["attention_mask"],
+            }
+
         class Tokenizer(FakeQwenEmbedder.Tokenizer):
             def __call__(self, text, **kwargs):
                 tokenized = super().__call__(text, **kwargs)
@@ -969,27 +1025,37 @@ def test_qwen_cache_builder_truncates_oversized_table_parts_and_pools_each_group
             def __init__(self):
                 self.tokenizer = TruncatingFakeQwenEmbedder.Tokenizer()
 
-    embedder = TruncatingFakeQwenEmbedder()
+    record = {
+        "object_id": "q",
+        "object_type": "table",
+        "embedding_role": "query",
+        "table_parts": [
+            "schema",
+            "row " + "x " * 5000,
+            "row retained",
+        ],
+    }
     payload = build_object_features(
-        embedder,
-        {
-            "object_id": "q",
-            "object_type": "table",
-            "embedding_role": "query",
-            "table_parts": [
-                "schema",
-                "row " + "x " * 5000,
-                "row retained",
-            ],
-        },
+        TruncatingFakeQwenEmbedder(),
+        record,
         input_dir=tmp_path,
         instruction=None,
         storage_dtype=torch.float16,
+    )
+    base_payload = build_object_features(
+        TruncatingFakeQwenEmbedder(),
+        record,
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+        include_hidden=False,
     )
 
     assert payload["hidden_states"].shape == (3, 4)
     assert "token_groups" not in payload
     assert payload["row_embeddings"].shape == (2, 4)
+    assert torch.equal(payload["embedding"], base_payload["embedding"])
+    assert torch.equal(payload["row_embeddings"], base_payload["row_embeddings"])
 
 
 def test_qwen_cache_run_writes_base_tier_and_incremental_teacher_tier(
@@ -1374,9 +1440,13 @@ def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
         original,
         ["other_positive", "hard_1", "hard_2"],
         [],
-        [HardPath("e1", "hard_1", 5.0), HardPath("e2", "hard_1", 4.0)],
+        [
+            HardPath("e1", "hard_1", 5.0),
+            HardPath("e2", "hard_1", 4.0),
+            HardPath("e3", "hard_1", 3.0),
+            HardPath("e2", "hard_1", 2.0),
+        ],
         hard_targets_per_query=2,
-        max_evidence_per_target=2,
     )
     target_example = candidate_set.target_example
 
@@ -1389,7 +1459,7 @@ def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
     assert target_example.direct_positive_index == 0
     assert target_example.evidence_positive_index == 1
     assert target_example.candidates[2:] == (
-        TargetCandidate("hard_1", ("e1", "e2")),
+        TargetCandidate("hard_1", ("e1", "e2", "e3")),
         TargetCandidate("hard_2", ()),
     )
 
@@ -1436,7 +1506,6 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         hard_targets_per_query=1,
         hard_evidence_per_type=1,
         hard_paths_per_query=1,
-        max_evidence_per_target=2,
         direct_k=2,
         evidence_k=3,
         targets_per_evidence=2,
@@ -1448,7 +1517,6 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         hard_targets_per_query=1,
         hard_evidence_per_type=1,
         hard_paths_per_query=1,
-        max_evidence_per_target=2,
         direct_k=2,
         evidence_k=3,
         targets_per_evidence=2,
@@ -1528,7 +1596,6 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
         [],
         [HardPath("evidence", "hard", 3.0)],
         hard_targets_per_query=1,
-        max_evidence_per_target=1,
     )
 
     pending_targets, pending_edges = hard_candidate_records([candidate_set], store)
@@ -1583,7 +1650,7 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
             json.dumps(metadata),
             encoding="utf-8",
         )
-    loaded_target = load_target_examples(target_path, max_evidence=1)[0]
+    loaded_target = load_target_examples(target_path)[0]
     loaded_edge = load_edge_examples(edge_path)[0]
 
     assert loaded_target.teacher_direct_logits == pytest.approx(
@@ -1630,7 +1697,6 @@ def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
             HardPath("hard_image", "hard", 3.0),
         ],
         hard_targets_per_query=1,
-        max_evidence_per_target=2,
     )
 
     _target_records, edge_records = score_hard_candidate_sets(

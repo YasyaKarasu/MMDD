@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from mmdd_stage1.construction import build_stage1_training_artifacts
+from mmdd_stage1.construction import (
+    DEFAULT_MAX_CELL_CHARS,
+    build_stage1_training_artifacts,
+)
 
 
 def _write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> int:
@@ -30,7 +33,7 @@ def run(args: argparse.Namespace) -> None:
         dataset_root,
         dataset_name=args.dataset_name or dataset_root.name,
         max_rows=args.max_rows,
-        max_evidence_per_target=args.max_evidence_per_target,
+        max_cell_chars=args.max_cell_chars,
         seed=args.seed,
     )
     counts = {
@@ -46,7 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset-name")
     parser.add_argument("--max-rows", type=int, default=12)
-    parser.add_argument("--max-evidence-per-target", type=int, default=8)
+    parser.add_argument(
+        "--max-cell-chars",
+        type=int,
+        default=DEFAULT_MAX_CELL_CHARS,
+        help="Maximum characters retained from each cleaned table cell.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
 

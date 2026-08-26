@@ -39,12 +39,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--teacher-checkpoint is required unless --mine-only is set")
     if not args.mine_only and args.teacher_batch_size <= 0:
         raise ValueError("Teacher batch size must be positive")
-    if min(
-        args.hard_evidence_per_type,
-        args.hard_paths_per_query,
-        args.max_evidence_per_target,
-    ) < 0:
-        raise ValueError("Hard-evidence, hard-path, and evidence limits must be non-negative")
+    if min(args.hard_evidence_per_type, args.hard_paths_per_query) < 0:
+        raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     split = None if args.split == "all" else args.split
     target_paths = [Path(value) for value in args.target_lists]
@@ -54,7 +50,6 @@ def run(args: argparse.Namespace) -> None:
         for example in load_target_examples(
             path,
             split=split,
-            max_evidence=args.max_evidence_per_target,
             dataset_name=path.stem,
         )
     ]
@@ -85,7 +80,6 @@ def run(args: argparse.Namespace) -> None:
         hard_targets_per_query=args.hard_targets_per_query,
         hard_evidence_per_type=args.hard_evidence_per_type,
         hard_paths_per_query=args.hard_paths_per_query,
-        max_evidence_per_target=args.max_evidence_per_target,
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
@@ -131,7 +125,6 @@ def run(args: argparse.Namespace) -> None:
         "hard_targets_per_query": args.hard_targets_per_query,
         "hard_evidence_per_type": args.hard_evidence_per_type,
         "hard_paths_per_query": args.hard_paths_per_query,
-        "max_evidence_per_target": args.max_evidence_per_target,
         "direct_k": args.direct_k,
         "evidence_k": args.evidence_k,
         "targets_per_evidence": args.targets_per_evidence,
@@ -185,7 +178,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-targets-per-query", type=int, default=16)
     parser.add_argument("--hard-evidence-per-type", type=int, default=16)
     parser.add_argument("--hard-paths-per-query", type=int, default=16)
-    parser.add_argument("--max-evidence-per-target", type=int, default=8)
     parser.add_argument("--direct-k", type=int, default=200)
     parser.add_argument("--evidence-k", type=int, default=100)
     parser.add_argument("--targets-per-evidence", type=int, default=100)

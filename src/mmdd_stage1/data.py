@@ -162,11 +162,8 @@ def load_target_examples(
     path: Path,
     *,
     split: str | None = "train",
-    max_evidence: int = 8,
     dataset_name: str | None = None,
 ) -> list[TargetExample]:
-    if max_evidence < 0:
-        raise ValueError("max_evidence must be non-negative")
     metadata = _metadata(path)
     examples = []
     for line_number, record in _records(path, split):
@@ -175,15 +172,13 @@ def load_target_examples(
         if not isinstance(raw_candidates, list) or len(raw_candidates) < 2:
             raise ValueError(f"{path}:{line_number}: target candidate list must contain at least two targets")
         candidates = []
-        evidence_was_truncated = False
         for raw_candidate in raw_candidates:
             if not isinstance(raw_candidate, dict):
                 raise ValueError(f"{path}:{line_number}: each target candidate must be an object")
             raw_evidence_ids = raw_candidate.get("evidence_ids", [])
             if not isinstance(raw_evidence_ids, list):
                 raise ValueError(f"{path}:{line_number}: evidence_ids must be a list")
-            evidence_was_truncated |= len(raw_evidence_ids) > max_evidence
-            evidence_ids = tuple(str(value) for value in raw_evidence_ids[:max_evidence])
+            evidence_ids = tuple(str(value) for value in raw_evidence_ids)
             candidates.append(TargetCandidate(str(raw_candidate["target_id"]), evidence_ids))
         target_ids = [candidate.target_id for candidate in candidates]
         if len(set(target_ids)) != len(target_ids):
@@ -235,11 +230,6 @@ def load_target_examples(
         teacher_evidence_logits = _teacher_logits(
             path, line_number, record, len(candidates), "teacher_evidence_logits"
         )
-        if teacher_evidence_logits is not None and evidence_was_truncated:
-            raise ValueError(
-                f"{path}:{line_number}: cannot reuse teacher_evidence_logits after "
-                "truncating candidate evidence"
-            )
         raw_score_config = record.get("teacher_score_config")
         if raw_score_config is None and {
             "evidence_aggregation",

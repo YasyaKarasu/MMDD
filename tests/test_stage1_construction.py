@@ -7,7 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mmdd_stage1.construction import _artifact_records, build_stage1_training_artifacts
+from mmdd_stage1.construction import (
+    DEFAULT_MAX_CELL_CHARS,
+    _artifact_records,
+    build_stage1_training_artifacts,
+    serialize_table_parts,
+)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -34,6 +39,19 @@ def _table(table_id: str, headers: list[str], values: list[list[str]]) -> dict:
             for row_index, row in enumerate(values)
         ],
     }
+
+
+def test_serialize_table_parts_limits_cleaned_cell_text():
+    long_value = "  prefix   " + "x" * DEFAULT_MAX_CELL_CHARS
+    parts = serialize_table_parts(
+        _table("q", ["Entity", "Value"], [[long_value, "short"]]),
+        max_rows=1,
+    )
+
+    assert parts == [
+        "Columns: Entity | Value",
+        "Row: prefix " + "x" * (DEFAULT_MAX_CELL_CHARS - len("prefix ")) + " | short",
+    ]
 
 
 def test_artifact_records_prefers_manifest_over_stale_flat_file(tmp_path: Path):
@@ -114,7 +132,6 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
         tmp_path,
         dataset_name="synthetic",
         max_rows=2,
-        max_evidence_per_target=1,
         seed=7,
     )
 
@@ -141,7 +158,6 @@ def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp
     assert all(set(candidate) == {"target_id", "evidence_ids"} for candidate in candidates)
     by_target = {candidate["target_id"]: candidate for candidate in candidates}
     assert by_target["corrupted"]["evidence_ids"] == ["e_positive"]
-    assert all(len(candidate["evidence_ids"]) <= 1 for candidate in candidates)
     edge = artifacts["edge_lists"][0]
     assert edge["destination_type"] == "table"
     assert len(edge["candidate_ids"]) == 5
@@ -206,35 +222,39 @@ def test_stage1_constructor_builds_cross_modal_edge_lists(tmp_path):
     )
     _write_jsonl(tmp_path / "evidence_recoveries.jsonl", recoveries)
 
-    artifacts = build_stage1_training_artifacts(
-        tmp_path,
-        dataset_name="synthetic",
-        max_evidence_per_target=2,
-    )
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="synthetic")
 
-    edges = {
-        (record["source_type"], record["destination_type"]): record
-        for record in artifacts["edge_lists"]
+    candidates = {
+        candidate["target_id"]: candidate
+        for candidate in artifacts["target_lists"][0]["candidates"]
     }
-    assert set(edges) == {
+    assert candidates["positive"]["evidence_ids"] == [
+        "positive_text",
+        "positive_text_extra",
+        "positive_image",
+    ]
+    edges = artifacts["edge_lists"]
+    assert {
+        (record["source_type"], record["destination_type"])
+        for record in edges
+    } == {
         ("table", "table"),
         ("table", "text"),
         ("text", "table"),
         ("table", "image"),
         ("image", "table"),
     }
-    assert edges[("table", "text")]["candidate_ids"] == [
-        "positive_text",
-        "negative_text",
-    ]
-    assert edges[("table", "image")]["candidate_ids"] == [
-        "positive_image",
-        "negative_image",
-    ]
-    assert edges[("text", "table")]["query_id"] == "positive_text"
-    assert edges[("text", "table")]["candidate_ids"] == ["positive", "negative"]
-    assert edges[("image", "table")]["query_id"] == "positive_image"
-    assert edges[("image", "table")]["candidate_ids"] == ["positive", "negative"]
+    assert [
+        record["positive_id"]
+        for record in edges
+        if record["query_id"] == "q" and record["destination_type"] == "text"
+    ] == ["positive_text", "positive_text_extra"]
+    assert {
+        record["query_id"]
+        for record in edges
+        if record["destination_type"] == "table"
+        and record["source_type"] in {"text", "image"}
+    } == {"positive_text", "positive_text_extra", "positive_image"}
 
 
 def test_stage1_constructor_uses_path_only_target_as_direct_hard_negative(tmp_path):

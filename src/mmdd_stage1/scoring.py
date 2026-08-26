@@ -127,13 +127,35 @@ def score_target_batch(
                 target_sources.append(evidence)
                 target_destinations.append(target)
 
-    direct_scores = model.score_pairs(direct_sources, direct_destinations)
-    if evidence_sources:
-        query_evidence_scores = model.score_pairs(evidence_sources, evidence_destinations)
-        evidence_target_edge_scores = model.score_pairs(target_sources, target_destinations)
+    if isinstance(model, TeacherJoinabilityModel):
+        compression_cache: dict[str, torch.Tensor] = {}
+        direct_scores = model.score_pairs(
+            direct_sources,
+            direct_destinations,
+            compression_cache=compression_cache,
+        )
+        if evidence_sources:
+            query_evidence_scores = model.score_pairs(
+                evidence_sources,
+                evidence_destinations,
+                compression_cache=compression_cache,
+            )
+            evidence_target_edge_scores = model.score_pairs(
+                target_sources,
+                target_destinations,
+                compression_cache=compression_cache,
+            )
+        else:
+            query_evidence_scores = direct_scores.new_empty(0)
+            evidence_target_edge_scores = direct_scores.new_empty(0)
     else:
-        query_evidence_scores = direct_scores.new_empty(0)
-        evidence_target_edge_scores = direct_scores.new_empty(0)
+        direct_scores = model.score_pairs(direct_sources, direct_destinations)
+        if evidence_sources:
+            query_evidence_scores = model.score_pairs(evidence_sources, evidence_destinations)
+            evidence_target_edge_scores = model.score_pairs(target_sources, target_destinations)
+        else:
+            query_evidence_scores = direct_scores.new_empty(0)
+            evidence_target_edge_scores = direct_scores.new_empty(0)
 
     evidence_scores = []
     evidence_offset = 0

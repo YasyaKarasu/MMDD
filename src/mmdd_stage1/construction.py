@@ -13,6 +13,7 @@ from mmdd_dataset.utils import clean_text, get_cell, read_jsonl
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
 
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+DEFAULT_MAX_CELL_CHARS = 1024
 
 
 def _artifact_records(root: Path, name: str, *, required: bool = True) -> list[dict[str, Any]]:
@@ -29,14 +30,20 @@ def _artifact_records(root: Path, name: str, *, required: bool = True) -> list[d
     return records
 
 
-def serialize_table_parts(table: dict[str, Any], max_rows: int) -> list[str]:
+def serialize_table_parts(
+    table: dict[str, Any],
+    max_rows: int,
+    max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
+) -> list[str]:
     headers = [clean_text(column.get("column_name")) for column in table["columns"]]
     parts = ["Columns: " + " | ".join(headers)]
     for row in table["rows"][:max_rows]:
-        values = [
-            clean_text(get_cell(row, int(column["column_index"])).get("text"))
-            for column in table["columns"]
-        ]
+        values = []
+        for column in table["columns"]:
+            value = clean_text(
+                get_cell(row, int(column["column_index"])).get("text")
+            )
+            values.append(value[:max_cell_chars].rstrip())
         parts.append("Row: " + " | ".join(values))
     return parts
 
@@ -44,10 +51,11 @@ def serialize_table_parts(table: dict[str, Any], max_rows: int) -> list[str]:
 def _table_object(
     table: dict[str, Any],
     max_rows: int,
+    max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
     *,
     embedding_role: str,
 ) -> dict[str, Any]:
-    parts = serialize_table_parts(table, max_rows)
+    parts = serialize_table_parts(table, max_rows, max_cell_chars)
     record = {
         "object_id": str(table["table_id"]),
         "object_type": "table",
@@ -202,35 +210,6 @@ def _recovery_evidence(
     return result
 
 
-def _edge_evidence_ids(
-    evidence_ids: Iterable[str],
-    asset_types: dict[str, str],
-    limit: int,
-) -> list[str]:
-    """Retain modality coverage before filling the remaining edge-positive budget."""
-
-    if limit == 0:
-        return []
-    values = list(evidence_ids)
-    selected = []
-    for evidence_type in dict.fromkeys(asset_types[evidence_id] for evidence_id in values):
-        selected.append(
-            next(
-                evidence_id
-                for evidence_id in values
-                if asset_types[evidence_id] == evidence_type
-            )
-        )
-        if len(selected) >= limit:
-            return selected
-    for evidence_id in values:
-        if evidence_id not in selected:
-            selected.append(evidence_id)
-        if len(selected) >= limit:
-            break
-    return selected
-
-
 def _resolve_target_references(
     dataset_root: Path, records: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -265,11 +244,11 @@ def build_stage1_training_artifacts(
     *,
     dataset_name: str,
     max_rows: int = 12,
-    max_evidence_per_target: int = 8,
+    max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
     seed: int = 13,
 ) -> dict[str, list[dict[str, Any]]]:
-    if max_rows <= 0 or max_evidence_per_target < 0:
-        raise ValueError("max_rows must be positive and max_evidence_per_target must be non-negative")
+    if max_rows <= 0 or max_cell_chars <= 0:
+        raise ValueError("max_rows and max_cell_chars must be positive")
     queries = {
         str(record["table_id"]): record
         for record in _artifact_records(dataset_root, "query_tables")
@@ -300,12 +279,18 @@ def build_stage1_training_artifacts(
         query_id: _table_object(
             table,
             max_rows,
+            max_cell_chars,
             embedding_role="query",
         )
         for query_id, table in queries.items()
     }
     target_objects = {
-        target_id: _table_object(table, max_rows, embedding_role="target")
+        target_id: _table_object(
+            table,
+            max_rows,
+            max_cell_chars,
+            embedding_role="target",
+        )
         for target_id, table in targets.items()
     }
     asset_objects = [_asset_object(asset, dataset_root) for asset in assets]
@@ -343,30 +328,34 @@ def build_stage1_training_artifacts(
     edge_lists = []
     target_lists = []
     emitted_evidence_target_edges: set[tuple[str, str]] = set()
-    for query_id, direct_positive_ids in positives_by_query.items():
+    for query_id, direct_positive_target_ids in positives_by_query.items():
         query = queries[query_id]
         split = str(query.get("split", "train"))
         split_targets = targets_by_split[split]
-        evidence_positive_ids = [
+        evidence_positive_target_ids = [
             target_id
             for recovery_query_id, target_id in recovery_evidence
             if recovery_query_id == query_id
             if str(targets[target_id].get("split", "train")) == split
         ]
-        if not evidence_positive_ids:
-            evidence_positive_ids = [
+        if not evidence_positive_target_ids:
+            evidence_positive_target_ids = [
                 target_id
-                for target_id in direct_positive_ids
+                for target_id in direct_positive_target_ids
                 if evidence_by_target[target_id]
             ]
-        if not evidence_positive_ids:
-            evidence_positive_ids = [direct_positive_ids[0]]
+        if not evidence_positive_target_ids:
+            evidence_positive_target_ids = [direct_positive_target_ids[0]]
         positive_evidence_by_target = {
             target_id: recovery_evidence.get((query_id, target_id), evidence_by_target[target_id])
-            for target_id in evidence_positive_ids
+            for target_id in evidence_positive_target_ids
         }
-        positive_ids = list(dict.fromkeys([*direct_positive_ids, *evidence_positive_ids]))
-        excluded = set(positive_ids)
+        positive_target_ids = list(
+            dict.fromkeys(
+                [*direct_positive_target_ids, *evidence_positive_target_ids]
+            )
+        )
+        excluded = set(positive_target_ids)
         selected: dict[str, str] = {}
 
         semantic_id = _semantic_negative(
@@ -387,8 +376,8 @@ def build_stage1_training_artifacts(
 
         rng = random.Random(f"{seed}:{query_id}")
         corrupted_id = _pick_random(split_targets, excluded, rng)
-        positive_evidence = positive_evidence_by_target[evidence_positive_ids[0]][
-            :max_evidence_per_target
+        positive_evidence = positive_evidence_by_target[
+            evidence_positive_target_ids[0]
         ]
         if corrupted_id is not None and positive_evidence:
             selected["corrupted_path"] = corrupted_id
@@ -406,7 +395,13 @@ def build_stage1_training_artifacts(
         )
         negative_ids = [selected[source] for source in ordered_sources if source in selected]
         candidate_ids = list(
-            dict.fromkeys([direct_positive_ids[0], evidence_positive_ids[0], *negative_ids])
+            dict.fromkeys(
+                [
+                    direct_positive_target_ids[0],
+                    evidence_positive_target_ids[0],
+                    *negative_ids,
+                ]
+            )
         )
         if len(candidate_ids) < 2:
             continue
@@ -422,16 +417,18 @@ def build_stage1_training_artifacts(
                         if source == "corrupted_path"
                         else positive_evidence_by_target.get(
                             target_id, evidence_by_target[target_id]
-                        )[:max_evidence_per_target]
+                        )
                     ),
                 }
             )
 
         direct_hard_ids = [
-            target_id for target_id in evidence_positive_ids if target_id not in direct_positive_ids
+            target_id
+            for target_id in evidence_positive_target_ids
+            if target_id not in direct_positive_target_ids
         ]
         direct_negative_ids = list(dict.fromkeys([*direct_hard_ids, *negative_ids]))
-        for positive_id in direct_positive_ids:
+        for positive_id in direct_positive_target_ids:
             edge_lists.append(
                 {
                     "query_id": query_id,
@@ -445,19 +442,15 @@ def build_stage1_training_artifacts(
             )
 
         positive_evidence_ids = []
-        for positive_id in evidence_positive_ids:
-            for evidence_id in _edge_evidence_ids(
-                positive_evidence_by_target[positive_id],
-                asset_types,
-                max_evidence_per_target,
-            ):
+        for positive_id in evidence_positive_target_ids:
+            for evidence_id in positive_evidence_by_target[positive_id]:
                 if evidence_id not in positive_evidence_ids:
                     positive_evidence_ids.append(evidence_id)
         positive_evidence_set = set(positive_evidence_ids)
 
         evidence_negatives: dict[str, list[str]] = defaultdict(list)
         for candidate in candidates:
-            if candidate["target_id"] in evidence_positive_ids:
+            if candidate["target_id"] in evidence_positive_target_ids:
                 continue
             seen_type = set()
             for evidence_id in candidate["evidence_ids"]:
@@ -499,17 +492,16 @@ def build_stage1_training_artifacts(
                 }
             )
 
-        evidence_positive_set = set(evidence_positive_ids)
-        for positive_target_id in evidence_positive_ids:
-            for evidence_id in _edge_evidence_ids(
-                positive_evidence_by_target[positive_target_id],
-                asset_types,
-                max_evidence_per_target,
-            ):
+        evidence_positive_target_set = set(evidence_positive_target_ids)
+        for positive_target_id in evidence_positive_target_ids:
+            for evidence_id in positive_evidence_by_target[positive_target_id]:
                 edge_key = (evidence_id, positive_target_id)
                 if edge_key in emitted_evidence_target_edges:
                     continue
-                excluded_targets = targets_by_evidence[evidence_id] | evidence_positive_set
+                excluded_targets = (
+                    targets_by_evidence[evidence_id]
+                    | evidence_positive_target_set
+                )
                 evidence_target_negatives = [
                     target_id for target_id in candidate_ids if target_id not in excluded_targets
                 ]
@@ -534,9 +526,9 @@ def build_stage1_training_artifacts(
         target_lists.append(
             {
                 "query_id": query_id,
-                "direct_positive_target_id": direct_positive_ids[0],
-                "evidence_positive_target_id": evidence_positive_ids[0],
-                "positive_target_ids": positive_ids,
+                "direct_positive_target_id": direct_positive_target_ids[0],
+                "evidence_positive_target_id": evidence_positive_target_ids[0],
+                "positive_target_ids": positive_target_ids,
                 "candidates": candidates,
                 "dataset": dataset_name,
                 "split": split,

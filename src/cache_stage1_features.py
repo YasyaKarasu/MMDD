@@ -256,22 +256,24 @@ def build_object_features(
         return payload
 
     assert isinstance(parts, list)
-    encoded_parts = parts
     if include_hidden:
         try:
-            indices, groups = _table_token_groups(embedder, item, encoded_parts, input_ids)
+            indices, groups = _table_token_groups(embedder, item, parts, input_ids)
         except ValueError as error:
-            if str(error) != "Table truncation removed all tokens from at least one schema/row group":
+            if (
+                str(error)
+                != "Table truncation removed all tokens from at least one schema/row group"
+            ):
                 raise
             for max_chars in (4096, 2048, 1024, 512, 256, 128):
-                encoded_parts = [part[:max_chars].rstrip() for part in parts]
-                if encoded_parts == parts:
+                truncated_parts = [part[:max_chars].rstrip() for part in parts]
+                if truncated_parts == parts:
                     continue
-                item["text"] = "\n".join(encoded_parts)
-                embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
+                teacher_item = {**item, "text": "\n".join(truncated_parts)}
+                _, hidden_states, input_ids = encode_inputs(embedder, [teacher_item])[0]
                 try:
                     indices, groups = _table_token_groups(
-                        embedder, item, encoded_parts, input_ids
+                        embedder, teacher_item, truncated_parts, input_ids
                     )
                 except ValueError as retry_error:
                     if str(retry_error) == str(error):
@@ -289,7 +291,6 @@ def build_object_features(
                 break
             else:
                 raise
-            payload["embedding"] = embedding.float()
         # Legacy caches loaded storage-dtype tokens as float32 before pooling.
         # Preserve that numerical order, then keep the much smaller pooled table
         # representation in float32 so no second quantization is introduced.
@@ -308,7 +309,7 @@ def build_object_features(
                     "instruction": row_instruction,
                 }
                 for text in (
-                    f"{encoded_parts[0]}\n{row}" for row in encoded_parts[1:]
+                    f"{parts[0]}\n{row}" for row in parts[1:]
                 )
             ],
         )

@@ -46,14 +46,11 @@ def build_hard_candidate_set(
     hard_paths: Sequence[HardPath],
     *,
     hard_targets_per_query: int,
-    max_evidence_per_target: int,
 ) -> HardCandidateSet:
     """Merge the three independently ranked hard-negative pools."""
 
     if hard_targets_per_query <= 0:
         raise ValueError("hard_targets_per_query must be positive")
-    if max_evidence_per_target < 0:
-        raise ValueError("max_evidence_per_target must be non-negative")
 
     direct_positive = example.candidates[example.direct_positive_index]
     evidence_positive = example.candidates[example.evidence_positive_index]
@@ -77,13 +74,8 @@ def build_hard_candidate_set(
     for path in hard_paths:
         if path.target_id == example.query_id or path.target_id in known_positives:
             continue
-        if max_evidence_per_target == 0:
-            continue
         evidence_ids = path_evidence_by_target.setdefault(path.target_id, [])
-        if (
-            path.evidence_id not in evidence_ids
-            and len(evidence_ids) < max_evidence_per_target
-        ):
+        if path.evidence_id not in evidence_ids:
             evidence_ids.append(path.evidence_id)
 
     selected_ids = set(selected_target_ids) | set(path_evidence_by_target)
@@ -261,7 +253,6 @@ def retrieve_hard_candidate_sets(
     hard_targets_per_query: int,
     hard_evidence_per_type: int,
     hard_paths_per_query: int,
-    max_evidence_per_target: int,
     direct_k: int,
     evidence_k: int,
     targets_per_evidence: int,
@@ -271,8 +262,6 @@ def retrieve_hard_candidate_sets(
         raise ValueError("hard_targets_per_query must be positive")
     if hard_evidence_per_type < 0 or hard_paths_per_query < 0:
         raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
-    if max_evidence_per_target < 0:
-        raise ValueError("max_evidence_per_target must be non-negative")
     if min(direct_k, evidence_k, targets_per_evidence) < 0:
         raise ValueError("ANN search sizes must be non-negative")
 
@@ -313,23 +302,13 @@ def retrieve_hard_candidate_sets(
                     )
 
         hard_paths.sort(key=lambda path: (-path.score, path.target_id, path.evidence_id))
-        selected_paths = []
-        selected_path_counts: dict[str, int] = {}
-        for path in hard_paths:
-            if len(selected_paths) >= hard_paths_per_query:
-                break
-            if selected_path_counts.get(path.target_id, 0) >= max_evidence_per_target:
-                continue
-            selected_paths.append(path)
-            selected_path_counts[path.target_id] = selected_path_counts.get(path.target_id, 0) + 1
         candidate_sets.append(
             build_hard_candidate_set(
                 example,
                 hard_target_ids,
                 hard_evidence_ids,
-                selected_paths,
+                hard_paths[:hard_paths_per_query],
                 hard_targets_per_query=hard_targets_per_query,
-                max_evidence_per_target=max_evidence_per_target,
             )
         )
     return candidate_sets

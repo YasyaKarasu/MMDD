@@ -187,10 +187,12 @@ class TeacherJoinabilityModel(nn.Module):
         self,
         sources: Sequence[ObjectFeatures],
         destinations: Sequence[ObjectFeatures],
+        *,
+        compression_cache: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if len(sources) != len(destinations):
             raise ValueError("Pair inputs must have equal lengths")
-        compressed: dict[str, torch.Tensor] = {}
+        compressed = compression_cache if compression_cache is not None else {}
         for features in (*sources, *destinations):
             if features.object_id not in compressed:
                 compressed[features.object_id] = self.compress(features)

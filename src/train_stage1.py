@@ -40,14 +40,13 @@ def _load_edge_training_data(paths: list[Path], split: str | None):
     ]
 
 
-def _load_target_training_data(paths: list[Path], split: str | None, max_evidence: int):
+def _load_target_training_data(paths: list[Path], split: str | None):
     return [
         example
         for path in paths
         for example in load_target_examples(
             path,
             split=split,
-            max_evidence=max_evidence,
             dataset_name=path.stem,
         )
     ]
@@ -130,7 +129,7 @@ def run(args: argparse.Namespace) -> None:
         teacher = load_teacher(teacher_path, device)
         if teacher.input_dim != hidden_dim:
             raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
-        examples = _load_target_training_data(training_paths, split, args.max_evidence_per_target)
+        examples = _load_target_training_data(training_paths, split)
         optimizer = torch.optim.AdamW(teacher.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         history = train_teacher_paths(
             teacher, examples, store, optimizer, aggregator, device=device, epochs=args.epochs,
@@ -164,7 +163,7 @@ def run(args: argparse.Namespace) -> None:
         student = load_student(student_path, device)
         if teacher.input_dim != hidden_dim or student.input_dim != embedding_dim:
             raise ValueError("Checkpoint input dimensions do not match the feature cache")
-        examples = _load_target_training_data(training_paths, split, args.max_evidence_per_target)
+        examples = _load_target_training_data(training_paths, split)
         _validate_cached_teacher(examples, teacher_path)
         optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         history = train_student_paths(
@@ -234,7 +233,6 @@ def parse_args() -> argparse.Namespace:
         "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
     )
     parser.add_argument("--evidence-top-k", type=int)
-    parser.add_argument("--max-evidence-per-target", type=int, default=8)
     return parser.parse_args()
 
 
