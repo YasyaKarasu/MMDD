@@ -41,7 +41,7 @@ from mmdd_stage2.verifier import (
 )
 
 
-def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
+def test_build_evidence_bundles_preserves_compact_path_order_and_limit():
     bundles = build_evidence_bundles(
         [
             {
@@ -50,10 +50,10 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
                 "direct_score": 3.0,
                 "evidence_score": 2.25,
                 "paths": [
-                    {"kind": "evidence", "evidence_id": "e2", "evidence_type": "image", "path_score": 2.0},
                     {"kind": "direct", "path_score": 3.0},
-                    {"kind": "evidence", "evidence_id": "e1", "evidence_type": "text", "path_score": 1.5},
-                    {"kind": "evidence", "evidence_id": "e1", "evidence_type": "text", "path_score": 1.5},
+                    {"kind": "evidence", "evidence_id": "e2"},
+                    {"kind": "evidence", "evidence_id": "e1"},
+                    {"kind": "evidence", "evidence_id": "e3"},
                 ],
             }
         ],
@@ -62,7 +62,7 @@ def test_build_evidence_bundles_selects_unique_evidence_by_path_score():
 
     assert bundles[0].target_id == "t1"
     assert bundles[0].retrieval_score == pytest.approx(2.25)
-    assert bundles[0].evidence_ids == ("e1", "e2")
+    assert bundles[0].evidence_ids == ("e2", "e1")
 
 
 def test_stage2_preserves_global_rrf_order_while_using_route_scores():
@@ -774,19 +774,7 @@ def _train_stage2_args(tmp_path: Path, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"epochs": 0}, "--epochs"),
-        ({"max_targets": -1}, "--max-targets"),
-        ({"max_targets": 0}, "--max-targets"),
-        ({"top_k_evidence": -1}, "--top-k-evidence"),
-        ({"top_k_evidence": 0}, "--top-k-evidence"),
-    ],
-)
-def test_train_stage2_rejects_invalid_limits_before_other_work(
-    tmp_path, monkeypatch, overrides, message
-):
+def test_train_stage2_rejects_invalid_epochs_before_other_work(tmp_path, monkeypatch):
     def unexpected(*_args, **_kwargs):
         pytest.fail("Stage-2 validation must run before seeding or loading data")
 
@@ -794,8 +782,29 @@ def test_train_stage2_rejects_invalid_limits_before_other_work(
     monkeypatch.setattr(stage2_train, "load_column_training_data", unexpected)
     monkeypatch.setattr(stage2_train, "QwenStage2Backend", unexpected)
 
-    with pytest.raises(ValueError, match=message):
-        stage2_train.run(_train_stage2_args(tmp_path, **overrides))
+    with pytest.raises(ValueError, match="--epochs"):
+        stage2_train.run(_train_stage2_args(tmp_path, epochs=0))
+
+
+@pytest.mark.parametrize(
+    ("max_targets", "top_k_evidence"),
+    [(-1, 1), (0, 1), (1, -1), (1, 0)],
+)
+def test_stage2_training_loader_rejects_invalid_limits(
+    monkeypatch, max_targets, top_k_evidence
+):
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_dataset_artifact",
+        lambda *_args, **_kwargs: pytest.fail("validation must precede data loading"),
+    )
+
+    with pytest.raises(ValueError, match="target and evidence limits"):
+        load_column_training_data(
+            Path("unused"),
+            [],
+            max_targets=max_targets,
+            top_k_evidence=top_k_evidence,
+        )
 
 
 def test_train_stage2_loads_data_before_seeded_model_initialization(tmp_path, monkeypatch):

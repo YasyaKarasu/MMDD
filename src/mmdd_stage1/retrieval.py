@@ -172,9 +172,15 @@ def _logsumexp(values: Iterable[float]) -> float:
 def _aggregate_path_channels(
     paths: list[dict[str, Any]], aggregator: PathAggregator
 ) -> tuple[float | None, float | None]:
-    direct_scores = [float(path["path_score"]) for path in paths if path["kind"] == "direct"]
+    direct_score = next(
+        (
+            float(path["path_score"])
+            for path in paths
+            if path["kind"] == "direct"
+        ),
+        None,
+    )
     evidence_scores = [float(path["path_score"]) for path in paths if path["kind"] == "evidence"]
-    direct_score = _logsumexp(direct_scores) if direct_scores else None
     if not evidence_scores:
         return direct_score, None
     if aggregator.evidence_aggregation == "logsumexp":
@@ -201,26 +207,16 @@ def _compact_result_paths(
     compact = []
     if any(path["kind"] == "direct" for path in paths):
         compact.append({"kind": "direct"})
-    scores_by_evidence: dict[str, list[float]] = defaultdict(list)
-    for path in paths:
-        if path["kind"] != "evidence":
-            continue
-        scores_by_evidence[str(path["evidence_id"])].append(float(path["path_score"]))
-    ranked = sorted(
-        (
-            (evidence_id, _logsumexp(scores))
-            for evidence_id, scores in scores_by_evidence.items()
-        ),
-        key=lambda item: item[1],
-        reverse=True,
-    )[:evidence_limit]
+    evidence_paths = [
+        path for path in paths if path["kind"] == "evidence"
+    ][:evidence_limit]
     compact.extend(
         {
             "kind": "evidence",
-            "evidence_id": evidence_id,
-            "path_score": score,
+            "evidence_id": str(path["evidence_id"]),
+            "path_score": float(path["path_score"]),
         }
-        for evidence_id, score in ranked
+        for path in evidence_paths
     )
     return compact
 
@@ -253,7 +249,10 @@ def retrieve_zero_one_hop(
     for target_id, score in indices.search(query_id, "table", direct_k):
         paths_by_target[target_id].append({"kind": "direct", "path_score": score})
 
-    for evidence_type in dict.fromkeys(evidence_types):
+    normalized_evidence_types = dict.fromkeys(
+        normalize_object_type(value) for value in evidence_types
+    )
+    for evidence_type in normalized_evidence_types:
         for evidence_id, query_evidence_score in indices.search(query_id, evidence_type, evidence_k):
             for target_id, evidence_target_score in indices.search(evidence_id, "table", targets_per_evidence):
                 paths_by_target[target_id].append(

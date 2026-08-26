@@ -191,14 +191,11 @@ def run(args: argparse.Namespace) -> None:
                         f"{object_id}: source cache has no Teacher hidden features"
                     )
                 hidden_states = features.hidden_states
-                token_groups = features.token_groups
-                if features.object_type == "table":
-                    if token_groups is not None:
-                        hidden_states = structural_table_pool(hidden_states, token_groups)
-                    token_groups = torch.arange(len(hidden_states), dtype=torch.long)
+                if features.object_type == "table" and features.token_groups is not None:
+                    hidden_states = structural_table_pool(
+                        hidden_states, features.token_groups
+                    )
                 teacher_payload = {"hidden_states": hidden_states}
-                if token_groups is not None:
-                    teacher_payload["token_groups"] = token_groups
                 relative_path = Path("teacher_objects") / name
                 _save(teacher_payload, output_dir / relative_path)
                 record = {

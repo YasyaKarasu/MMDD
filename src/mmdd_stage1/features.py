@@ -35,9 +35,9 @@ class ObjectFeatures:
     """The two frozen feature granularities consumed by Teacher and Student.
 
     ``hidden_states`` contains the frozen states consumed by the Teacher.
-    Current table caches store one vector per schema/example-row group and
-    identify them with ``token_groups``. Historical caches may omit the groups
-    because their table states were already pooled.
+    Current table caches store one already-pooled vector per schema/example-row
+    group. Historical raw-token caches identify those groups with
+    ``token_groups``.
     """
 
     object_id: str

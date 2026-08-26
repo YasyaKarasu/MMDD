@@ -17,8 +17,6 @@ from mmdd_stage2.verifier import CandidateColumnScorer
 def run(args: argparse.Namespace) -> None:
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
-    if args.max_targets <= 0 or args.top_k_evidence <= 0:
-        raise ValueError("--max-targets and --top-k-evidence must be positive")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)

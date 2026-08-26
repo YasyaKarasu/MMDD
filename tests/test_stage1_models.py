@@ -31,7 +31,7 @@ from mmdd_stage1.data import (
     load_edge_examples,
     load_target_examples,
 )
-from mmdd_stage1.features import FeatureStore, ObjectFeatures
+from mmdd_stage1.features import FeatureStore, ObjectFeatures, normalize_object_type
 from mmdd_stage1.mining import (
     HardPath,
     build_hard_candidate_set,
@@ -602,9 +602,9 @@ def test_legacy_feature_cache_conversion_pools_tables_and_drops_unneeded_hidden(
 
     store = FeatureStore.from_path(output)
     assert store.get("q").hidden_states.shape == (2, 4)
-    assert store.get("q").token_groups.tolist() == [0, 1]
+    assert store.get("q").token_groups is None
     assert torch.equal(store.get("t").hidden_states, legacy_table_hidden)
-    assert store.get("t").token_groups.tolist() == [0, 1, 2, 3]
+    assert store.get("t").token_groups is None
     assert store.get("e").hidden_states is None
     assert len((output / "manifest.jsonl").read_text().splitlines()) == 3
     assert len((output / "teacher_manifest.jsonl").read_text().splitlines()) == 2
@@ -808,7 +808,7 @@ def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
     assert payload["embedding"].norm().item() == pytest.approx(1.0)
     assert payload["hidden_states"].shape == (2, 4)
     assert payload["hidden_states"].dtype == torch.float32
-    assert payload["token_groups"].tolist() == [0, 1]
+    assert "token_groups" not in payload
 
 
 def test_qwen_cache_builder_skips_table_teacher_features_for_base_only(
@@ -943,7 +943,7 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
     ]
 
 
-def test_qwen_cache_builder_truncates_oversized_table_parts_without_dropping_groups(tmp_path):
+def test_qwen_cache_builder_truncates_oversized_table_parts_and_pools_each_group(tmp_path):
     class TruncatingFakeQwenEmbedder(FakeQwenEmbedder):
         max_length = 80
 
@@ -987,7 +987,8 @@ def test_qwen_cache_builder_truncates_oversized_table_parts_without_dropping_gro
         storage_dtype=torch.float16,
     )
 
-    assert torch.unique(payload["token_groups"]).tolist() == [0, 1, 2]
+    assert payload["hidden_states"].shape == (3, 4)
+    assert "token_groups" not in payload
     assert payload["row_embeddings"].shape == (2, 4)
 
 
@@ -1062,7 +1063,9 @@ def test_qwen_cache_run_writes_base_tier_and_incremental_teacher_tier(
     assert len((output / "teacher_manifest.jsonl").read_text().splitlines()) == 3
     store = FeatureStore.from_path(output)
     assert store.get("t", include_hidden=False).hidden_states is None
-    assert store.get("t", include_hidden=True).hidden_states.shape == (2, 4)
+    teacher_features = store.get("t", include_hidden=True)
+    assert teacher_features.hidden_states.shape == (2, 4)
+    assert teacher_features.token_groups is None
 
 
 def test_embedding_instructions_distinguish_role_modality_and_query_rows():
@@ -1146,9 +1149,13 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
 
 
 def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
+    calls = Counter()
+
     class StaticIndices:
         def search(self, source_id, destination_type, k):
             del k
+            destination_type = normalize_object_type(destination_type)
+            calls[(source_id, destination_type)] += 1
             values = {
                 ("q", "table"): [("t", 1.0)],
                 ("q", "text"): [("e1", 2.0), ("e2", 1.0)],
@@ -1163,7 +1170,7 @@ def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
         direct_k=1,
         evidence_k=2,
         targets_per_evidence=1,
-        evidence_types=("text", "text"),
+        evidence_types=("text", "text_asset"),
         evidence_aggregation="topk_mean",
         evidence_top_k=1,
     )
@@ -1171,6 +1178,7 @@ def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
     result = results[0]
     assert result["evidence_score"] == pytest.approx(4.0)
     assert result["score"] == pytest.approx(2.0 / 61.0)
+    assert calls[("q", "text")] == 1
     assert "direct_score" not in result
     assert "direct_rank" not in result
     assert "evidence_rank" not in result

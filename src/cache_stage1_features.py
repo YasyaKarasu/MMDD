@@ -298,7 +298,6 @@ def build_object_features(
         ).float()
         pooled_hidden = structural_table_pool(selected_hidden, groups)
         payload["hidden_states"] = pooled_hidden
-        payload["token_groups"] = torch.arange(len(pooled_hidden), dtype=torch.long)
 
     if embedding_role == "query" and include_row_embeddings:
         routing_outputs = encode_inputs(
@@ -543,8 +542,6 @@ def run(args: argparse.Namespace) -> None:
                 base_written += 1
             if needs_teacher:
                 teacher_payload = {"hidden_states": payload["hidden_states"]}
-                if "token_groups" in payload:
-                    teacher_payload["token_groups"] = payload["token_groups"]
                 relative_path = Path("teacher_objects") / name
                 destination = output_dir / relative_path
                 temporary = destination.with_suffix(".pt.tmp")

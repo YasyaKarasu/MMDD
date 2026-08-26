@@ -33,39 +33,23 @@ class SemanticJoinability:
     mean_similarity: float
 
 
-def _logsumexp(values: Sequence[float]) -> float:
-    maximum = max(values)
-    return maximum + math.log(sum(math.exp(value - maximum) for value in values))
-
-
 def build_evidence_bundles(
     retrieval_results: Sequence[dict[str, Any]],
     *,
     top_k_evidence: int,
 ) -> list[EvidenceBundle]:
-    """Build evidence-only target bundles using their Stage-1 channel scores."""
+    """Build evidence-only bundles in Stage-1's compact path order."""
 
     if top_k_evidence < 0:
         raise ValueError("top_k_evidence must be non-negative")
     bundles = []
     for result in retrieval_results:
-        paths = [
-            path
+        evidence_ids = tuple(
+            str(path["evidence_id"])
             for path in result.get("paths", [])
             if path.get("kind") == "evidence" and path.get("evidence_id") is not None
-        ]
-        if not paths:
-            continue
-        scores_by_evidence: dict[str, list[float]] = {}
-        for path in paths:
-            evidence_id = str(path["evidence_id"])
-            scores_by_evidence.setdefault(evidence_id, []).append(float(path["path_score"]))
-        ranked = sorted(
-            ((evidence_id, _logsumexp(scores)) for evidence_id, scores in scores_by_evidence.items()),
-            key=lambda item: item[1],
-            reverse=True,
         )[:top_k_evidence]
-        if not ranked:
+        if not evidence_ids:
             continue
         evidence_score = result.get("evidence_score")
         if evidence_score is None:
@@ -77,7 +61,7 @@ def build_evidence_bundles(
             EvidenceBundle(
                 target_id=str(result["target_id"]),
                 retrieval_score=float(evidence_score),
-                evidence_ids=tuple(evidence_id for evidence_id, _ in ranked),
+                evidence_ids=evidence_ids,
             )
         )
     return bundles
