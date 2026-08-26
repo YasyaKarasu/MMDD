@@ -13,16 +13,20 @@ Build the initial Stage-1 files directly from a completed dataset artifact:
 ```bash
 conda run -n MMDD python src/build_stage1_training_data.py \
   --dataset-root output_mm_joinability_v15 \
-  --output-dir work/stage1_v15 \
-  --max-evidence-per-target 8
+  --output-dir work/stage1_v15
 ```
 
 This writes `stage1_objects.jsonl`, `edge_lists.jsonl`, `target_lists.jsonl`,
 and `stage1_corpus.jsonl`. Initial target lists draw from random,
 TF-IDF-similar non-joinable, type/structure-matched, and corrupted-path
 negatives without retaining those construction-only labels. Candidate evidence
-comes from recovery or source provenance and is capped while constructing the
-list, rather than truncated from an unspecified external list later.
+contains all unique recovery or source-provenance assets.
+Table serialization cleans each cell and retains at most its first 1024
+characters so anomalously long WDC cells cannot consume the encoder context.
+Use `--max-cell-chars` to change this limit; changing it requires rebuilding
+the Stage-1 objects and feature cache.
+Target lists built with the former per-target evidence cap must be regenerated,
+along with their cached Teacher scores, before path training.
 
 `cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores the two
 feature granularities in separate tiers. The base `objects/` tier contains the
@@ -100,14 +104,13 @@ identifies the source, including for evidence-to-target edges:
 ```
 
 Construction emits query-to-target edges plus query-to-evidence and
-evidence-to-target edges for retained text/image recoveries whenever a valid
-negative exists. The edge budget retains one recovery from each available
-modality before filling its remaining slots. Each positive edge gets its own
-list; other known positives are excluded from its negatives. `source_type` and
-`destination_type` are checked against the feature cache during scoring.
+evidence-to-target edges for all text/image recoveries whenever a valid negative
+exists. Each positive edge gets its own list; other known positives are excluded
+from its negatives. `source_type` and `destination_type` are checked against the
+feature cache during scoring.
 
-Path-level data groups evidence by candidate target. Evidence order is the
-retrieval-score order; `--max-evidence-per-target` retains its prefix:
+Path-level data groups all unique evidence by candidate target. Mined evidence
+remains in retrieval-score order:
 
 ```json
 {"query_id":"q1","direct_positive_target_id":"t1","evidence_positive_target_id":"t2","positive_target_ids":["t1","t2"],"candidates":[{"target_id":"t1","evidence_ids":[]},{"target_id":"t2","evidence_ids":["e1","i1"]}],"dataset":"2k","split":"train"}
@@ -264,8 +267,8 @@ target for the Evidence target channel. Edge outputs store aligned
 `teacher_direct_logits` and `teacher_evidence_logits`.
 `student-edge` and `student-path` consume these cached soft labels directly.
 The loader rejects the obsolete merged target `teacher_logits` format and also
-checks declared edge types, the Teacher checkpoint, evidence truncation, and
-path-aggregation configuration before reuse:
+checks declared edge types, the Teacher checkpoint, and path-aggregation
+configuration before reuse:
 
 ```bash
 conda run -n MMDD python src/train_stage1.py student-edge \
@@ -331,9 +334,10 @@ evidence. No external table or asset metadata participates in routing.
 Rows with no assigned evidence produce an empty value without localization or
 generation. For assigned evidence, the Qwen backend captures the later
 full-attention layers' `v_proj` outputs. It builds separate entity and attribute
-relevance maps over text or image tokens, multiplies and normalizes them, and
-averages the maps over layers. Text evidence is processed in overlapping token
-windows and reduced to a coherent high-relevance span. Image maps are
+relevance maps over text or image tokens and combines them. For text evidence,
+joint pre-softmax logits from overlapping token windows are averaged on the
+full evidence token axis, normalized once per layer, averaged over layers, and
+reduced to a coherent high-relevance span. Image maps are
 Gaussian-smoothed; FOCUS-style separated anchors, adaptive ROI expansion, NMS,
 and an existence confidence pass select the crop. The output names the
 modality-local values explicitly as `text_span_relevance` or
