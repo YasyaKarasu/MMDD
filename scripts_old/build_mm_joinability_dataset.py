@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
 
+from json_repair import repair_json
+
 try:
     import requests
 except ImportError:  # pragma: no cover - exercised only in minimal envs.
@@ -1880,20 +1882,58 @@ def iter_json_objects(text: str) -> Iterable[dict[str, Any]]:
         start += max(1, end)
 
 
-def safe_json_object(text: str) -> dict[str, Any]:
+_QUOTED_ATTRIBUTES_KEY_RE = re.compile(r'''["']attributes["']\s*:''', re.I)
+_UNQUOTED_ATTRIBUTES_KEY_RE = re.compile(r"\battributes\s*:", re.I)
+
+
+@dataclass(frozen=True)
+class JsonObjectParseResult:
+    payload: dict[str, Any]
+    method: str
+
+
+def parse_json_object(
+    text: str,
+    *,
+    allow_repair: bool = True,
+) -> JsonObjectParseResult:
     text = clean_text(text)
     if not text:
-        return {}
+        return JsonObjectParseResult({}, "empty")
     try:
         payload = json.loads(text)
-        return payload if isinstance(payload, dict) else {}
+        return JsonObjectParseResult(
+            payload if isinstance(payload, dict) else {},
+            "json" if isinstance(payload, dict) else "json_non_object",
+        )
     except json.JSONDecodeError:
         pass
     objects = list(iter_json_objects(text))
     for payload in reversed(objects):
         if isinstance(payload.get("attributes"), list):
-            return payload
-    return objects[-1] if objects else {}
+            return JsonObjectParseResult(payload, "embedded_json")
+    repair_can_produce_attributes = bool(
+        _QUOTED_ATTRIBUTES_KEY_RE.search(text)
+        or ("{" in text and _UNQUOTED_ATTRIBUTES_KEY_RE.search(text))
+    )
+    if allow_repair and repair_can_produce_attributes:
+        try:
+            repaired = repair_json(
+                text,
+                return_objects=True,
+                skip_json_loads=True,
+            )
+        except Exception:
+            repaired = None
+        if isinstance(repaired, dict):
+            return JsonObjectParseResult(repaired, "json_repair")
+    if objects:
+        return JsonObjectParseResult(objects[-1], "embedded_json_fallback")
+    return JsonObjectParseResult({}, "invalid")
+
+
+def safe_json_object(text: str) -> dict[str, Any]:
+    return parse_json_object(text).payload
 
 
 def is_placeholder_text(value: str) -> bool:
@@ -4091,21 +4131,22 @@ class LocalAttributeExtractor:
                 )
             except Exception as error:
                 error_code = _safe_error_code(error)
-                state["primary_error_code"] = error_code
-                return finish(
-                    value="",
-                    verdict="insufficient",
-                    comparison="auto_check_failed",
-                    source="primary_local_incomplete",
-                    complete=False,
-                    error_code=error_code,
+                primary_value = ""
+                primary_verdict = "insufficient"
+                primary_comparison = "auto_check_failed"
+                state.update(
+                    primary_extracted_value=primary_value,
+                    primary_verdict=primary_verdict,
+                    primary_comparison=primary_comparison,
+                    primary_error_code=error_code,
                 )
-            primary_verdict, primary_comparison = classify(primary_value)
-            state.update(
-                primary_extracted_value=primary_value,
-                primary_verdict=primary_verdict,
-                primary_comparison=primary_comparison,
-            )
+            else:
+                primary_verdict, primary_comparison = classify(primary_value)
+                state.update(
+                    primary_extracted_value=primary_value,
+                    primary_verdict=primary_verdict,
+                    primary_comparison=primary_comparison,
+                )
         else:
             raw_primary_value = (
                 local_review.get("primary_extracted_value")
@@ -4149,6 +4190,15 @@ class LocalAttributeExtractor:
             )
         luna = getattr(self, "auto_check_luna_reviewer", None)
         if luna is None:
+            if state["primary_error_code"]:
+                return finish(
+                    value=primary_value,
+                    verdict=primary_verdict,
+                    comparison=primary_comparison,
+                    source="primary_local_incomplete",
+                    complete=False,
+                    error_code=state["primary_error_code"],
+                )
             return finish(
                 value=primary_value,
                 verdict=primary_verdict,
@@ -4227,7 +4277,10 @@ class LocalAttributeExtractor:
             luna_extracted_value=luna_value,
             luna_verdict=luna_verdict,
             luna_comparison=luna_comparison,
-            luna_agrees_with_local=results_agree(primary_value, luna_value),
+            luna_agrees_with_local=(
+                not state["primary_error_code"]
+                and results_agree(primary_value, luna_value)
+            ),
         )
         if state["luna_agrees_with_local"]:
             return finish(
@@ -5775,6 +5828,9 @@ def query_recovery_cached_check(
     if (
         transient is not None
         and cached_model_auto_check_review_policy(transient) == requested_policy
+        and model_auto_check_is_complete(
+            {"auto_check": transient.get("auto_check")}, required=True
+        )
     ):
         return transient
     cached = cache.get(key)
@@ -6154,7 +6210,11 @@ def resolve_query_recovery_auto_check_plans(
     ):
         progress_bar = tqdm(
             total=0,
-            desc="Query recovery auto-check",
+            desc=(
+                "Query recovery accepted-evidence check"
+                if exhaustive
+                else "Query recovery eligibility check"
+            ),
             unit="recovery",
             dynamic_ncols=True,
             disable=not bool(getattr(args, "model_progress", True)),
@@ -7891,8 +7951,9 @@ def reparse_extraction_record(
     raw_response = clean_text(record.get("raw_response"))
     if not raw_response:
         return record, False
+    parsed = parse_json_object(raw_response)
     attributes = normalize_extracted_attributes(
-        safe_json_object(raw_response),
+        parsed.payload,
         candidate_attribute_names,
     )
     target_field = (
@@ -7905,6 +7966,7 @@ def reparse_extraction_record(
     updated = dict(record)
     updated[target_field] = attributes
     updated["reparsed_raw_response"] = True
+    updated["raw_response_parse_method"] = parsed.method
     return updated, True
 
 

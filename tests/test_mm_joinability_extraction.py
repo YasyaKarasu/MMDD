@@ -542,7 +542,7 @@ def test_query_recovery_auto_check_reuses_completed_cache(
     bars: list[ProgressBar] = []
 
     def fake_tqdm(*, total: int, **kwargs: object) -> ProgressBar:
-        assert kwargs["desc"] == "Query recovery auto-check"
+        assert kwargs["desc"] == "Query recovery eligibility check"
         assert kwargs["unit"] == "recovery"
         assert kwargs["dynamic_ncols"] is True
         assert kwargs["disable"] is False
@@ -652,6 +652,41 @@ def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
             ],
         },
     }
+
+
+def test_repaired_extraction_reuses_unchanged_auto_check_key(
+    tmp_path: Path,
+) -> None:
+    repaired, changed = reparse_extraction_record(
+        {
+            "cache_key": "extraction-cache-key",
+            "attributes": [],
+            "raw_response": (
+                '{"attributes":[{"name":"State","value":"Alabama"}]'
+            ),
+            "error": "",
+        },
+        ["State"],
+    )
+    candidate = _make_query_recovery_candidate(
+        cache_key=str(repaired["cache_key"])
+    )
+    extractor = SimpleNamespace(auto_check_luna_reviewer=object())
+    key = joinability_dataset.query_recovery_auto_check_key(
+        candidate,
+        extractor,
+    )
+    cache = ExtractionCache(tmp_path / "query-auto-check-cache.jsonl")
+    cached_record = _completed_query_recovery_record(key)
+    cache.put(key, cached_record)
+
+    assert changed is True
+    assert joinability_dataset.query_recovery_cached_check(
+        key,
+        cache,
+        candidate,
+        extractor=extractor,
+    ) == cached_record
 
 
 def test_query_recovery_auto_check_key_ignores_reviewer_pool_identity() -> None:
@@ -892,6 +927,30 @@ def test_remote_cache_alias_is_available_only_to_cascade_policy(
         cache,
         candidate,
         extractor=None,
+    ) is None
+
+
+def test_query_recovery_cache_rejects_incomplete_transient_review(
+    tmp_path: Path,
+) -> None:
+    candidate = _make_query_recovery_candidate()
+    extractor = SimpleNamespace(auto_check_luna_reviewer=object())
+    key = joinability_dataset.query_recovery_auto_check_key(
+        candidate,
+        extractor,
+    )
+    record = _completed_query_recovery_record(key)
+    review = record["auto_check"]["reviews"][0]
+    review["review_complete"] = False
+    review["error_code"] = "model_review_failed:invalid_json"
+    cache = ExtractionCache(tmp_path / "query-auto-check-cache.jsonl")
+    cache.put_transient(key, record)
+
+    assert joinability_dataset.query_recovery_cached_check(
+        key,
+        cache,
+        candidate,
+        extractor=extractor,
     ) is None
 
 
@@ -2653,6 +2712,33 @@ def test_safe_json_object_uses_final_attributes_json_after_thinking_text():
     assert attrs == [{"name": "State", "value": "Alabama"}]
 
 
+def test_safe_json_object_repairs_truncated_attributes_object():
+    raw = (
+        '{"attributes":[{"name":"Rank","value":"10"},'
+        '{"name":"Season","value":"1856"},'
+        '{"name":"Fatalities","value":"400"}]'
+    )
+
+    payload = safe_json_object(raw)
+
+    assert normalize_extracted_attributes(
+        payload,
+        ["Rank", "Season", "Fatalities"],
+    ) == [
+        {"name": "Rank", "value": "10"},
+        {"name": "Season", "value": "1856"},
+        {"name": "Fatalities", "value": "400"},
+    ]
+    assert joinability_dataset.parse_json_object(raw).method == "json_repair"
+
+
+def test_safe_json_object_keeps_valid_empty_attributes_as_native_json():
+    parsed = joinability_dataset.parse_json_object('{"attributes":[]}')
+
+    assert parsed.payload == {"attributes": []}
+    assert parsed.method == "json"
+
+
 def test_normalize_extracted_attributes_drops_placeholders_and_non_candidates():
     payload = {
         "attributes": [
@@ -3236,6 +3322,38 @@ def test_reparse_extraction_record_updates_old_cached_raw_response():
     assert updated["attributes"] == [{"name": "State", "value": "Alabama"}]
 
 
+def test_reparse_extraction_record_repairs_cache_without_changing_key():
+    cached = {
+        "cache_key": "stable-extraction-key",
+        "attributes": [],
+        "raw_response": (
+            '{"attributes":[{"name":"Season","value":"1856"}]'
+        ),
+        "error": "",
+    }
+
+    updated, changed = reparse_extraction_record(cached, ["Season"])
+
+    assert changed is True
+    assert updated["cache_key"] == "stable-extraction-key"
+    assert updated["attributes"] == [{"name": "Season", "value": "1856"}]
+    assert updated["raw_response_parse_method"] == "json_repair"
+
+
+def test_reparse_extraction_record_does_not_rewrite_valid_empty_result():
+    cached = {
+        "cache_key": "legitimate-empty",
+        "attributes": [],
+        "raw_response": '{"attributes":[]}',
+        "error": "",
+    }
+
+    updated, changed = reparse_extraction_record(cached, ["Season"])
+
+    assert changed is False
+    assert updated is cached
+
+
 def _task(asset_type: str, suffix: str = "1") -> ExtractionTask:
     return ExtractionTask(
         order=0,
@@ -3510,6 +3628,51 @@ def test_supported_local_auto_check_still_runs_luna(monkeypatch):
     assert review["luna_agrees_with_local"] is True
     assert luna.calls == 1
     assert terra.calls == 0
+
+
+def test_failed_local_auto_check_still_runs_luna_and_terra(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+
+    class Reviewer:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def extract_batches(self, batches):
+            self.calls += 1
+            return {
+                batches[0]["query_table_id"]: [
+                    {"extracted_value": self.value}
+                ]
+            }
+
+    luna = Reviewer("Alabama")
+    terra = Reviewer("Alabama")
+    extractor.auto_check_luna_reviewer = luna
+    extractor.auto_check_terra_reviewer = terra
+    monkeypatch.setattr(
+        extractor,
+        "extract_auto_check_value",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("invalid local JSON")
+        ),
+    )
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    assert review["primary_error_code"]
+    assert review["luna_triggered"] is True
+    assert review["luna_agrees_with_local"] is False
+    assert review["terra_triggered"] is True
+    assert review["decision_source"] == "terra_adjudication"
+    assert review["verdict"] == "supported"
+    assert review["review_complete"] is True
+    assert luna.calls == 1
+    assert terra.calls == 1
 
 
 def test_supported_local_luna_disagreement_runs_final_judge(monkeypatch):

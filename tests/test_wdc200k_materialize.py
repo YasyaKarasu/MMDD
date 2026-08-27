@@ -82,6 +82,7 @@ class _MemoryCache:
         self.items = {
             str(record["cache_key"]): dict(record) for record in records
         }
+        self.transient_items: dict[str, dict[str, Any]] = {}
 
     def get(self, key: str) -> dict[str, Any] | None:
         record = self.items.get(key)
@@ -89,6 +90,13 @@ class _MemoryCache:
 
     def put(self, key: str, record: dict[str, Any]) -> None:
         self.items[key] = dict(record)
+
+    def get_transient(self, key: str) -> dict[str, Any] | None:
+        record = self.transient_items.get(key)
+        return dict(record) if record is not None else None
+
+    def put_transient(self, key: str, record: dict[str, Any]) -> None:
+        self.transient_items[key] = dict(record)
 
 
 def test_materialize_schema_initialization_commit_uses_live_guard(
@@ -2891,39 +2899,42 @@ def test_nonempty_task6_outputs_materialize_query_qrel_and_evidence(
     )
 
 
+class _QueryChecker:
+    auto_check_enabled = True
+    auto_check_parallelism = 1
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str]] = []
+        self.supported_asset_ids: set[str] = set()
+
+    def extract_auto_check_value(
+        self,
+        *,
+        task: Any,
+        attribute_name: str,
+        claimed_value: str,
+        **_kwargs: Any,
+    ) -> str:
+        asset_id = str(task.asset["asset_id"])
+        self.calls.append((task.source_row_id, asset_id))
+        if asset_id.endswith("_000"):
+            self.supported_asset_ids.add(asset_id)
+            return claimed_value
+        return ""
+
+
+@pytest.mark.parametrize("remote_review", [False, True])
 def test_query_auto_check_exhausts_final_query_evidence_after_threshold_selection(
     tmp_path: Path,
+    remote_review: bool,
 ) -> None:
     inputs, args = _authoritative_inputs(
         tmp_path,
         page_success=True,
         extractor=_StateExtractor(),
     )
-
-    class QueryChecker:
-        auto_check_enabled = True
-        auto_check_parallelism = 1
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, str]] = []
-            self.supported_asset_ids: set[str] = set()
-
-        def extract_auto_check_value(
-            self,
-            *,
-            task: Any,
-            attribute_name: str,
-            claimed_value: str,
-            **_kwargs: Any,
-        ) -> str:
-            asset_id = str(task.asset["asset_id"])
-            self.calls.append((task.source_row_id, asset_id))
-            if asset_id.endswith("_000"):
-                self.supported_asset_ids.add(asset_id)
-                return claimed_value
-            return ""
-
-    checker = QueryChecker()
+    args.auto_check_secondary_openai = remote_review
+    checker = _QueryChecker()
     output_root = tmp_path / "output"
     result = materialize_dataset(
         inputs,
@@ -2971,6 +2982,110 @@ def test_query_auto_check_exhausts_final_query_evidence_after_threshold_selectio
         (inputs.work_root / "materialization").glob("index-*.sqlite3")
     )
     with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM query_auto_check_units WHERE complete = 1"
+        ).fetchone()[0] == 1
+
+
+def test_final_materialization_loads_query_checks_by_exact_cache_key(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        extractor=_StateExtractor(),
+    )
+    args.auto_check_secondary_openai = True
+    materialize_dataset(
+        inputs,
+        output_root=tmp_path / "output",
+        args=args,
+        extractor=_QueryChecker(),
+        records_per_shard=2,
+    )
+    database_path = next(
+        (inputs.work_root / "materialization").glob("index-*.sqlite3")
+    )
+    with materializer._connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE query_auto_checks
+            SET extraction_cache_key = 'unrelated-extraction'
+            """
+        )
+        connection.commit()
+
+    materialize_args = argparse.Namespace(**vars(args))
+    materialize_args._query_auto_check_required = True
+    materialize_args._query_auto_check_review_policy = (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    materialized = materializer._materialize_from_index(
+        _source_table(),
+        database_path,
+        args=materialize_args,
+        split="train",
+    )
+
+    assert len(materialized.query_tables) == 1
+    assert len(materialized.qrels) == 1
+    assert len(materialized.evidence_recoveries) == 2
+
+
+@pytest.mark.parametrize("cache_has_missing_check", [False, True])
+def test_global_query_auto_check_repairs_incomplete_completed_unit(
+    tmp_path: Path,
+    cache_has_missing_check: bool,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        extractor=_StateExtractor(),
+    )
+    args.auto_check_secondary_openai = True
+    checker = _QueryChecker()
+    materialize_dataset(
+        inputs,
+        output_root=tmp_path / "output",
+        args=args,
+        extractor=checker,
+        records_per_shard=2,
+    )
+    database_path = next(
+        (inputs.work_root / "materialization").glob("index-*.sqlite3")
+    )
+    with materializer._connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT cache_key, record_json FROM query_auto_checks "
+            "ORDER BY cache_key"
+        ).fetchall()
+        assert len(rows) == 4
+        connection.execute(
+            "DELETE FROM query_auto_checks WHERE cache_key = ?",
+            (str(rows[0]["cache_key"]),),
+        )
+        connection.commit()
+    cached_rows = rows if cache_has_missing_check else rows[1:]
+    cache = _MemoryCache(
+        [json.loads(str(row["record_json"])) for row in cached_rows]
+    )
+    calls_before_resume = len(checker.calls)
+
+    materializer._run_small_query_auto_check_prepass(
+        database_path,
+        extractor=checker,
+        cache=cache,
+        args=args,
+        expected_tables=1,
+    )
+
+    assert len(checker.calls) == calls_before_resume + int(
+        not cache_has_missing_check
+    )
+    with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM query_auto_checks"
+        ).fetchone()[0] == 4
         assert connection.execute(
             "SELECT COUNT(*) FROM query_auto_check_units WHERE complete = 1"
         ).fetchone()[0] == 1
@@ -3305,6 +3420,66 @@ def test_materialization_checkpoints_between_bounded_source_batches(
         assert connection.execute(
             "SELECT COUNT(*) FROM source_units WHERE complete = 1"
         ).fetchone()[0] == len(sources)
+
+
+def test_query_auto_check_prepass_selects_execution_path_from_review_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def small(*_args: Any, **_kwargs: Any) -> None:
+        calls.append("small")
+
+    def large(*_args: Any, **_kwargs: Any) -> None:
+        calls.append("large")
+
+    monkeypatch.setattr(
+        materializer,
+        "_run_small_query_auto_check_prepass",
+        small,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_run_large_query_auto_check_prepass",
+        large,
+    )
+    common = {
+        "extractor": object(),
+        "cache": object(),
+        "expected_tables": 0,
+    }
+
+    materializer._run_query_auto_check_prepass(
+        tmp_path / "small.sqlite3",
+        args=SimpleNamespace(auto_check_secondary_openai=True),
+        **common,
+    )
+    materializer._run_query_auto_check_prepass(
+        tmp_path / "large.sqlite3",
+        args=SimpleNamespace(auto_check_secondary_openai=False),
+        **common,
+    )
+
+    assert calls == ["small", "large"]
+
+
+def test_materialization_worker_source_fingerprint_rejects_changed_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = materializer._MATERIALIZATION_WORKER_SOURCE_FINGERPRINT
+    materializer._require_materialization_worker_source(expected)
+
+    monkeypatch.setattr(
+        materializer,
+        "_materialization_worker_source_fingerprint",
+        lambda: "changed-source",
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="source changed after pipeline startup",
+    ):
+        materializer._require_materialization_worker_source(expected)
 
 
 def test_parallel_materialization_commits_in_source_order_and_resumes(

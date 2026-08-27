@@ -3707,7 +3707,10 @@ def _run_fast_materialization_resume(
         def report_materialization(event: dict[str, Any]) -> None:
             phase = str(event.get("phase") or "materialize")
             completed = int(event.get("completed", 0))
-            if phase == "query_auto_check":
+            if phase == "query_auto_check_prepare":
+                overall = completed
+                detail = "prepare global auto-check plans"
+            elif phase == "query_auto_check":
                 overall = completed
                 detail = "auto-check selected query evidence"
             elif phase == "materialize_tables":
@@ -5438,6 +5441,9 @@ def _run_materialize(
         if phase == "catalog_sources":
             overall = completed
             detail = "catalog source tables"
+        elif phase == "query_auto_check_prepare":
+            overall = table_total + completed
+            detail = "prepare global auto-check plans"
         elif phase == "query_auto_check":
             overall = table_total + completed
             detail = "auto-check selected query evidence"

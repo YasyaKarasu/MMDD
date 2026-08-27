@@ -150,6 +150,36 @@ _DIAGNOSTIC_FILES = (
 )
 
 
+def _materialization_worker_source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    paths = (
+        Path(__file__).resolve(),
+        Path(join_builder.__file__).resolve(),
+    )
+    for path in paths:
+        digest.update(str(path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+_MATERIALIZATION_WORKER_SOURCE_FINGERPRINT = (
+    _materialization_worker_source_fingerprint()
+)
+
+
+def _require_materialization_worker_source(
+    expected_fingerprint: str,
+) -> None:
+    if _materialization_worker_source_fingerprint() == expected_fingerprint:
+        return
+    raise RuntimeError(
+        "materialization worker source changed after pipeline startup; "
+        "stop editing the WDC builder and rerun with --resume"
+    )
+
+
 @dataclass(frozen=True)
 class MaterializationShardInputs:
     """Already-validated upstream paths needed for one-table materialization."""
@@ -3824,13 +3854,13 @@ def _table_inputs(
     return entities, assets, links, extractions, wiki_to_entity_id
 
 
-def _query_auto_check_records_for_extractions(
+def _query_auto_check_records_for_keys(
     database_path: Path,
-    extraction_cache_keys: Iterable[str],
+    cache_keys: Iterable[str],
 ) -> list[dict[str, Any]]:
     keys = list(
         dict.fromkeys(
-            clean_text(key) for key in extraction_cache_keys if clean_text(key)
+            clean_text(key) for key in cache_keys if clean_text(key)
         )
     )
     records: list[dict[str, Any]] = []
@@ -3842,7 +3872,7 @@ def _query_auto_check_records_for_extractions(
                 f"""
                 SELECT cache_key, record_json
                 FROM query_auto_checks
-                WHERE extraction_cache_key IN ({placeholders})
+                WHERE cache_key IN ({placeholders})
                 ORDER BY cache_key
                 """,
                 tuple(batch),
@@ -3889,17 +3919,35 @@ def _materialize_from_index(
     query_auto_check_required = bool(
         getattr(materialize_args, "_query_auto_check_required", False)
     )
-    query_auto_check_records = (
-        _query_auto_check_records_for_extractions(
-            database_path,
-            (
-                clean_text(record.get("cache_key"))
-                for record in extractions
-            ),
+    query_auto_check_extractor = (
+        _CachedQueryAutoCheckExtractor(
+            str(materialize_args._query_auto_check_review_policy)
         )
         if query_auto_check_required
-        else []
+        else None
     )
+    if query_auto_check_required:
+        query_recovery_plans, _extraction_records = (
+            _query_auto_check_plans_for_table(
+                database_path,
+                source_table,
+                split=split,
+                args=materialize_args,
+            )
+        )
+        query_auto_check_records = _query_auto_check_records_for_keys(
+            database_path,
+            (
+                join_builder.query_recovery_auto_check_key(
+                    candidate,
+                    query_auto_check_extractor,
+                )
+                for plan in query_recovery_plans
+                for candidate in plan.candidates
+            ),
+        )
+    else:
+        query_auto_check_records = []
     (
         query_tables,
         data_lake_tables,
@@ -3911,13 +3959,7 @@ def _materialize_from_index(
         assets=asset_by_id,
         entity_to_assets=entity_to_assets,
         wiki_to_entity_id=wiki_to_entity_id,
-        extractor=(
-            _CachedQueryAutoCheckExtractor(
-                str(materialize_args._query_auto_check_review_policy)
-            )
-            if query_auto_check_required
-            else None
-        ),
+        extractor=query_auto_check_extractor,
         cache=_TableExtractionCache(extractions),
         progress=None,
         concurrency_state=join_builder.ModelConcurrencyState.from_args(
@@ -4016,8 +4058,10 @@ _WORKER_ARGS: argparse.Namespace | None = None
 def _initialize_materialization_worker(
     database_path: Path,
     args: argparse.Namespace,
+    source_fingerprint: str,
 ) -> None:
     global _WORKER_DATABASE_PATH, _WORKER_ARGS
+    _require_materialization_worker_source(source_fingerprint)
     _WORKER_DATABASE_PATH = database_path
     _WORKER_ARGS = args
 
@@ -4692,7 +4736,251 @@ def _persist_query_auto_check_batch(
     return persisted_units, persisted_checks
 
 
-def _run_query_auto_check_prepass(
+def _query_auto_check_source_batch(
+    database_path: Path,
+    *,
+    last_ordinal: int,
+) -> list[dict[str, Any]]:
+    with _connect(database_path) as connection:
+        return [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT source_catalog.source_table_id,
+                       source_catalog.ordinal,
+                       source_catalog.split,
+                       source_catalog.record_sha256,
+                       query_auto_check_units.source_sha256
+                           AS checked_sha256,
+                       query_auto_check_units.complete AS checked
+                FROM source_catalog
+                LEFT JOIN query_auto_check_units
+                  ON query_auto_check_units.source_table_id =
+                     source_catalog.source_table_id
+                WHERE source_catalog.ordinal > ?
+                ORDER BY source_catalog.ordinal
+                LIMIT ?
+                """,
+                (last_ordinal, _MATERIALIZATION_READ_BATCH_RECORDS),
+            )
+        ]
+
+
+def _pending_query_auto_check_items(
+    rows: Iterable[dict[str, Any]],
+) -> list[_MaterializationWorkItem]:
+    pending: list[_MaterializationWorkItem] = []
+    for row in rows:
+        if row["checked"] is not None:
+            if (
+                int(row["checked"]) != 1
+                or str(row["checked_sha256"])
+                != str(row["record_sha256"])
+            ):
+                raise ValueError(
+                    "query auto-check source unit resume mismatch: "
+                    f"{row['source_table_id']}"
+                )
+            continue
+        pending.append(
+            _MaterializationWorkItem(
+                source_table_id=str(row["source_table_id"]),
+                source_ordinal=int(row["ordinal"]),
+                source_sha256=str(row["record_sha256"]),
+                split=clean_text(row["split"]),
+            )
+        )
+    return pending
+
+
+def _prepare_query_auto_check_units(
+    database_path: Path,
+    items: Iterable[_MaterializationWorkItem],
+    *,
+    extractor: Any,
+    cache: Any,
+    args: argparse.Namespace,
+) -> tuple[list[tuple[_MaterializationWorkItem, list[Any]]], list[Any], int]:
+    units: list[tuple[_MaterializationWorkItem, list[Any]]] = []
+    plans: list[Any] = []
+    migrated = 0
+    for item in items:
+        source_table = _load_materialization_source(database_path, item)
+        table_plans, extraction_records = _query_auto_check_plans_for_table(
+            database_path,
+            source_table,
+            split=item.split,
+            args=args,
+        )
+        migrated += _migrate_legacy_query_auto_checks(
+            table_plans,
+            extraction_records,
+            cache,
+            extractor=extractor,
+        )
+        units.append((item, table_plans))
+        plans.extend(table_plans)
+    return units, plans, migrated
+
+
+def _query_auto_check_completed_units(database_path: Path) -> int:
+    with _connect(database_path) as connection:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM query_auto_check_units
+                WHERE complete = 1
+                """
+            ).fetchone()[0]
+        )
+
+
+def _restore_query_auto_checks_from_index(
+    database_path: Path,
+    cache: Any,
+) -> int:
+    restored = 0
+    with _connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT cache_key, record_json
+            FROM query_auto_checks
+            ORDER BY cache_key
+            """
+        )
+        for row in rows:
+            key = str(row["cache_key"])
+            if cache.get(key) is not None:
+                continue
+            record = json.loads(str(row["record_json"]))
+            record["cache_key"] = key
+            items = getattr(cache, "items", None)
+            if isinstance(items, dict):
+                items[key] = record
+            else:
+                cache.put(key, record)
+            restored += 1
+    return restored
+
+
+def _indexed_query_auto_check_links(
+    database_path: Path,
+) -> dict[str, str]:
+    with _connect(database_path) as connection:
+        return {
+            str(row["cache_key"]): str(row["extraction_cache_key"])
+            for row in connection.execute(
+                """
+                SELECT cache_key, extraction_cache_key
+                FROM query_auto_checks
+                """
+            )
+        }
+
+
+def _query_auto_check_unit_needs_index_backfill(
+    plans: Iterable[Any],
+    *,
+    extractor: Any,
+    cache: Any,
+    indexed_links: dict[str, str],
+) -> bool:
+    for plan in plans:
+        for candidate in plan.candidates:
+            key = join_builder.query_recovery_auto_check_key(
+                candidate,
+                extractor,
+            )
+            record = join_builder.query_recovery_cached_check(
+                key,
+                cache,
+                candidate,
+                extractor=extractor,
+            )
+            if record is None:
+                continue
+            if indexed_links.get(key) != candidate.task.cache_key:
+                return True
+    return False
+
+
+def _query_auto_check_plans_are_complete(
+    plans: Iterable[Any],
+    *,
+    extractor: Any,
+    cache: Any,
+) -> bool:
+    for plan in plans:
+        if join_builder.query_recovery_plan_needs_model_check(
+            plan,
+            extractor,
+            cache,
+        ):
+            return False
+        if (
+            join_builder.query_recovery_plan_is_supported(
+                plan,
+                extractor,
+                cache,
+            )
+            and join_builder.query_recovery_plan_needs_model_check(
+                plan,
+                extractor,
+                cache,
+                exhaustive=True,
+            )
+        ):
+            return False
+    return True
+
+
+def _invalidate_query_auto_check_units(
+    database_path: Path,
+    source_table_ids: Iterable[str],
+) -> None:
+    table_ids = list(dict.fromkeys(source_table_ids))
+    if not table_ids:
+        return
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for offset in range(0, len(table_ids), _SQLITE_IN_BATCH_RECORDS):
+            batch = table_ids[offset : offset + _SQLITE_IN_BATCH_RECORDS]
+            placeholders = ",".join("?" for _ in batch)
+            connection.execute(
+                f"""
+                DELETE FROM query_auto_check_units
+                WHERE source_table_id IN ({placeholders})
+                """,
+                tuple(batch),
+            )
+        connection.commit()
+
+
+def _verify_query_auto_check_prepass(
+    database_path: Path,
+    *,
+    observed: int,
+    expected_tables: int,
+    cached_checks: int,
+    migrated_legacy_checks: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    if observed != expected_tables:
+        raise ValueError("query auto-check source iteration count mismatch")
+    durable_completed = _query_auto_check_completed_units(database_path)
+    if durable_completed != expected_tables:
+        raise ValueError("query auto-check table barrier is incomplete")
+    _report_work_progress(
+        progress_callback,
+        phase="query_auto_check",
+        completed=durable_completed,
+        total=expected_tables,
+        cached_checks=cached_checks,
+        migrated_legacy_checks=migrated_legacy_checks,
+    )
+
+
+def _run_large_query_auto_check_prepass(
     database_path: Path,
     *,
     extractor: Any,
@@ -4702,15 +4990,8 @@ def _run_query_auto_check_prepass(
     pre_write_guard: PreWriteGuard | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
-    with _connect(database_path) as connection:
-        completed = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM query_auto_check_units
-                WHERE complete = 1
-                """
-            ).fetchone()[0]
-        )
+    """Stream local-only checks in small durable batches."""
+    completed = _query_auto_check_completed_units(database_path)
     _report_work_progress(
         progress_callback,
         phase="query_auto_check",
@@ -4722,74 +5003,21 @@ def _run_query_auto_check_prepass(
     migrated_total = 0
     cached_total = 0
     while True:
-        with _connect(database_path) as connection:
-            rows = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT source_catalog.source_table_id,
-                           source_catalog.ordinal,
-                           source_catalog.split,
-                           source_catalog.record_sha256,
-                           query_auto_check_units.source_sha256
-                               AS checked_sha256,
-                           query_auto_check_units.complete AS checked
-                    FROM source_catalog
-                    LEFT JOIN query_auto_check_units
-                      ON query_auto_check_units.source_table_id =
-                         source_catalog.source_table_id
-                    WHERE source_catalog.ordinal > ?
-                    ORDER BY source_catalog.ordinal
-                    LIMIT ?
-                    """,
-                    (last_ordinal, _MATERIALIZATION_READ_BATCH_RECORDS),
-                )
-            ]
+        rows = _query_auto_check_source_batch(
+            database_path,
+            last_ordinal=last_ordinal,
+        )
         if not rows:
             break
         observed += len(rows)
-        pending: list[_MaterializationWorkItem] = []
-        for row in rows:
-            if row["checked"] is not None:
-                if (
-                    int(row["checked"]) != 1
-                    or str(row["checked_sha256"])
-                    != str(row["record_sha256"])
-                ):
-                    raise ValueError(
-                        "query auto-check source unit resume mismatch: "
-                        f"{row['source_table_id']}"
-                    )
-                continue
-            pending.append(
-                _MaterializationWorkItem(
-                    source_table_id=str(row["source_table_id"]),
-                    source_ordinal=int(row["ordinal"]),
-                    source_sha256=str(row["record_sha256"]),
-                    split=clean_text(row["split"]),
-                )
-            )
-
-        units: list[tuple[_MaterializationWorkItem, list[Any]]] = []
-        plans: list[Any] = []
-        for item in pending:
-            source_table = _load_materialization_source(database_path, item)
-            table_plans, extraction_records = (
-                _query_auto_check_plans_for_table(
-                    database_path,
-                    source_table,
-                    split=item.split,
-                    args=args,
-                )
-            )
-            migrated_total += _migrate_legacy_query_auto_checks(
-                table_plans,
-                extraction_records,
-                cache,
-                extractor=extractor,
-            )
-            units.append((item, table_plans))
-            plans.extend(table_plans)
+        units, plans, migrated = _prepare_query_auto_check_units(
+            database_path,
+            _pending_query_auto_check_items(rows),
+            extractor=extractor,
+            cache=cache,
+            args=args,
+        )
+        migrated_total += migrated
         join_builder.finalize_query_recovery_auto_checks(
             plans=plans,
             extractor=extractor,
@@ -4817,26 +5045,204 @@ def _run_query_auto_check_prepass(
         )
         last_ordinal = int(rows[-1]["ordinal"])
         _checkpoint_wal(database_path)
-    if observed != expected_tables:
-        raise ValueError("query auto-check source iteration count mismatch")
-    with _connect(database_path) as connection:
-        durable_completed = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM query_auto_check_units
-                WHERE complete = 1
-                """
-            ).fetchone()[0]
-        )
-    if durable_completed != expected_tables:
-        raise ValueError("query auto-check table barrier is incomplete")
+    _verify_query_auto_check_prepass(
+        database_path,
+        observed=observed,
+        expected_tables=expected_tables,
+        cached_checks=cached_total,
+        migrated_legacy_checks=migrated_total,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_small_query_auto_check_prepass(
+    database_path: Path,
+    *,
+    extractor: Any,
+    cache: Any,
+    args: argparse.Namespace,
+    expected_tables: int,
+    pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    """Resolve all remote reviews globally, then checkpoint the results."""
+    restored_checks = _restore_query_auto_checks_from_index(
+        database_path,
+        cache,
+    )
+    completed = _query_auto_check_completed_units(database_path)
     _report_work_progress(
         progress_callback,
         phase="query_auto_check",
-        completed=durable_completed,
+        completed=completed,
         total=expected_tables,
+    )
+    last_ordinal = -1
+    observed = 0
+    migrated_total = 0
+    units: list[tuple[_MaterializationWorkItem, list[Any]]] = []
+    plans: list[Any] = []
+    invalid_completed_units: list[str] = []
+    indexed_links = _indexed_query_auto_check_links(database_path)
+    while True:
+        rows = _query_auto_check_source_batch(
+            database_path,
+            last_ordinal=last_ordinal,
+        )
+        if not rows:
+            break
+        observed += len(rows)
+        _pending_query_auto_check_items(rows)
+        batch_units, _batch_plans, migrated = _prepare_query_auto_check_units(
+            database_path,
+            (
+                _MaterializationWorkItem(
+                    source_table_id=str(row["source_table_id"]),
+                    source_ordinal=int(row["ordinal"]),
+                    source_sha256=str(row["record_sha256"]),
+                    split=clean_text(row["split"]),
+                )
+                for row in rows
+            ),
+            extractor=extractor,
+            cache=cache,
+            args=args,
+        )
+        checked_by_id = {
+            str(row["source_table_id"]): row["checked"] is not None
+            for row in rows
+        }
+        for item, table_plans in batch_units:
+            complete = _query_auto_check_plans_are_complete(
+                table_plans,
+                extractor=extractor,
+                cache=cache,
+            )
+            needs_backfill = _query_auto_check_unit_needs_index_backfill(
+                table_plans,
+                extractor=extractor,
+                cache=cache,
+                indexed_links=indexed_links,
+            )
+            if (
+                checked_by_id[item.source_table_id]
+                and complete
+                and not needs_backfill
+            ):
+                continue
+            units.append((item, table_plans))
+            if not complete:
+                plans.extend(table_plans)
+            if checked_by_id[item.source_table_id] and not complete:
+                invalid_completed_units.append(item.source_table_id)
+        migrated_total += migrated
+        last_ordinal = int(rows[-1]["ordinal"])
+        _report_work_progress(
+            progress_callback,
+            phase="query_auto_check_prepare",
+            completed=observed,
+            total=expected_tables,
+            plans=len(plans),
+            migrated_legacy_checks=migrated_total,
+        )
+
+    _invalidate_query_auto_check_units(
+        database_path,
+        invalid_completed_units,
+    )
+    completed = _query_auto_check_completed_units(database_path)
+    if restored_checks or invalid_completed_units:
+        logging.info(
+            "WDC global auto-check resume validation: restored_checks=%d "
+            "invalid_completed_units=%d",
+            restored_checks,
+            len(invalid_completed_units),
+        )
+
+    join_builder.finalize_query_recovery_auto_checks(
+        plans=plans,
+        extractor=extractor,
+        cache=cache,
+        args=args,
+        concurrency_state=join_builder.ModelConcurrencyState.from_args(args),
+    )
+
+    cached_total = 0
+    for offset in range(0, len(units), _MATERIALIZATION_READ_BATCH_RECORDS):
+        batch = units[offset : offset + _MATERIALIZATION_READ_BATCH_RECORDS]
+        incomplete = [
+            item.source_table_id
+            for item, table_plans in batch
+            if not _query_auto_check_plans_are_complete(
+                table_plans,
+                extractor=extractor,
+                cache=cache,
+            )
+        ]
+        if incomplete:
+            raise RuntimeError(
+                "global query auto-check remained incomplete after review: "
+                + ", ".join(incomplete[:5])
+            )
+        _persisted_units, persisted_checks = _persist_query_auto_check_batch(
+            database_path,
+            batch,
+            cache=cache,
+            extractor=extractor,
+            pre_write_guard=pre_write_guard,
+        )
+        completed = _query_auto_check_completed_units(database_path)
+        cached_total += persisted_checks
+        _report_work_progress(
+            progress_callback,
+            phase="query_auto_check",
+            completed=completed,
+            total=expected_tables,
+            plans=len(plans),
+            cached_checks=cached_total,
+            migrated_legacy_checks=migrated_total,
+        )
+        _checkpoint_wal(database_path)
+
+    _verify_query_auto_check_prepass(
+        database_path,
+        observed=observed,
+        expected_tables=expected_tables,
         cached_checks=cached_total,
         migrated_legacy_checks=migrated_total,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_query_auto_check_prepass(
+    database_path: Path,
+    *,
+    extractor: Any,
+    cache: Any,
+    args: argparse.Namespace,
+    expected_tables: int,
+    pre_write_guard: PreWriteGuard | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    runner = (
+        _run_small_query_auto_check_prepass
+        if bool(getattr(args, "auto_check_secondary_openai", False))
+        else _run_large_query_auto_check_prepass
+    )
+    logging.info(
+        "WDC query auto-check execution path: %s",
+        "global remote-review"
+        if runner is _run_small_query_auto_check_prepass
+        else "streaming local-only",
+    )
+    runner(
+        database_path,
+        extractor=extractor,
+        cache=cache,
+        args=args,
+        expected_tables=expected_tables,
+        pre_write_guard=pre_write_guard,
+        progress_callback=progress_callback,
     )
 
 
@@ -4928,12 +5334,19 @@ def _materialize_all_tables(
                     )
                 )
             if executor is None and worker_count > 1 and work_items:
+                _require_materialization_worker_source(
+                    _MATERIALIZATION_WORKER_SOURCE_FINGERPRINT
+                )
                 executor = stack.enter_context(
                     ProcessPoolExecutor(
                         max_workers=worker_count,
                         mp_context=get_context("spawn"),
                         initializer=_initialize_materialization_worker,
-                        initargs=(database_path, args),
+                        initargs=(
+                            database_path,
+                            args,
+                            _MATERIALIZATION_WORKER_SOURCE_FINGERPRINT,
+                        ),
                     )
                 )
             materialized_tables: Iterable[MaterializedTable]

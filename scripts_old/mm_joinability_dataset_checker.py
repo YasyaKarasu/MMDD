@@ -89,7 +89,7 @@ PAGE_TEMPLATE = """
   {% else %}
   <section class="panel stats">
     <div class="stat"><span class="label">Implicit query 总数</span><span class="value">{{ summary.population }}</span></div>
-    <div class="stat"><span class="label">1% 抽检数</span><span class="value">{{ summary.sampled }}</span></div>
+    <div class="stat"><span class="label">{{ sample_percent }} 抽检数</span><span class="value">{{ summary.sampled }}</span></div>
     <div class="stat"><span class="label">审核进度</span><span class="value">{{ summary.reviewed }}/{{ summary.sampled }}</span></div>
     <div class="stat"><span class="label">合格</span><span class="value">{{ summary.qualified }}</span></div>
     <div class="stat"><span class="label">不合格</span><span class="value">{{ summary.unqualified }}</span></div>
