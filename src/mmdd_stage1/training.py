@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, TypeVar
 
 import torch
@@ -23,6 +23,8 @@ from .objectives import (
 from .scoring import ListScores, TargetScores, score_edge_batch, score_target_batch
 
 Example = TypeVar("Example", EdgeExample, TargetExample)
+Model = TypeVar("Model", TeacherJoinabilityModel, StudentJoinabilityModel)
+EpochCallback = Callable[[int, Model, dict[str, Any]], bool]
 
 
 def sample_balanced_epoch(
@@ -66,6 +68,84 @@ def sample_balanced_epoch(
             needed -= take
     rng.shuffle(sampled)
     return sampled
+
+
+def _sample_balanced_count(
+    examples: Sequence[Example],
+    count: int,
+    rng: random.Random,
+    dataset_sampling_alpha: float,
+) -> list[Example]:
+    if count == 0:
+        return []
+    if not examples:
+        raise ValueError("Cannot sample a non-zero count from an empty training set")
+    groups: dict[str, list[Example]] = defaultdict(list)
+    for example in examples:
+        groups[example.dataset].append(example)
+    datasets = sorted(groups)
+    weights = {
+        dataset: len(groups[dataset]) ** dataset_sampling_alpha
+        for dataset in datasets
+    }
+    total_weight = sum(weights.values())
+    exact = {
+        dataset: count * weights[dataset] / total_weight for dataset in datasets
+    }
+    quotas = {dataset: int(exact[dataset]) for dataset in datasets}
+    remaining = count - sum(quotas.values())
+    by_fraction = sorted(
+        datasets,
+        key=lambda dataset: (exact[dataset] - quotas[dataset], dataset),
+        reverse=True,
+    )
+    for dataset in by_fraction[:remaining]:
+        quotas[dataset] += 1
+
+    sampled = []
+    for dataset in datasets:
+        needed = quotas[dataset]
+        while needed:
+            cycle = list(groups[dataset])
+            rng.shuffle(cycle)
+            take = min(needed, len(cycle))
+            sampled.extend(cycle[:take])
+            needed -= take
+    return sampled
+
+
+def sample_mixed_epoch(
+    base_examples: Sequence[Example],
+    hard_examples: Sequence[Example],
+    rng: random.Random,
+    *,
+    hard_fraction: float,
+    dataset_sampling_alpha: float,
+) -> tuple[list[Example], dict[str, int]]:
+    """Sample an auditable base/hard mixture, keeping one base pass per epoch."""
+
+    if not base_examples:
+        raise ValueError("Base training data cannot be empty")
+    if not 0 <= hard_fraction < 1:
+        raise ValueError("hard_fraction must be in [0, 1)")
+    if not 0 <= dataset_sampling_alpha <= 1:
+        raise ValueError("dataset_sampling_alpha must be between 0 and 1")
+
+    base_count = len(base_examples)
+    hard_count = 0
+    if hard_examples and hard_fraction > 0:
+        hard_count = round(base_count * hard_fraction / (1.0 - hard_fraction))
+        hard_count = max(1, hard_count)
+    sampled = [
+        *_sample_balanced_count(
+            base_examples, base_count, rng, dataset_sampling_alpha
+        ),
+        *_sample_balanced_count(
+            hard_examples, hard_count, rng, dataset_sampling_alpha
+        ),
+    ]
+    rng.shuffle(sampled)
+    return sampled, {"base": base_count, "hard": hard_count}
 
 
 def _batches(examples: Sequence[Example], batch_size: int) -> list[list[Example]]:
@@ -177,11 +257,17 @@ def _path_distillation_losses(
     return direct + evidence, direct, evidence
 
 
-def _epoch_record(epoch: int, loss_values: dict[str, float], sampled: Sequence[Example]) -> dict[str, Any]:
+def _epoch_record(
+    epoch: int,
+    loss_values: dict[str, float],
+    sampled: Sequence[Example],
+    source_samples: dict[str, int],
+) -> dict[str, Any]:
     return {
         "epoch": epoch,
         **loss_values,
         "dataset_samples": dict(sorted(Counter(example.dataset for example in sampled).items())),
+        "source_samples": source_samples,
     }
 
 
@@ -189,6 +275,137 @@ def _optimize(loss: torch.Tensor, optimizer: torch.optim.Optimizer) -> None:
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _finish_epoch(
+    history: list[dict[str, Any]],
+    record: dict[str, Any],
+    model: Model,
+    callback: EpochCallback[Model] | None,
+) -> bool:
+    history.append(record)
+    return bool(callback and callback(int(record["epoch"]), model, record))
+
+
+@torch.no_grad()
+def _teacher_edge_objective(
+    model: TeacherJoinabilityModel,
+    examples: Sequence[EdgeExample],
+    store: FeatureStore,
+    device: torch.device,
+    batch_size: int,
+) -> float:
+    model.eval()
+    losses = []
+    for batch in _batches(examples, batch_size):
+        scores = score_edge_batch(model, batch, store, device)
+        losses.append(
+            float(
+                listwise_cross_entropy(
+                    scores.logits, scores.positive_indices, scores.candidate_mask
+                )
+            )
+        )
+    return _mean(losses)
+
+
+@torch.no_grad()
+def _teacher_path_objective(
+    model: TeacherJoinabilityModel,
+    examples: Sequence[TargetExample],
+    store: FeatureStore,
+    aggregator: PathAggregator,
+    device: torch.device,
+    batch_size: int,
+) -> float:
+    model.eval()
+    losses = []
+    for batch in _batches(examples, batch_size):
+        scores = score_target_batch(model, batch, store, device, aggregator)
+        loss, _direct, _evidence = _path_supervised_losses(scores)
+        losses.append(float(loss))
+    return _mean(losses)
+
+
+@torch.no_grad()
+def _student_edge_objective(
+    student: StudentJoinabilityModel,
+    teacher: TeacherJoinabilityModel,
+    examples: Sequence[EdgeExample],
+    store: FeatureStore,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+) -> float:
+    student.eval()
+    teacher.eval()
+    losses = []
+    for batch in _batches(examples, batch_size):
+        teacher_scores = _cached_edge_teacher_scores(batch, device)
+        if teacher_scores is None:
+            teacher_scores = score_edge_batch(teacher, batch, store, device)
+        student_scores = score_edge_batch(student, batch, store, device)
+        losses.append(
+            float(
+                distillation_kl(
+                    student_scores.logits,
+                    teacher_scores.logits,
+                    student_scores.candidate_mask,
+                    temperature,
+                )
+            )
+        )
+    return _mean(losses)
+
+
+def _validate_cached_path_aggregation(
+    examples: Sequence[TargetExample], aggregator: PathAggregator
+) -> None:
+    for example in examples:
+        config = example.teacher_score_config
+        if config is not None and (
+            config.evidence_aggregation != aggregator.evidence_aggregation
+            or config.evidence_top_k != aggregator.top_k
+        ):
+            raise ValueError(
+                "Cached Teacher logits use a different evidence aggregation configuration"
+            )
+
+
+@torch.no_grad()
+def _student_path_objective(
+    student: StudentJoinabilityModel,
+    teacher: TeacherJoinabilityModel,
+    examples: Sequence[TargetExample],
+    store: FeatureStore,
+    aggregator: PathAggregator,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+    distillation_weight: float,
+) -> float:
+    student.eval()
+    teacher.eval()
+    losses = []
+    for batch in _batches(examples, batch_size):
+        teacher_scores = _cached_target_teacher_scores(batch, device)
+        if teacher_scores is None:
+            teacher_scores = score_target_batch(
+                teacher, batch, store, device, aggregator
+            )
+        student_scores = score_target_batch(
+            student, batch, store, device, aggregator
+        )
+        supervised, _direct, _evidence = _path_supervised_losses(student_scores)
+        distillation, _direct_distill, _evidence_distill = (
+            _path_distillation_losses(student_scores, teacher_scores, temperature)
+        )
+        losses.append(float(supervised + distillation_weight * distillation))
+    return _mean(losses)
 
 
 def train_teacher_edges(
@@ -202,19 +419,37 @@ def train_teacher_edges(
     batch_size: int,
     seed: int,
     dataset_sampling_alpha: float = 0.0,
+    hard_examples: Sequence[EdgeExample] = (),
+    hard_fraction: float = 0.5,
+    dev_examples: Sequence[EdgeExample] = (),
+    epoch_callback: EpochCallback[TeacherJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    model.train()
     for epoch in range(epochs):
+        model.train()
         losses = []
-        sampled = sample_balanced_epoch(examples, rng, dataset_sampling_alpha)
+        sampled, source_samples = sample_mixed_epoch(
+            examples,
+            hard_examples,
+            rng,
+            hard_fraction=hard_fraction,
+            dataset_sampling_alpha=dataset_sampling_alpha,
+        )
         for batch in _batches(sampled, batch_size):
             scores = score_edge_batch(model, batch, store, device)
             loss = listwise_cross_entropy(scores.logits, scores.positive_indices, scores.candidate_mask)
             _optimize(loss, optimizer)
             losses.append(float(loss.detach()))
-        history.append(_epoch_record(epoch + 1, {"loss": sum(losses) / len(losses)}, sampled))
+        train_loss = _mean(losses)
+        values = {"loss": train_loss, "train_loss": train_loss}
+        if dev_examples:
+            values["dev_loss"] = _teacher_edge_objective(
+                model, dev_examples, store, device, batch_size
+            )
+        record = _epoch_record(epoch + 1, values, sampled, source_samples)
+        if _finish_epoch(history, record, model, epoch_callback):
+            break
     return history
 
 
@@ -230,15 +465,25 @@ def train_teacher_paths(
     batch_size: int,
     seed: int,
     dataset_sampling_alpha: float = 0.0,
+    hard_examples: Sequence[TargetExample] = (),
+    hard_fraction: float = 0.5,
+    dev_examples: Sequence[TargetExample] = (),
+    epoch_callback: EpochCallback[TeacherJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    model.train()
     for epoch in range(epochs):
+        model.train()
         losses = []
         direct_losses = []
         evidence_losses = []
-        sampled = sample_balanced_epoch(examples, rng, dataset_sampling_alpha)
+        sampled, source_samples = sample_mixed_epoch(
+            examples,
+            hard_examples,
+            rng,
+            hard_fraction=hard_fraction,
+            dataset_sampling_alpha=dataset_sampling_alpha,
+        )
         for batch in _batches(sampled, batch_size):
             scores = score_target_batch(model, batch, store, device, aggregator)
             loss, direct_loss, evidence_loss = _path_supervised_losses(scores)
@@ -246,17 +491,20 @@ def train_teacher_paths(
             losses.append(float(loss.detach()))
             direct_losses.append(float(direct_loss.detach()))
             evidence_losses.append(float(evidence_loss.detach()))
-        history.append(
-            _epoch_record(
-                epoch + 1,
-                {
-                    "loss": sum(losses) / len(losses),
-                    "direct_loss": sum(direct_losses) / len(direct_losses),
-                    "evidence_loss": sum(evidence_losses) / len(evidence_losses),
-                },
-                sampled,
+        train_loss = _mean(losses)
+        values = {
+            "loss": train_loss,
+            "train_loss": train_loss,
+            "direct_loss": _mean(direct_losses),
+            "evidence_loss": _mean(evidence_losses),
+        }
+        if dev_examples:
+            values["dev_loss"] = _teacher_path_objective(
+                model, dev_examples, store, aggregator, device, batch_size
             )
-        )
+        record = _epoch_record(epoch + 1, values, sampled, source_samples)
+        if _finish_epoch(history, record, model, epoch_callback):
+            break
     return history
 
 
@@ -273,15 +521,25 @@ def train_student_edges(
     seed: int,
     temperature: float,
     dataset_sampling_alpha: float = 0.0,
+    hard_examples: Sequence[EdgeExample] = (),
+    hard_fraction: float = 0.5,
+    dev_examples: Sequence[EdgeExample] = (),
+    epoch_callback: EpochCallback[StudentJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
     teacher.eval()
     teacher.requires_grad_(False)
-    student.train()
     for epoch in range(epochs):
+        student.train()
         losses = []
-        sampled = sample_balanced_epoch(examples, rng, dataset_sampling_alpha)
+        sampled, source_samples = sample_mixed_epoch(
+            examples,
+            hard_examples,
+            rng,
+            hard_fraction=hard_fraction,
+            dataset_sampling_alpha=dataset_sampling_alpha,
+        )
         for batch in _batches(sampled, batch_size):
             teacher_scores = _cached_edge_teacher_scores(batch, device)
             if teacher_scores is None:
@@ -296,7 +554,21 @@ def train_student_edges(
             )
             _optimize(loss, optimizer)
             losses.append(float(loss.detach()))
-        history.append(_epoch_record(epoch + 1, {"loss": sum(losses) / len(losses)}, sampled))
+        train_loss = _mean(losses)
+        values = {"loss": train_loss, "train_loss": train_loss}
+        if dev_examples:
+            values["dev_loss"] = _student_edge_objective(
+                student,
+                teacher,
+                dev_examples,
+                store,
+                device,
+                batch_size,
+                temperature,
+            )
+        record = _epoch_record(epoch + 1, values, sampled, source_samples)
+        if _finish_epoch(history, record, student, epoch_callback):
+            break
     return history
 
 
@@ -315,13 +587,20 @@ def train_student_paths(
     temperature: float,
     distillation_weight: float,
     dataset_sampling_alpha: float = 0.0,
+    hard_examples: Sequence[TargetExample] = (),
+    hard_fraction: float = 0.5,
+    dev_examples: Sequence[TargetExample] = (),
+    epoch_callback: EpochCallback[StudentJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
     teacher.eval()
     teacher.requires_grad_(False)
-    student.train()
+    _validate_cached_path_aggregation(
+        [*examples, *hard_examples, *dev_examples], aggregator
+    )
     for epoch in range(epochs):
+        student.train()
         totals = []
         supervised_losses = []
         distillation_losses = []
@@ -329,20 +608,18 @@ def train_student_paths(
         evidence_supervised_losses = []
         direct_distillation_losses = []
         evidence_distillation_losses = []
-        sampled = sample_balanced_epoch(examples, rng, dataset_sampling_alpha)
+        sampled, source_samples = sample_mixed_epoch(
+            examples,
+            hard_examples,
+            rng,
+            hard_fraction=hard_fraction,
+            dataset_sampling_alpha=dataset_sampling_alpha,
+        )
         for batch in _batches(sampled, batch_size):
             teacher_scores = _cached_target_teacher_scores(batch, device)
             if teacher_scores is None:
                 with torch.no_grad():
                     teacher_scores = score_target_batch(teacher, batch, store, device, aggregator)
-            else:
-                for example in batch:
-                    config = example.teacher_score_config
-                    if config is not None and (
-                        config.evidence_aggregation != aggregator.evidence_aggregation
-                        or config.evidence_top_k != aggregator.top_k
-                    ):
-                        raise ValueError("Cached Teacher logits use a different evidence aggregation configuration")
             student_scores = score_target_batch(student, batch, store, device, aggregator)
             supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
                 student_scores
@@ -359,25 +636,32 @@ def train_student_paths(
             evidence_supervised_losses.append(float(evidence_supervised.detach()))
             direct_distillation_losses.append(float(direct_distillation.detach()))
             evidence_distillation_losses.append(float(evidence_distillation.detach()))
-        history.append(
-            _epoch_record(
-                epoch + 1,
-                {
-                    "loss": sum(totals) / len(totals),
-                    "supervised_loss": sum(supervised_losses) / len(supervised_losses),
-                    "distillation_loss": sum(distillation_losses) / len(distillation_losses),
-                    "direct_supervised_loss": sum(direct_supervised_losses)
-                    / len(direct_supervised_losses),
-                    "evidence_supervised_loss": sum(evidence_supervised_losses)
-                    / len(evidence_supervised_losses),
-                    "direct_distillation_loss": sum(direct_distillation_losses)
-                    / len(direct_distillation_losses),
-                    "evidence_distillation_loss": sum(evidence_distillation_losses)
-                    / len(evidence_distillation_losses),
-                },
-                sampled,
+        train_loss = _mean(totals)
+        values = {
+            "loss": train_loss,
+            "train_loss": train_loss,
+            "supervised_loss": _mean(supervised_losses),
+            "distillation_loss": _mean(distillation_losses),
+            "direct_supervised_loss": _mean(direct_supervised_losses),
+            "evidence_supervised_loss": _mean(evidence_supervised_losses),
+            "direct_distillation_loss": _mean(direct_distillation_losses),
+            "evidence_distillation_loss": _mean(evidence_distillation_losses),
+        }
+        if dev_examples:
+            values["dev_loss"] = _student_path_objective(
+                student,
+                teacher,
+                dev_examples,
+                store,
+                aggregator,
+                device,
+                batch_size,
+                temperature,
+                distillation_weight,
             )
-        )
+        record = _epoch_record(epoch + 1, values, sampled, source_samples)
+        if _finish_epoch(history, record, student, epoch_callback):
+            break
     return history
 
 

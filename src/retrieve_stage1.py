@@ -26,12 +26,16 @@ def run(args: argparse.Namespace) -> None:
     evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
     model.eval()
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
+    corpus_sha256 = (
+        checkpoint_fingerprint(Path(args.corpus)) if args.corpus else None
+    )
     indices = StudentANNIndices(
         model,
         store,
         Path(args.index_dir),
         device=device,
         checkpoint_sha256=checkpoint_fingerprint(checkpoint_path),
+        corpus_sha256=corpus_sha256,
     )
     results = retrieve_zero_one_hop(
         args.query_id,
@@ -50,6 +54,7 @@ def run(args: argparse.Namespace) -> None:
     payload = json.dumps(
         {
             "query_id": args.query_id,
+            "student_checkpoint_sha256": checkpoint_fingerprint(checkpoint_path),
             "path_aggregation": {
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
@@ -82,6 +87,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features", required=True)
     parser.add_argument("--student-checkpoint", required=True)
     parser.add_argument("--index-dir", required=True)
+    parser.add_argument(
+        "--corpus",
+        help="Full shared corpus used to build the index; validates its fingerprint.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=128)
     parser.add_argument("--direct-k", type=int, default=100)

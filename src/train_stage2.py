@@ -12,11 +12,18 @@ from mmdd_stage2.checkpoints import save_candidate_scorer
 from mmdd_stage2.qwen import QwenStage2Backend
 from mmdd_stage2.training import load_column_training_data, train_candidate_scorer
 from mmdd_stage2.verifier import CandidateColumnScorer
+from mmdd_stage1.selection import validate_stage2_gate
 
 
 def run(args: argparse.Namespace) -> None:
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
+    stage1_gate = getattr(args, "stage1_gate", None)
+    if not stage1_gate:
+        raise ValueError("--stage1-gate is required")
+    validate_stage2_gate(
+        Path(stage1_gate), [Path(path) for path in args.retrieval_results]
+    )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -75,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--retrieval-results", nargs="+", required=True)
+    parser.add_argument(
+        "--stage1-gate",
+        required=True,
+        help="Final dev-gated Stage-1 selection manifest.",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-dir", default="hf_models/Qwen3.5-9B")
     parser.add_argument("--device", default="auto")

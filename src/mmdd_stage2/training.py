@@ -43,6 +43,7 @@ def load_column_training_data(
         str(record["query_table_id"]): record
         for record in iter_dataset_artifact(output_dir, "qrels")
         if record.get("reason") == "model_recoverable_join_column"
+        and record.get("split", "train") == "train"
     }
     examples = []
     query_ids: set[str] = set()

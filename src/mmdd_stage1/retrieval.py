@@ -55,6 +55,7 @@ def build_indices(
     *,
     device: torch.device,
     checkpoint_sha256: str,
+    corpus_sha256: str | None = None,
     batch_size: int = 1024,
     m: int = 32,
     ef_construction: int = 200,
@@ -102,6 +103,7 @@ def build_indices(
         "space": "ip",
         "student_dim": model.student_dim,
         "student_checkpoint_sha256": checkpoint_sha256,
+        "corpus_sha256": corpus_sha256,
         "ef_search": ef_search,
         "types": type_records,
     }
@@ -120,6 +122,7 @@ class StudentANNIndices:
         *,
         device: torch.device,
         checkpoint_sha256: str,
+        corpus_sha256: str | None = None,
     ) -> None:
         import hnswlib
 
@@ -131,6 +134,8 @@ class StudentANNIndices:
             raise ValueError(f"{manifest_path}: Student dimension does not match the checkpoint")
         if manifest.get("student_checkpoint_sha256") != checkpoint_sha256:
             raise ValueError(f"{manifest_path}: indexes were built from a different Student checkpoint")
+        if corpus_sha256 is not None and manifest.get("corpus_sha256") != corpus_sha256:
+            raise ValueError(f"{manifest_path}: indexes were built from a different corpus")
         self.model = model
         self.store = store
         self.device = device
@@ -238,10 +243,54 @@ def retrieve_zero_one_hop(
 ) -> list[dict[str, Any]]:
     """Retrieve and rank with all paths, then retain only Stage-2 path detail."""
 
-    if min(direct_k, evidence_k, targets_per_evidence, result_k, path_result_k) < 0:
+    if min(result_k, path_result_k) < 0:
         raise ValueError("Retrieval k values must be non-negative")
     if evidence_path_k is not None and evidence_path_k < 0:
         raise ValueError("evidence_path_k must be non-negative")
+    ranked = retrieve_zero_one_hop_detailed(
+        query_id,
+        indices,
+        direct_k=direct_k,
+        evidence_k=evidence_k,
+        targets_per_evidence=targets_per_evidence,
+        evidence_types=evidence_types,
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
+        rrf_k=rrf_k,
+    )["fused"]
+    results = []
+    retained_evidence = evidence_top_k if evidence_path_k is None else evidence_path_k
+    for result_index, detailed in enumerate(ranked[:result_k]):
+        result = {
+            "target_id": detailed["target_id"],
+            "score": detailed["score"],
+        }
+        if detailed["evidence_score"] is not None:
+            result["evidence_score"] = detailed["evidence_score"]
+        if result_index < path_result_k:
+            result["paths"] = _compact_result_paths(
+                detailed["paths"], evidence_limit=retained_evidence
+            )
+        results.append(result)
+    return results
+
+
+def retrieve_zero_one_hop_detailed(
+    query_id: str,
+    indices: StudentANNIndices,
+    *,
+    direct_k: int = 100,
+    evidence_k: int = 50,
+    targets_per_evidence: int = 50,
+    evidence_types: tuple[str, ...] = ("text", "image"),
+    evidence_aggregation: str = "logsumexp",
+    evidence_top_k: int = 4,
+    rrf_k: int = 60,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return full fused/direct/evidence rankings for evaluation."""
+
+    if min(direct_k, evidence_k, targets_per_evidence) < 0:
+        raise ValueError("Retrieval k values must be non-negative")
     if rrf_k < 0:
         raise ValueError("rrf_k must be non-negative")
     aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
@@ -284,16 +333,22 @@ def retrieve_zero_one_hop(
         result["score"] = sum(
             1.0 / (rrf_k + rank) for rank in (direct_rank, evidence_rank) if rank is not None
         )
-        result.pop("direct_score")
-        if result["evidence_score"] is None:
-            result.pop("evidence_score")
-    results.sort(key=lambda result: (-float(result["score"]), str(result["target_id"])))
-    results = results[:result_k]
-    retained_evidence = evidence_top_k if evidence_path_k is None else evidence_path_k
-    for result_index, result in enumerate(results):
-        paths = result.pop("paths")
-        if result_index < path_result_k:
-            result["paths"] = _compact_result_paths(
-                paths, evidence_limit=retained_evidence
-            )
-    return results
+    fused = sorted(
+        results,
+        key=lambda result: (-float(result["score"]), str(result["target_id"])),
+    )
+    direct = sorted(
+        (result for result in results if result["direct_score"] is not None),
+        key=lambda result: (
+            -float(result["direct_score"]),
+            str(result["target_id"]),
+        ),
+    )
+    evidence = sorted(
+        (result for result in results if result["evidence_score"] is not None),
+        key=lambda result: (
+            -float(result["evidence_score"]),
+            str(result["target_id"]),
+        ),
+    )
+    return {"fused": fused, "direct": direct, "evidence": evidence}

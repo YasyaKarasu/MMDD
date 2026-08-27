@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.selection import validate_stage2_gate
 from mmdd_stage2.checkpoints import load_candidate_scorer
 from mmdd_stage2.data import (
     direct_target_ids,
@@ -29,6 +30,9 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError(
             "--top-k-evidence and --max-direct-targets must be non-negative"
         )
+    validate_stage2_gate(
+        Path(args.stage1_gate), [Path(args.retrieval_results)]
+    )
     records = list(iter_retrieval_results(Path(args.retrieval_results)))
     if args.query_id:
         records = [record for record in records if str(record["query_id"]) == args.query_id]
@@ -97,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--retrieval-results", required=True)
+    parser.add_argument(
+        "--stage1-gate",
+        required=True,
+        help="Final dev-gated Stage-1 selection manifest.",
+    )
     parser.add_argument("--scorer-checkpoint", required=True)
     parser.add_argument(
         "--stage1-features",

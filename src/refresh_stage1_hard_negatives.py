@@ -18,6 +18,7 @@ from mmdd_stage1.mining import (
     score_hard_candidate_sets,
 )
 from mmdd_stage1.objectives import PathAggregator
+from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import StudentANNIndices, checkpoint_fingerprint
 
 
@@ -41,8 +42,9 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Teacher batch size must be positive")
     if min(args.hard_evidence_per_type, args.hard_paths_per_query) < 0:
         raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
+    validate_protocol_split("mining", args.split)
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
-    split = None if args.split == "all" else args.split
+    split = args.split
     target_paths = [Path(value) for value in args.target_lists]
     examples = [
         example
@@ -66,12 +68,14 @@ def run(args: argparse.Namespace) -> None:
     if student.input_dim != embedding_dim:
         raise ValueError("Student input dimension does not match the feature cache")
     student_sha256 = checkpoint_fingerprint(student_path)
+    corpus_sha256 = checkpoint_fingerprint(Path(args.corpus))
     indices = StudentANNIndices(
         student,
         store,
         Path(args.index_dir),
         device=device,
         checkpoint_sha256=student_sha256,
+        corpus_sha256=corpus_sha256,
     )
     evidence_types = tuple(dict.fromkeys(args.evidence_types))
     candidate_sets = retrieve_hard_candidate_sets(
@@ -114,6 +118,10 @@ def run(args: argparse.Namespace) -> None:
     metadata = {
         "mining_round": args.mining_round,
         "student_checkpoint_sha256": student_sha256,
+        "corpus_sha256": corpus_sha256,
+        "index_manifest_sha256": checkpoint_fingerprint(
+            Path(args.index_dir) / "manifest.json"
+        ),
         "evidence_aggregation": evidence_aggregation,
         "evidence_top_k": evidence_top_k,
         "teacher_target_channels": ["direct", "evidence"],
@@ -132,6 +140,7 @@ def run(args: argparse.Namespace) -> None:
     }
     if teacher_sha256 is not None:
         metadata["teacher_checkpoint_sha256"] = teacher_sha256
+        metadata["teacher_scoring"] = "complete"
     else:
         metadata["teacher_scoring"] = "pending"
     output_paths = [Path(args.output_target_lists)]
@@ -159,10 +168,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-checkpoint")
     parser.add_argument("--student-checkpoint", required=True)
     parser.add_argument("--index-dir", required=True)
+    parser.add_argument("--corpus", required=True, help="Full shared corpus used for the ANN index.")
     parser.add_argument("--target-lists", required=True, nargs="+")
     parser.add_argument("--output-target-lists", required=True)
     parser.add_argument("--output-edge-lists")
-    parser.add_argument("--split", default="train")
+    parser.add_argument("--split", default="train", choices=["train"])
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=128)
     parser.add_argument("--teacher-batch-size", type=int, default=4)

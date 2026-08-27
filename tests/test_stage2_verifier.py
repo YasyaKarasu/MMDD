@@ -1030,6 +1030,7 @@ def _train_stage2_args(tmp_path: Path, **overrides) -> argparse.Namespace:
     values = {
         "dataset_root": "dataset",
         "retrieval_results": ["retrieval.jsonl"],
+        "stage1_gate": str(tmp_path / "stage1.selection.json"),
         "output": str(tmp_path / "stage2.pt"),
         "model_dir": "qwen",
         "device": "cpu",
@@ -1055,6 +1056,17 @@ def test_train_stage2_rejects_invalid_epochs_before_other_work(tmp_path, monkeyp
 
     with pytest.raises(ValueError, match="--epochs"):
         stage2_train.run(_train_stage2_args(tmp_path, epochs=0))
+
+
+def test_train_stage2_requires_stage1_gate_before_loading_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        stage2_train,
+        "load_column_training_data",
+        lambda *_args, **_kwargs: pytest.fail("data loaded before Stage-1 gate"),
+    )
+
+    with pytest.raises(ValueError, match="--stage1-gate is required"):
+        stage2_train.run(_train_stage2_args(tmp_path, stage1_gate=None))
 
 
 @pytest.mark.parametrize(
@@ -1116,6 +1128,7 @@ def test_train_stage2_loads_data_before_seeded_model_initialization(tmp_path, mo
     monkeypatch.setattr(stage2_train.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(stage2_train.torch.cuda, "manual_seed_all", cuda_seeds.append)
     monkeypatch.setattr(stage2_train, "load_column_training_data", load_data)
+    monkeypatch.setattr(stage2_train, "validate_stage2_gate", lambda *_args: None)
     monkeypatch.setattr(stage2_train, "QwenStage2Backend", Backend)
     monkeypatch.setattr(stage2_train, "CandidateColumnScorer", build_scorer)
     monkeypatch.setattr(stage2_train, "train_candidate_scorer", train)

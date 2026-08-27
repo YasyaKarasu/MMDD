@@ -19,7 +19,8 @@ def run(args: argparse.Namespace) -> None:
     checkpoint_path = Path(args.student_checkpoint)
     model = load_student(checkpoint_path, device)
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
-    ids_by_type = load_corpus_ids(Path(args.corpus), store)
+    corpus_path = Path(args.corpus)
+    ids_by_type = load_corpus_ids(corpus_path, store)
     manifest = build_indices(
         model,
         store,
@@ -27,6 +28,7 @@ def run(args: argparse.Namespace) -> None:
         Path(args.output_dir),
         device=device,
         checkpoint_sha256=checkpoint_fingerprint(checkpoint_path),
+        corpus_sha256=checkpoint_fingerprint(corpus_path),
         batch_size=args.batch_size,
         m=args.hnsw_m,
         ef_construction=args.ef_construction,

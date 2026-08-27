@@ -72,10 +72,14 @@ conda run -n MMDD python src/cache_stage1_features.py \
   --input-jsonl stage1_objects.jsonl \
   --output-dir cache/stage1_qwen8b \
   --model-dir hf_models/Qwen3-VL-Embedding-8B \
-  --teacher-data edge_lists.jsonl target_lists.jsonl
+  --teacher-data edge_lists.jsonl target_lists.jsonl \
+  --teacher-split all
 ```
 
-Omit `--teacher-data` for a base-only retrieval/Stage-2 cache. Re-running the
+The dev listwise objectives require Teacher features for the dev records, so
+the training cache uses `--teacher-split all`; test records are cached but are
+never loaded by training or checkpoint selection. Omit `--teacher-data` for a
+base-only retrieval/Stage-2 cache. Re-running the
 same command with additional hard-negative files writes only missing Teacher
 objects; already cached base objects are not encoded again. `--teacher-split`
 defaults to `train` and accepts `all` when all record splits are needed.
@@ -86,7 +90,8 @@ Convert an existing all-hidden-state cache without running Qwen again:
 conda run -n MMDD python src/compact_stage1_feature_cache.py \
   --input-dir cache/stage1_qwen8b_legacy \
   --output-dir cache/stage1_qwen8b \
-  --teacher-data edge_lists.jsonl target_lists.jsonl
+  --teacher-data edge_lists.jsonl target_lists.jsonl \
+  --teacher-split all
 ```
 
 The conversion is resumable and can also prune an existing two-tier cache into
@@ -120,25 +125,52 @@ Run the four training stages explicitly:
 
 ```bash
 conda run -n MMDD python src/train_stage1.py teacher-edge \
-  --features cache/stage1_qwen8b --train-data edge_lists.jsonl \
+  --features cache/stage1_qwen8b \
+  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
   --output checkpoints/teacher_edge.pt
 
 conda run -n MMDD python src/train_stage1.py teacher-path \
-  --features cache/stage1_qwen8b --train-data target_lists.jsonl \
+  --features cache/stage1_qwen8b \
+  --base-data target_lists.jsonl --dev-data target_lists.jsonl \
   --teacher-checkpoint checkpoints/teacher_edge.pt \
   --output checkpoints/teacher_path.pt
 
 conda run -n MMDD python src/train_stage1.py student-edge \
-  --features cache/stage1_qwen8b --train-data edge_lists.jsonl \
+  --features cache/stage1_qwen8b \
+  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --output checkpoints/student_edge.pt
 
 conda run -n MMDD python src/train_stage1.py student-path \
-  --features cache/stage1_qwen8b --train-data target_lists.jsonl \
+  --features cache/stage1_qwen8b \
+  --base-data target_lists.jsonl --dev-data target_lists.jsonl \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --student-checkpoint checkpoints/student_edge.pt \
+  --corpus stage1_corpus.jsonl \
+  --primary-metric recall@10 --min-delta 0.001 --patience 3 \
   --output checkpoints/student_path.pt
 ```
+
+Training records are filtered to `train`; the fixed gate records are filtered
+to `dev`. Teacher edge/path and Student edge stages select on their matching dev
+listwise objective and never build an ANN index. Every Student path epoch saves
+a candidate checkpoint, rebuilds indexes over the same complete shared corpus,
+and evaluates the fixed dev queries. Its retrieval record contains Recall@1/5/
+10/50/100 and MRR@100 for fused, direct, and evidence rankings, plus the number
+and fraction of dev queries whose global top 10 contains a labeled positive
+evidence path. `--primary-metric` also accepts nested names such as
+`direct.recall@10` or `evidence.mrr@100`.
+
+For an output such as `student_path.pt`, training writes:
+
+- `student_path.pt`: best checkpoint selected by the dev gate;
+- `student_path.last.pt`: final attempted checkpoint, never overwriting best;
+- `student_path.epochs/epoch_NNN.pt`: per-epoch candidates;
+- `student_path.dev_indices/epoch_NNN/`: per-epoch full-corpus indexes;
+- `student_path.pt.history.json`: epoch objectives, retrieval metrics, sampling
+  counts, best epoch, and stop reason;
+- `student_path.pt.selection.json`: best checkpoint/index fingerprints and the
+  Stage-2 evidence-coverage decision.
 
 The Teacher uses one shared Relation Transformer with modality, direction,
 and ordered type-pair identities. The Student learns one projection per type
@@ -163,7 +195,7 @@ ranks and `direct_score` are intermediate values and are not written to the
 retrieval results. Student relation queries and projected target vectors
 preserve the bilinear score exactly as an inner product for ANN indexing.
 
-`--train-data` accepts multiple files. Every record should carry `dataset`;
+`--base-data` and `--dev-data` accept multiple files. Every record should carry `dataset`;
 when it does not, the input filename stem is used. Sampling assigns dataset
 mass proportional to `n_d ** alpha`. The default `--dataset-sampling-alpha 0`
 gives 2K and 20K equal epoch mass, while `1` preserves their natural sample
@@ -173,7 +205,8 @@ record includes `dataset_samples` so the realized balance is auditable:
 ```bash
 conda run -n MMDD python src/train_stage1.py teacher-edge \
   --features cache/stage1_qwen8b \
-  --train-data edge_lists_2k.jsonl edge_lists_20k.jsonl \
+  --base-data edge_lists_2k.jsonl edge_lists_20k.jsonl \
+  --dev-data edge_lists_2k.jsonl edge_lists_20k.jsonl \
   --dataset-sampling-alpha 0 \
   --output checkpoints/teacher_edge.pt
 ```
@@ -191,7 +224,8 @@ conda run -n MMDD python src/build_stage1_index.py \
 conda run -n MMDD python src/retrieve_stage1.py \
   --query-id q1 --features cache/stage1_qwen8b \
   --student-checkpoint checkpoints/student_path.pt \
-  --index-dir indices/stage1 --output retrieval_q1.json
+  --index-dir indices/stage1 --corpus stage1_corpus.jsonl \
+  --output retrieval_q1.json
 ```
 
 Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
@@ -218,6 +252,7 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --student-checkpoint checkpoints/student_path_round0.pt \
   --index-dir indices/stage1_round0 \
+  --corpus stage1_corpus.jsonl \
   --target-lists target_lists_2k.jsonl target_lists_20k.jsonl \
   --output-target-lists hard_targets_round1.jsonl \
   --output-edge-lists hard_edges_round1.jsonl \
@@ -235,7 +270,8 @@ newly referenced Teacher objects, then rerun the same refresh command without
 conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
   --mine-only --features cache/stage1_qwen8b \
   --student-checkpoint checkpoints/student_path_round0.pt \
-  --index-dir indices/stage1_round0 --target-lists target_lists.jsonl \
+  --index-dir indices/stage1_round0 --corpus stage1_corpus.jsonl \
+  --target-lists target_lists.jsonl \
   --output-target-lists hard_targets_round1.jsonl \
   --output-edge-lists hard_edges_round1.jsonl
 
@@ -273,21 +309,54 @@ configuration before reuse:
 ```bash
 conda run -n MMDD python src/train_stage1.py student-edge \
   --features cache/stage1_qwen8b \
-  --train-data edge_lists.jsonl hard_edges_round1.jsonl \
+  --base-data edge_lists.jsonl --hard-data hard_edges_round1.jsonl \
+  --dev-data edge_lists.jsonl --hard-fraction 0.5 \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --student-checkpoint checkpoints/student_path_round0.pt \
+  --hard-source-checkpoint checkpoints/student_path_round0.pt \
+  --hard-learning-rate 2e-5 \
   --output checkpoints/student_edge_round1.pt
 
 conda run -n MMDD python src/train_stage1.py student-path \
-  --features cache/stage1_qwen8b --train-data hard_targets_round1.jsonl \
+  --features cache/stage1_qwen8b \
+  --base-data target_lists.jsonl --hard-data hard_targets_round1.jsonl \
+  --dev-data target_lists.jsonl --hard-fraction 0.5 \
   --teacher-checkpoint checkpoints/teacher_path.pt \
   --student-checkpoint checkpoints/student_edge_round1.pt \
+  --hard-source-checkpoint checkpoints/student_path_round0.pt \
+  --corpus stage1_corpus.jsonl --hard-learning-rate 2e-5 \
   --output checkpoints/student_path_round1.pt
 ```
 
-Rebuild the indexes from `student_path_round1.pt` before the next refresh.
-This keeps the Teacher frozen and changes only the candidate distribution, as
-specified by the training scheme.
+The hard fraction is sampled explicitly and deterministically every epoch; a
+value of `0.5` gives one sampled hard record per sampled base record. Base and
+hard counts are separate in history. Hard inputs must have one round number and
+matching source-Student, frozen-Teacher, and path-aggregation fingerprints.
+
+Use the multi-round driver to rebuild, mine, supplement the two-tier Teacher
+cache when needed, rescore, mixed-train, and dev-gate until the round patience
+or maximum is reached:
+
+```bash
+conda run -n MMDD python src/run_stage1_rounds.py \
+  --features cache/stage1_qwen8b --objects stage1_objects.jsonl \
+  --corpus stage1_corpus.jsonl \
+  --teacher-checkpoint checkpoints/teacher_path.pt \
+  --initial-selection checkpoints/student_path.pt.selection.json \
+  --base-edge-data edge_lists.jsonl --base-path-data target_lists.jsonl \
+  --dev-edge-data edge_lists.jsonl --dev-path-data target_lists.jsonl \
+  --test-data target_lists.jsonl --output-dir runs/stage1_mining \
+  --max-mining-rounds 3 --round-patience 2 \
+  --hard-fraction 0.5 --hard-learning-rate 2e-5
+```
+
+Each `round_NN/` owns its mining index, pending and Teacher-scored hard files,
+metadata, Student edge/path checkpoints, per-epoch dev indexes, and metrics.
+Step markers bind all reusable outputs to their input fingerprints; mismatches
+raise instead of silently reusing an old index or logits. `final_selection.json`
+records the selected round, epoch, checkpoint, complete dev metrics, round stop
+reason, and the single final test evaluation. Test labels are loaded only after
+round selection has finished.
 
 ## Stage-2 verification
 
@@ -320,6 +389,7 @@ path are skipped:
 conda run -n MMDD python src/train_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_train.jsonl \
+  --stage1-gate runs/stage1_mining/final_selection.json \
   --model-dir hf_models/Qwen3.5-9B \
   --output checkpoints/stage2_candidate.pt
 ```
@@ -358,6 +428,7 @@ final verification summary; it does not duplicate the full input table.
 conda run -n MMDD python src/run_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_q1.json \
+  --stage1-gate runs/stage1_mining/final_selection.json \
   --stage1-features cache/stage1_qwen8b \
   --scorer-checkpoint checkpoints/stage2_candidate.pt \
   --model-dir hf_models/Qwen3.5-9B \
