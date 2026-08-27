@@ -388,6 +388,13 @@ The two source families share one joinability algorithm in
 EntiTables builder and the WDC backend both call this same function. WDC adds
 only a source adapter and a disk-backed execution backend.
 
+Train/dev/test partitions apply only to query tables. Queries derived from the
+same source table remain together, while every split retrieves against the same
+complete `data_lake_tables` artifact. Data-lake table records therefore have no
+`split` field; query-scoped qrels and evidence recoveries inherit the query
+split. Stage-1 negative construction follows the same contract and samples
+targets and evidence from the complete shared corpus for every query split.
+
 ## WDC stages
 
 The scalable WDC entry point is `build_wdc_dataset.py`. Its work directory has
@@ -540,7 +547,7 @@ checked before each request, and every redirect target is checked again.
 
 ## Final WDC output
 
-The final directory uses `mmdd_joinability_sharded_v2`. It is self-contained:
+The final directory uses `mmdd_joinability_sharded_v3`. It is self-contained:
 all manifest paths are relative, image bytes are copied under `images/`, and no
 record or manifest refers to `work_*`. The main artifacts retain the existing
 names: `source_tables`, `entities`, `bridge_assets`, `table_asset_links`,
@@ -553,8 +560,9 @@ Compatibility changes from the old WDC builder are intentional:
   chains, or absolute upstream paths;
 - every potentially large artifact, including `qrels` and decisions, is a
   sharded directory rather than a large single JSONL file;
-- `splits.json` is a small summary, while detailed assignments live in the
-  sharded `split_assignments` artifact.
+- `splits.json` is a small query-split summary, while detailed query assignments
+  live in the sharded `split_assignments` artifact; `data_lake_tables` is the
+  single shared corpus and is never assigned to train/dev/test.
 
 Only files listed in `dataset_manifest.json` are authoritative. The helper
 `mmdd_dataset.wdc_runtime.iter_dataset_artifact()` resolves them relative to

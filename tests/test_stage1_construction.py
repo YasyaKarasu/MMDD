@@ -333,6 +333,35 @@ def test_stage1_constructor_keeps_direct_training_without_recovery(tmp_path):
     assert direct_edge["positive_id"] == "direct"
 
 
+def test_stage1_constructor_uses_one_shared_data_lake_for_dev_queries(tmp_path):
+    query = _table("q", ["Entity"], [["A"]])
+    query["split"] = "dev"
+    positive = _table("positive", ["Value"], [["1"]])
+    negative = _table("negative", ["Value"], [["2"]])
+    positive.pop("split")
+    negative.pop("split")
+    _write_jsonl(tmp_path / "query_tables.jsonl", [query])
+    _write_jsonl(tmp_path / "data_lake_tables.jsonl", [positive, negative])
+    _write_jsonl(
+        tmp_path / "bridge_assets.jsonl",
+        [{"asset_id": "unused", "asset_type": "text", "content": "unrelated"}],
+    )
+    _write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [{"query_table_id": "q", "target_table_id": "positive", "split": "dev"}],
+    )
+
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="synthetic")
+
+    assert len(artifacts["target_lists"]) == 1
+    target_list = artifacts["target_lists"][0]
+    assert target_list["split"] == "dev"
+    assert {candidate["target_id"] for candidate in target_list["candidates"]} == {
+        "positive",
+        "negative",
+    }
+
+
 def test_stage1_constructor_resolves_raw_data_lake_source_references(tmp_path):
     query = _table("q", ["Entity"], [["A"]])
     positive = _table("positive", ["Value"], [["1"]])

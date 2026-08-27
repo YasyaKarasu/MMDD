@@ -407,6 +407,7 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = json.loads(manifest_text)
     assert manifest["complete"] is True
+    assert manifest["format"] == "mmdd_joinability_sharded_v3"
     assert str(config.work_dir) not in manifest_text
     assert all(
         not Path(shard["path"]).is_absolute()
@@ -417,6 +418,14 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     renamed_work = tmp_path / "renamed-work"
     config.work_dir.rename(renamed_work)
     source_tables = list(iter_dataset_artifact(config.output_dir, "source_tables"))
+    query_tables = list(iter_dataset_artifact(config.output_dir, "query_tables"))
+    data_lake_tables = list(
+        iter_dataset_artifact(config.output_dir, "data_lake_tables")
+    )
+    split_assignments = list(
+        iter_dataset_artifact(config.output_dir, "split_assignments")
+    )
+    splits = json.loads((config.output_dir / "splits.json").read_text(encoding="utf-8"))
     decisions = list(
         iter_dataset_artifact(config.output_dir, "table_queryability_decisions")
     )
@@ -426,7 +435,15 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
         if asset["asset_type"] == "image"
     ]
     assert len(source_tables) == len(decisions) == 2
-    assert len(list(iter_dataset_artifact(config.output_dir, "query_tables"))) == 2
+    assert len(query_tables) == 2
+    assert all("split" not in target for target in data_lake_tables)
+    assert len(split_assignments) == len(query_tables)
+    assert {record["object_type"] for record in split_assignments} == {"query_table"}
+    assert splits["split_policy"] == "query_only"
+    assert splits["data_lake_scope"] == "shared"
+    assert sum(splits["query_table_counts"].values()) == len(query_tables)
+    assert splits["data_lake_table_count"] == len(data_lake_tables)
+    assert splits["data_lake_artifact"] == "data_lake_tables"
     assert image_assets
     assert all(not Path(asset["local_path"]).is_absolute() for asset in image_assets)
     assert all((config.output_dir / asset["local_path"]).is_file() for asset in image_assets)

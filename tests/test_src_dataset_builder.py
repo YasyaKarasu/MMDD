@@ -115,11 +115,14 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     assert len(result["data_lake_tables"]) == 1
     assert len(result["qrels"]) == 1
     query, target = result["query_tables"][0], result["data_lake_tables"][0]
+    assert query["split"] == "train"
+    assert "split" not in target
     assert not {"page_title", "caption", "section_title"} & query.keys()
     assert not {"page_title", "caption", "section_title"} & target.keys()
     assert "Founded" not in [column["column_name"] for column in query["columns"]]
     assert target["columns"][0]["column_name"] == "Founded"
     assert len(result["evidence_recoveries"]) == 3
+    assert {record["split"] for record in result["evidence_recoveries"]} == {"train"}
     assert result["qrels"][0]["target_table_id"] == target["table_id"]
     assert "data_lake_table_id" not in result["qrels"][0]
     assert "object_id" not in query
@@ -153,7 +156,18 @@ def test_table_workload_projects_reproducible_query_views(tmp_path: Path) -> Non
         ]
     ) == 0
     manifest = json.loads((output_dir / "dataset_manifest.json").read_text())
+    splits = json.loads((output_dir / "splits.json").read_text())
+    assert manifest["format"] == "mmdd_table_workload_research_v2"
     assert manifest["artifacts"]["query_views"]["records"] == 4
+    assert splits["split_policy"] == "query_only"
+    assert splits["data_lake_scope"] == "shared"
+    assert splits["data_lake_source_table_ids"] == [
+        prepared.source_tables[0]["source_table_id"]
+    ]
+    assert all(
+        set(splits[split]) == {"query_view_ids"}
+        for split in ("train", "dev", "test")
+    )
 
 
 def test_extraction_masks_the_requested_attribute(tmp_path: Path) -> None:
@@ -499,9 +513,23 @@ def test_offline_cli_pipeline_is_self_contained(tmp_path: Path) -> None:
     )
 
     manifest = json.loads((output_dir / "dataset_manifest.json").read_text())
+    splits = json.loads((output_dir / "splits.json").read_text())
+    targets = list(
+        json.loads(line)
+        for line in (output_dir / "data_lake_tables.jsonl").read_text().splitlines()
+    )
     assert exit_code == 0
+    assert manifest["format"] == "mmdd_joinability_research_v2"
     assert manifest["artifacts"]["query_tables"]["records"] == 1
     assert manifest["artifacts"]["qrels"]["records"] == 1
+    assert all("split" not in target for target in targets)
+    assert splits["split_policy"] == "query_only"
+    assert splits["data_lake_scope"] == "shared"
+    assert splits["data_lake_table_ids"] == [target["table_id"] for target in targets]
+    assert sum(
+        len(splits[split]["query_table_ids"])
+        for split in ("train", "dev", "test")
+    ) == 1
 
 
 def test_image_attribute_builder_copies_selected_images(tmp_path: Path) -> None:

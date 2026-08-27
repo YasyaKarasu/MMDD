@@ -157,8 +157,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     for query in artifacts["query_tables"]:
         splits[query["split"]]["query_table_ids"].append(query["table_id"])
-    for target in artifacts["data_lake_tables"]:
-        splits[target["split"]]["data_lake_table_ids"].append(target["table_id"])
+    splits["data_lake_table_ids"] = sorted(
+        target["table_id"] for target in artifacts["data_lake_tables"]
+    )
 
     counts = {
         artifact: write_jsonl(output_dir / f"{artifact}.jsonl", artifacts[artifact])
@@ -176,7 +177,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     write_json(
         output_dir / "dataset_manifest.json",
         {
-            "format": "mmdd_joinability_research_v1",
+            "format": "mmdd_joinability_research_v2",
             "artifacts": {
                 artifact: {"path": f"{artifact}.jsonl", "records": counts[artifact]}
                 for artifact in ARTIFACTS

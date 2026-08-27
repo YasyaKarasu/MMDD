@@ -1239,27 +1239,11 @@ def _materialize_one_shard(
             ):
                 for record in built[artifact]:
                     writers[artifact].write(record)
-            writers["split_assignments"].write(
-                {
-                    "object_id": source_table_id,
-                    "object_type": "source_table",
-                    "split": split,
-                }
-            )
             for query in built["query_tables"]:
                 writers["split_assignments"].write(
                     {
                         "object_id": query["table_id"],
                         "object_type": "query_table",
-                        "source_table_id": source_table_id,
-                        "split": split,
-                    }
-                )
-            for target in built["data_lake_tables"]:
-                writers["split_assignments"].write(
-                    {
-                        "object_id": target["table_id"],
-                        "object_type": "data_lake_table",
                         "source_table_id": source_table_id,
                         "split": split,
                     }
@@ -1296,7 +1280,7 @@ def _final_manifest(
             "shards": shards,
         }
     return {
-        "format": "mmdd_joinability_sharded_v2",
+        "format": "mmdd_joinability_sharded_v3",
         "source": "wdc_schemaorg_tables",
         "input_fingerprint": input_fingerprint,
         "build": {
@@ -1307,6 +1291,8 @@ def _final_manifest(
             "extraction": extraction_identity,
             "split": {
                 "split_by": "source_table_id",
+                "split_policy": "query_only",
+                "data_lake_scope": "shared",
                 "train_ratio": config.train_ratio,
                 "dev_ratio": config.dev_ratio,
                 "test_ratio": config.test_ratio,
@@ -1357,6 +1343,7 @@ def run_materialize(
             "test_ratio",
         ),
     )
+    parameters["split_policy"] = "query_only_shared_data_lake_v1"
     input_fingerprint = _stage_input_fingerprint(config, *required)
     root.mkdir(parents=True, exist_ok=True)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1410,15 +1397,18 @@ def run_materialize(
     split_counts = {"train": 0, "dev": 0, "test": 0}
     for record in _artifact_records(manifest, "split_assignments"):
         for assignment in iter_jsonl(config.output_dir / record["path"]):
-            if assignment["object_type"] == "source_table":
-                split_counts[str(assignment["split"])] += 1
+            split_counts[str(assignment["split"])] += 1
     atomic_write_json(config.output_dir / "stats.json", stats)
     atomic_write_json(
         config.output_dir / "splits.json",
         {
             "split_key": "source_table_id",
-            "source_table_counts": split_counts,
+            "split_policy": "query_only",
+            "data_lake_scope": "shared",
+            "query_table_counts": split_counts,
+            "data_lake_table_count": stats["data_lake_tables"],
             "assignments_artifact": "split_assignments",
+            "data_lake_artifact": "data_lake_tables",
         },
     )
     dataset_manifest = _final_manifest(config, manifest, input_fingerprint)

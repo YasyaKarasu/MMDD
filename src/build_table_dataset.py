@@ -52,7 +52,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             if split_of[view["source_table_id"]] == split
         ]
         splits[split].pop("query_table_ids")
-        splits[split].pop("data_lake_table_ids")
+    splits["data_lake_source_table_ids"] = sorted(
+        table["source_table_id"] for table in prepared.source_tables
+    )
 
     failures: list[dict[str, str]] = []
     assets: list[dict[str, Any]] = []
@@ -92,7 +94,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     write_json(
         output_dir / "dataset_manifest.json",
         {
-            "format": "mmdd_table_workload_research_v1",
+            "format": "mmdd_table_workload_research_v2",
             "artifacts": {
                 name: {"path": f"{name}.jsonl", "records": count}
                 for name, count in counts.items()

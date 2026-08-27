@@ -101,10 +101,10 @@ def source_splits(
     for split, selected_source_ids in split_keys.items():
         selected_source_ids.sort()
         splits[split] = {
-            "source_table_ids": selected_source_ids,
             "query_table_ids": [],
-            "data_lake_table_ids": [],
         }
         split_of.update({source_id: split for source_id in selected_source_ids})
     splits["split_key"] = "source_table_id"
+    splits["split_policy"] = "query_only"
+    splits["data_lake_scope"] = "shared"
     return splits, split_of

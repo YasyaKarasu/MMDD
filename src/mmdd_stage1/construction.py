@@ -147,14 +147,13 @@ def _pick_random(ids: list[str], excluded: set[str], rng: random.Random) -> str 
 
 def _structure_negative(
     query: dict[str, Any],
-    split: str,
     excluded: set[str],
-    structure_buckets: dict[tuple[str, int, int], list[str]],
+    structure_buckets: dict[tuple[int, int], list[str]],
 ) -> str | None:
     query_shape = (len(query["columns"]), len(query["rows"]))
     keys = sorted(
-        (key for key in structure_buckets if key[0] == split),
-        key=lambda key: (abs(key[1] - query_shape[0]), abs(key[2] - query_shape[1]), key),
+        structure_buckets,
+        key=lambda key: (abs(key[0] - query_shape[0]), abs(key[1] - query_shape[1]), key),
     )
     for key in keys:
         candidate = next((value for value in structure_buckets[key] if value not in excluded), None)
@@ -306,22 +305,18 @@ def build_stage1_training_artifacts(
     evidence_by_target = _evidence_by_target(targets, assets, recoveries)
     recovery_evidence = _recovery_evidence(queries, targets, assets, recoveries)
     asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
-    targets_by_split: dict[str, list[str]] = defaultdict(list)
-    target_sets_by_split: dict[str, set[str]] = defaultdict(set)
-    structure_buckets: dict[tuple[str, int, int], list[str]] = defaultdict(list)
+    target_ids = list(targets)
+    target_id_set = set(target_ids)
+    structure_buckets: dict[tuple[int, int], list[str]] = defaultdict(list)
     for target_id, target in targets.items():
-        split = str(target.get("split", "train"))
-        targets_by_split[split].append(target_id)
-        target_sets_by_split[split].add(target_id)
-        structure_buckets[(split, len(target["columns"]), len(target["rows"]))].append(target_id)
+        structure_buckets[(len(target["columns"]), len(target["rows"]))].append(target_id)
 
     targets_by_evidence: dict[str, set[str]] = defaultdict(set)
-    evidence_by_split_type: dict[tuple[str, str], list[str]] = defaultdict(list)
+    evidence_by_type: dict[str, list[str]] = defaultdict(list)
     for target_id, evidence_ids in evidence_by_target.items():
-        split = str(targets[target_id].get("split", "train"))
         for evidence_id in evidence_ids:
             targets_by_evidence[evidence_id].add(target_id)
-            bucket = evidence_by_split_type[(split, asset_types[evidence_id])]
+            bucket = evidence_by_type[asset_types[evidence_id]]
             if evidence_id not in bucket:
                 bucket.append(evidence_id)
 
@@ -331,12 +326,10 @@ def build_stage1_training_artifacts(
     for query_id, direct_positive_target_ids in positives_by_query.items():
         query = queries[query_id]
         split = str(query.get("split", "train"))
-        split_targets = targets_by_split[split]
         evidence_positive_target_ids = [
             target_id
             for recovery_query_id, target_id in recovery_evidence
             if recovery_query_id == query_id
-            if str(targets[target_id].get("split", "train")) == split
         ]
         if not evidence_positive_target_ids:
             evidence_positive_target_ids = [
@@ -360,7 +353,7 @@ def build_stage1_training_artifacts(
 
         semantic_id = _semantic_negative(
             "\n".join(query_objects[query_id]["table_parts"]),
-            target_sets_by_split[split],
+            target_id_set,
             excluded,
             postings,
             inverse_document_frequency,
@@ -369,13 +362,13 @@ def build_stage1_training_artifacts(
             selected["semantic_similar_non_joinable"] = semantic_id
             excluded.add(semantic_id)
 
-        structure_id = _structure_negative(query, split, excluded, structure_buckets)
+        structure_id = _structure_negative(query, excluded, structure_buckets)
         if structure_id is not None:
             selected["type_structure_matched"] = structure_id
             excluded.add(structure_id)
 
         rng = random.Random(f"{seed}:{query_id}")
-        corrupted_id = _pick_random(split_targets, excluded, rng)
+        corrupted_id = _pick_random(target_ids, excluded, rng)
         positive_evidence = positive_evidence_by_target[
             evidence_positive_target_ids[0]
         ]
@@ -383,7 +376,7 @@ def build_stage1_training_artifacts(
             selected["corrupted_path"] = corrupted_id
             excluded.add(corrupted_id)
 
-        random_id = _pick_random(split_targets, excluded, rng)
+        random_id = _pick_random(target_ids, excluded, rng)
         if random_id is not None:
             selected["random"] = random_id
 
@@ -468,7 +461,7 @@ def build_stage1_training_artifacts(
             if evidence_negatives[evidence_type]:
                 continue
             fallback_id = _pick_random(
-                evidence_by_split_type[(split, evidence_type)],
+                evidence_by_type[evidence_type],
                 positive_evidence_set,
                 rng,
             )
@@ -506,7 +499,7 @@ def build_stage1_training_artifacts(
                     target_id for target_id in candidate_ids if target_id not in excluded_targets
                 ]
                 if not evidence_target_negatives:
-                    fallback_id = _pick_random(split_targets, excluded_targets, rng)
+                    fallback_id = _pick_random(target_ids, excluded_targets, rng)
                     if fallback_id is not None:
                         evidence_target_negatives.append(fallback_id)
                 if not evidence_target_negatives:
@@ -536,7 +529,9 @@ def build_stage1_training_artifacts(
         )
 
     if not target_lists:
-        raise ValueError("No query has both a positive and a non-joinable target in the same split")
+        raise ValueError(
+            "No query has both a positive and a non-joinable target in the shared data lake"
+        )
     return {
         "stage1_objects": [*query_objects.values(), *target_objects.values(), *asset_objects],
         "edge_lists": edge_lists,

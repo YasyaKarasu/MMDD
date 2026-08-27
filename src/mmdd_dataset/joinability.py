@@ -77,16 +77,15 @@ def _table_record(
     *,
     table_id: str,
     role: str,
-    split: str,
+    split: str | None,
     column_indices: list[int],
     rows: list[dict[str, Any]],
     source_row_ids: list[int],
     extra: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    record = {
         "table_id": table_id,
         "role": role,
-        "split": split,
         "source_table_id": table["source_table_id"],
         "columns": [
             {
@@ -101,6 +100,9 @@ def _table_record(
         "source_row_indices": source_row_ids,
         **extra,
     }
+    if split is not None:
+        record["split"] = split
+    return record
 
 
 def _rank_additional_columns(
@@ -268,7 +270,7 @@ def _materialize_join(
         table,
         table_id=target_id,
         role="target_data_lake_table",
-        split=split,
+        split=None,
         column_indices=target_columns,
         rows=target_rows,
         source_row_ids=target_source_rows,
