@@ -13,6 +13,7 @@ htmlcov/
 .env.*
 .auto_check_apis.json
 /layout-control-token
+/configs/model_endpoints.qwen35.wdc.remote_gpu0_only.json
 .venv/
 venv/
 .idea/
