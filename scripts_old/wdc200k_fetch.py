@@ -1630,6 +1630,72 @@ def _enqueue_page_refs(
         job_connection.close()
 
 
+def reconcile_page_jobs_from_outcomes(
+    jobs_path: Path,
+    outcomes_path: Path,
+    policy_fingerprint: str,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    """Finish work-local jobs that already have durable shared outcomes."""
+    if not jobs_path.is_file() or not outcomes_path.is_file():
+        return
+    write_tracker = GuardedWriteTracker(jobs_path, pre_write_guard)
+    with sqlite3.connect(jobs_path) as connection:
+        connection.execute("ATTACH DATABASE ? AS page_cache", (str(outcomes_path),))
+        kind = _job_kind(policy_fingerprint)
+        repair_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE kind = ? AND status NOT IN ('success', 'terminal')
+                """,
+                (kind,),
+            ).fetchone()[0]
+        )
+        write_tracker.before_write(4096 + repair_count * 512)
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = (
+                    SELECT outcomes.status
+                    FROM page_cache.page_outcomes AS outcomes
+                    WHERE outcomes.policy_fingerprint = ?
+                      AND outcomes.url_key = json_extract(
+                          jobs.payload_json, '$.url_key'
+                      )
+                ),
+                result_json = json_object(
+                    'url_key', json_extract(payload_json, '$.url_key'),
+                    'policy_fingerprint', ?
+                ),
+                owner = NULL,
+                lease_expires = NULL,
+                lease_id = NULL,
+                updated_at = ?
+            WHERE kind = ?
+              AND status NOT IN ('success', 'terminal')
+              AND EXISTS (
+                    SELECT 1
+                    FROM page_cache.page_outcomes AS outcomes
+                    WHERE outcomes.policy_fingerprint = ?
+                      AND outcomes.url_key = json_extract(
+                          jobs.payload_json, '$.url_key'
+                      )
+                      AND outcomes.status IN ('success', 'terminal')
+                )
+            """,
+            (
+                policy_fingerprint,
+                policy_fingerprint,
+                time.time(),
+                kind,
+                policy_fingerprint,
+            ),
+        )
+        write_tracker.before_commit(0)
+        connection.commit()
+
+
 def fetch_unique_pages(
     page_refs: Iterable[dict[str, Any]],
     store: SqliteJobStore,
@@ -1697,6 +1763,12 @@ def fetch_unique_pages(
         policy_fingerprint=fingerprint,
         kind=kind,
         outcome_write_tracker=outcome_write_tracker,
+    )
+    reconcile_page_jobs_from_outcomes(
+        store.path,
+        outcomes_path,
+        fingerprint,
+        pre_write_guard=pre_write_guard,
     )
 
     unique = _job_count(store, kind)

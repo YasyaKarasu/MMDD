@@ -4150,6 +4150,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         encoding="utf-8",
     )
 
+    adapter_updates: list[models.ModelTaskAdapterProgress] = []
     adapted = adapt_model_tasks_from_manifests(
         structural_output_root=structural_root,
         structural_manifests=[structural_manifest],
@@ -4159,6 +4160,7 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         assets_barrier=task5_barrier(),
         output_root=tmp_path / "adapted",
         args=model_args(),
+        progress_callback=adapter_updates.append,
     )
     records = [
         json.loads(line)
@@ -4175,6 +4177,18 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         == "entity-alpha-0"
     )
     assert records[0]["extraction_task"]["source_row_id"] == 0
+    assert [update.phase for update in adapter_updates] == [
+        "index_assets",
+        "index_entities",
+        "index_links",
+        "tasks",
+    ]
+    assert adapter_updates[-1].completed_shards == 1
+    assert adapter_updates[-1].total_shards == 1
+    assert adapter_updates[-1].tasks == 1
+    assert (
+        adapted.output_root / "model-task-adapter-index-manifest.json"
+    ).is_file()
 
     index_path = adapted.output_root / "model-task-adapter.sqlite3"
     stale_tmp = adapted.output_root / ".stale-adapter.tmp"
@@ -4201,6 +4215,71 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         (assets_root / link_completed["path"]).resolve(),
     }
     real_iter_jsonl_paths = models._iter_jsonl_paths
+
+    partial_root = tmp_path / "partial-adapted"
+    real_atomic_json = models._atomic_json
+
+    def interrupt_after_checkpoint(
+        path: Path,
+        payload: dict[str, object],
+        pre_write_guard=None,
+    ) -> None:
+        if (
+            path.name == "model-task-adapter-manifest.json"
+            and payload.get("complete") is True
+        ):
+            raise RuntimeError("interrupt after adapter checkpoint")
+        real_atomic_json(path, payload, pre_write_guard)
+
+    monkeypatch.setattr(models, "_atomic_json", interrupt_after_checkpoint)
+    with pytest.raises(RuntimeError, match="after adapter checkpoint"):
+        adapt_model_tasks_from_manifests(
+            structural_output_root=structural_root,
+            structural_manifests=[structural_manifest],
+            finalized_selection_manifest=final_manifest,
+            structural_barrier=structural_barrier,
+            assets_manifest=assets_manifest,
+            assets_barrier=task5_barrier(),
+            output_root=partial_root,
+            args=model_args(),
+        )
+    monkeypatch.setattr(models, "_atomic_json", real_atomic_json)
+    checkpoint_payload = json.loads(
+        (partial_root / "model-task-adapter-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert checkpoint_payload["complete"] is False
+    assert checkpoint_payload["source_shards_completed"] == 1
+    partial_index = partial_root / "model-task-adapter.sqlite3"
+    partial_index_mtime = partial_index.stat().st_mtime_ns
+    source_table_path = (
+        structural_root / "source_tables/part-00000.jsonl"
+    ).resolve()
+
+    def reject_completed_source(paths: object) -> object:
+        materialized = tuple(Path(path) for path in paths)
+        if any(path.resolve() == source_table_path for path in materialized):
+            raise AssertionError("completed source shard was replayed")
+        return real_iter_jsonl_paths(materialized)
+
+    monkeypatch.setattr(models, "_iter_jsonl_paths", reject_completed_source)
+    resumed_partial = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=partial_root,
+        args=model_args(),
+    )
+    monkeypatch.setattr(models, "_iter_jsonl_paths", real_iter_jsonl_paths)
+    assert resumed_partial.tasks == adapted.tasks
+    assert partial_index.stat().st_mtime_ns == partial_index_mtime
+    assert [
+        path.read_bytes() for path in resumed_partial.task_paths
+    ] == [path.read_bytes() for path in adapted.task_paths]
 
     def reject_model_input_streams(paths: object) -> object:
         materialized = tuple(Path(path) for path in paths)

@@ -90,6 +90,12 @@ STRUCTURAL_STAGE_SCHEMA_VERSION = "wdc200k-structural-v2"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
 _ROLLING_CLAIM_GROUPS = 8
+_ADAPTER_INDEX_SCHEMA_VERSION = "wdc200k-model-task-adapter-index-v1"
+_ADAPTER_CHECKPOINT_SCHEMA_VERSION = (
+    "wdc200k-model-task-adapter-checkpoint-v1"
+)
+_ADAPTER_INDEX_BATCH_SIZE = 10_000
+_ADAPTER_CHECKPOINT_SOURCE_SHARDS = 32
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,15 @@ class ModelProgressSnapshot:
     @property
     def completed(self) -> int:
         return self.success + self.terminal
+
+
+@dataclass(frozen=True)
+class ModelTaskAdapterProgress:
+    phase: str
+    completed_shards: int
+    total_shards: int
+    tasks: int = 0
+    errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -3878,11 +3893,12 @@ class _AdapterShardWriter:
         root: Path,
         *,
         records_per_shard: int,
+        completed: Iterable[CompletedShard] = (),
         pre_write_guard: PreWriteGuard | None = None,
     ) -> None:
         self.root = root
         self.records_per_shard = records_per_shard
-        self.completed: list[CompletedShard] = []
+        self.completed = list(completed)
         self.writer: AtomicJsonlShard | None = None
         self.current_records = 0
         self.pre_write_guard = pre_write_guard
@@ -3920,6 +3936,327 @@ class _AdapterShardWriter:
     def abort(self) -> None:
         if self.writer is not None:
             self.writer.abort()
+
+
+def _relative_adapter_shards(
+    shards: Iterable[CompletedShard],
+    output_root: Path,
+) -> list[CompletedShard]:
+    return [
+        CompletedShard(
+            path=Path(shard.path).relative_to(output_root).as_posix(),
+            records=shard.records,
+            bytes=shard.bytes,
+            sha256=shard.sha256,
+        )
+        for shard in shards
+    ]
+
+
+def _adapter_index_is_complete(
+    index_path: Path,
+    manifest_path: Path,
+    *,
+    input_fingerprint: str,
+) -> dict[str, int] | None:
+    if not index_path.is_file() or not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("stage") != _ADAPTER_INDEX_SCHEMA_VERSION
+            or payload.get("input_fingerprint") != input_fingerprint
+            or payload.get("complete") is not True
+        ):
+            return None
+        declared = payload.get("counts")
+        if not isinstance(declared, dict):
+            return None
+        counts = {
+            table: _strict_adapter_nonnegative_int(
+                declared.get(table),
+                field=f"adapter_index.counts.{table}",
+            )
+            for table in ("assets", "entities", "links")
+        }
+        with sqlite3.connect(index_path) as connection:
+            expected_columns = {
+                "assets": ("asset_id", "payload"),
+                "entities": ("entity_id", "payload"),
+                "links": ("source_table_id", "entity_id", "asset_id"),
+            }
+            for table, expected in expected_columns.items():
+                actual = tuple(
+                    str(row[1])
+                    for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                )
+                if actual != expected:
+                    return None
+                actual_count = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                )
+                if actual_count != counts[table]:
+                    return None
+        return counts
+    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _build_adapter_index(
+    *,
+    index_path: Path,
+    manifest_path: Path,
+    input_fingerprint: str,
+    asset_paths: list[Path],
+    entity_paths: list[Path],
+    link_paths: list[Path],
+    pre_write_guard: PreWriteGuard | None,
+    progress_callback: Callable[[ModelTaskAdapterProgress], None] | None,
+) -> dict[str, int]:
+    index_path.unlink(missing_ok=True)
+    manifest_path.unlink(missing_ok=True)
+    index_tracker = GuardedWriteTracker(index_path, pre_write_guard)
+    index_tracker.before_write(64 * 1024)
+
+    def publish(phase: str, completed: int, total: int) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                ModelTaskAdapterProgress(
+                    phase=phase,
+                    completed_shards=completed,
+                    total_shards=total,
+                )
+            )
+
+    with sqlite3.connect(index_path) as connection:
+        connection.execute(
+            "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE entities (entity_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE links (
+                source_table_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                PRIMARY KEY (source_table_id, entity_id, asset_id)
+            )
+            """
+        )
+
+        for path_index, path in enumerate(asset_paths, start=1):
+            batch: list[tuple[str, str]] = []
+            estimated_bytes = 0
+            for record in _iter_jsonl_paths([path]):
+                record = _verify_task5_asset_bytes(record)
+                encoded = _canonical_json(record)
+                batch.append((str(record["asset_id"]), encoded))
+                estimated_bytes += 4096 + 2 * len(encoded.encode("utf-8"))
+                if len(batch) >= _ADAPTER_INDEX_BATCH_SIZE:
+                    index_tracker.before_write(estimated_bytes)
+                    connection.executemany(
+                        "INSERT OR REPLACE INTO assets VALUES (?, ?)",
+                        batch,
+                    )
+                    batch.clear()
+                    estimated_bytes = 0
+            if batch:
+                index_tracker.before_write(estimated_bytes)
+                connection.executemany(
+                    "INSERT OR REPLACE INTO assets VALUES (?, ?)",
+                    batch,
+                )
+            index_tracker.before_commit(0)
+            connection.commit()
+            publish("index_assets", path_index, len(asset_paths))
+
+        for path_index, path in enumerate(entity_paths, start=1):
+            batch = []
+            estimated_bytes = 0
+            for record in _iter_jsonl_paths([path]):
+                encoded = _canonical_json(record)
+                batch.append((str(record["entity_id"]), encoded))
+                estimated_bytes += 4096 + 2 * len(encoded.encode("utf-8"))
+                if len(batch) >= _ADAPTER_INDEX_BATCH_SIZE:
+                    index_tracker.before_write(estimated_bytes)
+                    connection.executemany(
+                        "INSERT OR REPLACE INTO entities VALUES (?, ?)",
+                        batch,
+                    )
+                    batch.clear()
+                    estimated_bytes = 0
+            if batch:
+                index_tracker.before_write(estimated_bytes)
+                connection.executemany(
+                    "INSERT OR REPLACE INTO entities VALUES (?, ?)",
+                    batch,
+                )
+            index_tracker.before_commit(0)
+            connection.commit()
+            publish("index_entities", path_index, len(entity_paths))
+
+        for path_index, path in enumerate(link_paths, start=1):
+            link_batch: list[tuple[str, str, str]] = []
+            for record in _iter_jsonl_paths([path]):
+                for asset_id in record.get("asset_ids") or []:
+                    link_batch.append(
+                        (
+                            str(record["source_table_id"]),
+                            str(record["entity_id"]),
+                            str(asset_id),
+                        )
+                    )
+                    if len(link_batch) >= _ADAPTER_INDEX_BATCH_SIZE:
+                        index_tracker.before_write(4096 * len(link_batch))
+                        connection.executemany(
+                            "INSERT OR IGNORE INTO links VALUES (?, ?, ?)",
+                            link_batch,
+                        )
+                        link_batch.clear()
+            if link_batch:
+                index_tracker.before_write(4096 * len(link_batch))
+                connection.executemany(
+                    "INSERT OR IGNORE INTO links VALUES (?, ?, ?)",
+                    link_batch,
+                )
+            index_tracker.before_commit(0)
+            connection.commit()
+            publish("index_links", path_index, len(link_paths))
+
+        counts = {
+            table: int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+            for table in ("assets", "entities", "links")
+        }
+    _atomic_json(
+        manifest_path,
+        {
+            "stage": _ADAPTER_INDEX_SCHEMA_VERSION,
+            "input_fingerprint": input_fingerprint,
+            "counts": counts,
+            "complete": True,
+        },
+        pre_write_guard,
+    )
+    return counts
+
+
+def _load_adapter_checkpoint(
+    *,
+    output_root: Path,
+    manifest_path: Path,
+    input_fingerprint: str,
+    parameter_fingerprint: str,
+    source_shards: int,
+) -> tuple[int, list[CompletedShard], list[CompletedShard], int, int] | None:
+    if not manifest_path.is_file():
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("complete") is not False
+        or payload.get("checkpoint_schema_version")
+        != _ADAPTER_CHECKPOINT_SCHEMA_VERSION
+    ):
+        return None
+    _validate_adapter_manifest_identity(
+        payload,
+        expected_input_fingerprint=input_fingerprint,
+    )
+    if payload.get("parameter_fingerprint") != parameter_fingerprint:
+        raise ValueError("model adapter parameter identity mismatch")
+    _validate_adapter_shard_paths(payload)
+    task_shards = list(_parse_adapter_shards(payload, field="task_shards"))
+    error_shards = list(_parse_adapter_shards(payload, field="error_shards"))
+    completed_sources = _strict_adapter_nonnegative_int(
+        payload.get("source_shards_completed"),
+        field="source_shards_completed",
+    )
+    if completed_sources > source_shards:
+        raise ValueError("model adapter checkpoint source count is invalid")
+    counts = payload.get("counts")
+    if not isinstance(counts, dict):
+        raise ValueError("model adapter checkpoint counts are invalid")
+    tasks = _strict_adapter_nonnegative_int(
+        counts.get("tasks"), field="counts.tasks"
+    )
+    errors = _strict_adapter_nonnegative_int(
+        counts.get("errors"), field="counts.errors"
+    )
+    if (
+        sum(shard.records for shard in task_shards) != tasks
+        or sum(shard.records for shard in error_shards) != errors
+        or not all(
+            validate_completed_shard(shard, output_root)
+            for shard in (*task_shards, *error_shards)
+        )
+    ):
+        raise ValueError("model adapter checkpoint shard validation failed")
+
+    def absolute(shard: CompletedShard) -> CompletedShard:
+        return CompletedShard(
+            path=(output_root / shard.path).as_posix(),
+            records=shard.records,
+            bytes=shard.bytes,
+            sha256=shard.sha256,
+        )
+
+    return (
+        completed_sources,
+        [absolute(shard) for shard in task_shards],
+        [absolute(shard) for shard in error_shards],
+        tasks,
+        errors,
+    )
+
+
+def _write_adapter_checkpoint(
+    *,
+    output_root: Path,
+    manifest_path: Path,
+    input_fingerprint: str,
+    parameter_fingerprint: str,
+    source_shards_completed: int,
+    task_shards: Iterable[CompletedShard],
+    error_shards: Iterable[CompletedShard],
+    tasks: int,
+    errors: int,
+    pre_write_guard: PreWriteGuard | None,
+) -> None:
+    relative_tasks = _relative_adapter_shards(task_shards, output_root)
+    relative_errors = _relative_adapter_shards(error_shards, output_root)
+    _atomic_json(
+        manifest_path,
+        {
+            "stage": "wdc200k_model_task_adapter",
+            "schema_version": MODEL_QUEUE_SCHEMA_VERSION,
+            "checkpoint_schema_version": (
+                _ADAPTER_CHECKPOINT_SCHEMA_VERSION
+            ),
+            "input_fingerprint": input_fingerprint,
+            "parameter_fingerprint": parameter_fingerprint,
+            "source_shards_completed": source_shards_completed,
+            "task_shards": [
+                _shard_payload(shard) for shard in relative_tasks
+            ],
+            "error_shards": [
+                _shard_payload(shard) for shard in relative_errors
+            ],
+            "counts": {"tasks": tasks, "errors": errors},
+            "complete": False,
+        },
+        pre_write_guard,
+    )
 
 
 def _iter_jsonl_paths(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
@@ -4154,6 +4491,9 @@ def adapt_model_tasks_from_manifests(
     pre_write_guard: PreWriteGuard | None = None,
     sampled_entity_paths: Iterable[Path] | None = None,
     sampling_manifest: Path | None = None,
+    progress_callback: (
+        Callable[[ModelTaskAdapterProgress], None] | None
+    ) = None,
 ) -> AdaptedModelTasks:
     """Disk-index Task-3/Task-5 artifacts into authoritative model tasks."""
     if records_per_shard <= 0:
@@ -4408,180 +4748,197 @@ def adapt_model_tasks_from_manifests(
         pre_write_guard(output_root, 0)
     output_root.mkdir(parents=True, exist_ok=True)
     index_path = output_root / "model-task-adapter.sqlite3"
-    index_path.unlink(missing_ok=True)
-    index_tracker = GuardedWriteTracker(index_path, pre_write_guard)
-    index_tracker.before_write(64 * 1024)
-    with sqlite3.connect(index_path) as connection:
-        connection.execute(
-            "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+    index_manifest_path = output_root / "model-task-adapter-index-manifest.json"
+    index_counts = _adapter_index_is_complete(
+        index_path,
+        index_manifest_path,
+        input_fingerprint=input_fingerprint,
+    )
+    if index_counts is None:
+        index_counts = _build_adapter_index(
+            index_path=index_path,
+            manifest_path=index_manifest_path,
+            input_fingerprint=input_fingerprint,
+            asset_paths=list(asset_paths),
+            entity_paths=list(entity_paths),
+            link_paths=list(link_paths),
+            pre_write_guard=pre_write_guard,
+            progress_callback=progress_callback,
         )
-        connection.execute(
-            "CREATE TABLE entities (entity_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+    elif progress_callback is not None:
+        progress_callback(
+            ModelTaskAdapterProgress(
+                phase="index_cache",
+                completed_shards=1,
+                total_shards=1,
+            )
         )
-        connection.execute(
-            """
-            CREATE TABLE links (
-                source_table_id TEXT NOT NULL,
-                entity_id TEXT NOT NULL,
-                asset_id TEXT NOT NULL,
-                PRIMARY KEY (source_table_id, entity_id, asset_id)
-            )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX links_source ON links(source_table_id)"
-        )
-        for record in _iter_jsonl_paths(asset_paths):
-            record = _verify_task5_asset_bytes(record)
-            encoded = _canonical_json(record)
-            index_tracker.before_write(
-                4096 + 2 * len(encoded.encode("utf-8"))
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO assets VALUES (?, ?)",
-                (str(record["asset_id"]), encoded),
-            )
-        for record in _iter_jsonl_paths(entity_paths):
-            encoded = _canonical_json(record)
-            index_tracker.before_write(
-                4096 + 2 * len(encoded.encode("utf-8"))
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO entities VALUES (?, ?)",
-                (str(record["entity_id"]), encoded),
-            )
-        for record in _iter_jsonl_paths(link_paths):
-            for asset_id in record.get("asset_ids") or []:
-                index_tracker.before_write(4096)
-                connection.execute(
-                    "INSERT OR IGNORE INTO links VALUES (?, ?, ?)",
-                    (
-                        str(record["source_table_id"]),
-                        str(record["entity_id"]),
-                        str(asset_id),
-                    ),
-                )
-        index_tracker.before_commit(0)
-        connection.commit()
+
+    checkpoint = _load_adapter_checkpoint(
+        output_root=output_root,
+        manifest_path=adapter_manifest_path,
+        input_fingerprint=input_fingerprint,
+        parameter_fingerprint=parameter_fingerprint,
+        source_shards=len(source_paths),
+    )
+    if checkpoint is None:
+        completed_sources = 0
+        completed_task_shards: list[CompletedShard] = []
+        completed_error_shards: list[CompletedShard] = []
+        task_count = 0
+        error_count = 0
+    else:
+        (
+            completed_sources,
+            completed_task_shards,
+            completed_error_shards,
+            task_count,
+            error_count,
+        ) = checkpoint
 
     task_writer = _AdapterShardWriter(
         output_root / "tasks",
         records_per_shard=records_per_shard,
+        completed=completed_task_shards,
         pre_write_guard=pre_write_guard,
     )
     error_writer = _AdapterShardWriter(
         output_root / "planning_errors",
         records_per_shard=records_per_shard,
+        completed=completed_error_shards,
         pre_write_guard=pre_write_guard,
     )
-    task_count = 0
-    error_count = 0
     adapter_args = argparse.Namespace(**vars(args))
     if not hasattr(adapter_args, "min_column_non_empty_ratio"):
         adapter_args.min_column_non_empty_ratio = 0.5
     try:
         with sqlite3.connect(index_path) as connection:
             connection.row_factory = sqlite3.Row
-            for source_table in _iter_jsonl_paths(source_paths):
-                source_table_id = str(source_table["source_table_id"])
-                link_rows = connection.execute(
-                    """
-                    SELECT entity_id, asset_id
-                    FROM links
-                    WHERE source_table_id = ?
-                    ORDER BY entity_id, asset_id
-                    """,
-                    (source_table_id,),
-                ).fetchall()
-                entity_to_assets: dict[str, list[str]] = {}
-                assets: dict[str, dict[str, Any]] = {}
-                wiki_to_entity_id: dict[str, str] = {}
-                for link in link_rows:
-                    entity_id = str(link["entity_id"])
-                    asset_id = str(link["asset_id"])
-                    entity_to_assets.setdefault(entity_id, []).append(
-                        asset_id
-                    )
-                    asset_row = connection.execute(
-                        "SELECT payload FROM assets WHERE asset_id = ?",
-                        (asset_id,),
-                    ).fetchone()
-                    entity_row = connection.execute(
-                        "SELECT payload FROM entities WHERE entity_id = ?",
-                        (entity_id,),
-                    ).fetchone()
-                    if asset_row is None or entity_row is None:
-                        continue
-                    assets[asset_id] = json.loads(str(asset_row["payload"]))
-                    entity = json.loads(str(entity_row["payload"]))
-                    wiki_to_entity_id[str(entity["wiki_title"])] = entity_id
-                tasks = collect_table_extraction_tasks(
-                    source_table=source_table,
-                    assets=assets,
-                    entity_to_assets=entity_to_assets,
-                    wiki_to_entity_id=wiki_to_entity_id,
-                    args=adapter_args,
-                )
-                if link_rows and not tasks:
-                    error_writer.write(
-                        {
-                            "status": "terminal",
-                            "error_class": "no_candidate_attributes",
-                            "source_table_id": source_table_id,
-                        }
-                    )
-                    error_count += 1
-                for task in tasks:
-                    if not task.candidate_attribute_names:
-                        raise ValueError(
-                            "adapter produced an empty candidate task"
+            for source_index, source_path in enumerate(
+                source_paths[completed_sources:],
+                start=completed_sources + 1,
+            ):
+                for source_table in _iter_jsonl_paths([source_path]):
+                    source_table_id = str(source_table["source_table_id"])
+                    link_rows = connection.execute(
+                        """
+                        SELECT
+                            links.entity_id,
+                            links.asset_id,
+                            assets.payload AS asset_payload,
+                            entities.payload AS entity_payload
+                        FROM links
+                        LEFT JOIN assets ON assets.asset_id = links.asset_id
+                        LEFT JOIN entities ON entities.entity_id = links.entity_id
+                        WHERE links.source_table_id = ?
+                        ORDER BY links.entity_id, links.asset_id
+                        """,
+                        (source_table_id,),
+                    ).fetchall()
+                    entity_to_assets: dict[str, list[str]] = {}
+                    assets: dict[str, dict[str, Any]] = {}
+                    wiki_to_entity_id: dict[str, str] = {}
+                    decoded_entities: dict[str, dict[str, Any]] = {}
+                    for link in link_rows:
+                        entity_id = str(link["entity_id"])
+                        asset_id = str(link["asset_id"])
+                        entity_to_assets.setdefault(entity_id, []).append(
+                            asset_id
                         )
-                    task_writer.write(
-                        {
-                            "extraction_task": {
-                                "order": task.order,
-                                "cache_key": task.cache_key,
-                                "source_table_id": task.source_table_id,
-                                "source_row_id": task.source_row_id,
-                                "entity_column_index": (
-                                    task.entity_column_index
-                                ),
-                                "entity_column_name": (
-                                    task.entity_column_name
-                                ),
-                                "entity": task.entity,
-                                "asset": task.asset,
-                                "candidate_attribute_names": (
-                                    task.candidate_attribute_names
-                                ),
-                            }
-                        }
+                        if (
+                            link["asset_payload"] is None
+                            or link["entity_payload"] is None
+                        ):
+                            continue
+                        assets[asset_id] = json.loads(
+                            str(link["asset_payload"])
+                        )
+                        entity = decoded_entities.get(entity_id)
+                        if entity is None:
+                            entity = json.loads(str(link["entity_payload"]))
+                            decoded_entities[entity_id] = entity
+                        wiki_to_entity_id[str(entity["wiki_title"])] = (
+                            entity_id
+                        )
+                    tasks = collect_table_extraction_tasks(
+                        source_table=source_table,
+                        assets=assets,
+                        entity_to_assets=entity_to_assets,
+                        wiki_to_entity_id=wiki_to_entity_id,
+                        args=adapter_args,
                     )
-                    task_count += 1
+                    if link_rows and not tasks:
+                        error_writer.write(
+                            {
+                                "status": "terminal",
+                                "error_class": "no_candidate_attributes",
+                                "source_table_id": source_table_id,
+                            }
+                        )
+                        error_count += 1
+                    for task in tasks:
+                        if not task.candidate_attribute_names:
+                            raise ValueError(
+                                "adapter produced an empty candidate task"
+                            )
+                        task_writer.write(
+                            {
+                                "extraction_task": {
+                                    "order": task.order,
+                                    "cache_key": task.cache_key,
+                                    "source_table_id": task.source_table_id,
+                                    "source_row_id": task.source_row_id,
+                                    "entity_column_index": (
+                                        task.entity_column_index
+                                    ),
+                                    "entity_column_name": (
+                                        task.entity_column_name
+                                    ),
+                                    "entity": task.entity,
+                                    "asset": task.asset,
+                                    "candidate_attribute_names": (
+                                        task.candidate_attribute_names
+                                    ),
+                                }
+                            }
+                        )
+                        task_count += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        ModelTaskAdapterProgress(
+                            phase="tasks",
+                            completed_shards=source_index,
+                            total_shards=len(source_paths),
+                            tasks=task_count,
+                            errors=error_count,
+                        )
+                    )
+                if (
+                    source_index % _ADAPTER_CHECKPOINT_SOURCE_SHARDS == 0
+                    or source_index == len(source_paths)
+                ):
+                    task_writer._commit()
+                    error_writer._commit()
+                    _write_adapter_checkpoint(
+                        output_root=output_root,
+                        manifest_path=adapter_manifest_path,
+                        input_fingerprint=input_fingerprint,
+                        parameter_fingerprint=parameter_fingerprint,
+                        source_shards_completed=source_index,
+                        task_shards=task_writer.completed,
+                        error_shards=error_writer.completed,
+                        tasks=task_count,
+                        errors=error_count,
+                        pre_write_guard=pre_write_guard,
+                    )
         task_shards = task_writer.close()
         error_shards = error_writer.close()
     except BaseException:
         task_writer.abort()
         error_writer.abort()
         raise
-    task_shards = [
-        CompletedShard(
-            path=Path(shard.path).relative_to(output_root).as_posix(),
-            records=shard.records,
-            bytes=shard.bytes,
-            sha256=shard.sha256,
-        )
-        for shard in task_shards
-    ]
-    error_shards = [
-        CompletedShard(
-            path=Path(shard.path).relative_to(output_root).as_posix(),
-            records=shard.records,
-            bytes=shard.bytes,
-            sha256=shard.sha256,
-        )
-        for shard in error_shards
-    ]
+    task_shards = _relative_adapter_shards(task_shards, output_root)
+    error_shards = _relative_adapter_shards(error_shards, output_root)
     if pre_write_guard is not None:
         pre_write_guard(adapter_manifest_path, 0)
     _atomic_json(

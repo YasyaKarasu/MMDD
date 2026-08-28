@@ -1235,7 +1235,7 @@ def test_image_progress_callback_starts_from_durable_baseline_and_is_bounded(
     )
 
     assert result.complete
-    assert [snapshot.completed_durable for snapshot in updates] == [0, 2, 4, 5]
+    assert [snapshot.completed_durable for snapshot in updates] == [1, 2, 4, 5]
     assert all(snapshot.total == 5 for snapshot in updates)
     assert len({snapshot.execution_epoch for snapshot in updates}) == 1
 
@@ -1738,6 +1738,74 @@ def test_terminal_image_outcome_is_not_replayed_on_resume(
 
     assert first.terminal == second.terminal == 1
     assert transport.calls == [image_url]
+
+
+def test_shared_image_cache_bulk_reconciles_fresh_job_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    success_url = "https://i.test/cached.jpg"
+    terminal_url = "https://i.test/broken.jpg"
+    unique_jobs = write_unique_jobs(
+        tmp_path / "unique.jsonl",
+        [success_url, terminal_url],
+    )
+    transport = FakeImageTransport(
+        tmp_path,
+        {
+            success_url: "cached",
+            terminal_url: TimeoutError(),
+        },
+    )
+    policy = FetchPolicy(
+        network_policy_fingerprint="image-v1",
+        policy_version="wdc200k-image-v1",
+        global_concurrency=1,
+        per_host_concurrency=1,
+    )
+    outcomes_path = tmp_path / "outcomes.sqlite3"
+    first = fetch_unique_images(
+        unique_jobs,
+        SqliteJobStore(tmp_path / "first-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    resumed_store = SqliteJobStore(tmp_path / "resumed-jobs.sqlite3")
+    original_claim = resumed_store.claim
+    claimed_counts: list[int] = []
+
+    def tracked_claim(*args: Any, **kwargs: Any):
+        claimed = original_claim(*args, **kwargs)
+        claimed_counts.append(len(claimed))
+        return claimed
+
+    monkeypatch.setattr(resumed_store, "claim", tracked_claim)
+    resumed = fetch_unique_images(
+        unique_jobs,
+        resumed_store,
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+        image_dir=tmp_path / "content",
+    )
+
+    assert first.success == resumed.success == 1
+    assert first.terminal == resumed.terminal == 1
+    assert transport.calls == [success_url, terminal_url]
+    assert sum(claimed_counts) == 0
+    assert resumed.maximum_claimed == 0
+    with sqlite3.connect(resumed_store.path) as connection:
+        assert connection.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM jobs
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall() == [("success", 1), ("terminal", 1)]
 
 
 def test_image_fetch_isolates_overlapping_job_sets_and_scopes_outcomes(

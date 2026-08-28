@@ -55,6 +55,7 @@ from wdc200k_fetch import (
     fetch_unique_pages,
     iter_page_fanout,
     iter_page_outcomes,
+    reconcile_page_jobs_from_outcomes,
     validate_complete_page_fetch,
 )
 from wdc200k_io import (
@@ -90,6 +91,7 @@ from wdc200k_models import (
     ModelProgressSnapshot,
     ModelStageAuthority,
     ModelStageResult,
+    ModelTaskAdapterProgress,
     StructuralStageBarrier,
     adapt_model_tasks_from_manifests,
     enqueue_model_tasks,
@@ -4636,72 +4638,6 @@ def _run_selection_and_structural(
     return tuple(results), finalized, counters
 
 
-def _reconcile_page_jobs_from_outcomes(
-    jobs_path: Path,
-    outcomes_path: Path,
-    policy_fingerprint: str,
-    pre_write_guard: PreWriteGuard | None = None,
-) -> None:
-    """Finish crash-window jobs from already durable terminal outcomes."""
-    if not jobs_path.is_file() or not outcomes_path.is_file():
-        return
-    write_tracker = GuardedWriteTracker(jobs_path, pre_write_guard)
-    with sqlite3.connect(jobs_path) as connection:
-        connection.execute("ATTACH DATABASE ? AS page_cache", (str(outcomes_path),))
-        kind = f"wdc200k-page:{policy_fingerprint}"
-        repair_count = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM jobs
-                WHERE kind = ? AND status NOT IN ('success', 'terminal')
-                """,
-                (kind,),
-            ).fetchone()[0]
-        )
-        write_tracker.before_write(4096 + repair_count * 512)
-        connection.execute(
-            """
-            UPDATE jobs
-            SET status = (
-                    SELECT outcomes.status
-                    FROM page_cache.page_outcomes AS outcomes
-                    WHERE outcomes.policy_fingerprint = ?
-                      AND outcomes.url_key = json_extract(
-                          jobs.payload_json, '$.url_key'
-                      )
-                ),
-                result_json = json_object(
-                    'url_key', json_extract(payload_json, '$.url_key'),
-                    'policy_fingerprint', ?
-                ),
-                owner = NULL,
-                lease_expires = NULL,
-                lease_id = NULL,
-                updated_at = ?
-            WHERE kind = ?
-              AND status NOT IN ('success', 'terminal')
-              AND EXISTS (
-                    SELECT 1
-                    FROM page_cache.page_outcomes AS outcomes
-                    WHERE outcomes.policy_fingerprint = ?
-                      AND outcomes.url_key = json_extract(
-                          jobs.payload_json, '$.url_key'
-                      )
-                      AND outcomes.status IN ('success', 'terminal')
-                )
-            """,
-            (
-                policy_fingerprint,
-                policy_fingerprint,
-                time.time(),
-                kind,
-                policy_fingerprint,
-            ),
-        )
-        write_tracker.before_commit(0)
-        connection.commit()
-
-
 def _new_web_transport(
     config: PipelineConfig,
     namespace: str,
@@ -4851,7 +4787,7 @@ def _run_pages(
         pre_write_guard(jobs_path, 0)
         pre_write_guard(outcomes_path, 0)
     SqliteJobStore(jobs_path, pre_write_guard=pre_write_guard)
-    _reconcile_page_jobs_from_outcomes(
+    reconcile_page_jobs_from_outcomes(
         jobs_path,
         outcomes_path,
         policy.fingerprint,
@@ -5253,6 +5189,21 @@ def _run_models(
 ) -> tuple[AdaptedModelTasks, ModelStageResult, ModelStageAuthority, argparse.Namespace]:
     reporter.update(stage="models", completed_shards=0, total_shards=2)
     args = _runtime_args(config)
+
+    def adapter_progress(snapshot: ModelTaskAdapterProgress) -> None:
+        reporter.update(
+            detail=(
+                f"adapter {snapshot.phase}: "
+                f"{snapshot.completed_shards}/{snapshot.total_shards}"
+            ),
+            counters={
+                "model_adapter_shards_completed": snapshot.completed_shards,
+                "model_adapter_shards_total": snapshot.total_shards,
+                "model_adapter_tasks_live": snapshot.tasks,
+                "model_adapter_errors_live": snapshot.errors,
+            },
+        )
+
     adapted = adapt_model_tasks_from_manifests(
         structural_output_root=config.work_dir / "structural",
         structural_manifests=(item.manifest for item in structural),
@@ -5266,6 +5217,7 @@ def _run_models(
         pre_write_guard=pre_write_guard,
         sampled_entity_paths=sampling.artifact_paths["sampled_entities"],
         sampling_manifest=sampling.manifest_path,
+        progress_callback=adapter_progress,
     )
     reporter.update(completed_shards=1, total_shards=2)
     model_jobs_path = _model_jobs_path(config)

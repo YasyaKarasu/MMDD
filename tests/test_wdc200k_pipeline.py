@@ -3109,7 +3109,7 @@ def test_run_pages_wires_nonzero_tracker_elapsed_through_reporter_restore(
     monkeypatch.setattr(pipeline_module, "_page_refs", lambda *_args: iter(()))
     monkeypatch.setattr(
         pipeline_module,
-        "_reconcile_page_jobs_from_outcomes",
+        "reconcile_page_jobs_from_outcomes",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(

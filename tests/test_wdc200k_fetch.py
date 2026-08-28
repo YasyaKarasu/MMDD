@@ -162,6 +162,40 @@ def test_page_transport_attempts_survive_resume_without_replay(
     assert len(second.transport_attempt_summary["digest"]) == 64
 
 
+def test_new_job_store_bulk_reconciles_shared_page_cache_after_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://e.test/shared-cache"
+    outcomes_path = tmp_path / "shared-outcomes.sqlite3"
+    transport = CountingTransport({url: {"text": "cached"}})
+    policy = FetchPolicy()
+
+    fetch_unique_pages(
+        [page_ref("first", url)],
+        SqliteJobStore(tmp_path / "first-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+
+    def fail_per_job_cache_lookup(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("shared cache hit fell back to per-job reconciliation")
+
+    monkeypatch.setattr(PageOutcomeStore, "get", fail_per_job_cache_lookup)
+    resumed = fetch_unique_pages(
+        [page_ref("second", url)],
+        SqliteJobStore(tmp_path / "second-jobs.sqlite3"),
+        transport,
+        policy,
+        outcomes_path=outcomes_path,
+    )
+
+    assert resumed.complete
+    assert (resumed.unique, resumed.success, resumed.terminal) == (1, 1, 0)
+    assert transport.calls == [url]
+
+
 def test_page_progress_callback_starts_from_durable_baseline_and_is_bounded(
     tmp_path: Path,
 ) -> None:
@@ -214,13 +248,12 @@ def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
     policy = FetchPolicy(global_concurrency=4, per_host_concurrency=1)
     outcomes_path = tmp_path / "outcomes.sqlite3"
     outcome_store = PageOutcomeStore(outcomes_path)
-    for url in (cached, suppressed):
-        outcome_store.put(
-            policy.fingerprint,
-            hashlib.sha256(url.encode("utf-8")).hexdigest(),
-            url,
-            {"status": "success", "text": url, "image_urls": []},
-        )
+    outcome_store.put(
+        policy.fingerprint,
+        hashlib.sha256(cached.encode("utf-8")).hexdigest(),
+        cached,
+        {"status": "success", "text": cached, "image_urls": []},
+    )
     suppressed_key = hashlib.sha256(suppressed.encode("utf-8")).hexdigest()
     original_get = fetch_module.PageOutcomeStore.get
     get_calls = 0
@@ -230,6 +263,16 @@ def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
         if url_key == suppressed_key:
             get_calls += 1
             if get_calls == 1:
+                self.put(
+                    fingerprint,
+                    url_key,
+                    suppressed,
+                    {
+                        "status": "success",
+                        "text": suppressed,
+                        "image_urls": [],
+                    },
+                )
                 return None
         return original_get(self, fingerprint, url_key)
 
@@ -239,16 +282,17 @@ def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
         hide_suppressed_once,
     )
     snapshots: list[UrlProgressSnapshot] = []
+    transport = CountingTransport(
+        {
+            physical: {"text": "ok"},
+            failed: TimeoutError("deadline"),
+            suppressed: {"text": "must not run"},
+        }
+    )
     result = fetch_unique_pages(
         refs,
         SqliteJobStore(tmp_path / "jobs.sqlite3"),
-        CountingTransport(
-            {
-                physical: {"text": "ok"},
-                failed: TimeoutError("deadline"),
-                suppressed: {"text": "must not run"},
-            }
-        ),
+        transport,
         policy,
         outcomes_path=outcomes_path,
         progress_callback=snapshots.append,
@@ -256,7 +300,7 @@ def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
     )
 
     assert result.complete
-    assert snapshots[0].completed_durable == 0
+    assert snapshots[0].completed_durable == 1
     final = snapshots[-1]
     assert final.completed_durable == final.total == 4
     assert sum(final.transport_event_histogram) == 2
@@ -264,9 +308,10 @@ def test_page_tracker_distinguishes_physical_cache_and_suppressed_paths(
     assert final.physical_in_flight == 0
     assert final.in_flight_jobs == 0
     assert final.finished_not_durable == 0
+    assert set(transport.calls) == {physical, failed}
 
 
-def test_page_claim_batch_is_buffered_before_synchronous_cache_callback(
+def test_page_tracker_starts_with_bulk_cache_hits_as_durable_baseline(
     tmp_path: Path,
 ) -> None:
     urls = ["https://e.test/claim-a", "https://e.test/claim-b"]
@@ -296,11 +341,11 @@ def test_page_claim_batch_is_buffered_before_synchronous_cache_callback(
     )
 
     assert result.complete
-    cached_snapshot = next(
-        item for item in snapshots if item.completed_durable == 1
-    )
-    assert cached_snapshot.local_buffered_not_started == 1
-    assert cached_snapshot.unobserved_nonlocal == 0
+    cached_snapshot = snapshots[0]
+    assert cached_snapshot.baseline_completed == 1
+    assert cached_snapshot.completed_durable == 1
+    assert cached_snapshot.local_buffered_not_started == 0
+    assert cached_snapshot.unobserved_nonlocal == 1
 
 
 def test_page_first_completed_batch_moves_all_futures_before_serial_commits(
