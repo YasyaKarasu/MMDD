@@ -38,7 +38,7 @@ def load_corpus_ids(path: Path, store: FeatureStore) -> dict[str, list[str]]:
             if object_id in seen:
                 raise ValueError(f"{path}:{line_number}: duplicate object_id {object_id!r}")
             seen.add(object_id)
-            features = store.get(object_id, include_hidden=False)
+            features = store.embedding_features(object_id)
             if "object_type" in record:
                 declared_type = normalize_object_type(str(record["object_type"]))
                 if declared_type != features.object_type:
@@ -79,7 +79,7 @@ def build_indices(
                 batch_ids = object_ids[start : start + batch_size]
                 embeddings = torch.stack(
                     [
-                        store.get(object_id, include_hidden=False).embedding.to(
+                        store.embedding_features(object_id).embedding.to(
                             device=device, dtype=torch.float32
                         )
                         for object_id in batch_ids
@@ -136,7 +136,7 @@ def build_raw_embedding_indices(
     )
     if first_id is None:
         raise ValueError("Cannot build raw embedding indexes for an empty corpus")
-    embedding_dim = int(store.get(first_id, include_hidden=False).embedding.shape[0])
+    embedding_dim = int(store.embedding_features(first_id).embedding.shape[0])
     output_dir.mkdir(parents=True, exist_ok=True)
     type_records = {}
     for object_type in OBJECT_TYPES:
@@ -149,7 +149,7 @@ def build_raw_embedding_indices(
             batch_ids = object_ids[start : start + batch_size]
             vectors = torch.stack(
                 [
-                    store.get(object_id, include_hidden=False).embedding.float()
+                    store.embedding_features(object_id).embedding.float()
                     for object_id in batch_ids
                 ]
             ).numpy().astype("float32")
@@ -210,6 +210,7 @@ class StudentANNIndices:
         self.device = device
         self.indices = {}
         self.object_ids = {}
+        self._relation_queries: dict[tuple[str, str], np.ndarray] = {}
         for object_type, record in manifest["types"].items():
             index = hnswlib.Index(space="ip", dim=model.student_dim)
             index.load_index(str(index_dir / record["index_path"]), max_elements=int(record["objects"]))
@@ -222,18 +223,51 @@ class StudentANNIndices:
 
     @torch.no_grad()
     def search(self, source_id: str, destination_type: str, k: int) -> list[tuple[str, float]]:
+        return self.search_many([source_id], destination_type, k)[0]
+
+    @torch.no_grad()
+    def search_many(
+        self, source_ids: list[str], destination_type: str, k: int
+    ) -> list[list[tuple[str, float]]]:
         destination_type = normalize_object_type(destination_type)
-        if k <= 0 or destination_type not in self.indices:
+        if not source_ids:
             return []
-        source = self.store.get(source_id, include_hidden=False)
-        embedding = source.embedding.to(device=self.device, dtype=torch.float32)
-        query = self.model.relation_query(embedding, source.object_type, destination_type)
-        query_array = query.detach().cpu().numpy().astype("float32").reshape(1, -1)
+        if k <= 0 or destination_type not in self.indices:
+            return [[] for _source_id in source_ids]
+
+        missing_by_type: dict[str, list[Any]] = defaultdict(list)
+        for source_id in dict.fromkeys(source_ids):
+            key = (source_id, destination_type)
+            if key not in self._relation_queries:
+                source = self.store.embedding_features(source_id)
+                missing_by_type[source.object_type].append(source)
+        for source_type, features in missing_by_type.items():
+            embeddings = torch.stack([value.embedding for value in features]).to(
+                device=self.device, dtype=torch.float32
+            )
+            queries = self.model.relation_query(
+                embeddings, source_type, destination_type
+            )
+            arrays = queries.detach().cpu().numpy().astype("float32")
+            for features_value, array in zip(features, arrays):
+                self._relation_queries[
+                    (features_value.object_id, destination_type)
+                ] = array
+
+        query_array = np.stack(
+            [self._relation_queries[(source_id, destination_type)] for source_id in source_ids]
+        )
         count = len(self.object_ids[destination_type])
         labels, distances = self.indices[destination_type].knn_query(query_array, k=min(k, count))
         return [
-            (self.object_ids[destination_type][int(label)], 1.0 - float(distance))
-            for label, distance in zip(labels[0], distances[0])
+            [
+                (
+                    self.object_ids[destination_type][int(label)],
+                    1.0 - float(distance),
+                )
+                for label, distance in zip(row_labels, row_distances)
+            ]
+            for row_labels, row_distances in zip(labels, distances)
         ]
 
 
@@ -283,20 +317,38 @@ class RawEmbeddingANNIndices:
     def search(
         self, source_id: str, destination_type: str, k: int
     ) -> list[tuple[str, float]]:
+        return self.search_many([source_id], destination_type, k)[0]
+
+    def search_many(
+        self, source_ids: list[str], destination_type: str, k: int
+    ) -> list[list[tuple[str, float]]]:
         destination_type = normalize_object_type(destination_type)
-        if k <= 0 or destination_type not in self.indices:
+        if not source_ids:
             return []
-        embedding = self.store.get(source_id, include_hidden=False).embedding.float()
-        if embedding.shape != (self.embedding_dim,):
-            raise ValueError(f"{source_id}: raw embedding dimension does not match the index")
-        query_array = embedding.numpy().astype("float32").reshape(1, -1)
+        if k <= 0 or destination_type not in self.indices:
+            return [[] for _source_id in source_ids]
+        embeddings = torch.stack(
+            [
+                self.store.embedding_features(source_id).embedding
+                for source_id in source_ids
+            ]
+        ).float()
+        if embeddings.shape[1:] != (self.embedding_dim,):
+            raise ValueError("Raw embedding dimension does not match the index")
+        query_array = embeddings.numpy().astype("float32")
         count = len(self.object_ids[destination_type])
         labels, distances = self.indices[destination_type].knn_query(
             query_array, k=min(k, count)
         )
         return [
-            (self.object_ids[destination_type][int(label)], 1.0 - float(distance))
-            for label, distance in zip(labels[0], distances[0])
+            [
+                (
+                    self.object_ids[destination_type][int(label)],
+                    1.0 - float(distance),
+                )
+                for label, distance in zip(row_labels, row_distances)
+            ]
+            for row_labels, row_distances in zip(labels, distances)
         ]
 
 
@@ -475,16 +527,29 @@ def retrieve_zero_one_hop_detailed(
     normalized_evidence_types = dict.fromkeys(
         normalize_object_type(value) for value in evidence_types
     )
-    for evidence_type in normalized_evidence_types:
-        for evidence_id, query_evidence_score in indices.search(query_id, evidence_type, evidence_k):
-            for target_id, evidence_target_score in indices.search(evidence_id, "table", targets_per_evidence):
-                paths_by_target[target_id].append(
-                    {
-                        "kind": "evidence",
-                        "evidence_id": evidence_id,
-                        "path_score": query_evidence_score + evidence_target_score,
-                    }
-                )
+    evidence_hits = [
+        (evidence_id, query_evidence_score)
+        for evidence_type in normalized_evidence_types
+        for evidence_id, query_evidence_score in indices.search(
+            query_id, evidence_type, evidence_k
+        )
+    ]
+    target_hits = indices.search_many(
+        [evidence_id for evidence_id, _score in evidence_hits],
+        "table",
+        targets_per_evidence,
+    )
+    for (evidence_id, query_evidence_score), evidence_targets in zip(
+        evidence_hits, target_hits
+    ):
+        for target_id, evidence_target_score in evidence_targets:
+            paths_by_target[target_id].append(
+                {
+                    "kind": "evidence",
+                    "evidence_id": evidence_id,
+                    "path_score": query_evidence_score + evidence_target_score,
+                }
+            )
 
     results = []
     for target_id, paths in paths_by_target.items():

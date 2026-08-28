@@ -53,8 +53,14 @@ from mmdd_stage1.retrieval import (
     build_indices,
     build_raw_embedding_indices,
     retrieve_zero_one_hop,
+    retrieve_zero_one_hop_detailed,
 )
 from mmdd_stage1.scoring import score_edge_batch, score_target_batch
+from mmdd_stage1.teacher_logits import (
+    has_teacher_logits,
+    load_teacher_logits,
+    score_and_cache_teacher_logits,
+)
 from mmdd_stage1.training import (
     checkpoint,
     sample_balanced_epoch,
@@ -83,6 +89,11 @@ def feature_store() -> FeatureStore:
             "evidence": feature("evidence", "text", 0.3),
         }
     )
+
+
+class _BatchedSearchMixin:
+    def search_many(self, source_ids, destination_type, k):
+        return [self.search(source_id, destination_type, k) for source_id in source_ids]
 
 
 @pytest.mark.parametrize(
@@ -392,7 +403,14 @@ def test_edge_scoring_validates_declared_destination_type():
 def test_all_four_training_stages_run_on_synthetic_features():
     torch.manual_seed(11)
     store = feature_store()
-    edge_examples = [EdgeExample("q", ("positive", "negative"), positive_index=0)]
+    edge_examples = [
+        EdgeExample(
+            "q",
+            ("positive", "negative"),
+            positive_index=0,
+            teacher_logits=(1.0, -1.0),
+        )
+    ]
     target_examples = [
         TargetExample(
             "q",
@@ -402,6 +420,8 @@ def test_all_four_training_stages_run_on_synthetic_features():
             ),
             direct_positive_index=0,
             evidence_positive_index=0,
+            teacher_direct_logits=(1.0, -1.0),
+            teacher_evidence_logits=(1.0, -1.0),
         )
     ]
     teacher_model = teacher()
@@ -432,7 +452,6 @@ def test_all_four_training_stages_run_on_synthetic_features():
     )
     student_edge_history = train_student_edges(
         student_model,
-        teacher_model,
         edge_examples,
         store,
         torch.optim.AdamW(student_model.parameters(), lr=1e-3),
@@ -444,7 +463,6 @@ def test_all_four_training_stages_run_on_synthetic_features():
     )
     student_path_history = train_student_paths(
         student_model,
-        teacher_model,
         target_examples,
         store,
         torch.optim.AdamW(student_model.parameters(), lr=1e-3),
@@ -577,7 +595,8 @@ def test_lazy_feature_store_loads_teacher_tier_only_when_requested(tmp_path):
     assert teacher_features.token_groups.tolist() == [0, 1]
     assert torch.equal(teacher_features.embedding, torch.ones(4))
     assert torch.equal(teacher_features.row_embeddings, torch.ones(1, 4))
-    assert store.dimensions() == (4, 4)
+    assert store.embedding_dimension() == 4
+    assert store.teacher_dimension() == 4
 
     torch.save(
         {"token_groups": torch.tensor([0, 1])},
@@ -1315,7 +1334,7 @@ def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path
 def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
     calls = Counter()
 
-    class StaticIndices:
+    class StaticIndices(_BatchedSearchMixin):
         def search(self, source_id, destination_type, k):
             del k
             destination_type = normalize_object_type(destination_type)
@@ -1349,7 +1368,7 @@ def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
 
 
 def test_online_retrieval_scores_all_paths_before_compacting_stage2_detail():
-    class StaticIndices:
+    class StaticIndices(_BatchedSearchMixin):
         def search(self, source_id, destination_type, k):
             del k
             values = {
@@ -1386,7 +1405,7 @@ def test_online_retrieval_scores_all_paths_before_compacting_stage2_detail():
 
 
 def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
-    class StaticIndices:
+    class StaticIndices(_BatchedSearchMixin):
         def search(self, source_id, destination_type, k):
             del k
             values = {
@@ -1447,7 +1466,6 @@ def test_dataset_sampling_alpha_balances_or_preserves_natural_mass():
 
 def test_student_edge_distillation_reuses_cached_teacher_logits():
     store = feature_store()
-    teacher_model = teacher()
     student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
     example = EdgeExample(
         "q",
@@ -1457,14 +1475,8 @@ def test_student_edge_distillation_reuses_cached_teacher_logits():
         teacher_logits=(3.0, -2.0),
     )
 
-    def unexpected_teacher_call(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("cached Teacher logits were not used")
-
-    teacher_model.score_pairs = unexpected_teacher_call
     history = train_student_edges(
         student_model,
-        teacher_model,
         [example],
         store,
         torch.optim.AdamW(student_model.parameters(), lr=1e-3),
@@ -1480,7 +1492,6 @@ def test_student_edge_distillation_reuses_cached_teacher_logits():
 
 def test_student_path_distillation_reuses_separate_cached_teacher_logits():
     store = feature_store()
-    teacher_model = teacher()
     student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
     example = TargetExample(
         "q",
@@ -1495,14 +1506,8 @@ def test_student_path_distillation_reuses_separate_cached_teacher_logits():
         teacher_evidence_logits=(-1.0, 2.0),
     )
 
-    def unexpected_teacher_call(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("cached Teacher channel logits were not used")
-
-    teacher_model.score_pairs = unexpected_teacher_call
     history = train_student_paths(
         student_model,
-        teacher_model,
         [example],
         store,
         torch.optim.AdamW(student_model.parameters(), lr=1e-3),
@@ -1563,7 +1568,7 @@ def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
 
 
 def test_hard_negative_refresh_mines_three_independent_candidate_pools():
-    class StaticIndices:
+    class StaticIndices(_BatchedSearchMixin):
         def search(self, source_id, destination_type, k):
             values = {
                 ("q", "table"): [
@@ -1828,3 +1833,331 @@ def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
     assert edges[("text", "table")]["candidate_ids"] == ["positive", "hard"]
     assert edges[("image", "table")]["candidate_ids"] == ["positive", "hard"]
     assert all(len(record["teacher_logits"]) == 2 for record in edge_records)
+
+
+def test_student_pair_scoring_projects_each_unique_object_once():
+    store = feature_store()
+    model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    sources = [store.get("q"), store.get("q"), store.get("evidence")]
+    destinations = [
+        store.get("positive"),
+        store.get("negative"),
+        store.get("positive"),
+    ]
+    expected = torch.stack(
+        [
+            model.score_embeddings(
+                source.embedding,
+                source.object_type,
+                destination.embedding,
+                destination.object_type,
+            )
+            for source, destination in zip(sources, destinations)
+        ]
+    )
+    projected_batch_sizes = {}
+    hooks = [
+        projection.register_forward_hook(
+            lambda _module, inputs, _output, object_type=object_type: (
+                projected_batch_sizes.setdefault(object_type, []).append(
+                    inputs[0].shape[0]
+                )
+            )
+        )
+        for object_type, projection in model.projections.items()
+    ]
+
+    actual = model.score_pairs(sources, destinations)
+    for hook in hooks:
+        hook.remove()
+
+    assert torch.allclose(actual, expected)
+    assert projected_batch_sizes == {"table": [3], "text": [1]}
+
+
+def test_target_scoring_batches_path_aggregation_once():
+    store = feature_store()
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        ),
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("negative", ()),
+                TargetCandidate("positive", ("evidence",)),
+            ),
+            direct_positive_index=1,
+            evidence_positive_index=1,
+        ),
+    ]
+    aggregator = PathAggregator()
+    calls = []
+    model = StudentJoinabilityModel(4, 3)
+    projection_calls = Counter()
+    hook = aggregator.register_forward_hook(
+        lambda _module, inputs, _output: calls.append(inputs[0].shape)
+    )
+    projection_hooks = [
+        projection.register_forward_hook(
+            lambda _module, _inputs, _output, object_type=object_type: projection_calls.update(
+                [object_type]
+            )
+        )
+        for object_type, projection in model.projections.items()
+    ]
+
+    scores = score_target_batch(
+        model,
+        examples,
+        store,
+        torch.device("cpu"),
+        aggregator,
+    )
+    hook.remove()
+    for projection_hook in projection_hooks:
+        projection_hook.remove()
+
+    assert scores.evidence.logits.shape == (2, 2)
+    assert calls == [torch.Size([1, 4, 1])]
+    assert projection_calls == {"table": 1, "text": 1}
+
+
+def test_student_training_rejects_missing_teacher_logits():
+    store = feature_store()
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    with pytest.raises(ValueError, match="requires cached Teacher logits"):
+        train_student_edges(
+            student_model,
+            [EdgeExample("q", ("negative", "positive"), 1)],
+            store,
+            torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+            device=torch.device("cpu"),
+            epochs=1,
+            batch_size=1,
+            seed=13,
+            temperature=1.0,
+        )
+
+
+def test_teacher_logit_sidecars_support_teacher_free_student_training(tmp_path):
+    store = feature_store()
+    teacher_model = teacher()
+    edge_examples = [EdgeExample("q", ("positive", "negative"), 0)]
+    cached_edges, edge_path = score_and_cache_teacher_logits(
+        edge_examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+    loaded_edges, loaded_path, hit = load_teacher_logits(
+        edge_examples, tmp_path, "teacher-sha"
+    )
+
+    assert hit
+    assert loaded_path == edge_path
+    assert loaded_edges == cached_edges
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    train_student_edges(
+        student_model,
+        loaded_edges,
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+    )
+
+    target_examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        )
+    ]
+    aggregator = PathAggregator()
+    cached_targets, _path = score_and_cache_teacher_logits(
+        target_examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=aggregator,
+    )
+    loaded_targets, _path, hit = load_teacher_logits(
+        target_examples, tmp_path, "teacher-sha", aggregator
+    )
+
+    assert hit
+    assert loaded_targets == cached_targets
+    assert not has_teacher_logits(
+        loaded_targets,
+        "teacher-sha",
+        PathAggregator("topk_sum", 1),
+    )
+
+
+def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_tier(
+    tmp_path, monkeypatch
+):
+    features_path = tmp_path / "features.pt"
+    store = feature_store()
+    features = {
+        object_id: {
+            "object_type": value.object_type,
+            "embedding": value.embedding,
+            "hidden_states": value.hidden_states,
+            "token_groups": value.token_groups,
+        }
+        for object_id in store.object_ids()
+        for value in [store.get(object_id)]
+    }
+    torch.save({"objects": features}, features_path)
+    data_path = tmp_path / "edges.jsonl"
+    data_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "query_id": "q",
+                    "candidate_ids": ["positive", "negative"],
+                    "positive_id": "positive",
+                    "dataset": "2k",
+                    "split": split,
+                }
+            )
+            + "\n"
+            for split in ("train", "dev")
+        ),
+        encoding="utf-8",
+    )
+    teacher_path = tmp_path / "teacher.pt"
+    torch.save(
+        checkpoint(teacher(), "teacher-path", PathAggregator()), teacher_path
+    )
+    cache_dir = tmp_path / "teacher_logits"
+
+    def arguments(output: Path):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "train_stage1.py",
+                "student-edge",
+                "--features",
+                str(features_path),
+                "--base-data",
+                str(data_path),
+                "--dev-data",
+                str(data_path),
+                "--teacher-checkpoint",
+                str(teacher_path),
+                "--teacher-logit-cache",
+                str(cache_dir),
+                "--output",
+                str(output),
+                "--device",
+                "cpu",
+                "--epochs",
+                "1",
+                "--batch-size",
+                "1",
+            ],
+        )
+        return train_stage1.parse_args()
+
+    first = train_stage1.run(arguments(tmp_path / "student_first.pt"))
+    assert first["teacher_cache_generated"]
+
+    for payload in features.values():
+        payload.pop("hidden_states")
+        payload.pop("token_groups")
+    torch.save({"objects": features}, features_path)
+    monkeypatch.setattr(
+        train_stage1,
+        "load_teacher",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Teacher was loaded after the logit cache was complete")
+        ),
+    )
+
+    second = train_stage1.run(arguments(tmp_path / "student_second.pt"))
+
+    assert not second["teacher_cache_generated"]
+    assert second["teacher_logit_cache_hits"] == 2
+
+
+def test_feature_store_preloads_contiguous_training_embeddings():
+    store = feature_store()
+    count = store.preload_embeddings(["q", "positive", "q"])
+    query = store.embedding_features("q").embedding
+    positive = store.embedding_features("positive").embedding
+
+    assert count == 2
+    assert query.data_ptr() + query.numel() * query.element_size() == positive.data_ptr()
+    store.get = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("preloaded embedding fell back to the object file")
+    )
+    assert torch.equal(store.embedding_features("q").embedding, query)
+
+
+def test_retrieval_batches_all_evidence_to_target_queries():
+    class BatchIndices:
+        def __init__(self):
+            self.batch_calls = []
+
+        def search(self, source_id, destination_type, k):
+            del k
+            values = {
+                ("q", "table"): [("direct", 1.0)],
+                ("q", "text"): [("e1", 2.0), ("e2", 1.0)],
+            }
+            return values.get((source_id, destination_type), [])
+
+        def search_many(self, source_ids, destination_type, k):
+            self.batch_calls.append((source_ids, destination_type, k))
+            return [[("target", 0.5)] for _source_id in source_ids]
+
+    indices = BatchIndices()
+    retrieve_zero_one_hop_detailed(
+        "q",
+        indices,
+        direct_k=1,
+        evidence_k=2,
+        targets_per_evidence=3,
+        evidence_types=("text",),
+    )
+
+    assert indices.batch_calls == [(["e1", "e2"], "table", 3)]
+
+
+def test_epoch_controller_prunes_only_non_best_non_latest_indices(tmp_path):
+    paths = [tmp_path / f"epoch_{epoch:03d}" for epoch in range(1, 4)]
+    for path in paths:
+        path.mkdir()
+    controller = object.__new__(train_stage1._EpochController)
+    controller.created_indices = paths
+    controller.best_index = paths[0]
+    controller.latest_index = paths[2]
+
+    controller.prune_indices()
+
+    assert paths[0].is_dir()
+    assert not paths[1].exists()
+    assert paths[2].is_dir()

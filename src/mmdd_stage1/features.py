@@ -137,6 +137,7 @@ class FeatureStore:
         self._teacher_index = dict(teacher_index or {})
         self._cache_size = max(0, cache_size)
         self._cache: OrderedDict[tuple[str, bool], ObjectFeatures] = OrderedDict()
+        self._preloaded_features: dict[str, ObjectFeatures] = {}
         if not self._eager and not self._index:
             raise ValueError("Feature store is empty")
 
@@ -219,6 +220,59 @@ class FeatureStore:
         yield from self._eager
         yield from self._index
 
+    def preload_embeddings(self, object_ids: Iterable[str]) -> int:
+        """Load the referenced raw embeddings into one contiguous CPU tensor."""
+
+        unique_ids = list(dict.fromkeys(str(object_id) for object_id in object_ids))
+        if not unique_ids:
+            self._preloaded_features = {}
+            self._cache.clear()
+            return 0
+
+        embeddings = torch.empty((len(unique_ids), self.embedding_dimension()))
+        preloaded = {}
+        for row, object_id in enumerate(unique_ids):
+            features = self.get(object_id, include_hidden=False)
+            embeddings[row].copy_(features.embedding)
+            preloaded[object_id] = ObjectFeatures(
+                object_id=object_id,
+                object_type=features.object_type,
+                embedding=embeddings[row],
+            )
+        self._preloaded_features = preloaded
+        self._cache.clear()
+        return len(unique_ids)
+
+    def embedding_features(self, object_id: str) -> ObjectFeatures:
+        """Return scoring features from the contiguous embedding tier when loaded."""
+
+        features = self._preloaded_features.get(object_id)
+        return features if features is not None else self.get(
+            object_id, include_hidden=False
+        )
+
+    def embedding_dimension(self) -> int:
+        first_id = next(iter(self.object_ids()))
+        return int(self.embedding_features(first_id).embedding.shape[0])
+
+    def teacher_dimension(self) -> int | None:
+        hidden = next(
+            (
+                feature.hidden_states
+                for feature in self._eager.values()
+                if feature.hidden_states is not None
+            ),
+            None,
+        )
+        if hidden is None and self._teacher_index:
+            teacher_id = next(iter(self._teacher_index))
+            hidden = self.get(teacher_id, include_hidden=True).hidden_states
+        if hidden is None and not self._teacher_index:
+            # Legacy directory caches kept both tiers in the base object file.
+            first_id = next(iter(self.object_ids()))
+            hidden = self.get(first_id, include_hidden=True).hidden_states
+        return int(hidden.shape[1]) if hidden is not None else None
+
     def get(self, object_id: str, *, include_hidden: bool = True) -> ObjectFeatures:
         if object_id in self._eager:
             value = self._eager[object_id]
@@ -267,23 +321,3 @@ class FeatureStore:
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         return feature
-
-    def dimensions(self) -> tuple[int, int | None]:
-        first_id = next(iter(self.object_ids()))
-        first = self.get(first_id, include_hidden=False)
-        hidden = next(
-            (
-                feature.hidden_states
-                for feature in self._eager.values()
-                if feature.hidden_states is not None
-            ),
-            None,
-        )
-        if hidden is None and self._teacher_index:
-            teacher_id = next(iter(self._teacher_index))
-            hidden = self.get(teacher_id, include_hidden=True).hidden_states
-        if hidden is None and not self._teacher_index:
-            # Legacy directory caches kept both tiers in the base object file.
-            hidden = self.get(first_id, include_hidden=True).hidden_states
-        hidden_dim = hidden.shape[1] if hidden is not None else None
-        return int(first.embedding.shape[0]), int(hidden_dim) if hidden_dim is not None else None

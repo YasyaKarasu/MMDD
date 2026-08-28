@@ -147,7 +147,7 @@ def _edge_examples_for_candidate_set(
     positive_evidence_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
     negative_evidence_by_type: dict[str, list[str]] = {}
     for evidence_id in evidence_negative_ids:
-        evidence_type = store.get(evidence_id, include_hidden=False).object_type
+        evidence_type = store.embedding_features(evidence_id).object_type
         negative_evidence_by_type.setdefault(evidence_type, []).append(evidence_id)
 
     examples = [
@@ -162,7 +162,7 @@ def _edge_examples_for_candidate_set(
         )
     ]
     for evidence_id in positive_evidence_ids:
-        evidence_type = store.get(evidence_id, include_hidden=False).object_type
+        evidence_type = store.embedding_features(evidence_id).object_type
         negative_evidence_ids = negative_evidence_by_type.get(evidence_type, [])
         if negative_evidence_ids:
             examples.append(
@@ -277,10 +277,12 @@ def retrieve_hard_candidate_sets(
         positive_evidence_ids = set(evidence_positive.evidence_ids)
         hard_evidence_ids = []
         hard_paths = []
+        all_evidence_hits = []
         for evidence_type in dict.fromkeys(evidence_types):
             evidence_hits = indices.search(example.query_id, evidence_type, evidence_k)
             evidence_negatives_for_type = 0
             for evidence_id, query_evidence_score in evidence_hits:
+                all_evidence_hits.append((evidence_id, query_evidence_score))
                 if (
                     evidence_id not in positive_evidence_ids
                     and evidence_negatives_for_type < hard_evidence_per_type
@@ -288,18 +290,24 @@ def retrieve_hard_candidate_sets(
                     hard_evidence_ids.append(evidence_id)
                     evidence_negatives_for_type += 1
 
-                for target_id, evidence_target_score in indices.search(
-                    evidence_id, "table", targets_per_evidence
-                ):
-                    if target_id == example.query_id or target_id in known_positives:
-                        continue
-                    hard_paths.append(
-                        HardPath(
-                            evidence_id,
-                            target_id,
-                            float(query_evidence_score) + float(evidence_target_score),
-                        )
+        target_hits = indices.search_many(
+            [evidence_id for evidence_id, _score in all_evidence_hits],
+            "table",
+            targets_per_evidence,
+        )
+        for (evidence_id, query_evidence_score), evidence_targets in zip(
+            all_evidence_hits, target_hits
+        ):
+            for target_id, evidence_target_score in evidence_targets:
+                if target_id == example.query_id or target_id in known_positives:
+                    continue
+                hard_paths.append(
+                    HardPath(
+                        evidence_id,
+                        target_id,
+                        float(query_evidence_score) + float(evidence_target_score),
                     )
+                )
 
         hard_paths.sort(key=lambda path: (-path.score, path.target_id, path.evidence_id))
         candidate_sets.append(

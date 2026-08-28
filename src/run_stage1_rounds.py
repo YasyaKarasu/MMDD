@@ -146,6 +146,9 @@ def _train_args(
         weight_decay=args.weight_decay,
         seed=args.seed,
         feature_cache_size=args.feature_cache_size,
+        teacher_logit_cache=None,
+        teacher_logit_batch_size=args.teacher_batch_size,
+        preload_embeddings=True,
         dataset_sampling_alpha=args.dataset_sampling_alpha,
         primary_metric=args.primary_metric,
         min_delta=args.min_delta,
@@ -517,6 +520,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "round": mining_round,
                 "hard_fraction": args.hard_fraction,
                 "learning_rate": args.hard_learning_rate,
+                "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "patience": args.patience,
             },
@@ -556,6 +560,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "round": mining_round,
                 "hard_fraction": args.hard_fraction,
                 "learning_rate": args.hard_learning_rate,
+                "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "primary_metric": args.primary_metric,
                 "min_delta": args.min_delta,
@@ -641,7 +646,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--round-min-delta", type=float, default=0.0)
 
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--hard-learning-rate", type=float, default=2e-5)
     parser.add_argument("--hard-fraction", type=float, default=0.5)

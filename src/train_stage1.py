@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,11 @@ from mmdd_stage1.retrieval import (
     load_corpus_ids,
 )
 from mmdd_stage1.selection import CheckpointManager, MetricGate, write_json
+from mmdd_stage1.teacher_logits import (
+    has_teacher_logits,
+    load_teacher_logits,
+    score_and_cache_teacher_logits,
+)
 from mmdd_stage1.training import (
     checkpoint,
     train_student_edges,
@@ -62,31 +68,27 @@ def _load_target_training_data(paths: list[Path], split: str):
     ]
 
 
-def _validate_cached_teacher(
-    examples: list[Any], teacher_checkpoint: Path, *, require_all: bool = False
-) -> None:
-    expected = checkpoint_fingerprint(teacher_checkpoint)
-    fingerprints = [example.teacher_checkpoint_sha256 for example in examples]
-    if require_all and any(value is None for value in fingerprints):
-        raise ValueError("Hard-negative data must contain cached Teacher logits and fingerprint metadata")
-    if require_all and any(
-        (
-            isinstance(example, EdgeExample)
-            and example.teacher_logits is None
-        )
-        or (
-            isinstance(example, TargetExample)
-            and (
-                example.teacher_direct_logits is None
-                or example.teacher_evidence_logits is None
-            )
-        )
-        for example in examples
-    ):
-        raise ValueError("Hard-negative data must contain cached frozen-Teacher logits")
-    mismatched = {value for value in fingerprints if value is not None and value != expected}
-    if mismatched:
-        raise ValueError("Cached Teacher logits were produced by a different Teacher checkpoint")
+def _referenced_object_ids(examples: list[Any]) -> list[str]:
+    object_ids = []
+    for example in examples:
+        object_ids.append(example.query_id)
+        if isinstance(example, EdgeExample):
+            object_ids.extend(example.candidate_ids)
+        else:
+            for candidate in example.candidates:
+                object_ids.append(candidate.target_id)
+                object_ids.extend(candidate.evidence_ids)
+    return list(dict.fromkeys(object_ids))
+
+
+def _teacher_logit_cache_dir(args: argparse.Namespace) -> Path:
+    configured = args.teacher_logit_cache
+    if configured:
+        return Path(configured)
+    features = Path(args.features)
+    if features.is_dir():
+        return features / "teacher_logits"
+    return features.parent / f"{features.name}.teacher_logits"
 
 
 def _metadata(path: Path) -> dict[str, Any]:
@@ -159,6 +161,8 @@ class _EpochController:
         self.args = args
         self.best_metrics: dict[str, Any] | None = None
         self.best_index: Path | None = None
+        self.latest_index: Path | None = None
+        self.created_indices: list[Path] = []
         self.raw_embedding_metrics: dict[str, Any] | None = None
         self.stop_reason = "max_epochs"
         self.corpus_sha256 = (
@@ -187,6 +191,8 @@ class _EpochController:
             assert self.raw_index_root is not None
             assert self.ids_by_type is not None
             index_dir = self.index_root / f"epoch_{epoch:03d}"
+            self.latest_index = index_dir
+            self.created_indices.append(index_dir)
             build_indices(
                 model,
                 self.store,
@@ -264,6 +270,12 @@ class _EpochController:
             self.stop_reason = f"early_stopping_patience_{self.gate.patience}"
         return decision.should_stop
 
+    def prune_indices(self) -> None:
+        retained = {self.best_index, self.latest_index}
+        for path in self.created_indices:
+            if path not in retained and path.is_dir():
+                shutil.rmtree(path)
+
 
 def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[Path]]:
     legacy = getattr(args, "train_data", None)
@@ -284,8 +296,12 @@ def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.batch_size is None:
+        args.batch_size = 64 if args.stage.startswith("student") else 8
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("--epochs and --batch-size must be positive")
+    if args.teacher_logit_batch_size <= 0:
+        raise ValueError("--teacher-logit-batch-size must be positive")
     if args.temperature <= 0:
         raise ValueError("--temperature must be positive")
     if args.distillation_weight < 0:
@@ -317,11 +333,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     store = FeatureStore.from_path(
         Path(args.features), cache_size=args.feature_cache_size
     )
-    embedding_dim, hidden_dim = store.dimensions()
-    if hidden_dim is None:
-        raise ValueError(
-            "All training stages require hidden_states so the frozen Teacher can score candidates"
-        )
+    embedding_dim = store.embedding_dimension()
+    hidden_dim: int | None = None
 
     is_path = args.stage.endswith("path")
     loader = _load_target_training_data if is_path else _load_edge_training_data
@@ -346,15 +359,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     teacher: TeacherJoinabilityModel | None = None
     student: StudentJoinabilityModel | None = None
-    teacher_path: Path | None = None
     mining_round = None
+    teacher_cache_paths: list[Path] = []
+    teacher_cache_hits = 0
+    teacher_cache_generated = False
+    preloaded_embeddings = 0
     if args.stage.startswith("student"):
         teacher_path = _required_path(
             args.teacher_checkpoint, "--teacher-checkpoint", args.stage
         )
-        teacher = load_teacher(teacher_path, device)
-        _validate_cached_teacher(examples, teacher_path)
-        _validate_cached_teacher(dev_examples, teacher_path)
+        teacher_sha256 = checkpoint_fingerprint(teacher_path)
+        cache_aggregator = aggregator if is_path else None
         if hard_examples:
             source_checkpoint = _required_path(
                 args.hard_source_checkpoint,
@@ -367,7 +382,75 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 source_student_checkpoint=source_checkpoint,
                 aggregator=aggregator,
             )
-            _validate_cached_teacher(hard_examples, teacher_path, require_all=True)
+            if not has_teacher_logits(
+                hard_examples, teacher_sha256, cache_aggregator
+            ):
+                raise ValueError(
+                    "Hard-negative data must contain matching cached Teacher logits"
+                )
+
+        cache_dir = _teacher_logit_cache_dir(args)
+        examples, train_cache_path, train_cache_hit = load_teacher_logits(
+            examples, cache_dir, teacher_sha256, cache_aggregator
+        )
+        dev_examples, dev_cache_path, dev_cache_hit = load_teacher_logits(
+            dev_examples, cache_dir, teacher_sha256, cache_aggregator
+        )
+        teacher_cache_hits = int(train_cache_hit) + int(dev_cache_hit)
+
+        train_logits_ready = has_teacher_logits(
+            examples, teacher_sha256, cache_aggregator
+        )
+        dev_logits_ready = has_teacher_logits(
+            dev_examples, teacher_sha256, cache_aggregator
+        )
+        if not train_logits_ready or not dev_logits_ready:
+            frozen_teacher = load_teacher(teacher_path, device)
+            teacher_cache_generated = True
+            hidden_dim = store.teacher_dimension()
+            if hidden_dim is None:
+                raise ValueError(
+                    "Teacher logit cache is incomplete and the feature cache has no hidden_states"
+                )
+            if frozen_teacher.input_dim != hidden_dim:
+                raise ValueError(
+                    "Teacher checkpoint input dimension does not match the feature cache"
+                )
+            if not train_logits_ready:
+                examples, train_cache_path = score_and_cache_teacher_logits(
+                    examples,
+                    frozen_teacher,
+                    store,
+                    cache_dir,
+                    teacher_sha256,
+                    device=device,
+                    batch_size=args.teacher_logit_batch_size,
+                    aggregator=cache_aggregator,
+                )
+            if not dev_logits_ready:
+                dev_examples, dev_cache_path = score_and_cache_teacher_logits(
+                    dev_examples,
+                    frozen_teacher,
+                    store,
+                    cache_dir,
+                    teacher_sha256,
+                    device=device,
+                    batch_size=args.teacher_logit_batch_size,
+                    aggregator=cache_aggregator,
+                )
+            del frozen_teacher
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        teacher_cache_paths = [train_cache_path, dev_cache_path]
+
+        if args.preload_embeddings:
+            preloaded_embeddings = store.preload_embeddings(
+                _referenced_object_ids([*examples, *hard_examples, *dev_examples])
+            )
+    else:
+        hidden_dim = store.teacher_dimension()
+        if hidden_dim is None:
+            raise ValueError("Teacher training requires cached hidden_states")
 
     corpus_path = None
     index_root = None
@@ -380,10 +463,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if args.index_root
             else Path(args.output).with_suffix(".dev_indices")
         )
-        raw_index_root_value = getattr(args, "raw_index_root", None)
         raw_index_root = (
-            Path(raw_index_root_value)
-            if raw_index_root_value
+            Path(args.raw_index_root)
+            if args.raw_index_root
             else index_root / "raw_embedding"
         )
         primary_metric = args.primary_metric
@@ -454,7 +536,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             teacher, examples, store, optimizer, aggregator, **common
         )
     elif args.stage == "student-edge":
-        assert teacher is not None and teacher_path is not None
         if hard_examples and not args.student_checkpoint:
             raise ValueError(
                 "Hard-negative Student edge training must continue from the previous best Student checkpoint"
@@ -471,14 +552,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if args.student_checkpoint
             else StudentJoinabilityModel(embedding_dim, args.student_dim).to(device)
         )
-        if teacher.input_dim != hidden_dim or student.input_dim != embedding_dim:
-            raise ValueError("Checkpoint input dimensions do not match the feature cache")
+        if student.input_dim != embedding_dim:
+            raise ValueError("Student checkpoint input dimension does not match the feature cache")
         optimizer = torch.optim.AdamW(
             student.parameters(), lr=learning_rate, weight_decay=args.weight_decay
         )
         history = train_student_edges(
             student,
-            teacher,
             examples,
             store,
             optimizer,
@@ -486,19 +566,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             **common,
         )
     else:
-        assert teacher is not None and teacher_path is not None
         student_path = _required_path(
             args.student_checkpoint, "--student-checkpoint", args.stage
         )
         student = load_student(student_path, device)
-        if teacher.input_dim != hidden_dim or student.input_dim != embedding_dim:
-            raise ValueError("Checkpoint input dimensions do not match the feature cache")
+        if student.input_dim != embedding_dim:
+            raise ValueError("Student checkpoint input dimension does not match the feature cache")
         optimizer = torch.optim.AdamW(
             student.parameters(), lr=learning_rate, weight_decay=args.weight_decay
         )
         history = train_student_paths(
             student,
-            teacher,
             examples,
             store,
             optimizer,
@@ -508,6 +586,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             **common,
         )
 
+    controller.prune_indices()
     paths = controller.manager.paths
     assert controller.best_metrics is not None
     best_sha256 = checkpoint_fingerprint(paths["best"])
@@ -537,6 +616,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "hard_examples": len(hard_examples),
         "hard_fraction": args.hard_fraction if hard_examples else 0.0,
         "mining_round": mining_round,
+        "teacher_cache_generated": teacher_cache_generated,
+        "teacher_logit_cache_hits": teacher_cache_hits,
+        "teacher_logit_caches": [str(path.resolve()) for path in teacher_cache_paths],
+        "preloaded_embeddings": preloaded_embeddings,
     }
     selection = {
         "format_version": 1,
@@ -551,6 +634,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "best_index": (
             str(controller.best_index.resolve())
             if controller.best_index is not None
+            else None
+        ),
+        "latest_index": (
+            str(controller.latest_index.resolve())
+            if controller.latest_index is not None
             else None
         ),
         "raw_embedding_index": (
@@ -581,6 +669,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "base_examples": len(examples),
         "hard_examples": len(hard_examples),
         "stage2_allowed": stage2_allowed,
+        "teacher_cache_generated": teacher_cache_generated,
+        "teacher_logit_cache_hits": teacher_cache_hits,
+        "preloaded_embeddings": preloaded_embeddings,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
@@ -608,13 +699,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dev-split", default="dev", choices=["dev"])
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Defaults to 8 for Teacher stages and 64 for vectorized Student stages.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--hard-learning-rate", type=float, default=2e-5)
     parser.add_argument("--hard-fraction", type=float, default=0.5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--feature-cache-size", type=int, default=128)
+    parser.add_argument(
+        "--teacher-logit-cache",
+        help="Persistent base/dev Teacher-logit cache; defaults inside the feature cache.",
+    )
+    parser.add_argument("--teacher-logit-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--preload-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preload all Student-training embeddings into one contiguous CPU tensor.",
+    )
     parser.add_argument("--dataset-sampling-alpha", type=float, default=0.0)
 
     parser.add_argument("--primary-metric", default="recall@10")

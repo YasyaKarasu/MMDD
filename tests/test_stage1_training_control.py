@@ -93,6 +93,12 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
             }
             return values.get((source_id, destination_type), [])[:k]
 
+        def search_many(self, source_ids, destination_type, k):
+            return [
+                self.search(source_id, destination_type, k)
+                for source_id in source_ids
+            ]
+
     example = TargetExample(
         "q",
         (

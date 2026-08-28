@@ -37,11 +37,12 @@ def _device_features(
     include_hidden: bool,
 ) -> ObjectFeatures:
     if object_id not in cache:
-        cache[object_id] = store.get(
-            object_id, include_hidden=include_hidden
-        ).for_scoring(
-            device, include_hidden=include_hidden
-        )
+        if include_hidden:
+            cache[object_id] = store.get(
+                object_id, include_hidden=True
+            ).for_scoring(device, include_hidden=True)
+        else:
+            cache[object_id] = store.embedding_features(object_id)
     return cache[object_id]
 
 
@@ -149,38 +150,40 @@ def score_target_batch(
             query_evidence_scores = direct_scores.new_empty(0)
             evidence_target_edge_scores = direct_scores.new_empty(0)
     else:
-        direct_scores = model.score_pairs(direct_sources, direct_destinations)
-        if evidence_sources:
-            query_evidence_scores = model.score_pairs(evidence_sources, evidence_destinations)
-            evidence_target_edge_scores = model.score_pairs(target_sources, target_destinations)
-        else:
-            query_evidence_scores = direct_scores.new_empty(0)
-            evidence_target_edge_scores = direct_scores.new_empty(0)
+        evidence_count = len(evidence_sources)
+        scores = model.score_pairs(
+            [*direct_sources, *evidence_sources, *target_sources],
+            [*direct_destinations, *evidence_destinations, *target_destinations],
+        )
+        direct_scores, query_evidence_scores, evidence_target_edge_scores = (
+            scores.split((len(direct_sources), evidence_count, evidence_count))
+        )
 
-    evidence_scores = []
-    evidence_offset = 0
-    for evidence_count in evidence_lengths:
-        if evidence_count:
-            query_evidence = query_evidence_scores[evidence_offset : evidence_offset + evidence_count]
-            evidence_target = evidence_target_edge_scores[
-                evidence_offset : evidence_offset + evidence_count
-            ]
-            evidence_offset += evidence_count
-            evidence_score = aggregator(
-                query_evidence.reshape(1, 1, evidence_count),
-                evidence_target.reshape(1, 1, evidence_count),
-                torch.ones((1, 1, evidence_count), dtype=torch.bool, device=device),
-            ).squeeze()
-        else:
-            evidence_score = direct_scores.new_zeros(())
-        evidence_scores.append(evidence_score)
+    query_evidence_rows = pad_sequence(
+        list(query_evidence_scores.split(evidence_lengths)),
+        batch_first=True,
+        padding_value=0.0,
+    )
+    evidence_target_rows = pad_sequence(
+        list(evidence_target_edge_scores.split(evidence_lengths)),
+        batch_first=True,
+        padding_value=0.0,
+    )
+    evidence_path_mask = _mask(
+        evidence_lengths, query_evidence_rows.shape[1], device
+    )
+    evidence_scores = aggregator(
+        query_evidence_rows.unsqueeze(0),
+        evidence_target_rows.unsqueeze(0),
+        evidence_path_mask.unsqueeze(0),
+    ).squeeze(0)
 
     candidate_lengths = [len(example.candidates) for example in examples]
     direct_rows = pad_sequence(
         list(direct_scores.split(candidate_lengths)), batch_first=True, padding_value=0.0
     )
     evidence_rows = pad_sequence(
-        list(torch.stack(evidence_scores).split(candidate_lengths)),
+        list(evidence_scores.split(candidate_lengths)),
         batch_first=True,
         padding_value=0.0,
     )

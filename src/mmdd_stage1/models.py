@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Sequence
 
 import torch
@@ -249,14 +250,53 @@ class StudentJoinabilityModel(nn.Module):
     ) -> torch.Tensor:
         if len(sources) != len(destinations):
             raise ValueError("Pair inputs must have equal lengths")
+        parameter = next(self.parameters())
         if not sources:
-            parameter = next(self.parameters())
             return parameter.new_empty(0)
-        scores = [
-            self.score_embeddings(source.embedding, source.object_type, destination.embedding, destination.object_type)
-            for source, destination in zip(sources, destinations)
-        ]
-        return torch.stack(scores)
+
+        projected: dict[tuple[str, str], torch.Tensor] = {}
+        features_by_type: dict[str, dict[str, ObjectFeatures]] = defaultdict(dict)
+        for features in (*sources, *destinations):
+            features_by_type[features.object_type].setdefault(
+                features.object_id, features
+            )
+
+        for object_type, by_id in features_by_type.items():
+            object_ids = list(by_id)
+            embeddings = torch.stack(
+                [by_id[object_id].embedding for object_id in object_ids]
+            ).to(device=parameter.device, dtype=torch.float32)
+            vectors = self.project(embeddings, object_type)
+            projected.update(
+                ((object_type, object_id), vectors[row])
+                for row, object_id in enumerate(object_ids)
+            )
+
+        pair_groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for index, (source, destination) in enumerate(zip(sources, destinations)):
+            pair_groups[(source.object_type, destination.object_type)].append(index)
+
+        scores = parameter.new_empty(len(sources))
+        for (source_type, destination_type), pair_indices in pair_groups.items():
+            source_vectors = torch.stack(
+                [
+                    projected[(source_type, sources[index].object_id)]
+                    for index in pair_indices
+                ]
+            )
+            destination_vectors = torch.stack(
+                [
+                    projected[(destination_type, destinations[index].object_id)]
+                    for index in pair_indices
+                ]
+            )
+            relation = self.relations[
+                self.relation_key(source_type, destination_type)
+            ]
+            values = ((source_vectors @ relation) * destination_vectors).sum(dim=-1)
+            indices = torch.tensor(pair_indices, device=scores.device)
+            scores = scores.index_copy(0, indices, values)
+        return scores
 
     def relation_query(
         self,

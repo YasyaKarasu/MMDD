@@ -163,27 +163,33 @@ def _list_scores(
     return ListScores(logits, candidate_mask, positive_indices)
 
 
-def _cached_edge_teacher_scores(
+def _edge_teacher_scores(
     examples: Sequence[EdgeExample],
     device: torch.device,
-) -> ListScores | None:
-    if not all(example.teacher_logits is not None for example in examples):
-        return None
-    rows = [torch.tensor(example.teacher_logits, dtype=torch.float32, device=device) for example in examples]
-    positive_indices = torch.tensor([example.positive_index for example in examples], device=device)
+) -> ListScores:
+    if any(example.teacher_logits is None for example in examples):
+        raise ValueError("Student training requires cached Teacher logits")
+    rows = [
+        torch.tensor(example.teacher_logits, dtype=torch.float32, device=device)
+        for example in examples
+    ]
+    positive_indices = torch.tensor(
+        [example.positive_index for example in examples], device=device
+    )
     return _list_scores(rows, positive_indices, device)
 
 
-def _cached_target_teacher_scores(
+def _target_teacher_scores(
     examples: Sequence[TargetExample],
     device: torch.device,
-) -> TargetScores | None:
-    if not all(
-        example.teacher_direct_logits is not None
-        and example.teacher_evidence_logits is not None
+) -> TargetScores:
+    if any(
+        example.teacher_direct_logits is None
+        or example.teacher_evidence_logits is None
         for example in examples
     ):
-        return None
+        raise ValueError("Student training requires cached Teacher logits")
+
     direct_positive_indices = torch.tensor(
         [example.direct_positive_index for example in examples], device=device
     )
@@ -192,7 +198,9 @@ def _cached_target_teacher_scores(
     )
     direct = _list_scores(
         [
-            torch.tensor(example.teacher_direct_logits, dtype=torch.float32, device=device)
+            torch.tensor(
+                example.teacher_direct_logits, dtype=torch.float32, device=device
+            )
             for example in examples
         ],
         direct_positive_indices,
@@ -200,7 +208,9 @@ def _cached_target_teacher_scores(
     )
     evidence_logits = pad_sequence(
         [
-            torch.tensor(example.teacher_evidence_logits, dtype=torch.float32, device=device)
+            torch.tensor(
+                example.teacher_evidence_logits, dtype=torch.float32, device=device
+            )
             for example in examples
         ],
         batch_first=True,
@@ -218,8 +228,12 @@ def _cached_target_teacher_scores(
         batch_first=True,
         padding_value=False,
     )
-    evidence = ListScores(evidence_logits, evidence_mask, evidence_positive_indices)
-    return TargetScores(direct=direct, evidence=evidence)
+    return TargetScores(
+        direct=direct,
+        evidence=ListScores(
+            evidence_logits, evidence_mask, evidence_positive_indices
+        ),
+    )
 
 
 def _path_supervised_losses(scores: TargetScores) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -334,7 +348,6 @@ def _teacher_path_objective(
 @torch.no_grad()
 def _student_edge_objective(
     student: StudentJoinabilityModel,
-    teacher: TeacherJoinabilityModel,
     examples: Sequence[EdgeExample],
     store: FeatureStore,
     device: torch.device,
@@ -342,12 +355,9 @@ def _student_edge_objective(
     temperature: float,
 ) -> float:
     student.eval()
-    teacher.eval()
     losses = []
     for batch in _batches(examples, batch_size):
-        teacher_scores = _cached_edge_teacher_scores(batch, device)
-        if teacher_scores is None:
-            teacher_scores = score_edge_batch(teacher, batch, store, device)
+        teacher_scores = _edge_teacher_scores(batch, device)
         student_scores = score_edge_batch(student, batch, store, device)
         losses.append(
             float(
@@ -379,7 +389,6 @@ def _validate_cached_path_aggregation(
 @torch.no_grad()
 def _student_path_objective(
     student: StudentJoinabilityModel,
-    teacher: TeacherJoinabilityModel,
     examples: Sequence[TargetExample],
     store: FeatureStore,
     aggregator: PathAggregator,
@@ -389,14 +398,9 @@ def _student_path_objective(
     distillation_weight: float,
 ) -> float:
     student.eval()
-    teacher.eval()
     losses = []
     for batch in _batches(examples, batch_size):
-        teacher_scores = _cached_target_teacher_scores(batch, device)
-        if teacher_scores is None:
-            teacher_scores = score_target_batch(
-                teacher, batch, store, device, aggregator
-            )
+        teacher_scores = _target_teacher_scores(batch, device)
         student_scores = score_target_batch(
             student, batch, store, device, aggregator
         )
@@ -510,7 +514,6 @@ def train_teacher_paths(
 
 def train_student_edges(
     student: StudentJoinabilityModel,
-    teacher: TeacherJoinabilityModel,
     examples: Sequence[EdgeExample],
     store: FeatureStore,
     optimizer: torch.optim.Optimizer,
@@ -528,8 +531,6 @@ def train_student_edges(
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    teacher.eval()
-    teacher.requires_grad_(False)
     for epoch in range(epochs):
         student.train()
         losses = []
@@ -541,10 +542,7 @@ def train_student_edges(
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
         for batch in _batches(sampled, batch_size):
-            teacher_scores = _cached_edge_teacher_scores(batch, device)
-            if teacher_scores is None:
-                with torch.no_grad():
-                    teacher_scores = score_edge_batch(teacher, batch, store, device)
+            teacher_scores = _edge_teacher_scores(batch, device)
             student_scores = score_edge_batch(student, batch, store, device)
             loss = distillation_kl(
                 student_scores.logits,
@@ -559,7 +557,6 @@ def train_student_edges(
         if dev_examples:
             values["dev_loss"] = _student_edge_objective(
                 student,
-                teacher,
                 dev_examples,
                 store,
                 device,
@@ -574,7 +571,6 @@ def train_student_edges(
 
 def train_student_paths(
     student: StudentJoinabilityModel,
-    teacher: TeacherJoinabilityModel,
     examples: Sequence[TargetExample],
     store: FeatureStore,
     optimizer: torch.optim.Optimizer,
@@ -594,8 +590,6 @@ def train_student_paths(
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    teacher.eval()
-    teacher.requires_grad_(False)
     _validate_cached_path_aggregation(
         [*examples, *hard_examples, *dev_examples], aggregator
     )
@@ -616,10 +610,7 @@ def train_student_paths(
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
         for batch in _batches(sampled, batch_size):
-            teacher_scores = _cached_target_teacher_scores(batch, device)
-            if teacher_scores is None:
-                with torch.no_grad():
-                    teacher_scores = score_target_batch(teacher, batch, store, device, aggregator)
+            teacher_scores = _target_teacher_scores(batch, device)
             student_scores = score_target_batch(student, batch, store, device, aggregator)
             supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
                 student_scores
@@ -650,7 +641,6 @@ def train_student_paths(
         if dev_examples:
             values["dev_loss"] = _student_path_objective(
                 student,
-                teacher,
                 dev_examples,
                 store,
                 aggregator,

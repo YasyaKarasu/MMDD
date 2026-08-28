@@ -151,6 +151,22 @@ conda run -n MMDD python src/train_stage1.py student-path \
   --output checkpoints/student_path.pt
 ```
 
+Student stages automatically cache all base-train and fixed-dev Teacher logits
+before optimization. Sidecars default to `FEATURES/teacher_logits/` and are
+keyed by the full Teacher checkpoint SHA-256, candidate-list fingerprint, and
+path aggregation settings. `--teacher-logit-cache` selects another directory,
+and `--teacher-logit-batch-size` controls only the one-time Teacher pass. Once
+both sidecars exist, Student training does not instantiate the Teacher or read
+the Teacher hidden-feature tier. Changing the Teacher, candidates, split, or
+path aggregation creates a distinct cache entry.
+
+Student training also preloads every raw embedding referenced by its base,
+hard, and dev examples into one contiguous CPU tensor. This avoids repeated
+per-object `torch.load` calls without duplicating embeddings on disk. Disable
+it with `--no-preload-embeddings` only when host memory is constrained. Pair
+projection and path aggregation are vectorized, so `--batch-size` defaults to
+64 for Student stages and 8 for Teacher stages; either can be overridden.
+
 Training records are filtered to `train`; the fixed gate records are filtered
 to `dev`. Teacher edge/path and Student edge stages select on their matching dev
 listwise objective and never build an ANN index. Every Student path epoch saves
@@ -170,7 +186,7 @@ For an output such as `student_path.pt`, training writes:
 - `student_path.pt`: best checkpoint selected by the dev gate;
 - `student_path.last.pt`: final attempted checkpoint, never overwriting best;
 - `student_path.epochs/epoch_NNN.pt`: per-epoch candidates;
-- `student_path.dev_indices/epoch_NNN/`: per-epoch full-corpus indexes;
+- `student_path.dev_indices/epoch_NNN/`: best and latest full-corpus indexes;
 - `student_path.pt.history.json`: epoch objectives, retrieval metrics, sampling
   counts, best epoch, and stop reason;
 - `student_path.pt.selection.json`: best checkpoint/index fingerprints and the
@@ -198,6 +214,9 @@ evaluation. `--rrf-k` controls the rank constant (default 60). The channel
 ranks and `direct_score` are intermediate values and are not written to the
 retrieval results. Student relation queries and projected target vectors
 preserve the bilinear score exactly as an inner product for ANN indexing.
+Evidence-to-target expansion submits all evidence relation vectors for one
+query to HNSW in one batch. Relation vectors are cached for the lifetime of the
+loaded index, so evidence reused across full-dev retrieval is projected once.
 
 `--base-data` and `--dev-data` accept multiple files. Every record should carry `dataset`;
 when it does not, the input filename stem is used. Sampling assigns dataset

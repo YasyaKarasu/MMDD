@@ -56,10 +56,7 @@ def run(args: argparse.Namespace) -> None:
         )
     ]
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
-    first_id = next(iter(store.object_ids()))
-    embedding_dim = int(
-        store.get(first_id, include_hidden=False).embedding.shape[0]
-    )
+    embedding_dim = store.embedding_dimension()
     student_path = Path(args.student_checkpoint)
     student = load_student(student_path, device)
     saved_aggregation, saved_top_k = load_path_aggregation(student_path)
@@ -93,7 +90,7 @@ def run(args: argparse.Namespace) -> None:
     if args.mine_only:
         target_records, edge_records = hard_candidate_records(candidate_sets, store)
     else:
-        _, hidden_dim = store.dimensions()
+        hidden_dim = store.teacher_dimension()
         if hidden_dim is None:
             raise ValueError(
                 "Hard-negative Teacher rescoring requires a populated Teacher feature tier"
