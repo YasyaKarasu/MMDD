@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mmdd_progress import progress
 
 OBJECT_TYPES = ("table", "text", "image")
 TYPE_ALIASES = {
@@ -231,7 +232,13 @@ class FeatureStore:
 
         embeddings = torch.empty((len(unique_ids), self.embedding_dimension()))
         preloaded = {}
-        for row, object_id in enumerate(unique_ids):
+        object_ids = progress(
+            unique_ids,
+            desc="Preload embeddings",
+            unit="object",
+            leave=False,
+        )
+        for row, object_id in enumerate(object_ids):
             features = self.get(object_id, include_hidden=False)
             embeddings[row].copy_(features.embedding)
             preloaded[object_id] = ObjectFeatures(

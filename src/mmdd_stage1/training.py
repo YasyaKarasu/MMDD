@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, TypeVar
 
 import torch
+from mmdd_progress import progress
 from torch.nn.utils.rnn import pad_sequence
 
 from .data import EdgeExample, TargetExample
@@ -25,6 +26,7 @@ from .scoring import ListScores, TargetScores, score_edge_batch, score_target_ba
 Example = TypeVar("Example", EdgeExample, TargetExample)
 Model = TypeVar("Model", TeacherJoinabilityModel, StudentJoinabilityModel)
 EpochCallback = Callable[[int, Model, dict[str, Any]], bool]
+LOSS_REFRESH_STEPS = 100
 
 
 def sample_balanced_epoch(
@@ -295,6 +297,17 @@ def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
+def _loss_refresh_due(step: int, step_count: int) -> bool:
+    return step % LOSS_REFRESH_STEPS == 0 or step == step_count
+
+
+def _flush_loss_values(
+    pending: list[torch.Tensor], values: list[float]
+) -> None:
+    values.extend(torch.stack(pending).cpu().tolist())
+    pending.clear()
+
+
 def _finish_epoch(
     history: list[dict[str, Any]],
     record: dict[str, Any],
@@ -315,7 +328,9 @@ def _teacher_edge_objective(
 ) -> float:
     model.eval()
     losses = []
-    for batch in _batches(examples, batch_size):
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
+    ):
         scores = score_edge_batch(model, batch, store, device)
         losses.append(
             float(
@@ -338,7 +353,9 @@ def _teacher_path_objective(
 ) -> float:
     model.eval()
     losses = []
-    for batch in _batches(examples, batch_size):
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
+    ):
         scores = score_target_batch(model, batch, store, device, aggregator)
         loss, _direct, _evidence = _path_supervised_losses(scores)
         losses.append(float(loss))
@@ -356,7 +373,9 @@ def _student_edge_objective(
 ) -> float:
     student.eval()
     losses = []
-    for batch in _batches(examples, batch_size):
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
+    ):
         teacher_scores = _edge_teacher_scores(batch, device)
         student_scores = score_edge_batch(student, batch, store, device)
         losses.append(
@@ -399,7 +418,9 @@ def _student_path_objective(
 ) -> float:
     student.eval()
     losses = []
-    for batch in _batches(examples, batch_size):
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
+    ):
         teacher_scores = _target_teacher_scores(batch, device)
         student_scores = score_target_batch(
             student, batch, store, device, aggregator
@@ -430,9 +451,11 @@ def train_teacher_edges(
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    for epoch in range(epochs):
+    epoch_bar = progress(range(epochs), desc="Teacher edge", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         losses = []
+        pending_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -440,17 +463,31 @@ def train_teacher_edges(
             hard_fraction=hard_fraction,
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
-        for batch in _batches(sampled, batch_size):
+        batches = _batches(sampled, batch_size)
+        batch_bar = progress(
+            batches,
+            desc=f"Epoch {epoch + 1}/{epochs} train",
+            unit="batch",
+            leave=False,
+        )
+        for step, batch in enumerate(batch_bar, 1):
             scores = score_edge_batch(model, batch, store, device)
             loss = listwise_cross_entropy(scores.logits, scores.positive_indices, scores.candidate_mask)
             _optimize(loss, optimizer)
-            losses.append(float(loss.detach()))
+            pending_losses.append(loss.detach())
+            if _loss_refresh_due(step, len(batches)):
+                _flush_loss_values(pending_losses, losses)
+                batch_bar.set_postfix(loss=f"{_mean(losses):.4f}")
         train_loss = _mean(losses)
         values = {"loss": train_loss, "train_loss": train_loss}
         if dev_examples:
             values["dev_loss"] = _teacher_edge_objective(
                 model, dev_examples, store, device, batch_size
             )
+        epoch_bar.set_postfix(
+            train=f"{train_loss:.4f}",
+            **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
+        )
         record = _epoch_record(epoch + 1, values, sampled, source_samples)
         if _finish_epoch(history, record, model, epoch_callback):
             break
@@ -476,11 +513,15 @@ def train_teacher_paths(
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    for epoch in range(epochs):
+    epoch_bar = progress(range(epochs), desc="Teacher path", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         losses = []
         direct_losses = []
         evidence_losses = []
+        pending_losses = []
+        pending_direct_losses = []
+        pending_evidence_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -488,13 +529,25 @@ def train_teacher_paths(
             hard_fraction=hard_fraction,
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
-        for batch in _batches(sampled, batch_size):
+        batches = _batches(sampled, batch_size)
+        batch_bar = progress(
+            batches,
+            desc=f"Epoch {epoch + 1}/{epochs} train",
+            unit="batch",
+            leave=False,
+        )
+        for step, batch in enumerate(batch_bar, 1):
             scores = score_target_batch(model, batch, store, device, aggregator)
             loss, direct_loss, evidence_loss = _path_supervised_losses(scores)
             _optimize(loss, optimizer)
-            losses.append(float(loss.detach()))
-            direct_losses.append(float(direct_loss.detach()))
-            evidence_losses.append(float(evidence_loss.detach()))
+            pending_losses.append(loss.detach())
+            pending_direct_losses.append(direct_loss.detach())
+            pending_evidence_losses.append(evidence_loss.detach())
+            if _loss_refresh_due(step, len(batches)):
+                _flush_loss_values(pending_losses, losses)
+                _flush_loss_values(pending_direct_losses, direct_losses)
+                _flush_loss_values(pending_evidence_losses, evidence_losses)
+                batch_bar.set_postfix(loss=f"{_mean(losses):.4f}")
         train_loss = _mean(losses)
         values = {
             "loss": train_loss,
@@ -506,6 +559,10 @@ def train_teacher_paths(
             values["dev_loss"] = _teacher_path_objective(
                 model, dev_examples, store, aggregator, device, batch_size
             )
+        epoch_bar.set_postfix(
+            train=f"{train_loss:.4f}",
+            **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
+        )
         record = _epoch_record(epoch + 1, values, sampled, source_samples)
         if _finish_epoch(history, record, model, epoch_callback):
             break
@@ -531,9 +588,11 @@ def train_student_edges(
 ) -> list[dict[str, Any]]:
     history = []
     rng = random.Random(seed)
-    for epoch in range(epochs):
+    epoch_bar = progress(range(epochs), desc="Student edge", unit="epoch")
+    for epoch in epoch_bar:
         student.train()
         losses = []
+        pending_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -541,7 +600,14 @@ def train_student_edges(
             hard_fraction=hard_fraction,
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
-        for batch in _batches(sampled, batch_size):
+        batches = _batches(sampled, batch_size)
+        batch_bar = progress(
+            batches,
+            desc=f"Epoch {epoch + 1}/{epochs} train",
+            unit="batch",
+            leave=False,
+        )
+        for step, batch in enumerate(batch_bar, 1):
             teacher_scores = _edge_teacher_scores(batch, device)
             student_scores = score_edge_batch(student, batch, store, device)
             loss = distillation_kl(
@@ -551,7 +617,10 @@ def train_student_edges(
                 temperature,
             )
             _optimize(loss, optimizer)
-            losses.append(float(loss.detach()))
+            pending_losses.append(loss.detach())
+            if _loss_refresh_due(step, len(batches)):
+                _flush_loss_values(pending_losses, losses)
+                batch_bar.set_postfix(loss=f"{_mean(losses):.4f}")
         train_loss = _mean(losses)
         values = {"loss": train_loss, "train_loss": train_loss}
         if dev_examples:
@@ -563,6 +632,10 @@ def train_student_edges(
                 batch_size,
                 temperature,
             )
+        epoch_bar.set_postfix(
+            train=f"{train_loss:.4f}",
+            **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
+        )
         record = _epoch_record(epoch + 1, values, sampled, source_samples)
         if _finish_epoch(history, record, student, epoch_callback):
             break
@@ -593,7 +666,8 @@ def train_student_paths(
     _validate_cached_path_aggregation(
         [*examples, *hard_examples, *dev_examples], aggregator
     )
-    for epoch in range(epochs):
+    epoch_bar = progress(range(epochs), desc="Student path", unit="epoch")
+    for epoch in epoch_bar:
         student.train()
         totals = []
         supervised_losses = []
@@ -602,6 +676,13 @@ def train_student_paths(
         evidence_supervised_losses = []
         direct_distillation_losses = []
         evidence_distillation_losses = []
+        pending_totals = []
+        pending_supervised_losses = []
+        pending_distillation_losses = []
+        pending_direct_supervised_losses = []
+        pending_evidence_supervised_losses = []
+        pending_direct_distillation_losses = []
+        pending_evidence_distillation_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -609,7 +690,14 @@ def train_student_paths(
             hard_fraction=hard_fraction,
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
-        for batch in _batches(sampled, batch_size):
+        batches = _batches(sampled, batch_size)
+        batch_bar = progress(
+            batches,
+            desc=f"Epoch {epoch + 1}/{epochs} train",
+            unit="batch",
+            leave=False,
+        )
+        for step, batch in enumerate(batch_bar, 1):
             teacher_scores = _target_teacher_scores(batch, device)
             student_scores = score_target_batch(student, batch, store, device, aggregator)
             supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
@@ -620,13 +708,32 @@ def train_student_paths(
             )
             total = supervised + distillation_weight * distillation
             _optimize(total, optimizer)
-            totals.append(float(total.detach()))
-            supervised_losses.append(float(supervised.detach()))
-            distillation_losses.append(float(distillation.detach()))
-            direct_supervised_losses.append(float(direct_supervised.detach()))
-            evidence_supervised_losses.append(float(evidence_supervised.detach()))
-            direct_distillation_losses.append(float(direct_distillation.detach()))
-            evidence_distillation_losses.append(float(evidence_distillation.detach()))
+            pending_totals.append(total.detach())
+            pending_supervised_losses.append(supervised.detach())
+            pending_distillation_losses.append(distillation.detach())
+            pending_direct_supervised_losses.append(direct_supervised.detach())
+            pending_evidence_supervised_losses.append(evidence_supervised.detach())
+            pending_direct_distillation_losses.append(direct_distillation.detach())
+            pending_evidence_distillation_losses.append(evidence_distillation.detach())
+            if _loss_refresh_due(step, len(batches)):
+                _flush_loss_values(pending_totals, totals)
+                _flush_loss_values(pending_supervised_losses, supervised_losses)
+                _flush_loss_values(pending_distillation_losses, distillation_losses)
+                _flush_loss_values(
+                    pending_direct_supervised_losses, direct_supervised_losses
+                )
+                _flush_loss_values(
+                    pending_evidence_supervised_losses, evidence_supervised_losses
+                )
+                _flush_loss_values(
+                    pending_direct_distillation_losses,
+                    direct_distillation_losses,
+                )
+                _flush_loss_values(
+                    pending_evidence_distillation_losses,
+                    evidence_distillation_losses,
+                )
+                batch_bar.set_postfix(loss=f"{_mean(totals):.4f}")
         train_loss = _mean(totals)
         values = {
             "loss": train_loss,
@@ -649,6 +756,10 @@ def train_student_paths(
                 temperature,
                 distillation_weight,
             )
+        epoch_bar.set_postfix(
+            train=f"{train_loss:.4f}",
+            **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
+        )
         record = _epoch_record(epoch + 1, values, sampled, source_samples)
         if _finish_epoch(history, record, student, epoch_callback):
             break

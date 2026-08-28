@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from mmdd_dataset.utils import clean_text, get_cell, read_jsonl
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
+from mmdd_progress import progress
 
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 DEFAULT_MAX_CELL_CHARS = 1024
@@ -323,7 +324,13 @@ def build_stage1_training_artifacts(
     edge_lists = []
     target_lists = []
     emitted_evidence_target_edges: set[tuple[str, str]] = set()
-    for query_id, direct_positive_target_ids in positives_by_query.items():
+    query_items = progress(
+        positives_by_query.items(),
+        total=len(positives_by_query),
+        desc="Build Stage-1 examples",
+        unit="query",
+    )
+    for query_id, direct_positive_target_ids in query_items:
         query = queries[query_id]
         split = str(query.get("split", "train"))
         evidence_positive_target_ids = [

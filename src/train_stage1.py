@@ -709,7 +709,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-fraction", type=float, default=0.5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--feature-cache-size", type=int, default=128)
+    parser.add_argument("--feature-cache-size", type=int, default=60_000)
     parser.add_argument(
         "--teacher-logit-cache",
         help="Persistent base/dev Teacher-logit cache; defaults inside the feature cache.",

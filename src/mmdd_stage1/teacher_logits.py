@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+from mmdd_progress import progress
 from torch.nn.utils.rnn import pad_sequence
 
 from .data import (
@@ -211,7 +212,14 @@ def score_and_cache_teacher_logits(
         if not has_teacher_logits([example], teacher_sha256, aggregator)
     ]
     teacher.eval()
-    for start in range(0, len(missing), batch_size):
+    starts = range(0, len(missing), batch_size)
+    for start in progress(
+        starts,
+        total=len(starts),
+        desc="Teacher logits",
+        unit="batch",
+        leave=False,
+    ):
         indices = missing[start : start + batch_size]
         batch = [result[index] for index in indices]
         if isinstance(batch[0], EdgeExample):

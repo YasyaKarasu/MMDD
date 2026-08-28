@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import cache_stage1_features as stage1_cache
 import compact_stage1_feature_cache as compact_cache
+import mmdd_stage1.training as stage1_training
 import refresh_stage1_hard_negatives as hard_negative_refresh
 import train_stage1
 from cache_stage1_features import (
@@ -478,6 +479,37 @@ def test_all_four_training_stages_run_on_synthetic_features():
     histories = [teacher_edge_history, teacher_path_history, student_edge_history, student_path_history]
     assert all(len(history) == 1 for history in histories)
     assert all(torch.isfinite(torch.tensor(history[0]["loss"])) for history in histories)
+
+
+def test_training_loss_refreshes_every_hundred_steps_and_at_epoch_end():
+    refreshes = [
+        step
+        for step in range(1, 238)
+        if stage1_training._loss_refresh_due(step, 237)
+    ]
+
+    assert refreshes == [100, 200, 237]
+
+
+def test_train_stage1_defaults_to_full_feature_cache(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_stage1.py",
+            "teacher-edge",
+            "--features",
+            "features",
+            "--base-data",
+            "train.jsonl",
+            "--dev-data",
+            "dev.jsonl",
+            "--output",
+            "teacher.pt",
+        ],
+    )
+
+    assert train_stage1.parse_args().feature_cache_size == 60_000
 
 
 def test_lazy_feature_store_and_target_jsonl(tmp_path):

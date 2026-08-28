@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from mmdd_progress import progress
 
 from .data import EdgeExample, TargetCandidate, TargetExample
 from .features import FeatureStore
@@ -266,7 +267,9 @@ def retrieve_hard_candidate_sets(
         raise ValueError("ANN search sizes must be non-negative")
 
     candidate_sets = []
-    for example in examples:
+    for example in progress(
+        examples, desc="Mine hard negatives", unit="query", leave=False
+    ):
         known_positives = set(_known_positive_target_ids(example))
         hard_target_ids = [
             target_id
@@ -337,7 +340,14 @@ def score_hard_candidate_sets(
     teacher.eval()
     target_records = []
     edge_records = []
-    for start in range(0, len(candidate_sets), batch_size):
+    starts = range(0, len(candidate_sets), batch_size)
+    for start in progress(
+        starts,
+        total=len(starts),
+        desc="Teacher hard-negative scoring",
+        unit="batch",
+        leave=False,
+    ):
         mined_batch = candidate_sets[start : start + batch_size]
         batch = [item.target_example for item in mined_batch]
         edge_examples_by_item = [

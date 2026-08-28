@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from mmdd_progress import progress
+
 from .features import normalize_object_type
 
 
@@ -53,7 +55,13 @@ class TargetExample:
 
 def _records(path: Path, split: str | None) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
+        lines = progress(
+            handle,
+            desc=f"Load {path.name}",
+            unit="record",
+            leave=False,
+        )
+        for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             record = json.loads(line)

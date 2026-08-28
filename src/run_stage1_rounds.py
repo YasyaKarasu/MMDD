@@ -32,6 +32,7 @@ from mmdd_stage1.workflow import (
     validate_round_index,
     workflow_fingerprint,
 )
+from mmdd_progress import progress
 
 
 def _selection_checkpoint(selection: dict[str, Any]) -> Path:
@@ -338,7 +339,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ]
     stop_reason = "max_mining_rounds"
 
-    for mining_round in range(1, args.max_mining_rounds + 1):
+    round_bar = progress(
+        range(1, args.max_mining_rounds + 1),
+        desc="Stage-1 mining rounds",
+        unit="round",
+    )
+    for mining_round in round_bar:
+        round_bar.set_postfix(round=mining_round)
         round_dir = output_dir / f"round_{mining_round:02d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         previous_sha256 = checkpoint_fingerprint(previous_checkpoint)
@@ -675,7 +682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rrf-k", type=int, default=60)
 
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--feature-cache-size", type=int, default=128)
+    parser.add_argument("--feature-cache-size", type=int, default=60_000)
     parser.add_argument("--teacher-batch-size", type=int, default=4)
     parser.add_argument("--index-batch-size", type=int, default=1024)
     parser.add_argument("--hnsw-m", type=int, default=32)

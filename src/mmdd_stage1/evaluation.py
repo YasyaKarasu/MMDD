@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from mmdd_progress import progress
+
 from .data import TargetExample
 from .retrieval import (
     RawEmbeddingANNIndices,
@@ -68,7 +70,9 @@ def evaluate_student_retrieval(
         "evidence": [],
     }
     positive_evidence_path_queries = 0
-    for example in examples:
+    for example in progress(
+        examples, desc="Retrieval evaluation", unit="query", leave=False
+    ):
         positives = set(example.positive_target_ids)
         positive_sets.append(positives)
         result = retrieve_zero_one_hop_detailed(

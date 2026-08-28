@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from mmdd_progress import progress
+
 from mmdd_stage1.construction import (
     DEFAULT_MAX_CELL_CHARS,
     build_stage1_training_artifacts,
@@ -18,7 +20,14 @@ def _write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> int:
     temporary = path.with_suffix(path.suffix + ".tmp")
     count = 0
     with temporary.open("w", encoding="utf-8") as handle:
-        for record in records:
+        total = len(records) if isinstance(records, list) else None
+        for record in progress(
+            records,
+            total=total,
+            desc=f"Write {path.name}",
+            unit="record",
+            leave=False,
+        ):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
     temporary.replace(path)

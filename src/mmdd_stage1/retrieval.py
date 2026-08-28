@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from mmdd_progress import progress
 
 from .features import OBJECT_TYPES, FeatureStore, normalize_object_type
 from .models import StudentJoinabilityModel
@@ -30,7 +31,8 @@ def load_corpus_ids(path: Path, store: FeatureStore) -> dict[str, list[str]]:
     ids_by_type = {object_type: [] for object_type in OBJECT_TYPES}
     seen = set()
     with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
+        lines = progress(handle, desc="Load corpus", unit="object", leave=False)
+        for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             record = json.loads(line)
@@ -69,13 +71,22 @@ def build_indices(
     model.eval()
     type_records = {}
     with torch.no_grad():
-        for object_type in OBJECT_TYPES:
+        for object_type in progress(
+            OBJECT_TYPES, desc="Build Student indexes", unit="type", leave=False
+        ):
             object_ids = ids_by_type.get(object_type, [])
             if not object_ids:
                 continue
             index = hnswlib.Index(space="ip", dim=model.student_dim)
             index.init_index(max_elements=len(object_ids), ef_construction=ef_construction, M=m)
-            for start in range(0, len(object_ids), batch_size):
+            starts = range(0, len(object_ids), batch_size)
+            for start in progress(
+                starts,
+                total=len(starts),
+                desc=f"Index {object_type}",
+                unit="batch",
+                leave=False,
+            ):
                 batch_ids = object_ids[start : start + batch_size]
                 embeddings = torch.stack(
                     [
@@ -139,13 +150,22 @@ def build_raw_embedding_indices(
     embedding_dim = int(store.embedding_features(first_id).embedding.shape[0])
     output_dir.mkdir(parents=True, exist_ok=True)
     type_records = {}
-    for object_type in OBJECT_TYPES:
+    for object_type in progress(
+        OBJECT_TYPES, desc="Build raw indexes", unit="type", leave=False
+    ):
         object_ids = ids_by_type.get(object_type, [])
         if not object_ids:
             continue
         index = hnswlib.Index(space="ip", dim=embedding_dim)
         index.init_index(max_elements=len(object_ids), ef_construction=ef_construction, M=m)
-        for start in range(0, len(object_ids), batch_size):
+        starts = range(0, len(object_ids), batch_size)
+        for start in progress(
+            starts,
+            total=len(starts),
+            desc=f"Raw index {object_type}",
+            unit="batch",
+            leave=False,
+        ):
             batch_ids = object_ids[start : start + batch_size]
             vectors = torch.stack(
                 [

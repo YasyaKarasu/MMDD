@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 from cache_stage1_features import TEACHER_MANIFEST, teacher_object_ids
+from mmdd_progress import progress
 from mmdd_stage1.features import FeatureStore, normalize_object_type
 from mmdd_stage1.models import structural_table_pool
 
@@ -139,7 +140,13 @@ def run(args: argparse.Namespace) -> None:
         output_manifest.open("a", encoding="utf-8") as base_handle,
         output_teacher_manifest.open("a", encoding="utf-8") as teacher_handle,
     ):
-        for object_id, source_record in source_records.items():
+        records = progress(
+            source_records.items(),
+            total=len(source_records),
+            desc="Compact Stage-1 cache",
+            unit="object",
+        )
+        for object_id, source_record in records:
             completed_base = completed.get(object_id)
             if completed_base is not None:
                 _validate_completed_record(
@@ -208,6 +215,11 @@ def run(args: argparse.Namespace) -> None:
                 teacher_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 teacher_handle.flush()
                 teacher_written += 1
+            records.set_postfix(
+                base=base_written,
+                teacher=teacher_written,
+                skipped=base_skipped + teacher_skipped,
+            )
 
     print(
         json.dumps(

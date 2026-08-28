@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from mmdd_progress import progress
 from mmdd_stage1.features import normalize_object_type
 from mmdd_stage1.models import structural_table_pool
 from torch.nn import functional as F
@@ -420,7 +421,8 @@ def run(args: argparse.Namespace) -> None:
     teacher_skipped = 0
     seen = set()
     with input_path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
+        lines = progress(source, desc="Validate feature cache", unit="object")
+        for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             record = json.loads(line)
@@ -500,9 +502,13 @@ def run(args: argparse.Namespace) -> None:
         manifest.open("a", encoding="utf-8") as manifest_handle,
         teacher_manifest.open("a", encoding="utf-8") as teacher_manifest_handle,
     ):
-        for line in source:
-            if not line.strip():
-                continue
+        lines = progress(
+            (line for line in source if line.strip()),
+            total=len(seen),
+            desc="Cache Stage-1 features",
+            unit="object",
+        )
+        for line in lines:
             record = json.loads(line)
             object_id = str(record["object_id"])
             needs_base = object_id in pending_base_ids
@@ -559,16 +565,10 @@ def run(args: argparse.Namespace) -> None:
                 )
                 teacher_manifest_handle.flush()
                 teacher_written += 1
-            print(
-                json.dumps(
-                    {
-                        "object_id": object_id,
-                        "base_written": base_written,
-                        "base_skipped": base_skipped,
-                        "teacher_written": teacher_written,
-                        "teacher_skipped": teacher_skipped,
-                    }
-                )
+            lines.set_postfix(
+                base=base_written,
+                teacher=teacher_written,
+                skipped=base_skipped + teacher_skipped,
             )
 
     print(
