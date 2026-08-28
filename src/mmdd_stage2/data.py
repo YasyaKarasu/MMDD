@@ -10,6 +10,7 @@ from typing import Any
 
 from mmdd_dataset.utils import clean_text, get_cell
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
+from mmdd_progress import progress
 
 from .verifier import EvidenceBundle
 
@@ -66,7 +67,12 @@ def _selected_records(output_dir: Path, artifact: str, selected_ids: set[str]) -
     if not selected_ids:
         return {}
     records = {}
-    for record in iter_dataset_artifact(output_dir, artifact):
+    for record in progress(
+        iter_dataset_artifact(output_dir, artifact),
+        desc=f"Load {artifact}",
+        unit="record",
+        leave=False,
+    ):
         record_id = _record_id(record, artifact)
         if record_id in selected_ids:
             records[record_id] = record
@@ -86,11 +92,18 @@ def _resolve_targets(output_dir: Path, targets: dict[str, dict[str, Any]]) -> No
     }
     if not source_ids:
         return
-    sources = {
-        str(record["source_table_id"]): record
-        for record in iter_dataset_artifact(output_dir, "source_tables")
-        if str(record["source_table_id"]) in source_ids
-    }
+    sources = {}
+    for record in progress(
+        iter_dataset_artifact(output_dir, "source_tables"),
+        desc="Resolve source tables",
+        unit="record",
+        leave=False,
+    ):
+        source_id = str(record["source_table_id"])
+        if source_id in source_ids:
+            sources[source_id] = record
+            if len(sources) == len(source_ids):
+                break
     for target_id, record in list(targets.items()):
         reference = record.get("source_table_ref")
         if reference:
@@ -99,6 +112,44 @@ def _resolve_targets(output_dir: Path, targets: dict[str, dict[str, Any]]) -> No
                 **source,
                 **{key: value for key, value in record.items() if key != "source_table_ref"},
             }
+
+
+def load_stage2_evidence(
+    output_dirs: Sequence[Path], evidence_ids: set[str]
+) -> dict[str, dict[str, Any]]:
+    """Resolve evidence from any dataset participating in mixed retrieval."""
+
+    records: dict[str, dict[str, Any]] = {}
+    for output_dir in progress(
+        output_dirs, desc="Load Stage-2 evidence", unit="dataset", leave=False
+    ):
+        remaining = evidence_ids - records.keys()
+        if not remaining:
+            break
+        for record in progress(
+            iter_dataset_artifact(output_dir, "bridge_assets"),
+            desc="Scan bridge assets",
+            unit="record",
+            leave=False,
+        ):
+            record_id = str(record["asset_id"])
+            if record_id not in remaining:
+                continue
+            local_path = Path(str(record.get("local_path", "")))
+            relative_path = output_dir / str(record.get("relative_path", ""))
+            if (
+                record.get("asset_type") == "image"
+                and not local_path.is_file()
+                and relative_path.is_file()
+            ):
+                record["local_path"] = str(relative_path.resolve())
+            records[record_id] = record
+            if len(records) == len(evidence_ids):
+                break
+    missing = evidence_ids - records.keys()
+    if missing:
+        raise KeyError(f"bridge_assets has no records for: {', '.join(sorted(missing))}")
+    return records
 
 
 def load_stage2_index(
@@ -111,12 +162,7 @@ def load_stage2_index(
     queries = _selected_records(output_dir, "query_tables", query_ids)
     targets = _selected_records(output_dir, "data_lake_tables", target_ids)
     _resolve_targets(output_dir, targets)
-    evidence = _selected_records(output_dir, "bridge_assets", evidence_ids)
-    for record in evidence.values():
-        local_path = Path(str(record.get("local_path", "")))
-        relative_path = output_dir / str(record.get("relative_path", ""))
-        if record.get("asset_type") == "image" and not local_path.is_file() and relative_path.is_file():
-            record["local_path"] = str(relative_path.resolve())
+    evidence = load_stage2_evidence((output_dir,), evidence_ids)
     return Stage2ObjectIndex(queries, targets, evidence)
 
 

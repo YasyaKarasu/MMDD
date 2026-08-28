@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from mmdd_progress import progress
+
 import torch
 
 from .data import column_name, column_values, row_values
@@ -290,7 +292,12 @@ class Stage2Verifier:
         }
 
         verified = []
-        for target_id in target_ids:
+        for target_id in progress(
+            target_ids,
+            desc="Verify direct targets",
+            unit="target",
+            leave=False,
+        ):
             candidates = []
             for (query_index, query_values), query_vectors in zip(
                 query_columns, query_embeddings
@@ -360,7 +367,14 @@ class Stage2Verifier:
             evidence_by_row[row_position].append(evidence_id)
 
         predictions = []
-        for row_position, row in enumerate(query["rows"]):
+        rows = enumerate(query["rows"])
+        for row_position, row in progress(
+            rows,
+            total=len(query["rows"]),
+            desc="Stage-2 row filling",
+            unit="row",
+            leave=False,
+        ):
             visible_row = row_values(query, row)
             routed = evidence_by_row[row_position]
             if not routed:

@@ -29,7 +29,9 @@ def run(args: argparse.Namespace) -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     examples, objects = load_column_training_data(
-        Path(args.dataset_root),
+        [Path(path) for path in args.dataset_root]
+        if isinstance(args.dataset_root, list)
+        else Path(args.dataset_root),
         [Path(path) for path in args.retrieval_results],
         top_k_evidence=args.top_k_evidence,
         max_targets=args.max_targets,
@@ -80,7 +82,12 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", required=True)
+    parser.add_argument(
+        "--dataset-root",
+        nargs="+",
+        required=True,
+        help="One root shared by all retrieval files, or one root per retrieval file.",
+    )
     parser.add_argument("--retrieval-results", nargs="+", required=True)
     parser.add_argument(
         "--stage1-gate",

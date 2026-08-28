@@ -193,6 +193,9 @@ def test_stage2_training_skips_path_budget_validation_without_a_matching_qrel(mo
     monkeypatch.setattr(
         "mmdd_stage2.training.load_stage2_index", lambda *_args, **_kwargs: loaded_index
     )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.load_stage2_evidence", lambda *_args, **_kwargs: {}
+    )
 
     examples, objects = load_column_training_data(
         Path("dataset"),
@@ -207,6 +210,93 @@ def test_stage2_training_skips_path_budget_validation_without_a_matching_qrel(mo
         -torch.log_softmax(torch.tensor([2.0, 1.0]), 0)[1].item()
     )
     assert objects is loaded_index
+
+
+def test_stage2_training_pairs_multiple_dataset_roots_with_retrieval_files(monkeypatch):
+    def qrels(root, artifact):
+        assert artifact == "qrels"
+        suffix = Path(root).name
+        return iter(
+            [
+                {
+                    "query_table_id": f"q_{suffix}",
+                    "target_table_id": f"t_{suffix}",
+                    "reason": "model_recoverable_join_column",
+                    "split": "train",
+                    "join_attribute": {"source_column_index": 1},
+                }
+            ]
+        )
+
+    def retrieval(path):
+        suffix = Path(path).stem
+        return iter(
+            [
+                {
+                    "query_id": f"q_{suffix}",
+                    "results": [
+                        {
+                            "target_id": f"t_{suffix}",
+                            "evidence_score": 1.0,
+                            "paths": [
+                                {
+                                    "kind": "evidence",
+                                    "evidence_id": f"e_{suffix}",
+                                    "path_score": 1.0,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+
+    def stage2_index(root, **_kwargs):
+        suffix = Path(root).name
+        return Stage2ObjectIndex(
+            {f"q_{suffix}": {"table_id": f"q_{suffix}"}},
+            {f"t_{suffix}": {"table_id": f"t_{suffix}"}},
+            {},
+        )
+
+    monkeypatch.setattr("mmdd_stage2.training.iter_dataset_artifact", qrels)
+    monkeypatch.setattr("mmdd_stage2.training.iter_retrieval_results", retrieval)
+    monkeypatch.setattr("mmdd_stage2.training.load_stage2_index", stage2_index)
+    monkeypatch.setattr(
+        "mmdd_stage2.training.load_stage2_evidence",
+        lambda roots, evidence_ids: {
+            evidence_id: {"asset_id": evidence_id, "roots": [Path(root).name for root in roots]}
+            for evidence_id in evidence_ids
+        },
+    )
+
+    examples, objects = load_column_training_data(
+        [Path("entitables"), Path("wdc")],
+        [Path("entitables.jsonl"), Path("wdc.jsonl")],
+        max_targets=1,
+        top_k_evidence=1,
+    )
+
+    assert [example.query_id for example in examples] == ["q_entitables", "q_wdc"]
+    assert set(objects.queries) == {"q_entitables", "q_wdc"}
+    assert set(objects.targets) == {"t_entitables", "t_wdc"}
+    assert set(objects.evidence) == {"e_entitables", "e_wdc"}
+    assert objects.evidence["e_wdc"]["roots"] == ["entitables", "wdc"]
+
+
+def test_stage2_training_rejects_unpaired_dataset_roots(monkeypatch):
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_dataset_artifact",
+        lambda *_args, **_kwargs: pytest.fail("root validation must precede loading"),
+    )
+
+    with pytest.raises(ValueError, match="one root per file"):
+        load_column_training_data(
+            [Path("a"), Path("b")],
+            [Path("a.jsonl"), Path("b.jsonl"), Path("c.jsonl")],
+            max_targets=1,
+            top_k_evidence=1,
+        )
 
 
 def test_candidate_column_probabilities_match_table_times_column_formula():

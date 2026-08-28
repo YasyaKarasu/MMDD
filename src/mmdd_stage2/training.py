@@ -10,11 +10,13 @@ from typing import Any
 
 import torch
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
+from mmdd_progress import progress
 
 from .data import (
     Stage2ObjectIndex,
     iter_retrieval_results,
     load_stage2_index,
+    load_stage2_evidence,
     local_column_index,
     validate_retrieval_path_budget,
 )
@@ -31,7 +33,7 @@ class ColumnTrainingExample:
 
 
 def load_column_training_data(
-    output_dir: Path,
+    output_dirs: Path | Sequence[Path],
     retrieval_paths: Sequence[Path],
     *,
     top_k_evidence: int,
@@ -39,18 +41,40 @@ def load_column_training_data(
 ) -> tuple[list[ColumnTrainingExample], Stage2ObjectIndex]:
     if max_targets <= 0 or top_k_evidence <= 0:
         raise ValueError("Stage-2 training target and evidence limits must be positive")
-    qrels = {
-        str(record["query_table_id"]): record
-        for record in iter_dataset_artifact(output_dir, "qrels")
-        if record.get("reason") == "model_recoverable_join_column"
-        and record.get("split", "train") == "train"
-    }
+    roots = [output_dirs] if isinstance(output_dirs, Path) else list(output_dirs)
+    if not roots:
+        raise ValueError("At least one Stage-2 dataset root is required")
+    if len(roots) == 1:
+        roots = roots * len(retrieval_paths)
+    elif len(roots) != len(retrieval_paths):
+        raise ValueError(
+            "Provide one --dataset-root for all retrieval files, or one root per file"
+        )
+
     examples = []
-    query_ids: set[str] = set()
-    target_ids: set[str] = set()
-    evidence_ids: set[str] = set()
-    for path in retrieval_paths:
-        for record in iter_retrieval_results(path):
+    loaded_indices = []
+    all_evidence_ids: set[str] = set()
+    datasets = zip(roots, retrieval_paths, strict=True)
+    for output_dir, path in progress(
+        datasets,
+        total=len(retrieval_paths),
+        desc="Load Stage-2 data",
+        unit="file",
+    ):
+        qrels = {
+            str(record["query_table_id"]): record
+            for record in iter_dataset_artifact(output_dir, "qrels")
+            if record.get("reason") == "model_recoverable_join_column"
+            and record.get("split", "train") == "train"
+        }
+        query_ids: set[str] = set()
+        target_ids: set[str] = set()
+        for record in progress(
+            iter_retrieval_results(path),
+            desc=f"Scan {path.name}",
+            unit="query",
+            leave=False,
+        ):
             query_id = str(record["query_id"])
             qrel = qrels.get(query_id)
             if qrel is None:
@@ -87,15 +111,35 @@ def load_column_training_data(
             examples.append(example)
             query_ids.add(query_id)
             target_ids.add(positive_target)
-            evidence_ids.update(positive_bundle.evidence_ids)
+            all_evidence_ids.update(positive_bundle.evidence_ids)
+        if query_ids:
+            loaded_indices.append(
+                load_stage2_index(
+                    output_dir,
+                    query_ids=query_ids,
+                    target_ids=target_ids,
+                    evidence_ids=set(),
+                )
+            )
     if not examples:
         raise ValueError("No Stage-2 training examples have a retrieved positive evidence path")
-    return examples, load_stage2_index(
-        output_dir,
-        query_ids=query_ids,
-        target_ids=target_ids,
-        evidence_ids=evidence_ids,
-    )
+    evidence = load_stage2_evidence(tuple(dict.fromkeys(roots)), all_evidence_ids)
+    if len(loaded_indices) == 1:
+        loaded_indices[0].evidence.update(evidence)
+        return examples, loaded_indices[0]
+
+    merged = Stage2ObjectIndex({}, {}, {})
+    for index in loaded_indices:
+        for name in ("queries", "targets", "evidence"):
+            destination = getattr(merged, name)
+            for object_id, record in getattr(index, name).items():
+                if object_id in destination and destination[object_id] != record:
+                    raise ValueError(
+                        f"Conflicting {name[:-1]} ID across Stage-2 datasets: {object_id}"
+                    )
+                destination[object_id] = record
+    merged.evidence.update(evidence)
+    return examples, merged
 
 
 def train_candidate_scorer(
@@ -115,11 +159,18 @@ def train_candidate_scorer(
     generator = random.Random(seed)
     history = []
     scorer.train()
-    for epoch in range(epochs):
+    epoch_bar = progress(range(epochs), desc="Stage-2 training", unit="epoch")
+    for epoch in epoch_bar:
         generator.shuffle(order)
         total_column_loss = 0.0
         total_table_loss = 0.0
-        for example_index in order:
+        example_bar = progress(
+            order,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            unit="example",
+            leave=False,
+        )
+        for example_index in example_bar:
             example = examples[example_index]
             positive_bundle = example.positive_bundle
             logits = verifier.candidate_logits(
@@ -139,6 +190,9 @@ def train_candidate_scorer(
             optimizer.step()
             total_column_loss += float(column_loss.detach())
             total_table_loss += example.table_loss
+            example_bar.set_postfix(
+                column_loss=f"{total_column_loss / (example_bar.n + 1):.4f}"
+            )
         mean_column_loss = total_column_loss / len(examples)
         mean_table_loss = total_table_loss / len(examples)
         history.append(
@@ -148,4 +202,5 @@ def train_candidate_scorer(
                 "table_loss": mean_table_loss,
             }
         )
+        epoch_bar.set_postfix(column_loss=f"{mean_column_loss:.4f}")
     return history

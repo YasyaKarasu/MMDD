@@ -417,6 +417,18 @@ conda run -n MMDD python src/train_stage2.py \
   --output checkpoints/stage2_candidate.pt
 ```
 
+For mixed-source training, pass one dataset root per retrieval file in the
+same order. A single root is still shared by every retrieval file:
+
+```bash
+conda run -n MMDD python src/train_stage2.py \
+  --dataset-root output_entitables output_wdc \
+  --retrieval-results retrieval_entitables_train.jsonl retrieval_wdc_train.jsonl \
+  --stage1-gate runs/stage1_mining/final_selection.json \
+  --model-dir hf_models/Qwen3.5-9B \
+  --output checkpoints/stage2_candidate.pt
+```
+
 After the target column is fixed, each selected evidence object's original
 Qwen embedding is compared with the cached query-row routing embeddings and
 assigned to exactly one row by cosine argmax. A row may receive zero or many
