@@ -25,7 +25,7 @@ from cache_stage1_features import (
     embedding_instructions,
     teacher_object_ids,
 )
-from mmdd_stage1.checkpoints import load_path_aggregation
+from mmdd_stage1.checkpoints import load_path_aggregation, load_student
 from mmdd_stage1.data import (
     EdgeExample,
     TargetCandidate,
@@ -42,12 +42,14 @@ from mmdd_stage1.mining import (
     score_hard_candidate_sets,
 )
 from mmdd_stage1.models import (
+    IdentityStudentJoinabilityModel,
     TYPE_TO_ID,
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
     structural_table_pool,
 )
 from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
+from mmdd_stage1.pca import compute_pca_projection, load_pca_projection
 from mmdd_stage1.retrieval import (
     RawEmbeddingANNIndices,
     StudentANNIndices,
@@ -209,6 +211,145 @@ def test_student_score_is_exact_ann_inner_product():
 
     assert score.item() == pytest.approx(torch.dot(relation_query, index_vector).item())
     assert not torch.allclose(score, model.score_pairs([target], [query])[0])
+
+
+def test_student_identity_noise_initialization_starts_near_raw_geometry():
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=4,
+        initialization="identity_noise",
+        initialization_noise_std=0.0,
+    )
+
+    for projection in model.projections.values():
+        torch.testing.assert_close(projection.weight, torch.eye(4))
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=4,
+        initialization="identity_noise",
+        initialization_noise_std=0.01,
+    )
+    for projection in model.projections.values():
+        assert torch.linalg.norm(projection.weight - torch.eye(4)) < 0.1
+
+
+def test_student_identity_noise_initialization_requires_square_projection():
+    with pytest.raises(ValueError, match="student_dim == input_dim"):
+        StudentJoinabilityModel(
+            input_dim=4,
+            student_dim=3,
+            initialization="identity_noise",
+        )
+
+
+def test_student_random_orthogonal_initialization_is_shared_low_rank_raw_geometry():
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="random_orthogonal",
+    )
+    projection = model.projections["table"].weight
+    torch.testing.assert_close(projection @ projection.T, torch.eye(2))
+    for object_type in ("text", "image"):
+        torch.testing.assert_close(model.projections[object_type].weight, projection)
+    for relation in model.relations.values():
+        torch.testing.assert_close(relation, torch.eye(2))
+
+    source = torch.tensor([1.0, 2.0, -1.0, 0.5])
+    destination = torch.tensor([-0.5, 1.0, 3.0, 2.0])
+    basis = projection.T
+    expected = source @ basis @ basis.T @ destination
+    actual = model.score_embeddings(source, "table", destination, "image")
+    torch.testing.assert_close(actual, expected)
+
+
+def test_student_pca_initialization_uses_shared_basis_and_identity_relations():
+    projection = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="pca",
+        initialization_basis=projection,
+    )
+
+    for object_type in ("table", "text", "image"):
+        torch.testing.assert_close(model.projections[object_type].weight, projection)
+    for relation in model.relations.values():
+        torch.testing.assert_close(relation, torch.eye(2))
+
+
+def test_student_pca_checkpoint_loads_without_external_basis(tmp_path):
+    projection = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="pca",
+        initialization_basis=projection,
+    )
+    path = tmp_path / "student.pt"
+    torch.save(checkpoint(model, "student-edge"), path)
+
+    loaded = load_student(path, torch.device("cpu"))
+
+    assert loaded.config()["initialization"] == "pca"
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[key], value)
+
+
+def test_pca_projection_finds_top_component_and_round_trips(tmp_path):
+    embeddings = torch.tensor(
+        [
+            [-4.0, -0.2, 0.0],
+            [-2.0, 0.1, 0.0],
+            [2.0, -0.1, 0.0],
+            [4.0, 0.2, 0.0],
+        ]
+    )
+    projection, mean, explained = compute_pca_projection(
+        embeddings,
+        1,
+        device=torch.device("cpu"),
+        oversampling=2,
+        iterations=2,
+    )
+    assert abs(projection[0, 0]) > 0.99
+    assert explained > 0.99
+
+    path = tmp_path / "pca.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "input_dim": 3,
+            "student_dim": 1,
+            "mean": mean,
+            "projection": projection,
+        },
+        path,
+    )
+    torch.testing.assert_close(
+        load_pca_projection(path, input_dim=3, student_dim=1), projection
+    )
+
+
+def test_identity_student_uses_raw_inner_product_for_every_type_pair():
+    model = IdentityStudentJoinabilityModel(4)
+    query = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    target = torch.tensor([0.5, -1.0, 2.0, 0.25])
+
+    for source_type in ("table", "text", "image"):
+        for destination_type in ("table", "text", "image"):
+            relation_query = model.relation_query(
+                query, source_type, destination_type
+            )
+            index_vector = model.index_vector(target, destination_type)
+
+            assert relation_query is query
+            assert index_vector is target
+            assert torch.dot(relation_query, index_vector) == torch.dot(query, target)
 
 
 def test_path_aggregator_accumulates_only_evidence_paths():

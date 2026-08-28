@@ -15,8 +15,13 @@ from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_te
 from mmdd_stage1.data import EdgeExample, TargetExample, load_edge_examples, load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
-from mmdd_stage1.models import StudentJoinabilityModel, TeacherJoinabilityModel
+from mmdd_stage1.models import (
+    STUDENT_INITIALIZATIONS,
+    StudentJoinabilityModel,
+    TeacherJoinabilityModel,
+)
 from mmdd_stage1.objectives import PathAggregator
+from mmdd_stage1.pca import load_pca_projection
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
@@ -547,11 +552,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "Hard-negative Student edge training must start from the Student "
                 "checkpoint used for mining"
             )
-        student = (
-            load_student(Path(args.student_checkpoint), device)
-            if args.student_checkpoint
-            else StudentJoinabilityModel(embedding_dim, args.student_dim).to(device)
-        )
+        if args.student_checkpoint:
+            student = load_student(Path(args.student_checkpoint), device)
+        else:
+            initialization = getattr(args, "student_initialization", "random")
+            pca_basis_path = getattr(args, "student_pca_basis", None)
+            if initialization == "pca":
+                if pca_basis_path is None:
+                    raise ValueError("--student-pca-basis is required for PCA initialization")
+                initialization_basis = load_pca_projection(
+                    Path(pca_basis_path),
+                    input_dim=embedding_dim,
+                    student_dim=args.student_dim,
+                )
+            else:
+                if pca_basis_path is not None:
+                    raise ValueError(
+                        "--student-pca-basis requires --student-initialization pca"
+                    )
+                initialization_basis = None
+            student = StudentJoinabilityModel(
+                embedding_dim,
+                args.student_dim,
+                initialization=initialization,
+                initialization_noise_std=getattr(
+                    args, "student_init_noise_std", 0.01
+                ),
+                initialization_basis=initialization_basis,
+            ).to(device)
         if student.input_dim != embedding_dim:
             raise ValueError("Student checkpoint input dimension does not match the feature cache")
         optimizer = torch.optim.AdamW(
@@ -657,6 +685,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "stop_reason": controller.stop_reason,
         "mining_round": mining_round,
     }
+    if student is not None:
+        history_payload["student_config"] = student.config()
     write_json(paths["history"], history_payload)
     write_json(paths["selection"], selection)
     summary = {
@@ -736,6 +766,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-latents", type=int, default=24)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--student-dim", type=int, default=128)
+    parser.add_argument(
+        "--student-initialization",
+        choices=STUDENT_INITIALIZATIONS,
+        default="random",
+    )
+    parser.add_argument("--student-init-noise-std", type=float, default=0.01)
+    parser.add_argument("--student-pca-basis")
 
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)

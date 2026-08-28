@@ -23,7 +23,11 @@ def _recall(ranked_ids: Sequence[str], positives: set[str], k: int) -> float:
 
 def _reciprocal_rank(ranked_ids: Sequence[str], positives: set[str], k: int) -> float:
     return next(
-        (1.0 / rank for rank, target_id in enumerate(ranked_ids[:k], 1) if target_id in positives),
+        (
+            1.0 / rank
+            for rank, target_id in enumerate(ranked_ids[:k], 1)
+            if target_id in positives
+        ),
         0.0,
     )
 
@@ -40,10 +44,13 @@ def _channel_metrics(
         / query_count
         for k in RECALL_KS
     }
-    values["mrr@100"] = sum(
-        _reciprocal_rank(ranking, relevant, 100)
-        for ranking, relevant in zip(rankings, positives)
-    ) / query_count
+    values["mrr@100"] = (
+        sum(
+            _reciprocal_rank(ranking, relevant, 100)
+            for ranking, relevant in zip(rankings, positives)
+        )
+        / query_count
+    )
     return values
 
 
@@ -119,3 +126,27 @@ def evaluate_student_retrieval(
             positive_evidence_path_queries / len(examples)
         ),
     }
+
+
+def evaluate_direct_retrieval(
+    examples: Sequence[TargetExample],
+    indices: StudentANNIndices | RawEmbeddingANNIndices,
+    *,
+    direct_k: int = 100,
+) -> dict[str, float | int]:
+    """Evaluate only direct Q-to-table retrieval with the Stage-1 metric contract."""
+
+    if not examples:
+        raise ValueError("Retrieval evaluation requires at least one query")
+    rankings = []
+    positives = []
+    for example in progress(
+        examples, desc="Direct retrieval evaluation", unit="query", leave=False
+    ):
+        ranked = sorted(
+            indices.search(example.query_id, "table", max(direct_k, max(RECALL_KS))),
+            key=lambda item: (-item[1], item[0]),
+        )
+        rankings.append([target_id for target_id, _score in ranked])
+        positives.append(set(example.positive_target_ids))
+    return {"queries": len(examples), **_channel_metrics(rankings, positives)}

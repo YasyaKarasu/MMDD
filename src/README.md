@@ -167,6 +167,64 @@ it with `--no-preload-embeddings` only when host memory is constrained. Pair
 projection and path aggregation are vectorized, so `--batch-size` defaults to
 64 for Student stages and 8 for Teacher stages; either can be overridden.
 
+Student projector initialization is selected with `--student-initialization`.
+The default `random` mode preserves the original behavior. `identity_noise`
+requires `--student-dim` to match the embedding dimension and initializes each
+projector as `I + noise`. `random_orthogonal` shares one row-orthogonal
+projector across object types and initializes every relation as `I`, so its
+initial score is the raw inner product restricted to one random low-rank
+subspace. Use `--student-init-noise-std` to set the projector noise in
+`identity_noise` mode. `pca` uses the same geometry but takes the shared
+subspace from a projection artifact built over frozen corpus embeddings:
+
+```bash
+conda run -n MMDD python src/build_stage1_pca_basis.py \
+  --features cache/stage1_qwen8b --corpus stage1_corpus.jsonl \
+  --student-dim 128 --device cuda --output work/stage1_pca_128.pt
+conda run -n MMDD python src/train_stage1.py student-edge \
+  ... --student-dim 128 --student-initialization pca \
+  --student-pca-basis work/stage1_pca_128.pt
+```
+
+Before training, the zero-training identity probe can exercise the complete
+Student index and dev retrieval path with `P = I` and `R = I`. It runs on CPU;
+`--raw-index` optionally evaluates an existing corpus-matched raw index in the
+same invocation and records the direct Recall@10 delta:
+
+```bash
+conda run -n MMDD python src/probe_stage1_identity.py \
+  --features cache/stage1_qwen8b \
+  --corpus stage1_corpus.jsonl \
+  --dev-data target_lists.jsonl \
+  --output-dir indices/stage1_identity \
+  --raw-index indices/stage1_raw
+```
+
+Use the zero-training PCA dimension probe to settle the Student dimension
+before another training run. It computes the complete centered covariance
+spectrum once, then evaluates shared `P = U_d^T`, `R = I` Students at the
+requested dimensions. Retrieval applies `P` to the original frozen embeddings
+without subtracting the PCA mean, matching the Student's linear projection.
+Only table indexes are built because the reported metric is dev direct
+Recall@10:
+
+```bash
+conda run -n MMDD python src/probe_stage1_pca_dimensions.py \
+  --features cache/stage1_qwen8b \
+  --corpus stage1_corpus.jsonl \
+  --dev-data entitables_target_lists.jsonl wdc_target_lists.jsonl \
+  --dimensions 128 256 512 1024 2048 \
+  --raw-index indices/stage1_raw \
+  --device cuda:0 \
+  --output-dir work/stage1_pca_dimension_ceiling
+```
+
+The output contains `summary.json`, exact dimension and variance CSV files,
+the reusable `pca_spectrum.pt`, one resumable index directory per dimension,
+and `pca_dimension_ceiling.png`. The summary selects the smallest tested
+dimension whose direct Recall@10 reaches at least 90% of the raw-embedding
+baseline; change that rule with `--raw-fraction-threshold`.
+
 Training records are filtered to `train`; the fixed gate records are filtered
 to `dev`. Teacher edge/path and Student edge stages select on their matching dev
 listwise objective and never build an ANN index. Every Student path epoch saves

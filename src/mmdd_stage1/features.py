@@ -139,6 +139,7 @@ class FeatureStore:
         self._cache_size = max(0, cache_size)
         self._cache: OrderedDict[tuple[str, bool], ObjectFeatures] = OrderedDict()
         self._preloaded_features: dict[str, ObjectFeatures] = {}
+        self._preloaded_embeddings: torch.Tensor | None = None
         if not self._eager and not self._index:
             raise ValueError("Feature store is empty")
 
@@ -224,11 +225,17 @@ class FeatureStore:
     def preload_embeddings(self, object_ids: Iterable[str]) -> int:
         """Load the referenced raw embeddings into one contiguous CPU tensor."""
 
+        return int(self.preload_embedding_matrix(object_ids).shape[0])
+
+    def preload_embedding_matrix(self, object_ids: Iterable[str]) -> torch.Tensor:
+        """Preload raw embeddings and return their contiguous matrix."""
+
         unique_ids = list(dict.fromkeys(str(object_id) for object_id in object_ids))
         if not unique_ids:
             self._preloaded_features = {}
+            self._preloaded_embeddings = torch.empty((0, self.embedding_dimension()))
             self._cache.clear()
-            return 0
+            return self._preloaded_embeddings
 
         embeddings = torch.empty((len(unique_ids), self.embedding_dimension()))
         preloaded = {}
@@ -247,8 +254,9 @@ class FeatureStore:
                 embedding=embeddings[row],
             )
         self._preloaded_features = preloaded
+        self._preloaded_embeddings = embeddings
         self._cache.clear()
-        return len(unique_ids)
+        return embeddings
 
     def embedding_features(self, object_id: str) -> ObjectFeatures:
         """Return scoring features from the contiguous embedding tier when loaded."""

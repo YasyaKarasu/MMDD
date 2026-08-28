@@ -30,7 +30,14 @@ def load_student(path: Path, device: torch.device) -> StudentJoinabilityModel:
     payload = load_checkpoint(path)
     if payload.get("model_kind") != "student":
         raise ValueError(f"{path}: expected a Student checkpoint")
-    model = StudentJoinabilityModel(**payload["config"])
+    config = dict(payload["config"])
+    if config.get("initialization") == "pca":
+        input_dim = int(config["input_dim"])
+        student_dim = int(config["student_dim"])
+        placeholder = torch.zeros(student_dim, input_dim)
+        placeholder[:, :student_dim] = torch.eye(student_dim)
+        config["initialization_basis"] = placeholder
+    model = StudentJoinabilityModel(**config)
     model.load_state_dict(payload["state_dict"])
     return model.to(device)
 

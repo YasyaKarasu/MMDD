@@ -115,6 +115,8 @@ def build_indices(
         "student_dim": model.student_dim,
         "student_checkpoint_sha256": checkpoint_sha256,
         "corpus_sha256": corpus_sha256,
+        "hnsw_m": m,
+        "ef_construction": ef_construction,
         "ef_search": ef_search,
         "types": type_records,
     }
@@ -212,6 +214,7 @@ class StudentANNIndices:
         device: torch.device,
         checkpoint_sha256: str,
         corpus_sha256: str | None = None,
+        destination_types: tuple[str, ...] | None = None,
     ) -> None:
         import hnswlib
 
@@ -231,7 +234,14 @@ class StudentANNIndices:
         self.indices = {}
         self.object_ids = {}
         self._relation_queries: dict[tuple[str, str], np.ndarray] = {}
+        selected_types = (
+            set(OBJECT_TYPES)
+            if destination_types is None
+            else {normalize_object_type(value) for value in destination_types}
+        )
         for object_type, record in manifest["types"].items():
+            if object_type not in selected_types:
+                continue
             index = hnswlib.Index(space="ip", dim=model.student_dim)
             index.load_index(str(index_dir / record["index_path"]), max_elements=int(record["objects"]))
             index.set_ef(int(manifest["ef_search"]))
@@ -300,6 +310,7 @@ class RawEmbeddingANNIndices:
         index_dir: Path,
         *,
         corpus_sha256: str,
+        destination_types: tuple[str, ...] | None = None,
     ) -> None:
         import hnswlib
 
@@ -317,7 +328,14 @@ class RawEmbeddingANNIndices:
         self.embedding_dim = int(manifest["embedding_dim"])
         self.indices = {}
         self.object_ids = {}
+        selected_types = (
+            set(OBJECT_TYPES)
+            if destination_types is None
+            else {normalize_object_type(value) for value in destination_types}
+        )
         for object_type, record in manifest["types"].items():
+            if object_type not in selected_types:
+                continue
             index = hnswlib.Index(space="ip", dim=self.embedding_dim)
             index.load_index(
                 str(index_dir / record["index_path"]),

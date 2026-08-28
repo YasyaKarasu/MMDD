@@ -12,6 +12,12 @@ from torch.nn.utils.rnn import pad_sequence
 from .features import OBJECT_TYPES, ObjectFeatures, normalize_object_type
 
 TYPE_TO_ID = {name: index for index, name in enumerate(OBJECT_TYPES)}
+STUDENT_INITIALIZATIONS = (
+    "random",
+    "identity_noise",
+    "random_orthogonal",
+    "pca",
+)
 
 
 def structural_table_pool(
@@ -208,25 +214,94 @@ class TeacherJoinabilityModel(nn.Module):
 class StudentJoinabilityModel(nn.Module):
     """Independent type projections with an ordered relation per type pair."""
 
-    def __init__(self, input_dim: int, student_dim: int = 128) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        student_dim: int = 128,
+        initialization: str = "random",
+        initialization_noise_std: float = 0.01,
+        initialization_basis: torch.Tensor | None = None,
+    ) -> None:
         super().__init__()
+        if input_dim <= 0 or student_dim <= 0:
+            raise ValueError("input_dim and student_dim must be positive")
+        if initialization not in STUDENT_INITIALIZATIONS:
+            raise ValueError(
+                f"initialization must be one of {STUDENT_INITIALIZATIONS}"
+            )
+        if initialization_noise_std < 0:
+            raise ValueError("initialization_noise_std must be non-negative")
+        if initialization == "identity_noise" and student_dim != input_dim:
+            raise ValueError("identity_noise initialization requires student_dim == input_dim")
+        if initialization in {"random_orthogonal", "pca"} and student_dim > input_dim:
+            raise ValueError(
+                f"{initialization} initialization requires student_dim <= input_dim"
+            )
+        if initialization == "pca":
+            if initialization_basis is None:
+                raise ValueError("pca initialization requires initialization_basis")
+            if initialization_basis.shape != (student_dim, input_dim):
+                raise ValueError(
+                    "initialization_basis must have shape [student_dim, input_dim]"
+                )
+            if not torch.isfinite(initialization_basis).all():
+                raise ValueError("initialization_basis must be finite")
+            gram = initialization_basis @ initialization_basis.T
+            if not torch.allclose(
+                gram,
+                torch.eye(student_dim, device=gram.device, dtype=gram.dtype),
+                atol=1e-4,
+                rtol=1e-4,
+            ):
+                raise ValueError("initialization_basis rows must be orthonormal")
         self.input_dim = input_dim
         self.student_dim = student_dim
+        self.initialization = initialization
+        self.initialization_noise_std = initialization_noise_std
         self.projections = nn.ModuleDict(
             {object_type: nn.Linear(input_dim, student_dim, bias=False) for object_type in OBJECT_TYPES}
         )
+
+        if initialization == "identity_noise":
+            with torch.no_grad():
+                for projection in self.projections.values():
+                    nn.init.eye_(projection.weight)
+                    projection.weight.add_(
+                        initialization_noise_std
+                        * torch.randn_like(projection.weight)
+                    )
+        elif initialization in {"random_orthogonal", "pca"}:
+            if initialization == "random_orthogonal":
+                basis, _ = torch.linalg.qr(
+                    torch.randn(input_dim, student_dim), mode="reduced"
+                )
+                projection_weight = basis.T
+            else:
+                assert initialization_basis is not None
+                projection_weight = initialization_basis
+            with torch.no_grad():
+                for projection in self.projections.values():
+                    projection.weight.copy_(projection_weight)
+
         self.relations = nn.ParameterDict()
         for source_type in OBJECT_TYPES:
             for destination_type in OBJECT_TYPES:
-                relation = torch.eye(student_dim) + 0.01 * torch.randn(student_dim, student_dim)
+                relation = torch.eye(student_dim)
+                if initialization not in {"random_orthogonal", "pca"}:
+                    relation = relation + 0.01 * torch.randn(student_dim, student_dim)
                 self.relations[self.relation_key(source_type, destination_type)] = nn.Parameter(relation)
 
     @staticmethod
     def relation_key(source_type: str, destination_type: str) -> str:
         return f"{normalize_object_type(source_type)}_to_{normalize_object_type(destination_type)}"
 
-    def config(self) -> dict[str, int]:
-        return {"input_dim": self.input_dim, "student_dim": self.student_dim}
+    def config(self) -> dict[str, int | float | str]:
+        return {
+            "input_dim": self.input_dim,
+            "student_dim": self.student_dim,
+            "initialization": self.initialization,
+            "initialization_noise_std": self.initialization_noise_std,
+        }
 
     def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
         return self.projections[normalize_object_type(object_type)](embedding)
@@ -309,4 +384,98 @@ class StudentJoinabilityModel(nn.Module):
         return source @ relation
 
     def index_vector(self, destination_embedding: torch.Tensor, destination_type: str) -> torch.Tensor:
+        return self.project(destination_embedding, destination_type)
+
+
+class IdentityStudentJoinabilityModel(nn.Module):
+    """Zero-training Student with every type projection and relation equal to I."""
+
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
+        self.input_dim = embedding_dim
+        self.student_dim = embedding_dim
+
+    def config(self) -> dict[str, int | str]:
+        return {
+            "input_dim": self.input_dim,
+            "student_dim": self.student_dim,
+            "projection": "identity",
+            "relation": "identity",
+        }
+
+    def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
+        normalize_object_type(object_type)
+        if embedding.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Expected embedding dimension {self.input_dim}, got {embedding.shape[-1]}"
+            )
+        return embedding
+
+    def relation_query(
+        self,
+        source_embedding: torch.Tensor,
+        source_type: str,
+        destination_type: str,
+    ) -> torch.Tensor:
+        normalize_object_type(destination_type)
+        return self.project(source_embedding, source_type)
+
+    def index_vector(
+        self, destination_embedding: torch.Tensor, destination_type: str
+    ) -> torch.Tensor:
+        return self.project(destination_embedding, destination_type)
+
+
+class ProjectedIdentityStudentJoinabilityModel(nn.Module):
+    """Zero-training shared projection P with every relation fixed to identity."""
+
+    def __init__(self, projection: torch.Tensor) -> None:
+        super().__init__()
+        if projection.ndim != 2 or min(projection.shape) <= 0:
+            raise ValueError("projection must have shape [student_dim, input_dim]")
+        projection = projection.detach().float()
+        if not torch.isfinite(projection).all():
+            raise ValueError("projection must be finite")
+        gram = projection @ projection.T
+        if not torch.allclose(
+            gram,
+            torch.eye(projection.shape[0], dtype=projection.dtype),
+            atol=1e-4,
+            rtol=1e-4,
+        ):
+            raise ValueError("projection rows must be orthonormal")
+        self.input_dim = int(projection.shape[1])
+        self.student_dim = int(projection.shape[0])
+        self.register_buffer("projection", projection)
+
+    def config(self) -> dict[str, int | str]:
+        return {
+            "input_dim": self.input_dim,
+            "student_dim": self.student_dim,
+            "projection": "shared_pca",
+            "relation": "identity",
+        }
+
+    def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
+        normalize_object_type(object_type)
+        if embedding.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Expected embedding dimension {self.input_dim}, got {embedding.shape[-1]}"
+            )
+        return torch.nn.functional.linear(embedding, self.projection)
+
+    def relation_query(
+        self,
+        source_embedding: torch.Tensor,
+        source_type: str,
+        destination_type: str,
+    ) -> torch.Tensor:
+        normalize_object_type(destination_type)
+        return self.project(source_embedding, source_type)
+
+    def index_vector(
+        self, destination_embedding: torch.Tensor, destination_type: str
+    ) -> torch.Tensor:
         return self.project(destination_embedding, destination_type)
