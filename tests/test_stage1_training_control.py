@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import refresh_stage1_hard_negatives
+import run_stage1_rounds
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.protocol import validate_protocol_split
@@ -115,6 +116,37 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert metrics["evidence"]["recall@1"] == 1.0
     assert metrics["positive_evidence_path_queries@10"] == 1
     assert metrics["positive_evidence_path_coverage@10"] == 1.0
+
+
+def test_teacher_feature_readiness_requires_actual_hidden_states(tmp_path):
+    data = tmp_path / "edges.jsonl"
+    data.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "candidate_ids": ["t"],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    features = tmp_path / "features.pt"
+    objects = {
+        object_id: {
+            "object_type": "table",
+            "embedding": torch.ones(4),
+        }
+        for object_id in ("q", "t")
+    }
+    torch.save({"objects": objects}, features)
+
+    assert not run_stage1_rounds._teacher_features_ready(features, [data])
+
+    for payload in objects.values():
+        payload["hidden_states"] = torch.ones(2, 4)
+    torch.save({"objects": objects}, features)
+    assert run_stage1_rounds._teacher_features_ready(features, [data])
 
 
 def test_round_index_rejects_old_checkpoint_or_corpus(tmp_path):

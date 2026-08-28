@@ -60,7 +60,8 @@ def _teacher_features_ready(features: Path, data_paths: list[Path]) -> bool:
     store = FeatureStore.from_path(features)
     for object_id in teacher_object_ids(data_paths, split="train"):
         try:
-            store.get(object_id, include_hidden=True)
+            if store.get(object_id, include_hidden=True).hidden_states is None:
+                return False
         except (KeyError, ValueError, FileNotFoundError):
             return False
     return True
@@ -402,36 +403,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {"round": mining_round, "feature_cache": str(Path(args.features).resolve())},
             [pending_targets, pending_edges],
         )
-        if not supplement_step.completed():
-            if not _teacher_features_ready(
-                Path(args.features), [pending_targets, pending_edges]
-            ):
-                if args.objects is None or not Path(args.features).is_dir():
-                    raise ValueError(
-                        "Mined objects are missing Teacher features; provide --objects and "
-                        "use a two-tier feature directory, then resume"
-                    )
-                cache_stage1_features.run(
-                    argparse.Namespace(
-                        input_jsonl=args.objects,
-                        output_dir=args.features,
-                        model_dir=args.embedding_model_dir,
-                        device=args.device,
-                        dtype=args.embedding_dtype,
-                        teacher_data=[str(pending_targets), str(pending_edges)],
-                        teacher_split="train",
-                        instruction=None,
-                    )
-                )
-            if not _teacher_features_ready(
-                Path(args.features), [pending_targets, pending_edges]
-            ):
-                raise ValueError("Teacher feature supplementation did not complete")
-            supplement_step.complete([])
-        elif not _teacher_features_ready(
+        supplement_completed = supplement_step.completed()
+        if not _teacher_features_ready(
             Path(args.features), [pending_targets, pending_edges]
         ):
-            raise ValueError("Completed Teacher-feature step no longer matches the cache")
+            if args.objects is None or not Path(args.features).is_dir():
+                raise ValueError(
+                    "Mined objects are missing Teacher features; provide --objects and "
+                    "use a two-tier feature directory, then resume"
+                )
+            cache_stage1_features.run(
+                argparse.Namespace(
+                    input_jsonl=args.objects,
+                    output_dir=args.features,
+                    model_dir=args.embedding_model_dir,
+                    device=args.device,
+                    dtype=args.embedding_dtype,
+                    teacher_data=[str(pending_targets), str(pending_edges)],
+                    teacher_split="train",
+                    instruction=None,
+                )
+            )
+        if not _teacher_features_ready(
+            Path(args.features), [pending_targets, pending_edges]
+        ):
+            raise ValueError("Teacher feature supplementation did not complete")
+        if not supplement_completed:
+            supplement_step.complete([])
 
         hard_targets = round_dir / "hard_targets.jsonl"
         hard_edges = round_dir / "hard_edges.jsonl"
