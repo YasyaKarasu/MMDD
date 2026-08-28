@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import cache_stage1_features as stage1_cache
 import compact_stage1_feature_cache as compact_cache
 import refresh_stage1_hard_negatives as hard_negative_refresh
+import train_stage1
 from cache_stage1_features import (
     EMBEDDING_INSTRUCTIONS,
     build_object_features,
@@ -47,8 +48,10 @@ from mmdd_stage1.models import (
 )
 from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
 from mmdd_stage1.retrieval import (
+    RawEmbeddingANNIndices,
     StudentANNIndices,
     build_indices,
+    build_raw_embedding_indices,
     retrieve_zero_one_hop,
 )
 from mmdd_stage1.scoring import score_edge_batch, score_target_batch
@@ -1212,6 +1215,101 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
         assert score == pytest.approx(expected[target_id], abs=1e-5)
     assert {result["target_id"] for result in results} == {"positive", "negative"}
     assert all({path["kind"] for path in result["paths"]} == {"direct", "evidence"} for result in results)
+
+
+def test_raw_embedding_ann_uses_frozen_vectors_without_student_head(tmp_path):
+    store = feature_store()
+    ids_by_type = {
+        "table": ["positive", "negative"],
+        "text": ["evidence"],
+        "image": [],
+    }
+    build_raw_embedding_indices(
+        store,
+        ids_by_type,
+        tmp_path,
+        corpus_sha256="synthetic-corpus",
+        batch_size=2,
+        m=8,
+        ef_construction=20,
+        ef_search=20,
+    )
+    indices = RawEmbeddingANNIndices(
+        store,
+        tmp_path,
+        corpus_sha256="synthetic-corpus",
+    )
+
+    hits = indices.search("q", "table", 2)
+    expected = {
+        target_id: torch.dot(
+            store.get("q", include_hidden=False).embedding,
+            store.get(target_id, include_hidden=False).embedding,
+        ).item()
+        for target_id in ("positive", "negative")
+    }
+
+    assert {target_id for target_id, _ in hits} == set(expected)
+    for target_id, score in hits:
+        assert score == pytest.approx(expected[target_id], abs=1e-5)
+
+
+def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path):
+    store = feature_store()
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text(
+        "".join(
+            json.dumps({"object_id": object_id}) + "\n"
+            for object_id in ("positive", "negative", "evidence")
+        ),
+        encoding="utf-8",
+    )
+    example = TargetExample(
+        "q",
+        (
+            TargetCandidate("positive", ("evidence",)),
+            TargetCandidate("negative", ()),
+        ),
+        direct_positive_index=0,
+        evidence_positive_index=0,
+        split="dev",
+        positive_target_ids=("positive",),
+    )
+    args = argparse.Namespace(
+        index_batch_size=2,
+        hnsw_m=8,
+        ef_construction=20,
+        ef_search=20,
+        direct_k=2,
+        evidence_k=1,
+        targets_per_evidence=2,
+        evidence_types=["text"],
+        rrf_k=60,
+    )
+    controller = train_stage1._EpochController(
+        output=tmp_path / "student.pt",
+        stage="student-path",
+        aggregator=PathAggregator(),
+        primary_metric="recall@10",
+        min_delta=0.0,
+        patience=1,
+        store=store,
+        device=torch.device("cpu"),
+        dev_examples=[example],
+        corpus_path=corpus,
+        index_root=tmp_path / "dev_indices",
+        raw_index_root=tmp_path / "raw_index",
+        args=args,
+    )
+    record = {"dev_loss": 1.0}
+
+    controller(1, StudentJoinabilityModel(4, 3), record)
+
+    assert record["dev_retrieval"]["raw_embedding"]["queries"] == 1
+    assert controller.best_metrics["raw_embedding"] == record["dev_retrieval"][
+        "raw_embedding"
+    ]
+    assert (tmp_path / "raw_index" / "manifest.json").is_file()
 
 
 def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():

@@ -6,7 +6,11 @@ from collections.abc import Sequence
 from typing import Any
 
 from .data import TargetExample
-from .retrieval import StudentANNIndices, retrieve_zero_one_hop_detailed
+from .retrieval import (
+    RawEmbeddingANNIndices,
+    StudentANNIndices,
+    retrieve_zero_one_hop_detailed,
+)
 
 RECALL_KS = (1, 5, 10, 50, 100)
 
@@ -43,7 +47,7 @@ def _channel_metrics(
 
 def evaluate_student_retrieval(
     examples: Sequence[TargetExample],
-    indices: StudentANNIndices,
+    indices: StudentANNIndices | RawEmbeddingANNIndices,
     *,
     direct_k: int = 100,
     evidence_k: int = 50,

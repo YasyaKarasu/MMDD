@@ -23,6 +23,7 @@ from mmdd_stage1.retrieval import (
     StudentANNIndices,
     build_indices,
     checkpoint_fingerprint,
+    load_or_build_raw_embedding_indices,
     load_corpus_ids,
 )
 from mmdd_stage1.selection import MetricGate, load_stage1_selection, write_json
@@ -129,6 +130,11 @@ def _train_args(
         hard_source_checkpoint=str(hard_source_checkpoint),
         corpus=args.corpus if stage == "student-path" else None,
         index_root=str(index_root) if index_root is not None else None,
+        raw_index_root=(
+            str(Path(args.output_dir) / "raw_embedding_index")
+            if stage == "student-path"
+            else None
+        ),
         split="train",
         dev_split="dev",
         device=args.device,
@@ -186,6 +192,7 @@ def _evaluate_final_test(
     corpus_sha256 = checkpoint_fingerprint(corpus_path)
     metrics_path = output_dir / "final_test_metrics.json"
     index_dir = output_dir / "final_test_index"
+    raw_index_dir = output_dir / "raw_embedding_index"
     step = _step(
         output_dir,
         "final_test",
@@ -198,6 +205,7 @@ def _evaluate_final_test(
                 "targets_per_evidence": args.dev_targets_per_evidence,
                 "rrf_k": args.rrf_k,
             },
+            "raw_embedding_baseline": True,
         },
         [checkpoint_path, corpus_path, *map(Path, args.test_data)],
     )
@@ -218,10 +226,11 @@ def _evaluate_final_test(
         Path(args.features), cache_size=args.feature_cache_size
     )
     student = load_student(checkpoint_path, device)
+    ids_by_type = load_corpus_ids(corpus_path, store)
     build_indices(
         student,
         store,
-        load_corpus_ids(corpus_path, store),
+        ids_by_type,
         index_dir,
         device=device,
         checkpoint_sha256=checkpoint_sha256,
@@ -256,8 +265,31 @@ def _evaluate_final_test(
         evidence_top_k=top_k,
         rrf_k=args.rrf_k,
     )
+    raw_indices = load_or_build_raw_embedding_indices(
+        store,
+        ids_by_type,
+        raw_index_dir,
+        corpus_sha256=corpus_sha256,
+        batch_size=args.index_batch_size,
+        m=args.hnsw_m,
+        ef_construction=args.ef_construction,
+        ef_search=args.ef_search,
+    )
+    metrics["raw_embedding"] = evaluate_student_retrieval(
+        test_examples,
+        raw_indices,
+        direct_k=args.dev_direct_k,
+        evidence_k=args.dev_evidence_k,
+        targets_per_evidence=args.dev_targets_per_evidence,
+        evidence_types=tuple(args.evidence_types),
+        evidence_aggregation=aggregation,
+        evidence_top_k=top_k,
+        rrf_k=args.rrf_k,
+    )
     write_json(metrics_path, metrics)
-    step.complete([metrics_path, index_dir / "manifest.json"])
+    step.complete(
+        [metrics_path, index_dir / "manifest.json", raw_index_dir / "manifest.json"]
+    )
     return metrics
 
 

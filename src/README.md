@@ -158,7 +158,11 @@ a candidate checkpoint, rebuilds indexes over the same complete shared corpus,
 and evaluates the fixed dev queries. Its retrieval record contains Recall@1/5/
 10/50/100 and MRR@100 for fused, direct, and evidence rankings, plus the number
 and fraction of dev queries whose global top 10 contains a labeled positive
-evidence path. `--primary-metric` also accepts nested names such as
+evidence path. The same record includes a `raw_embedding` baseline that runs
+the identical zero/one-hop retrieval directly on the frozen normalized Qwen
+embeddings, without the Student projection or relation matrices. This
+corpus-bound raw index is built once and reused across epochs and mining rounds.
+`--primary-metric` also accepts nested names such as
 `direct.recall@10` or `evidence.mrr@100`.
 
 For an output such as `student_path.pt`, training writes:

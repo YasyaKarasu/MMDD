@@ -21,6 +21,7 @@ from mmdd_stage1.retrieval import (
     StudentANNIndices,
     build_indices,
     checkpoint_fingerprint,
+    load_or_build_raw_embedding_indices,
     load_corpus_ids,
 )
 from mmdd_stage1.selection import CheckpointManager, MetricGate, write_json
@@ -142,6 +143,7 @@ class _EpochController:
         dev_examples: list[Any],
         corpus_path: Path | None,
         index_root: Path | None,
+        raw_index_root: Path | None,
         args: argparse.Namespace,
     ) -> None:
         self.stage = stage
@@ -153,9 +155,11 @@ class _EpochController:
         self.dev_examples = dev_examples
         self.corpus_path = corpus_path
         self.index_root = index_root
+        self.raw_index_root = raw_index_root
         self.args = args
         self.best_metrics: dict[str, Any] | None = None
         self.best_index: Path | None = None
+        self.raw_embedding_metrics: dict[str, Any] | None = None
         self.stop_reason = "max_epochs"
         self.corpus_sha256 = (
             checkpoint_fingerprint(corpus_path) if corpus_path is not None else None
@@ -180,6 +184,7 @@ class _EpochController:
         if self.stage == "student-path":
             assert isinstance(model, StudentJoinabilityModel)
             assert self.index_root is not None
+            assert self.raw_index_root is not None
             assert self.ids_by_type is not None
             index_dir = self.index_root / f"epoch_{epoch:03d}"
             build_indices(
@@ -214,6 +219,29 @@ class _EpochController:
                 evidence_top_k=self.aggregator.top_k,
                 rrf_k=self.args.rrf_k,
             )
+            if self.raw_embedding_metrics is None:
+                raw_indices = load_or_build_raw_embedding_indices(
+                    self.store,
+                    self.ids_by_type,
+                    self.raw_index_root,
+                    corpus_sha256=self.corpus_sha256,
+                    batch_size=self.args.index_batch_size,
+                    m=self.args.hnsw_m,
+                    ef_construction=self.args.ef_construction,
+                    ef_search=self.args.ef_search,
+                )
+                self.raw_embedding_metrics = evaluate_student_retrieval(
+                    self.dev_examples,
+                    raw_indices,
+                    direct_k=self.args.direct_k,
+                    evidence_k=self.args.evidence_k,
+                    targets_per_evidence=self.args.targets_per_evidence,
+                    evidence_types=tuple(self.args.evidence_types),
+                    evidence_aggregation=self.aggregator.evidence_aggregation,
+                    evidence_top_k=self.aggregator.top_k,
+                    rrf_k=self.args.rrf_k,
+                )
+            retrieval_metrics["raw_embedding"] = self.raw_embedding_metrics
             record["dev_retrieval"] = retrieval_metrics
             gate_metrics = {**retrieval_metrics, "dev_loss": record["dev_loss"]}
         else:
@@ -343,6 +371,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     corpus_path = None
     index_root = None
+    raw_index_root = None
     primary_metric = "dev_loss"
     if args.stage == "student-path":
         corpus_path = _required_path(args.corpus, "--corpus", args.stage)
@@ -350,6 +379,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             Path(args.index_root)
             if args.index_root
             else Path(args.output).with_suffix(".dev_indices")
+        )
+        raw_index_root_value = getattr(args, "raw_index_root", None)
+        raw_index_root = (
+            Path(raw_index_root_value)
+            if raw_index_root_value
+            else index_root / "raw_embedding"
         )
         primary_metric = args.primary_metric
 
@@ -365,6 +400,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         dev_examples=dev_examples,
         corpus_path=corpus_path,
         index_root=index_root,
+        raw_index_root=raw_index_root,
         args=args,
     )
     learning_rate = args.hard_learning_rate if hard_examples else args.learning_rate
@@ -517,6 +553,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if controller.best_index is not None
             else None
         ),
+        "raw_embedding_index": (
+            str(controller.raw_index_root.resolve())
+            if controller.raw_index_root is not None
+            else None
+        ),
         "corpus_sha256": controller.corpus_sha256,
         "stage2_allowed": stage2_allowed,
         "stage2_evidence_gate": {
@@ -559,6 +600,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-source-checkpoint", help="Student checkpoint used to mine --hard-data.")
     parser.add_argument("--corpus", help="Full shared data-lake corpus; required by student-path.")
     parser.add_argument("--index-root", help="Per-epoch dev ANN index root.")
+    parser.add_argument(
+        "--raw-index-root",
+        help="Reusable corpus ANN index built directly from frozen embeddings.",
+    )
     parser.add_argument("--split", default="train", choices=["train"])
     parser.add_argument("--dev-split", default="dev", choices=["dev"])
     parser.add_argument("--device", default="auto")

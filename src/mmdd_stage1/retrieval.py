@@ -113,6 +113,75 @@ def build_indices(
     return manifest
 
 
+def build_raw_embedding_indices(
+    store: FeatureStore,
+    ids_by_type: dict[str, list[str]],
+    output_dir: Path,
+    *,
+    corpus_sha256: str,
+    batch_size: int = 1024,
+    m: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 100,
+) -> dict[str, Any]:
+    """Build per-type ANN indexes from the frozen embeddings without a Student head."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    import hnswlib
+
+    first_id = next(
+        (object_id for object_type in OBJECT_TYPES for object_id in ids_by_type.get(object_type, [])),
+        None,
+    )
+    if first_id is None:
+        raise ValueError("Cannot build raw embedding indexes for an empty corpus")
+    embedding_dim = int(store.get(first_id, include_hidden=False).embedding.shape[0])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    type_records = {}
+    for object_type in OBJECT_TYPES:
+        object_ids = ids_by_type.get(object_type, [])
+        if not object_ids:
+            continue
+        index = hnswlib.Index(space="ip", dim=embedding_dim)
+        index.init_index(max_elements=len(object_ids), ef_construction=ef_construction, M=m)
+        for start in range(0, len(object_ids), batch_size):
+            batch_ids = object_ids[start : start + batch_size]
+            vectors = torch.stack(
+                [
+                    store.get(object_id, include_hidden=False).embedding.float()
+                    for object_id in batch_ids
+                ]
+            ).numpy().astype("float32")
+            labels = np.arange(start, start + len(batch_ids))
+            index.add_items(vectors, labels)
+        index.set_ef(ef_search)
+        index_path = output_dir / f"{object_type}.hnsw"
+        ids_path = output_dir / f"{object_type}_ids.json"
+        index.save_index(str(index_path))
+        ids_path.write_text(json.dumps(object_ids, ensure_ascii=False) + "\n", encoding="utf-8")
+        type_records[object_type] = {
+            "index_path": index_path.name,
+            "ids_path": ids_path.name,
+            "objects": len(object_ids),
+        }
+    manifest = {
+        "format_version": 1,
+        "index_kind": "raw_embedding",
+        "space": "ip",
+        "embedding_dim": embedding_dim,
+        "corpus_sha256": corpus_sha256,
+        "hnsw_m": m,
+        "ef_construction": ef_construction,
+        "ef_search": ef_search,
+        "types": type_records,
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
 class StudentANNIndices:
     def __init__(
         self,
@@ -166,6 +235,111 @@ class StudentANNIndices:
             (self.object_ids[destination_type][int(label)], 1.0 - float(distance))
             for label, distance in zip(labels[0], distances[0])
         ]
+
+
+class RawEmbeddingANNIndices:
+    """ANN search over frozen embeddings with no learned projection or relation."""
+
+    def __init__(
+        self,
+        store: FeatureStore,
+        index_dir: Path,
+        *,
+        corpus_sha256: str,
+    ) -> None:
+        import hnswlib
+
+        manifest_path = index_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("format_version") != 1
+            or manifest.get("index_kind") != "raw_embedding"
+            or manifest.get("space") != "ip"
+        ):
+            raise ValueError(f"{manifest_path}: unsupported raw embedding ANN format")
+        if manifest.get("corpus_sha256") != corpus_sha256:
+            raise ValueError(f"{manifest_path}: raw embedding index belongs to a different corpus")
+        self.store = store
+        self.embedding_dim = int(manifest["embedding_dim"])
+        self.indices = {}
+        self.object_ids = {}
+        for object_type, record in manifest["types"].items():
+            index = hnswlib.Index(space="ip", dim=self.embedding_dim)
+            index.load_index(
+                str(index_dir / record["index_path"]),
+                max_elements=int(record["objects"]),
+            )
+            index.set_ef(int(manifest["ef_search"]))
+            object_ids = json.loads(
+                (index_dir / record["ids_path"]).read_text(encoding="utf-8")
+            )
+            if len(object_ids) != int(record["objects"]):
+                raise ValueError(
+                    f"{index_dir / record['ids_path']}: object count does not match the manifest"
+                )
+            self.indices[object_type] = index
+            self.object_ids[object_type] = object_ids
+
+    def search(
+        self, source_id: str, destination_type: str, k: int
+    ) -> list[tuple[str, float]]:
+        destination_type = normalize_object_type(destination_type)
+        if k <= 0 or destination_type not in self.indices:
+            return []
+        embedding = self.store.get(source_id, include_hidden=False).embedding.float()
+        if embedding.shape != (self.embedding_dim,):
+            raise ValueError(f"{source_id}: raw embedding dimension does not match the index")
+        query_array = embedding.numpy().astype("float32").reshape(1, -1)
+        count = len(self.object_ids[destination_type])
+        labels, distances = self.indices[destination_type].knn_query(
+            query_array, k=min(k, count)
+        )
+        return [
+            (self.object_ids[destination_type][int(label)], 1.0 - float(distance))
+            for label, distance in zip(labels[0], distances[0])
+        ]
+
+
+def load_or_build_raw_embedding_indices(
+    store: FeatureStore,
+    ids_by_type: dict[str, list[str]],
+    output_dir: Path,
+    *,
+    corpus_sha256: str,
+    batch_size: int = 1024,
+    m: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 100,
+) -> RawEmbeddingANNIndices:
+    """Reuse one corpus-bound raw index, or build it once when absent."""
+
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = {
+            "corpus_sha256": corpus_sha256,
+            "hnsw_m": m,
+            "ef_construction": ef_construction,
+            "ef_search": ef_search,
+        }
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"{manifest_path}: raw embedding index settings differ from this run")
+    else:
+        build_raw_embedding_indices(
+            store,
+            ids_by_type,
+            output_dir,
+            corpus_sha256=corpus_sha256,
+            batch_size=batch_size,
+            m=m,
+            ef_construction=ef_construction,
+            ef_search=ef_search,
+        )
+    return RawEmbeddingANNIndices(
+        store,
+        output_dir,
+        corpus_sha256=corpus_sha256,
+    )
 
 
 def _logsumexp(values: Iterable[float]) -> float:
