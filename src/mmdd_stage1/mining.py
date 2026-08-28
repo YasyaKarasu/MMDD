@@ -385,3 +385,69 @@ def score_hard_candidate_sets(
                 edge_records.append(edge_record)
                 edge_offset += 1
     return target_records, edge_records
+
+
+@torch.no_grad()
+def score_pending_hard_examples(
+    target_examples: Sequence[TargetExample],
+    edge_examples: Sequence[EdgeExample],
+    teacher: TeacherJoinabilityModel,
+    store: FeatureStore,
+    aggregator: PathAggregator,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Score persisted hard candidates without repeating ANN retrieval."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    teacher.eval()
+
+    target_records = []
+    target_starts = range(0, len(target_examples), batch_size)
+    for start in progress(
+        target_starts,
+        total=len(target_starts),
+        desc="Teacher hard-target scoring",
+        unit="batch",
+        leave=False,
+    ):
+        batch = target_examples[start : start + batch_size]
+        scores = score_target_batch(teacher, batch, store, device, aggregator)
+        for index, example in enumerate(batch):
+            candidate_count = len(example.candidates)
+            record = _target_record(example)
+            record.update(
+                teacher_direct_logits=scores.direct.logits[
+                    index, :candidate_count
+                ].cpu().tolist(),
+                teacher_evidence_logits=scores.evidence.logits[
+                    index, :candidate_count
+                ].cpu().tolist(),
+            )
+            target_records.append(record)
+
+    # One mined target produces roughly four directly supervised edge lists.
+    # Preserve the effective batch size of score_hard_candidate_sets.
+    edge_batch_size = batch_size * 4
+    edge_records = []
+    edge_starts = range(0, len(edge_examples), edge_batch_size)
+    for start in progress(
+        edge_starts,
+        total=len(edge_starts),
+        desc="Teacher hard-edge scoring",
+        unit="batch",
+        leave=False,
+    ):
+        batch = edge_examples[start : start + edge_batch_size]
+        scores = score_edge_batch(teacher, batch, store, device)
+        for index, example in enumerate(batch):
+            candidate_count = len(example.candidate_ids)
+            record = _edge_record(example)
+            record["teacher_logits"] = scores.logits[
+                index, :candidate_count
+            ].cpu().tolist()
+            edge_records.append(record)
+
+    return target_records, edge_records

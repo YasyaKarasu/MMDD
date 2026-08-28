@@ -295,17 +295,29 @@ conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
   --student-checkpoint checkpoints/student_path_round0.pt \
   --index-dir indices/stage1_round0 --corpus stage1_corpus.jsonl \
   --target-lists target_lists.jsonl \
-  --output-target-lists hard_targets_round1.jsonl \
-  --output-edge-lists hard_edges_round1.jsonl
+  --output-target-lists hard_targets_round1.pending.jsonl \
+  --output-edge-lists hard_edges_round1.pending.jsonl
 
 conda run -n MMDD python src/cache_stage1_features.py \
   --input-jsonl stage1_objects.jsonl --output-dir cache/stage1_qwen8b \
   --model-dir hf_models/Qwen3-VL-Embedding-8B \
-  --teacher-data hard_targets_round1.jsonl hard_edges_round1.jsonl
+  --teacher-data \
+    hard_targets_round1.pending.jsonl hard_edges_round1.pending.jsonl
 
-# Rerun the first refresh command without --mine-only and add:
-# --teacher-checkpoint checkpoints/teacher_path.pt
+conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
+  --features cache/stage1_qwen8b \
+  --teacher-checkpoint checkpoints/teacher_path.pt \
+  --student-checkpoint checkpoints/student_path_round0.pt \
+  --index-dir indices/stage1_round0 --corpus stage1_corpus.jsonl \
+  --target-lists target_lists.jsonl \
+  --pending-target-lists hard_targets_round1.pending.jsonl \
+  --pending-edge-lists hard_edges_round1.pending.jsonl \
+  --output-target-lists hard_targets_round1.jsonl \
+  --output-edge-lists hard_edges_round1.jsonl
 ```
+
+The scoring pass reads the persisted pending candidates directly. It does not
+repeat ANN retrieval after Teacher features have been supplemented.
 
 The refresh mines three independent current-Student distributions. `Q -> T`
 ANN returns hard targets outside `positive_target_ids`. Per-modality `Q -> E`

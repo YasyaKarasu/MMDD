@@ -78,6 +78,8 @@ def _refresh_args(
     output_edges: Path,
     mining_round: int,
     mine_only: bool,
+    pending_targets: Path | None = None,
+    pending_edges: Path | None = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         features=args.features,
@@ -88,6 +90,10 @@ def _refresh_args(
         target_lists=args.base_path_data,
         output_target_lists=str(output_targets),
         output_edge_lists=str(output_edges),
+        pending_target_lists=(
+            str(pending_targets) if pending_targets is not None else None
+        ),
+        pending_edge_lists=str(pending_edges) if pending_edges is not None else None,
         split="train",
         device=args.device,
         feature_cache_size=args.feature_cache_size,
@@ -500,6 +506,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     output_edges=hard_edges,
                     mining_round=mining_round,
                     mine_only=False,
+                    pending_targets=pending_targets,
+                    pending_edges=pending_edges,
                 )
             )
             score_step.complete(

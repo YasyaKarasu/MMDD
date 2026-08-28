@@ -24,6 +24,7 @@ venv/
 *.log
 *.tmp
 tmp/
+/reports/
 
 # Generated Stage-1 / dataset outputs
 /audits/

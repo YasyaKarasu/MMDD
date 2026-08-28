@@ -53,6 +53,7 @@ from mmdd_stage1.retrieval import (
     StudentANNIndices,
     build_indices,
     build_raw_embedding_indices,
+    checkpoint_fingerprint,
     retrieve_zero_one_hop,
     retrieve_zero_one_hop_detailed,
 )
@@ -1798,6 +1799,191 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     assert loaded_target.teacher_checkpoint_sha256 == "synthetic"
     assert loaded_edge.teacher_logits == pytest.approx(edge_records[0]["teacher_logits"])
     assert loaded_edge.teacher_checkpoint_sha256 == "synthetic"
+
+
+def test_hard_negative_refresh_scores_pending_candidates_without_remining(
+    tmp_path, monkeypatch
+):
+    features = {
+        "q": feature("q", "table", 0.1),
+        "positive": feature("positive", "table", 0.2),
+        "hard": feature("hard", "table", 0.8),
+        "positive_evidence": feature("positive_evidence", "text", 0.4),
+        "hard_evidence": feature("hard_evidence", "text", 0.7),
+    }
+    store = FeatureStore(features)
+    original = TargetExample(
+        "q",
+        (
+            TargetCandidate("positive", ("positive_evidence",)),
+            TargetCandidate("hard", ()),
+        ),
+        direct_positive_index=0,
+        evidence_positive_index=0,
+        dataset="2k",
+        split="train",
+    )
+    candidate_set = build_hard_candidate_set(
+        original,
+        ["hard"],
+        ["hard_evidence"],
+        [HardPath("hard_evidence", "hard", 3.0)],
+        hard_targets_per_query=1,
+    )
+    pending_target_records, pending_edge_records = hard_candidate_records(
+        [candidate_set], store
+    )
+
+    features_path = tmp_path / "features.pt"
+    torch.save(
+        {
+            "objects": {
+                object_id: {
+                    "object_type": value.object_type,
+                    "embedding": value.embedding,
+                    "hidden_states": value.hidden_states,
+                    "token_groups": value.token_groups,
+                }
+                for object_id, value in features.items()
+            }
+        },
+        features_path,
+    )
+    student_path = tmp_path / "student.pt"
+    teacher_path = tmp_path / "teacher.pt"
+    teacher_model = teacher()
+    torch.save(
+        checkpoint(
+            StudentJoinabilityModel(input_dim=4, student_dim=3),
+            "student-path",
+            PathAggregator(),
+        ),
+        student_path,
+    )
+    torch.save(
+        checkpoint(teacher_model, "teacher-path", PathAggregator()), teacher_path
+    )
+    expected_targets, expected_edges = score_hard_candidate_sets(
+        [candidate_set],
+        teacher_model,
+        store,
+        PathAggregator(),
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text("{}\n", encoding="utf-8")
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    index_manifest = index_dir / "manifest.json"
+    index_manifest.write_text("{}\n", encoding="utf-8")
+
+    pending_targets = tmp_path / "hard_targets.pending.jsonl"
+    pending_edges = tmp_path / "hard_edges.pending.jsonl"
+    pending_targets.write_text(
+        "".join(json.dumps(record) + "\n" for record in pending_target_records),
+        encoding="utf-8",
+    )
+    pending_edges.write_text(
+        "".join(json.dumps(record) + "\n" for record in pending_edge_records),
+        encoding="utf-8",
+    )
+    metadata = {
+        "mining_round": 1,
+        "student_checkpoint_sha256": checkpoint_fingerprint(student_path),
+        "corpus_sha256": checkpoint_fingerprint(corpus_path),
+        "index_manifest_sha256": checkpoint_fingerprint(index_manifest),
+        "evidence_aggregation": "logsumexp",
+        "evidence_top_k": 4,
+        "teacher_target_channels": ["direct", "evidence"],
+        "hard_negative_mining": {
+            "hard_evidence": "query_to_evidence_ann",
+            "hard_target": "query_to_target_ann",
+            "path_hard": "raw_query_evidence_target_path_score",
+        },
+        "hard_targets_per_query": 1,
+        "hard_evidence_per_type": 1,
+        "hard_paths_per_query": 1,
+        "direct_k": 2,
+        "evidence_k": 2,
+        "targets_per_evidence": 2,
+        "evidence_types": ["text"],
+        "teacher_scoring": "pending",
+    }
+    for path in (pending_targets, pending_edges):
+        path.with_suffix(path.suffix + ".metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        hard_negative_refresh,
+        "retrieve_hard_candidate_sets",
+        lambda *_args, **_kwargs: pytest.fail("pending scoring repeated ANN mining"),
+    )
+    output_targets = tmp_path / "hard_targets.jsonl"
+    output_edges = tmp_path / "hard_edges.jsonl"
+    hard_negative_refresh.run(
+        argparse.Namespace(
+            features=str(features_path),
+            teacher_checkpoint=str(teacher_path),
+            student_checkpoint=str(student_path),
+            index_dir=str(index_dir),
+            corpus=str(corpus_path),
+            target_lists=[str(tmp_path / "unused.jsonl")],
+            output_target_lists=str(output_targets),
+            output_edge_lists=str(output_edges),
+            pending_target_lists=str(pending_targets),
+            pending_edge_lists=str(pending_edges),
+            split="train",
+            device="cpu",
+            feature_cache_size=128,
+            teacher_batch_size=1,
+            mine_only=False,
+            mining_round=1,
+            hard_targets_per_query=1,
+            hard_evidence_per_type=1,
+            hard_paths_per_query=1,
+            direct_k=2,
+            evidence_k=2,
+            targets_per_evidence=2,
+            evidence_types=["text"],
+            evidence_aggregation=None,
+            evidence_top_k=None,
+        )
+    )
+
+    target_record = json.loads(output_targets.read_text(encoding="utf-8"))
+    edge_records = [
+        json.loads(line)
+        for line in output_edges.read_text(encoding="utf-8").splitlines()
+    ]
+    assert target_record["candidates"] == pending_target_records[0]["candidates"]
+    assert len(target_record["teacher_direct_logits"]) == 2
+    assert len(target_record["teacher_evidence_logits"]) == 2
+    assert target_record["teacher_direct_logits"] == pytest.approx(
+        expected_targets[0]["teacher_direct_logits"]
+    )
+    assert target_record["teacher_evidence_logits"] == pytest.approx(
+        expected_targets[0]["teacher_evidence_logits"]
+    )
+    assert len(edge_records) == 3
+    assert all(len(record["teacher_logits"]) == 2 for record in edge_records)
+    for record, expected in zip(edge_records, expected_edges):
+        assert record["teacher_logits"] == pytest.approx(expected["teacher_logits"])
+    query_evidence_edge = next(
+        record for record in edge_records if record["destination_type"] == "text"
+    )
+    assert query_evidence_edge["candidate_ids"] == [
+        "positive_evidence",
+        "hard_evidence",
+    ]
+    output_metadata = json.loads(
+        output_targets.with_suffix(".jsonl.metadata.json").read_text(encoding="utf-8")
+    )
+    assert output_metadata["teacher_scoring"] == "complete"
+    assert output_metadata["teacher_checkpoint_sha256"] == checkpoint_fingerprint(
+        teacher_path
+    )
 
 
 def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
