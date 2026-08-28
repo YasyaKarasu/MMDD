@@ -11,6 +11,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from mmdd_progress import progress
+
 SPLITS = ("train", "dev", "test")
 SPLIT_SCHEMA_VERSION = "query-only-shared-data-lake-v1"
 
@@ -109,7 +111,10 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
     query_splits: dict[str, str] = {}
     query_sources: dict[str, str] = {}
     query_counts = {split: 0 for split in SPLITS}
-    for path in _artifact_paths(root, manifest, "query_tables"):
+    query_paths = _artifact_paths(root, manifest, "query_tables")
+    for path in progress(
+        query_paths, desc="Scan query tables", unit="shard", leave=False
+    ):
         for record in _iter_jsonl(path):
             query_id = str(record["table_id"])
             split = str(record["split"])
@@ -141,7 +146,14 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
     target_ids: set[str] = set()
     target_split_fields = 0
     target_artifact = manifest["artifacts"]["data_lake_tables"]
-    for shard, source in zip(target_artifact["shards"], _artifact_paths(root, manifest, "data_lake_tables")):
+    target_paths = _artifact_paths(root, manifest, "data_lake_tables")
+    target_shards = zip(target_artifact["shards"], target_paths)
+    for shard, source in progress(
+        target_shards,
+        total=len(target_paths),
+        desc="Rewrite data lake",
+        unit="shard",
+    ):
         temporary = _temporary(source)
         records = 0
         removed = 0
@@ -188,7 +200,13 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
         if str(record.get("split")) != query_splits[query_id]:
             raise ValueError(f"qrel split differs from its query: {query_id}")
 
-    for path in _artifact_paths(root, manifest, "evidence_recoveries"):
+    recovery_paths = _artifact_paths(root, manifest, "evidence_recoveries")
+    for path in progress(
+        recovery_paths,
+        desc="Validate recoveries",
+        unit="shard",
+        leave=False,
+    ):
         for record in _iter_jsonl(path):
             query_id = str(record["query_table_id"])
             target_id = str(record["target_table_id"])

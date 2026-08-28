@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
+from mmdd_progress import progress
 
 from .utils import clean_text, stable_hash
 from .wdc_runtime import bounded_map, stable_digest
@@ -321,8 +322,15 @@ def execute_tasks(
         cache.put(namespace, key, result)
         return url, result
 
+    fetched = bounded_map(get_or_fetch, unique_urls, workers=workers)
     outcomes = dict(
-        bounded_map(get_or_fetch, unique_urls, workers=workers)
+        progress(
+            fetched,
+            total=len(unique_urls),
+            desc=f"Fetch {kind} evidence",
+            unit="url",
+            leave=False,
+        )
     )
     return [
         {

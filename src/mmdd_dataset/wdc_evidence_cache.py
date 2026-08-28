@@ -11,6 +11,8 @@ from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from mmdd_progress import progress
+
 from .wdc_evidence import normalize_public_url
 from .wdc_runtime import (
     AtomicJsonlShard,
@@ -179,7 +181,10 @@ def _copy_page_shards(
     copy_mode: str,
 ) -> list[ShardInfo]:
     output: list[ShardInfo] = []
-    for shard in _declared_shards(source_manifest):
+    declared = _declared_shards(source_manifest)
+    for shard in progress(
+        declared, desc="Copy page evidence", unit="shard", leave=False
+    ):
         source = _validate_source_shard(source_root, shard)
         target = staging / "page_outcomes" / source.name
         _publish_file(
@@ -210,7 +215,13 @@ def _rewrite_image_shards(
     copy_mode: str,
 ) -> list[ShardInfo]:
     output: list[ShardInfo] = []
-    for index, shard in enumerate(_declared_shards(source_manifest)):
+    declared = _declared_shards(source_manifest)
+    for index, shard in progress(
+        enumerate(declared),
+        total=len(declared),
+        desc="Copy image evidence",
+        unit="shard",
+    ):
         source = _validate_source_shard(source_root, shard)
         writer = AtomicJsonlShard(
             staging / "image_outcomes" / f"part-{index:05d}.jsonl",
@@ -288,8 +299,16 @@ def _build_lookup(staging: Path, shards: dict[str, list[ShardInfo]]) -> tuple[Sh
             """
         )
         unsafe = 0
-        for kind, artifact in (("page", "page_outcomes"), ("image", "image_outcomes")):
-            for shard in shards[artifact]:
+        artifacts = (("page", "page_outcomes"), ("image", "image_outcomes"))
+        for kind, artifact in progress(
+            artifacts, desc="Index evidence", unit="type", leave=False
+        ):
+            for shard in progress(
+                shards[artifact],
+                desc=f"Index {kind} evidence",
+                unit="shard",
+                leave=False,
+            ):
                 shard_path = staging / shard.path
                 with shard_path.open("rb") as handle:
                     while True:
@@ -498,7 +517,13 @@ def verify_evidence_cache(
             "SELECT path, bytes, sha256 FROM image_files ORDER BY path"
         )
         if verify_images:
-            for relative, size, digest in image_rows:
+            for relative, size, digest in progress(
+                image_rows,
+                total=int(manifest["counts"]["unique_image_files"]),
+                desc="Verify cached images",
+                unit="image",
+                leave=False,
+            ):
                 record = {
                     "path": _safe_relative_path(relative).as_posix(),
                     "bytes": int(size),

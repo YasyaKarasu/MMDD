@@ -12,6 +12,7 @@ from mmdd_dataset.joinability import table_asset_links
 from mmdd_dataset.tables import prepare_entitables, prepare_wdc
 from mmdd_dataset.utils import read_jsonl, source_splits, write_json, write_jsonl
 from mmdd_dataset.workload import generate_query_views, query_view_asset_links
+from mmdd_progress import progress
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
@@ -35,11 +36,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             max_rows=args.max_rows_per_table,
         )
 
-    views = [
-        view
-        for table in prepared.source_tables
-        for view in generate_query_views(table, args.max_query_views_per_table, args.seed)
-    ]
+    views = []
+    for table in progress(
+        prepared.source_tables, desc="Build query views", unit="table"
+    ):
+        views.extend(
+            generate_query_views(table, args.max_query_views_per_table, args.seed)
+        )
     splits, split_of = source_splits(
         prepared.source_tables,
         ratios=(args.train_ratio, args.dev_ratio, args.test_ratio),

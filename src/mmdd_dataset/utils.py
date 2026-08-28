@@ -7,7 +7,9 @@ import math
 import random
 import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sized
+
+from mmdd_progress import progress
 
 
 def clean_text(value: Any) -> str:
@@ -51,7 +53,14 @@ def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     with path.open("w", encoding="utf-8") as handle:
-        for record in records:
+        rows = progress(
+            records,
+            total=len(records) if isinstance(records, Sized) else None,
+            desc=f"Write {path.name}",
+            unit="record",
+            leave=False,
+        )
+        for record in rows:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
     return count

@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from mmdd_progress import progress
+
 from mmdd_dataset.utils import (
     clean_text,
     normalize,
@@ -31,7 +33,11 @@ def build(input_dir: Path, output_dir: Path, max_samples: int | None, seed: int)
     }
 
     candidates: list[dict[str, Any]] = []
-    for extraction in read_jsonl(input_dir / "attribute_extractions.jsonl"):
+    for extraction in progress(
+        read_jsonl(input_dir / "attribute_extractions.jsonl"),
+        desc="Build image samples",
+        unit="extraction",
+    ):
         asset = assets.get(extraction["asset_id"])
         table = tables.get(extraction["source_table_id"])
         if asset is None or table is None:
@@ -78,7 +84,7 @@ def build(input_dir: Path, output_dir: Path, max_samples: int | None, seed: int)
     image_dir.mkdir(exist_ok=True)
     by_split: dict[str, list[dict[str, Any]]] = {"train": [], "dev": [], "test": []}
     copied: dict[str, str] = {}
-    for sample in candidates:
+    for sample in progress(candidates, desc="Copy sample images", unit="sample"):
         asset = assets[sample.pop("asset_id")]
         source_path = Path(asset["local_path"])
         relative_path = copied.get(asset["asset_id"])

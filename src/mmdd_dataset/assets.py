@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
+from mmdd_progress import progress
 
 from .utils import clean_text, stable_hash
 
@@ -156,7 +157,7 @@ def fetch_assets(
     selected = entities if max_entities is None else entities[:max_entities]
     assets: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-    for entity in selected:
+    for entity in progress(selected, desc="Fetch assets", unit="entity"):
         try:
             if entity["source"] == "entitables":
                 assets.extend(_wikipedia_assets(entity, session, image_dir, max_images_per_entity))

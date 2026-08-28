@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from mmdd_progress import progress
 
 from .utils import clean_text, get_cell, get_column_name, stable_hash, values_match
 
@@ -111,7 +112,7 @@ def build_extractions(
         assets_by_entity.setdefault(asset["entity_id"], []).append(asset)
 
     records: list[dict[str, Any]] = []
-    for table in tables:
+    for table in progress(tables, desc="Extract attributes", unit="table"):
         profiles = {
             profile["column_index"]: profile
             for profile in table["metadata"]["column_profiles"]
@@ -209,7 +210,11 @@ def auto_check_recoveries(
     checked_recoveries: list[dict[str, Any]] = []
     supported_rows: dict[str, set[int]] = {}
 
-    for recovery in artifacts["evidence_recoveries"]:
+    for recovery in progress(
+        artifacts["evidence_recoveries"],
+        desc="Check recoveries",
+        unit="recovery",
+    ):
         query_id = recovery["query_table_id"]
         query = query_by_id.get(query_id)
         asset = asset_by_id.get(recovery["evidence"]["asset_id"])

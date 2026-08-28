@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from mmdd_progress import progress
+
 from .utils import clean_text, stable_hash
 
 
@@ -212,7 +214,8 @@ def prepare_entitables(
 ) -> PreparedData:
     tables: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
-    for path in sorted(input_dir.rglob("*.json")):
+    paths = sorted(input_dir.rglob("*.json"))
+    for path in progress(paths, desc="Load EntiTables", unit="file"):
         payload = json.loads(path.read_text(encoding="utf-8"))
         for table_id, raw_table in payload.items():
             table, reason = _entitable(
@@ -241,7 +244,9 @@ def prepare_wdc(
     tables: list[dict[str, Any]] = []
     entities: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
-    for path in iter_gzip_paths(input_dir):
+    for path in progress(
+        iter_gzip_paths(input_dir), desc="Load WDC tables", unit="table"
+    ):
         try:
             adapted = adapt_table(
                 path,

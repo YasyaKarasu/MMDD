@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from mmdd_progress import progress
+
 from .utils import (
     clean_text,
     get_cell,
@@ -455,7 +457,7 @@ def build_joinability_dataset(
         "evidence_recoveries": [],
         "table_queryability_decisions": [],
     }
-    for table in tables:
+    for table in progress(tables, desc="Build joinability", unit="table"):
         table_artifacts = _build_joinability_for_table(
             table,
             assets_by_id=assets_by_id,

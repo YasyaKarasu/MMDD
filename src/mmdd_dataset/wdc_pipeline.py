@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from mmdd_progress import progress
+
 from .extraction import OpenAICompatibleExtractor, PROMPT_VERSION
 from .joinability import BuildConfig, build_joinability_for_table, table_asset_links
 from .utils import clean_text, get_cell, get_column_name, stable_hash
@@ -224,7 +226,9 @@ def _populate_catalog(
     connection: sqlite3.Connection,
 ) -> int:
     pending = []
-    for candidate in iter_candidates(config.input_dir):
+    for candidate in progress(
+        iter_candidates(config.input_dir), desc="Catalog WDC candidates", unit="table"
+    ):
         pending.append(
             (
                 candidate.relative_path,
@@ -307,6 +311,12 @@ def run_select_sample(
         selection_writer = _new_shard(root, "selected_tables", shard_index)
         entity_writer = _new_shard(root, "sampled_entities", shard_index)
         in_shard = 0
+        selected_bar = progress(
+            total=config.target_tables,
+            initial=selected_count,
+            desc="Select WDC tables",
+            unit="table",
+        )
         try:
             for candidate in cursor:
                 if selected_count >= config.target_tables:
@@ -327,6 +337,7 @@ def run_select_sample(
                     skipped += 1
                     last_rank = str(candidate["rank"])
                     last_path = relative_path
+                    selected_bar.set_postfix(skipped=skipped)
                     continue
                 source_table_id = sampled[0]["source_table_id"] if sampled else ""
                 selection_writer.write(
@@ -344,6 +355,7 @@ def run_select_sample(
                 for entity in sampled:
                     entity_writer.write(entity)
                 selected_count += 1
+                selected_bar.update()
                 in_shard += 1
                 last_rank = str(candidate["rank"])
                 last_path = relative_path
@@ -362,6 +374,7 @@ def run_select_sample(
                     in_shard = 0
                     selection_writer = _new_shard(root, "selected_tables", shard_index)
                     entity_writer = _new_shard(root, "sampled_entities", shard_index)
+                selected_bar.set_postfix(skipped=skipped)
             if in_shard:
                 add_stage_shard(root, manifest, selection_writer.commit())
                 add_stage_shard(root, manifest, entity_writer.commit())
@@ -374,6 +387,8 @@ def run_select_sample(
             selection_writer.abort()
             entity_writer.abort()
             raise
+        finally:
+            selected_bar.close()
 
     manifest["counts"]["selected_tables"] = selected_count
     manifest["counts"]["skipped_tables"] = skipped
@@ -424,7 +439,13 @@ def run_normalize(
     )
     complete = _completed_indices(manifest, "source_tables", "entities")
     selection_shards = _artifact_records(selection_manifest, "selected_tables")
-    for index, shard_record in enumerate(selection_shards):
+    shards = progress(
+        enumerate(selection_shards),
+        total=len(selection_shards),
+        desc="Normalize WDC",
+        unit="shard",
+    )
+    for index, shard_record in shards:
         if index in complete:
             continue
         table_writer = _new_shard(root, "source_tables", index)
@@ -447,10 +468,7 @@ def run_normalize(
             table_writer.abort()
             entity_writer.abort()
             raise
-        print(
-            f"normalize: shard={index + 1}/{len(selection_shards)} "
-            f"tables={manifest['counts'].get('source_tables', 0)}"
-        )
+        shards.set_postfix(tables=manifest["counts"].get("source_tables", 0))
         if after_shard:
             after_shard(index)
     manifest["complete"] = True
@@ -618,7 +636,13 @@ def run_fetch_evidence(
 
     if evidence_kind in {"pages", "all"}:
         completed = _completed_indices(manifest, "page_results")
-        for index, entity_path in enumerate(sampled_shards):
+        page_shards = progress(
+            enumerate(sampled_shards),
+            total=len(sampled_shards),
+            desc="Fetch evidence pages",
+            unit="shard",
+        )
+        for index, entity_path in page_shards:
             if index in completed:
                 continue
             tasks, unsafe = _page_tasks(iter_jsonl(entity_path))
@@ -646,10 +670,7 @@ def run_fetch_evidence(
                 + sum(bool(item.get("cache_source")) for item in outcomes)
             )
             publish_stage_manifest(root, manifest)
-            print(
-                f"fetch_evidence/pages: shard={index + 1}/{len(sampled_shards)} "
-                f"tasks={len(tasks)}"
-            )
+            page_shards.set_postfix(tasks=len(tasks))
             if after_shard:
                 after_shard("pages", index)
         manifest.setdefault("substeps", {})["pages_complete"] = True
@@ -657,7 +678,13 @@ def run_fetch_evidence(
 
     if evidence_kind in {"images", "all"}:
         completed = _completed_indices(manifest, "image_results")
-        for index, entity_path in enumerate(sampled_shards):
+        image_shards = progress(
+            enumerate(sampled_shards),
+            total=len(sampled_shards),
+            desc="Fetch evidence images",
+            unit="shard",
+        )
+        for index, entity_path in image_shards:
             if index in completed:
                 continue
             page_records: Iterable[dict[str, Any]] = ()
@@ -696,10 +723,7 @@ def run_fetch_evidence(
                 + sum(bool(item.get("cache_source")) for item in outcomes)
             )
             publish_stage_manifest(root, manifest)
-            print(
-                f"fetch_evidence/images: shard={index + 1}/{len(sampled_shards)} "
-                f"tasks={len(tasks)}"
-            )
+            image_shards.set_postfix(tasks=len(tasks))
             if after_shard:
                 after_shard("images", index)
         manifest.setdefault("substeps", {})["images_complete"] = True
@@ -950,8 +974,15 @@ def _run_model_tasks(
         cache.put(namespace, str(task["task_id"]), result)
         return _canonical_extraction(task, result)
 
+    task_results = bounded_map(execute, tasks, workers=workers)
     raw_results = list(
-        bounded_map(execute, tasks, workers=workers)
+        progress(
+            task_results,
+            total=len(tasks),
+            desc="Run extraction model",
+            unit="task",
+            leave=False,
+        )
     )
     return [result for result in raw_results if result is not None], sum(
         result is None for result in raw_results
@@ -1050,7 +1081,13 @@ def run_extract(
         _part_index(record["path"])
         for record in _artifact_records(manifest, "model_tasks")
     }
-    for index, table_record in enumerate(table_records):
+    task_shards = progress(
+        enumerate(table_records),
+        total=len(table_records),
+        desc="Prepare extraction tasks",
+        unit="shard",
+    )
+    for index, table_record in task_shards:
         if index in completed_tasks:
             continue
         assets = _successful_assets_for_shard(config, evidence_manifest, index)
@@ -1074,7 +1111,14 @@ def run_extract(
         for record in _artifact_records(manifest, "model_results")
     }
     total_pending = 0
-    for record in _artifact_records(manifest, "model_tasks"):
+    model_task_records = _artifact_records(manifest, "model_tasks")
+    result_shards = progress(
+        model_task_records,
+        total=len(model_task_records),
+        desc="Extract attributes",
+        unit="shard",
+    )
+    for record in result_shards:
         index = _part_index(record["path"])
         if index in completed_results:
             continue
@@ -1098,7 +1142,7 @@ def run_extract(
         except BaseException:
             writer.abort()
             raise
-        print(f"extract: shard={index + 1}/{len(table_records)} tasks={len(tasks)}")
+        result_shards.set_postfix(tasks=len(tasks))
         if after_shard:
             after_shard(index)
 
@@ -1374,7 +1418,12 @@ def run_materialize(
     )
     table_shards = _artifact_records(normalize_manifest, "source_tables")
     completed = _completed_indices(manifest, *FINAL_ARTIFACTS)
-    for index in range(len(table_shards)):
+    shard_indices = progress(
+        range(len(table_shards)),
+        desc="Materialize dataset",
+        unit="shard",
+    )
+    for index in shard_indices:
         if index in completed:
             continue
         infos = _materialize_one_shard(
@@ -1386,7 +1435,6 @@ def run_materialize(
         )
         for info in infos:
             add_stage_shard(root, manifest, info)
-        print(f"materialize: shard={index + 1}/{len(table_shards)}")
         if after_shard:
             after_shard(index)
 
@@ -1469,7 +1517,9 @@ def run_pipeline(config: WdcPipelineConfig, *, start_at_first_incomplete: bool) 
         "extract": lambda: run_extract(config),
         "materialize": lambda: run_materialize(config),
     }
-    for stage in STAGES:
+    stages = progress(STAGES, desc="WDC pipeline", unit="stage")
+    for stage in stages:
+        stages.set_postfix(stage=stage)
         if not started:
             started = not _stage_is_complete(config, stage)
         if not started:
