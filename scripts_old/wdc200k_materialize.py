@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import gzip
 import hashlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -249,6 +251,7 @@ class MaterializationResult:
 @dataclass(frozen=True)
 class _ValidatedUpstream:
     source_paths: tuple[Path, ...]
+    source_shards: tuple[CompletedShard, ...]
     entity_paths: tuple[Path, ...]
     page_ref_paths: tuple[Path, ...]
     structural_failure_paths: tuple[Path, ...]
@@ -344,6 +347,9 @@ def _canonical_json(value: Any) -> str:
 _INLINE_JSON_MAX_UTF8_BYTES = 4 * 1024 * 1024
 _JSON_TEXT_CHUNK_CHARACTERS = 1024 * 1024
 _MATERIALIZATION_READ_BATCH_RECORDS = 32
+_QUERY_AUTO_CHECK_MIN_BATCH_TABLES = 128
+_QUERY_AUTO_CHECK_MAX_BATCH_TABLES = 1024
+_QUERY_AUTO_CHECK_TABLES_PER_WORKER = 4
 _SQLITE_IN_BATCH_RECORDS = 900
 
 
@@ -497,6 +503,48 @@ def _load_stored_json(
             record = json.load(handle)
     if not isinstance(record, dict):
         raise ValueError("stored JSON record is not an object")
+    return record
+
+
+def _load_source_catalog_record(
+    database_path: Path,
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    columns = set(row.keys())
+    source_path = (
+        clean_text(row["source_path"])
+        if "source_path" in columns
+        else ""
+    )
+    if not source_path:
+        return _load_stored_json(
+            database_path,
+            row["record_json"],
+            row["record_path"],
+        )
+    path = Path(source_path)
+    if not path.is_absolute():
+        path = database_path.parent / path
+    offset = -1
+    length = -1
+    try:
+        resolved = path.resolve(strict=True)
+        offset = int(row["source_offset"])
+        length = int(row["source_length"])
+        if offset < 0 or length <= 0 or not resolved.is_file():
+            raise ValueError
+        with resolved.open("rb") as handle:
+            handle.seek(offset)
+            encoded = handle.read(length)
+        if len(encoded) != length:
+            raise ValueError
+        record = json.loads(encoded)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"source catalog locator is invalid: {source_path}:{offset}+{length}"
+        ) from error
+    if not isinstance(record, dict):
+        raise ValueError("source catalog locator record is not an object")
     return record
 
 
@@ -811,6 +859,36 @@ def _structural_inputs(
         entities,
         manifest_hashes,
     )
+
+
+def _source_shards_from_inputs(
+    inputs: MaterializationInputs,
+) -> tuple[CompletedShard, ...]:
+    if inputs.sampling_manifest is not None:
+        payload = _manifest_payload(Path(inputs.sampling_manifest))
+        authority = payload.get("compact_source_authority")
+        raw_shards = (
+            authority.get("source_table_shards")
+            if isinstance(authority, dict)
+            else None
+        )
+        if not isinstance(raw_shards, list):
+            raise ValueError("sampling compact source authority is invalid")
+        shards = tuple(_completed_from_payload(item) for item in raw_shards)
+    else:
+        shards = tuple(
+            _completed_from_payload(item)
+            for manifest_path in inputs.structural_manifests
+            for item in _manifest_payload(Path(manifest_path)).get(
+                "completed_shards", []
+            )
+            if str(item.get("path", "")).startswith("source_tables/")
+        )
+    if not shards or any(
+        not shard.path.startswith("source_tables/") for shard in shards
+    ):
+        raise ValueError("structural source shard authority is invalid")
+    return shards
 
 
 def _materialization_validation_workers(args: argparse.Namespace) -> int:
@@ -1194,6 +1272,7 @@ def _validate_upstream(
     )
     return _ValidatedUpstream(
         source_paths=tuple(source_paths),
+        source_shards=_source_shards_from_inputs(inputs),
         entity_paths=tuple(entity_paths),
         page_ref_paths=tuple(effective_page_ref_paths),
         structural_failure_paths=tuple(failure_paths),
@@ -1388,7 +1467,10 @@ def _initialize_index(
                 split TEXT,
                 record_sha256 TEXT NOT NULL,
                 record_json TEXT NOT NULL,
-                record_path TEXT NOT NULL DEFAULT ''
+                record_path TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                source_offset INTEGER NOT NULL DEFAULT 0,
+                source_length INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS source_catalog_group
                 ON source_catalog(split_group, source_table_id);
@@ -1456,6 +1538,21 @@ def _initialize_index(
                     ALTER TABLE {table}
                     ADD COLUMN record_path TEXT NOT NULL DEFAULT ''
                     """
+                )
+        source_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(source_catalog)"
+            )
+        }
+        for name, declaration in (
+            ("source_path", "TEXT NOT NULL DEFAULT ''"),
+            ("source_offset", "INTEGER NOT NULL DEFAULT 0"),
+            ("source_length", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in source_columns:
+                connection.execute(
+                    f"ALTER TABLE source_catalog ADD COLUMN {name} {declaration}"
                 )
         tracker.before_commit(0)
         connection.commit()
@@ -1937,6 +2034,11 @@ def _validate_source_catalog_closure(
             SELECT COALESCE(
                 SUM(
                     CASE
+                        WHEN source_path <> ''
+                        THEN json_extract(
+                            record_json,
+                            '$._source_locator.row_count'
+                        )
                         WHEN record_path = ''
                         THEN json_array_length(record_json, '$.rows')
                         ELSE json_extract(
@@ -2006,13 +2108,14 @@ def _validate_source_catalog_closure(
                     '$.row_id'
                 ) IN ('integer', 'text')
                   AND source_catalog.record_path = ''
+                  AND source_catalog.source_path = ''
                 """
             )
             external_sources = connection.execute(
                 """
-                SELECT source_table_id, record_json, record_path
+                SELECT *
                 FROM source_catalog
-                WHERE record_path <> ''
+                WHERE record_path <> '' OR source_path <> ''
                 ORDER BY ordinal
                 """
             ).fetchall()
@@ -2020,10 +2123,9 @@ def _validate_source_catalog_closure(
                 source_table_id = str(
                     catalog_row["source_table_id"]
                 )
-                source_table = _load_stored_json(
+                source_table = _load_source_catalog_record(
                     database_path,
-                    catalog_row["record_json"],
-                    catalog_row["record_path"],
+                    catalog_row,
                 )
 
                 def external_rows() -> Iterator[tuple[str, Any]]:
@@ -2682,6 +2784,9 @@ def _serialized_upstream(
         "source_paths": [
             path.resolve().as_posix() for path in upstream.source_paths
         ],
+        "source_shards": [
+            asdict(shard) for shard in upstream.source_shards
+        ],
         "entity_paths": [
             path.resolve().as_posix() for path in upstream.entity_paths
         ],
@@ -2742,6 +2847,11 @@ def _upstream_from_certificate(
             raise TypeError("provenance is not an object")
         return _ValidatedUpstream(
             source_paths=paths("source_paths"),
+            source_shards=tuple(
+                _completed_from_payload(item)
+                for item in upstream.get("source_shards")
+                or [asdict(shard) for shard in _source_shards_from_inputs(inputs)]
+            ),
             entity_paths=paths("entity_paths"),
             page_ref_paths=paths("page_ref_paths"),
             structural_failure_paths=paths(
@@ -3028,6 +3138,201 @@ def _persist_upstream_certificate(
         tracker.before_commit(0)
         connection.commit()
     return path
+
+
+_CERTIFIED_TRANSIENT_FILES = (
+    "adapted_model_tasks/model-task-adapter.sqlite3",
+    "adapted_model_tasks/model-task-adapter-index-manifest.json",
+    "model_outputs/validation.sqlite3",
+    "page_jobs/validation.sqlite3",
+    "image_jobs/unique-validation.sqlite3",
+    "upstream-validation/page-fetch.sqlite3",
+    "upstream-validation/unique-image-membership.sqlite3",
+    "upstream-validation/model-membership.sqlite3",
+)
+_RETIRABLE_STRUCTURAL_DIRECTORIES = {
+    "entities",
+    "page_refs",
+    "direct_image_refs",
+    "selection",
+}
+
+
+def _certified_cleanup_candidates(
+    inputs: MaterializationInputs,
+    certificate_payload: dict[str, Any],
+) -> tuple[Path, ...]:
+    work_root = Path(inputs.work_root).resolve()
+    structural_root = Path(inputs.structural_output_root).resolve()
+    protected = {
+        Path(str(item["path"])).resolve()
+        for item in certificate_payload.get("input_files") or []
+        if isinstance(item, dict) and item.get("path")
+    }
+    candidates = {
+        (work_root / relative).resolve()
+        for relative in _CERTIFIED_TRANSIENT_FILES
+    }
+    for path in tuple(candidates):
+        if not path.is_relative_to(work_root):
+            raise ValueError("certified transient path escapes work root")
+        if path.suffix in {".db", ".sqlite", ".sqlite3"}:
+            candidates.update(
+                Path(f"{path}{suffix}") for suffix in ("-wal", "-shm")
+            )
+
+    if (
+        inputs.sampling_manifest is not None
+        and structural_root.is_relative_to(work_root)
+    ):
+        sampling_payload = _manifest_payload(Path(inputs.sampling_manifest))
+        authority = sampling_payload.get("compact_source_authority")
+        manifest_records = (
+            authority.get("structural_manifests")
+            if isinstance(authority, dict)
+            else None
+        )
+        certified_manifest_hashes = {
+            str(item["path"]): str(item["sha256"])
+            for item in certificate_payload.get("manifest_hashes") or []
+            if isinstance(item, dict)
+        }
+        if (
+            not isinstance(manifest_records, list)
+            or {
+                Path(str(item["path"])).resolve().as_posix(): str(
+                    item["sha256"]
+                )
+                for item in manifest_records
+            }
+            != {
+                path.resolve().as_posix(): certified_manifest_hashes.get(
+                    path.resolve().as_posix(), ""
+                )
+                for path in inputs.structural_manifests
+            }
+        ):
+            raise ValueError("sampling compact authority is not certificate-bound")
+        for manifest_path in inputs.structural_manifests:
+            payload = _manifest_payload(Path(manifest_path))
+            for item in payload.get("completed_shards") or []:
+                relative = Path(str(item["path"]))
+                if (
+                    not relative.parts
+                    or relative.parts[0]
+                    not in _RETIRABLE_STRUCTURAL_DIRECTORIES
+                ):
+                    continue
+                candidate = (structural_root / relative).resolve()
+                if not candidate.is_relative_to(structural_root):
+                    raise ValueError("structural cleanup shard escapes its root")
+                candidates.add(candidate)
+    return tuple(
+        sorted(
+            (path for path in candidates if path not in protected),
+            key=lambda path: path.as_posix(),
+        )
+    )
+
+
+def _cleanup_certified_intermediates(
+    inputs: MaterializationInputs,
+    certificate_path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> dict[str, Any]:
+    """Delete only certificate-independent, manifest-declared intermediates."""
+    certificate_path = Path(certificate_path)
+    payload = json.loads(certificate_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("complete") is not True
+        or payload.get("certificate_sha256") != _certificate_digest(payload)
+    ):
+        raise ValueError("cleanup requires a valid upstream certificate")
+    work_root = Path(inputs.work_root).resolve()
+    removed: list[dict[str, Any]] = []
+    for candidate in _certified_cleanup_candidates(inputs, payload):
+        if not candidate.is_relative_to(work_root) or not candidate.is_file():
+            continue
+        size = candidate.stat().st_size
+        candidate.unlink()
+        removed.append(
+            {
+                "path": candidate.relative_to(work_root).as_posix(),
+                "bytes": size,
+            }
+        )
+    result = {
+        "schema_version": "wdc200k-certified-cleanup-v1",
+        "certificate_sha256": payload["certificate_sha256"],
+        "removed_files": removed,
+        "removed_bytes": sum(item["bytes"] for item in removed),
+    }
+    if removed:
+        _atomic_json(
+            Path(inputs.work_root)
+            / "materialization"
+            / "retired-intermediates.json",
+            result,
+            pre_write_guard=pre_write_guard,
+        )
+        logging.info(
+            "retired %d certified intermediate files (%d bytes)",
+            len(removed),
+            result["removed_bytes"],
+        )
+    return result
+
+
+def _refresh_certificate_after_source_publication(
+    inputs: MaterializationInputs,
+    upstream: _ValidatedUpstream,
+    *,
+    args: argparse.Namespace,
+    records_per_shard: int,
+    review_policy: str,
+    database_path: Path,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> None:
+    """Record inode ctime changes caused by publishing source hard links."""
+    config_fingerprint = _certificate_config_fingerprint(
+        args,
+        records_per_shard,
+        review_policy=review_policy,
+    )
+    certificate_path = _certificate_path(inputs.work_root, config_fingerprint)
+    payload = json.loads(certificate_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("certificate_sha256") != _certificate_digest(payload)
+    ):
+        raise ValueError("upstream certificate changed during source publication")
+    current_files = _file_identities(
+        _certificate_input_paths(inputs, upstream)
+    )
+    if payload.get("input_files") == current_files:
+        return
+    payload["input_files"] = current_files
+    payload["certificate_sha256"] = _certificate_digest(payload)
+    _atomic_json(
+        certificate_path,
+        payload,
+        pre_write_guard=pre_write_guard,
+    )
+    tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    tracker.before_write(16 * 1024)
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            UPDATE metadata SET value = ?
+            WHERE key = 'upstream_certificate_sha256'
+            """,
+            (payload["certificate_sha256"],),
+        )
+        tracker.before_commit(0)
+        connection.commit()
 
 
 def _inputs_from_certificate_payload(
@@ -3345,6 +3650,14 @@ _SOURCE_CATALOG_INSERT_SQL = """
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
 """
 
+_SOURCE_CATALOG_LOCATOR_INSERT_SQL = """
+    INSERT INTO source_catalog (
+        source_table_id, ordinal, page_title, split_group,
+        record_sha256, record_json, record_path,
+        source_path, source_offset, source_length
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 
 def _sqlite_parameter_summary(values: tuple[Any, ...]) -> str:
     parts = []
@@ -3434,8 +3747,7 @@ def _catalog_source_records(
             )
             existing = connection.execute(
                 """
-                SELECT ordinal, page_title, split_group,
-                       record_sha256, record_json, record_path
+                SELECT *
                 FROM source_catalog WHERE source_table_id = ?
                 """,
                 (source_table_id,),
@@ -3461,7 +3773,19 @@ def _catalog_source_records(
                     )
                 existing_json = str(existing["record_json"])
                 existing_path = str(existing["record_path"])
-                if not existing_path and record_path:
+                existing_source_path = (
+                    clean_text(existing["source_path"])
+                    if "source_path" in existing.keys()
+                    else ""
+                )
+                if existing_source_path:
+                    if _canonical_json(
+                        _load_source_catalog_record(database_path, existing)
+                    ) != encoded:
+                        raise ValueError(
+                            f"conflicting source table ID: {source_table_id}"
+                        )
+                elif not existing_path and record_path:
                     if existing_json != encoded:
                         raise ValueError(
                             "conflicting source table ID: "
@@ -3565,13 +3889,155 @@ def _catalog_sources(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
-    _catalog_source_records(
-        database_path,
-        _iter_jsonl(source_paths),
-        args=args,
-        expected_tables=expected_tables,
-        write_tracker=write_tracker,
-        progress_callback=progress_callback,
+    _report_work_progress(
+        progress_callback,
+        phase="catalog_sources",
+        completed=0,
+        total=expected_tables,
+    )
+    with _connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        observed_stream = 0
+        ordinal = 0
+        for source_path_value in source_paths:
+            source_path = Path(source_path_value).resolve(strict=True)
+            with source_path.open("rb") as handle:
+                line_number = 0
+                while True:
+                    offset = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    line_number += 1
+                    if not line.strip():
+                        continue
+                    try:
+                        source_table = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            "invalid JSONL record at "
+                            f"{source_path}:{line_number}"
+                        ) from error
+                    if not isinstance(source_table, dict):
+                        raise ValueError(
+                            "non-object JSONL record at "
+                            f"{source_path}:{line_number}"
+                        )
+                    observed_stream += 1
+                    source_table_id = clean_text(
+                        source_table.get("source_table_id")
+                    )
+                    if not source_table_id:
+                        raise ValueError(
+                            "source table is missing source_table_id"
+                        )
+                    encoded = _canonical_json(source_table)
+                    _encoded_size, digest = _json_text_identity(encoded)
+                    rows = source_table.get("rows")
+                    stub = _canonical_json(
+                        {
+                            "_source_locator": {
+                                "row_count": (
+                                    len(rows) if isinstance(rows, list) else 0
+                                )
+                            }
+                        }
+                    )
+                    expected_identity = (
+                        ordinal,
+                        clean_text(source_table.get("page_title")),
+                        _split_group(source_table, args),
+                        digest,
+                    )
+                    locator = (
+                        source_path.as_posix(),
+                        offset,
+                        len(line),
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM source_catalog
+                        WHERE source_table_id = ?
+                        """,
+                        (source_table_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        actual_identity = (
+                            int(existing["ordinal"]),
+                            str(existing["page_title"]),
+                            str(existing["split_group"]),
+                            str(existing["record_sha256"]),
+                        )
+                        if actual_identity != expected_identity:
+                            raise ValueError(
+                                f"conflicting source table ID: {source_table_id}"
+                            )
+                        existing_record = _load_source_catalog_record(
+                            database_path,
+                            existing,
+                        )
+                        if _canonical_json(existing_record) != encoded:
+                            raise ValueError(
+                                f"conflicting source table ID: {source_table_id}"
+                            )
+                        write_tracker.before_write(8 * 1024)
+                        connection.execute(
+                            """
+                            UPDATE source_catalog
+                            SET record_json = ?, record_path = '',
+                                source_path = ?, source_offset = ?,
+                                source_length = ?
+                            WHERE source_table_id = ?
+                            """,
+                            (stub, *locator, source_table_id),
+                        )
+                    else:
+                        values = (
+                            source_table_id,
+                            *expected_identity,
+                            stub,
+                            "",
+                            *locator,
+                        )
+                        write_tracker.before_write(8 * 1024)
+                        try:
+                            connection.execute(
+                                _SOURCE_CATALOG_LOCATOR_INSERT_SQL,
+                                values,
+                            )
+                        except sqlite3.IntegrityError as error:
+                            raise ValueError(
+                                f"duplicate source table ID: {source_table_id}"
+                            ) from error
+                    ordinal += 1
+                    if ordinal % 10 == 0:
+                        write_tracker.before_commit(0)
+                        connection.commit()
+                        connection.execute("BEGIN IMMEDIATE")
+                    if ordinal % 100 == 0:
+                        _report_work_progress(
+                            progress_callback,
+                            phase="catalog_sources",
+                            completed=ordinal,
+                            total=expected_tables,
+                        )
+        observed = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM source_catalog"
+            ).fetchone()[0]
+        )
+        if observed_stream != expected_tables or observed != expected_tables:
+            raise ValueError(
+                f"source table count {observed_stream}/{observed} does "
+                f"not match expected {expected_tables}"
+            )
+        write_tracker.before_commit(0)
+        connection.commit()
+    _report_work_progress(
+        progress_callback,
+        phase="catalog_sources",
+        completed=expected_tables,
+        total=expected_tables,
     )
 
 
@@ -3700,43 +4166,86 @@ def _source_wiki_titles(source_table: dict[str, Any]) -> list[str]:
     return titles
 
 
-def _table_inputs(
-    database_path: Path,
-    source_table: dict[str, Any],
-) -> tuple[
+_TableInputs = tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
     dict[str, str],
-]:
-    source_table_id = clean_text(source_table.get("source_table_id"))
+]
+
+
+def _table_inputs_batch(
+    database_path: Path,
+    source_tables: Iterable[dict[str, Any]],
+) -> list[_TableInputs]:
+    tables = list(source_tables)
+    source_ids = [
+        clean_text(source_table.get("source_table_id"))
+        for source_table in tables
+    ]
+    if any(not source_table_id for source_table_id in source_ids):
+        raise ValueError("source table is missing source_table_id")
+    if len(set(source_ids)) != len(source_ids):
+        raise ValueError("duplicate source table in input batch")
+    if not tables:
+        return []
+
+    entities_by_source: dict[str, list[dict[str, Any]]] = {
+        source_table_id: [] for source_table_id in source_ids
+    }
+    links_by_source: dict[str, list[dict[str, Any]]] = {
+        source_table_id: [] for source_table_id in source_ids
+    }
     with _connect(database_path) as connection:
-        entities = _decode_records(
-            connection,
-            """
-            SELECT record_json FROM entities
-            WHERE source_table_id = ?
-            ORDER BY source_row_id, entity_id
-            """,
-            (source_table_id,),
+        for offset in range(0, len(source_ids), _SQLITE_IN_BATCH_RECORDS):
+            source_batch = source_ids[
+                offset : offset + _SQLITE_IN_BATCH_RECORDS
+            ]
+            placeholders = ",".join("?" for _ in source_batch)
+            for row in connection.execute(
+                f"""
+                SELECT source_table_id, record_json
+                FROM entities
+                WHERE source_table_id IN ({placeholders})
+                ORDER BY source_table_id, source_row_id, entity_id
+                """,
+                tuple(source_batch),
+            ):
+                entities_by_source[str(row["source_table_id"])].append(
+                    json.loads(str(row["record_json"]))
+                )
+            for row in connection.execute(
+                f"""
+                SELECT source_table_id, record_json
+                FROM links
+                WHERE source_table_id IN ({placeholders})
+                ORDER BY source_table_id, source_row_id, link_id
+                """,
+                tuple(source_batch),
+            ):
+                links_by_source[str(row["source_table_id"])].append(
+                    json.loads(str(row["record_json"]))
+                )
+
+        asset_ids_by_source = {
+            source_table_id: list(
+                dict.fromkeys(
+                    clean_text(asset_id)
+                    for link in links_by_source[source_table_id]
+                    for asset_id in (link.get("asset_ids") or [])
+                    if clean_text(asset_id)
+                )
+            )
+            for source_table_id in source_ids
+        }
+        ordered_asset_ids = list(
+            dict.fromkeys(
+                asset_id
+                for source_table_id in source_ids
+                for asset_id in asset_ids_by_source[source_table_id]
+            )
         )
-        links = _decode_records(
-            connection,
-            """
-            SELECT record_json FROM links
-            WHERE source_table_id = ?
-            ORDER BY source_row_id, link_id
-            """,
-            (source_table_id,),
-        )
-        asset_ids = [
-            clean_text(asset_id)
-            for link in links
-            for asset_id in (link.get("asset_ids") or [])
-            if clean_text(asset_id)
-        ]
-        ordered_asset_ids = list(dict.fromkeys(asset_ids))
         assets_by_id: dict[str, dict[str, Any]] = {}
         extractions_by_asset: dict[
             str, list[tuple[str, dict[str, Any]]]
@@ -3778,30 +4287,10 @@ def _table_inputs(
                     )
                 )
 
-        assets = [
-            assets_by_id[asset_id]
-            for asset_id in ordered_asset_ids
-            if asset_id in assets_by_id
-        ]
-        extractions = []
-        seen_extractions: set[str] = set()
-        for asset_id in ordered_asset_ids:
-            if asset_id not in assets_by_id:
-                continue
-            for cache_key, extraction in extractions_by_asset.get(
-                asset_id, []
-            ):
-                if cache_key in seen_extractions:
-                    continue
-                seen_extractions.add(cache_key)
-                extractions.append(extraction)
-
-        wiki_to_entity_id = {
-            clean_text(entity.get("wiki_title")): str(entity["entity_id"])
-            for entity in entities
-            if clean_text(entity.get("wiki_title"))
+        source_titles_by_id = {
+            source_table_id: _source_wiki_titles(source_table)
+            for source_table_id, source_table in zip(source_ids, tables)
         }
-        source_titles = _source_wiki_titles(source_table)
         aliases_by_title = {
             title: (
                 title,
@@ -3809,7 +4298,8 @@ def _table_inputs(
                 title.casefold(),
                 normalize_title(title).casefold(),
             )
-            for title in source_titles
+            for source_table_id in source_ids
+            for title in source_titles_by_id[source_table_id]
         }
         ordered_aliases = list(
             dict.fromkeys(
@@ -3841,7 +4331,36 @@ def _table_inputs(
                     )
                 }
             )
-        for title in source_titles:
+
+    results: list[_TableInputs] = []
+    for source_table_id in source_ids:
+        entities = entities_by_source[source_table_id]
+        links = links_by_source[source_table_id]
+        table_asset_ids = asset_ids_by_source[source_table_id]
+        assets = [
+            assets_by_id[asset_id]
+            for asset_id in table_asset_ids
+            if asset_id in assets_by_id
+        ]
+        extractions = []
+        seen_extractions: set[str] = set()
+        for asset_id in table_asset_ids:
+            if asset_id not in assets_by_id:
+                continue
+            for cache_key, extraction in extractions_by_asset.get(
+                asset_id, []
+            ):
+                if cache_key in seen_extractions:
+                    continue
+                seen_extractions.add(cache_key)
+                extractions.append(extraction)
+
+        wiki_to_entity_id = {
+            clean_text(entity.get("wiki_title")): str(entity["entity_id"])
+            for entity in entities
+            if clean_text(entity.get("wiki_title"))
+        }
+        for title in source_titles_by_id[source_table_id]:
             for alias in aliases_by_title[title]:
                 entity_id = entity_id_by_alias.get(alias)
                 if entity_id is not None:
@@ -3851,7 +4370,17 @@ def _table_inputs(
                 wiki_to_entity_id[title] = (
                     "ent_" + stable_hash(title, length=16)
                 )
-    return entities, assets, links, extractions, wiki_to_entity_id
+        results.append(
+            (entities, assets, links, extractions, wiki_to_entity_id)
+        )
+    return results
+
+
+def _table_inputs(
+    database_path: Path,
+    source_table: dict[str, Any],
+) -> _TableInputs:
+    return _table_inputs_batch(database_path, [source_table])[0]
 
 
 def _query_auto_check_records_for_keys(
@@ -3989,33 +4518,17 @@ def _materialize_from_index(
     )
 
 
-def _load_materialization_source(
+def _materialization_source_from_row(
     database_path: Path,
     item: _MaterializationWorkItem,
+    row: sqlite3.Row,
 ) -> dict[str, Any]:
-    with _connect(database_path) as connection:
-        row = connection.execute(
-            """
-            SELECT record_sha256, record_json, record_path
-            FROM source_catalog
-            WHERE source_table_id = ?
-            """,
-            (item.source_table_id,),
-        ).fetchone()
-    if row is None:
-        raise ValueError(
-            f"materialization source is missing: {item.source_table_id}"
-        )
     if str(row["record_sha256"]) != item.source_sha256:
         raise ValueError(
             f"materialization source identity mismatch: "
             f"{item.source_table_id}"
         )
-    source_table = _load_stored_json(
-        database_path,
-        row["record_json"],
-        row["record_path"],
-    )
+    source_table = _load_source_catalog_record(database_path, row)
     if clean_text(source_table.get("source_table_id")) != item.source_table_id:
         raise ValueError(
             f"materialization source ID mismatch: {item.source_table_id}"
@@ -4029,6 +4542,48 @@ def _load_materialization_source(
             f"{item.source_table_id}"
         )
     return source_table
+
+
+def _load_materialization_sources(
+    database_path: Path,
+    items: Iterable[_MaterializationWorkItem],
+) -> list[dict[str, Any]]:
+    pending = list(items)
+    if not pending:
+        return []
+    rows_by_id: dict[str, sqlite3.Row] = {}
+    source_ids = [item.source_table_id for item in pending]
+    with _connect(database_path) as connection:
+        for offset in range(0, len(source_ids), _SQLITE_IN_BATCH_RECORDS):
+            batch = source_ids[offset : offset + _SQLITE_IN_BATCH_RECORDS]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"""
+                SELECT *
+                FROM source_catalog
+                WHERE source_table_id IN ({placeholders})
+                """,
+                tuple(batch),
+            ):
+                rows_by_id[str(row["source_table_id"])] = row
+    sources = []
+    for item in pending:
+        row = rows_by_id.get(item.source_table_id)
+        if row is None:
+            raise ValueError(
+                f"materialization source is missing: {item.source_table_id}"
+            )
+        sources.append(
+            _materialization_source_from_row(database_path, item, row)
+        )
+    return sources
+
+
+def _load_materialization_source(
+    database_path: Path,
+    item: _MaterializationWorkItem,
+) -> dict[str, Any]:
+    return _load_materialization_sources(database_path, [item])[0]
 
 
 def _materialize_work_item(
@@ -4485,13 +5040,25 @@ def _query_auto_check_plans_for_table(
     list[Any],
     dict[str, dict[str, Any]],
 ]:
-    (
-        _entities,
-        assets,
-        links,
-        extractions,
-        wiki_to_entity_id,
-    ) = _table_inputs(database_path, source_table)
+    return _query_auto_check_plans_from_inputs(
+        source_table,
+        _table_inputs(database_path, source_table),
+        split=split,
+        args=args,
+    )
+
+
+def _query_auto_check_plans_from_inputs(
+    source_table: dict[str, Any],
+    table_inputs: _TableInputs,
+    *,
+    split: str,
+    args: argparse.Namespace,
+) -> tuple[
+    list[Any],
+    dict[str, dict[str, Any]],
+]:
+    _entities, assets, links, extractions, wiki_to_entity_id = table_inputs
     assets_by_id = {
         str(asset["asset_id"]): asset for asset in assets
     }
@@ -4740,7 +5307,11 @@ def _query_auto_check_source_batch(
     database_path: Path,
     *,
     last_ordinal: int,
+    limit: int = _MATERIALIZATION_READ_BATCH_RECORDS,
+    pending_only: bool = False,
 ) -> list[dict[str, Any]]:
+    if limit <= 0:
+        raise ValueError("query auto-check batch limit must be positive")
     with _connect(database_path) as connection:
         return [
             dict(row)
@@ -4758,12 +5329,47 @@ def _query_auto_check_source_batch(
                   ON query_auto_check_units.source_table_id =
                      source_catalog.source_table_id
                 WHERE source_catalog.ordinal > ?
+                  AND (
+                    ? = 0
+                    OR query_auto_check_units.complete IS NULL
+                    OR query_auto_check_units.complete != 1
+                    OR query_auto_check_units.source_sha256 !=
+                       source_catalog.record_sha256
+                  )
                 ORDER BY source_catalog.ordinal
                 LIMIT ?
                 """,
-                (last_ordinal, _MATERIALIZATION_READ_BATCH_RECORDS),
+                (last_ordinal, int(pending_only), limit),
             )
         ]
+
+
+def _query_auto_check_batch_tables(args: argparse.Namespace) -> int:
+    configured = int(
+        getattr(args, "query_auto_check_batch_tables", 0) or 0
+    )
+    if configured < 0:
+        raise ValueError(
+            "query auto-check batch table count must be non-negative"
+        )
+    if configured:
+        return configured
+    workers = sum(
+        max(0, int(getattr(args, field, 0) or 0))
+        for field in (
+            "text_model_workers",
+            "image_model_workers",
+            "remote_text_model_workers",
+            "remote_image_model_workers",
+        )
+    )
+    return min(
+        _QUERY_AUTO_CHECK_MAX_BATCH_TABLES,
+        max(
+            _QUERY_AUTO_CHECK_MIN_BATCH_TABLES,
+            workers * _QUERY_AUTO_CHECK_TABLES_PER_WORKER,
+        ),
+    )
 
 
 def _pending_query_auto_check_items(
@@ -4801,14 +5407,21 @@ def _prepare_query_auto_check_units(
     cache: Any,
     args: argparse.Namespace,
 ) -> tuple[list[tuple[_MaterializationWorkItem, list[Any]]], list[Any], int]:
+    pending = list(items)
+    source_tables = _load_materialization_sources(database_path, pending)
+    table_inputs = _table_inputs_batch(database_path, source_tables)
     units: list[tuple[_MaterializationWorkItem, list[Any]]] = []
     plans: list[Any] = []
     migrated = 0
-    for item in items:
-        source_table = _load_materialization_source(database_path, item)
-        table_plans, extraction_records = _query_auto_check_plans_for_table(
-            database_path,
+    for item, source_table, inputs in zip(
+        pending,
+        source_tables,
+        table_inputs,
+        strict=True,
+    ):
+        table_plans, extraction_records = _query_auto_check_plans_from_inputs(
             source_table,
+            inputs,
             split=item.split,
             args=args,
         )
@@ -4990,7 +5603,7 @@ def _run_large_query_auto_check_prepass(
     pre_write_guard: PreWriteGuard | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
-    """Stream local-only checks in small durable batches."""
+    """Pipeline bounded plan preparation with local model checks."""
     completed = _query_auto_check_completed_units(database_path)
     _report_work_progress(
         progress_callback,
@@ -4999,52 +5612,89 @@ def _run_large_query_auto_check_prepass(
         total=expected_tables,
     )
     last_ordinal = -1
-    observed = 0
+    observed = completed
     migrated_total = 0
     cached_total = 0
-    while True:
-        rows = _query_auto_check_source_batch(
-            database_path,
-            last_ordinal=last_ordinal,
-        )
-        if not rows:
-            break
-        observed += len(rows)
-        units, plans, migrated = _prepare_query_auto_check_units(
-            database_path,
-            _pending_query_auto_check_items(rows),
-            extractor=extractor,
-            cache=cache,
-            args=args,
-        )
-        migrated_total += migrated
-        join_builder.finalize_query_recovery_auto_checks(
-            plans=plans,
-            extractor=extractor,
-            cache=cache,
-            args=args,
-            concurrency_state=join_builder.ModelConcurrencyState.from_args(args),
-        )
-        persisted_units, persisted_checks = _persist_query_auto_check_batch(
-            database_path,
-            units,
-            cache=cache,
-            extractor=extractor,
-            pre_write_guard=pre_write_guard,
-        )
-        completed += persisted_units
-        cached_total += persisted_checks
-        _report_work_progress(
-            progress_callback,
-            phase="query_auto_check",
-            completed=completed,
-            total=expected_tables,
-            plans=len(plans),
-            cached_checks=cached_total,
-            migrated_legacy_checks=migrated_total,
-        )
-        last_ordinal = int(rows[-1]["ordinal"])
-        _checkpoint_wal(database_path)
+    batch_tables = _query_auto_check_batch_tables(args)
+    concurrency_state = join_builder.ModelConcurrencyState.from_args(args)
+    rows = _query_auto_check_source_batch(
+        database_path,
+        last_ordinal=last_ordinal,
+        limit=batch_tables,
+        pending_only=True,
+    )
+    prepare_future = None
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="query-auto-check-prepare",
+    ) as prepare_executor:
+        while rows:
+            observed += len(rows)
+            if prepare_future is None:
+                prepare_future = prepare_executor.submit(
+                    _prepare_query_auto_check_units,
+                    database_path,
+                    _pending_query_auto_check_items(rows),
+                    extractor=extractor,
+                    cache=cache,
+                    args=args,
+                )
+            units, plans, migrated = prepare_future.result()
+            last_ordinal = int(rows[-1]["ordinal"])
+            next_rows = _query_auto_check_source_batch(
+                database_path,
+                last_ordinal=last_ordinal,
+                limit=batch_tables,
+                pending_only=True,
+            )
+            next_prepare_future = (
+                prepare_executor.submit(
+                    _prepare_query_auto_check_units,
+                    database_path,
+                    _pending_query_auto_check_items(next_rows),
+                    extractor=extractor,
+                    cache=cache,
+                    args=args,
+                )
+                if next_rows
+                else None
+            )
+
+            migrated_total += migrated
+            join_builder.finalize_query_recovery_auto_checks(
+                plans=plans,
+                extractor=extractor,
+                cache=cache,
+                args=args,
+                concurrency_state=concurrency_state,
+            )
+            persisted_units, persisted_checks = (
+                _persist_query_auto_check_batch(
+                    database_path,
+                    units,
+                    cache=cache,
+                    extractor=extractor,
+                    pre_write_guard=pre_write_guard,
+                )
+            )
+            completed += persisted_units
+            cached_total += persisted_checks
+            _report_work_progress(
+                progress_callback,
+                phase="query_auto_check",
+                completed=completed,
+                total=expected_tables,
+                plans=len(plans),
+                cached_checks=cached_total,
+                migrated_legacy_checks=migrated_total,
+            )
+            if next_prepare_future is not None:
+                # The next iteration needs this result before GPU work can
+                # resume. Finish its SQLite reads before truncating the WAL.
+                next_prepare_future.result()
+            _checkpoint_wal(database_path)
+            rows = next_rows
+            prepare_future = next_prepare_future
     _verify_query_auto_check_prepass(
         database_path,
         observed=observed,
@@ -5267,6 +5917,7 @@ def _materialize_all_tables(
                 "SELECT COUNT(*) FROM source_units WHERE complete = 1"
             ).fetchone()[0]
         )
+    observed = completed_count
     _report_work_progress(
         progress_callback,
         phase="materialize_tables",
@@ -5294,6 +5945,13 @@ def _materialize_all_tables(
                           ON source_units.source_table_id =
                              source_catalog.source_table_id
                         WHERE source_catalog.ordinal > ?
+                          AND (
+                            source_units.complete IS NULL
+                            OR source_units.complete != 1
+                            OR source_units.source_sha256 !=
+                               source_catalog.record_sha256
+                            OR source_units.split != source_catalog.split
+                          )
                         ORDER BY source_catalog.ordinal
                         LIMIT ?
                         """,
@@ -5564,7 +6222,7 @@ def _balance_explicit_join_records(
         with _connect(database_path) as connection:
             source_row = connection.execute(
                 """
-                SELECT record_json, record_path
+                SELECT *
                 FROM source_catalog WHERE source_table_id = ?
                 """,
                 (source_table_id,),
@@ -5573,10 +6231,9 @@ def _balance_explicit_join_records(
             raise ValueError(
                 f"balanced explicit source is missing: {source_table_id}"
             )
-        source_table = _load_stored_json(
+        source_table = _load_source_catalog_record(
             database_path,
-            source_row["record_json"],
-            source_row["record_path"],
+            source_row,
         )
         split = splits[source_table_id]
         explicit_queries: list[dict[str, Any]] = []
@@ -5877,7 +6534,7 @@ def _iter_materialized(
                 )
                 source_row = connection.execute(
                     """
-                    SELECT record_json, record_path
+                    SELECT *
                     FROM source_catalog
                     WHERE source_table_id = ?
                     """,
@@ -5888,10 +6545,9 @@ def _iter_materialized(
                         "materialized source-table reference is missing: "
                         f"{source_table_id}"
                     )
-                record = _load_stored_json(
+                record = _load_source_catalog_record(
                     database_path,
-                    source_row["record_json"],
-                    source_row["record_path"],
+                    source_row,
                 )
             yield record
 
@@ -6368,6 +7024,39 @@ def _artifact_manifest(
     }
 
 
+def _prevalidate_published_file_metadata(output_root: Path) -> None:
+    """Catch output mutations before a hard-linked source invalidates resume."""
+    manifest_path = output_root / "dataset_manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != MATERIALIZATION_SCHEMA_VERSION
+        ):
+            return
+        declarations = [
+            item
+            for artifact in payload["artifacts"].values()
+            for item in artifact["shards"]
+        ]
+        declarations.extend(payload["published_single_files"].values())
+        root = output_root.resolve()
+        for item in declarations:
+            path = (root / str(item["path"])).resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError
+            stat = path.stat()
+            if (
+                stat.st_size != int(item["bytes"])
+                or stat.st_mtime_ns != int(item["mtime_ns"])
+            ):
+                raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("published shard validation failed") from None
+
+
 def _load_published_result(
     output_root: Path,
     *,
@@ -6481,9 +7170,97 @@ def _load_published_result(
     )
 
 
+def _publish_source_table_shards(
+    upstream: _ValidatedUpstream,
+    output_root: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> tuple[CompletedShard, ...]:
+    directory = output_root / "source_tables"
+    if pre_write_guard is not None:
+        pre_write_guard(directory, 0)
+    directory.mkdir(parents=True, exist_ok=True)
+    sources_by_name: dict[str, Path] = {}
+    for path in upstream.source_paths:
+        name = Path(path).name
+        if name in sources_by_name:
+            raise ValueError(f"duplicate structural source shard name: {name}")
+        sources_by_name[name] = Path(path).resolve()
+    completed: list[CompletedShard] = []
+    destination_names: set[str] = set()
+    for shard in upstream.source_shards:
+        relative = Path(shard.path)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) != 2
+            or relative.parts[0] != "source_tables"
+        ):
+            raise ValueError("structural source shard path is invalid")
+        source = sources_by_name.get(relative.name)
+        if (
+            source is None
+            or not source.is_file()
+            or source.stat().st_size != shard.bytes
+            or relative.name in destination_names
+        ):
+            raise ValueError(
+                f"structural source shard metadata mismatch: {relative}"
+            )
+        destination_names.add(relative.name)
+        destination = directory / relative.name
+        published = CompletedShard(
+            path=relative.as_posix(),
+            records=shard.records,
+            bytes=shard.bytes,
+            sha256=shard.sha256,
+        )
+        if destination.is_file():
+            source_stat = source.stat()
+            destination_stat = destination.stat()
+            if (
+                source_stat.st_dev == destination_stat.st_dev
+                and source_stat.st_ino == destination_stat.st_ino
+            ):
+                completed.append(published)
+                continue
+        temporary = destination.with_suffix(
+            destination.suffix + ".tmp-link"
+        )
+        temporary.unlink(missing_ok=True)
+        try:
+            try:
+                os.link(source, temporary)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                if pre_write_guard is not None:
+                    pre_write_guard(destination, shard.bytes)
+                with source.open("rb") as source_handle, temporary.open(
+                    "wb"
+                ) as target_handle:
+                    shutil.copyfileobj(
+                        source_handle,
+                        target_handle,
+                        length=8 * 1024 * 1024,
+                    )
+                    target_handle.flush()
+                    os.fsync(target_handle.fileno())
+            os.replace(temporary, destination)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        completed.append(published)
+    if len(completed) != len(upstream.source_paths):
+        raise ValueError("structural source publication set mismatch")
+    _fsync_directory(directory)
+    return tuple(completed)
+
+
 def _finalize_dataset(
     database_path: Path,
     *,
+    inputs: MaterializationInputs,
     output_root: Path,
     upstream: _ValidatedUpstream,
     args: argparse.Namespace,
@@ -6520,6 +7297,25 @@ def _finalize_dataset(
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_shards: dict[str, tuple[CompletedShard, ...]] = {}
     for artifact in _CORE_ARTIFACTS:
+        if artifact == "source_tables":
+            artifact_shards[artifact] = _publish_source_table_shards(
+                upstream,
+                output_root,
+                pre_write_guard=pre_write_guard,
+            )
+            _refresh_certificate_after_source_publication(
+                inputs,
+                upstream,
+                args=args,
+                records_per_shard=records_per_shard,
+                review_policy=review_policy,
+                database_path=database_path,
+                pre_write_guard=pre_write_guard,
+            )
+            report_finalize(f"artifact:{artifact}")
+            if after_finalize_commit is not None:
+                after_finalize_commit(f"artifact:{artifact}")
+            continue
         writer = _AtomicArtifactWriter(
             output_root,
             artifact,
@@ -6774,6 +7570,7 @@ def materialize_dataset(
         or work_root.is_relative_to(output_root)
     ):
         raise ValueError("work_root and output_root must be separate")
+    _prevalidate_published_file_metadata(output_root)
     if pre_write_guard is not None:
         pre_write_guard(work_root / "upstream-validation", 0)
     query_auto_check_required = join_builder.auto_check_required(extractor)
@@ -6871,6 +7668,18 @@ def materialize_dataset(
             resumed_source_units=fast_resume.resumed_source_units,
             expected_source_units=upstream.expected_tables,
         )
+        _cleanup_certified_intermediates(
+            inputs,
+            _certificate_path(
+                inputs.work_root,
+                _certificate_config_fingerprint(
+                    args,
+                    records_per_shard,
+                    review_policy=review_policy,
+                ),
+            ),
+            pre_write_guard=pre_write_guard,
+        )
 
     resumed = _load_published_result(
         output_root,
@@ -6941,7 +7750,7 @@ def materialize_dataset(
             raise ValueError(
                 "upstream identity changed before certificate persistence"
             )
-        _persist_upstream_certificate(
+        certificate_path = _persist_upstream_certificate(
             inputs,
             upstream,
             args=args,
@@ -6950,6 +7759,11 @@ def materialize_dataset(
             database_path=database_path,
             manifest_hashes=strict_manifest_hashes,
             input_files=strict_input_files,
+            pre_write_guard=pre_write_guard,
+        )
+        _cleanup_certified_intermediates(
+            inputs,
+            certificate_path,
             pre_write_guard=pre_write_guard,
         )
     materialize_args = copy.copy(args)
@@ -7002,6 +7816,7 @@ def materialize_dataset(
     )
     return _finalize_dataset(
         database_path,
+        inputs=inputs,
         output_root=output_root,
         upstream=upstream,
         args=materialize_args,

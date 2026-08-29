@@ -283,6 +283,7 @@ class PipelineConfig:
     remote_layout_coordination_poll_seconds: float = 0.2
     materialization_workers: int = 1
     materialization_validation_workers: int = 3
+    query_auto_check_batch_tables: int = 0
     run_fingerprint: str = ""
     runtime_dir: Path | None = None
     model_start_marker: Path | None = None
@@ -541,6 +542,9 @@ class PipelineConfig:
             materialization_workers=args.materialization_workers,
             materialization_validation_workers=(
                 args.materialization_validation_workers
+            ),
+            query_auto_check_batch_tables=(
+                args.query_auto_check_batch_tables
             ),
             run_fingerprint=args.run_fingerprint,
             runtime_dir=(
@@ -2971,6 +2975,12 @@ def _validate_producer_manifest(
                 ("entities/", "page_refs/", "direct_image_refs/")
             ):
                 continue
+            if (
+                compact_replacements
+                and producer_stage == "wdc200k_structural"
+                and completed.path.startswith("selection/")
+            ):
+                continue
             if not validate_completed_shard(completed, root):
                 if (
                     allow_network_shard_repair
@@ -3502,6 +3512,12 @@ def _validate_fast_producer_manifest(
                 ("entities/", "page_refs/", "direct_image_refs/")
             ):
                 continue
+            if (
+                compact_replacements
+                and producer_stage == "wdc200k_structural"
+                and relative.startswith("selection/")
+            ):
+                continue
             artifact = (root / relative).resolve()
             if (
                 not artifact.is_relative_to(root)
@@ -3954,6 +3970,9 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
     args.materialization_workers = config.materialization_workers
     args.materialization_validation_workers = (
         config.materialization_validation_workers
+    )
+    args.query_auto_check_batch_tables = (
+        config.query_auto_check_batch_tables
     )
     args.auto_check_secondary_openai = config.auto_check_secondary_openai
     args.auto_check_api_config_file = config.auto_check_api_config_file
@@ -6692,6 +6711,15 @@ def parse_args(
             "each SQLite writer uses an independent validation database."
         ),
     )
+    parser.add_argument(
+        "--query_auto_check_batch_tables",
+        type=int,
+        default=0,
+        help=(
+            "Source tables prepared per local-only auto-check batch; zero "
+            "scales the bounded batch from configured model workers."
+        ),
+    )
     join_builder.add_model_auto_check_arguments(parser)
     if configure_parser is not None:
         configure_parser(parser)
@@ -6776,6 +6804,10 @@ def parse_args(
     if not 1 <= args.materialization_validation_workers <= 4:
         parser.error(
             "--materialization_validation_workers must be between 1 and 4"
+        )
+    if args.query_auto_check_batch_tables < 0:
+        parser.error(
+            "--query_auto_check_batch_tables must be non-negative"
         )
     if (
         not math.isfinite(args.model_endpoint_ready_timeout_seconds)

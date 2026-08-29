@@ -954,6 +954,70 @@ def test_query_recovery_cache_rejects_incomplete_transient_review(
     ) is None
 
 
+def test_finalize_query_recovery_uses_one_cache_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _make_query_recovery_candidate()
+    extractor = SimpleNamespace(
+        auto_check_enabled=True,
+        auto_check_luna_reviewer=None,
+    )
+    key = joinability_dataset.query_recovery_auto_check_key(
+        candidate,
+        extractor,
+    )
+    record = _completed_query_recovery_record(key)
+    record["review_policy"] = (
+        joinability_dataset.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    record["auto_check"]["review_policy"] = (
+        joinability_dataset.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    cache = ExtractionCache(tmp_path / "query-auto-check-cache.jsonl")
+    cache.put(key, record)
+    plan = joinability_dataset.QueryRecoveryAutoCheckPlan(
+        query_key="query",
+        required_recovered_rows=1,
+        source_row_order=(0,),
+        candidates=(candidate,),
+    )
+    rounds: list[bool] = []
+    acceptance_caches: list[object] = []
+
+    def run_round(**kwargs):
+        rounds.append(bool(kwargs.get("exhaustive")))
+        return {}
+
+    def is_supported(_plan, _extractor, acceptance_cache):
+        acceptance_caches.append(acceptance_cache)
+        assert acceptance_cache.get(key) == record
+        return True
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "run_query_recovery_auto_check_round",
+        run_round,
+    )
+    monkeypatch.setattr(
+        joinability_dataset,
+        "query_recovery_plan_is_supported",
+        is_supported,
+    )
+
+    accepted = joinability_dataset.finalize_query_recovery_auto_checks(
+        plans=[plan],
+        extractor=extractor,
+        cache=cache,
+        args=argparse.Namespace(),
+    )
+
+    assert accepted == [plan]
+    assert rounds == [False, True]
+    assert len(acceptance_caches) == 1
+    assert acceptance_caches[0] is not cache
+
+
 def test_changed_reviewer_pool_reuses_completed_legacy_recovery(
     tmp_path: Path,
 ) -> None:

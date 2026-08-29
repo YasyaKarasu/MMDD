@@ -5214,6 +5214,133 @@ def _load_completed_adapted_model_tasks(
     )
 
 
+def _remove_sqlite_database(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
+def _compact_model_membership_summary(
+    task_paths: Iterable[Path],
+    *,
+    args: argparse.Namespace,
+    input_fingerprint: str,
+    prompt_version: str,
+    policy_fingerprint: str,
+    validation_store_path: Path,
+) -> dict[str, tuple[int, str]]:
+    """Recompute model membership without duplicating full task payloads."""
+    identities = {
+        modality: _model_identity(args, modality)
+        for modality in ("text", "image")
+    }
+    fingerprints = {
+        modality: _modality_fingerprint(
+            modality=modality,
+            input_fingerprint=input_fingerprint,
+            prompt_version=prompt_version,
+            model_identity=identities[modality],
+            policy_fingerprint=policy_fingerprint,
+        )
+        for modality in ("text", "image")
+    }
+    path = Path(validation_store_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _remove_sqlite_database(path)
+    connection = sqlite3.connect(path, timeout=30.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=OFF;
+            PRAGMA temp_store=MEMORY;
+            CREATE TABLE members (
+                job_id TEXT PRIMARY KEY,
+                modality TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                asset_fingerprint TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            ) WITHOUT ROWID;
+            """
+        )
+        connection.execute("BEGIN")
+        for order, record in enumerate(_iter_jsonl_paths(task_paths)):
+            if not isinstance(record, dict):
+                raise ValueError("model task input must be an object")
+            status = clean_text(record.get("status"))
+            if status and status != "success":
+                continue
+            nested = record.get("extraction_task")
+            nested_asset = (
+                nested.get("asset")
+                if isinstance(nested, dict)
+                and isinstance(nested.get("asset"), dict)
+                else None
+            )
+            modality = clean_text(
+                (nested_asset or record).get("asset_type")
+            )
+            if modality not in {"text", "image"}:
+                continue
+            job_id, asset_fingerprint, payload = _task_payload(
+                record,
+                order=order,
+                args=args,
+                prompt_version=prompt_version,
+                model_identity=identities[modality],
+                policy_fingerprint=policy_fingerprint,
+                jobset_fingerprint=fingerprints[modality],
+            )
+            encoded = _canonical_json(payload)
+            values = (
+                job_id,
+                modality,
+                str(payload["cache_key"]),
+                asset_fingerprint,
+                hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            )
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO members (
+                    job_id, modality, cache_key, asset_fingerprint,
+                    payload_sha256
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            if cursor.rowcount == 0:
+                existing = connection.execute(
+                    "SELECT * FROM members WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if existing is None or tuple(existing) != values:
+                    raise ValueError(
+                        f"conflicting incoming model member: {job_id}"
+                    )
+        connection.commit()
+
+        summary: dict[str, tuple[int, str]] = {}
+        for modality in ("text", "image"):
+            digest = hashlib.sha256()
+            count = 0
+            for row in connection.execute(
+                """
+                SELECT job_id, cache_key, asset_fingerprint, payload_sha256
+                FROM members
+                WHERE modality = ?
+                ORDER BY job_id
+                """,
+                (modality,),
+            ):
+                digest.update(_canonical_json(tuple(row)).encode("utf-8"))
+                digest.update(b"\n")
+                count += 1
+            summary[modality] = (count, digest.hexdigest())
+        return summary
+    finally:
+        connection.close()
+
+
 def validate_model_stage_for_adapter(
     result: ModelStageResult,
     adapted: AdaptedModelTasks,
@@ -5263,66 +5390,62 @@ def validate_model_stage_for_adapter(
             raise ValueError("model stage authority fingerprint mismatch")
     if not validate_model_stage(result):
         raise ValueError("model stage result validation failed")
-    expected = enqueue_model_tasks(
-        _iter_jsonl_paths(adapted.task_paths),
-        SqliteJobStore(Path(validation_store_path)),
-        args=args,
-        input_fingerprint=adapted.input_fingerprint,
-        text_input_fingerprint=adapted.input_fingerprint,
-        image_input_fingerprint=adapted.input_fingerprint,
-        prompt_version=authority.prompt_version,
-        policy_fingerprint=authority.policy_fingerprint,
-    )
-    comparable_fields = (
-        "input_fingerprint",
-        "prompt_version",
-        "text_fingerprint",
-        "image_fingerprint",
-        "text_kind",
-        "image_kind",
-        "text_tasks",
-        "image_tasks",
-    )
-    if any(
-        getattr(expected, field) != getattr(result.jobset, field)
-        for field in comparable_fields
-    ):
-        raise ValueError("model stage does not belong to adapter task set")
-    for modality in ("text", "image"):
-        expected_fingerprint = expected.fingerprint_for(modality)
-        actual_fingerprint = result.jobset.fingerprint_for(modality)
-        with _connect(expected.database_path) as connection:
-            expected_row = connection.execute(
-                """
-                SELECT input_fingerprint, prompt_version, model_identity,
-                       policy_fingerprint, task_count, membership_digest,
-                       enqueue_complete
-                FROM model_jobsets WHERE fingerprint = ?
-                """,
-                (expected_fingerprint,),
-            ).fetchone()
-        with _connect(result.jobset.database_path) as connection:
-            actual_row = connection.execute(
-                """
-                SELECT input_fingerprint, prompt_version, model_identity,
-                       policy_fingerprint, task_count, membership_digest,
-                       enqueue_complete
-                FROM model_jobsets WHERE fingerprint = ?
-                """,
-                (actual_fingerprint,),
-            ).fetchone()
-        if (
-            expected_row is None
-            or actual_row is None
-            or str(expected_row["input_fingerprint"])
-            != adapted.input_fingerprint
-            or str(actual_row["input_fingerprint"])
-            != adapted.input_fingerprint
-            or tuple(expected_row) != tuple(actual_row)
-            or int(actual_row["enqueue_complete"]) != 1
-        ):
-            raise ValueError("model adapter membership digest mismatch")
-    return True
+    validation_store_path = Path(validation_store_path)
+    try:
+        expected_membership = _compact_model_membership_summary(
+            adapted.task_paths,
+            args=args,
+            input_fingerprint=adapted.input_fingerprint,
+            prompt_version=authority.prompt_version,
+            policy_fingerprint=authority.policy_fingerprint,
+            validation_store_path=validation_store_path,
+        )
+        for modality in ("text", "image"):
+            expected_fingerprint = _modality_fingerprint(
+                modality=modality,
+                input_fingerprint=adapted.input_fingerprint,
+                prompt_version=authority.prompt_version,
+                model_identity=authority_identities[modality],
+                policy_fingerprint=authority.policy_fingerprint,
+            )
+            actual_fingerprint = result.jobset.fingerprint_for(modality)
+            expected_count, expected_digest = expected_membership[modality]
+            declared_count = (
+                result.jobset.text_tasks
+                if modality == "text"
+                else result.jobset.image_tasks
+            )
+            with _connect(result.jobset.database_path) as connection:
+                actual_row = connection.execute(
+                    """
+                    SELECT input_fingerprint, prompt_version, model_identity,
+                           policy_fingerprint, task_count, membership_digest,
+                           enqueue_complete
+                    FROM model_jobsets WHERE fingerprint = ?
+                    """,
+                    (actual_fingerprint,),
+                ).fetchone()
+            if (
+                actual_fingerprint != expected_fingerprint
+                or expected_count != declared_count
+                or actual_row is None
+                or str(actual_row["input_fingerprint"])
+                != adapted.input_fingerprint
+                or str(actual_row["prompt_version"])
+                != authority.prompt_version
+                or str(actual_row["model_identity"])
+                != authority_identities[modality]
+                or str(actual_row["policy_fingerprint"])
+                != authority.policy_fingerprint
+                or int(actual_row["task_count"]) != expected_count
+                or str(actual_row["membership_digest"])
+                != expected_digest
+                or int(actual_row["enqueue_complete"]) != 1
+            ):
+                raise ValueError("model adapter membership digest mismatch")
+        return True
+    finally:
+        _remove_sqlite_database(validation_store_path)
 
 
 def enqueue_model_tasks_from_manifest(

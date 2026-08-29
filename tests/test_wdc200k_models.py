@@ -1653,6 +1653,7 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
         authority=authority,
         validation_store_path=tmp_path / "validation-models.sqlite3",
     )
+    assert not (tmp_path / "validation-models.sqlite3").exists()
 
     foreign_adapter = models.AdaptedModelTasks(
         **{
@@ -1732,6 +1733,41 @@ def test_adapter_and_model_validators_bind_exact_task_membership(
                 tmp_path / "foreign-policy-authority.sqlite3"
             ),
         )
+
+
+def test_compact_model_membership_store_omits_payload_json(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "tasks.jsonl"
+    writer = AtomicJsonlShard(task_path)
+    writer.write(asset("compact-membership"))
+    writer.commit()
+    database_path = tmp_path / "membership.sqlite3"
+
+    summary = models._compact_model_membership_summary(
+        (task_path,),
+        args=model_args(),
+        input_fingerprint="adapter-input-v1",
+        prompt_version=models.PROMPT_VERSION,
+        policy_fingerprint=models.MODEL_POLICY_VERSION,
+        validation_store_path=database_path,
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(members)")
+        }
+    assert columns == {
+        "job_id",
+        "modality",
+        "cache_key",
+        "asset_fingerprint",
+        "payload_sha256",
+    }
+    assert summary["text"][0] == 1
+    assert summary["image"][0] == 0
+    models._remove_sqlite_database(database_path)
 
 
 def test_model_stage_resumes_without_repeating_success(tmp_path: Path) -> None:

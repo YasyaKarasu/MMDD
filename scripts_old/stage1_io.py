@@ -66,6 +66,10 @@ def stable_hash(*parts: Any, length: int = 16) -> str:
 
 def is_numeric_text(value: Any) -> bool:
     text = clean_text(value).replace(",", "")
+    return _is_numeric_clean_text(text)
+
+
+def _is_numeric_clean_text(text: str) -> bool:
     if not text:
         return False
     if NUMERIC_RE.match(text):
@@ -323,20 +327,51 @@ def column_values(table: dict[str, Any], col_idx: int) -> list[str]:
     return [get_cell_text(row, col_idx) for row in table.get("rows", [])]
 
 
-def compute_profile_from_values(values: list[str]) -> dict[str, Any]:
+def table_column_values(table: dict[str, Any]) -> dict[int, list[str]]:
+    values: dict[int, list[str]] = {}
+    for column in table.get("columns", []):
+        try:
+            column_index = int(column.get("column_index"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        values[column_index] = column_values(table, column_index)
+    return values
+
+
+def compute_profile_from_values(
+    values: list[str],
+    *,
+    values_are_clean: bool = False,
+) -> dict[str, Any]:
     total = len(values)
-    non_empty = [clean_text(v) for v in values if clean_text(v)]
+    if values_are_clean:
+        non_empty = [value for value in values if value]
+    else:
+        non_empty = []
+        for value in values:
+            cleaned = clean_text(value)
+            if cleaned:
+                non_empty.append(cleaned)
     distinct = set(non_empty)
     return {
         "non_empty_ratio": len(non_empty) / max(1, total),
         "unique_ratio": len(distinct) / max(1, len(non_empty)),
-        "numeric_ratio": sum(1 for value in non_empty if is_numeric_text(value)) / max(1, len(non_empty)),
+        "numeric_ratio": sum(
+            1 for value in non_empty if _is_numeric_clean_text(value)
+        )
+        / max(1, len(non_empty)),
         "distinct_count": len(distinct),
         "examples": list(dict.fromkeys(non_empty))[:8],
     }
 
 
-def column_profiles(table: dict[str, Any]) -> dict[int, dict[str, Any]]:
+def column_profiles(
+    table: dict[str, Any],
+    *,
+    values_by_column: dict[int, list[str]] | None = None,
+) -> dict[int, dict[str, Any]]:
+    if values_by_column is None:
+        values_by_column = table_column_values(table)
     profiles: dict[int, dict[str, Any]] = {}
     for profile in table.get("metadata", {}).get("column_profiles", []) or []:
         try:
@@ -349,9 +384,15 @@ def column_profiles(table: dict[str, Any]) -> dict[int, dict[str, Any]]:
         except (TypeError, ValueError):
             continue
         if idx not in profiles:
-            profiles[idx] = compute_profile_from_values(column_values(table, idx))
+            profiles[idx] = compute_profile_from_values(
+                values_by_column.get(idx, []),
+                values_are_clean=True,
+            )
         else:
-            computed = compute_profile_from_values(column_values(table, idx))
+            computed = compute_profile_from_values(
+                values_by_column.get(idx, []),
+                values_are_clean=True,
+            )
             profiles[idx].setdefault("non_empty_ratio", computed["non_empty_ratio"])
             profiles[idx].setdefault("unique_ratio", computed["unique_ratio"])
             profiles[idx].setdefault("numeric_ratio", computed["numeric_ratio"])

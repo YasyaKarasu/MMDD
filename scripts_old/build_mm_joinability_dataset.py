@@ -96,6 +96,7 @@ from stage1_io import (
     sanitize_cell_text_for_model,
     setup_logging,
     stable_hash,
+    table_column_values,
     write_json,
     write_jsonl,
 )
@@ -4385,6 +4386,22 @@ class LocalAttributeExtractor:
         )
 
 
+class ExtractionCacheSnapshot:
+    def __init__(
+        self,
+        items: dict[str, dict[str, Any]],
+        transient_items: dict[str, dict[str, Any]],
+    ) -> None:
+        self.items = items
+        self.transient_items = transient_items
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        return self.items.get(key)
+
+    def get_transient(self, key: str) -> dict[str, Any] | None:
+        return self.transient_items.get(key)
+
+
 class ExtractionCache:
     def __init__(
         self,
@@ -4414,6 +4431,22 @@ class ExtractionCache:
     def get_transient(self, key: str) -> dict[str, Any] | None:
         with self._lock:
             return self.transient_items.get(key)
+
+    def snapshot(self, keys: Iterable[str]) -> ExtractionCacheSnapshot:
+        unique_keys = tuple(dict.fromkeys(keys))
+        with self._lock:
+            return ExtractionCacheSnapshot(
+                {
+                    key: self.items[key]
+                    for key in unique_keys
+                    if key in self.items
+                },
+                {
+                    key: self.transient_items[key]
+                    for key in unique_keys
+                    if key in self.transient_items
+                },
+            )
 
     def put(self, key: str, record: dict[str, Any]) -> None:
         with self._lock:
@@ -6697,6 +6730,7 @@ def choose_entity_column(
     table: dict[str, Any],
     *,
     min_linked_rows: int = 0,
+    profiles: dict[int, dict[str, Any]] | None = None,
 ) -> int | None:
     candidates = [
         int(index)
@@ -6707,7 +6741,8 @@ def choose_entity_column(
     ]
     if not candidates:
         return None
-    profiles = column_profiles(table)
+    if profiles is None:
+        profiles = column_profiles(table)
     candidates.sort(
         key=lambda idx: (
             -float(profiles.get(idx, {}).get("wiki_link_ratio", 0.0)),
@@ -6725,8 +6760,15 @@ def linked_entity_row_count(table: dict[str, Any], entity_col: int) -> int:
     )
 
 
-def candidate_attribute_columns(table: dict[str, Any], entity_col: int, min_non_empty_ratio: float) -> list[int]:
-    profiles = column_profiles(table)
+def candidate_attribute_columns(
+    table: dict[str, Any],
+    entity_col: int,
+    min_non_empty_ratio: float,
+    *,
+    profiles: dict[int, dict[str, Any]] | None = None,
+) -> list[int]:
+    if profiles is None:
+        profiles = column_profiles(table)
     cols: list[int] = []
     for column in table.get("columns", []):
         try:
@@ -6933,8 +6975,15 @@ def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, 
     }
 
 
-def context_columns(table: dict[str, Any], excluded: set[int], limit: int) -> list[int]:
-    profiles = column_profiles(table)
+def context_columns(
+    table: dict[str, Any],
+    excluded: set[int],
+    limit: int,
+    *,
+    profiles: dict[int, dict[str, Any]] | None = None,
+) -> list[int]:
+    if profiles is None:
+        profiles = column_profiles(table)
     candidates: list[tuple[float, float, int]] = []
     for column in table.get("columns", []):
         idx = int(column.get("column_index"))
@@ -6978,6 +7027,7 @@ def _explicit_join_candidate_columns(
     source_table: dict[str, Any],
     entity_col: int,
     args: argparse.Namespace,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> list[int]:
     rows = source_table.get("rows", [])
     if not rows:
@@ -6987,6 +7037,11 @@ def _explicit_join_candidate_columns(
     min_non_empty_ratio = float(
         getattr(args, "min_column_non_empty_ratio", 0.5)
     )
+    entity_values = (
+        values_by_column.get(entity_col)
+        if values_by_column is not None
+        else None
+    )
     candidates: list[int] = []
     for fallback, column in enumerate(source_table.get("columns", [])):
         try:
@@ -6995,13 +7050,28 @@ def _explicit_join_candidate_columns(
             continue
         if column_index == entity_col:
             continue
+        join_values = (
+            values_by_column.get(column_index)
+            if values_by_column is not None
+            else None
+        )
         non_empty_join_rows = 0
         query_eligible_rows = 0
-        for row in rows:
-            if not get_cell_text(row, column_index):
+        for row_index, row in enumerate(rows):
+            join_value = (
+                join_values[row_index]
+                if join_values is not None
+                else get_cell_text(row, column_index)
+            )
+            if not join_value:
                 continue
             non_empty_join_rows += 1
-            if get_cell_text(row, entity_col):
+            entity_value = (
+                entity_values[row_index]
+                if entity_values is not None
+                else get_cell_text(row, entity_col)
+            )
+            if entity_value:
                 query_eligible_rows += 1
         if non_empty_join_rows / len(rows) < min_non_empty_ratio:
             continue
@@ -7027,6 +7097,8 @@ def _explicit_join_context_partition(
     entity_col: int,
     join_columns: list[int],
     args: argparse.Namespace,
+    profiles: dict[int, dict[str, Any]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Partition ordinary columns once for a source's explicit variants.
 
@@ -7040,13 +7112,21 @@ def _explicit_join_context_partition(
         source_table,
         {entity_col, *join_columns},
         0,
+        profiles=profiles,
     )
     ordinary = [
         column_index
         for column_index in ordinary
         if sum(
-            bool(get_cell_text(source_row, column_index))
-            for source_row in source_table.get("rows", [])
+            bool(value)
+            for value in (
+                values_by_column.get(column_index, [])
+                if values_by_column is not None
+                else (
+                    get_cell_text(source_row, column_index)
+                    for source_row in source_table.get("rows", [])
+                )
+            )
         )
         >= min_target_rows
     ]
@@ -7079,17 +7159,41 @@ def _build_explicit_join_candidate(
     rejected_multimodal_reason: str,
     rejected_multimodal_decision: dict[str, Any] | None,
     args: argparse.Namespace,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> dict[str, Any] | None:
     """Build one deterministic explicit query/target candidate specification."""
     seed = int(getattr(args, "seed", 13))
     source_table_id = str(source_table["source_table_id"])
     query_cols = [entity_col, join_col, *query_context]
     target_cols = [join_col, *target_context]
+    source_rows = source_table.get("rows", [])
+    indexed_source_rows = [
+        (fallback, row_id(source_row, fallback), source_row)
+        for fallback, source_row in enumerate(source_rows)
+    ]
+    entity_values = (
+        values_by_column.get(entity_col)
+        if values_by_column is not None
+        else None
+    )
+    join_values = (
+        values_by_column.get(join_col)
+        if values_by_column is not None
+        else None
+    )
     eligible_source_rows = [
-        row_id(source_row, fallback)
-        for fallback, source_row in enumerate(source_table.get("rows", []))
-        if get_cell_text(source_row, entity_col)
-        and get_cell_text(source_row, join_col)
+        source_row_id
+        for row_index, source_row_id, source_row in indexed_source_rows
+        if (
+            entity_values[row_index]
+            if entity_values is not None
+            else get_cell_text(source_row, entity_col)
+        )
+        and (
+            join_values[row_index]
+            if join_values is not None
+            else get_cell_text(source_row, join_col)
+        )
     ]
     eligible_source_rows.sort(
         key=lambda source_row_id: (
@@ -7106,26 +7210,35 @@ def _build_explicit_join_candidate(
     )
     query_rows_per_table = configured_query_rows_per_table(args)
     selected_source_rows = eligible_source_rows[:query_rows_per_table]
-    query_rows, query_source_rows = project_selected_rows(
-        source_table,
-        query_cols,
-        set(selected_source_rows),
-        min_required_cols=2,
-    )
-    all_source_rows = {
-        row_id(source_row, fallback)
-        for fallback, source_row in enumerate(source_table.get("rows", []))
-    }
-    target_rows, target_source_rows = project_selected_rows(
-        source_table,
-        target_cols,
-        all_source_rows,
-        min_required_cols=1,
-    )
+    selected_source_row_set = set(selected_source_rows)
+    query_source_rows = [
+        source_row_id
+        for row_index, source_row_id, source_row in indexed_source_rows
+        if source_row_id in selected_source_row_set
+        and (
+            entity_values[row_index]
+            if entity_values is not None
+            else get_cell_text(source_row, entity_col)
+        )
+        and (
+            join_values[row_index]
+            if join_values is not None
+            else get_cell_text(source_row, join_col)
+        )
+    ]
+    target_source_rows = [
+        source_row_id
+        for row_index, source_row_id, source_row in indexed_source_rows
+        if (
+            join_values[row_index]
+            if join_values is not None
+            else get_cell_text(source_row, join_col)
+        )
+    ]
     min_target_rows = int(getattr(args, "min_rows_per_output_table", 2))
-    if len(query_rows) != query_rows_per_table:
+    if len(query_source_rows) != query_rows_per_table:
         return None
-    if len(target_rows) < min_target_rows:
+    if len(target_source_rows) < min_target_rows:
         return None
     if not set(query_source_rows).issubset(target_source_rows):
         return None
@@ -7139,8 +7252,8 @@ def _build_explicit_join_candidate(
         "column_name": join_col_name,
         "role": "visible_join_column",
         "hidden_in_query": False,
-        "selected_rows": len(query_rows),
-        "target_rows": len(target_rows),
+        "selected_rows": len(query_source_rows),
+        "target_rows": len(target_source_rows),
     }
     return {
         "reason": "explicit_join_fallback",
@@ -7307,6 +7420,8 @@ def build_explicit_join_fallback_records(
     args: argparse.Namespace,
     rejected_multimodal_decision: dict[str, Any] | None = None,
     force: bool = False,
+    profiles: dict[int, dict[str, Any]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -7325,8 +7440,13 @@ def build_explicit_join_fallback_records(
     ):
         return None
 
+    if values_by_column is None:
+        values_by_column = table_column_values(source_table)
     candidate_columns = _explicit_join_candidate_columns(
-        source_table, entity_col, args
+        source_table,
+        entity_col,
+        args,
+        values_by_column,
     )
     if not candidate_columns:
         return None
@@ -7353,6 +7473,8 @@ def build_explicit_join_fallback_records(
         rejected_multimodal_decision=rejected_multimodal_decision,
         args=args,
         join_columns=[join_column],
+        profiles=profiles,
+        values_by_column=values_by_column,
     )
     if not candidates:
         return None
@@ -7374,6 +7496,8 @@ def build_explicit_join_fallback_candidates(
     rejected_multimodal_decision: dict[str, Any] | None = None,
     force: bool = False,
     join_columns: list[int] | None = None,
+    profiles: dict[int, dict[str, Any]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build all viable explicit query candidates for one source table.
 
@@ -7387,8 +7511,15 @@ def build_explicit_join_fallback_candidates(
         and not _explicit_join_fallback_selected(source_table, args)
     ):
         return []
+    if values_by_column is None:
+        values_by_column = table_column_values(source_table)
     candidates = list(join_columns) if join_columns is not None else (
-        _explicit_join_candidate_columns(source_table, entity_col, args)
+        _explicit_join_candidate_columns(
+            source_table,
+            entity_col,
+            args,
+            values_by_column,
+        )
     )
     if not candidates:
         return []
@@ -7414,6 +7545,8 @@ def build_explicit_join_fallback_candidates(
         entity_col=entity_col,
         join_columns=candidates,
         args=args,
+        profiles=profiles,
+        values_by_column=values_by_column,
     )
     output: list[dict[str, Any]] = []
     for join_col in candidates:
@@ -7427,6 +7560,7 @@ def build_explicit_join_fallback_candidates(
             rejected_multimodal_reason=rejected_multimodal_reason,
             rejected_multimodal_decision=rejected_multimodal_decision,
             args=args,
+            values_by_column=values_by_column,
         )
         if candidate is not None:
             output.append(candidate)
@@ -7440,6 +7574,8 @@ def rejected_table_join_records(
     entity_col: int | None,
     decision: dict[str, Any],
     args: argparse.Namespace,
+    profiles: dict[int, dict[str, Any]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -7456,6 +7592,8 @@ def rejected_table_join_records(
             rejected_multimodal_decision=decision,
             args=args,
             force=True,
+            profiles=profiles,
+            values_by_column=values_by_column,
         )
         if explicit_candidates:
             return (
@@ -7480,6 +7618,8 @@ def rejected_table_join_records(
         rejected_multimodal_reason=str(decision["reason"]),
         rejected_multimodal_decision=decision,
         args=args,
+        profiles=profiles,
+        values_by_column=values_by_column,
     )
     if explicit_records is not None:
         return explicit_records
@@ -7498,6 +7638,7 @@ def multi_attribute_context_layout(
     entity_col: int,
     qualified_cols: list[dict[str, Any]],
     args: argparse.Namespace,
+    profiles: dict[int, dict[str, Any]] | None = None,
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
     """Assign safe query/target contexts for all qualified bridge columns.
 
@@ -7526,6 +7667,7 @@ def multi_attribute_context_layout(
         source_table,
         {entity_col, *all_qualified_indices},
         0,
+        profiles=profiles,
     )
     query_context_width = max(
         1, int(getattr(args, "max_query_context_attrs", 1))
@@ -7570,7 +7712,12 @@ def multi_attribute_context_layout(
 
     best = select_best_qualified_column(ordered_qualified)[0]
     join_col = int(best["column_index"])
-    other_cols = context_columns(source_table, {entity_col, join_col}, 0)
+    other_cols = context_columns(
+        source_table,
+        {entity_col, join_col},
+        0,
+        profiles=profiles,
+    )
     if not other_cols:
         return []
     query_context = other_cols[:query_context_width]
@@ -9017,19 +9164,62 @@ def finalize_query_recovery_auto_checks(
         args=args,
         concurrency_state=concurrency_state,
     )
+    acceptance_cache = cache
+    snapshot = getattr(cache, "snapshot", None)
+    if callable(snapshot):
+        snapshot_keys: list[str] = []
+        include_remote_keys = (
+            model_auto_check_review_policy(extractor)
+            == AUTO_CHECK_REVIEW_POLICY_CASCADE
+        )
+        for plan in plans:
+            for candidate in plan.candidates:
+                snapshot_keys.append(
+                    query_recovery_auto_check_key(candidate, extractor)
+                )
+                if include_remote_keys:
+                    snapshot_keys.append(
+                        query_recovery_remote_evidence_key(candidate)
+                    )
+        acceptance_cache = snapshot(snapshot_keys)
     accepted = [
         plan
         for plan in plans
-        if query_recovery_plan_is_supported(plan, extractor, cache)
+        if query_recovery_plan_is_supported(
+            plan,
+            extractor,
+            acceptance_cache,
+        )
     ]
-    run_query_recovery_auto_check_round(
-        plans=accepted,
-        extractor=extractor,
-        cache=cache,
-        args=args,
-        concurrency_state=concurrency_state,
-        exhaustive=True,
-    )
+    incomplete = accepted
+    for _attempt in range(
+        max(1, int(getattr(args, "model_max_retries", 2)) + 1)
+    ):
+        run_query_recovery_auto_check_round(
+            plans=incomplete,
+            extractor=extractor,
+            cache=cache,
+            args=args,
+            concurrency_state=concurrency_state,
+            exhaustive=True,
+        )
+        incomplete = [
+            plan
+            for plan in incomplete
+            if query_recovery_plan_needs_model_check(
+                plan,
+                extractor,
+                cache,
+                exhaustive=True,
+            )
+        ]
+        if not incomplete:
+            break
+    if incomplete:
+        raise TransientModelEndpointError(
+            "accepted query evidence auto-check remained incomplete: "
+            f"{incomplete[0].query_key}"
+        )
     return accepted
 
 
@@ -9248,9 +9438,15 @@ def build_table_join_records(
     query_recovery_plans_out: list[QueryRecoveryAutoCheckPlan] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
+    values_by_column = table_column_values(source_table)
+    profiles = column_profiles(
+        source_table,
+        values_by_column=values_by_column,
+    )
     entity_col = choose_entity_column(
         source_table,
         min_linked_rows=query_rows_per_table,
+        profiles=profiles,
     )
     if entity_col is None:
         return rejected_table_join_records(
@@ -9259,9 +9455,16 @@ def build_table_join_records(
             entity_col=None,
             decision={"reason": "no_entity_column", "qualified_columns": []},
             args=args,
+            profiles=profiles,
+            values_by_column=values_by_column,
         )
 
-    attribute_cols = candidate_attribute_columns(source_table, entity_col, args.min_column_non_empty_ratio)
+    attribute_cols = candidate_attribute_columns(
+        source_table,
+        entity_col,
+        args.min_column_non_empty_ratio,
+        profiles=profiles,
+    )
     if not attribute_cols:
         return rejected_table_join_records(
             source_table=source_table,
@@ -9273,6 +9476,8 @@ def build_table_join_records(
                 "qualified_columns": [],
             },
             args=args,
+            profiles=profiles,
+            values_by_column=values_by_column,
         )
 
     candidate_attribute_names = [get_column_name(source_table, col) for col in attribute_cols]
@@ -9455,6 +9660,8 @@ def build_table_join_records(
                 "qualified_columns": [],
             },
             args=args,
+            profiles=profiles,
+            values_by_column=values_by_column,
         )
 
     variant_layouts = multi_attribute_context_layout(
@@ -9462,6 +9669,7 @@ def build_table_join_records(
         entity_col=entity_col,
         qualified_cols=qualified_cols,
         args=args,
+        profiles=profiles,
     )
 
     query_tables: list[dict[str, Any]] = []
@@ -9616,6 +9824,7 @@ def build_table_join_records(
                             "query recovery cache"
                         )
                     final_check_results = {}
+                    missing_check_keys: list[str] = []
                     for candidate in view_candidates:
                         key = query_recovery_auto_check_key(
                             candidate, extractor
@@ -9627,24 +9836,33 @@ def build_table_join_records(
                             extractor=extractor,
                         )
                         if record is None:
-                            raise RuntimeError(
-                                "final query evidence auto-check is incomplete: "
-                                f"{auto_check_plan.query_key} {key}"
-                            )
+                            missing_check_keys.append(key)
+                            continue
                         final_check_results[key] = record
                     approved_candidates = [
                         candidate
                         for candidate in view_candidates
-                        if final_check_results[
+                        if final_check_results.get(
                             query_recovery_auto_check_key(
                                 candidate, extractor
-                            )
-                        ].get("supported")
+                            ),
+                            {},
+                        ).get("supported")
                     ]
                     approved_source_rows = {
                         int(candidate.recovery["source_row_id"])
                         for candidate in approved_candidates
                     }
+                    if len(approved_source_rows) < int(
+                        qualified["required_recovered_rows"]
+                    ):
+                        if missing_check_keys:
+                            raise RuntimeError(
+                                "final query evidence auto-check is incomplete: "
+                                f"{auto_check_plan.query_key} "
+                                f"{missing_check_keys[0]}"
+                            )
+                        continue
             view_hidden_attribute = {
                 **hidden_attribute,
                 "recovered_rows": len(approved_source_rows),
@@ -9788,6 +10006,8 @@ def build_table_join_records(
                 ],
             },
             args=args,
+            profiles=profiles,
+            values_by_column=values_by_column,
         )
     validate_implicit_query_uniqueness(
         qrels,

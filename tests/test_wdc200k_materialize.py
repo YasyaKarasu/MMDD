@@ -12,7 +12,7 @@ import tracemalloc
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 import pytest
 
@@ -156,6 +156,163 @@ def test_unsampled_source_rows_receive_stable_derived_entity_identity(
     assert wiki_to_entity[unsampled_title] == (
         "ent_" + stable_hash(unsampled_title, length=16)
     )
+
+
+def test_batched_table_inputs_match_single_table_reads(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.sqlite3"
+    args = _args(tmp_path)
+    sources = []
+    for source_index in range(2):
+        source = _source_table(f"source-{source_index}")
+        for row in source["rows"]:
+            cell = row["cells"][0]
+            cell["wiki_title"] = (
+                f"{cell['wiki_title']}_{source_index}"
+            )
+        sources.append(source)
+
+    materializer._initialize_index(database)
+    materializer._catalog_source_records(
+        database,
+        sources,
+        args=args,
+        expected_tables=len(sources),
+    )
+    with materializer._connect(database) as connection:
+        for source_index, source in enumerate(sources):
+            source_id = str(source["source_table_id"])
+            for row in source["rows"]:
+                row_id = int(row["row_id"])
+                wiki_title = str(row["cells"][0]["wiki_title"])
+                entity_id = f"entity-{source_index}-{row_id}"
+                asset_id = f"asset-{source_index}-{row_id}"
+                link_id = f"link-{source_index}-{row_id}"
+                cache_key = f"cache-{source_index}-{row_id}"
+                entity = {
+                    "entity_id": entity_id,
+                    "wiki_title": wiki_title,
+                }
+                asset = {
+                    "asset_id": asset_id,
+                    "entity_id": entity_id,
+                    "asset_type": "text",
+                    "content": f"content-{source_index}-{row_id}",
+                }
+                link = {
+                    "link_id": link_id,
+                    "source_table_id": source_id,
+                    "row_id": row_id,
+                    "entity_id": entity_id,
+                    "asset_ids": [asset_id],
+                }
+                extraction = {
+                    "cache_key": cache_key,
+                    "entity_id": entity_id,
+                    "asset_id": asset_id,
+                    "attributes": [],
+                }
+                connection.execute(
+                    """
+                    INSERT INTO entities (
+                        entity_id, source_table_id, source_row_id,
+                        record_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        entity_id,
+                        source_id,
+                        row_id,
+                        materializer._canonical_json(entity),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO assets (asset_id, entity_id, record_json)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        asset_id,
+                        entity_id,
+                        materializer._canonical_json(asset),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO links (
+                        link_id, source_table_id, source_row_id,
+                        entity_id, record_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link_id,
+                        source_id,
+                        row_id,
+                        entity_id,
+                        materializer._canonical_json(link),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO extractions (
+                        cache_key, model_call_key, job_id,
+                        entity_id, asset_id, source_table_id,
+                        source_row_id, status, record_json
+                    ) VALUES (?, '', '', ?, ?, ?, ?, 'success', ?)
+                    """,
+                    (
+                        cache_key,
+                        entity_id,
+                        asset_id,
+                        source_id,
+                        row_id,
+                        materializer._canonical_json(extraction),
+                    ),
+                )
+                for alias in {
+                    wiki_title,
+                    materializer.normalize_title(wiki_title),
+                    wiki_title.casefold(),
+                    materializer.normalize_title(wiki_title).casefold(),
+                }:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO entity_aliases (
+                            alias, entity_id
+                        ) VALUES (?, ?)
+                        """,
+                        (alias, entity_id),
+                    )
+        rows = {
+            str(row["source_table_id"]): row
+            for row in connection.execute(
+                """
+                SELECT source_table_id, ordinal, record_sha256
+                FROM source_catalog
+                """
+            )
+        }
+        connection.commit()
+
+    items = [
+        materializer._MaterializationWorkItem(
+            source_table_id=source_id,
+            source_ordinal=int(rows[source_id]["ordinal"]),
+            source_sha256=str(rows[source_id]["record_sha256"]),
+            split="train",
+        )
+        for source_id in ("source-1", "source-0")
+    ]
+    loaded = materializer._load_materialization_sources(database, items)
+
+    assert [source["source_table_id"] for source in loaded] == [
+        "source-1",
+        "source-0",
+    ]
+    assert materializer._table_inputs_batch(database, loaded) == [
+        materializer._table_inputs(database, source) for source in loaded
+    ]
 
 
 def test_extraction_lookup_has_asset_leading_index(
@@ -3464,6 +3621,206 @@ def test_query_auto_check_prepass_selects_execution_path_from_review_mode(
     assert calls == ["small", "large"]
 
 
+def test_query_auto_check_batch_tables_scales_with_model_workers() -> None:
+    args = SimpleNamespace(
+        query_auto_check_batch_tables=0,
+        text_model_workers=120,
+        image_model_workers=36,
+        remote_text_model_workers=0,
+        remote_image_model_workers=0,
+    )
+
+    assert materializer._query_auto_check_batch_tables(args) == 624
+    args.query_auto_check_batch_tables = 256
+    assert materializer._query_auto_check_batch_tables(args) == 256
+    args.query_auto_check_batch_tables = -1
+    with pytest.raises(ValueError, match="must be non-negative"):
+        materializer._query_auto_check_batch_tables(args)
+
+
+def test_query_auto_check_source_batch_skips_only_valid_completed_units(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.sqlite3"
+    sources = [_source_table(f"source-{index}") for index in range(3)]
+    materializer._initialize_index(database)
+    materializer._catalog_source_records(
+        database,
+        sources,
+        args=_args(tmp_path),
+        expected_tables=len(sources),
+    )
+    with materializer._connect(database) as connection:
+        hashes = {
+            str(row["source_table_id"]): str(row["record_sha256"])
+            for row in connection.execute(
+                "SELECT source_table_id, record_sha256 FROM source_catalog"
+            )
+        }
+        connection.executemany(
+            """
+            INSERT INTO query_auto_check_units (
+                source_table_id, source_sha256, plan_count,
+                cached_check_count, complete
+            ) VALUES (?, ?, 0, 0, 1)
+            """,
+            [
+                ("source-0", hashes["source-0"]),
+                ("source-1", "stale-source-hash"),
+            ],
+        )
+        connection.commit()
+
+    rows = materializer._query_auto_check_source_batch(
+        database,
+        last_ordinal=-1,
+        limit=10,
+        pending_only=True,
+    )
+
+    assert [row["source_table_id"] for row in rows] == [
+        "source-1",
+        "source-2",
+    ]
+    with pytest.raises(ValueError, match="resume mismatch"):
+        materializer._pending_query_auto_check_items(rows)
+
+
+def test_large_query_auto_check_prefetches_and_reuses_concurrency_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace(
+        query_auto_check_batch_tables=1,
+        text_model_workers=2,
+        image_model_workers=1,
+        remote_text_model_workers=0,
+        remote_image_model_workers=0,
+    )
+    rows = {
+        -1: [
+            {
+                "source_table_id": "source-0",
+                "ordinal": 0,
+                "split": "train",
+                "record_sha256": "sha-0",
+                "checked_sha256": None,
+                "checked": None,
+            }
+        ],
+        0: [
+            {
+                "source_table_id": "source-1",
+                "ordinal": 1,
+                "split": "train",
+                "record_sha256": "sha-1",
+                "checked_sha256": None,
+                "checked": None,
+            }
+        ],
+        1: [],
+    }
+    second_prepare_started = threading.Event()
+    second_prepare_finished = threading.Event()
+    release_second_prepare = threading.Event()
+    concurrency_states: list[Any] = []
+    persisted: list[str] = []
+    verified: list[tuple[int, int]] = []
+
+    def source_batch(
+        _database_path: Path,
+        *,
+        last_ordinal: int,
+        limit: int,
+        pending_only: bool,
+    ) -> list[dict[str, Any]]:
+        assert limit == 1
+        assert pending_only is True
+        return rows[last_ordinal]
+
+    def prepare(
+        _database_path: Path,
+        items: Iterable[Any],
+        **_kwargs: Any,
+    ) -> tuple[list[tuple[Any, list[str]]], list[str], int]:
+        item = next(iter(items))
+        if item.source_ordinal == 1:
+            second_prepare_started.set()
+            assert release_second_prepare.wait(timeout=2)
+            second_prepare_finished.set()
+        plan = f"plan-{item.source_ordinal}"
+        return [(item, [plan])], [plan], 0
+
+    def finalize(*, plans: list[str], concurrency_state: Any, **_kwargs: Any) -> None:
+        concurrency_states.append(concurrency_state)
+        if plans == ["plan-0"]:
+            assert second_prepare_started.wait(timeout=2)
+            release_second_prepare.set()
+
+    def persist(
+        _database_path: Path,
+        units: list[tuple[Any, list[str]]],
+        **_kwargs: Any,
+    ) -> tuple[int, int]:
+        persisted.append(units[0][0].source_table_id)
+        return len(units), 0
+
+    monkeypatch.setattr(
+        materializer,
+        "_query_auto_check_completed_units",
+        lambda _path: 0,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_query_auto_check_source_batch",
+        source_batch,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_prepare_query_auto_check_units",
+        prepare,
+    )
+    monkeypatch.setattr(
+        materializer.join_builder,
+        "finalize_query_recovery_auto_checks",
+        finalize,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_persist_query_auto_check_batch",
+        persist,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_checkpoint_wal",
+        lambda _path: (
+            None
+            if second_prepare_finished.is_set()
+            else pytest.fail("WAL checkpoint raced with batch preparation")
+        ),
+    )
+    monkeypatch.setattr(
+        materializer,
+        "_verify_query_auto_check_prepass",
+        lambda _path, *, observed, expected_tables, **_kwargs: (
+            verified.append((observed, expected_tables))
+        ),
+    )
+
+    materializer._run_large_query_auto_check_prepass(
+        tmp_path / "materialize.sqlite3",
+        extractor=object(),
+        cache=object(),
+        args=args,
+        expected_tables=2,
+    )
+
+    assert persisted == ["source-0", "source-1"]
+    assert len(concurrency_states) == 2
+    assert concurrency_states[0] is concurrency_states[1]
+    assert verified == [(2, 2)]
+
+
 def test_materialization_worker_source_fingerprint_rejects_changed_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3799,6 +4156,169 @@ def test_external_json_uses_global_content_addressed_path() -> None:
         "different-identity",
         digest,
     )
+
+
+def test_source_catalog_locator_loads_original_jsonl_record(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    source_path = tmp_path / "source.jsonl"
+    source_table = _source_table()
+    _write_jsonl(source_path, [source_table])
+    materializer._initialize_index(database_path)
+
+    materializer._catalog_sources(
+        database_path,
+        (source_path,),
+        args=_args(tmp_path),
+        expected_tables=1,
+    )
+
+    with materializer._connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM source_catalog"
+        ).fetchone()
+        assert row is not None
+        assert row["source_path"] == source_path.resolve().as_posix()
+        assert row["record_path"] == ""
+        assert "rows" not in json.loads(str(row["record_json"]))
+        digest = str(row["record_sha256"])
+    item = materializer._MaterializationWorkItem(
+        source_table_id="source-1",
+        source_ordinal=0,
+        source_sha256=digest,
+        split="train",
+    )
+    assert materializer._load_materialization_source(
+        database_path,
+        item,
+    ) == source_table
+
+
+def test_source_table_publication_uses_hard_links(tmp_path: Path) -> None:
+    structural_root = tmp_path / "structural"
+    source_path = structural_root / "source_tables/part-00000.jsonl"
+    writer = AtomicJsonlShard(source_path)
+    writer.write(_source_table())
+    shard = writer.commit()
+    completed = CompletedShard(
+        path="source_tables/part-00000.jsonl",
+        records=shard.records,
+        bytes=shard.bytes,
+        sha256=shard.sha256,
+    )
+    output_root = tmp_path / "output"
+
+    published = materializer._publish_source_table_shards(
+        SimpleNamespace(
+            source_paths=(source_path,),
+            source_shards=(completed,),
+        ),
+        output_root,
+    )
+
+    output_path = output_root / completed.path
+    assert published == (completed,)
+    assert output_path.stat().st_ino == source_path.stat().st_ino
+    assert output_path.stat().st_dev == source_path.stat().st_dev
+    assert json.loads(output_path.read_text(encoding="utf-8"))[
+        "source_table_id"
+    ] == "source-1"
+
+
+def test_certified_cleanup_deletes_only_allowlisted_files(
+    tmp_path: Path,
+) -> None:
+    work_root = tmp_path / "work"
+    structural_root = work_root / "structural"
+    candidates = {
+        "entities/part-00000.jsonl": b"entity",
+        "page_refs/part-00000.jsonl": b"page",
+        "selection/part-00000.jsonl": b"selection",
+        "selection/protected.jsonl": b"protected",
+    }
+    completed_shards = []
+    for relative, content in candidates.items():
+        path = structural_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        completed_shards.append(
+            {
+                "path": relative,
+                "records": 1,
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    unrelated = structural_root / "unrelated/keep.jsonl"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("keep\n", encoding="utf-8")
+    manifest_path = structural_root / "stage_manifests/structural.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"complete": True, "completed_shards": completed_shards}),
+        encoding="utf-8",
+    )
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    sampling_manifest = work_root / "sampling/manifest.json"
+    sampling_manifest.parent.mkdir(parents=True)
+    sampling_manifest.write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "compact_source_authority": {
+                    "structural_manifests": [
+                        {
+                            "path": manifest_path.resolve().as_posix(),
+                            "sha256": manifest_sha256,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transient = work_root / "model_outputs/validation.sqlite3"
+    transient.parent.mkdir(parents=True)
+    transient.write_bytes(b"temporary")
+    Path(f"{transient}-wal").write_bytes(b"wal")
+    protected = structural_root / "selection/protected.jsonl"
+    certificate = {
+        "complete": True,
+        "manifest_hashes": [
+            {
+                "path": manifest_path.resolve().as_posix(),
+                "sha256": manifest_sha256,
+            }
+        ],
+        "input_files": [{"path": protected.resolve().as_posix()}],
+    }
+    certificate["certificate_sha256"] = materializer._certificate_digest(
+        certificate
+    )
+    certificate_path = work_root / "materialization/certificate.json"
+    certificate_path.parent.mkdir(parents=True)
+    certificate_path.write_text(json.dumps(certificate), encoding="utf-8")
+    inputs = SimpleNamespace(
+        work_root=work_root,
+        structural_output_root=structural_root,
+        sampling_manifest=sampling_manifest,
+        structural_manifests=(manifest_path,),
+    )
+
+    result = materializer._cleanup_certified_intermediates(
+        inputs,
+        certificate_path,
+    )
+
+    assert result["removed_bytes"] > 0
+    assert not transient.exists()
+    assert not Path(f"{transient}-wal").exists()
+    assert not (structural_root / "entities/part-00000.jsonl").exists()
+    assert not (structural_root / "page_refs/part-00000.jsonl").exists()
+    assert not (structural_root / "selection/part-00000.jsonl").exists()
+    assert protected.is_file()
+    assert unrelated.is_file()
 
 
 def test_large_materialized_record_uses_external_json(
