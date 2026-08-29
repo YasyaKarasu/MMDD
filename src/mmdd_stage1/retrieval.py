@@ -470,6 +470,81 @@ def _channel_ranks(results: list[dict[str, Any]], score_key: str) -> dict[str, i
     return {str(result["target_id"]): rank for rank, result in enumerate(ranked, 1)}
 
 
+def _quantile(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = quantile * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def fuse_ranked_channels(
+    direct: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    *,
+    rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+) -> list[dict[str, Any]]:
+    """Fuse pre-ranked channels without repeating ANN retrieval."""
+
+    direct_ranks = {
+        str(result["target_id"]): rank for rank, result in enumerate(direct, 1)
+    }
+    evidence_ranks = {
+        str(result["target_id"]): rank for rank, result in enumerate(evidence, 1)
+    }
+    results_by_id = {
+        str(result["target_id"]): result for result in [*direct, *evidence]
+    }
+    evidence_values = [float(result["evidence_score"]) for result in evidence]
+    evidence_threshold = (
+        _quantile(evidence_values, gated_evidence_quantile)
+        if fusion_mode == "gated" and evidence_values
+        else None
+    )
+    weights = (
+        (1.0, 1.0)
+        if fusion_mode == "rrf"
+        else (direct_weight, evidence_weight)
+    )
+    fused = []
+    for target_id, result in results_by_id.items():
+        direct_rank = direct_ranks.get(target_id)
+        evidence_rank = evidence_ranks.get(target_id)
+        evidence_path_count = sum(
+            path["kind"] == "evidence" for path in result["paths"]
+        )
+        evidence_allowed = fusion_mode != "gated" or (
+            evidence_rank is not None
+            and (
+                evidence_path_count >= gated_evidence_min_paths
+                or (
+                    evidence_threshold is not None
+                    and float(result["evidence_score"]) >= evidence_threshold
+                )
+            )
+        )
+        contributions = []
+        if direct_rank is not None and weights[0] > 0:
+            contributions.append(weights[0] / (rrf_k + direct_rank))
+        if evidence_rank is not None and evidence_allowed and weights[1] > 0:
+            contributions.append(weights[1] / (rrf_k + evidence_rank))
+        if contributions:
+            result["score"] = sum(contributions)
+            fused.append(result)
+    return sorted(
+        fused,
+        key=lambda result: (-float(result["score"]), str(result["target_id"])),
+    )
+
+
 def _compact_result_paths(
     paths: list[dict[str, Any]], *, evidence_limit: int
 ) -> list[dict[str, Any]]:
@@ -502,6 +577,12 @@ def retrieve_zero_one_hop(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+    evidence_modality_weights: dict[str, float] | None = None,
     path_result_k: int = 10,
     evidence_path_k: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -521,6 +602,12 @@ def retrieve_zero_one_hop(
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
         rrf_k=rrf_k,
+        fusion_mode=fusion_mode,
+        direct_weight=direct_weight,
+        evidence_weight=evidence_weight,
+        gated_evidence_min_paths=gated_evidence_min_paths,
+        gated_evidence_quantile=gated_evidence_quantile,
+        evidence_modality_weights=evidence_modality_weights,
     )["fused"]
     results = []
     retained_evidence = evidence_top_k if evidence_path_k is None else evidence_path_k
@@ -550,6 +637,12 @@ def retrieve_zero_one_hop_detailed(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+    evidence_modality_weights: dict[str, float] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return full fused/direct/evidence rankings for evaluation."""
 
@@ -557,6 +650,16 @@ def retrieve_zero_one_hop_detailed(
         raise ValueError("Retrieval k values must be non-negative")
     if rrf_k < 0:
         raise ValueError("rrf_k must be non-negative")
+    if fusion_mode not in {"rrf", "weighted_rrf", "gated"}:
+        raise ValueError("fusion_mode must be one of: rrf, weighted_rrf, gated")
+    if direct_weight < 0 or evidence_weight < 0:
+        raise ValueError("fusion weights must be non-negative")
+    if fusion_mode != "rrf" and direct_weight == evidence_weight == 0:
+        raise ValueError("at least one fusion weight must be positive")
+    if gated_evidence_min_paths <= 0:
+        raise ValueError("gated_evidence_min_paths must be positive")
+    if not 0 <= gated_evidence_quantile <= 1:
+        raise ValueError("gated_evidence_quantile must be in [0, 1]")
     aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
     paths_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for target_id, score in indices.search(query_id, "table", direct_k):
@@ -565,19 +668,30 @@ def retrieve_zero_one_hop_detailed(
     normalized_evidence_types = dict.fromkeys(
         normalize_object_type(value) for value in evidence_types
     )
+    modality_weights = {
+        normalize_object_type(key): float(value)
+        for key, value in (evidence_modality_weights or {}).items()
+    }
+    if any(value < 0 for value in modality_weights.values()):
+        raise ValueError("evidence modality weights must be non-negative")
     evidence_hits = [
-        (evidence_id, query_evidence_score)
+        (
+            evidence_id,
+            query_evidence_score + math.log(modality_weights.get(evidence_type, 1.0)),
+            evidence_type,
+        )
         for evidence_type in normalized_evidence_types
+        if modality_weights.get(evidence_type, 1.0) > 0
         for evidence_id, query_evidence_score in indices.search(
             query_id, evidence_type, evidence_k
         )
     ]
     target_hits = indices.search_many(
-        [evidence_id for evidence_id, _score in evidence_hits],
+        [evidence_id for evidence_id, _score, _type in evidence_hits],
         "table",
         targets_per_evidence,
     )
-    for (evidence_id, query_evidence_score), evidence_targets in zip(
+    for (evidence_id, query_evidence_score, evidence_type), evidence_targets in zip(
         evidence_hits, target_hits
     ):
         for target_id, evidence_target_score in evidence_targets:
@@ -585,6 +699,7 @@ def retrieve_zero_one_hop_detailed(
                 {
                     "kind": "evidence",
                     "evidence_id": evidence_id,
+                    "evidence_type": evidence_type,
                     "path_score": query_evidence_score + evidence_target_score,
                 }
             )
@@ -601,19 +716,6 @@ def retrieve_zero_one_hop_detailed(
                 "paths": paths,
             }
         )
-    direct_ranks = _channel_ranks(results, "direct_score")
-    evidence_ranks = _channel_ranks(results, "evidence_score")
-    for result in results:
-        target_id = str(result["target_id"])
-        direct_rank = direct_ranks.get(target_id)
-        evidence_rank = evidence_ranks.get(target_id)
-        result["score"] = sum(
-            1.0 / (rrf_k + rank) for rank in (direct_rank, evidence_rank) if rank is not None
-        )
-    fused = sorted(
-        results,
-        key=lambda result: (-float(result["score"]), str(result["target_id"])),
-    )
     direct = sorted(
         (result for result in results if result["direct_score"] is not None),
         key=lambda result: (
@@ -627,5 +729,15 @@ def retrieve_zero_one_hop_detailed(
             -float(result["evidence_score"]),
             str(result["target_id"]),
         ),
+    )
+    fused = fuse_ranked_channels(
+        direct,
+        evidence,
+        rrf_k=rrf_k,
+        fusion_mode=fusion_mode,
+        direct_weight=direct_weight,
+        evidence_weight=evidence_weight,
+        gated_evidence_min_paths=gated_evidence_min_paths,
+        gated_evidence_quantile=gated_evidence_quantile,
     )
     return {"fused": fused, "direct": direct, "evidence": evidence}

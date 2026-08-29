@@ -12,7 +12,7 @@ from mmdd_progress import progress
 from torch.nn.utils.rnn import pad_sequence
 
 from .data import EdgeExample, TargetExample
-from .features import FeatureStore
+from .features import OBJECT_TYPES, FeatureStore
 from .models import StudentJoinabilityModel, TeacherJoinabilityModel
 from .objectives import (
     PathAggregator,
@@ -21,7 +21,15 @@ from .objectives import (
     optional_distillation_kl,
     optional_listwise_cross_entropy,
 )
-from .scoring import ListScores, TargetScores, score_edge_batch, score_target_batch
+from .scoring import (
+    ListScores,
+    TargetScores,
+    restrict_list_scores,
+    score_edge_batch,
+    score_edge_batch_in_batch,
+    score_target_batch,
+    score_target_direct_batch_in_batch,
+)
 
 Example = TypeVar("Example", EdgeExample, TargetExample)
 Model = TypeVar("Model", TeacherJoinabilityModel, StudentJoinabilityModel)
@@ -152,6 +160,23 @@ def sample_mixed_epoch(
 
 def _batches(examples: Sequence[Example], batch_size: int) -> list[list[Example]]:
     return [list(examples[start : start + batch_size]) for start in range(0, len(examples), batch_size)]
+
+
+def oversample_student_edges(
+    examples: Sequence[EdgeExample],
+    factors: dict[str, int],
+    rng: random.Random,
+) -> list[EdgeExample]:
+    """Repeat selected directed edge types before Student batching."""
+
+    sampled = list(examples)
+    for example in examples:
+        if example.source_type is None or example.destination_type is None:
+            continue
+        key = f"{example.source_type}_{example.destination_type}"
+        sampled.extend([example] * (factors.get(key, 1) - 1))
+    rng.shuffle(sampled)
+    return sampled
 
 
 def _list_scores(
@@ -293,6 +318,39 @@ def _optimize(loss: torch.Tensor, optimizer: torch.optim.Optimizer) -> None:
     optimizer.step()
 
 
+def student_anchor_loss(student: StudentJoinabilityModel) -> torch.Tensor:
+    """Return the scale-normalized distance from raw-retrieval geometry."""
+
+    parameter = next(student.parameters())
+    identity = torch.eye(
+        student.student_dim, device=parameter.device, dtype=parameter.dtype
+    )
+    relation_anchor = sum(
+        (relation - identity).square().sum() / (student.student_dim**2)
+        for relation in student.relations.values()
+    )
+    if student.freeze_projections:
+        return relation_anchor
+    projection_anchor = sum(
+        (student.projections[object_type].weight - initial).square().sum()
+        / (student.input_dim * student.student_dim)
+        for object_type, initial in zip(
+            OBJECT_TYPES, student.initial_projection_weights
+        )
+    )
+    return relation_anchor + projection_anchor
+
+
+def _anchor_loss(
+    student: StudentJoinabilityModel, anchor_weight: float
+) -> torch.Tensor:
+    return (
+        student_anchor_loss(student)
+        if anchor_weight > 0
+        else next(student.parameters()).new_zeros(())
+    )
+
+
 def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
@@ -370,22 +428,59 @@ def _student_edge_objective(
     device: torch.device,
     batch_size: int,
     temperature: float,
+    distillation_weight: float,
+    anchor_weight: float,
+    in_batch_negatives: bool,
+    in_batch_max_negatives: int,
 ) -> float:
     student.eval()
     losses = []
+    rng = random.Random(0)
     for batch in progress(
         _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
     ):
-        teacher_scores = _edge_teacher_scores(batch, device)
-        student_scores = score_edge_batch(student, batch, store, device)
+        teacher_scores = (
+            _edge_teacher_scores(batch, device)
+            if distillation_weight > 0
+            else None
+        )
+        if in_batch_negatives:
+            expanded_scores = score_edge_batch_in_batch(
+                student,
+                batch,
+                store,
+                device,
+                max_negatives=in_batch_max_negatives,
+                rng=rng,
+            )
+            student_scores = restrict_list_scores(
+                expanded_scores,
+                [len(example.candidate_ids) for example in batch],
+                device,
+            )
+            supervised = listwise_cross_entropy(
+                expanded_scores.logits,
+                expanded_scores.positive_indices,
+                expanded_scores.candidate_mask,
+            )
+        else:
+            student_scores = score_edge_batch(student, batch, store, device)
+            supervised = student_scores.logits.new_zeros(())
+        distillation = (
+            distillation_kl(
+                student_scores.logits,
+                teacher_scores.logits,
+                student_scores.candidate_mask,
+                temperature,
+            )
+            if teacher_scores is not None
+            else student_scores.logits.new_zeros(())
+        )
         losses.append(
             float(
-                distillation_kl(
-                    student_scores.logits,
-                    teacher_scores.logits,
-                    student_scores.candidate_mask,
-                    temperature,
-                )
+                supervised
+                + distillation_weight * distillation
+                + anchor_weight * _anchor_loss(student, anchor_weight)
             )
         )
     return _mean(losses)
@@ -415,21 +510,54 @@ def _student_path_objective(
     batch_size: int,
     temperature: float,
     distillation_weight: float,
+    anchor_weight: float,
+    in_batch_negatives: bool,
+    in_batch_max_negatives: int,
 ) -> float:
     student.eval()
     losses = []
+    rng = random.Random(0)
     for batch in progress(
         _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
     ):
-        teacher_scores = _target_teacher_scores(batch, device)
+        teacher_scores = (
+            _target_teacher_scores(batch, device)
+            if distillation_weight > 0
+            else None
+        )
         student_scores = score_target_batch(
             student, batch, store, device, aggregator
         )
-        supervised, _direct, _evidence = _path_supervised_losses(student_scores)
-        distillation, _direct_distill, _evidence_distill = (
-            _path_distillation_losses(student_scores, teacher_scores, temperature)
+        supervised, direct, evidence = _path_supervised_losses(student_scores)
+        if in_batch_negatives:
+            expanded_direct = score_target_direct_batch_in_batch(
+                student,
+                batch,
+                store,
+                device,
+                max_negatives=in_batch_max_negatives,
+                rng=rng,
+            )
+            direct = listwise_cross_entropy(
+                expanded_direct.logits,
+                expanded_direct.positive_indices,
+                expanded_direct.candidate_mask,
+            )
+            supervised = direct + evidence
+        distillation = (
+            _path_distillation_losses(
+                student_scores, teacher_scores, temperature
+            )[0]
+            if teacher_scores is not None
+            else supervised.new_zeros(())
         )
-        losses.append(float(supervised + distillation_weight * distillation))
+        losses.append(
+            float(
+                supervised
+                + distillation_weight * distillation
+                + anchor_weight * _anchor_loss(student, anchor_weight)
+            )
+        )
     return _mean(losses)
 
 
@@ -580,6 +708,11 @@ def train_student_edges(
     batch_size: int,
     seed: int,
     temperature: float,
+    distillation_weight: float = 1.0,
+    anchor_weight: float = 0.0,
+    in_batch_negatives: bool = False,
+    in_batch_max_negatives: int = 256,
+    edge_type_oversample: dict[str, int] | None = None,
     dataset_sampling_alpha: float = 0.0,
     hard_examples: Sequence[EdgeExample] = (),
     hard_fraction: float = 0.5,
@@ -592,7 +725,13 @@ def train_student_edges(
     for epoch in epoch_bar:
         student.train()
         losses = []
+        supervised_losses = []
+        distillation_losses = []
+        anchor_losses = []
         pending_losses = []
+        pending_supervised_losses = []
+        pending_distillation_losses = []
+        pending_anchor_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -600,6 +739,12 @@ def train_student_edges(
             hard_fraction=hard_fraction,
             dataset_sampling_alpha=dataset_sampling_alpha,
         )
+        if edge_type_oversample:
+            original_count = len(sampled)
+            sampled = oversample_student_edges(
+                sampled, edge_type_oversample, rng
+            )
+            source_samples["oversampled"] = len(sampled) - original_count
         batches = _batches(sampled, batch_size)
         batch_bar = progress(
             batches,
@@ -608,21 +753,71 @@ def train_student_edges(
             leave=False,
         )
         for step, batch in enumerate(batch_bar, 1):
-            teacher_scores = _edge_teacher_scores(batch, device)
-            student_scores = score_edge_batch(student, batch, store, device)
-            loss = distillation_kl(
-                student_scores.logits,
-                teacher_scores.logits,
-                student_scores.candidate_mask,
-                temperature,
+            teacher_scores = (
+                _edge_teacher_scores(batch, device)
+                if distillation_weight > 0
+                else None
             )
-            _optimize(loss, optimizer)
-            pending_losses.append(loss.detach())
+            if in_batch_negatives:
+                expanded_scores = score_edge_batch_in_batch(
+                    student,
+                    batch,
+                    store,
+                    device,
+                    max_negatives=in_batch_max_negatives,
+                    rng=rng,
+                )
+                student_scores = restrict_list_scores(
+                    expanded_scores,
+                    [len(example.candidate_ids) for example in batch],
+                    device,
+                )
+                supervised = listwise_cross_entropy(
+                    expanded_scores.logits,
+                    expanded_scores.positive_indices,
+                    expanded_scores.candidate_mask,
+                )
+            else:
+                student_scores = score_edge_batch(student, batch, store, device)
+                supervised = student_scores.logits.new_zeros(())
+            distillation = (
+                distillation_kl(
+                    student_scores.logits,
+                    teacher_scores.logits,
+                    student_scores.candidate_mask,
+                    temperature,
+                )
+                if teacher_scores is not None
+                else student_scores.logits.new_zeros(())
+            )
+            anchor = _anchor_loss(student, anchor_weight)
+            total = (
+                supervised
+                + distillation_weight * distillation
+                + anchor_weight * anchor
+            )
+            _optimize(total, optimizer)
+            pending_losses.append(total.detach())
+            pending_supervised_losses.append(supervised.detach())
+            pending_distillation_losses.append(distillation.detach())
+            pending_anchor_losses.append(anchor.detach())
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_losses, losses)
+                _flush_loss_values(pending_supervised_losses, supervised_losses)
+                _flush_loss_values(
+                    pending_distillation_losses, distillation_losses
+                )
+                _flush_loss_values(pending_anchor_losses, anchor_losses)
                 batch_bar.set_postfix(loss=f"{_mean(losses):.4f}")
         train_loss = _mean(losses)
-        values = {"loss": train_loss, "train_loss": train_loss}
+        values = {
+            "loss": train_loss,
+            "train_loss": train_loss,
+            "supervised_loss": _mean(supervised_losses),
+            "distillation_loss": _mean(distillation_losses),
+            "anchor_loss": _mean(anchor_losses),
+            "weighted_anchor_loss": anchor_weight * _mean(anchor_losses),
+        }
         if dev_examples:
             values["dev_loss"] = _student_edge_objective(
                 student,
@@ -631,6 +826,10 @@ def train_student_edges(
                 device,
                 batch_size,
                 temperature,
+                distillation_weight,
+                anchor_weight,
+                in_batch_negatives,
+                in_batch_max_negatives,
             )
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",
@@ -655,6 +854,9 @@ def train_student_paths(
     seed: int,
     temperature: float,
     distillation_weight: float,
+    anchor_weight: float = 0.0,
+    in_batch_negatives: bool = False,
+    in_batch_max_negatives: int = 256,
     dataset_sampling_alpha: float = 0.0,
     hard_examples: Sequence[TargetExample] = (),
     hard_fraction: float = 0.5,
@@ -676,6 +878,7 @@ def train_student_paths(
         evidence_supervised_losses = []
         direct_distillation_losses = []
         evidence_distillation_losses = []
+        anchor_losses = []
         pending_totals = []
         pending_supervised_losses = []
         pending_distillation_losses = []
@@ -683,6 +886,7 @@ def train_student_paths(
         pending_evidence_supervised_losses = []
         pending_direct_distillation_losses = []
         pending_evidence_distillation_losses = []
+        pending_anchor_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -698,15 +902,46 @@ def train_student_paths(
             leave=False,
         )
         for step, batch in enumerate(batch_bar, 1):
-            teacher_scores = _target_teacher_scores(batch, device)
+            teacher_scores = (
+                _target_teacher_scores(batch, device)
+                if distillation_weight > 0
+                else None
+            )
             student_scores = score_target_batch(student, batch, store, device, aggregator)
             supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
                 student_scores
             )
-            distillation, direct_distillation, evidence_distillation = (
-                _path_distillation_losses(student_scores, teacher_scores, temperature)
+            if in_batch_negatives:
+                expanded_direct = score_target_direct_batch_in_batch(
+                    student,
+                    batch,
+                    store,
+                    device,
+                    max_negatives=in_batch_max_negatives,
+                    rng=rng,
+                )
+                direct_supervised = listwise_cross_entropy(
+                    expanded_direct.logits,
+                    expanded_direct.positive_indices,
+                    expanded_direct.candidate_mask,
+                )
+                supervised = direct_supervised + evidence_supervised
+            if teacher_scores is not None:
+                distillation, direct_distillation, evidence_distillation = (
+                    _path_distillation_losses(
+                        student_scores, teacher_scores, temperature
+                    )
+                )
+            else:
+                distillation = supervised.new_zeros(())
+                direct_distillation = supervised.new_zeros(())
+                evidence_distillation = supervised.new_zeros(())
+            anchor = _anchor_loss(student, anchor_weight)
+            total = (
+                supervised
+                + distillation_weight * distillation
+                + anchor_weight * anchor
             )
-            total = supervised + distillation_weight * distillation
             _optimize(total, optimizer)
             pending_totals.append(total.detach())
             pending_supervised_losses.append(supervised.detach())
@@ -715,6 +950,7 @@ def train_student_paths(
             pending_evidence_supervised_losses.append(evidence_supervised.detach())
             pending_direct_distillation_losses.append(direct_distillation.detach())
             pending_evidence_distillation_losses.append(evidence_distillation.detach())
+            pending_anchor_losses.append(anchor.detach())
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_totals, totals)
                 _flush_loss_values(pending_supervised_losses, supervised_losses)
@@ -733,6 +969,7 @@ def train_student_paths(
                     pending_evidence_distillation_losses,
                     evidence_distillation_losses,
                 )
+                _flush_loss_values(pending_anchor_losses, anchor_losses)
                 batch_bar.set_postfix(loss=f"{_mean(totals):.4f}")
         train_loss = _mean(totals)
         values = {
@@ -744,6 +981,8 @@ def train_student_paths(
             "evidence_supervised_loss": _mean(evidence_supervised_losses),
             "direct_distillation_loss": _mean(direct_distillation_losses),
             "evidence_distillation_loss": _mean(evidence_distillation_losses),
+            "anchor_loss": _mean(anchor_losses),
+            "weighted_anchor_loss": anchor_weight * _mean(anchor_losses),
         }
         if dev_examples:
             values["dev_loss"] = _student_path_objective(
@@ -755,6 +994,9 @@ def train_student_paths(
                 batch_size,
                 temperature,
                 distillation_weight,
+                anchor_weight,
+                in_batch_negatives,
+                in_batch_max_negatives,
             )
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",

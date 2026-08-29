@@ -39,6 +39,7 @@ def load_student(path: Path, device: torch.device) -> StudentJoinabilityModel:
         config["initialization_basis"] = placeholder
     model = StudentJoinabilityModel(**config)
     model.load_state_dict(payload["state_dict"])
+    model.reset_projection_anchors()
     return model.to(device)
 
 

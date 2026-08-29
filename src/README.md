@@ -151,8 +151,10 @@ conda run -n MMDD python src/train_stage1.py student-path \
   --output checkpoints/student_path.pt
 ```
 
-Student stages automatically cache all base-train and fixed-dev Teacher logits
-before optimization. Sidecars default to `FEATURES/teacher_logits/` and are
+Student stages with a nonzero `--distillation-weight` automatically cache all
+base-train and fixed-dev Teacher logits before optimization. `--distillation-weight 0`
+is a genuinely Teacher-free supervised run and does not require
+`--teacher-checkpoint`. Sidecars default to `FEATURES/teacher_logits/` and are
 keyed by the full Teacher checkpoint SHA-256, candidate-list fingerprint, and
 path aggregation settings. `--teacher-logit-cache` selects another directory,
 and `--teacher-logit-batch-size` controls only the one-time Teacher pass. Once
@@ -225,12 +227,34 @@ and `pca_dimension_ceiling.png`. The summary selects the smallest tested
 dimension whose direct Recall@10 reaches at least 90% of the raw-embedding
 baseline; change that rule with `--raw-fraction-threshold`.
 
+The spectrum artifact can be passed directly to training. A geometry-preserving
+Student configuration freezes the shared PCA projection, uses a lower relation
+rate, and anchors the nine relation matrices to identity. In-batch negatives
+expand only the supervised lists; KD remains aligned to the original cached
+Teacher lists:
+
+```bash
+conda run -n MMDD python src/train_stage1.py student-edge \
+  --features cache/stage1_qwen8b \
+  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
+  --student-dim 1024 --student-init pca \
+  --student-pca-basis work/stage1_pca_dimension_ceiling/pca_spectrum.pt \
+  --freeze-projection --relation-learning-rate 1e-5 --anchor-weight 0.1 \
+  --distillation-weight 0 --in-batch-negatives \
+  --in-batch-max-negatives 256 --output checkpoints/student_edge.pt
+```
+
+`--edge-type-oversample text_table:2 image_table:2` can increase the share of
+evidence-to-table edges. It is off by default. Frozen projection state and the
+initial projection anchors are retained across Student checkpoints.
+
 Training records are filtered to `train`; the fixed gate records are filtered
 to `dev`. Teacher edge/path and Student edge stages select on their matching dev
 listwise objective and never build an ANN index. Every Student path epoch saves
 a candidate checkpoint, rebuilds indexes over the same complete shared corpus,
 and evaluates the fixed dev queries. Its retrieval record contains Recall@1/5/
-10/50/100 and MRR@100 for fused, direct, and evidence rankings, plus the number
+10/50/100 and MRR@100 for fused, direct, and evidence rankings, both overall
+and under `by_dataset`, plus the number
 and fraction of dev queries whose global top 10 contains a labeled positive
 evidence path. The same record includes a `raw_embedding` baseline that runs
 the identical zero/one-hop retrieval directly on the frozen normalized Qwen
@@ -238,6 +262,47 @@ embeddings, without the Student projection or relation matrices. This
 corpus-bound raw index is built once and reused across epochs and mining rounds.
 `--primary-metric` also accepts nested names such as
 `direct.recall@10` or `evidence.mrr@100`.
+Student-path evaluation records epoch 0 before the first optimizer step by
+default, and this initial checkpoint participates in best-checkpoint selection.
+If `--student-checkpoint` is omitted, path training starts directly from
+`--student-initialization`; this supports a fresh PCA baseline when edge
+training is known to damage retrieval geometry.
+Use `--no-eval-epoch-zero` only to reproduce historical runs.
+
+To retrain a Teacher on retrieval-aligned lists, first expand the original
+handcrafted lists with frozen raw-ANN neighbors:
+
+```bash
+conda run -n MMDD python src/build_stage1_retrieval_aligned_data.py \
+  --features features_qwen3_vl_embedding_8b \
+  --edge-data entitables/edge_lists.jsonl wdc/edge_lists.jsonl \
+  --target-data entitables/target_lists.jsonl wdc/target_lists.jsonl \
+  --corpus mixed_stage1_data/stage1_corpus.jsonl \
+  --raw-index-root stage1_mining/raw_embedding_index \
+  --output-dir task7_teacher_retrain/data
+```
+
+The default width is 16: one positive, up to four original handcrafted
+negatives, then raw hard negatives. New path targets receive the query's top
+raw text and image evidence. `preflight.json` reports exactly how many selected
+objects still need Teacher hidden states before training.
+
+For large missing sets, `cache_stage1_features.py --teacher-output-dir ...`
+can write disjoint Teacher-only shards on separate GPUs. Merge completed shards
+with `merge_stage1_teacher_cache.py`; the main `teacher_manifest.jsonl` is
+replaced atomically. Use `partition_stage1_teacher_work.py` with the main and
+staging manifests to repartition only unfinished objects when one GPU finishes
+early. On a shared filesystem with insufficient room for a second copy, pass
+`--move` to the merge command so each staged file is installed with an atomic
+rename and its staging space is released immediately. Audit newly selected images with
+`audit_stage1_teacher_images.py` first so corrupt or decompression-bomb inputs
+can be excluded instead of silently becoming the upstream wrapper's `NULL`
+fallback. During `teacher-path`, `--teacher-rerank` together with
+`--teacher-rerank-dev-data` and
+`--primary-metric teacher_rerank.recall@10` selects checkpoints by raw-top-100
+reranking rather than listwise dev loss alone. Use
+`--teacher-rerank-interval 2` to run that expensive gate every second epoch;
+the default remains every epoch.
 
 For an output such as `student_path.pt`, training writes:
 
@@ -266,9 +331,12 @@ scores are never combined into one training logit. The path checkpoint stores
 the evidence aggregation configuration.
 
 Online retrieval computes `direct_score` and `evidence_score` separately and
-ranks each target in both channels. Reciprocal Rank Fusion (RRF) combines the
-two ranks into the single `score` used for global top-k truncation and Recall@k
-evaluation. `--rrf-k` controls the rank constant (default 60). The channel
+ranks each target in both channels. `--fusion-mode` selects ordinary RRF,
+weighted RRF, or evidence-gated RRF. Weighted RRF uses `--direct-weight` and
+`--evidence-weight`; setting the latter to zero makes fused ranking exactly
+direct ranking while retaining discovered evidence paths for Stage 2.
+`--evidence-modality-weights text=1 image=0.3` applies optional modality priors
+inside the evidence channel. `--rrf-k` controls the rank constant (default 60). The channel
 ranks and `direct_score` are intermediate values and are not written to the
 retrieval results. Student relation queries and projected target vectors
 preserve the bilinear score exactly as an inner product for ANN indexing.

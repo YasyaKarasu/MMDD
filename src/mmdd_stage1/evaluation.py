@@ -54,6 +54,35 @@ def _channel_metrics(
     return values
 
 
+def _retrieval_metrics(
+    query_indices: Sequence[int],
+    rankings: dict[str, list[list[str]]],
+    positive_sets: Sequence[set[str]],
+    positive_evidence_hits: Sequence[bool],
+) -> dict[str, Any]:
+    selected_positives = [positive_sets[index] for index in query_indices]
+    selected_rankings = {
+        channel: [values[index] for index in query_indices]
+        for channel, values in rankings.items()
+    }
+    positive_evidence_path_queries = sum(
+        positive_evidence_hits[index] for index in query_indices
+    )
+    fused = _channel_metrics(selected_rankings["fused"], selected_positives)
+    return {
+        "queries": len(query_indices),
+        **fused,
+        "direct": _channel_metrics(selected_rankings["direct"], selected_positives),
+        "evidence": _channel_metrics(
+            selected_rankings["evidence"], selected_positives
+        ),
+        "positive_evidence_path_queries@10": positive_evidence_path_queries,
+        "positive_evidence_path_coverage@10": (
+            positive_evidence_path_queries / len(query_indices)
+        ),
+    }
+
+
 def evaluate_student_retrieval(
     examples: Sequence[TargetExample],
     indices: StudentANNIndices | RawEmbeddingANNIndices,
@@ -65,6 +94,12 @@ def evaluate_student_retrieval(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+    evidence_modality_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate fixed queries against the shared full-corpus ANN indexes."""
 
@@ -76,7 +111,7 @@ def evaluate_student_retrieval(
         "direct": [],
         "evidence": [],
     }
-    positive_evidence_path_queries = 0
+    positive_evidence_hits: list[bool] = []
     for example in progress(
         examples, desc="Retrieval evaluation", unit="query", leave=False
     ):
@@ -92,6 +127,12 @@ def evaluate_student_retrieval(
             evidence_aggregation=evidence_aggregation,
             evidence_top_k=evidence_top_k,
             rrf_k=rrf_k,
+            fusion_mode=fusion_mode,
+            direct_weight=direct_weight,
+            evidence_weight=evidence_weight,
+            gated_evidence_min_paths=gated_evidence_min_paths,
+            gated_evidence_quantile=gated_evidence_quantile,
+            evidence_modality_weights=evidence_modality_weights,
         )
         for channel in rankings:
             rankings[channel].append(
@@ -103,7 +144,7 @@ def evaluate_student_retrieval(
             for candidate in example.candidates
             if candidate.target_id in positives and candidate.evidence_ids
         }
-        if any(
+        positive_evidence_hits.append(any(
             str(item["target_id"]) in positive_evidence
             and any(
                 path["kind"] == "evidence"
@@ -112,20 +153,26 @@ def evaluate_student_retrieval(
                 for path in item["paths"]
             )
             for item in result["fused"][:10]
-        ):
-            positive_evidence_path_queries += 1
+        ))
 
-    fused = _channel_metrics(rankings["fused"], positive_sets)
-    return {
-        "queries": len(examples),
-        **fused,
-        "direct": _channel_metrics(rankings["direct"], positive_sets),
-        "evidence": _channel_metrics(rankings["evidence"], positive_sets),
-        "positive_evidence_path_queries@10": positive_evidence_path_queries,
-        "positive_evidence_path_coverage@10": (
-            positive_evidence_path_queries / len(examples)
-        ),
+    metrics = _retrieval_metrics(
+        list(range(len(examples))), rankings, positive_sets, positive_evidence_hits
+    )
+    datasets = sorted({example.dataset for example in examples})
+    metrics["by_dataset"] = {
+        dataset: _retrieval_metrics(
+            [
+                index
+                for index, example in enumerate(examples)
+                if example.dataset == dataset
+            ],
+            rankings,
+            positive_sets,
+            positive_evidence_hits,
+        )
+        for dataset in datasets
     }
+    return metrics
 
 
 def evaluate_direct_retrieval(

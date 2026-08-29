@@ -17,6 +17,19 @@ from mmdd_stage1.retrieval import (
 )
 
 
+def _modality_weight(value: str) -> tuple[str, float]:
+    modality, separator, raw_weight = value.partition("=")
+    if separator != "=" or modality not in {"text", "image"}:
+        raise argparse.ArgumentTypeError("expected text=WEIGHT or image=WEIGHT")
+    try:
+        weight = float(raw_weight)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("modality weight must be numeric") from exc
+    if weight < 0:
+        raise argparse.ArgumentTypeError("modality weight must be non-negative")
+    return modality, weight
+
+
 def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint_path = Path(args.student_checkpoint)
@@ -48,6 +61,12 @@ def run(args: argparse.Namespace) -> None:
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
         rrf_k=args.rrf_k,
+        fusion_mode=args.fusion_mode,
+        direct_weight=args.direct_weight,
+        evidence_weight=args.evidence_weight,
+        gated_evidence_min_paths=args.gated_evidence_min_paths,
+        gated_evidence_quantile=args.gated_evidence_quantile,
+        evidence_modality_weights=dict(args.evidence_modality_weights),
         path_result_k=args.path_result_k,
         evidence_path_k=args.evidence_path_k,
     )
@@ -58,8 +77,15 @@ def run(args: argparse.Namespace) -> None:
             "path_aggregation": {
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
-                "target_fusion": "rrf",
+                "target_fusion": args.fusion_mode,
                 "rrf_k": args.rrf_k,
+                "direct_weight": args.direct_weight,
+                "evidence_weight": args.evidence_weight,
+                "gated_evidence_min_paths": args.gated_evidence_min_paths,
+                "gated_evidence_quantile": args.gated_evidence_quantile,
+                "evidence_modality_weights": dict(
+                    args.evidence_modality_weights
+                ),
                 "path_result_k": args.path_result_k,
                 "evidence_path_k": (
                     evidence_top_k
@@ -112,6 +138,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--rrf-k", type=int, default=60)
+    parser.add_argument("--fusion-mode", choices=["rrf", "weighted_rrf", "gated"], default="rrf")
+    parser.add_argument("--direct-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=1.0)
+    parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
+    parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
+    parser.add_argument("--evidence-modality-weights", nargs="*", type=_modality_weight, default=[])
     return parser.parse_args()
 
 

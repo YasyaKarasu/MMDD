@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Sequence
 
 import torch
@@ -14,7 +15,9 @@ from .features import OBJECT_TYPES, ObjectFeatures, normalize_object_type
 TYPE_TO_ID = {name: index for index, name in enumerate(OBJECT_TYPES)}
 STUDENT_INITIALIZATIONS = (
     "random",
+    "identity",
     "identity_noise",
+    "orthogonal",
     "random_orthogonal",
     "pca",
 )
@@ -46,14 +49,33 @@ class LearnedQueryPooler(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             raise ValueError("Cannot pool an object with no hidden-state tokens")
-        queries = self.queries.unsqueeze(0)
+        return self.forward_batch(
+            hidden_states.unsqueeze(0),
+            torch.zeros(
+                (1, hidden_states.shape[0]),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            ),
+        ).squeeze(0)
+
+    def forward_batch(
+        self, hidden_states: torch.Tensor, padding_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Pool a padded batch of objects into learned semantic slots."""
+
+        if hidden_states.ndim != 3 or hidden_states.shape[1] == 0:
+            raise ValueError("Batched hidden states must have shape [batch, tokens, dim]")
+        if padding_mask.shape != hidden_states.shape[:2]:
+            raise ValueError("Pooler padding mask must match batch and token dimensions")
+        queries = self.queries.unsqueeze(0).expand(hidden_states.shape[0], -1, -1)
         pooled, _ = self.attention(
             query=queries,
-            key=hidden_states.unsqueeze(0),
-            value=hidden_states.unsqueeze(0),
+            key=hidden_states,
+            value=hidden_states,
+            key_padding_mask=padding_mask,
             need_weights=False,
         )
-        return self.norm(pooled + queries).squeeze(0)
+        return self.norm(pooled + queries)
 
 
 class TeacherJoinabilityModel(nn.Module):
@@ -79,6 +101,7 @@ class TeacherJoinabilityModel(nn.Module):
         self.text_latents = text_latents
         self.image_latents = image_latents
         self.dropout = dropout
+        self.compute_dtype: torch.dtype | None = None
 
         self.adapters = nn.ModuleDict(
             {object_type: nn.Linear(input_dim, model_dim) for object_type in OBJECT_TYPES}
@@ -131,6 +154,19 @@ class TeacherJoinabilityModel(nn.Module):
             "dropout": self.dropout,
         }
 
+    def set_compute_dtype(self, dtype: torch.dtype | None) -> None:
+        """Select optional autocast compute without changing checkpoint weights."""
+
+        if dtype not in {None, torch.bfloat16}:
+            raise ValueError("Teacher compute dtype must be None or torch.bfloat16")
+        self.compute_dtype = dtype
+
+    def _autocast_context(self):
+        device_type = self.rel_token.device.type
+        if self.compute_dtype is None or device_type != "cuda":
+            return nullcontext()
+        return torch.autocast(device_type, dtype=self.compute_dtype)
+
     def compress(self, features: ObjectFeatures) -> torch.Tensor:
         object_type = normalize_object_type(features.object_type)
         if features.hidden_states is None:
@@ -145,6 +181,83 @@ class TeacherJoinabilityModel(nn.Module):
             return tokens + self.table_token_embeddings(token_kinds)
         hidden = self.adapters[object_type](features.hidden_states)
         return self.poolers[object_type](hidden)
+
+    @staticmethod
+    def _compression_buckets(
+        features: Sequence[ObjectFeatures], max_padded_tokens: int = 8192
+    ) -> list[list[ObjectFeatures]]:
+        """Group similarly sized objects without creating oversized padded tensors."""
+
+        ordered = sorted(
+            features,
+            key=lambda item: int(item.hidden_states.shape[0]),
+        )
+        buckets: list[list[ObjectFeatures]] = []
+        current: list[ObjectFeatures] = []
+        current_max = 0
+        for item in ordered:
+            length = int(item.hidden_states.shape[0])
+            next_max = max(current_max, length)
+            if current and next_max * (len(current) + 1) > max_padded_tokens:
+                buckets.append(current)
+                current = []
+                current_max = 0
+            current.append(item)
+            current_max = max(current_max, length)
+        if current:
+            buckets.append(current)
+        return buckets
+
+    def compress_many(
+        self,
+        features: Sequence[ObjectFeatures],
+        compression_cache: dict[str, torch.Tensor],
+    ) -> None:
+        """Compress missing objects in modality and length batches."""
+
+        grouped: dict[str, list[ObjectFeatures]] = defaultdict(list)
+        for item in features:
+            if item.hidden_states is None:
+                raise ValueError(f"{item.object_id}: Teacher requires hidden_states")
+            grouped[normalize_object_type(item.object_type)].append(item)
+
+        table_features = grouped.pop("table", [])
+        if table_features:
+            pooled = [
+                structural_table_pool(item.hidden_states, item.token_groups)
+                for item in table_features
+            ]
+            lengths = [tokens.shape[0] for tokens in pooled]
+            projected = self.adapters["table"](
+                pad_sequence(pooled, batch_first=True)
+            )
+            token_kinds = torch.ones(
+                projected.shape[:2], dtype=torch.long, device=projected.device
+            )
+            token_kinds[:, 0] = 0
+            projected = projected + self.table_token_embeddings(token_kinds)
+            for item, tokens, length in zip(table_features, projected, lengths):
+                compression_cache[item.object_id] = tokens[:length]
+
+        for object_type, items in grouped.items():
+            for bucket in self._compression_buckets(items):
+                lengths = torch.tensor(
+                    [item.hidden_states.shape[0] for item in bucket],
+                    device=bucket[0].hidden_states.device,
+                )
+                hidden = pad_sequence(
+                    [item.hidden_states for item in bucket], batch_first=True
+                )
+                hidden = self.adapters[object_type](hidden)
+                positions = torch.arange(
+                    hidden.shape[1], device=hidden.device
+                ).unsqueeze(0)
+                padding_mask = positions >= lengths.unsqueeze(1)
+                pooled = self.poolers[object_type].forward_batch(
+                    hidden, padding_mask
+                )
+                for item, tokens in zip(bucket, pooled):
+                    compression_cache[item.object_id] = tokens
 
     def score_compressed_pairs(
         self,
@@ -163,28 +276,63 @@ class TeacherJoinabilityModel(nn.Module):
         ):
             raise ValueError("Pair inputs must have equal lengths")
 
-        sequences = []
-        for source, source_type, destination, destination_type in zip(
-            source_tokens, source_types, destination_tokens, destination_types
-        ):
-            source_type = normalize_object_type(source_type)
-            destination_type = normalize_object_type(destination_type)
-            source_id = TYPE_TO_ID[source_type]
-            destination_id = TYPE_TO_ID[destination_type]
-            rel = self.rel_token + self.type_pair_embeddings.weight[source_id * len(OBJECT_TYPES) + destination_id]
-            source_with_identity = source + self.modality_embeddings.weight[source_id] + self.role_embeddings.weight[0]
-            destination_with_identity = (
-                destination + self.modality_embeddings.weight[destination_id] + self.role_embeddings.weight[1]
-            )
-            sequences.append(
-                torch.cat(
-                    [rel.unsqueeze(0), source_with_identity, self.sep_token.unsqueeze(0), destination_with_identity],
-                    dim=0,
-                )
-            )
+        device = source_tokens[0].device
+        batch_size = len(source_tokens)
+        source_lengths = torch.tensor(
+            [tokens.shape[0] for tokens in source_tokens], device=device
+        )
+        destination_lengths = torch.tensor(
+            [tokens.shape[0] for tokens in destination_tokens], device=device
+        )
+        source_ids = torch.tensor(
+            [TYPE_TO_ID[normalize_object_type(value)] for value in source_types],
+            device=device,
+        )
+        destination_ids = torch.tensor(
+            [
+                TYPE_TO_ID[normalize_object_type(value)]
+                for value in destination_types
+            ],
+            device=device,
+        )
+        lengths = source_lengths + destination_lengths + 2
+        input_dtype = self.compute_dtype or self.rel_token.dtype
+        inputs = torch.zeros(
+            (batch_size, int(lengths.max()), self.model_dim),
+            dtype=input_dtype,
+            device=device,
+        )
+        rows = torch.arange(batch_size, device=device)
+        pair_ids = source_ids * len(OBJECT_TYPES) + destination_ids
+        inputs[:, 0] = (
+            self.rel_token + self.type_pair_embeddings(pair_ids)
+        ).to(input_dtype)
 
-        lengths = torch.tensor([sequence.shape[0] for sequence in sequences], device=sequences[0].device)
-        inputs = pad_sequence(sequences, batch_first=True)
+        padded_sources = pad_sequence(source_tokens, batch_first=True).to(input_dtype)
+        padded_sources = padded_sources + (
+            self.modality_embeddings(source_ids) + self.role_embeddings.weight[0]
+        ).to(input_dtype).unsqueeze(1)
+        inputs[:, 1 : 1 + padded_sources.shape[1]] = padded_sources
+        inputs[rows, source_lengths + 1] = self.sep_token.to(input_dtype)
+
+        padded_destinations = pad_sequence(
+            destination_tokens, batch_first=True
+        ).to(input_dtype)
+        padded_destinations = padded_destinations + (
+            self.modality_embeddings(destination_ids)
+            + self.role_embeddings.weight[1]
+        ).to(input_dtype).unsqueeze(1)
+        destination_offsets = torch.arange(
+            padded_destinations.shape[1], device=device
+        ).unsqueeze(0)
+        destination_positions = source_lengths.unsqueeze(1) + 2 + destination_offsets
+        destination_mask = destination_offsets < destination_lengths.unsqueeze(1)
+        destination_rows = rows.unsqueeze(1).expand_as(destination_positions)
+        inputs[
+            destination_rows[destination_mask],
+            destination_positions[destination_mask],
+        ] = padded_destinations[destination_mask]
+
         positions = torch.arange(inputs.shape[1], device=inputs.device).unsqueeze(0)
         padding_mask = positions >= lengths.unsqueeze(1)
         encoded = self.relation_transformer(inputs, src_key_padding_mask=padding_mask)
@@ -199,16 +347,24 @@ class TeacherJoinabilityModel(nn.Module):
     ) -> torch.Tensor:
         if len(sources) != len(destinations):
             raise ValueError("Pair inputs must have equal lengths")
+        if not sources:
+            return self.rel_token.new_empty(0)
         compressed = compression_cache if compression_cache is not None else {}
+        missing = []
+        seen = set(compressed)
         for features in (*sources, *destinations):
-            if features.object_id not in compressed:
-                compressed[features.object_id] = self.compress(features)
-        return self.score_compressed_pairs(
-            [compressed[features.object_id] for features in sources],
-            [features.object_type for features in sources],
-            [compressed[features.object_id] for features in destinations],
-            [features.object_type for features in destinations],
-        )
+            if features.object_id not in seen:
+                missing.append(features)
+                seen.add(features.object_id)
+        with self._autocast_context():
+            self.compress_many(missing, compressed)
+            scores = self.score_compressed_pairs(
+                [compressed[features.object_id] for features in sources],
+                [features.object_type for features in sources],
+                [compressed[features.object_id] for features in destinations],
+                [features.object_type for features in destinations],
+            )
+        return scores.float()
 
 
 class StudentJoinabilityModel(nn.Module):
@@ -221,6 +377,7 @@ class StudentJoinabilityModel(nn.Module):
         initialization: str = "random",
         initialization_noise_std: float = 0.01,
         initialization_basis: torch.Tensor | None = None,
+        freeze_projections: bool = False,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or student_dim <= 0:
@@ -231,9 +388,11 @@ class StudentJoinabilityModel(nn.Module):
             )
         if initialization_noise_std < 0:
             raise ValueError("initialization_noise_std must be non-negative")
-        if initialization == "identity_noise" and student_dim != input_dim:
-            raise ValueError("identity_noise initialization requires student_dim == input_dim")
-        if initialization in {"random_orthogonal", "pca"} and student_dim > input_dim:
+        if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
+            raise ValueError(
+                f"{initialization} initialization requires student_dim == input_dim"
+            )
+        if initialization in {"orthogonal", "random_orthogonal", "pca"} and student_dim > input_dim:
             raise ValueError(
                 f"{initialization} initialization requires student_dim <= input_dim"
             )
@@ -258,20 +417,22 @@ class StudentJoinabilityModel(nn.Module):
         self.student_dim = student_dim
         self.initialization = initialization
         self.initialization_noise_std = initialization_noise_std
+        self.freeze_projections = bool(freeze_projections)
         self.projections = nn.ModuleDict(
             {object_type: nn.Linear(input_dim, student_dim, bias=False) for object_type in OBJECT_TYPES}
         )
 
-        if initialization == "identity_noise":
+        if initialization in {"identity", "identity_noise"}:
             with torch.no_grad():
                 for projection in self.projections.values():
                     nn.init.eye_(projection.weight)
-                    projection.weight.add_(
-                        initialization_noise_std
-                        * torch.randn_like(projection.weight)
-                    )
-        elif initialization in {"random_orthogonal", "pca"}:
-            if initialization == "random_orthogonal":
+                    if initialization == "identity_noise":
+                        projection.weight.add_(
+                            initialization_noise_std
+                            * torch.randn_like(projection.weight)
+                        )
+        elif initialization in {"orthogonal", "random_orthogonal", "pca"}:
+            if initialization in {"orthogonal", "random_orthogonal"}:
                 basis, _ = torch.linalg.qr(
                     torch.randn(input_dim, student_dim), mode="reduced"
                 )
@@ -283,11 +444,25 @@ class StudentJoinabilityModel(nn.Module):
                 for projection in self.projections.values():
                     projection.weight.copy_(projection_weight)
 
+        self.register_buffer(
+            "initial_projection_weights",
+            torch.stack(
+                [self.projections[object_type].weight.detach().clone() for object_type in OBJECT_TYPES]
+            ),
+            persistent=False,
+        )
+        self.set_projection_frozen(self.freeze_projections)
+
         self.relations = nn.ParameterDict()
         for source_type in OBJECT_TYPES:
             for destination_type in OBJECT_TYPES:
                 relation = torch.eye(student_dim)
-                if initialization not in {"random_orthogonal", "pca"}:
+                if initialization not in {
+                    "identity",
+                    "orthogonal",
+                    "random_orthogonal",
+                    "pca",
+                }:
                     relation = relation + 0.01 * torch.randn(student_dim, student_dim)
                 self.relations[self.relation_key(source_type, destination_type)] = nn.Parameter(relation)
 
@@ -295,13 +470,31 @@ class StudentJoinabilityModel(nn.Module):
     def relation_key(source_type: str, destination_type: str) -> str:
         return f"{normalize_object_type(source_type)}_to_{normalize_object_type(destination_type)}"
 
-    def config(self) -> dict[str, int | float | str]:
+    def config(self) -> dict[str, int | float | str | bool]:
         return {
             "input_dim": self.input_dim,
             "student_dim": self.student_dim,
             "initialization": self.initialization,
             "initialization_noise_std": self.initialization_noise_std,
+            "freeze_projections": self.freeze_projections,
         }
+
+    def set_projection_frozen(self, frozen: bool) -> None:
+        """Freeze or unfreeze the object-type projections explicitly."""
+
+        self.freeze_projections = bool(frozen)
+        for projection in self.projections.values():
+            projection.weight.requires_grad_(not self.freeze_projections)
+
+    @torch.no_grad()
+    def reset_projection_anchors(self) -> None:
+        """Anchor projection regularization to the model's current starting point."""
+
+        self.initial_projection_weights.copy_(
+            torch.stack(
+                [self.projections[object_type].weight for object_type in OBJECT_TYPES]
+            )
+        )
 
     def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
         return self.projections[normalize_object_type(object_type)](embedding)

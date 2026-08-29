@@ -74,14 +74,18 @@ class ObjectFeatures:
                 raise ValueError(f"{self.object_id}: row_embeddings must have shape [rows, D]")
 
     def for_scoring(
-        self, device: torch.device, *, include_hidden: bool
+        self,
+        device: torch.device,
+        *,
+        include_hidden: bool,
+        hidden_dtype: torch.dtype | None = torch.float32,
     ) -> ObjectFeatures:
         hidden = self.hidden_states
         groups = self.token_groups
         if include_hidden:
             if hidden is None:
                 raise ValueError(f"{self.object_id}: Teacher training requires hidden_states")
-            hidden = hidden.to(device=device, dtype=torch.float32)
+            hidden = hidden.to(device=device, dtype=hidden_dtype)
             groups = groups.to(device=device, dtype=torch.long) if groups is not None else None
         else:
             hidden = None
@@ -112,7 +116,7 @@ def _feature_from_payload(object_id: str, object_type: str, payload: Mapping[str
         object_id=object_id,
         object_type=object_type,
         embedding=embedding.detach().cpu().float(),
-        hidden_states=hidden_states.detach().cpu().float() if hidden_states is not None else None,
+        hidden_states=hidden_states.detach().cpu() if hidden_states is not None else None,
         token_groups=token_groups.detach().cpu().long() if token_groups is not None else None,
         row_embeddings=row_embeddings.detach().cpu().float() if row_embeddings is not None else None,
     )
@@ -132,21 +136,39 @@ class FeatureStore:
         index: Mapping[str, tuple[str, Path]] | None = None,
         teacher_index: Mapping[str, Path] | None = None,
         cache_size: int = 128,
+        cache_bytes: int | None = None,
     ) -> None:
         self._eager = dict(eager_features or {})
         self._index = dict(index or {})
         self._teacher_index = dict(teacher_index or {})
         self._cache_size = max(0, cache_size)
+        self._cache_byte_limit = (
+            max(0, cache_bytes) if cache_bytes is not None else None
+        )
         self._cache: OrderedDict[tuple[str, bool], ObjectFeatures] = OrderedDict()
+        self._cache_bytes = 0
+        self._hot_keys: set[tuple[str, bool]] = set()
+        self._hot_cache: dict[tuple[str, bool], ObjectFeatures] = {}
+        self._hot_cache_bytes = 0
+        self._hot_cache_estimated_bytes = 0
+        self._hot_cache_access_coverage = 0.0
         self._preloaded_features: dict[str, ObjectFeatures] = {}
         self._preloaded_embeddings: torch.Tensor | None = None
         if not self._eager and not self._index:
             raise ValueError("Feature store is empty")
 
     @classmethod
-    def from_path(cls, path: Path, *, cache_size: int = 128) -> FeatureStore:
+    def from_path(
+        cls,
+        path: Path,
+        *,
+        cache_size: int = 128,
+        cache_bytes: int | None = None,
+    ) -> FeatureStore:
         if path.is_dir():
-            return cls._from_directory(path, cache_size=cache_size)
+            return cls._from_directory(
+                path, cache_size=cache_size, cache_bytes=cache_bytes
+            )
         payload = _load_tensor_file(path)
         if not isinstance(payload, Mapping):
             raise ValueError(f"{path}: expected a mapping of object features")
@@ -161,10 +183,16 @@ class FeatureStore:
             if not isinstance(object_type, str):
                 raise ValueError(f"{path}: object {object_id!r} has no object_type")
             features[str(object_id)] = _feature_from_payload(str(object_id), object_type, record)
-        return cls(features)
+        return cls(features, cache_bytes=cache_bytes)
 
     @classmethod
-    def _from_directory(cls, root: Path, *, cache_size: int) -> FeatureStore:
+    def _from_directory(
+        cls,
+        root: Path,
+        *,
+        cache_size: int,
+        cache_bytes: int | None,
+    ) -> FeatureStore:
         manifest = root / "manifest.jsonl"
         if not manifest.is_file():
             raise FileNotFoundError(f"Missing feature manifest: {manifest}")
@@ -216,11 +244,144 @@ class FeatureStore:
                             f"{teacher_manifest}:{line_number}: duplicate object_id {object_id!r}"
                         )
                     teacher_index[object_id] = feature_path
-        return cls(index=index, teacher_index=teacher_index, cache_size=cache_size)
+        return cls(
+            index=index,
+            teacher_index=teacher_index,
+            cache_size=cache_size,
+            cache_bytes=cache_bytes,
+        )
+
+    @staticmethod
+    def _feature_bytes(features: ObjectFeatures) -> int:
+        tensors = (
+            features.embedding,
+            features.hidden_states,
+            features.token_groups,
+            features.row_embeddings,
+        )
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in tensors
+            if tensor is not None
+        )
+
+    def estimated_feature_bytes(
+        self, object_id: str, *, include_hidden: bool
+    ) -> int:
+        """Estimate cached bytes without loading an object's tensors."""
+
+        if object_id in self._eager:
+            value = self._eager[object_id]
+            if not include_hidden and value.hidden_states is not None:
+                value = ObjectFeatures(
+                    object_id=value.object_id,
+                    object_type=value.object_type,
+                    embedding=value.embedding,
+                    row_embeddings=value.row_embeddings,
+                )
+            return self._feature_bytes(value)
+        try:
+            _object_type, base_path = self._index[object_id]
+        except KeyError as exc:
+            raise KeyError(f"Feature cache has no object {object_id!r}") from exc
+        size = base_path.stat().st_size
+        if include_hidden and object_id in self._teacher_index:
+            size += self._teacher_index[object_id].stat().st_size
+        return size
+
+    def configure_hot_cache(
+        self,
+        access_weights: Mapping[str, float],
+        *,
+        byte_budget: int | None = None,
+        object_budget: int | None = None,
+        include_hidden: bool,
+    ) -> dict[str, int | float]:
+        """Reserve a lazy frequency-aware cache within explicit budgets."""
+
+        if byte_budget is not None and byte_budget < 0:
+            raise ValueError("Hot-cache byte budget must be non-negative")
+        if object_budget is not None and object_budget < 0:
+            raise ValueError("Hot-cache object budget must be non-negative")
+        if byte_budget is None and object_budget is None:
+            raise ValueError("Hot cache requires a byte or object budget")
+        if self._hot_cache:
+            raise ValueError("Hot cache must be configured before it is populated")
+        if (
+            self._eager
+            or byte_budget == 0
+            or object_budget == 0
+        ):
+            return {
+                "planned_objects": 0,
+                "estimated_bytes": 0,
+                "access_coverage": 0.0,
+            }
+        candidates = []
+        total_weight = 0.0
+        for object_id, raw_weight in access_weights.items():
+            weight = float(raw_weight)
+            if weight <= 0 or object_id not in self._index:
+                continue
+            size = (
+                self.estimated_feature_bytes(
+                    object_id, include_hidden=include_hidden
+                )
+                if byte_budget is not None
+                else 0
+            )
+            priority = weight / max(size, 1) if byte_budget is not None else weight
+            candidates.append((priority, weight, object_id, size))
+            total_weight += weight
+        candidates.sort(key=lambda value: (-value[0], -value[1], value[2]))
+        selected = set()
+        estimated_bytes = 0
+        selected_weight = 0.0
+        for _density, weight, object_id, size in candidates:
+            if object_budget is not None and len(selected) >= object_budget:
+                break
+            if byte_budget is not None and estimated_bytes + size > byte_budget:
+                continue
+            selected.add((object_id, include_hidden))
+            estimated_bytes += size
+            selected_weight += weight
+        self._hot_keys = selected
+        self._hot_cache_estimated_bytes = estimated_bytes
+        self._hot_cache_access_coverage = (
+            selected_weight / total_weight if total_weight else 0.0
+        )
+        return {
+            "planned_objects": len(selected),
+            "estimated_bytes": estimated_bytes,
+            "access_coverage": self._hot_cache_access_coverage,
+        }
+
+    def cache_info(self) -> dict[str, int | float | None]:
+        return {
+            "lru_objects": len(self._cache),
+            "lru_bytes": self._cache_bytes,
+            "lru_object_limit": self._cache_size,
+            "lru_byte_limit": self._cache_byte_limit,
+            "hot_objects": len(self._hot_cache),
+            "hot_bytes": self._hot_cache_bytes,
+            "planned_hot_objects": len(self._hot_keys),
+            "planned_hot_estimated_bytes": self._hot_cache_estimated_bytes,
+            "planned_hot_access_coverage": self._hot_cache_access_coverage,
+        }
 
     def object_ids(self) -> Iterable[str]:
         yield from self._eager
         yield from self._index
+
+    def object_type(self, object_id: str) -> str:
+        """Return an object's normalized type without loading its tensors."""
+
+        if object_id in self._eager:
+            return self._eager[object_id].object_type
+        try:
+            return self._index[object_id][0]
+        except KeyError as exc:
+            raise KeyError(f"Feature cache has no object {object_id!r}") from exc
 
     def preload_embeddings(self, object_ids: Iterable[str]) -> int:
         """Load the referenced raw embeddings into one contiguous CPU tensor."""
@@ -256,6 +417,7 @@ class FeatureStore:
         self._preloaded_features = preloaded
         self._preloaded_embeddings = embeddings
         self._cache.clear()
+        self._cache_bytes = 0
         return embeddings
 
     def embedding_features(self, object_id: str) -> ObjectFeatures:
@@ -288,6 +450,15 @@ class FeatureStore:
             hidden = self.get(first_id, include_hidden=True).hidden_states
         return int(hidden.shape[1]) if hidden is not None else None
 
+    def has_teacher_features(self, object_id: str) -> bool:
+        """Return whether an object has cached hidden states without loading them."""
+
+        if object_id in self._eager:
+            return self._eager[object_id].hidden_states is not None
+        if self._teacher_index:
+            return object_id in self._teacher_index
+        return self.get(object_id, include_hidden=True).hidden_states is not None
+
     def get(self, object_id: str, *, include_hidden: bool = True) -> ObjectFeatures:
         if object_id in self._eager:
             value = self._eager[object_id]
@@ -300,6 +471,8 @@ class FeatureStore:
                 row_embeddings=value.row_embeddings,
             )
         cache_key = (object_id, include_hidden)
+        if cache_key in self._hot_cache:
+            return self._hot_cache[cache_key]
         if cache_key in self._cache:
             value = self._cache.pop(cache_key)
             self._cache[cache_key] = value
@@ -331,8 +504,20 @@ class FeatureStore:
                 if key not in {"hidden_states", "token_groups"}
             }
         feature = _feature_from_payload(object_id, object_type, payload)
-        if self._cache_size:
+        feature_bytes = self._feature_bytes(feature)
+        if cache_key in self._hot_keys:
+            self._hot_cache[cache_key] = feature
+            self._hot_cache_bytes += feature_bytes
+        elif self._cache_size or self._cache_byte_limit:
             self._cache[cache_key] = feature
-            while len(self._cache) > self._cache_size:
-                self._cache.popitem(last=False)
+            self._cache_bytes += feature_bytes
+            while self._cache and (
+                (self._cache_size and len(self._cache) > self._cache_size)
+                or (
+                    self._cache_byte_limit is not None
+                    and self._cache_bytes > self._cache_byte_limit
+                )
+            ):
+                _evicted_key, evicted = self._cache.popitem(last=False)
+                self._cache_bytes -= self._feature_bytes(evicted)
         return feature

@@ -80,12 +80,32 @@
 3. 按 teacher 分数重排,计算重排后的 `R@10`/`R@100`/`mrr@100`(overall + 分数据集),与 raw direct(36.84%)对照。GT 不在 top-100 内的查询按 miss 计,口径与 raw 相同。
 4. 顺带输出:teacher 分数与 raw 内积分数在候选上的 Spearman 相关(判断 teacher 学到的是不是原始相似度的复读)。
 
-**判读**:
-- Teacher 重排 R@10 明显高于 36.84% → Teacher 有真实细粒度信号:student 修好后保留 KD;可考虑把 Teacher 用作在线 rerank 层。
-- Teacher 重排 ≈ raw(±2pt)→ Teacher 无增量价值:移除 KD 与 teacher-logits 管线,student 走纯监督 + in-batch(Task 3),Teacher 重训降为远期可选项。
-- Teacher 重排 < raw → Teacher 主动有害,且 Task 6 的 mining 标注不可信:冻结 Task 6,Teacher 必须用检索对齐列表(raw top-k 负样本)重训后再进入任何蒸馏/打分环节。
+**判读**(注意:本任务评的是**当前 checkpoint**,不是 teacher 范式的裁决;它同时为 Task 7 重训立对照基线):
+- Teacher 重排 R@10 明显高于 36.84% → 当前 Teacher 已有真实细粒度信号:保留 KD,Task 7 仍值得做(重训预期进一步拉开差距);可考虑把 Teacher 用作在线 rerank 层。
+- Teacher 重排 ≈ raw(±2pt)或更差 → 说明窄列表训练废掉了它的判别力(与 student 同源的病):**KD 在 Task 3 期间暂停(distillation-weight=0),转入 Task 7 重训 Teacher**;Task 6 冻结(mining 标注依赖 teacher 打分,当前不可信)。
+- 无论哪支,记录 teacher-vs-raw 的 Spearman 相关:相关性极高(>0.95)说明 teacher 只学会复读原始相似度,是 Task 7 要重点打破的现象。
 
-**验收**:诊断报告落盘 `work/stage1_optimization_20260828/task2b_teacher_rerank/`(JSON + RESULTS.md 摘要),明确给出上面三分支中的哪一支。
+**验收**:诊断报告落盘 `work/stage1_optimization_20260828/task2b_teacher_rerank/`(JSON + RESULTS.md 摘要),明确给出上面分支之一,并把重排 R@10 记为 Task 7 的 baseline。
+
+---
+
+## Task 7:Teacher 重训——检索对齐的列表 + 重排口径验收(Task 2b 落入"≈ raw 或更差"分支时启动;可与 Task 4/5 并行)
+
+**理由**:Teacher 与 student 的失败同源——modality adapter 随机初始化 + 每列表仅 2–5 个手工负样本,训练分布与在线要判别的分布(raw/student top-k 高分混淆项)脱节,epoch 2 即过拟合。但与 student 不同,**Teacher 不需要保持全局 ANN 几何,只需要列表内判别力**,所以"换成检索对齐的候选列表"这一个改动对 teacher 恰好是对症的。Teacher 的 cross-object token interaction 是 bilinear student 表达不出来的能力(schema 对齐、E→T 桥接判断),这是整条 Teacher-Student 蒸馏叙事成立的前提:必须做出 `raw < student(蒸馏后) ≤ teacher(重排)` 的链条,论文里"fine-grained → decomposable"的核心主张才有实验支撑。重训后的 teacher 同时修复 Task 6 的 mining 标注可信度,并可作为二阶段前的在线 rerank 层。
+
+**实现**:
+1. **重构 teacher 训练列表**(新脚本或扩展 `src/build_stage1_training_data.py`):
+   - edge 列表:每个正例配 **raw ANN top-k 中的高分非正例** 作为负样本(direct 通道从 raw table 索引取,evidence 通道从对应模态索引取),列表宽度提升到 16–32;保留原有 4 类手工负样本作为补充(各占少数配额),防止分布过窄。
+   - 负样本取样自 `RawEmbeddingANNIndices`(零训练、无循环依赖;不要用任何 student 索引,student 此时可能仍在迭代)。
+   - path/target 列表同理:candidate targets 从 raw direct top-k 采样,candidate evidence 从 raw Q→E top-k 采样。
+2. **训练配置**:沿用 `train_stage1.py` teacher-edge → teacher-path 两阶段;dropout 维持 0.1,lr 可降至 5e-5,早停 patience 3;`--dataset-sampling-alpha 0` 不变。
+3. **验收口径改为重排**:teacher-path 的 epoch gate 除 dev loss 外,新增每 epoch(或每 2 epoch)跑一次 Task 2b 的 rerank 评测(raw top-100 重排 R@10),以它为 primary metric 选 checkpoint——这与"student 用 recall@10 选 checkpoint"对称,杜绝"dev loss 好但检索差"的重演。
+4. 重训完成后:重新生成 teacher logits 缓存(旧缓存因 checkpoint sha 变化自动失效,属预期),Task 3 的 KD 用新 teacher 重新开启(`distillation-weight` 从 0.1 起步对比 0 与 1.0),Task 6 解除冻结。
+
+**验收**:
+- 重排口径:重训 teacher 的 raw-top-100 重排 `R@10` **> 36.84% + 3pt**(即 ≥ 40%),且分数据集(EntiTables/WDC)均不低于各自 raw direct。
+- E→T 专项:对 dev 的 (evidence, target) 对做同样的重排评测,验证 teacher 在第二跳上超过 raw(这是 evidence 通道天花板 43.5% 能否突破的关键)。
+- 蒸馏闭环:Task 3 + 新 teacher KD 的 student 相比 KD=0 的 student 有可测的提升(这是论文的核心 ablation 数字)。
 
 ---
 
@@ -148,8 +168,11 @@ Task 0(插桩)
   → Task 1(冻结 P + 锚定,4 组 μ)‖ Task 2b(teacher rerank 诊断,零训练,可并行先跑)
       ├─ 有 μ 不跌破 epoch-0 → Task 2(KD 消融)→ Task 3(in-batch)
       └─ 全部跌破 epoch-0   → Task 2(KD 消融)→ Task 3(in-batch,优先级提升)
-  → Task 2b 判读:teacher ≈ raw 或更差 → Task 3 起全程 KD=0;teacher < raw 时冻结 Task 6
-  → Task 3 达到 >36.84% → Task 4(融合)→ Task 5(evidence)→ Task 6(mining,需 Task 2b 未冻结)
+  → Task 2b 判读:
+      ├─ 当前 teacher 重排 > raw → 保留 KD,Task 7 仍做(拉开差距)
+      └─ ≈ raw 或更差 → Task 3 期间 KD=0;启动 Task 7(teacher 重训);冻结 Task 6
+  → Task 3 达到 >36.84% → Task 4(融合)→ Task 5(evidence)
+  → Task 7 验收通过 → Task 3 复跑一次开 KD(蒸馏 ablation)→ 解除 Task 6 冻结 → Task 6(mining)
   → Task 3 未达标但 ≥35% → 仍做 Task 4/5(整体收益),Task 6 暂缓,另行分析差距
 ```
 

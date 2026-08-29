@@ -133,15 +133,18 @@ def load_pca_projection(
         or payload.get("format_version") != PCA_FORMAT_VERSION
     ):
         raise ValueError(f"{path}: unsupported PCA projection artifact")
-    if (
-        payload.get("input_dim") != input_dim
-        or payload.get("student_dim") != student_dim
+    is_spectrum = payload.get("artifact_kind") == "stage1_pca_spectrum"
+    if payload.get("input_dim") != input_dim or (
+        is_spectrum
+        and int(payload.get("max_components", 0)) < student_dim
+    ) or (
+        not is_spectrum and payload.get("student_dim") != student_dim
     ):
         raise ValueError(f"{path}: PCA projection dimensions do not match the Student")
     projection = payload.get("projection")
     if not isinstance(projection, torch.Tensor):
         raise ValueError(f"{path}: PCA artifact has no projection tensor")
-    projection = projection.float()
+    projection = projection[:student_dim].float() if is_spectrum else projection.float()
     if (
         projection.shape != (student_dim, input_dim)
         or not torch.isfinite(projection).all()

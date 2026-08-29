@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from mmdd_stage1.teacher_logits import (
     load_teacher_logits,
     score_and_cache_teacher_logits,
 )
+from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
 from mmdd_stage1.training import (
     checkpoint,
     train_student_edges,
@@ -45,6 +47,120 @@ from mmdd_stage1.training import (
 )
 
 STAGES = ("teacher-edge", "teacher-path", "student-edge", "student-path")
+
+
+def _feature_cache_size(stage: str, value: int | None) -> int:
+    if value is not None:
+        return value
+    return 60_000 if stage.startswith("student") else 8_000
+
+
+def _parse_modality_weight(value: str) -> tuple[str, float]:
+    modality, separator, raw_weight = value.partition("=")
+    if separator != "=" or modality not in {"text", "image"}:
+        raise argparse.ArgumentTypeError(
+            "modality weights must use text=VALUE or image=VALUE"
+        )
+    try:
+        weight = float(raw_weight)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("modality weight must be numeric") from exc
+    if weight < 0:
+        raise argparse.ArgumentTypeError("modality weight must be non-negative")
+    return modality, weight
+
+
+def _parse_edge_oversample(value: str) -> tuple[str, int]:
+    type_pair, separator, raw_factor = value.partition(":")
+    parts = type_pair.split("_")
+    if separator != ":" or len(parts) != 2 or any(
+        part not in {"table", "text", "image"} for part in parts
+    ):
+        raise argparse.ArgumentTypeError(
+            "edge oversampling must use SOURCE_DESTINATION:FACTOR"
+        )
+    try:
+        factor = int(raw_factor)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("oversampling factor must be an integer") from exc
+    if factor < 1:
+        raise argparse.ArgumentTypeError("oversampling factor must be at least 1")
+    return type_pair, factor
+
+
+def _student_optimizer(
+    student: StudentJoinabilityModel,
+    *,
+    projection_learning_rate: float,
+    relation_learning_rate: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
+    groups: list[dict[str, Any]] = [
+        {
+            "params": list(student.relations.parameters()),
+            "lr": relation_learning_rate,
+        }
+    ]
+    projection_parameters = [
+        parameter
+        for parameter in student.projections.parameters()
+        if parameter.requires_grad
+    ]
+    if projection_parameters:
+        groups.append(
+            {"params": projection_parameters, "lr": projection_learning_rate}
+        )
+    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
+def _initialize_student(
+    args: argparse.Namespace,
+    *,
+    embedding_dim: int,
+    device: torch.device,
+) -> StudentJoinabilityModel:
+    initialization = getattr(args, "student_initialization", "random")
+    pca_basis_path = getattr(args, "student_pca_basis", None)
+    if initialization == "pca":
+        if pca_basis_path is None:
+            raise ValueError("--student-pca-basis is required for PCA initialization")
+        initialization_basis = load_pca_projection(
+            Path(pca_basis_path),
+            input_dim=embedding_dim,
+            student_dim=args.student_dim,
+        )
+    else:
+        if pca_basis_path is not None:
+            raise ValueError(
+                "--student-pca-basis requires --student-initialization pca"
+            )
+        initialization_basis = None
+    return StudentJoinabilityModel(
+        embedding_dim,
+        args.student_dim,
+        initialization=initialization,
+        initialization_noise_std=getattr(args, "student_init_noise_std", 0.01),
+        initialization_basis=initialization_basis,
+        freeze_projections=bool(args.freeze_projection),
+    ).to(device)
+
+
+def _load_or_initialize_student(
+    args: argparse.Namespace,
+    *,
+    embedding_dim: int,
+    device: torch.device,
+) -> tuple[StudentJoinabilityModel, str]:
+    if args.student_checkpoint:
+        student = load_student(Path(args.student_checkpoint), device)
+        if args.freeze_projection is not None:
+            student.set_projection_frozen(args.freeze_projection)
+            student.reset_projection_anchors()
+        return student, "checkpoint"
+    return (
+        _initialize_student(args, embedding_dim=embedding_dim, device=device),
+        "fresh_initialization",
+    )
 
 
 def _required_path(value: str | None, flag: str, stage: str) -> Path:
@@ -84,6 +200,62 @@ def _referenced_object_ids(examples: list[Any]) -> list[str]:
                 object_ids.append(candidate.target_id)
                 object_ids.extend(candidate.evidence_ids)
     return list(dict.fromkeys(object_ids))
+
+
+def _object_ids(example: EdgeExample | TargetExample) -> list[str]:
+    values = [example.query_id]
+    if isinstance(example, EdgeExample):
+        values.extend(example.candidate_ids)
+    else:
+        for candidate in example.candidates:
+            values.append(candidate.target_id)
+            values.extend(candidate.evidence_ids)
+    return list(dict.fromkeys(values))
+
+
+def _feature_access_weights(
+    examples: list[Any], dataset_sampling_alpha: float
+) -> dict[str, float]:
+    """Expected per-epoch object accesses under balanced dataset sampling."""
+
+    dataset_counts = Counter(example.dataset for example in examples)
+    denominator = sum(
+        count**dataset_sampling_alpha for count in dataset_counts.values()
+    )
+    example_weights = {
+        dataset: (
+            len(examples)
+            * count ** (dataset_sampling_alpha - 1.0)
+            / denominator
+        )
+        for dataset, count in dataset_counts.items()
+    }
+    weights: dict[str, float] = defaultdict(float)
+    for example in examples:
+        for object_id in _object_ids(example):
+            weights[object_id] += example_weights[example.dataset]
+    return dict(weights)
+
+
+def _add_feature_accesses(
+    weights: dict[str, float], examples: list[Any], multiplier: float = 1.0
+) -> None:
+    for example in examples:
+        for object_id in _object_ids(example):
+            weights[object_id] = weights.get(object_id, 0.0) + multiplier
+
+
+def _configure_teacher_compute(
+    teacher: TeacherJoinabilityModel,
+    teacher_amp: str,
+    device: torch.device,
+) -> None:
+    if teacher_amp == "bf16":
+        if device.type != "cuda":
+            raise ValueError("--teacher-amp bf16 requires a CUDA device")
+        teacher.set_compute_dtype(torch.bfloat16)
+    else:
+        teacher.set_compute_dtype(None)
 
 
 def _teacher_logit_cache_dir(args: argparse.Namespace) -> Path:
@@ -176,6 +348,52 @@ class _EpochController:
         self.ids_by_type = (
             load_corpus_ids(corpus_path, store) if corpus_path is not None else None
         )
+        self.teacher_rerank_examples: list[TargetExample] = []
+        self.teacher_raw_hits: list[list[tuple[str, float]]] = []
+        if stage == "teacher-path" and args.teacher_rerank:
+            assert self.ids_by_type is not None
+            assert self.raw_index_root is not None
+            self.teacher_rerank_examples = [
+                example
+                for path_value in args.teacher_rerank_dev_data
+                for example in load_target_examples(
+                    Path(path_value),
+                    split=args.dev_split,
+                    dataset_name=Path(path_value).stem,
+                )
+            ]
+            raw_indices = load_or_build_raw_embedding_indices(
+                self.store,
+                self.ids_by_type,
+                self.raw_index_root,
+                corpus_sha256=self.corpus_sha256,
+                batch_size=self.args.index_batch_size,
+                m=self.args.hnsw_m,
+                ef_construction=self.args.ef_construction,
+                ef_search=self.args.ef_search,
+            )
+            self.teacher_raw_hits = [
+                raw_indices.search(
+                    example.query_id, "table", args.teacher_rerank_top_k
+                )
+                for example in self.teacher_rerank_examples
+            ]
+            missing = {
+                object_id
+                for example, hits in zip(
+                    self.teacher_rerank_examples, self.teacher_raw_hits
+                )
+                for object_id in [
+                    example.query_id,
+                    *(target_id for target_id, _score in hits),
+                ]
+                if not self.store.has_teacher_features(object_id)
+            }
+            if missing:
+                raise ValueError(
+                    "Teacher rerank gate requires hidden states for "
+                    f"{len(missing)} additional dev objects"
+                )
 
     def __call__(
         self,
@@ -229,6 +447,18 @@ class _EpochController:
                 evidence_aggregation=self.aggregator.evidence_aggregation,
                 evidence_top_k=self.aggregator.top_k,
                 rrf_k=self.args.rrf_k,
+                fusion_mode=getattr(self.args, "fusion_mode", "rrf"),
+                direct_weight=getattr(self.args, "direct_weight", 1.0),
+                evidence_weight=getattr(self.args, "evidence_weight", 1.0),
+                gated_evidence_min_paths=getattr(
+                    self.args, "gated_evidence_min_paths", 2
+                ),
+                gated_evidence_quantile=getattr(
+                    self.args, "gated_evidence_quantile", 0.75
+                ),
+                evidence_modality_weights=getattr(
+                    self.args, "evidence_modality_weights", None
+                ),
             )
             if self.raw_embedding_metrics is None:
                 raw_indices = load_or_build_raw_embedding_indices(
@@ -251,10 +481,52 @@ class _EpochController:
                     evidence_aggregation=self.aggregator.evidence_aggregation,
                     evidence_top_k=self.aggregator.top_k,
                     rrf_k=self.args.rrf_k,
+                    fusion_mode=getattr(self.args, "fusion_mode", "rrf"),
+                    direct_weight=getattr(self.args, "direct_weight", 1.0),
+                    evidence_weight=getattr(self.args, "evidence_weight", 1.0),
+                    gated_evidence_min_paths=getattr(
+                        self.args, "gated_evidence_min_paths", 2
+                    ),
+                    gated_evidence_quantile=getattr(
+                        self.args, "gated_evidence_quantile", 0.75
+                    ),
+                    evidence_modality_weights=getattr(
+                        self.args, "evidence_modality_weights", None
+                    ),
                 )
             retrieval_metrics["raw_embedding"] = self.raw_embedding_metrics
             record["dev_retrieval"] = retrieval_metrics
-            gate_metrics = {**retrieval_metrics, "dev_loss": record["dev_loss"]}
+            gate_metrics = dict(retrieval_metrics)
+            if "dev_loss" in record:
+                gate_metrics["dev_loss"] = record["dev_loss"]
+        elif self.stage == "teacher-path" and self.args.teacher_rerank:
+            assert isinstance(model, TeacherJoinabilityModel)
+            index_dir = None
+            if epoch % self.args.teacher_rerank_interval:
+                record["teacher_rerank_skipped"] = {
+                    "interval": self.args.teacher_rerank_interval,
+                    "next_epoch": (
+                        epoch
+                        + self.args.teacher_rerank_interval
+                        - epoch % self.args.teacher_rerank_interval
+                    ),
+                }
+                return False
+            rerank_metrics = evaluate_teacher_reranking(
+                model,
+                self.teacher_rerank_examples,
+                self.teacher_raw_hits,
+                self.store,
+                device=self.device,
+                batch_size=self.args.teacher_rerank_batch_size,
+            )
+            record["dev_teacher_rerank"] = rerank_metrics
+            gate_metrics = {
+                "dev_loss": record["dev_loss"],
+                "teacher_rerank": rerank_metrics["teacher_reranked"],
+                "raw_direct": rerank_metrics["raw_direct"],
+                "spearman": rerank_metrics["spearman"],
+            }
         else:
             index_dir = None
             gate_metrics = {"dev_loss": record["dev_loss"]}
@@ -300,9 +572,56 @@ def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[
     )
 
 
+def _validate_teacher_rerank_interval(args: argparse.Namespace) -> None:
+    if args.teacher_rerank_interval <= 0:
+        raise ValueError("--teacher-rerank-interval must be positive")
+    if (
+        args.stage == "teacher-path"
+        and args.teacher_rerank
+        and args.teacher_rerank_interval > args.epochs
+    ):
+        raise ValueError("--teacher-rerank-interval cannot exceed --epochs")
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    optional_defaults = {
+        "anchor_weight": 0.0,
+        "relation_learning_rate": None,
+        "freeze_projection": None,
+        "in_batch_negatives": False,
+        "in_batch_max_negatives": 256,
+        "eval_epoch_zero": True,
+        "fusion_mode": "rrf",
+        "direct_weight": 1.0,
+        "evidence_weight": 1.0,
+        "gated_evidence_min_paths": 2,
+        "gated_evidence_quantile": 0.75,
+        "evidence_modality_weights": [],
+        "min_dev_evidence_path_coverage_by_dataset": 0.0,
+        "edge_type_oversample": [],
+        "teacher_rerank": False,
+        "teacher_rerank_dev_data": [],
+        "teacher_rerank_top_k": 100,
+        "teacher_rerank_batch_size": 16,
+        "teacher_rerank_interval": 1,
+        "teacher_amp": "off",
+        "feature_cache_gb": None,
+        "feature_hot_fraction": 0.8,
+    }
+    for name, default in optional_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    if not isinstance(args.evidence_modality_weights, dict):
+        args.evidence_modality_weights = dict(args.evidence_modality_weights)
+    if not isinstance(args.edge_type_oversample, dict):
+        args.edge_type_oversample = dict(args.edge_type_oversample)
     if args.batch_size is None:
         args.batch_size = 64 if args.stage.startswith("student") else 8
+    args.feature_cache_size = _feature_cache_size(
+        args.stage, args.feature_cache_size
+    )
+    if args.feature_cache_size < 0:
+        raise ValueError("--feature-cache-size must be non-negative")
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("--epochs and --batch-size must be positive")
     if args.teacher_logit_batch_size <= 0:
@@ -311,6 +630,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--temperature must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
+    if args.anchor_weight < 0:
+        raise ValueError("--anchor-weight must be non-negative")
+    if args.relation_learning_rate is not None and args.relation_learning_rate <= 0:
+        raise ValueError("--relation-learning-rate must be positive")
+    if args.in_batch_max_negatives < 0:
+        raise ValueError("--in-batch-max-negatives must be non-negative")
+    if args.direct_weight < 0 or args.evidence_weight < 0:
+        raise ValueError("Fusion weights must be non-negative")
+    if not 0 <= args.gated_evidence_quantile <= 1:
+        raise ValueError("--gated-evidence-quantile must be in [0, 1]")
+    if args.gated_evidence_min_paths <= 0:
+        raise ValueError("--gated-evidence-min-paths must be positive")
     if not 0 <= args.dataset_sampling_alpha <= 1:
         raise ValueError("--dataset-sampling-alpha must be between 0 and 1")
     if not 0 <= args.hard_fraction < 1:
@@ -323,6 +654,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--min-dev-evidence-path-queries must be non-negative")
     if not 0 <= args.min_dev_evidence_path_coverage <= 1:
         raise ValueError("--min-dev-evidence-path-coverage must be in [0, 1]")
+    if not 0 <= args.min_dev_evidence_path_coverage_by_dataset <= 1:
+        raise ValueError(
+            "--min-dev-evidence-path-coverage-by-dataset must be in [0, 1]"
+        )
+    if args.teacher_rerank and args.stage != "teacher-path":
+        raise ValueError("--teacher-rerank is only valid for teacher-path")
+    if args.teacher_rerank and not args.teacher_rerank_dev_data:
+        raise ValueError("--teacher-rerank-dev-data is required with --teacher-rerank")
+    if args.teacher_rerank_top_k <= 0 or args.teacher_rerank_batch_size <= 0:
+        raise ValueError("Teacher rerank top-k and batch size must be positive")
+    if args.teacher_amp not in {"off", "bf16"}:
+        raise ValueError("--teacher-amp must be off or bf16")
+    if args.feature_cache_gb is not None and args.feature_cache_gb <= 0:
+        raise ValueError("--feature-cache-gb must be positive")
+    if not 0 <= args.feature_hot_fraction <= 1:
+        raise ValueError("--feature-hot-fraction must be in [0, 1]")
+    _validate_teacher_rerank_interval(args)
     validate_protocol_split("training", args.split)
     validate_protocol_split("dev_gate", args.dev_split)
 
@@ -335,8 +683,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.device != "auto"
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
+    teacher_stage = args.stage.startswith("teacher")
+    total_cache_bytes = (
+        int(args.feature_cache_gb * 2**30)
+        if args.feature_cache_gb is not None
+        else None
+    )
+    hot_cache_bytes = (
+        int(total_cache_bytes * args.feature_hot_fraction)
+        if teacher_stage and total_cache_bytes is not None
+        else None
+    )
+    lru_cache_bytes = (
+        total_cache_bytes - hot_cache_bytes
+        if hot_cache_bytes is not None
+        else None
+    )
+    hot_cache_objects = (
+        int(args.feature_cache_size * args.feature_hot_fraction)
+        if teacher_stage
+        else 0
+    )
+    lru_cache_objects = args.feature_cache_size - hot_cache_objects
     store = FeatureStore.from_path(
-        Path(args.features), cache_size=args.feature_cache_size
+        Path(args.features),
+        cache_size=lru_cache_objects,
+        cache_bytes=lru_cache_bytes,
     )
     embedding_dim = store.embedding_dimension()
     hidden_dim: int | None = None
@@ -346,6 +718,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     examples = loader(base_paths, args.split)
     hard_examples = loader(hard_paths, args.split) if hard_paths else []
     dev_examples = loader(dev_paths, args.dev_split)
+    hot_cache_plan = None
+    if teacher_stage and (hot_cache_objects or hot_cache_bytes):
+        access_weights = _feature_access_weights(
+            examples, args.dataset_sampling_alpha
+        )
+        _add_feature_accesses(access_weights, hard_examples)
+        _add_feature_accesses(access_weights, dev_examples)
+        hot_cache_plan = store.configure_hot_cache(
+            access_weights,
+            byte_budget=hot_cache_bytes,
+            object_budget=hot_cache_objects,
+            include_hidden=True,
+        )
 
     aggregator: PathAggregator | None = None
     if args.stage != "teacher-edge":
@@ -369,7 +754,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     teacher_cache_hits = 0
     teacher_cache_generated = False
     preloaded_embeddings = 0
-    if args.stage.startswith("student"):
+    student_initialization_source: str | None = None
+    if args.stage.startswith("student") and (
+        args.distillation_weight > 0 or hard_examples
+    ):
         teacher_path = _required_path(
             args.teacher_checkpoint, "--teacher-checkpoint", args.stage
         )
@@ -411,6 +799,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not train_logits_ready or not dev_logits_ready:
             frozen_teacher = load_teacher(teacher_path, device)
+            _configure_teacher_compute(
+                frozen_teacher, args.teacher_amp, device
+            )
             teacher_cache_generated = True
             hidden_dim = store.teacher_dimension()
             if hidden_dim is None:
@@ -452,6 +843,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             preloaded_embeddings = store.preload_embeddings(
                 _referenced_object_ids([*examples, *hard_examples, *dev_examples])
             )
+    elif args.stage.startswith("student"):
+        if args.preload_embeddings:
+            preloaded_embeddings = store.preload_embeddings(
+                _referenced_object_ids(
+                    [*examples, *hard_examples, *dev_examples]
+                )
+            )
     else:
         hidden_dim = store.teacher_dimension()
         if hidden_dim is None:
@@ -461,19 +859,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     index_root = None
     raw_index_root = None
     primary_metric = "dev_loss"
-    if args.stage == "student-path":
+    if args.stage == "student-path" or args.teacher_rerank:
         corpus_path = _required_path(args.corpus, "--corpus", args.stage)
-        index_root = (
-            Path(args.index_root)
-            if args.index_root
-            else Path(args.output).with_suffix(".dev_indices")
-        )
-        raw_index_root = (
-            Path(args.raw_index_root)
-            if args.raw_index_root
-            else index_root / "raw_embedding"
-        )
         primary_metric = args.primary_metric
+        if args.stage == "student-path":
+            index_root = (
+                Path(args.index_root)
+                if args.index_root
+                else Path(args.output).with_suffix(".dev_indices")
+            )
+            raw_index_root = (
+                Path(args.raw_index_root)
+                if args.raw_index_root
+                else index_root / "raw_embedding"
+            )
+        else:
+            raw_index_root = (
+                Path(args.raw_index_root)
+                if args.raw_index_root
+                else Path(args.output).parent / "raw_embedding_index"
+            )
 
     controller = _EpochController(
         output=Path(args.output),
@@ -491,6 +896,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args=args,
     )
     learning_rate = args.hard_learning_rate if hard_examples else args.learning_rate
+    relation_learning_rate: float | None = None
     if hard_examples and args.hard_learning_rate >= args.learning_rate:
         raise ValueError(
             "--hard-learning-rate must be lower than --learning-rate"
@@ -523,6 +929,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if teacher.input_dim != hidden_dim:
             raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
+        _configure_teacher_compute(teacher, args.teacher_amp, device)
         optimizer = torch.optim.AdamW(
             teacher.parameters(), lr=learning_rate, weight_decay=args.weight_decay
         )
@@ -534,6 +941,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         teacher = load_teacher(teacher_path, device)
         if teacher.input_dim != hidden_dim:
             raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
+        _configure_teacher_compute(teacher, args.teacher_amp, device)
         optimizer = torch.optim.AdamW(
             teacher.parameters(), lr=learning_rate, weight_decay=args.weight_decay
         )
@@ -552,38 +960,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "Hard-negative Student edge training must start from the Student "
                 "checkpoint used for mining"
             )
-        if args.student_checkpoint:
-            student = load_student(Path(args.student_checkpoint), device)
-        else:
-            initialization = getattr(args, "student_initialization", "random")
-            pca_basis_path = getattr(args, "student_pca_basis", None)
-            if initialization == "pca":
-                if pca_basis_path is None:
-                    raise ValueError("--student-pca-basis is required for PCA initialization")
-                initialization_basis = load_pca_projection(
-                    Path(pca_basis_path),
-                    input_dim=embedding_dim,
-                    student_dim=args.student_dim,
-                )
-            else:
-                if pca_basis_path is not None:
-                    raise ValueError(
-                        "--student-pca-basis requires --student-initialization pca"
-                    )
-                initialization_basis = None
-            student = StudentJoinabilityModel(
-                embedding_dim,
-                args.student_dim,
-                initialization=initialization,
-                initialization_noise_std=getattr(
-                    args, "student_init_noise_std", 0.01
-                ),
-                initialization_basis=initialization_basis,
-            ).to(device)
+        student, student_initialization_source = _load_or_initialize_student(
+            args, embedding_dim=embedding_dim, device=device
+        )
         if student.input_dim != embedding_dim:
             raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        optimizer = torch.optim.AdamW(
-            student.parameters(), lr=learning_rate, weight_decay=args.weight_decay
+        relation_learning_rate = args.relation_learning_rate or (
+            1e-5 if student.freeze_projections else learning_rate
+        )
+        optimizer = _student_optimizer(
+            student,
+            projection_learning_rate=learning_rate,
+            relation_learning_rate=relation_learning_rate,
+            weight_decay=args.weight_decay,
         )
         history = train_student_edges(
             student,
@@ -591,18 +980,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             store,
             optimizer,
             temperature=args.temperature,
+            distillation_weight=args.distillation_weight,
+            anchor_weight=args.anchor_weight,
+            in_batch_negatives=args.in_batch_negatives,
+            in_batch_max_negatives=args.in_batch_max_negatives,
+            edge_type_oversample=args.edge_type_oversample,
             **common,
         )
     else:
-        student_path = _required_path(
-            args.student_checkpoint, "--student-checkpoint", args.stage
+        student, student_initialization_source = _load_or_initialize_student(
+            args, embedding_dim=embedding_dim, device=device
         )
-        student = load_student(student_path, device)
         if student.input_dim != embedding_dim:
             raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        optimizer = torch.optim.AdamW(
-            student.parameters(), lr=learning_rate, weight_decay=args.weight_decay
+        relation_learning_rate = args.relation_learning_rate or (
+            1e-5 if student.freeze_projections else learning_rate
         )
+        optimizer = _student_optimizer(
+            student,
+            projection_learning_rate=learning_rate,
+            relation_learning_rate=relation_learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        epoch_zero_record = None
+        if args.eval_epoch_zero:
+            epoch_zero_record = {
+                "epoch": 0,
+                "training_state": "initial",
+                "dataset_samples": {},
+                "source_samples": {"base": 0, "hard": 0},
+            }
+            controller(0, student, epoch_zero_record)
         history = train_student_paths(
             student,
             examples,
@@ -611,8 +1019,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             aggregator,
             temperature=args.temperature,
             distillation_weight=args.distillation_weight,
+            anchor_weight=args.anchor_weight,
+            in_batch_negatives=args.in_batch_negatives,
+            in_batch_max_negatives=args.in_batch_max_negatives,
             **common,
         )
+        if epoch_zero_record is not None:
+            history.insert(0, epoch_zero_record)
 
     controller.prune_indices()
     paths = controller.manager.paths
@@ -624,10 +1037,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     evidence_coverage = float(
         controller.best_metrics.get("positive_evidence_path_coverage@10", 0.0)
     )
+    evidence_coverage_by_dataset = {
+        dataset: float(metrics.get("positive_evidence_path_coverage@10", 0.0))
+        for dataset, metrics in controller.best_metrics.get(
+            "by_dataset", {}
+        ).items()
+    }
     stage2_allowed = (
         args.stage == "student-path"
         and evidence_count >= args.min_dev_evidence_path_queries
         and evidence_coverage >= args.min_dev_evidence_path_coverage
+        and all(
+            coverage >= args.min_dev_evidence_path_coverage_by_dataset
+            for coverage in evidence_coverage_by_dataset.values()
+        )
     )
     history_payload = {
         "format_version": 1,
@@ -640,6 +1063,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "patience": args.patience,
         "stop_reason": controller.stop_reason,
         "learning_rate": learning_rate,
+        "relation_learning_rate": relation_learning_rate,
+        "anchor_weight": args.anchor_weight,
+        "in_batch_negatives": args.in_batch_negatives,
+        "in_batch_max_negatives": args.in_batch_max_negatives,
+        "edge_type_oversample": args.edge_type_oversample,
+        "eval_epoch_zero": args.eval_epoch_zero,
+        "fusion": {
+            "mode": args.fusion_mode,
+            "direct_weight": args.direct_weight,
+            "evidence_weight": args.evidence_weight,
+            "gated_evidence_min_paths": args.gated_evidence_min_paths,
+            "gated_evidence_quantile": args.gated_evidence_quantile,
+            "evidence_modality_weights": args.evidence_modality_weights,
+        },
+        "teacher_rerank_gate": {
+            "enabled": args.teacher_rerank,
+            "dev_data": args.teacher_rerank_dev_data,
+            "top_k": args.teacher_rerank_top_k,
+            "batch_size": args.teacher_rerank_batch_size,
+            "interval": args.teacher_rerank_interval,
+        },
+        "teacher_amp": args.teacher_amp,
+        "feature_cache": {
+            "object_limit": args.feature_cache_size,
+            "hot_object_limit": hot_cache_objects,
+            "lru_object_limit": lru_cache_objects,
+            "total_gb": args.feature_cache_gb,
+            "hot_fraction": args.feature_hot_fraction,
+            "hot_plan": hot_cache_plan,
+            "state": store.cache_info(),
+        },
         "base_examples": len(examples),
         "hard_examples": len(hard_examples),
         "hard_fraction": args.hard_fraction if hard_examples else 0.0,
@@ -648,6 +1102,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_logit_cache_hits": teacher_cache_hits,
         "teacher_logit_caches": [str(path.resolve()) for path in teacher_cache_paths],
         "preloaded_embeddings": preloaded_embeddings,
+        "student_initialization_source": student_initialization_source,
     }
     selection = {
         "format_version": 1,
@@ -681,9 +1136,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "minimum_coverage": args.min_dev_evidence_path_coverage,
             "observed_queries": evidence_count,
             "observed_coverage": evidence_coverage,
+            "minimum_coverage_by_dataset": (
+                args.min_dev_evidence_path_coverage_by_dataset
+            ),
+            "observed_coverage_by_dataset": evidence_coverage_by_dataset,
         },
         "stop_reason": controller.stop_reason,
         "mining_round": mining_round,
+        "fusion": {
+            "mode": args.fusion_mode,
+            "direct_weight": args.direct_weight,
+            "evidence_weight": args.evidence_weight,
+            "gated_evidence_min_paths": args.gated_evidence_min_paths,
+            "gated_evidence_quantile": args.gated_evidence_quantile,
+            "evidence_modality_weights": args.evidence_modality_weights,
+        },
+        "teacher_rerank_gate": {
+            "enabled": args.teacher_rerank,
+            "dev_data": args.teacher_rerank_dev_data,
+            "top_k": args.teacher_rerank_top_k,
+            "batch_size": args.teacher_rerank_batch_size,
+            "interval": args.teacher_rerank_interval,
+        },
     }
     if student is not None:
         history_payload["student_config"] = student.config()
@@ -702,6 +1176,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_cache_generated": teacher_cache_generated,
         "teacher_logit_cache_hits": teacher_cache_hits,
         "preloaded_embeddings": preloaded_embeddings,
+        "feature_cache": store.cache_info(),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
@@ -717,7 +1192,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dev-data", required=True, nargs="+", help="Fixed dev edge or target/path lists.")
     parser.add_argument("--output", required=True, help="Best checkpoint path; last uses a distinct sibling path.")
     parser.add_argument("--teacher-checkpoint")
-    parser.add_argument("--student-checkpoint")
+    parser.add_argument(
+        "--student-checkpoint",
+        help=(
+            "Student checkpoint to continue from. If omitted, Student edge/path "
+            "starts from --student-initialization."
+        ),
+    )
     parser.add_argument("--hard-source-checkpoint", help="Student checkpoint used to mine --hard-data.")
     parser.add_argument("--corpus", help="Full shared data-lake corpus; required by student-path.")
     parser.add_argument("--index-root", help="Per-epoch dev ANN index root.")
@@ -735,16 +1216,70 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to 8 for Teacher stages and 64 for vectorized Student stages.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--relation-learning-rate",
+        type=float,
+        help="Student relation-matrix rate; defaults to 1e-5 when projections are frozen.",
+    )
     parser.add_argument("--hard-learning-rate", type=float, default=2e-5)
     parser.add_argument("--hard-fraction", type=float, default=0.5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--feature-cache-size", type=int, default=60_000)
+    parser.add_argument(
+        "--feature-cache-size",
+        type=int,
+        help=(
+            "Total in-memory object-cache size; defaults to 8000 for hidden-state "
+            "Teacher stages and 60000 for compact Student features."
+        ),
+    )
+    parser.add_argument(
+        "--feature-cache-gb",
+        type=float,
+        help=(
+            "Optional total Teacher feature-cache memory budget in GiB. The "
+            "budget is split between a static hot set and an LRU remainder."
+        ),
+    )
+    parser.add_argument(
+        "--feature-hot-fraction",
+        type=float,
+        default=0.8,
+        help=(
+            "Fraction of the Teacher object/byte cache reserved for a "
+            "frequency-aware static hot set."
+        ),
+    )
     parser.add_argument(
         "--teacher-logit-cache",
         help="Persistent base/dev Teacher-logit cache; defaults inside the feature cache.",
     )
     parser.add_argument("--teacher-logit-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--teacher-amp",
+        choices=["off", "bf16"],
+        default="off",
+        help="Run Teacher model compute under CUDA BF16 autocast; weights stay FP32.",
+    )
+    parser.add_argument(
+        "--teacher-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Gate teacher-path checkpoints by raw top-k reranking metrics.",
+    )
+    parser.add_argument(
+        "--teacher-rerank-dev-data",
+        nargs="+",
+        help="Original fixed dev target lists used by the Teacher rerank gate.",
+    )
+    parser.add_argument("--teacher-rerank-top-k", type=int, default=100)
+    parser.add_argument("--teacher-rerank-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--teacher-rerank-interval",
+        type=int,
+        default=1,
+        help="Evaluate the Teacher rerank gate every N epochs.",
+    )
     parser.add_argument(
         "--preload-embeddings",
         action=argparse.BooleanOptionalAction,
@@ -758,6 +1293,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-dev-evidence-path-queries", type=int, default=1)
     parser.add_argument("--min-dev-evidence-path-coverage", type=float, default=0.0)
+    parser.add_argument(
+        "--min-dev-evidence-path-coverage-by-dataset",
+        type=float,
+        default=0.0,
+    )
 
     parser.add_argument("--teacher-dim", type=int, default=512)
     parser.add_argument("--teacher-heads", type=int, default=8)
@@ -768,11 +1308,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-dim", type=int, default=128)
     parser.add_argument(
         "--student-initialization",
+        "--student-init",
+        dest="student_initialization",
         choices=STUDENT_INITIALIZATIONS,
         default="random",
     )
     parser.add_argument("--student-init-noise-std", type=float, default=0.01)
     parser.add_argument("--student-pca-basis")
+    parser.add_argument(
+        "--freeze-projection",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze Student object projections; loaded checkpoints keep their setting by default.",
+    )
+    parser.add_argument("--anchor-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--in-batch-negatives",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--in-batch-max-negatives", type=int, default=256)
+    parser.add_argument(
+        "--edge-type-oversample",
+        nargs="*",
+        type=_parse_edge_oversample,
+        default=[],
+        metavar="SOURCE_DESTINATION:FACTOR",
+    )
+    parser.add_argument(
+        "--eval-epoch-zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate and gate the initial student-path checkpoint before optimization.",
+    )
 
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
@@ -782,12 +1350,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-k", type=int, default=50)
     parser.add_argument("--targets-per-evidence", type=int, default=50)
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
+    parser.add_argument(
+        "--evidence-modality-weights",
+        nargs="*",
+        type=_parse_modality_weight,
+        default=[],
+        metavar="MODALITY=WEIGHT",
+    )
     parser.add_argument("--rrf-k", type=int, default=60)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["rrf", "weighted_rrf", "gated"],
+        default="rrf",
+    )
+    parser.add_argument("--direct-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=1.0)
+    parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
+    parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
     parser.add_argument("--index-batch-size", type=int, default=1024)
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--ef-search", type=int, default=100)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.feature_cache_size = _feature_cache_size(
+        args.stage, args.feature_cache_size
+    )
+    return args
 
 
 if __name__ == "__main__":

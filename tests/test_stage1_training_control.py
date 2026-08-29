@@ -14,8 +14,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import refresh_stage1_hard_negatives
 import run_stage1_rounds
+import diagnose_stage1_teacher_rerank
+import train_stage1
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample
 from mmdd_stage1.evaluation import evaluate_student_retrieval
+from mmdd_stage1.models import TeacherJoinabilityModel
+from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import checkpoint_fingerprint
 from mmdd_stage1.selection import (
@@ -24,7 +28,7 @@ from mmdd_stage1.selection import (
     validate_stage2_gate,
     write_json,
 )
-from mmdd_stage1.training import sample_mixed_epoch
+from mmdd_stage1.training import oversample_student_edges, sample_mixed_epoch
 from mmdd_stage1.workflow import RoundStep, validate_round_index, workflow_fingerprint
 
 
@@ -48,6 +52,74 @@ def test_checkpoint_gate_keeps_best_and_last_separate_and_stops_on_patience(tmp_
     assert torch.load(manager.paths["best"], weights_only=True)["epoch"] == 1
     assert torch.load(manager.paths["last"], weights_only=True)["epoch"] == 3
     assert first != second != third
+
+
+def test_teacher_rerank_diagnostic_correlation_and_decision_thresholds():
+    assert diagnose_stage1_teacher_rerank.spearman_correlation(
+        [1.0, 2.0, 3.0], [3.0, 2.0, 1.0]
+    ) == pytest.approx(-1.0)
+    assert (
+        diagnose_stage1_teacher_rerank._branch(0.36, 0.39)
+        == "teacher_adds_retrieval_value"
+    )
+    assert (
+        diagnose_stage1_teacher_rerank._branch(0.36, 0.35)
+        == "teacher_has_no_incremental_value"
+    )
+    assert (
+        diagnose_stage1_teacher_rerank._branch(0.36, 0.33)
+        == "teacher_is_harmful"
+    )
+
+
+def test_teacher_rerank_interval_must_fit_training_schedule():
+    args = argparse.Namespace(
+        stage="teacher-path",
+        teacher_rerank=True,
+        teacher_rerank_interval=3,
+        epochs=2,
+    )
+
+    with pytest.raises(
+        ValueError, match="--teacher-rerank-interval cannot exceed --epochs"
+    ):
+        train_stage1._validate_teacher_rerank_interval(args)
+
+
+def test_teacher_rerank_interval_saves_but_does_not_gate_skipped_epoch(
+    tmp_path, monkeypatch
+):
+    controller = object.__new__(train_stage1._EpochController)
+    controller.stage = "teacher-path"
+    controller.aggregator = PathAggregator("logsumexp", 4)
+    controller.manager = CheckpointManager(tmp_path / "teacher.pt")
+    controller.gate = MetricGate("teacher_rerank.recall@10", patience=3)
+    controller.args = argparse.Namespace(
+        teacher_rerank=True,
+        teacher_rerank_interval=2,
+    )
+    model = TeacherJoinabilityModel(
+        input_dim=4,
+        model_dim=4,
+        num_heads=1,
+        num_layers=1,
+        text_latents=1,
+        image_latents=1,
+        dropout=0.0,
+    )
+    monkeypatch.setattr(
+        train_stage1,
+        "evaluate_teacher_reranking",
+        lambda *_args, **_kwargs: pytest.fail("rerank should be skipped"),
+    )
+    record = {"dev_loss": 0.5}
+
+    assert controller(1, model, record) is False
+
+    assert record["teacher_rerank_skipped"] == {"interval": 2, "next_epoch": 2}
+    assert controller.gate.best_value is None
+    assert controller.manager.paths["last"].is_file()
+    assert not controller.manager.paths["best"].exists()
 
 
 def test_base_hard_sampling_is_explicit_proportional_and_deterministic():
@@ -82,6 +154,66 @@ def test_base_hard_sampling_is_explicit_proportional_and_deterministic():
     assert sum(example.query_id.startswith("hard_") for example in sampled) == 4
 
 
+def test_student_edge_type_oversampling_repeats_only_requested_direction():
+    examples = [
+        EdgeExample(
+            "text_query",
+            ("positive", "negative"),
+            0,
+            source_type="text",
+            destination_type="table",
+        ),
+        EdgeExample(
+            "table_query",
+            ("positive", "negative"),
+            0,
+            source_type="table",
+            destination_type="text",
+        ),
+    ]
+
+    sampled = oversample_student_edges(
+        examples, {"text_table": 3}, random.Random(7)
+    )
+
+    assert sum(example.query_id == "text_query" for example in sampled) == 3
+    assert sum(example.query_id == "table_query" for example in sampled) == 1
+
+
+def test_student_path_can_start_from_fresh_frozen_pca(tmp_path):
+    basis = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    artifact = tmp_path / "pca.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "input_dim": 4,
+            "student_dim": 2,
+            "projection": basis,
+        },
+        artifact,
+    )
+    args = argparse.Namespace(
+        student_checkpoint=None,
+        student_initialization="pca",
+        student_pca_basis=str(artifact),
+        student_dim=2,
+        student_init_noise_std=0.01,
+        freeze_projection=True,
+    )
+
+    student, source = train_stage1._load_or_initialize_student(
+        args, embedding_dim=4, device=torch.device("cpu")
+    )
+
+    assert source == "fresh_initialization"
+    assert student.freeze_projections
+    for projection in student.projections.values():
+        torch.testing.assert_close(projection.weight, basis)
+        assert not projection.weight.requires_grad
+
+
 def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     class StaticIndices:
         def search(self, source_id, destination_type, k):
@@ -109,6 +241,7 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
         evidence_positive_index=0,
         split="dev",
         positive_target_ids=("positive",),
+        dataset="EntiTables",
     )
 
     metrics = evaluate_student_retrieval(
@@ -122,6 +255,8 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert metrics["evidence"]["recall@1"] == 1.0
     assert metrics["positive_evidence_path_queries@10"] == 1
     assert metrics["positive_evidence_path_coverage@10"] == 1.0
+    assert metrics["by_dataset"]["EntiTables"]["queries"] == 1
+    assert metrics["by_dataset"]["EntiTables"]["direct"]["recall@10"] == 1.0
 
 
 def test_teacher_feature_readiness_requires_actual_hidden_states(tmp_path):

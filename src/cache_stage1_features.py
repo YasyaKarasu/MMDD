@@ -337,6 +337,9 @@ def teacher_object_ids(
                     raise TypeError(f"{path}:{line_number}: expected a JSON object")
                 if split is not None and record.get("split") != split:
                     continue
+                if "object_id" in record and "query_id" not in record:
+                    object_ids.add(str(record["object_id"]))
+                    continue
                 object_ids.add(str(record["query_id"]))
                 if "candidate_ids" in record:
                     object_ids.update(str(value) for value in record["candidate_ids"])
@@ -379,9 +382,26 @@ def run(args: argparse.Namespace) -> None:
     object_dir.mkdir(parents=True, exist_ok=True)
     manifest = output_dir / "manifest.jsonl"
     completed = _completed_records(manifest)
-    teacher_dir = output_dir / "teacher_objects"
-    teacher_manifest = output_dir / TEACHER_MANIFEST
-    completed_teacher = _completed_records(teacher_manifest)
+    teacher_output_dir = (
+        Path(args.teacher_output_dir)
+        if getattr(args, "teacher_output_dir", None)
+        else output_dir
+    )
+    teacher_dir = teacher_output_dir / "teacher_objects"
+    teacher_manifest = teacher_output_dir / TEACHER_MANIFEST
+    completed_teacher: dict[str, tuple[dict[str, Any], Path]] = {}
+    for root in dict.fromkeys([output_dir, teacher_output_dir]):
+        for object_id, record in _completed_records(
+            root / TEACHER_MANIFEST
+        ).items():
+            if object_id in completed_teacher:
+                previous, _previous_root = completed_teacher[object_id]
+                if previous != record:
+                    raise ValueError(
+                        f"Teacher staging record for {object_id!r} conflicts with the main cache"
+                    )
+                continue
+            completed_teacher[object_id] = (record, root)
     teacher_paths = [Path(value).resolve() for value in args.teacher_data]
     selected_teacher_ids = teacher_object_ids(
         teacher_paths,
@@ -446,8 +466,8 @@ def run(args: argparse.Namespace) -> None:
                 pending_base_ids.add(object_id)
             if object_id in selected_teacher_ids:
                 if object_id in completed_teacher:
-                    completed_record = completed_teacher[object_id]
-                    completed_path = output_dir / completed_record["teacher_feature_path"]
+                    completed_record, completed_root = completed_teacher[object_id]
+                    completed_path = completed_root / completed_record["teacher_feature_path"]
                     if not completed_path.is_file():
                         raise FileNotFoundError(
                             f"Teacher manifest references a missing feature file: {completed_path}"
@@ -490,8 +510,10 @@ def run(args: argparse.Namespace) -> None:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }[args.dtype]
-    embedder = embedder_class(model_name_or_path=str(model_dir), torch_dtype=torch_dtype)
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.device(device).type == "cuda":
+        torch.cuda.set_device(torch.device(device))
+    embedder = embedder_class(model_name_or_path=str(model_dir), torch_dtype=torch_dtype)
     embedder.model.to(torch.device(device))
     embedder.model.eval()
 
@@ -550,7 +572,7 @@ def run(args: argparse.Namespace) -> None:
             if needs_teacher:
                 teacher_payload = {"hidden_states": payload["hidden_states"]}
                 relative_path = Path("teacher_objects") / name
-                destination = output_dir / relative_path
+                destination = teacher_output_dir / relative_path
                 temporary = destination.with_suffix(".pt.tmp")
                 torch.save(teacher_payload, temporary)
                 temporary.replace(destination)
@@ -579,6 +601,7 @@ def run(args: argparse.Namespace) -> None:
                 "teacher_objects_written": teacher_written,
                 "teacher_objects_skipped": teacher_skipped,
                 "output_dir": str(output_dir),
+                "teacher_output_dir": str(teacher_output_dir),
             },
             indent=2,
         )
@@ -589,6 +612,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--teacher-output-dir",
+        help=(
+            "Optional staging directory for Teacher-only features. The base cache "
+            "is read from --output-dir and can be merged after parallel GPU runs."
+        ),
+    )
     parser.add_argument("--model-dir", default="hf_models/Qwen3-VL-Embedding-8B")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")

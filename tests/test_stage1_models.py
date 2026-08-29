@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import cache_stage1_features as stage1_cache
 import compact_stage1_feature_cache as compact_cache
+import mmdd_stage1.features as stage1_features
 import mmdd_stage1.training as stage1_training
 import refresh_stage1_hard_negatives as hard_negative_refresh
 import train_stage1
@@ -59,7 +60,12 @@ from mmdd_stage1.retrieval import (
     retrieve_zero_one_hop,
     retrieve_zero_one_hop_detailed,
 )
-from mmdd_stage1.scoring import score_edge_batch, score_target_batch
+from mmdd_stage1.scoring import (
+    score_edge_batch,
+    score_edge_batch_in_batch,
+    score_target_batch,
+    score_target_direct_batch_in_batch,
+)
 from mmdd_stage1.teacher_logits import (
     has_teacher_logits,
     load_teacher_logits,
@@ -178,7 +184,12 @@ def test_teacher_pools_table_groups_before_the_equivalent_adapter_projection():
     projected_before_pooling = structural_table_pool(
         model.adapters["table"](table.hidden_states), table.token_groups
     )
-    assert torch.allclose(projected_after_pooling, projected_before_pooling)
+    torch.testing.assert_close(
+        projected_after_pooling,
+        projected_before_pooling,
+        atol=1e-6,
+        rtol=1e-5,
+    )
     assert torch.allclose(tokens, projected_after_pooling + token_kind_embeddings)
 
 
@@ -280,6 +291,111 @@ def test_student_pca_initialization_uses_shared_basis_and_identity_relations():
         torch.testing.assert_close(relation, torch.eye(2))
 
 
+def test_frozen_pca_student_records_freeze_and_anchor_penalizes_only_relations():
+    projection = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="pca",
+        initialization_basis=projection,
+        freeze_projections=True,
+    )
+
+    assert model.config()["freeze_projections"] is True
+    assert all(
+        not parameter.requires_grad for parameter in model.projections.parameters()
+    )
+    assert stage1_training.student_anchor_loss(model).item() == pytest.approx(0.0)
+
+    with torch.no_grad():
+        model.projections["table"].weight.add_(10.0)
+        model.relations["table_to_table"][0, 0].add_(1.0)
+    assert stage1_training.student_anchor_loss(model).item() == pytest.approx(0.25)
+
+
+def test_student_in_batch_scoring_expands_lists_and_respects_maximum():
+    store = FeatureStore(
+        {
+            object_id: feature(object_id, "table", value)
+            for object_id, value in {
+                "q1": 0.1,
+                "q2": 0.2,
+                "p1": 0.3,
+                "p2": 0.4,
+                "n1": 0.5,
+                "n2": 0.6,
+            }.items()
+        }
+    )
+    model = StudentJoinabilityModel(4, 3)
+    examples = [
+        EdgeExample("q1", ("p1", "n1"), 0),
+        EdgeExample("q2", ("p2", "n2"), 0),
+    ]
+
+    expanded = score_edge_batch_in_batch(
+        model,
+        examples,
+        store,
+        torch.device("cpu"),
+        max_negatives=1,
+        rng=random.Random(4),
+    )
+    unexpanded = score_edge_batch_in_batch(
+        model,
+        examples,
+        store,
+        torch.device("cpu"),
+        max_negatives=0,
+    )
+
+    assert expanded.candidate_mask.sum(dim=1).tolist() == [3, 3]
+    assert unexpanded.candidate_mask.sum(dim=1).tolist() == [2, 2]
+
+
+def test_target_in_batch_scoring_excludes_all_known_positive_targets():
+    store = FeatureStore(
+        {
+            object_id: feature(object_id, "table", value)
+            for object_id, value in {
+                "q1": 0.1,
+                "q2": 0.2,
+                "p1": 0.3,
+                "p2": 0.4,
+                "n1": 0.5,
+                "n2": 0.6,
+            }.items()
+        }
+    )
+    examples = [
+        TargetExample(
+            "q1",
+            (TargetCandidate("p1", ()), TargetCandidate("n1", ())),
+            0,
+            0,
+            positive_target_ids=("p1", "p2"),
+        ),
+        TargetExample(
+            "q2",
+            (TargetCandidate("p2", ()), TargetCandidate("n2", ())),
+            0,
+            0,
+            positive_target_ids=("p2",),
+        ),
+    ]
+
+    scores = score_target_direct_batch_in_batch(
+        StudentJoinabilityModel(4, 3),
+        examples,
+        store,
+        torch.device("cpu"),
+    )
+
+    assert scores.candidate_mask.sum(dim=1).tolist() == [3, 4]
+
+
 def test_student_pca_checkpoint_loads_without_external_basis(tmp_path):
     projection = torch.tensor(
         [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
@@ -332,6 +448,24 @@ def test_pca_projection_finds_top_component_and_round_trips(tmp_path):
     )
     torch.testing.assert_close(
         load_pca_projection(path, input_dim=3, student_dim=1), projection
+    )
+
+    spectrum_path = tmp_path / "spectrum.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "artifact_kind": "stage1_pca_spectrum",
+            "input_dim": 3,
+            "max_components": 2,
+            "projection": torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            ),
+        },
+        spectrum_path,
+    )
+    torch.testing.assert_close(
+        load_pca_projection(spectrum_path, input_dim=3, student_dim=1),
+        torch.tensor([[1.0, 0.0, 0.0]]),
     )
 
 
@@ -437,13 +571,13 @@ def test_teacher_target_scoring_compresses_each_object_once(monkeypatch):
         )
     ]
     compress_calls = Counter()
-    original_compress = model.compress
+    original_compress_many = model.compress_many
 
-    def counted_compress(features):
-        compress_calls[features.object_id] += 1
-        return original_compress(features)
+    def counted_compress_many(features, compression_cache):
+        compress_calls.update(item.object_id for item in features)
+        return original_compress_many(features, compression_cache)
 
-    monkeypatch.setattr(model, "compress", counted_compress)
+    monkeypatch.setattr(model, "compress_many", counted_compress_many)
     scores = score_target_batch(
         model,
         examples,
@@ -455,6 +589,135 @@ def test_teacher_target_scoring_compresses_each_object_once(monkeypatch):
 
     assert compress_calls == {"q": 1, "positive": 1, "negative": 1, "evidence": 1}
     assert model.poolers["text"].queries.grad is not None
+
+
+def test_teacher_target_scoring_deduplicates_repeated_directed_pairs(monkeypatch):
+    model = teacher()
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=1,
+        )
+    ]
+    scored_pairs = []
+    original_score_pairs = model.score_pairs
+
+    def counted_score_pairs(sources, destinations, *, compression_cache=None):
+        scored_pairs.append(
+            [(source.object_id, destination.object_id) for source, destination in zip(sources, destinations)]
+        )
+        return original_score_pairs(
+            sources,
+            destinations,
+            compression_cache=compression_cache,
+        )
+
+    monkeypatch.setattr(model, "score_pairs", counted_score_pairs)
+    score_target_batch(
+        model,
+        examples,
+        feature_store(),
+        torch.device("cpu"),
+        PathAggregator(),
+    )
+
+    assert scored_pairs == [
+        [("q", "positive"), ("q", "negative")],
+        [("q", "evidence")],
+        [("evidence", "positive"), ("evidence", "negative")],
+    ]
+
+
+def test_teacher_batched_compression_matches_individual_compression():
+    model = teacher().eval()
+    items = [
+        feature("table", "table", 0.1),
+        feature("text-short", "text", 0.2),
+        ObjectFeatures(
+            "text-long",
+            "text",
+            feature("unused", "text", 0.3).embedding,
+            torch.cat(
+                [
+                    feature("unused", "text", 0.3).hidden_states,
+                    feature("unused", "text", 0.3).hidden_states[:2],
+                ]
+            ),
+        ),
+        feature("image", "image", 0.4),
+    ]
+    expected = {item.object_id: model.compress(item) for item in items}
+    actual = {}
+
+    model.compress_many(items, actual)
+
+    assert actual.keys() == expected.keys()
+    for object_id, expected_tokens in expected.items():
+        torch.testing.assert_close(actual[object_id], expected_tokens)
+
+
+def test_teacher_vectorized_pair_packing_matches_reference_assembly():
+    model = teacher().eval()
+    sources = [
+        model.compress(feature("source-table", "table", 0.1)),
+        model.compress(feature("source-text", "text", 0.2)),
+    ]
+    destinations = [
+        model.compress(feature("destination-image", "image", 0.3)),
+        model.compress(feature("destination-table", "table", 0.4)),
+    ]
+    source_types = ["table", "text"]
+    destination_types = ["image", "table"]
+    reference_sequences = []
+    for source, source_type, destination, destination_type in zip(
+        sources, source_types, destinations, destination_types
+    ):
+        source_id = TYPE_TO_ID[source_type]
+        destination_id = TYPE_TO_ID[destination_type]
+        pair_id = source_id * len(TYPE_TO_ID) + destination_id
+        reference_sequences.append(
+            torch.cat(
+                [
+                    (
+                        model.rel_token
+                        + model.type_pair_embeddings.weight[pair_id]
+                    ).unsqueeze(0),
+                    source
+                    + model.modality_embeddings.weight[source_id]
+                    + model.role_embeddings.weight[0],
+                    model.sep_token.unsqueeze(0),
+                    destination
+                    + model.modality_embeddings.weight[destination_id]
+                    + model.role_embeddings.weight[1],
+                ]
+            )
+        )
+    reference_inputs = torch.nn.utils.rnn.pad_sequence(
+        reference_sequences, batch_first=True
+    )
+    reference_mask = torch.arange(reference_inputs.shape[1]).unsqueeze(0) >= torch.tensor(
+        [sequence.shape[0] for sequence in reference_sequences]
+    ).unsqueeze(1)
+    reference = model.scoring_head(
+        model.relation_transformer(
+            reference_inputs,
+            src_key_padding_mask=reference_mask,
+        )[:, 0]
+    ).squeeze(-1)
+
+    actual = model.score_compressed_pairs(
+        sources,
+        source_types,
+        destinations,
+        destination_types,
+    )
+
+    torch.testing.assert_close(actual, reference)
 
 
 def test_cross_modal_edge_warmup_backpropagates_through_all_path_relations():
@@ -633,7 +896,7 @@ def test_training_loss_refreshes_every_hundred_steps_and_at_epoch_end():
     assert refreshes == [100, 200, 237]
 
 
-def test_train_stage1_defaults_to_full_feature_cache(monkeypatch):
+def test_train_stage1_uses_stage_specific_feature_cache_defaults(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
@@ -651,6 +914,11 @@ def test_train_stage1_defaults_to_full_feature_cache(monkeypatch):
         ],
     )
 
+    assert train_stage1.parse_args().feature_cache_size == 8_000
+
+    monkeypatch.setattr(
+        sys, "argv", [sys.argv[0], "student-edge", *sys.argv[2:]]
+    )
     assert train_stage1.parse_args().feature_cache_size == 60_000
 
 
@@ -778,6 +1046,120 @@ def test_lazy_feature_store_loads_teacher_tier_only_when_requested(tmp_path):
     )
     with pytest.raises(ValueError, match="has no hidden_states"):
         FeatureStore.from_path(feature_dir).get("q", include_hidden=True)
+
+
+def test_lazy_feature_store_preserves_native_teacher_dtype(tmp_path):
+    feature_dir = tmp_path / "features"
+    (feature_dir / "objects").mkdir(parents=True)
+    (feature_dir / "teacher_objects").mkdir()
+    torch.save(
+        {"embedding": torch.ones(4)},
+        feature_dir / "objects" / "text.pt",
+    )
+    torch.save(
+        {"hidden_states": torch.ones(3, 4, dtype=torch.bfloat16)},
+        feature_dir / "teacher_objects" / "text.pt",
+    )
+    (feature_dir / "manifest.jsonl").write_text(
+        json.dumps(
+            {
+                "object_id": "text",
+                "object_type": "text",
+                "feature_path": "objects/text.pt",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (feature_dir / "teacher_manifest.jsonl").write_text(
+        json.dumps(
+            {
+                "object_id": "text",
+                "object_type": "text",
+                "teacher_feature_path": "teacher_objects/text.pt",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cached = FeatureStore.from_path(feature_dir).get("text", include_hidden=True)
+    fp32 = cached.for_scoring(torch.device("cpu"), include_hidden=True)
+    bf16 = cached.for_scoring(
+        torch.device("cpu"),
+        include_hidden=True,
+        hidden_dtype=torch.bfloat16,
+    )
+
+    assert cached.hidden_states.dtype == torch.bfloat16
+    assert fp32.hidden_states.dtype == torch.float32
+    assert bf16.hidden_states.dtype == torch.bfloat16
+
+
+def test_lazy_feature_store_keeps_frequency_selected_hot_objects(monkeypatch, tmp_path):
+    feature_dir = tmp_path / "features"
+    (feature_dir / "objects").mkdir(parents=True)
+    (feature_dir / "teacher_objects").mkdir()
+    manifest = []
+    teacher_manifest = []
+    for object_id in ("hot", "cold-1", "cold-2"):
+        torch.save(
+            {"embedding": torch.ones(4)},
+            feature_dir / "objects" / f"{object_id}.pt",
+        )
+        torch.save(
+            {"hidden_states": torch.ones(2, 4)},
+            feature_dir / "teacher_objects" / f"{object_id}.pt",
+        )
+        manifest.append(
+            json.dumps(
+                {
+                    "object_id": object_id,
+                    "object_type": "text",
+                    "feature_path": f"objects/{object_id}.pt",
+                }
+            )
+        )
+        teacher_manifest.append(
+            json.dumps(
+                {
+                    "object_id": object_id,
+                    "object_type": "text",
+                    "teacher_feature_path": f"teacher_objects/{object_id}.pt",
+                }
+            )
+        )
+    (feature_dir / "manifest.jsonl").write_text(
+        "\n".join(manifest) + "\n", encoding="utf-8"
+    )
+    (feature_dir / "teacher_manifest.jsonl").write_text(
+        "\n".join(teacher_manifest) + "\n", encoding="utf-8"
+    )
+
+    loads = Counter()
+    original_load = stage1_features._load_tensor_file
+
+    def counted_load(path):
+        loads[path.stem] += 1
+        return original_load(path)
+
+    monkeypatch.setattr(stage1_features, "_load_tensor_file", counted_load)
+    store = FeatureStore.from_path(feature_dir, cache_size=1, cache_bytes=1)
+    hot_bytes = store.estimated_feature_bytes("hot", include_hidden=True)
+    plan = store.configure_hot_cache(
+        {"hot": 100.0, "cold-1": 1.0, "cold-2": 1.0},
+        byte_budget=hot_bytes,
+        object_budget=1,
+        include_hidden=True,
+    )
+
+    for object_id in ("hot", "cold-1", "cold-2", "hot"):
+        store.get(object_id, include_hidden=True)
+
+    assert plan["planned_objects"] == 1
+    assert loads["hot"] == 2
+    assert store.cache_info()["hot_objects"] == 1
+    assert store.cache_info()["lru_objects"] == 0
 
 
 def test_legacy_feature_cache_conversion_pools_tables_and_drops_unneeded_hidden(
@@ -1146,6 +1528,9 @@ def test_teacher_object_ids_collects_only_the_selected_split(tmp_path):
         "negative",
         "evidence",
     }
+    selector = tmp_path / "selector.jsonl"
+    selector.write_text(json.dumps({"object_id": "selected"}) + "\n", encoding="utf-8")
+    assert teacher_object_ids([selector], split=None) == {"selected"}
 
 
 def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
@@ -1494,11 +1879,13 @@ def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path
         raw_index_root=tmp_path / "raw_index",
         args=args,
     )
-    record = {"dev_loss": 1.0}
+    record = {"epoch": 0, "training_state": "initial"}
 
-    controller(1, StudentJoinabilityModel(4, 3), record)
+    controller(0, StudentJoinabilityModel(4, 3), record)
 
     assert record["dev_retrieval"]["raw_embedding"]["queries"] == 1
+    assert record["gate"]["improved"]
+    assert controller.gate.best_epoch == 0
     assert controller.best_metrics["raw_embedding"] == record["dev_retrieval"][
         "raw_embedding"
     ]
@@ -1539,6 +1926,46 @@ def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
     assert "direct_score" not in result
     assert "direct_rank" not in result
     assert "evidence_rank" not in result
+
+
+def test_weighted_rrf_can_preserve_direct_ranking_when_evidence_is_noisy():
+    class StaticIndices(_BatchedSearchMixin):
+        def search(self, source_id, destination_type, k):
+            del k
+            values = {
+                ("q", "table"): [("direct_first", 2.0), ("direct_second", 1.0)],
+                ("q", "text"): [("e", 2.0)],
+                ("e", "table"): [("direct_second", 2.0), ("direct_first", 1.0)],
+            }
+            return values.get((source_id, normalize_object_type(destination_type)), [])
+
+    rankings = retrieve_zero_one_hop_detailed(
+        "q",
+        StaticIndices(),
+        evidence_types=("text",),
+        fusion_mode="weighted_rrf",
+        direct_weight=1.0,
+        evidence_weight=0.0,
+    )
+
+    assert [row["target_id"] for row in rankings["fused"]] == [
+        "direct_first",
+        "direct_second",
+    ]
+
+    text_disabled = retrieve_zero_one_hop_detailed(
+        "q",
+        StaticIndices(),
+        evidence_types=("text",),
+        fusion_mode="weighted_rrf",
+        evidence_weight=0.0,
+        evidence_modality_weights={"text": 0.0},
+    )
+    assert not text_disabled["evidence"]
+    assert [row["target_id"] for row in text_disabled["fused"]] == [
+        "direct_first",
+        "direct_second",
+    ]
 
 
 def test_online_retrieval_scores_all_paths_before_compacting_stage2_detail():
@@ -2303,6 +2730,27 @@ def test_student_training_rejects_missing_teacher_logits():
             seed=13,
             temperature=1.0,
         )
+
+
+def test_zero_kd_student_training_needs_no_teacher_logits():
+    store = feature_store()
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    history = train_student_edges(
+        student_model,
+        [EdgeExample("q", ("positive", "negative"), 0)],
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.0,
+        in_batch_negatives=True,
+    )
+
+    assert history[0]["distillation_loss"] == pytest.approx(0.0)
+    assert history[0]["supervised_loss"] > 0
 
 
 def test_teacher_logit_sidecars_support_teacher_free_student_training(tmp_path):

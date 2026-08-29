@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -35,15 +37,49 @@ def _device_features(
     cache: dict[str, ObjectFeatures],
     device: torch.device,
     include_hidden: bool,
+    hidden_dtype: torch.dtype | None = None,
 ) -> ObjectFeatures:
     if object_id not in cache:
         if include_hidden:
             cache[object_id] = store.get(
                 object_id, include_hidden=True
-            ).for_scoring(device, include_hidden=True)
+            ).for_scoring(
+                device, include_hidden=True, hidden_dtype=hidden_dtype
+            )
         else:
             cache[object_id] = store.embedding_features(object_id)
     return cache[object_id]
+
+
+def _score_teacher_pairs(
+    model: TeacherJoinabilityModel,
+    sources: Sequence[ObjectFeatures],
+    destinations: Sequence[ObjectFeatures],
+    compression_cache: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Score unique directed object pairs and gather repeated occurrences."""
+
+    unique_sources = []
+    unique_destinations = []
+    pair_indices: dict[tuple[str, str], int] = {}
+    inverse = []
+    for source, destination in zip(sources, destinations):
+        pair = (source.object_id, destination.object_id)
+        if pair not in pair_indices:
+            pair_indices[pair] = len(unique_sources)
+            unique_sources.append(source)
+            unique_destinations.append(destination)
+        inverse.append(pair_indices[pair])
+    scores = model.score_pairs(
+        unique_sources,
+        unique_destinations,
+        compression_cache=compression_cache,
+    )
+    if len(unique_sources) == len(sources):
+        return scores
+    return scores.index_select(
+        0, torch.tensor(inverse, dtype=torch.long, device=scores.device)
+    )
 
 
 def _mask(lengths: Sequence[int], width: int, device: torch.device) -> torch.Tensor:
@@ -58,12 +94,24 @@ def score_edge_batch(
     device: torch.device,
 ) -> ListScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
+    hidden_dtype = (
+        model.compute_dtype or next(model.parameters()).dtype
+        if include_hidden
+        else None
+    )
     feature_cache: dict[str, ObjectFeatures] = {}
     sources = []
     destinations = []
     lengths = []
     for example in examples:
-        query = _device_features(example.query_id, store, feature_cache, device, include_hidden)
+        query = _device_features(
+            example.query_id,
+            store,
+            feature_cache,
+            device,
+            include_hidden,
+            hidden_dtype,
+        )
         source_type = (
             normalize_object_type(example.source_type) if example.source_type is not None else None
         )
@@ -79,7 +127,14 @@ def score_edge_batch(
             )
         lengths.append(len(example.candidate_ids))
         for candidate_id in example.candidate_ids:
-            destination = _device_features(candidate_id, store, feature_cache, device, include_hidden)
+            destination = _device_features(
+                candidate_id,
+                store,
+                feature_cache,
+                device,
+                include_hidden,
+                hidden_dtype,
+            )
             if (
                 destination_type is not None
                 and destination.object_type != destination_type
@@ -90,11 +145,178 @@ def score_edge_batch(
                 )
             sources.append(query)
             destinations.append(destination)
-    flat_scores = model.score_pairs(sources, destinations)
+    flat_scores = (
+        _score_teacher_pairs(model, sources, destinations)
+        if isinstance(model, TeacherJoinabilityModel)
+        else model.score_pairs(sources, destinations)
+    )
     rows = pad_sequence(list(flat_scores.split(lengths)), batch_first=True, padding_value=0.0)
     candidate_mask = _mask(lengths, rows.shape[1], device)
     positive_indices = torch.tensor([example.positive_index for example in examples], device=device)
     return ListScores(rows, candidate_mask, positive_indices)
+
+
+def _expanded_candidate_ids(
+    original_ids: Sequence[str],
+    pool_ids: Sequence[str],
+    positive_ids: set[str],
+    max_negatives: int,
+    rng: random.Random,
+) -> list[str]:
+    original = list(original_ids)
+    excluded = set(original) | positive_ids
+    extras = [object_id for object_id in pool_ids if object_id not in excluded]
+    if len(extras) > max_negatives:
+        selected = set(rng.sample(range(len(extras)), max_negatives))
+        extras = [value for index, value in enumerate(extras) if index in selected]
+    return [*original, *extras]
+
+
+def _score_student_candidate_rows(
+    student: StudentJoinabilityModel,
+    query_features: Sequence[ObjectFeatures],
+    candidate_rows: Sequence[Sequence[str]],
+    candidate_features: dict[str, ObjectFeatures],
+    positive_indices: Sequence[int],
+    device: torch.device,
+) -> ListScores:
+    parameter = next(student.parameters())
+    score_rows: list[torch.Tensor | None] = [None] * len(query_features)
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index, (query, candidate_ids) in enumerate(
+        zip(query_features, candidate_rows)
+    ):
+        destination_types = {candidate_features[value].object_type for value in candidate_ids}
+        if len(destination_types) != 1:
+            raise ValueError(
+                "In-batch candidate expansion requires one destination type per list"
+            )
+        groups[(query.object_type, next(iter(destination_types)))].append(index)
+
+    for (source_type, destination_type), row_indices in groups.items():
+        pooled_ids = list(
+            dict.fromkeys(
+                candidate_id
+                for row_index in row_indices
+                for candidate_id in candidate_rows[row_index]
+            )
+        )
+        query_embeddings = torch.stack(
+            [query_features[index].embedding for index in row_indices]
+        ).to(device=parameter.device, dtype=torch.float32)
+        candidate_embeddings = torch.stack(
+            [candidate_features[object_id].embedding for object_id in pooled_ids]
+        ).to(device=parameter.device, dtype=torch.float32)
+        query_vectors = student.project(query_embeddings, source_type)
+        candidate_vectors = student.project(candidate_embeddings, destination_type)
+        relation = student.relations[
+            student.relation_key(source_type, destination_type)
+        ]
+        score_matrix = query_vectors @ relation @ candidate_vectors.T
+        column_by_id = {object_id: column for column, object_id in enumerate(pooled_ids)}
+        for matrix_row, row_index in enumerate(row_indices):
+            columns = torch.tensor(
+                [column_by_id[value] for value in candidate_rows[row_index]],
+                device=score_matrix.device,
+            )
+            score_rows[row_index] = score_matrix[matrix_row].index_select(0, columns)
+
+    rows = [row for row in score_rows if row is not None]
+    if len(rows) != len(candidate_rows):
+        raise RuntimeError("Every in-batch candidate row must be scored")
+    logits = pad_sequence(rows, batch_first=True, padding_value=0.0)
+    lengths = [len(row) for row in candidate_rows]
+    return ListScores(
+        logits,
+        _mask(lengths, logits.shape[1], device),
+        torch.tensor(positive_indices, device=device),
+    )
+
+
+def score_edge_batch_in_batch(
+    student: StudentJoinabilityModel,
+    examples: Sequence[EdgeExample],
+    store: FeatureStore,
+    device: torch.device,
+    *,
+    max_negatives: int = 256,
+    rng: random.Random | None = None,
+) -> ListScores:
+    """Score each edge list against same-type candidates pooled from the batch."""
+
+    if max_negatives < 0:
+        raise ValueError("max_negatives must be non-negative")
+    rng = rng or random.Random(0)
+    cache: dict[str, ObjectFeatures] = {}
+    queries = []
+    destination_pools: dict[str, list[str]] = defaultdict(list)
+    destination_types = []
+    for example in examples:
+        query = _device_features(example.query_id, store, cache, device, False)
+        if example.source_type is not None and query.object_type != normalize_object_type(
+            example.source_type
+        ):
+            raise ValueError(
+                f"{example.query_id}: declared source_type {example.source_type!r} "
+                f"does not match cached type {query.object_type!r}"
+            )
+        candidates = [
+            _device_features(candidate_id, store, cache, device, False)
+            for candidate_id in example.candidate_ids
+        ]
+        types = {candidate.object_type for candidate in candidates}
+        if len(types) != 1:
+            raise ValueError(
+                "In-batch candidate expansion requires one destination type per edge list"
+            )
+        destination_type = next(iter(types))
+        if example.destination_type is not None and destination_type != normalize_object_type(
+            example.destination_type
+        ):
+            raise ValueError(
+                f"{example.query_id}: declared destination_type "
+                f"{example.destination_type!r} does not match cached candidates"
+            )
+        queries.append(query)
+        destination_types.append(destination_type)
+        destination_pools[destination_type].extend(example.candidate_ids)
+
+    destination_pools = {
+        key: list(dict.fromkeys(values)) for key, values in destination_pools.items()
+    }
+    candidate_rows = []
+    for example, destination_type in zip(examples, destination_types):
+        positive_id = example.candidate_ids[example.positive_index]
+        candidate_rows.append(
+            _expanded_candidate_ids(
+                example.candidate_ids,
+                destination_pools[destination_type],
+                {positive_id},
+                max_negatives,
+                rng,
+            )
+        )
+    return _score_student_candidate_rows(
+        student,
+        queries,
+        candidate_rows,
+        cache,
+        [example.positive_index for example in examples],
+        device,
+    )
+
+
+def restrict_list_scores(
+    scores: ListScores, lengths: Sequence[int], device: torch.device
+) -> ListScores:
+    """Restrict expanded rows back to their original candidate prefixes."""
+
+    width = max(lengths)
+    return ListScores(
+        scores.logits[:, :width],
+        _mask(lengths, width, device),
+        scores.positive_indices,
+    )
 
 
 def score_target_batch(
@@ -105,6 +327,11 @@ def score_target_batch(
     aggregator: PathAggregator,
 ) -> TargetScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
+    hidden_dtype = (
+        model.compute_dtype or next(model.parameters()).dtype
+        if include_hidden
+        else None
+    )
     feature_cache: dict[str, ObjectFeatures] = {}
     direct_sources = []
     direct_destinations = []
@@ -115,14 +342,35 @@ def score_target_batch(
     evidence_lengths = []
 
     for example in examples:
-        query = _device_features(example.query_id, store, feature_cache, device, include_hidden)
+        query = _device_features(
+            example.query_id,
+            store,
+            feature_cache,
+            device,
+            include_hidden,
+            hidden_dtype,
+        )
         for candidate in example.candidates:
-            target = _device_features(candidate.target_id, store, feature_cache, device, include_hidden)
+            target = _device_features(
+                candidate.target_id,
+                store,
+                feature_cache,
+                device,
+                include_hidden,
+                hidden_dtype,
+            )
             direct_sources.append(query)
             direct_destinations.append(target)
             evidence_lengths.append(len(candidate.evidence_ids))
             for evidence_id in candidate.evidence_ids:
-                evidence = _device_features(evidence_id, store, feature_cache, device, include_hidden)
+                evidence = _device_features(
+                    evidence_id,
+                    store,
+                    feature_cache,
+                    device,
+                    include_hidden,
+                    hidden_dtype,
+                )
                 evidence_sources.append(query)
                 evidence_destinations.append(evidence)
                 target_sources.append(evidence)
@@ -130,21 +378,24 @@ def score_target_batch(
 
     if isinstance(model, TeacherJoinabilityModel):
         compression_cache: dict[str, torch.Tensor] = {}
-        direct_scores = model.score_pairs(
+        direct_scores = _score_teacher_pairs(
+            model,
             direct_sources,
             direct_destinations,
-            compression_cache=compression_cache,
+            compression_cache,
         )
         if evidence_sources:
-            query_evidence_scores = model.score_pairs(
+            query_evidence_scores = _score_teacher_pairs(
+                model,
                 evidence_sources,
                 evidence_destinations,
-                compression_cache=compression_cache,
+                compression_cache,
             )
-            evidence_target_edge_scores = model.score_pairs(
+            evidence_target_edge_scores = _score_teacher_pairs(
+                model,
                 target_sources,
                 target_destinations,
-                compression_cache=compression_cache,
+                compression_cache,
             )
         else:
             query_evidence_scores = direct_scores.new_empty(0)
@@ -209,4 +460,62 @@ def score_target_batch(
     return TargetScores(
         direct=ListScores(direct_rows, candidate_mask, direct_positive_indices),
         evidence=ListScores(evidence_rows, evidence_mask, evidence_positive_indices),
+    )
+
+
+def score_target_direct_batch_in_batch(
+    student: StudentJoinabilityModel,
+    examples: Sequence[TargetExample],
+    store: FeatureStore,
+    device: torch.device,
+    *,
+    max_negatives: int = 256,
+    rng: random.Random | None = None,
+) -> ListScores:
+    """Expand direct target lists with other table candidates from the batch."""
+
+    if max_negatives < 0:
+        raise ValueError("max_negatives must be non-negative")
+    rng = rng or random.Random(0)
+    cache: dict[str, ObjectFeatures] = {}
+    queries = [
+        _device_features(example.query_id, store, cache, device, False)
+        for example in examples
+    ]
+    all_target_ids = list(
+        dict.fromkeys(
+            candidate.target_id
+            for example in examples
+            for candidate in example.candidates
+        )
+    )
+    for target_id in all_target_ids:
+        target = _device_features(target_id, store, cache, device, False)
+        if target.object_type != "table":
+            raise ValueError(
+                "Direct in-batch candidate expansion requires table targets"
+            )
+
+    candidate_rows = []
+    for example in examples:
+        original_ids = [candidate.target_id for candidate in example.candidates]
+        positive_ids = set(example.positive_target_ids) or {
+            original_ids[example.direct_positive_index]
+        }
+        candidate_rows.append(
+            _expanded_candidate_ids(
+                original_ids,
+                all_target_ids,
+                positive_ids,
+                max_negatives,
+                rng,
+            )
+        )
+    return _score_student_candidate_rows(
+        student,
+        queries,
+        candidate_rows,
+        cache,
+        [example.direct_positive_index for example in examples],
+        device,
     )
