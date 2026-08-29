@@ -11,6 +11,7 @@ from .data import TargetExample
 from .retrieval import (
     RawEmbeddingANNIndices,
     StudentANNIndices,
+    fuse_ranked_channels,
     retrieve_zero_one_hop_detailed,
 )
 
@@ -58,16 +59,22 @@ def _retrieval_metrics(
     query_indices: Sequence[int],
     rankings: dict[str, list[list[str]]],
     positive_sets: Sequence[set[str]],
-    positive_evidence_hits: Sequence[bool],
+    positive_evidence_hits: dict[str, Sequence[bool]],
 ) -> dict[str, Any]:
     selected_positives = [positive_sets[index] for index in query_indices]
     selected_rankings = {
         channel: [values[index] for index in query_indices]
         for channel, values in rankings.items()
     }
-    positive_evidence_path_queries = sum(
-        positive_evidence_hits[index] for index in query_indices
-    )
+    def fused_metrics(channel: str) -> dict[str, Any]:
+        count = sum(positive_evidence_hits[channel][index] for index in query_indices)
+        return {
+            **_channel_metrics(selected_rankings[channel], selected_positives),
+            "positive_evidence_path_queries@10": count,
+            "positive_evidence_path_coverage@10": count / len(query_indices),
+        }
+
+    primary_fused = fused_metrics("fused")
     fused = _channel_metrics(selected_rankings["fused"], selected_positives)
     return {
         "queries": len(query_indices),
@@ -76,10 +83,14 @@ def _retrieval_metrics(
         "evidence": _channel_metrics(
             selected_rankings["evidence"], selected_positives
         ),
-        "positive_evidence_path_queries@10": positive_evidence_path_queries,
-        "positive_evidence_path_coverage@10": (
-            positive_evidence_path_queries / len(query_indices)
-        ),
+        "fused_e0": fused_metrics("fused_e0"),
+        "fused_e005": fused_metrics("fused_e005"),
+        "positive_evidence_path_queries@10": primary_fused[
+            "positive_evidence_path_queries@10"
+        ],
+        "positive_evidence_path_coverage@10": primary_fused[
+            "positive_evidence_path_coverage@10"
+        ],
     }
 
 
@@ -94,12 +105,13 @@ def evaluate_student_retrieval(
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
     rrf_k: int = 60,
-    fusion_mode: str = "rrf",
+    fusion_mode: str = "weighted_rrf",
     direct_weight: float = 1.0,
-    evidence_weight: float = 1.0,
+    evidence_weight: float = 0.05,
     gated_evidence_min_paths: int = 2,
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
+    identity_baseline_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate fixed queries against the shared full-corpus ANN indexes."""
 
@@ -110,8 +122,14 @@ def evaluate_student_retrieval(
         "fused": [],
         "direct": [],
         "evidence": [],
+        "fused_e0": [],
+        "fused_e005": [],
     }
-    positive_evidence_hits: list[bool] = []
+    positive_evidence_hits: dict[str, list[bool]] = {
+        "fused": [],
+        "fused_e0": [],
+        "fused_e005": [],
+    }
     for example in progress(
         examples, desc="Retrieval evaluation", unit="query", leave=False
     ):
@@ -134,6 +152,22 @@ def evaluate_student_retrieval(
             gated_evidence_quantile=gated_evidence_quantile,
             evidence_modality_weights=evidence_modality_weights,
         )
+        result["fused_e0"] = fuse_ranked_channels(
+            result["direct"],
+            result["evidence"],
+            rrf_k=rrf_k,
+            fusion_mode="weighted_rrf",
+            direct_weight=direct_weight,
+            evidence_weight=0.0,
+        )
+        result["fused_e005"] = fuse_ranked_channels(
+            result["direct"],
+            result["evidence"],
+            rrf_k=rrf_k,
+            fusion_mode="weighted_rrf",
+            direct_weight=direct_weight,
+            evidence_weight=0.05,
+        )
         for channel in rankings:
             rankings[channel].append(
                 [str(item["target_id"]) for item in result[channel]]
@@ -144,16 +178,17 @@ def evaluate_student_retrieval(
             for candidate in example.candidates
             if candidate.target_id in positives and candidate.evidence_ids
         }
-        positive_evidence_hits.append(any(
-            str(item["target_id"]) in positive_evidence
-            and any(
-                path["kind"] == "evidence"
-                and str(path["evidence_id"])
-                in positive_evidence[str(item["target_id"])]
-                for path in item["paths"]
-            )
-            for item in result["fused"][:10]
-        ))
+        for channel in positive_evidence_hits:
+            positive_evidence_hits[channel].append(any(
+                str(item["target_id"]) in positive_evidence
+                and any(
+                    path["kind"] == "evidence"
+                    and str(path["evidence_id"])
+                    in positive_evidence[str(item["target_id"])]
+                    for path in item["paths"]
+                )
+                for item in result[channel][:10]
+            ))
 
     metrics = _retrieval_metrics(
         list(range(len(examples))), rankings, positive_sets, positive_evidence_hits
@@ -172,6 +207,16 @@ def evaluate_student_retrieval(
         )
         for dataset in datasets
     }
+    if identity_baseline_metrics is not None:
+        metrics["evidence_identity_baseline"] = {
+            **identity_baseline_metrics["evidence"],
+            "by_dataset": {
+                dataset: values["evidence"]
+                for dataset, values in identity_baseline_metrics[
+                    "by_dataset"
+                ].items()
+            },
+        }
     return metrics
 
 

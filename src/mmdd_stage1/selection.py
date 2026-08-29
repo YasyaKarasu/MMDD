@@ -107,6 +107,16 @@ class CheckpointManager:
     def update_best(self, candidate: Path) -> None:
         self._copy(candidate, self.paths["best"])
 
+    def prune_candidates(self, retained_epochs: set[int]) -> None:
+        """Keep only explicitly retained per-epoch checkpoints."""
+
+        retained_names = {
+            f"epoch_{epoch:03d}.pt" for epoch in retained_epochs
+        }
+        for candidate in self.paths["epochs"].glob("epoch_*.pt"):
+            if candidate.name not in retained_names:
+                candidate.unlink()
+
     @staticmethod
     def _copy(source: Path, destination: Path) -> None:
         temporary = destination.with_suffix(destination.suffix + ".tmp")

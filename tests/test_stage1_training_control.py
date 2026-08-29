@@ -29,6 +29,7 @@ from mmdd_stage1.selection import (
     write_json,
 )
 from mmdd_stage1.training import oversample_student_edges, sample_mixed_epoch
+from mmdd_stage1.teacher_rerank import ensemble_scores, z_scores
 from mmdd_stage1.workflow import RoundStep, validate_round_index, workflow_fingerprint
 
 
@@ -53,6 +54,53 @@ def test_checkpoint_gate_keeps_best_and_last_separate_and_stops_on_patience(tmp_
     assert torch.load(manager.paths["last"], weights_only=True)["epoch"] == 3
     assert first != second != third
 
+    manager.prune_candidates({1, 3})
+    assert first.is_file()
+    assert not second.exists()
+    assert third.is_file()
+
+
+def test_per_dataset_gate_parses_alias_and_evaluates_nested_metric():
+    constraint = train_stage1._parse_per_dataset_gate(
+        "wdc2k_v2:direct_recall@10>=0.609"
+    )
+
+    results = train_stage1._per_dataset_gate_results(
+        {"by_dataset": {"wdc2k_v2": {"direct": {"recall@10": 0.61}}}},
+        [constraint],
+    )
+
+    assert constraint == ("wdc2k_v2", "direct.recall@10", ">=", 0.609)
+    assert results[0]["satisfied"] is True
+
+
+def test_per_dataset_gate_rejects_invalid_syntax():
+    with pytest.raises(argparse.ArgumentTypeError, match="DATASET:METRIC"):
+        train_stage1._parse_per_dataset_gate("wdc2k_v2=0.609")
+
+
+def test_per_dataset_gate_falls_back_to_epoch_zero_when_never_satisfied(tmp_path):
+    controller = object.__new__(train_stage1._EpochController)
+    controller.manager = CheckpointManager(tmp_path / "student.pt")
+    candidate = controller.manager.save_candidate(0, {"epoch": 0})
+    controller.gate = MetricGate("recall@10")
+    controller.best_metrics = None
+    controller.best_index = None
+    controller.per_dataset_gates = [
+        ("wdc2k_v2", "direct.recall@10", ">=", 0.609)
+    ]
+    controller.epoch_zero_fallback = (candidate, {"recall@10": 0.35}, None)
+    controller.gate_unsatisfied = False
+
+    controller.finalize_gate()
+
+    assert controller.gate_unsatisfied is True
+    assert controller.gate.best_epoch == 0
+    assert controller.best_metrics == {"recall@10": 0.35}
+    assert torch.load(controller.manager.paths["best"], weights_only=True) == {
+        "epoch": 0
+    }
+
 
 def test_teacher_rerank_diagnostic_correlation_and_decision_thresholds():
     assert diagnose_stage1_teacher_rerank.spearman_correlation(
@@ -70,6 +118,43 @@ def test_teacher_rerank_diagnostic_correlation_and_decision_thresholds():
         diagnose_stage1_teacher_rerank._branch(0.36, 0.33)
         == "teacher_is_harmful"
     )
+
+
+def test_teacher_ensemble_normalizes_within_query_and_preserves_alpha_endpoints():
+    raw = [1.0, 2.0, 3.0]
+    teacher = [30.0, 20.0, 10.0]
+
+    assert z_scores([4.0, 4.0]) == [0.0, 0.0]
+    assert ensemble_scores(raw, teacher, 0.0) == pytest.approx(z_scores(raw))
+    assert ensemble_scores(raw, teacher, 1.0) == pytest.approx(z_scores(teacher))
+    assert ensemble_scores(raw, teacher, 0.5) == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_teacher_ensemble_selection_enforces_wdc_raw_guard():
+    payload = {
+        "raw_direct": {
+            "by_dataset": {"wdc2k_v2": {"recall@10": 0.63}}
+        },
+        "ensembles": [
+            {
+                "alpha": 0.7,
+                "recall@10": 0.45,
+                "mrr@100": 0.2,
+                "by_dataset": {"wdc2k_v2": {"recall@10": 0.60}},
+            },
+            {
+                "alpha": 0.3,
+                "recall@10": 0.42,
+                "mrr@100": 0.3,
+                "by_dataset": {"wdc2k_v2": {"recall@10": 0.63}},
+            },
+        ],
+    }
+
+    selected = diagnose_stage1_teacher_rerank._select_ensemble(payload)
+
+    assert selected["alpha"] == pytest.approx(0.3)
+    assert selected["accepted"] is True
 
 
 def test_teacher_rerank_interval_must_fit_training_schedule():
@@ -245,7 +330,15 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     )
 
     metrics = evaluate_student_retrieval(
-        [example], StaticIndices(), evidence_types=("text",)
+        [example],
+        StaticIndices(),
+        evidence_types=("text",),
+        identity_baseline_metrics={
+            "evidence": {"recall@10": 0.75},
+            "by_dataset": {
+                "EntiTables": {"evidence": {"recall@10": 0.5}}
+            },
+        },
     )
 
     assert metrics["recall@10"] == 1.0
@@ -257,6 +350,12 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert metrics["positive_evidence_path_coverage@10"] == 1.0
     assert metrics["by_dataset"]["EntiTables"]["queries"] == 1
     assert metrics["by_dataset"]["EntiTables"]["direct"]["recall@10"] == 1.0
+    assert metrics["fused_e0"]["positive_evidence_path_coverage@10"] == 1.0
+    assert metrics["fused_e005"]["recall@10"] == 1.0
+    assert metrics["evidence_identity_baseline"]["recall@10"] == 0.75
+    assert metrics["evidence_identity_baseline"]["by_dataset"]["EntiTables"][
+        "recall@10"
+    ] == 0.5
 
 
 def test_teacher_feature_readiness_requires_actual_hidden_states(tmp_path):

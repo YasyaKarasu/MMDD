@@ -1,0 +1,137 @@
+#!/usr/bin/env python
+"""Evaluate one dev-selected Stage-1 Student checkpoint without retraining."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from mmdd_stage1.checkpoints import load_path_aggregation, load_student
+from mmdd_stage1.data import load_target_examples
+from mmdd_stage1.evaluation import evaluate_student_retrieval
+from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.retrieval import (
+    StudentANNIndices,
+    checkpoint_fingerprint,
+    load_corpus_ids,
+    load_or_build_raw_embedding_indices,
+)
+from mmdd_stage1.selection import load_stage1_selection, write_json
+
+
+def _examples(paths: list[str]) -> list[Any]:
+    return [
+        example
+        for value in paths
+        for example in load_target_examples(
+            Path(value), split="dev", dataset_name=Path(value).stem
+        )
+    ]
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    selection = load_stage1_selection(Path(args.selection))
+    if selection.get("completed_stage") != "student-path":
+        raise ValueError("Selection must describe a student-path checkpoint")
+    checkpoint_path = Path(selection["best_checkpoint"])
+    index_dir = Path(selection["best_index"])
+    corpus_path = Path(args.corpus)
+    corpus_sha256 = checkpoint_fingerprint(corpus_path)
+    if corpus_sha256 != selection.get("corpus_sha256"):
+        raise ValueError("Selection and corpus fingerprints differ")
+    checkpoint_sha256 = checkpoint_fingerprint(checkpoint_path)
+    if checkpoint_sha256 != selection.get("best_checkpoint_sha256"):
+        raise ValueError("Selection and checkpoint fingerprints differ")
+
+    device = torch.device(
+        args.device
+        if args.device != "auto"
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    store = FeatureStore.from_path(
+        Path(args.features), cache_size=args.feature_cache_size
+    )
+    student = load_student(checkpoint_path, device)
+    student.eval()
+    indices = StudentANNIndices(
+        student,
+        store,
+        index_dir,
+        device=device,
+        checkpoint_sha256=checkpoint_sha256,
+        corpus_sha256=corpus_sha256,
+    )
+    examples = _examples(args.dev_data)
+    saved_aggregation, saved_top_k = load_path_aggregation(checkpoint_path)
+    evidence_aggregation = args.evidence_aggregation or saved_aggregation
+    evidence_top_k = (
+        args.evidence_top_k
+        if args.evidence_top_k is not None
+        else saved_top_k
+    )
+    raw_indices = load_or_build_raw_embedding_indices(
+        store,
+        load_corpus_ids(corpus_path, store),
+        Path(selection["raw_embedding_index"]),
+        corpus_sha256=corpus_sha256,
+        batch_size=args.index_batch_size,
+        m=args.hnsw_m,
+        ef_construction=args.ef_construction,
+        ef_search=args.ef_search,
+    )
+    raw_metrics = evaluate_student_retrieval(
+        examples,
+        raw_indices,
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
+        fusion_mode="weighted_rrf",
+        evidence_weight=0.05,
+    )
+    metrics = evaluate_student_retrieval(
+        examples,
+        indices,
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
+        fusion_mode="weighted_rrf",
+        evidence_weight=0.05,
+        identity_baseline_metrics=raw_metrics,
+    )
+    payload = {
+        "format_version": 1,
+        "selection": str(Path(args.selection).resolve()),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "best_epoch": selection["best_epoch"],
+        "corpus_sha256": corpus_sha256,
+        "metrics": metrics,
+        "raw_embedding": raw_metrics,
+    }
+    write_json(Path(args.output), payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return payload
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--selection", required=True)
+    parser.add_argument("--features", required=True)
+    parser.add_argument("--dev-data", nargs="+", required=True)
+    parser.add_argument("--corpus", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--feature-cache-size", type=int, default=60_000)
+    parser.add_argument("--evidence-aggregation")
+    parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--index-batch-size", type=int, default=1024)
+    parser.add_argument("--hnsw-m", type=int, default=32)
+    parser.add_argument("--ef-construction", type=int, default=200)
+    parser.add_argument("--ef-search", type=int, default=100)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run(parse_args())

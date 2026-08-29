@@ -335,6 +335,20 @@ ranks each target in both channels. `--fusion-mode` selects ordinary RRF,
 weighted RRF, or evidence-gated RRF. Weighted RRF uses `--direct-weight` and
 `--evidence-weight`; setting the latter to zero makes fused ranking exactly
 direct ranking while retaining discovered evidence paths for Stage 2.
+The Stage-1 round-2 default is `--fusion-mode weighted_rrf
+--evidence-weight 0.05`. Evaluation also emits `fused_e0` and `fused_e005`
+for direct-only and default-fusion comparisons from the same retrieval pass.
+When a raw embedding index is available, `evidence_identity_baseline` records
+the evidence channel with identity relations.
+
+For frozen-PCA Student path runs, `--anchor-weight-evidence` gives the four
+table-to/from-text/image relations an independent identity-anchor weight.
+Every epoch history records `relation_drift` (`||R-I||_F`) for all nine
+directed relation matrices. Repeated `--per-dataset-gate
+DATASET:METRIC>=VALUE` constraints restrict checkpoint selection to qualifying
+epochs and fall back to epoch 0 with `gate_unsatisfied: true` if none qualify.
+A clean dataset-gated KD ablation can use `--distillation-datasets` to apply
+the global `--distillation-weight` only to named datasets.
 `--evidence-modality-weights text=1 image=0.3` applies optional modality priors
 inside the evidence channel. `--rrf-k` controls the rank constant (default 60). The channel
 ranks and `direct_score` are intermediate values and are not written to the

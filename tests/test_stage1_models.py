@@ -315,6 +315,90 @@ def test_frozen_pca_student_records_freeze_and_anchor_penalizes_only_relations()
     assert stage1_training.student_anchor_loss(model).item() == pytest.approx(0.25)
 
 
+def test_evidence_anchor_weight_targets_only_table_evidence_relations():
+    model = StudentJoinabilityModel(
+        input_dim=2,
+        student_dim=2,
+        initialization="identity",
+        freeze_projections=True,
+    )
+    with torch.no_grad():
+        model.relations["table_to_text"][0, 0].add_(1.0)
+
+    assert stage1_training.student_anchor_loss(model).item() == pytest.approx(0.25)
+    assert stage1_training.student_evidence_anchor_loss(model).item() == pytest.approx(
+        0.25
+    )
+    anchor, weighted = stage1_training._anchor_losses(model, 0.1, 1.0)
+    assert anchor.item() == pytest.approx(0.25)
+    assert weighted.item() == pytest.approx(0.25)
+    assert stage1_training.student_relation_drift(model)["table_to_text"] == pytest.approx(
+        1.0
+    )
+
+    with torch.no_grad():
+        model.relations["table_to_table"][0, 0].add_(1.0)
+    _anchor, weighted = stage1_training._anchor_losses(model, 0.1, 1.0)
+    assert weighted.item() == pytest.approx(0.275)
+
+
+def test_path_distillation_row_mask_excludes_unselected_dataset_rows():
+    direct = stage1_training.ListScores(
+        torch.tensor([[3.0, 0.0], [0.0, 3.0]]),
+        torch.ones(2, 2, dtype=torch.bool),
+        torch.tensor([0, 0]),
+    )
+    evidence = stage1_training.ListScores(
+        torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
+        torch.ones(2, 2, dtype=torch.bool),
+        torch.tensor([0, 0]),
+    )
+    student = stage1_training.TargetScores(direct, evidence)
+    teacher = stage1_training.TargetScores(
+        stage1_training.ListScores(
+            torch.tensor([[0.0, 3.0], [3.0, 0.0]]),
+            direct.candidate_mask,
+            direct.positive_indices,
+        ),
+        stage1_training.ListScores(
+            torch.tensor([[0.0, 2.0], [2.0, 0.0]]),
+            evidence.candidate_mask,
+            evidence.positive_indices,
+        ),
+    )
+
+    selected = stage1_training._path_distillation_losses(
+        student, teacher, 1.0, torch.tensor([False, True])
+    )[0]
+    expected = stage1_training._path_distillation_losses(
+        stage1_training.TargetScores(
+            stage1_training.ListScores(
+                direct.logits[1:], direct.candidate_mask[1:], direct.positive_indices[1:]
+            ),
+            stage1_training.ListScores(
+                evidence.logits[1:],
+                evidence.candidate_mask[1:],
+                evidence.positive_indices[1:],
+            ),
+        ),
+        stage1_training.TargetScores(
+            stage1_training.ListScores(
+                teacher.direct.logits[1:],
+                teacher.direct.candidate_mask[1:],
+                teacher.direct.positive_indices[1:],
+            ),
+            stage1_training.ListScores(
+                teacher.evidence.logits[1:],
+                teacher.evidence.candidate_mask[1:],
+                teacher.evidence.positive_indices[1:],
+            ),
+        ),
+        1.0,
+    )[0]
+
+    assert selected.item() == pytest.approx(expected.item())
+
+
 def test_student_in_batch_scoring_expands_lists_and_respects_maximum():
     store = FeatureStore(
         {

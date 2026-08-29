@@ -40,6 +40,51 @@ def _branch(raw_recall: float, reranked_recall: float) -> str:
     return "teacher_has_no_incremental_value"
 
 
+def _select_ensemble(payload: dict[str, Any]) -> dict[str, Any] | None:
+    ensembles = payload.get("ensembles", [])
+    if not ensembles:
+        return None
+    raw = payload["raw_direct"]
+    wdc_dataset = next(
+        (
+            dataset
+            for dataset in raw["by_dataset"]
+            if dataset.lower().startswith("wdc")
+        ),
+        None,
+    )
+    eligible = ensembles
+    if wdc_dataset is not None:
+        raw_wdc = float(raw["by_dataset"][wdc_dataset]["recall@10"])
+        guarded = [
+            metrics
+            for metrics in ensembles
+            if float(metrics["by_dataset"][wdc_dataset]["recall@10"])
+            >= raw_wdc
+        ]
+        if guarded:
+            eligible = guarded
+    best = max(
+        eligible,
+        key=lambda metrics: (
+            float(metrics["recall@10"]),
+            float(metrics["mrr@100"]),
+            -float(metrics["alpha"]),
+        ),
+    )
+    wdc_pass = wdc_dataset is None or (
+        float(best["by_dataset"][wdc_dataset]["recall@10"])
+        >= float(raw["by_dataset"][wdc_dataset]["recall@10"])
+    )
+    return {
+        "alpha": float(best["alpha"]),
+        "metrics": best,
+        "wdc_dataset": wdc_dataset,
+        "wdc_guard_satisfied": wdc_pass,
+        "accepted": float(best["recall@10"]) >= 0.42 and wdc_pass,
+    }
+
+
 def _evidence_to_table_examples(args: argparse.Namespace) -> list[TargetExample]:
     examples = []
     for path_value in args.edge_dev_data or []:
@@ -93,6 +138,36 @@ def _markdown(payload: dict[str, Any]) -> str:
             "",
         ]
     )
+    if payload.get("ensembles"):
+        rows.extend(
+            [
+                "## Raw + Teacher z-score ensemble",
+                "",
+                "| Alpha | Scope | R@10 | R@100 | MRR@100 |",
+                "| ---: | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for ensemble in payload["ensembles"]:
+            alpha = float(ensemble["alpha"])
+            rows.append(
+                f"| {alpha:g} | overall | {ensemble['recall@10']:.2%} | "
+                f"{ensemble['recall@100']:.2%} | {ensemble['mrr@100']:.4f} |"
+            )
+            for dataset, metrics in ensemble["by_dataset"].items():
+                rows.append(
+                    f"| {alpha:g} | {dataset} | {metrics['recall@10']:.2%} | "
+                    f"{metrics['recall@100']:.2%} | {metrics['mrr@100']:.4f} |"
+                )
+        selection = payload["ensemble_selection"]
+        rows.extend(
+            [
+                "",
+                f"- Selected alpha: `{selection['alpha']:g}`",
+                f"- WDC guard satisfied: **{selection['wdc_guard_satisfied']}**",
+                f"- Task C acceptance: **{selection['accepted']}**",
+                "",
+            ]
+        )
     evidence_to_table = payload.get("evidence_to_table")
     if evidence_to_table is not None:
         rows.extend(
@@ -110,6 +185,19 @@ def _markdown(payload: dict[str, Any]) -> str:
                 "",
             ]
         )
+        if evidence_to_table.get("ensembles"):
+            rows.extend(
+                [
+                    "| Alpha | Ensemble R@10 | R@100 | MRR@100 |",
+                    "| ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for ensemble in evidence_to_table["ensembles"]:
+                rows.append(
+                    f"| {ensemble['alpha']:g} | {ensemble['recall@10']:.2%} | "
+                    f"{ensemble['recall@100']:.2%} | {ensemble['mrr@100']:.4f} |"
+                )
+            rows.append("")
     return "\n".join(rows)
 
 
@@ -238,6 +326,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         store,
         device=device,
         batch_size=args.teacher_batch_size,
+        ensemble_alphas=args.ensemble_alphas,
     )
     raw_metrics = evaluation["raw_direct"]
     teacher_metrics = evaluation["teacher_reranked"]
@@ -256,7 +345,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             float(raw_metrics["recall@10"]),
             float(teacher_metrics["recall@10"]),
         ),
+        "ensembles": evaluation["ensembles"],
     }
+    payload["ensemble_selection"] = _select_ensemble(payload)
     if evidence_to_table_examples:
         payload["evidence_to_table"] = evaluate_teacher_reranking(
             teacher,
@@ -265,7 +356,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             store,
             device=device,
             batch_size=args.teacher_batch_size,
+            ensemble_alphas=args.ensemble_alphas,
         )
+    selection = payload["ensemble_selection"]
+    if selection is not None and selection["accepted"]:
+        interface_path = output_dir / "ensemble_config.json"
+        write_json(
+            interface_path,
+            {
+                "format_version": 1,
+                "score": "alpha*z(teacher)+(1-alpha)*z(raw_cosine)",
+                "normalization": "per_query_candidate_list",
+                "alpha": selection["alpha"],
+                "teacher_checkpoint": str(teacher_path.resolve()),
+                "teacher_checkpoint_sha256": payload[
+                    "teacher_checkpoint_sha256"
+                ],
+                "raw_top_k": args.raw_top_k,
+                "corpus_sha256": corpus_sha256,
+            },
+        )
+        payload["ensemble_interface"] = str(interface_path.resolve())
     write_json(output_dir / "metrics.json", payload)
     report = _markdown(payload)
     (output_dir / "RESULTS.md").write_text(report, encoding="utf-8")
@@ -280,6 +391,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "recall@10_delta": payload["recall@10_delta"],
                 "spearman": payload["spearman"],
                 "decision": payload["decision"],
+                "ensembles": payload["ensembles"],
+                "ensemble_selection": payload["ensemble_selection"],
                 "evidence_to_table": payload.get("evidence_to_table"),
                 "output_dir": str(output_dir),
             },
@@ -308,6 +421,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--raw-top-k", type=int, default=100)
     parser.add_argument("--teacher-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--ensemble-alphas",
+        type=float,
+        nargs="*",
+        default=[0.3, 0.4, 0.5, 0.6, 0.7],
+        help="Teacher weights for per-query z-score raw/Teacher ensembles.",
+    )
     parser.add_argument("--feature-cache-size", type=int, default=60_000)
     parser.add_argument("--index-batch-size", type=int, default=1024)
     parser.add_argument("--hnsw-m", type=int, default=32)

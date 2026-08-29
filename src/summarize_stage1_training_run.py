@@ -9,25 +9,51 @@ from pathlib import Path
 from typing import Any
 
 
-def _metrics_row(scope: str, ranking: str, metrics: dict[str, Any]) -> str:
-    channel = metrics if ranking == "fused" else metrics[ranking]
+def _metrics_row(scope: str, ranking: str, channel: dict[str, Any]) -> str:
+    coverage = channel.get("positive_evidence_path_coverage@10")
+    rendered_coverage = "-" if coverage is None else f"{coverage:.2%}"
     return (
         f"| {scope} | {ranking} | {channel['recall@10']:.2%} | "
-        f"{channel['recall@100']:.2%} | {channel['mrr@100']:.4f} |"
+        f"{channel['recall@100']:.2%} | {channel['mrr@100']:.4f} | "
+        f"{rendered_coverage} |"
     )
 
 
 def _metric_table(metrics: dict[str, Any]) -> list[str]:
     lines = [
-        "| Scope | Channel | R@10 | R@100 | MRR@100 |",
-        "| --- | --- | ---: | ---: | ---: |",
+        "| Scope | Channel | R@10 | R@100 | MRR@100 | Coverage@10 |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
-    for channel in ("direct", "evidence", "fused"):
-        lines.append(_metrics_row("overall", channel, metrics))
+    channels = ["direct", "evidence", "fused"]
+    channels.extend(
+        channel
+        for channel in ("fused_e0", "fused_e005", "evidence_identity_baseline")
+        if channel in metrics
+    )
+    for channel in channels:
+        values = metrics if channel == "fused" else metrics[channel]
+        lines.append(_metrics_row("overall", channel, values))
     for dataset, dataset_metrics in metrics.get("by_dataset", {}).items():
-        for channel in ("direct", "evidence", "fused"):
-            lines.append(_metrics_row(dataset, channel, dataset_metrics))
+        for channel in channels:
+            if channel == "fused":
+                values = dataset_metrics
+            elif channel == "evidence_identity_baseline":
+                values = metrics[channel]["by_dataset"][dataset]
+            else:
+                values = dataset_metrics[channel]
+            lines.append(_metrics_row(dataset, channel, values))
     return lines
+
+
+def _drift_table(record: dict[str, Any]) -> list[str]:
+    drift = record.get("relation_drift")
+    if not drift:
+        return []
+    return [
+        "| Relation | ||R-I||_F |",
+        "| --- | ---: |",
+        *(f"| {relation} | {value:.6f} |" for relation, value in drift.items()),
+    ]
 
 
 def run(args: argparse.Namespace) -> str:
@@ -56,13 +82,26 @@ def run(args: argparse.Namespace) -> str:
         "",
         f"Artifact: `{history_path.parent}`",
         "",
+        f"Configuration: anchor mu={payload.get('anchor_weight', 0):g}, "
+        f"evidence mu={payload.get('anchor_weight_evidence', payload.get('anchor_weight', 0)):g}; "
+        f"dataset alpha={payload.get('dataset_sampling_alpha', 'unknown')}; "
+        f"gate_unsatisfied={payload.get('gate_unsatisfied', False)}.",
+        "",
         "## Epoch 0",
         "",
         *_metric_table(epoch_zero["dev_retrieval"]),
         "",
+        "### Epoch-0 relation drift",
+        "",
+        *_drift_table(epoch_zero),
+        "",
         f"## Best epoch ({best_epoch})",
         "",
         *_metric_table(best["dev_retrieval"]),
+        "",
+        "### Best relation drift",
+        "",
+        *_drift_table(best),
         "",
         "## Raw reference",
         "",

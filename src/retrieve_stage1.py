@@ -138,9 +138,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--rrf-k", type=int, default=60)
-    parser.add_argument("--fusion-mode", choices=["rrf", "weighted_rrf", "gated"], default="rrf")
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["rrf", "weighted_rrf", "gated"],
+        default="weighted_rrf",
+    )
     parser.add_argument("--direct-weight", type=float, default=1.0)
-    parser.add_argument("--evidence-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=0.05)
     parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
     parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
     parser.add_argument("--evidence-modality-weights", nargs="*", type=_modality_weight, default=[])

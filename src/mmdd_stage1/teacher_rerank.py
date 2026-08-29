@@ -18,6 +18,37 @@ from .models import TeacherJoinabilityModel
 RECALL_KS = (10, 100)
 
 
+def z_scores(values: Sequence[float]) -> list[float]:
+    """Normalize one query's candidate scores without cross-query leakage."""
+
+    if not values:
+        return []
+    mean = statistics.fmean(values)
+    scale = math.sqrt(statistics.fmean((value - mean) ** 2 for value in values))
+    if scale == 0:
+        return [0.0] * len(values)
+    return [(value - mean) / scale for value in values]
+
+
+def ensemble_scores(
+    raw_scores: Sequence[float],
+    teacher_scores: Sequence[float],
+    alpha: float,
+) -> list[float]:
+    """Combine per-query normalized raw and Teacher scores."""
+
+    if len(raw_scores) != len(teacher_scores):
+        raise ValueError("Raw and Teacher candidate scores must align")
+    if not 0 <= alpha <= 1:
+        raise ValueError("Teacher ensemble alpha must be in [0, 1]")
+    normalized_raw = z_scores(raw_scores)
+    normalized_teacher = z_scores(teacher_scores)
+    return [
+        alpha * teacher + (1.0 - alpha) * raw
+        for raw, teacher in zip(normalized_raw, normalized_teacher)
+    ]
+
+
 def _average_ranks(values: Sequence[float]) -> list[float]:
     order = sorted(range(len(values)), key=lambda index: (values[index], index))
     ranks = [0.0] * len(values)
@@ -144,14 +175,21 @@ def evaluate_teacher_reranking(
     *,
     device: torch.device,
     batch_size: int,
+    ensemble_alphas: Sequence[float] = (),
 ) -> dict[str, Any]:
     """Rerank fixed raw candidates and return overall and per-dataset metrics."""
 
     if len(examples) != len(raw_hits_by_query) or batch_size <= 0:
         raise ValueError("Teacher rerank inputs must align and batch_size be positive")
+    if any(not 0 <= alpha <= 1 for alpha in ensemble_alphas):
+        raise ValueError("Teacher ensemble alphas must be in [0, 1]")
+    alphas = list(dict.fromkeys(float(alpha) for alpha in ensemble_alphas))
     teacher.eval()
     raw_rankings = []
     teacher_rankings = []
+    ensemble_rankings: dict[float, list[list[str]]] = {
+        alpha: [] for alpha in alphas
+    }
     positive_sets = []
     correlations = []
     for example, raw_hits in progress(
@@ -180,6 +218,17 @@ def evaluate_teacher_reranking(
                 )
             ]
         )
+        for alpha in alphas:
+            combined = ensemble_scores(raw_scores, teacher_scores, alpha)
+            ensemble_rankings[alpha].append(
+                [
+                    candidate_ids[index]
+                    for index in sorted(
+                        range(len(candidate_ids)),
+                        key=lambda index: (-combined[index], candidate_ids[index]),
+                    )
+                ]
+            )
         positive_sets.append(set(example.positive_target_ids))
         correlations.append(spearman_correlation(raw_scores, teacher_scores))
 
@@ -191,6 +240,13 @@ def evaluate_teacher_reranking(
     teacher_metrics["by_dataset"] = _metrics_by_dataset(
         examples, teacher_rankings, positive_sets
     )
+    ensembles = []
+    for alpha in alphas:
+        metrics = _retrieval_metrics(ensemble_rankings[alpha], positive_sets)
+        metrics["by_dataset"] = _metrics_by_dataset(
+            examples, ensemble_rankings[alpha], positive_sets
+        )
+        ensembles.append({"alpha": alpha, **metrics})
     return {
         "raw_direct": raw_metrics,
         "teacher_reranked": teacher_metrics,
@@ -202,4 +258,5 @@ def evaluate_teacher_reranking(
             "mean": statistics.fmean(correlations),
             "median": statistics.median(correlations),
         },
+        "ensembles": ensembles,
     }

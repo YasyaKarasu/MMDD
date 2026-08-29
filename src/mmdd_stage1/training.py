@@ -281,7 +281,38 @@ def _path_distillation_losses(
     student: TargetScores,
     teacher: TargetScores,
     temperature: float,
+    row_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if row_mask is not None:
+        if row_mask.shape != (student.direct.logits.shape[0],):
+            raise ValueError("Distillation row mask must match the batch")
+        if not row_mask.any().item():
+            zero = student.direct.logits.sum() * 0.0
+            return zero, zero, zero
+        student = TargetScores(
+            direct=ListScores(
+                student.direct.logits[row_mask],
+                student.direct.candidate_mask[row_mask],
+                student.direct.positive_indices[row_mask],
+            ),
+            evidence=ListScores(
+                student.evidence.logits[row_mask],
+                student.evidence.candidate_mask[row_mask],
+                student.evidence.positive_indices[row_mask],
+            ),
+        )
+        teacher = TargetScores(
+            direct=ListScores(
+                teacher.direct.logits[row_mask],
+                teacher.direct.candidate_mask[row_mask],
+                teacher.direct.positive_indices[row_mask],
+            ),
+            evidence=ListScores(
+                teacher.evidence.logits[row_mask],
+                teacher.evidence.candidate_mask[row_mask],
+                teacher.evidence.positive_indices[row_mask],
+            ),
+        )
     direct = distillation_kl(
         student.direct.logits,
         teacher.direct.logits,
@@ -341,14 +372,66 @@ def student_anchor_loss(student: StudentJoinabilityModel) -> torch.Tensor:
     return relation_anchor + projection_anchor
 
 
-def _anchor_loss(
-    student: StudentJoinabilityModel, anchor_weight: float
+def student_evidence_anchor_loss(
+    student: StudentJoinabilityModel,
 ) -> torch.Tensor:
-    return (
-        student_anchor_loss(student)
-        if anchor_weight > 0
-        else next(student.parameters()).new_zeros(())
+    """Return the anchor term for the four table/evidence relations."""
+
+    parameter = next(student.parameters())
+    identity = torch.eye(
+        student.student_dim, device=parameter.device, dtype=parameter.dtype
     )
+    evidence_keys = {
+        student.relation_key("table", "text"),
+        student.relation_key("text", "table"),
+        student.relation_key("table", "image"),
+        student.relation_key("image", "table"),
+    }
+    return sum(
+        (student.relations[key] - identity).square().sum()
+        / (student.student_dim**2)
+        for key in evidence_keys
+    )
+
+
+def student_relation_drift(
+    student: StudentJoinabilityModel,
+) -> dict[str, float]:
+    """Measure the Frobenius distance from identity for every relation."""
+
+    parameter = next(student.parameters())
+    identity = torch.eye(
+        student.student_dim, device=parameter.device, dtype=parameter.dtype
+    )
+    with torch.no_grad():
+        return {
+            key: float(torch.linalg.vector_norm(relation - identity).cpu())
+            for key, relation in sorted(student.relations.items())
+        }
+
+
+def _anchor_losses(
+    student: StudentJoinabilityModel,
+    anchor_weight: float,
+    anchor_weight_evidence: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    evidence_weight = (
+        anchor_weight
+        if anchor_weight_evidence is None
+        else anchor_weight_evidence
+    )
+    if anchor_weight == 0 and evidence_weight == 0:
+        zero = next(student.parameters()).new_zeros(())
+        return zero, zero
+    anchor = student_anchor_loss(student)
+    if evidence_weight == anchor_weight:
+        return anchor, anchor_weight * anchor
+    evidence_anchor = student_evidence_anchor_loss(student)
+    weighted = (
+        anchor_weight * anchor
+        + (evidence_weight - anchor_weight) * evidence_anchor
+    )
+    return anchor, weighted
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -430,6 +513,7 @@ def _student_edge_objective(
     temperature: float,
     distillation_weight: float,
     anchor_weight: float,
+    anchor_weight_evidence: float | None,
     in_batch_negatives: bool,
     in_batch_max_negatives: int,
 ) -> float:
@@ -476,12 +560,11 @@ def _student_edge_objective(
             if teacher_scores is not None
             else student_scores.logits.new_zeros(())
         )
+        _anchor, weighted_anchor = _anchor_losses(
+            student, anchor_weight, anchor_weight_evidence
+        )
         losses.append(
-            float(
-                supervised
-                + distillation_weight * distillation
-                + anchor_weight * _anchor_loss(student, anchor_weight)
-            )
+            float(supervised + distillation_weight * distillation + weighted_anchor)
         )
     return _mean(losses)
 
@@ -511,6 +594,8 @@ def _student_path_objective(
     temperature: float,
     distillation_weight: float,
     anchor_weight: float,
+    anchor_weight_evidence: float | None,
+    distillation_datasets: set[str] | None,
     in_batch_negatives: bool,
     in_batch_max_negatives: int,
 ) -> float:
@@ -544,19 +629,30 @@ def _student_path_objective(
                 expanded_direct.candidate_mask,
             )
             supervised = direct + evidence
+        distillation_rows = (
+            torch.tensor(
+                [example.dataset in distillation_datasets for example in batch],
+                dtype=torch.bool,
+                device=device,
+            )
+            if distillation_datasets is not None
+            else None
+        )
         distillation = (
             _path_distillation_losses(
-                student_scores, teacher_scores, temperature
+                student_scores,
+                teacher_scores,
+                temperature,
+                distillation_rows,
             )[0]
             if teacher_scores is not None
             else supervised.new_zeros(())
         )
+        _anchor, weighted_anchor = _anchor_losses(
+            student, anchor_weight, anchor_weight_evidence
+        )
         losses.append(
-            float(
-                supervised
-                + distillation_weight * distillation
-                + anchor_weight * _anchor_loss(student, anchor_weight)
-            )
+            float(supervised + distillation_weight * distillation + weighted_anchor)
         )
     return _mean(losses)
 
@@ -710,6 +806,7 @@ def train_student_edges(
     temperature: float,
     distillation_weight: float = 1.0,
     anchor_weight: float = 0.0,
+    anchor_weight_evidence: float | None = None,
     in_batch_negatives: bool = False,
     in_batch_max_negatives: int = 256,
     edge_type_oversample: dict[str, int] | None = None,
@@ -728,10 +825,12 @@ def train_student_edges(
         supervised_losses = []
         distillation_losses = []
         anchor_losses = []
+        weighted_anchor_losses = []
         pending_losses = []
         pending_supervised_losses = []
         pending_distillation_losses = []
         pending_anchor_losses = []
+        pending_weighted_anchor_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -790,17 +889,20 @@ def train_student_edges(
                 if teacher_scores is not None
                 else student_scores.logits.new_zeros(())
             )
-            anchor = _anchor_loss(student, anchor_weight)
+            anchor, weighted_anchor = _anchor_losses(
+                student, anchor_weight, anchor_weight_evidence
+            )
             total = (
                 supervised
                 + distillation_weight * distillation
-                + anchor_weight * anchor
+                + weighted_anchor
             )
             _optimize(total, optimizer)
             pending_losses.append(total.detach())
             pending_supervised_losses.append(supervised.detach())
             pending_distillation_losses.append(distillation.detach())
             pending_anchor_losses.append(anchor.detach())
+            pending_weighted_anchor_losses.append(weighted_anchor.detach())
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_losses, losses)
                 _flush_loss_values(pending_supervised_losses, supervised_losses)
@@ -808,6 +910,9 @@ def train_student_edges(
                     pending_distillation_losses, distillation_losses
                 )
                 _flush_loss_values(pending_anchor_losses, anchor_losses)
+                _flush_loss_values(
+                    pending_weighted_anchor_losses, weighted_anchor_losses
+                )
                 batch_bar.set_postfix(loss=f"{_mean(losses):.4f}")
         train_loss = _mean(losses)
         values = {
@@ -816,7 +921,7 @@ def train_student_edges(
             "supervised_loss": _mean(supervised_losses),
             "distillation_loss": _mean(distillation_losses),
             "anchor_loss": _mean(anchor_losses),
-            "weighted_anchor_loss": anchor_weight * _mean(anchor_losses),
+            "weighted_anchor_loss": _mean(weighted_anchor_losses),
         }
         if dev_examples:
             values["dev_loss"] = _student_edge_objective(
@@ -828,6 +933,7 @@ def train_student_edges(
                 temperature,
                 distillation_weight,
                 anchor_weight,
+                anchor_weight_evidence,
                 in_batch_negatives,
                 in_batch_max_negatives,
             )
@@ -855,6 +961,8 @@ def train_student_paths(
     temperature: float,
     distillation_weight: float,
     anchor_weight: float = 0.0,
+    anchor_weight_evidence: float | None = None,
+    distillation_datasets: set[str] | None = None,
     in_batch_negatives: bool = False,
     in_batch_max_negatives: int = 256,
     dataset_sampling_alpha: float = 0.0,
@@ -879,6 +987,7 @@ def train_student_paths(
         direct_distillation_losses = []
         evidence_distillation_losses = []
         anchor_losses = []
+        weighted_anchor_losses = []
         pending_totals = []
         pending_supervised_losses = []
         pending_distillation_losses = []
@@ -887,6 +996,7 @@ def train_student_paths(
         pending_direct_distillation_losses = []
         pending_evidence_distillation_losses = []
         pending_anchor_losses = []
+        pending_weighted_anchor_losses = []
         sampled, source_samples = sample_mixed_epoch(
             examples,
             hard_examples,
@@ -927,20 +1037,37 @@ def train_student_paths(
                 )
                 supervised = direct_supervised + evidence_supervised
             if teacher_scores is not None:
+                distillation_rows = (
+                    torch.tensor(
+                        [
+                            example.dataset in distillation_datasets
+                            for example in batch
+                        ],
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    if distillation_datasets is not None
+                    else None
+                )
                 distillation, direct_distillation, evidence_distillation = (
                     _path_distillation_losses(
-                        student_scores, teacher_scores, temperature
+                        student_scores,
+                        teacher_scores,
+                        temperature,
+                        distillation_rows,
                     )
                 )
             else:
                 distillation = supervised.new_zeros(())
                 direct_distillation = supervised.new_zeros(())
                 evidence_distillation = supervised.new_zeros(())
-            anchor = _anchor_loss(student, anchor_weight)
+            anchor, weighted_anchor = _anchor_losses(
+                student, anchor_weight, anchor_weight_evidence
+            )
             total = (
                 supervised
                 + distillation_weight * distillation
-                + anchor_weight * anchor
+                + weighted_anchor
             )
             _optimize(total, optimizer)
             pending_totals.append(total.detach())
@@ -951,6 +1078,7 @@ def train_student_paths(
             pending_direct_distillation_losses.append(direct_distillation.detach())
             pending_evidence_distillation_losses.append(evidence_distillation.detach())
             pending_anchor_losses.append(anchor.detach())
+            pending_weighted_anchor_losses.append(weighted_anchor.detach())
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_totals, totals)
                 _flush_loss_values(pending_supervised_losses, supervised_losses)
@@ -970,6 +1098,9 @@ def train_student_paths(
                     evidence_distillation_losses,
                 )
                 _flush_loss_values(pending_anchor_losses, anchor_losses)
+                _flush_loss_values(
+                    pending_weighted_anchor_losses, weighted_anchor_losses
+                )
                 batch_bar.set_postfix(loss=f"{_mean(totals):.4f}")
         train_loss = _mean(totals)
         values = {
@@ -982,7 +1113,7 @@ def train_student_paths(
             "direct_distillation_loss": _mean(direct_distillation_losses),
             "evidence_distillation_loss": _mean(evidence_distillation_losses),
             "anchor_loss": _mean(anchor_losses),
-            "weighted_anchor_loss": anchor_weight * _mean(anchor_losses),
+            "weighted_anchor_loss": _mean(weighted_anchor_losses),
         }
         if dev_examples:
             values["dev_loss"] = _student_path_objective(
@@ -995,6 +1126,8 @@ def train_student_paths(
                 temperature,
                 distillation_weight,
                 anchor_weight,
+                anchor_weight_evidence,
+                distillation_datasets,
                 in_batch_negatives,
                 in_batch_max_negatives,
             )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -31,7 +32,12 @@ from mmdd_stage1.retrieval import (
     load_or_build_raw_embedding_indices,
     load_corpus_ids,
 )
-from mmdd_stage1.selection import CheckpointManager, MetricGate, write_json
+from mmdd_stage1.selection import (
+    CheckpointManager,
+    MetricGate,
+    metric_value,
+    write_json,
+)
 from mmdd_stage1.teacher_logits import (
     has_teacher_logits,
     load_teacher_logits,
@@ -40,6 +46,7 @@ from mmdd_stage1.teacher_logits import (
 from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
 from mmdd_stage1.training import (
     checkpoint,
+    student_relation_drift,
     train_student_edges,
     train_student_paths,
     train_teacher_edges,
@@ -47,6 +54,55 @@ from mmdd_stage1.training import (
 )
 
 STAGES = ("teacher-edge", "teacher-path", "student-edge", "student-path")
+
+
+def _parse_per_dataset_gate(
+    value: str,
+) -> tuple[str, str, str, float]:
+    match = re.fullmatch(
+        r"([^:]+):(.+?)(>=|<=|>|<)([-+]?(?:\d+(?:\.\d*)?|\.\d+))",
+        value.strip(),
+    )
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "dataset gates must use DATASET:METRIC>=VALUE"
+        )
+    dataset, metric, comparison, raw_threshold = match.groups()
+    for channel in ("direct", "evidence", "fused"):
+        metric = metric.replace(f"{channel}_recall@", f"{channel}.recall@")
+        metric = metric.replace(f"{channel}_mrr@", f"{channel}.mrr@")
+    return dataset, metric, comparison, float(raw_threshold)
+
+
+def _per_dataset_gate_results(
+    metrics: dict[str, Any],
+    constraints: list[tuple[str, str, str, float]],
+) -> list[dict[str, Any]]:
+    comparisons = {
+        ">=": lambda value, threshold: value >= threshold,
+        "<=": lambda value, threshold: value <= threshold,
+        ">": lambda value, threshold: value > threshold,
+        "<": lambda value, threshold: value < threshold,
+    }
+    results = []
+    for dataset, metric, comparison, threshold in constraints:
+        by_dataset = metrics.get("by_dataset", {})
+        if dataset not in by_dataset:
+            raise ValueError(
+                f"Per-dataset gate references absent dataset {dataset!r}"
+            )
+        value = metric_value(by_dataset[dataset], metric)
+        results.append(
+            {
+                "dataset": dataset,
+                "metric": metric,
+                "comparison": comparison,
+                "threshold": threshold,
+                "value": value,
+                "satisfied": comparisons[comparison](value, threshold),
+            }
+        )
+    return results
 
 
 def _feature_cache_size(stage: str, value: int | None) -> int:
@@ -341,6 +397,11 @@ class _EpochController:
         self.latest_index: Path | None = None
         self.created_indices: list[Path] = []
         self.raw_embedding_metrics: dict[str, Any] | None = None
+        self.per_dataset_gates = list(getattr(args, "per_dataset_gate", []))
+        self.gate_unsatisfied = False
+        self.epoch_zero_fallback: tuple[
+            Path, dict[str, Any], Path | None
+        ] | None = None
         self.stop_reason = "max_epochs"
         self.corpus_sha256 = (
             checkpoint_fingerprint(corpus_path) if corpus_path is not None else None
@@ -401,6 +462,8 @@ class _EpochController:
         model: TeacherJoinabilityModel | StudentJoinabilityModel,
         record: dict[str, Any],
     ) -> bool:
+        if isinstance(model, StudentJoinabilityModel):
+            record["relation_drift"] = student_relation_drift(model)
         candidate = self.manager.save_candidate(
             epoch, checkpoint(model, self.stage, self.aggregator)
         )
@@ -437,29 +500,6 @@ class _EpochController:
                 checkpoint_sha256=candidate_sha256,
                 corpus_sha256=self.corpus_sha256,
             )
-            retrieval_metrics = evaluate_student_retrieval(
-                self.dev_examples,
-                indices,
-                direct_k=self.args.direct_k,
-                evidence_k=self.args.evidence_k,
-                targets_per_evidence=self.args.targets_per_evidence,
-                evidence_types=tuple(self.args.evidence_types),
-                evidence_aggregation=self.aggregator.evidence_aggregation,
-                evidence_top_k=self.aggregator.top_k,
-                rrf_k=self.args.rrf_k,
-                fusion_mode=getattr(self.args, "fusion_mode", "rrf"),
-                direct_weight=getattr(self.args, "direct_weight", 1.0),
-                evidence_weight=getattr(self.args, "evidence_weight", 1.0),
-                gated_evidence_min_paths=getattr(
-                    self.args, "gated_evidence_min_paths", 2
-                ),
-                gated_evidence_quantile=getattr(
-                    self.args, "gated_evidence_quantile", 0.75
-                ),
-                evidence_modality_weights=getattr(
-                    self.args, "evidence_modality_weights", None
-                ),
-            )
             if self.raw_embedding_metrics is None:
                 raw_indices = load_or_build_raw_embedding_indices(
                     self.store,
@@ -481,9 +521,11 @@ class _EpochController:
                     evidence_aggregation=self.aggregator.evidence_aggregation,
                     evidence_top_k=self.aggregator.top_k,
                     rrf_k=self.args.rrf_k,
-                    fusion_mode=getattr(self.args, "fusion_mode", "rrf"),
+                    fusion_mode=getattr(
+                        self.args, "fusion_mode", "weighted_rrf"
+                    ),
                     direct_weight=getattr(self.args, "direct_weight", 1.0),
-                    evidence_weight=getattr(self.args, "evidence_weight", 1.0),
+                    evidence_weight=getattr(self.args, "evidence_weight", 0.05),
                     gated_evidence_min_paths=getattr(
                         self.args, "gated_evidence_min_paths", 2
                     ),
@@ -494,6 +536,30 @@ class _EpochController:
                         self.args, "evidence_modality_weights", None
                     ),
                 )
+            retrieval_metrics = evaluate_student_retrieval(
+                self.dev_examples,
+                indices,
+                direct_k=self.args.direct_k,
+                evidence_k=self.args.evidence_k,
+                targets_per_evidence=self.args.targets_per_evidence,
+                evidence_types=tuple(self.args.evidence_types),
+                evidence_aggregation=self.aggregator.evidence_aggregation,
+                evidence_top_k=self.aggregator.top_k,
+                rrf_k=self.args.rrf_k,
+                fusion_mode=getattr(self.args, "fusion_mode", "weighted_rrf"),
+                direct_weight=getattr(self.args, "direct_weight", 1.0),
+                evidence_weight=getattr(self.args, "evidence_weight", 0.05),
+                gated_evidence_min_paths=getattr(
+                    self.args, "gated_evidence_min_paths", 2
+                ),
+                gated_evidence_quantile=getattr(
+                    self.args, "gated_evidence_quantile", 0.75
+                ),
+                evidence_modality_weights=getattr(
+                    self.args, "evidence_modality_weights", None
+                ),
+                identity_baseline_metrics=self.raw_embedding_metrics,
+            )
             retrieval_metrics["raw_embedding"] = self.raw_embedding_metrics
             record["dev_retrieval"] = retrieval_metrics
             gate_metrics = dict(retrieval_metrics)
@@ -531,12 +597,46 @@ class _EpochController:
             index_dir = None
             gate_metrics = {"dev_loss": record["dev_loss"]}
 
+        if epoch == 0:
+            self.epoch_zero_fallback = (candidate, gate_metrics, index_dir)
+        constraint_results = _per_dataset_gate_results(
+            gate_metrics, self.per_dataset_gates
+        )
+        constraints_satisfied = all(
+            result["satisfied"] for result in constraint_results
+        )
+        if not constraints_satisfied:
+            should_stop = False
+            if self.gate.best_value is not None:
+                self.gate.bad_epochs += 1
+                should_stop = (
+                    self.gate.patience > 0
+                    and self.gate.bad_epochs >= self.gate.patience
+                )
+            record["gate"] = {
+                "primary_metric": self.gate.primary_metric,
+                "value": metric_value(gate_metrics, self.gate.primary_metric),
+                "improved": False,
+                "bad_epochs": self.gate.bad_epochs,
+                "eligible": False,
+                "per_dataset": constraint_results,
+            }
+            record["best_epoch_so_far"] = (
+                self.gate.best_epoch if self.gate.best_value is not None else None
+            )
+            if should_stop:
+                self.stop_reason = (
+                    f"early_stopping_patience_{self.gate.patience}"
+                )
+            return should_stop
         decision = self.gate.observe(epoch, gate_metrics)
         record["gate"] = {
             "primary_metric": self.gate.primary_metric,
             "value": decision.value,
             "improved": decision.improved,
             "bad_epochs": decision.bad_epochs,
+            "eligible": True,
+            "per_dataset": constraint_results,
         }
         record["best_epoch_so_far"] = decision.best_epoch
         if decision.improved:
@@ -546,6 +646,19 @@ class _EpochController:
         if decision.should_stop:
             self.stop_reason = f"early_stopping_patience_{self.gate.patience}"
         return decision.should_stop
+
+    def finalize_gate(self) -> None:
+        if self.best_metrics is not None:
+            return
+        if not self.per_dataset_gates or self.epoch_zero_fallback is None:
+            raise RuntimeError("No checkpoint was eligible for dev selection")
+        candidate, metrics, index_dir = self.epoch_zero_fallback
+        self.manager.update_best(candidate)
+        self.best_metrics = metrics
+        self.best_index = index_dir
+        self.gate.best_epoch = 0
+        self.gate.best_value = metric_value(metrics, self.gate.primary_metric)
+        self.gate_unsatisfied = True
 
     def prune_indices(self) -> None:
         retained = {self.best_index, self.latest_index}
@@ -586,14 +699,15 @@ def _validate_teacher_rerank_interval(args: argparse.Namespace) -> None:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     optional_defaults = {
         "anchor_weight": 0.0,
+        "anchor_weight_evidence": None,
         "relation_learning_rate": None,
         "freeze_projection": None,
         "in_batch_negatives": False,
         "in_batch_max_negatives": 256,
         "eval_epoch_zero": True,
-        "fusion_mode": "rrf",
+        "fusion_mode": "weighted_rrf",
         "direct_weight": 1.0,
-        "evidence_weight": 1.0,
+        "evidence_weight": 0.05,
         "gated_evidence_min_paths": 2,
         "gated_evidence_quantile": 0.75,
         "evidence_modality_weights": [],
@@ -607,6 +721,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_amp": "off",
         "feature_cache_gb": None,
         "feature_hot_fraction": 0.8,
+        "per_dataset_gate": [],
+        "distillation_datasets": [],
     }
     for name, default in optional_defaults.items():
         if not hasattr(args, name):
@@ -630,8 +746,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--temperature must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
+    if args.distillation_datasets and args.stage != "student-path":
+        raise ValueError("--distillation-datasets is only valid for student-path")
     if args.anchor_weight < 0:
         raise ValueError("--anchor-weight must be non-negative")
+    if args.anchor_weight_evidence is not None and args.anchor_weight_evidence < 0:
+        raise ValueError("--anchor-weight-evidence must be non-negative")
     if args.relation_learning_rate is not None and args.relation_learning_rate <= 0:
         raise ValueError("--relation-learning-rate must be positive")
     if args.in_batch_max_negatives < 0:
@@ -670,6 +790,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--feature-cache-gb must be positive")
     if not 0 <= args.feature_hot_fraction <= 1:
         raise ValueError("--feature-hot-fraction must be in [0, 1]")
+    if args.per_dataset_gate and args.stage != "student-path":
+        raise ValueError("--per-dataset-gate is only valid for student-path")
+    if args.per_dataset_gate and not args.eval_epoch_zero:
+        raise ValueError("--per-dataset-gate requires --eval-epoch-zero")
     _validate_teacher_rerank_interval(args)
     validate_protocol_split("training", args.split)
     validate_protocol_split("dev_gate", args.dev_split)
@@ -718,6 +842,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     examples = loader(base_paths, args.split)
     hard_examples = loader(hard_paths, args.split) if hard_paths else []
     dev_examples = loader(dev_paths, args.dev_split)
+    unknown_distillation_datasets = set(args.distillation_datasets) - {
+        example.dataset for example in examples
+    }
+    if unknown_distillation_datasets:
+        raise ValueError(
+            "--distillation-datasets contains absent training datasets: "
+            + ", ".join(sorted(unknown_distillation_datasets))
+        )
     hot_cache_plan = None
     if teacher_stage and (hot_cache_objects or hot_cache_bytes):
         access_weights = _feature_access_weights(
@@ -982,6 +1114,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             temperature=args.temperature,
             distillation_weight=args.distillation_weight,
             anchor_weight=args.anchor_weight,
+            anchor_weight_evidence=args.anchor_weight_evidence,
             in_batch_negatives=args.in_batch_negatives,
             in_batch_max_negatives=args.in_batch_max_negatives,
             edge_type_oversample=args.edge_type_oversample,
@@ -1020,6 +1153,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             temperature=args.temperature,
             distillation_weight=args.distillation_weight,
             anchor_weight=args.anchor_weight,
+            anchor_weight_evidence=args.anchor_weight_evidence,
+            distillation_datasets=(
+                set(args.distillation_datasets)
+                if args.distillation_datasets
+                else None
+            ),
             in_batch_negatives=args.in_batch_negatives,
             in_batch_max_negatives=args.in_batch_max_negatives,
             **common,
@@ -1027,7 +1166,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if epoch_zero_record is not None:
             history.insert(0, epoch_zero_record)
 
+    controller.finalize_gate()
     controller.prune_indices()
+    controller.manager.prune_candidates({0, controller.gate.best_epoch})
     paths = controller.manager.paths
     assert controller.best_metrics is not None
     best_sha256 = checkpoint_fingerprint(paths["best"])
@@ -1065,6 +1206,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "learning_rate": learning_rate,
         "relation_learning_rate": relation_learning_rate,
         "anchor_weight": args.anchor_weight,
+        "anchor_weight_evidence": (
+            args.anchor_weight
+            if args.anchor_weight_evidence is None
+            else args.anchor_weight_evidence
+        ),
+        "distillation_datasets": args.distillation_datasets,
+        "per_dataset_gate": args.per_dataset_gate,
+        "gate_unsatisfied": controller.gate_unsatisfied,
         "in_batch_negatives": args.in_batch_negatives,
         "in_batch_max_negatives": args.in_batch_max_negatives,
         "edge_type_oversample": args.edge_type_oversample,
@@ -1097,6 +1246,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "base_examples": len(examples),
         "hard_examples": len(hard_examples),
         "hard_fraction": args.hard_fraction if hard_examples else 0.0,
+        "dataset_sampling_alpha": args.dataset_sampling_alpha,
         "mining_round": mining_round,
         "teacher_cache_generated": teacher_cache_generated,
         "teacher_logit_cache_hits": teacher_cache_hits,
@@ -1109,6 +1259,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "completed_stage": args.stage,
         "selection_split": "dev",
         "primary_metric": controller.gate.primary_metric,
+        "per_dataset_gate": args.per_dataset_gate,
+        "gate_unsatisfied": controller.gate_unsatisfied,
         "best_epoch": controller.gate.best_epoch,
         "best_metrics": controller.best_metrics,
         "best_checkpoint": str(paths["best"].resolve()),
@@ -1323,6 +1475,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--anchor-weight", type=float, default=0.0)
     parser.add_argument(
+        "--anchor-weight-evidence",
+        type=float,
+        help="Independent anchor weight for table<->text/image relations (defaults to --anchor-weight).",
+    )
+    parser.add_argument(
+        "--per-dataset-gate",
+        type=_parse_per_dataset_gate,
+        action="append",
+        default=[],
+        metavar="DATASET:METRIC>=VALUE",
+    )
+    parser.add_argument(
         "--in-batch-negatives",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1344,6 +1508,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--distillation-datasets",
+        nargs="*",
+        default=[],
+        help="Restrict path KD to these dataset names; empty applies KD globally.",
+    )
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--direct-k", type=int, default=100)
@@ -1361,10 +1531,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fusion-mode",
         choices=["rrf", "weighted_rrf", "gated"],
-        default="rrf",
+        default="weighted_rrf",
     )
     parser.add_argument("--direct-weight", type=float, default=1.0)
-    parser.add_argument("--evidence-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=0.05)
     parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
     parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
     parser.add_argument("--index-batch-size", type=int, default=1024)
