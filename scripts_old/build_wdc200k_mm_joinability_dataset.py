@@ -3697,6 +3697,7 @@ def _run_fast_materialization_resume(
         table_total = config.max_source_tables
         finalize_steps = 15
         total_work = table_total * 2 + finalize_steps
+        balance_source_total = 0
         reporter.update(
             stage="materialize",
             detail="resume materialization",
@@ -3723,6 +3724,7 @@ def _run_fast_materialization_resume(
             reporter.update(counters=counters)
 
         def report_materialization(event: dict[str, Any]) -> None:
+            nonlocal total_work, balance_source_total
             phase = str(event.get("phase") or "materialize")
             completed = int(event.get("completed", 0))
             if phase == "query_auto_check_prepare":
@@ -3735,14 +3737,43 @@ def _run_fast_materialization_resume(
                 overall = table_total + completed
                 detail = "materialize source tables"
             elif phase == "balance_explicit_joins":
-                overall = table_total * 2
-                detail = "balance explicit joins"
+                balance_total = int(event.get("total_sources", 0))
+                balance_completed = int(event.get("completed_sources", 0))
+                if balance_total > 0:
+                    balance_source_total = balance_total
+                    total_work = max(
+                        total_work,
+                        table_total * 2 + balance_source_total + finalize_steps,
+                    )
+                overall = table_total * 2 + min(
+                    balance_completed, balance_source_total
+                )
+                subphase = str(event.get("subphase") or "run")
+                detail = f"balance explicit joins ({subphase})"
+                if balance_total:
+                    detail += f": {balance_completed}/{balance_total} sources"
             elif phase == "publish_artifacts":
-                overall = table_total * 2 + completed
+                overall = (
+                    table_total * 2
+                    + balance_source_total
+                    + completed
+                )
                 detail = "publish dataset artifacts"
             else:
                 overall = 0
                 detail = phase.replace("_", " ")
+            balance_counters = {
+                f"materialization_balance_{key}": int(event[key])
+                for key in (
+                    "candidate_count",
+                    "selected_candidate_count",
+                    "selected_source_count",
+                    "completed_sources",
+                    "total_sources",
+                    "explicit_query_count",
+                )
+                if event.get(key) is not None
+            }
             reporter.update(
                 detail=detail,
                 completed_shards=overall,
@@ -3754,13 +3785,14 @@ def _run_fast_materialization_resume(
                     ),
                     **{
                         f"materialization_{key}": int(event[key])
-                        for key in (
-                            "plans",
-                            "cached_checks",
-                            "migrated_legacy_checks",
-                        )
-                        if event.get(key) is not None
+                    for key in (
+                        "plans",
+                        "cached_checks",
+                        "migrated_legacy_checks",
+                    )
+                    if event.get(key) is not None
                     },
+                    **balance_counters,
                 },
             )
 
@@ -5367,6 +5399,7 @@ def _run_materialize(
     table_total = config.max_source_tables
     finalize_steps = 15
     total_work = table_total * 3 + finalize_steps
+    balance_source_total = 0
     reporter.update(
         stage="materialize",
         detail="validate upstream",
@@ -5406,6 +5439,7 @@ def _run_materialize(
         )
 
     def report_materialization(event: dict[str, Any]) -> None:
+        nonlocal total_work, balance_source_total
         phase = str(event.get("phase") or "materialize")
         completed = int(event.get("completed", 0))
         total = int(event.get("total", 0))
@@ -5422,10 +5456,27 @@ def _run_materialize(
             overall = table_total * 2 + completed
             detail = "materialize source tables"
         elif phase == "balance_explicit_joins":
-            overall = table_total * 3
-            detail = "balance explicit joins"
+            balance_total = int(event.get("total_sources", 0))
+            balance_completed = int(event.get("completed_sources", 0))
+            if balance_total > 0:
+                balance_source_total = balance_total
+                total_work = max(
+                    total_work,
+                    table_total * 3 + balance_source_total + finalize_steps,
+                )
+            overall = table_total * 3 + min(
+                balance_completed, balance_source_total
+            )
+            subphase = str(event.get("subphase") or "run")
+            detail = f"balance explicit joins ({subphase})"
+            if balance_total:
+                detail += f": {balance_completed}/{balance_total} sources"
         elif phase == "publish_artifacts":
-            overall = table_total * 3 + completed
+            overall = (
+                table_total * 3
+                + balance_source_total
+                + completed
+            )
             detail = "publish dataset artifacts"
         else:
             overall = 0
@@ -5441,6 +5492,20 @@ def _run_materialize(
                     "plans",
                     "cached_checks",
                     "migrated_legacy_checks",
+                )
+                if event.get(key) is not None
+            }
+        )
+        counters.update(
+            {
+                f"materialization_balance_{key}": int(event[key])
+                for key in (
+                    "candidate_count",
+                    "selected_candidate_count",
+                    "selected_source_count",
+                    "completed_sources",
+                    "total_sources",
+                    "explicit_query_count",
                 )
                 if event.get(key) is not None
             }

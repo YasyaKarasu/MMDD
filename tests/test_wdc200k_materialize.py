@@ -1922,9 +1922,11 @@ def test_materialization_index_balances_explicit_queries_and_resumes(
             split="test",
         )
 
+    events: list[dict[str, object]] = []
     payload = materializer._balance_explicit_join_records(
         database_path,
         args=args,
+        progress_callback=events.append,
     )
 
     assert payload == {
@@ -1970,6 +1972,15 @@ def test_materialization_index_balances_explicit_queries_and_resumes(
         database_path,
         args=args,
     ) == payload
+    assert {
+        str(event["subphase"])
+        for event in events
+        if event.get("phase") == "balance_explicit_joins"
+    } >= {"scan_decisions", "select_candidates", "materialize_sources", "verify"}
+    with materializer._connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM explicit_join_balance_units WHERE complete = 1"
+        ).fetchone()[0] == 1
 
 
 def test_terminal_model_error_is_consumed_without_a_model_retry(
