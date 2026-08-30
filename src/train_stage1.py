@@ -719,7 +719,12 @@ class _EpochController:
         self.gate_unsatisfied = True
 
     def prune_indices(self) -> None:
-        retained = {self.best_index, self.latest_index}
+        epoch_zero_index = (
+            self.epoch_zero_fallback[2]
+            if self.epoch_zero_fallback is not None
+            else None
+        )
+        retained = {epoch_zero_index, self.best_index, self.latest_index}
         for path in self.created_indices:
             if path not in retained and path.is_dir():
                 shutil.rmtree(path)
@@ -754,6 +759,15 @@ def _validate_teacher_rerank_interval(args: argparse.Namespace) -> None:
         raise ValueError("--teacher-rerank-interval cannot exceed --epochs")
 
 
+def _validate_initialize_only(args: argparse.Namespace) -> None:
+    if args.initialize_only and (
+        args.stage != "student-path" or not args.eval_epoch_zero
+    ):
+        raise ValueError(
+            "--initialize-only requires student-path with --eval-epoch-zero"
+        )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     optional_defaults = {
         "anchor_weight": 0.0,
@@ -763,6 +777,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "in_batch_negatives": False,
         "in_batch_max_negatives": 256,
         "eval_epoch_zero": True,
+        "initialize_only": False,
         "fusion_mode": "weighted_rrf",
         "direct_weight": 1.0,
         "evidence_weight": 0.05,
@@ -874,6 +889,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--per-dataset-gate is only valid for student-path")
     if args.per_dataset_gate and not args.eval_epoch_zero:
         raise ValueError("--per-dataset-gate requires --eval-epoch-zero")
+    _validate_initialize_only(args)
     _validate_teacher_rerank_interval(args)
     validate_protocol_split("training", args.split)
     validate_protocol_split("dev_gate", args.dev_split)
@@ -1243,25 +1259,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "source_samples": {"base": 0, "hard": 0},
             }
             controller(0, student, epoch_zero_record)
-        history = train_student_paths(
-            student,
-            examples,
-            store,
-            optimizer,
-            aggregator,
-            temperature=args.temperature,
-            distillation_weight=args.distillation_weight,
-            anchor_weight=args.anchor_weight,
-            anchor_weight_evidence=args.anchor_weight_evidence,
-            distillation_datasets=(
-                set(args.distillation_datasets)
-                if args.distillation_datasets
-                else None
-            ),
-            in_batch_negatives=args.in_batch_negatives,
-            in_batch_max_negatives=args.in_batch_max_negatives,
-            **common,
-        )
+        if args.initialize_only:
+            controller.stop_reason = "initialize_only"
+            history = []
+        else:
+            history = train_student_paths(
+                student,
+                examples,
+                store,
+                optimizer,
+                aggregator,
+                temperature=args.temperature,
+                distillation_weight=args.distillation_weight,
+                anchor_weight=args.anchor_weight,
+                anchor_weight_evidence=args.anchor_weight_evidence,
+                distillation_datasets=(
+                    set(args.distillation_datasets)
+                    if args.distillation_datasets
+                    else None
+                ),
+                in_batch_negatives=args.in_batch_negatives,
+                in_batch_max_negatives=args.in_batch_max_negatives,
+                **common,
+            )
         if epoch_zero_record is not None:
             history.insert(0, epoch_zero_record)
 
@@ -1318,6 +1338,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "in_batch_max_negatives": args.in_batch_max_negatives,
         "edge_type_oversample": args.edge_type_oversample,
         "eval_epoch_zero": args.eval_epoch_zero,
+        "initialize_only": args.initialize_only,
         "fusion": {
             "mode": args.fusion_mode,
             "direct_weight": args.direct_weight,
@@ -1604,6 +1625,14 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Evaluate and gate the initial student-path checkpoint before optimization.",
+    )
+    parser.add_argument(
+        "--initialize-only",
+        action="store_true",
+        help=(
+            "Build and evaluate only the fresh student-path epoch-0 checkpoint; "
+            "no optimizer step is run."
+        ),
     )
 
     parser.add_argument("--temperature", type=float, default=1.0)
