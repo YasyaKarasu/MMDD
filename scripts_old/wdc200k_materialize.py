@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict
@@ -266,6 +267,33 @@ class _MaterializationWorkItem:
     source_ordinal: int
     source_sha256: str
     split: str
+
+
+@dataclass(frozen=True)
+class _BalanceMaterializationWorkItem:
+    """One source and its already-selected explicit candidates.
+
+    Balance is CPU/JSON work followed by a serialized SQLite commit.  Keeping
+    this item independent from a live SQLite connection lets a process pool
+    prepare the next sources while the parent commits the previous batch.
+    """
+
+    source_table_id: str
+    source_ordinal: int
+    split: str
+    candidate_decisions: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _BalancedSourceMaterialization:
+    source_table_id: str
+    source_ordinal: int
+    split: str
+    explicit_queries: tuple[dict[str, Any], ...]
+    explicit_targets: tuple[dict[str, Any], ...]
+    explicit_qrels: tuple[dict[str, Any], ...]
+    explicit_decision: dict[str, Any]
+    selected_candidates: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -4697,6 +4725,86 @@ def _run_materialization_worker(
     )
 
 
+def _materialize_balance_work_item(
+    database_path: Path,
+    args: argparse.Namespace,
+    item: _BalanceMaterializationWorkItem,
+) -> _BalancedSourceMaterialization:
+    """Prepare one balance source without taking the SQLite write lock."""
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM source_catalog WHERE source_table_id = ?",
+            (item.source_table_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"balanced explicit source is missing: {item.source_table_id}"
+        )
+    source_table = _load_source_catalog_record(database_path, row)
+    explicit_queries: list[dict[str, Any]] = []
+    explicit_targets: list[dict[str, Any]] = []
+    explicit_qrels: list[dict[str, Any]] = []
+    explicit_decisions: list[dict[str, Any]] = []
+    selected_candidates: list[dict[str, Any]] = []
+    for candidate_decision in item.candidate_decisions:
+        (
+            candidate_queries,
+            candidate_targets,
+            candidate_qrels,
+            candidate_result_decision,
+        ) = join_builder.materialize_balanced_explicit_join_candidate(
+            source_table=source_table,
+            split=item.split,
+            candidate_decision=candidate_decision,
+            args=args,
+        )
+        explicit_queries.extend(candidate_queries)
+        explicit_targets.extend(candidate_targets)
+        explicit_qrels.extend(candidate_qrels)
+        explicit_decisions.append(candidate_result_decision)
+        selected_candidates.append(candidate_decision)
+    if not explicit_decisions:
+        raise ValueError(
+            f"balanced explicit source has no selected candidates: "
+            f"{item.source_table_id}"
+        )
+    explicit_decision = {
+        **explicit_decisions[0],
+        "source_table_id": item.source_table_id,
+        "split": item.split,
+        "qualified_columns": [
+            qualified
+            for decision in explicit_decisions
+            for qualified in decision.get("qualified_columns", [])
+        ],
+        "explicit_join_candidates": selected_candidates,
+        "explicit_join_candidate": selected_candidates[0],
+        "explicit_join_query_count": len(explicit_queries),
+    }
+    return _BalancedSourceMaterialization(
+        source_table_id=item.source_table_id,
+        source_ordinal=item.source_ordinal,
+        split=item.split,
+        explicit_queries=tuple(explicit_queries),
+        explicit_targets=tuple(explicit_targets),
+        explicit_qrels=tuple(explicit_qrels),
+        explicit_decision=explicit_decision,
+        selected_candidates=tuple(selected_candidates),
+    )
+
+
+def _run_balance_materialization_worker(
+    item: _BalanceMaterializationWorkItem,
+) -> _BalancedSourceMaterialization:
+    if _WORKER_DATABASE_PATH is None or _WORKER_ARGS is None:
+        raise RuntimeError("materialization worker is not initialized")
+    return _materialize_balance_work_item(
+        _WORKER_DATABASE_PATH,
+        _WORKER_ARGS,
+        item,
+    )
+
+
 def materialize_dataset_shard(
     inputs: MaterializationShardInputs,
     *,
@@ -6186,6 +6294,27 @@ def _balance_explicit_join_records_streaming(
                 ON explicit_join_balance_units(complete, source_table_id)
             """
         )
+        # A normalized candidate cache means the expensive decision JSON is
+        # parsed exactly once.  The old path reparsed the full decisions table
+        # for candidate selection and then once more for selected payloads.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS explicit_join_balance_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                source_table_id TEXT NOT NULL,
+                source_ordinal INTEGER NOT NULL,
+                split TEXT NOT NULL,
+                decision_record_id TEXT NOT NULL,
+                candidate_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS explicit_join_balance_candidates_split
+                ON explicit_join_balance_candidates(split, source_ordinal, candidate_id)
+            """
+        )
         # Existing 200k indexes may predate the balance path.  These partial
         # indexes make the per-source replacement operations point lookups
         # instead of repeated scans of the full materialized-records table.
@@ -6213,6 +6342,46 @@ def _balance_explicit_join_records_streaming(
         stored_balance = connection.execute(
             "SELECT value FROM metadata WHERE key = 'explicit_join_balance_v1'"
         ).fetchone()
+        if stored_balance is not None:
+            # The balance certificate is written only after the split counts
+            # and all per-source rewrites have committed.  On a resume, trust
+            # that durable certificate instead of rescanning and reparsing
+            # every queryability decision (three full passes for 200k tables).
+            payload = json.loads(str(stored_balance["value"]))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("mode") != "match_implicit"
+                or not isinstance(
+                    payload.get("implicit_query_tables_by_split"), dict
+                )
+                or not isinstance(
+                    payload.get("explicit_query_tables_by_split"), dict
+                )
+                or not isinstance(payload.get("candidate_tables_by_split"), dict)
+            ):
+                raise ValueError("explicit join balance certificate is invalid")
+            connection.execute(
+                "DROP TABLE IF EXISTS explicit_join_balance_candidates"
+            )
+            connection.commit()
+            report(
+                subphase="verify",
+                completed=1,
+                total=1,
+                completed_sources=0,
+                total_sources=0,
+                explicit_query_count=sum(
+                    int(value)
+                    for value in payload["explicit_query_tables_by_split"].values()
+                ),
+                resumed=True,
+            )
+            return payload
+        # Rebuild the normalized cache on every incomplete run.  It is small
+        # compared with the materialized records and avoids trusting a cache
+        # that may have been interrupted halfway through its first scan.
+        connection.execute("DELETE FROM explicit_join_balance_candidates")
+        connection.commit()
         decision_total = int(
             connection.execute(
                 """
@@ -6246,11 +6415,13 @@ def _balance_explicit_join_records_streaming(
     }
     already_explicit: set[str] = set()
     seen_candidate_ids: set[str] = set()
+    source_ordinals: dict[str, int] = {}
     observed = 0
     with _connect(database_path) as connection:
         rows = connection.execute(
             """
-            SELECT decisions.source_table_id, decisions.record_json,
+            SELECT decisions.source_table_id, decisions.source_ordinal,
+                   decisions.record_id, decisions.record_json,
                    decisions.record_path, catalog.split
             FROM materialized_records AS decisions
             JOIN source_catalog AS catalog
@@ -6264,6 +6435,7 @@ def _balance_explicit_join_records_streaming(
                 observed += 1
                 source_table_id = str(row["source_table_id"])
                 split = str(row["split"])
+                source_ordinals[source_table_id] = int(row["source_ordinal"])
                 decision = _load_stored_json(
                     database_path, row["record_json"], row["record_path"]
                 )
@@ -6293,6 +6465,31 @@ def _balance_explicit_join_records_streaming(
                     if candidate_id in seen_candidate_ids:
                         continue
                     seen_candidate_ids.add(candidate_id)
+                    normalized_candidate = {
+                        **candidate,
+                        "candidate_id": candidate_id,
+                    }
+                    inserted = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO explicit_join_balance_candidates (
+                            candidate_id, source_table_id, source_ordinal, split,
+                            decision_record_id, candidate_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate_id,
+                            source_table_id,
+                            int(row["source_ordinal"]),
+                            split,
+                            str(row["record_id"]),
+                            _canonical_json(normalized_candidate),
+                        ),
+                    ).rowcount
+                    if inserted != 1:
+                        raise ValueError(
+                            "explicit balance candidate cache collision: "
+                            f"{candidate_id}"
+                        )
                     candidate_counts[split] += 1
                     candidate_tables[split].add(source_table_id)
                 if observed % 10_000 == 0 or observed == decision_total:
@@ -6308,27 +6505,23 @@ def _balance_explicit_join_records_streaming(
     if observed != decision_total:
         raise ValueError("explicit balance decision scan count mismatch")
 
-    # Query counts are only known after the first pass.  A second streaming
-    # pass applies the final per-split top-k limits without retaining all
-    # candidate payloads in memory.
+    # Query counts are only known after the first pass.  Apply the final
+    # per-split top-k limits over the normalized candidate cache.  This keeps
+    # the second pass in SQLite and avoids reparsing compressed decision JSON.
     seed = int(getattr(args, "seed", 13))
     heaps: dict[str, list[_BalanceHeapEntry]] = {
         "train": [],
         "dev": [],
         "test": [],
     }
-    seen_candidate_ids.clear()
     selected_scan_completed = 0
+    candidate_total = sum(candidate_counts.values())
     with _connect(database_path) as connection:
         rows = connection.execute(
             """
-            SELECT decisions.source_table_id, decisions.record_json,
-                   decisions.record_path, catalog.split
-            FROM materialized_records AS decisions
-            JOIN source_catalog AS catalog
-              ON catalog.source_table_id = decisions.source_table_id
-            WHERE decisions.artifact = 'table_queryability_decisions'
-            ORDER BY decisions.source_ordinal, decisions.record_id
+            SELECT candidate_id, source_table_id, split
+            FROM explicit_join_balance_candidates
+            ORDER BY source_ordinal, candidate_id
             """
         )
         try:
@@ -6336,69 +6529,43 @@ def _balance_explicit_join_records_streaming(
                 selected_scan_completed += 1
                 source_table_id = str(row["source_table_id"])
                 split = str(row["split"])
-                decision = _load_stored_json(
-                    database_path, row["record_json"], row["record_path"]
-                )
-                candidates = decision.get("explicit_join_candidates")
-                if not isinstance(candidates, list):
-                    candidate = decision.get("explicit_join_candidate")
-                    candidates = [candidate] if isinstance(candidate, dict) else []
-                if (
-                    str(decision.get("reason") or "") == "explicit_join_fallback"
-                    and not candidates
-                ):
-                    candidates = [decision]
-                for candidate in candidates:
-                    if not isinstance(candidate, dict):
-                        continue
-                    candidate_id = clean_text(candidate.get("candidate_id"))
-                    if not candidate_id:
-                        candidate_id = join_builder._explicit_join_candidate_id(
-                            source_table_id,
-                            int(candidate["entity_column_index"]),
-                            int(candidate["join_column_index"]),
-                        )
-                    if candidate_id in seen_candidate_ids:
-                        continue
-                    seen_candidate_ids.add(candidate_id)
-                    needed = int(implicit_by_split[split])
-                    if needed <= 0:
-                        continue
-                    sort_key = (
-                        int(
-                            stable_hash(
-                                "explicit-join-balance",
-                                seed,
-                                split,
-                                candidate_id,
-                                length=40,
-                            ),
-                            16,
+                candidate_id = str(row["candidate_id"])
+                needed = int(implicit_by_split[split])
+                if needed <= 0:
+                    continue
+                sort_key = (
+                    int(
+                        stable_hash(
+                            "explicit-join-balance",
+                            seed,
+                            split,
+                            candidate_id,
+                            length=40,
                         ),
-                        candidate_id,
-                    )
-                    entry = _BalanceHeapEntry(
-                        sort_key, candidate_id, source_table_id
-                    )
-                    heap = heaps[split]
-                    if len(heap) < needed:
-                        heapq.heappush(heap, entry)
-                    elif entry.sort_key < heap[0].sort_key:
-                        heapq.heapreplace(heap, entry)
+                        16,
+                    ),
+                    candidate_id,
+                )
+                entry = _BalanceHeapEntry(sort_key, candidate_id, source_table_id)
+                heap = heaps[split]
+                if len(heap) < needed:
+                    heapq.heappush(heap, entry)
+                elif entry.sort_key < heap[0].sort_key:
+                    heapq.heapreplace(heap, entry)
                 if (
                     selected_scan_completed % 10_000 == 0
-                    or selected_scan_completed == decision_total
+                    or selected_scan_completed == candidate_total
                 ):
                     report(
                         subphase="select_candidates",
                         completed=selected_scan_completed,
-                        total=decision_total,
+                        total=candidate_total,
                         candidate_count=sum(candidate_counts.values()),
                         implicit_query_count=sum(implicit_by_split.values()),
                     )
         finally:
             rows.close()
-    if selected_scan_completed != decision_total:
+    if selected_scan_completed != candidate_total:
         raise ValueError("explicit balance candidate scan count mismatch")
 
     selected: set[str] = set()
@@ -6430,19 +6597,6 @@ def _balance_explicit_join_records_streaming(
         selected_source_count=len(selected_sources),
     )
 
-    if stored_balance is not None:
-        payload = json.loads(str(stored_balance["value"]))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("implicit_query_tables_by_split")
-            != implicit_by_split
-            or payload.get("candidate_tables_by_split")
-            != candidate_table_counts
-            or explicit_by_split != implicit_by_split
-        ):
-            raise ValueError("explicit join balance resume mismatch")
-        return payload
-
     selected_by_source_hint: dict[str, list[str]] = {}
     for candidate_id in selected:
         selected_by_source_hint.setdefault(
@@ -6450,57 +6604,31 @@ def _balance_explicit_join_records_streaming(
         ).append(candidate_id)
     selected_source_ids = set(selected_by_source_hint)
     candidate_decisions: dict[str, dict[str, Any]] = {}
-    candidate_sources: dict[str, str] = {}
     source_splits: dict[str, str] = {}
     source_decision_ids: dict[str, str] = {}
     with _connect(database_path) as connection:
-        decision_rows = connection.execute(
-            """
-            SELECT decisions.source_table_id, decisions.record_id,
-                   decisions.record_json, decisions.record_path,
-                   catalog.split
-            FROM materialized_records AS decisions
-            JOIN source_catalog AS catalog
-              ON catalog.source_table_id = decisions.source_table_id
-            WHERE decisions.artifact = 'table_queryability_decisions'
-            ORDER BY decisions.source_ordinal, decisions.record_id
-            """
-        )
-        try:
-            for row in decision_rows:
-                source_table_id = str(row["source_table_id"])
-                if source_table_id not in selected_source_ids:
-                    continue
-                source_splits[source_table_id] = str(row["split"])
-                source_decision_ids[source_table_id] = str(row["record_id"])
-                decision = _load_stored_json(
-                    database_path, row["record_json"], row["record_path"]
+        selected_ids = sorted(selected)
+        for offset in range(0, len(selected_ids), _SQLITE_IN_BATCH_RECORDS):
+            batch = selected_ids[offset : offset + _SQLITE_IN_BATCH_RECORDS]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"""
+                SELECT candidate_id, source_table_id, split,
+                       decision_record_id, candidate_json
+                FROM explicit_join_balance_candidates
+                WHERE candidate_id IN ({placeholders})
+                """,
+                tuple(batch),
+            ):
+                candidate_id = str(row["candidate_id"])
+                candidate_decisions[candidate_id] = json.loads(
+                    str(row["candidate_json"])
                 )
-                candidates = decision.get("explicit_join_candidates")
-                if not isinstance(candidates, list):
-                    candidate = decision.get("explicit_join_candidate")
-                    candidates = [candidate] if isinstance(candidate, dict) else []
-                if (
-                    str(decision.get("reason") or "") == "explicit_join_fallback"
-                    and not candidates
-                ):
-                    candidates = [decision]
-                for candidate in candidates:
-                    if not isinstance(candidate, dict):
-                        continue
-                    candidate_id = clean_text(candidate.get("candidate_id"))
-                    if not candidate_id:
-                        candidate_id = join_builder._explicit_join_candidate_id(
-                            source_table_id,
-                            int(candidate["entity_column_index"]),
-                            int(candidate["join_column_index"]),
-                        )
-                        candidate = {**candidate, "candidate_id": candidate_id}
-                    if candidate_id in selected:
-                        candidate_decisions[candidate_id] = candidate
-                        candidate_sources[candidate_id] = source_table_id
-        finally:
-            decision_rows.close()
+                source_table_id = str(row["source_table_id"])
+                source_splits[source_table_id] = str(row["split"])
+                source_decision_ids[source_table_id] = str(
+                    row["decision_record_id"]
+                )
     if set(candidate_decisions) != selected:
         missing = sorted(selected - set(candidate_decisions))[:5]
         raise ValueError(
@@ -6510,9 +6638,8 @@ def _balance_explicit_join_records_streaming(
 
     selected_by_source: dict[str, list[str]] = {}
     for candidate_id in selected:
-        selected_by_source.setdefault(candidate_sources[candidate_id], []).append(
-            candidate_id
-        )
+        source_table_id = selected_source_hints[candidate_id]
+        selected_by_source.setdefault(source_table_id, []).append(candidate_id)
     for candidate_ids in selected_by_source.values():
         candidate_ids.sort()
     with _connect(database_path) as connection:
@@ -6548,171 +6675,182 @@ def _balance_explicit_join_records_streaming(
     batch_count = math.ceil(
         len(pending_sources) / _BALANCE_WRITE_BATCH_SOURCES
     )
-    for batch_index, batch_start in enumerate(
-        range(0, len(pending_sources), _BALANCE_WRITE_BATCH_SOURCES),
-        start=1,
-    ):
-        source_batch = pending_sources[
-            batch_start : batch_start + _BALANCE_WRITE_BATCH_SOURCES
-        ]
-        with _connect(database_path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            for source_table_id in source_batch:
-                source_row = connection.execute(
-                    "SELECT * FROM source_catalog WHERE source_table_id = ?",
-                    (source_table_id,),
-                ).fetchone()
-                if source_row is None:
-                    raise ValueError(
-                        f"balanced explicit source is missing: {source_table_id}"
-                    )
-                source_table = _load_source_catalog_record(
-                    database_path, source_row
+    worker_count = max(1, int(getattr(args, "materialization_workers", 1)))
+    executor: ProcessPoolExecutor | None = None
+    with ExitStack() as stack:
+        if worker_count > 1 and pending_sources:
+            _require_materialization_worker_source(
+                _MATERIALIZATION_WORKER_SOURCE_FINGERPRINT
+            )
+            executor = stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=get_context("spawn"),
+                    initializer=_initialize_materialization_worker,
+                    initargs=(
+                        database_path,
+                        args,
+                        _MATERIALIZATION_WORKER_SOURCE_FINGERPRINT,
+                    ),
                 )
-                split = source_splits[source_table_id]
-                explicit_queries: list[dict[str, Any]] = []
-                explicit_targets: list[dict[str, Any]] = []
-                explicit_qrels: list[dict[str, Any]] = []
-                explicit_decisions: list[dict[str, Any]] = []
-                selected_candidates: list[dict[str, Any]] = []
-                for candidate_id in selected_by_source[source_table_id]:
-                    (
-                        candidate_queries,
-                        candidate_targets,
-                        candidate_qrels,
-                        candidate_result_decision,
-                    ) = join_builder.materialize_balanced_explicit_join_candidate(
-                        source_table=source_table,
-                        split=split,
-                        candidate_decision=candidate_decisions[candidate_id],
-                        args=args,
-                    )
-                    explicit_queries.extend(candidate_queries)
-                    explicit_targets.extend(candidate_targets)
-                    explicit_qrels.extend(candidate_qrels)
-                    explicit_decisions.append(candidate_result_decision)
-                    selected_candidates.append(candidate_decisions[candidate_id])
-                explicit_decision = {
-                    **explicit_decisions[0],
-                    "source_table_id": source_table_id,
-                    "split": split,
-                    "qualified_columns": [
-                        qualified
-                        for item in explicit_decisions
-                        for qualified in item.get("qualified_columns", [])
-                    ],
-                    "explicit_join_candidates": selected_candidates,
-                    "explicit_join_candidate": selected_candidates[0],
-                    "explicit_join_query_count": len(explicit_queries),
-                }
-                estimated_bytes = 4096 + 2 * sum(
-                    len(_canonical_json(record).encode("utf-8"))
-                    for record in (
-                        *explicit_queries,
-                        *explicit_targets,
-                        *explicit_qrels,
-                        explicit_decision,
-                    )
-                )
-                write_tracker.before_write(estimated_bytes)
-                connection.execute(
-                    """
-                    DELETE FROM table_ids
-                    WHERE source_table_id = ? AND artifact = 'data_lake_tables'
-                    """,
-                    (source_table_id,),
-                )
-                deleted = connection.execute(
-                    """
-                    DELETE FROM materialized_records
-                    WHERE source_table_id = ? AND artifact = 'data_lake_tables'
-                    """,
-                    (source_table_id,),
-                ).rowcount
-                if deleted != 1:
-                    raise ValueError(
-                        "balanced explicit source does not have one raw table: "
-                        f"{source_table_id}"
-                    )
-                source_ordinal = int(source_row["ordinal"])
-                inserted_counts = {
-                    artifact: _insert_materialized_records(
-                        connection,
-                        database_path=database_path,
-                        artifact=artifact,
-                        records=records,
-                        source_table_id=source_table_id,
-                        source_ordinal=source_ordinal,
-                    )
-                    for artifact, records in (
-                        ("query_tables", explicit_queries),
-                        ("data_lake_tables", explicit_targets),
-                        ("qrels", explicit_qrels),
-                    )
-                }
-                decision_json = _canonical_json(explicit_decision)
-                decision_id = source_decision_ids[source_table_id]
-                stored_json, record_path = _stored_json_values(
-                    database_path,
-                    namespace="materialized-records/table_queryability_decisions",
-                    identity=decision_id,
-                    record=explicit_decision,
-                    encoded=decision_json,
-                    encoded_size=len(decision_json.encode("utf-8")),
-                    digest=hashlib.sha256(decision_json.encode("utf-8")).hexdigest(),
-                )
-                updated = connection.execute(
-                    """
-                    UPDATE materialized_records
-                    SET record_json = ?, record_path = ''
-                    WHERE artifact = 'table_queryability_decisions'
-                      AND source_table_id = ?
-                    """,
-                    (stored_json, source_table_id),
-                ).rowcount
-                if updated != 1 or record_path:
-                    raise ValueError("balanced explicit decision update failed")
-                counts_row = connection.execute(
-                    "SELECT counts_json FROM source_units WHERE source_table_id = ?",
-                    (source_table_id,),
-                ).fetchone()
-                if counts_row is None:
-                    raise ValueError("balanced explicit source unit is missing")
-                counts = json.loads(str(counts_row["counts_json"]))
-                counts.update(inserted_counts)
-                connection.execute(
-                    "UPDATE source_units SET counts_json = ? WHERE source_table_id = ?",
-                    (_canonical_json(counts), source_table_id),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO explicit_join_balance_units (
-                        source_table_id, selected_candidate_ids_json, complete
-                    ) VALUES (?, ?, 1)
-                    ON CONFLICT(source_table_id) DO UPDATE SET
-                        selected_candidate_ids_json = excluded.selected_candidate_ids_json,
-                        complete = excluded.complete
-                    """,
-                    (source_table_id, _canonical_json(selected_by_source[source_table_id])),
-                )
-            write_tracker.before_commit(0)
-            connection.commit()
-        completed_count += len(source_batch)
-        report(
-            subphase="materialize_sources",
-            completed=completed_count,
-            total=total_balance_sources,
-            selected_candidate_count=len(selected),
-            selected_source_count=total_balance_sources,
-            completed_sources=completed_count,
-            total_sources=total_balance_sources,
-            batch=len(source_batch),
-        )
-        if (
-            batch_index % _BALANCE_CHECKPOINT_INTERVAL_BATCHES == 0
-            or batch_index == batch_count
+            )
+        for batch_index, batch_start in enumerate(
+            range(0, len(pending_sources), _BALANCE_WRITE_BATCH_SOURCES),
+            start=1,
         ):
-            _checkpoint_wal(database_path)
+            source_batch = pending_sources[
+                batch_start : batch_start + _BALANCE_WRITE_BATCH_SOURCES
+            ]
+            work_items = tuple(
+                _BalanceMaterializationWorkItem(
+                    source_table_id=source_table_id,
+                    source_ordinal=source_ordinals[source_table_id],
+                    split=source_splits[source_table_id],
+                    candidate_decisions=tuple(
+                        candidate_decisions[candidate_id]
+                        for candidate_id in selected_by_source[source_table_id]
+                    ),
+                )
+                for source_table_id in source_batch
+            )
+            prepare_started = time.perf_counter()
+            if executor is None:
+                prepared = [
+                    _materialize_balance_work_item(database_path, args, item)
+                    for item in work_items
+                ]
+            else:
+                prepared = list(
+                    executor.map(
+                        _run_balance_materialization_worker,
+                        work_items,
+                        chunksize=1,
+                    )
+                )
+            prepare_seconds = time.perf_counter() - prepare_started
+            write_started = time.perf_counter()
+            with _connect(database_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for materialized in prepared:
+                    source_table_id = materialized.source_table_id
+                    explicit_queries = materialized.explicit_queries
+                    explicit_targets = materialized.explicit_targets
+                    explicit_qrels = materialized.explicit_qrels
+                    explicit_decision = materialized.explicit_decision
+                    estimated_bytes = 4096 + 2 * sum(
+                        len(_canonical_json(record).encode("utf-8"))
+                        for record in (
+                            *explicit_queries,
+                            *explicit_targets,
+                            *explicit_qrels,
+                            explicit_decision,
+                        )
+                    )
+                    write_tracker.before_write(estimated_bytes)
+                    connection.execute(
+                        """
+                        DELETE FROM table_ids
+                        WHERE source_table_id = ? AND artifact = 'data_lake_tables'
+                        """,
+                        (source_table_id,),
+                    )
+                    deleted = connection.execute(
+                        """
+                        DELETE FROM materialized_records
+                        WHERE source_table_id = ? AND artifact = 'data_lake_tables'
+                        """,
+                        (source_table_id,),
+                    ).rowcount
+                    if deleted != 1:
+                        raise ValueError(
+                            "balanced explicit source does not have one raw table: "
+                            f"{source_table_id}"
+                        )
+                    inserted_counts = {
+                        artifact: _insert_materialized_records(
+                            connection,
+                            database_path=database_path,
+                            artifact=artifact,
+                            records=records,
+                            source_table_id=source_table_id,
+                            source_ordinal=materialized.source_ordinal,
+                        )
+                        for artifact, records in (
+                            ("query_tables", explicit_queries),
+                            ("data_lake_tables", explicit_targets),
+                            ("qrels", explicit_qrels),
+                        )
+                    }
+                    decision_json = _canonical_json(explicit_decision)
+                    decision_id = source_decision_ids[source_table_id]
+                    stored_json, record_path = _stored_json_values(
+                        database_path,
+                        namespace="materialized-records/table_queryability_decisions",
+                        identity=decision_id,
+                        record=explicit_decision,
+                        encoded=decision_json,
+                        encoded_size=len(decision_json.encode("utf-8")),
+                        digest=hashlib.sha256(decision_json.encode("utf-8")).hexdigest(),
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE materialized_records
+                        SET record_json = ?, record_path = ''
+                        WHERE artifact = 'table_queryability_decisions'
+                          AND source_table_id = ?
+                        """,
+                        (stored_json, source_table_id),
+                    ).rowcount
+                    if updated != 1 or record_path:
+                        raise ValueError("balanced explicit decision update failed")
+                    counts_row = connection.execute(
+                        "SELECT counts_json FROM source_units WHERE source_table_id = ?",
+                        (source_table_id,),
+                    ).fetchone()
+                    if counts_row is None:
+                        raise ValueError("balanced explicit source unit is missing")
+                    counts = json.loads(str(counts_row["counts_json"]))
+                    counts.update(inserted_counts)
+                    connection.execute(
+                        "UPDATE source_units SET counts_json = ? WHERE source_table_id = ?",
+                        (_canonical_json(counts), source_table_id),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO explicit_join_balance_units (
+                            source_table_id, selected_candidate_ids_json, complete
+                        ) VALUES (?, ?, 1)
+                        ON CONFLICT(source_table_id) DO UPDATE SET
+                            selected_candidate_ids_json = excluded.selected_candidate_ids_json,
+                            complete = excluded.complete
+                        """,
+                        (
+                            source_table_id,
+                            _canonical_json(selected_by_source[source_table_id]),
+                        ),
+                    )
+                write_tracker.before_commit(0)
+                connection.commit()
+            write_seconds = time.perf_counter() - write_started
+            completed_count += len(source_batch)
+            report(
+                subphase="materialize_sources",
+                completed=completed_count,
+                total=total_balance_sources,
+                selected_candidate_count=len(selected),
+                selected_source_count=total_balance_sources,
+                completed_sources=completed_count,
+                total_sources=total_balance_sources,
+                batch=len(source_batch),
+                workers=worker_count,
+                prepare_ms=int(round(prepare_seconds * 1000)),
+                write_ms=int(round(write_seconds * 1000)),
+            )
+            if (
+                batch_index % _BALANCE_CHECKPOINT_INTERVAL_BATCHES == 0
+                or batch_index == batch_count
+            ):
+                _checkpoint_wal(database_path)
 
     report(
         subphase="verify",
@@ -6723,18 +6861,28 @@ def _balance_explicit_join_records_streaming(
     )
     explicit_by_split = {"train": 0, "dev": 0, "test": 0}
     with _connect(database_path) as connection:
+        # The previous verification joined every query row against every
+        # decision row and evaluated json_extract() on the full decisions
+        # table.  Balance already has the selected source IDs in memory, so
+        # materialize that small relation and count query rows directly.
+        # This avoids a second full JSON scan at the end of a 200k run.
+        connection.execute(
+            "CREATE TEMP TABLE balance_selected_sources "
+            "(source_table_id TEXT PRIMARY KEY)"
+        )
+        connection.executemany(
+            "INSERT INTO balance_selected_sources(source_table_id) VALUES (?)",
+            ((source_id,) for source_id in sorted(selected_source_ids)),
+        )
         for row in connection.execute(
             """
             SELECT catalog.split, COUNT(*) AS records
-            FROM materialized_records AS queries
+            FROM balance_selected_sources AS selected
             JOIN source_catalog AS catalog
-              ON catalog.source_table_id = queries.source_table_id
-            JOIN materialized_records AS decisions
-              ON decisions.source_table_id = queries.source_table_id
-             AND decisions.artifact = 'table_queryability_decisions'
-            WHERE queries.artifact = 'query_tables'
-              AND json_extract(decisions.record_json, '$.reason') =
-                  'explicit_join_fallback'
+              ON catalog.source_table_id = selected.source_table_id
+            JOIN materialized_records AS queries
+              ON queries.source_table_id = selected.source_table_id
+             AND queries.artifact = 'query_tables'
             GROUP BY catalog.split
             """
         ):
@@ -6757,6 +6905,12 @@ def _balance_explicit_join_records_streaming(
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (_canonical_json(payload),),
+        )
+        # Candidate rows are an execution cache, not a published artifact.
+        # Remove them before the final commit so the balance index does not
+        # permanently consume space after a successful 200k build.
+        connection.execute(
+            "DROP TABLE IF EXISTS explicit_join_balance_candidates"
         )
         write_tracker.before_commit(0)
         connection.commit()
@@ -6974,20 +7128,30 @@ def _validate_global_counts(
     if counts["data_lake_tables"] < upstream.expected_tables:
         raise ValueError("global data-lake table coverage is incomplete")
     with _connect(database_path) as connection:
+        # Build the qrel query-id relation once.  A correlated NOT EXISTS
+        # with json_extract(record_json, ...) rescans all qrels for every
+        # query table and becomes quadratic at 200k scale.
+        connection.execute(
+            "CREATE TEMP TABLE validated_qrel_query_ids "
+            "(query_table_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO validated_qrel_query_ids(query_table_id)
+            SELECT json_extract(record_json, '$.query_table_id')
+            FROM materialized_records
+            WHERE artifact = 'qrels'
+            """
+        )
         queries_without_qrels = int(
             connection.execute(
                 """
                 SELECT COUNT(*)
                 FROM materialized_records AS queries
+                LEFT JOIN validated_qrel_query_ids AS qrel_ids
+                  ON qrel_ids.query_table_id = queries.record_id
                 WHERE queries.artifact = 'query_tables'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM materialized_records AS qrels
-                      WHERE qrels.artifact = 'qrels'
-                        AND json_extract(
-                            qrels.record_json, '$.query_table_id'
-                        ) = queries.record_id
-                  )
+                  AND qrel_ids.query_table_id IS NULL
                 """
             ).fetchone()[0]
         )

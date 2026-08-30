@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -631,6 +631,87 @@ def _iter_canonical_rows(
             )
 
 
+def derive_structural_evidence(
+    source_table: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recreate compactable evidence records from a retained source table."""
+    table_id = str(source_table["source_table_id"])
+    entity_column = int(
+        source_table["metadata"]["candidate_entity_columns"][0]
+    )
+    entities: list[dict[str, Any]] = []
+    page_refs: list[dict[str, Any]] = []
+    direct_image_refs: list[dict[str, Any]] = []
+    for fallback, row in enumerate(source_table.get("rows") or []):
+        row_id = row.get("row_id", fallback)
+        cells = list(row.get("cells") or [])
+        cells_by_index = {
+            int(cell["column_index"]): cell for cell in cells
+        }
+        raw_by_name = {
+            str(cell["column_name"]): cell.get("raw") for cell in cells
+        }
+        entity_cell = cells_by_index[entity_column]
+        wiki_title = clean_text(entity_cell.get("wiki_title"))
+        entity_id = f"ent_{stable_hash(wiki_title, length=16)}"
+        page_url = clean_text(raw_by_name.get("page_url"))
+        image_urls = wdc_adapter.extract_image_urls(
+            raw_by_name.get("image"),
+            page_url,
+        )
+        entity = {
+            "entity_id": entity_id,
+            "wiki_title": wiki_title,
+            "display_texts": (
+                [clean_text(entity_cell.get("text"))]
+                if clean_text(entity_cell.get("text"))
+                else []
+            ),
+            "context_terms": wdc_adapter._context_terms(
+                cells,
+                entity_column,
+            ),
+            "appears_in": [
+                {
+                    "source_table_id": table_id,
+                    "query_view_id": None,
+                    "row_id": row_id,
+                    "column_index": entity_column,
+                    "column_name": str(entity_cell["column_name"]),
+                }
+            ],
+            "page_url": page_url,
+            "image_urls": image_urls,
+        }
+        entities.append(entity)
+        normalized_page = _normalize_http_url(page_url)
+        if normalized_page is not None:
+            page_refs.append(
+                {
+                    "url_key": _url_key(normalized_page),
+                    "page_url": normalized_page,
+                    "entity_id": entity_id,
+                    "source_table_id": table_id,
+                    "row_id": row_id,
+                }
+            )
+        for ordinal, image_url in enumerate(image_urls):
+            normalized_image = _normalize_http_url(image_url)
+            if normalized_image is None:
+                continue
+            direct_image_refs.append(
+                {
+                    "url_key": _url_key(normalized_image),
+                    "image_url": image_url,
+                    "entity_id": entity_id,
+                    "source_table_id": table_id,
+                    "row_id": row_id,
+                    "ordinal": ordinal,
+                }
+            )
+    return entities, page_refs, direct_image_refs
+
+
 def _failure_reason(error: Exception) -> str:
     return f"{type(error).__name__}: {clean_text(error)}"
 
@@ -1208,32 +1289,74 @@ def expand_selected_shard(
             selection_spool_path.unlink(missing_ok=True)
         raise
     if manifest.complete:
-        try:
-            report("validate_completed_shard", 0)
-            if not manifest.completed_shards or not all(
-                validate_completed_shard(shard, output_root)
-                for shard in manifest.completed_shards
-            ):
-                raise StructuralExpansionError(
-                    "completed structural output failed checksum validation"
+        report("validate_completed_shard", 0)
+        invalid: list[CompletedShard] = [
+            shard
+            for shard in manifest.completed_shards
+            if not validate_completed_shard(shard, output_root)
+        ]
+        if not invalid:
+            try:
+                _acknowledge_validated_replacements(
+                    paths.validated_selection,
+                    reserve_manager,
                 )
-            _acknowledge_validated_replacements(
-                paths.validated_selection,
-                reserve_manager,
+                result = _completed_result(paths)
+                report(
+                    "structural_shard_complete",
+                    result.tables,
+                    resumed=True,
+                    entities=result.entities_count,
+                    page_references=result.page_references,
+                    direct_image_references=result.direct_image_references,
+                )
+                return result
+            finally:
+                if selection_spool_path is not None:
+                    selection_spool_path.unlink(missing_ok=True)
+
+        # Certified materialization cleanup may retire the large derived
+        # structural shards (entities/page_refs/direct_image_refs and the
+        # validated-selection shard) while retaining the source-table
+        # authority and its complete manifest.  Sampling expansion needs to
+        # recreate those artifacts, so treat that narrow, lossless state as
+        # resumable rather than as corruption.  Any missing/corrupt source or
+        # failure shard remains a hard error.
+        compactable_prefixes = (
+            "entities/",
+            "page_refs/",
+            "direct_image_refs/",
+            "selection/",
+        )
+        compactable = all(
+            shard.path.startswith(compactable_prefixes)
+            and not (output_root / shard.path).exists()
+            for shard in invalid
+        )
+        required_prefixes = ("source_tables/", "structural_failures/")
+        required_ok = all(
+            any(
+                shard.path.startswith(prefix)
+                and validate_completed_shard(shard, output_root)
+                for shard in manifest.completed_shards
             )
-            result = _completed_result(paths)
-            report(
-                "structural_shard_complete",
-                result.tables,
-                resumed=True,
-                entities=result.entities_count,
-                page_references=result.page_references,
-                direct_image_references=result.direct_image_references,
-            )
-            return result
-        finally:
+            for prefix in required_prefixes
+        )
+        if not compactable or not required_ok:
             if selection_spool_path is not None:
                 selection_spool_path.unlink(missing_ok=True)
+            raise StructuralExpansionError(
+                "completed structural output failed checksum validation"
+            )
+
+        # Drop only invalid declarations.  The writers below will publish a
+        # fresh, complete artifact set and retain valid source/failure shards
+        # if their bytes are unchanged.
+        manifest.completed_shards = [
+            shard for shard in manifest.completed_shards if shard not in invalid
+        ]
+        manifest.complete = False
+        manifest._save()
 
     try:
         writers = {

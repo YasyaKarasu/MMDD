@@ -103,6 +103,7 @@ from wdc200k_sampling import (
     SamplingPolicy,
     SamplingResult,
     sample_structural_artifacts,
+    sampling_stage_fingerprint,
     validate_sampling_artifacts,
     validate_sampling_consumed_paths,
     validate_sampling_source_authority,
@@ -2350,6 +2351,50 @@ def _has_complete_sampling_authority(path: Path) -> bool:
     )
 
 
+def _looks_like_compacted_structural_output(config: PipelineConfig) -> bool:
+    """Detect certified structural cleanup when the sampling manifest is gone.
+
+    Materialization cleanup can retire the derived structural shards before a
+    later sampling-expansion resume.  Older runs did not persist a separate
+    cleanup marker, so use the manifest declarations plus filesystem shape as
+    a narrow recovery hint: source/failure shards must still exist, at least
+    one of the explicitly-retirable derived shards must be absent, and no
+    unrelated artifact may be missing.
+    """
+    registry_path = _producer_registry_path(config, "structural")
+    if not registry_path.is_file():
+        return False
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        references = registry.get("producer_manifests") or []
+        if registry.get("complete") is not True or not references:
+            return False
+        root = (config.work_dir / "structural").resolve()
+        compact_missing = False
+        for reference in references:
+            manifest_path = Path(str(reference.get("path") or ""))
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if payload.get("stage") != "wdc200k_structural":
+                continue
+            for raw in payload.get("completed_shards") or []:
+                relative = str(raw.get("path") or "")
+                if not relative:
+                    return False
+                artifact = (root / relative).resolve()
+                if not artifact.is_relative_to(root):
+                    return False
+                if relative.startswith(
+                    ("entities/", "page_refs/", "direct_image_refs/", "selection/")
+                ):
+                    if not artifact.is_file():
+                        compact_missing = True
+                elif not artifact.is_file():
+                    return False
+        return compact_missing
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 @dataclass(frozen=True)
 class ProducerManifestRef:
     path: Path
@@ -3027,6 +3072,8 @@ def _validate_stage_registry(
                     "compact source authority"
                 ) from error
             compact_replacements = True
+        elif _looks_like_compacted_structural_output(config):
+            compact_replacements = True
     for reference in registry.producer_manifests:
         if not reference.path.is_file():
             raise ValueError(f"producer manifest is missing: {reference.path}")
@@ -3446,6 +3493,27 @@ def _fast_materialization_resume_candidate(
     )
 
 
+def _fast_structural_resume_candidate(config: PipelineConfig) -> bool:
+    """Return whether selection/structural output can be resumed by metadata.
+
+    A completed structural registry is already the durable authority for the
+    shard set.  When sampling has not started yet, replaying every structural
+    shard only to recompute checksums is needlessly expensive (the source
+    table shards alone are tens of GiB).  The fast path still verifies the
+    registry envelope, producer-manifest digests, file existence, and sizes;
+    the full byte checks remain available as the fallback when that metadata
+    check cannot prove the chain is intact.
+    """
+    if (
+        not config.resume
+        or config.from_stage is not None
+        or not _producer_registry_path(config, "structural").is_file()
+        or _producer_registry_path(config, "sampling").exists()
+    ):
+        return False
+    return True
+
+
 def _validate_fast_producer_manifest(
     stage: str,
     path: Path,
@@ -3529,6 +3597,44 @@ def _validate_fast_producer_manifest(
                 )
 
 
+def _validate_fast_structural_resume_chain(
+    config: PipelineConfig,
+    archives: Iterable[Path],
+) -> None:
+    """Validate selection and structural authorities without reading shards."""
+    upstream = _input_identity(archives)
+    compact_replacements = _looks_like_compacted_structural_output(config)
+    for stage in ("selection", "structural"):
+        path = _producer_registry_path(config, stage)
+        registry = _load_stage_registry(path)
+        if (
+            not registry.complete
+            or registry.stage != stage
+            or registry.producer_type != _PRODUCER_TYPES[stage]
+            or registry.upstream_identity != upstream
+            or registry.config_fingerprint
+            != _stage_config_fingerprint(config, stage)
+            or not registry.producer_manifests
+        ):
+            raise ValueError(f"pipeline registry identity mismatch: {path}")
+        for reference in registry.producer_manifests:
+            if (
+                not reference.path.is_file()
+                or _sha256_path(reference.path) != reference.sha256
+            ):
+                raise ValueError(
+                    f"producer manifest checksum mismatch: {reference.path}"
+                )
+            _validate_fast_producer_manifest(
+                stage,
+                reference.path,
+                compact_replacements=(
+                    stage == "structural" and compact_replacements
+                ),
+            )
+        upstream = _registry_identity(config, stage)
+
+
 def _validate_fast_model_resume_chain(
     config: PipelineConfig,
     archives: Iterable[Path],
@@ -3537,7 +3643,7 @@ def _validate_fast_model_resume_chain(
     upstream = _input_identity(archives)
     compact_replacements = _has_complete_sampling_authority(
         config.work_dir / "sampling" / "manifest.json"
-    )
+    ) or _looks_like_compacted_structural_output(config)
     for stage in STAGES[: STAGES.index("models")]:
         path = _producer_registry_path(config, stage)
         registry = _load_stage_registry(path)
@@ -3771,6 +3877,10 @@ def _run_fast_materialization_resume(
                     "completed_sources",
                     "total_sources",
                     "explicit_query_count",
+                    "workers",
+                    "batch",
+                    "prepare_ms",
+                    "write_ms",
                 )
                 if event.get(key) is not None
             }
@@ -4571,6 +4681,112 @@ def _run_selection_and_structural(
         counters = dict(_load_stage_registry(structural_registry).counters)
         return tuple(reconstructed), finalized, counters
 
+    # On resume, the structural registry and all of its producer manifests
+    # are already authoritative.  Replaying 2,000 completed shards here would
+    # reread and rehash roughly 67 GiB of source JSONL before sampling can
+    # start.  Reconstruct the lightweight result objects directly from the
+    # manifest metadata; the caller has already validated the chain (strictly
+    # or through the fast metadata-only path) before entering this function.
+    if config.resume and structural_registry.is_file():
+        registry = _load_stage_registry(structural_registry)
+        if (
+            registry.complete
+            and registry.stage == "structural"
+            and registry.producer_type == _PRODUCER_TYPES["structural"]
+        ):
+            structural_root = config.work_dir / "structural"
+            restored: list[StructuralExpansionResult] = []
+            finalized_manifest: Path | None = None
+            finalized_path: Path | None = None
+            finalized_tables = 0
+            for reference in registry.producer_manifests:
+                manifest_path = Path(reference.path)
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                producer_stage = str(payload.get("stage") or "")
+                completed = payload.get("completed_shards") or []
+                if producer_stage == "wdc200k_validated_selection":
+                    if len(completed) != 1:
+                        raise ValueError(
+                            "structural resume global selection is invalid"
+                        )
+                    finalized_manifest = manifest_path
+                    finalized_path = structural_root / str(
+                        completed[0]["path"]
+                    )
+                    finalized_tables = int(completed[0]["records"])
+                    continue
+                if producer_stage != "wdc200k_structural":
+                    continue
+                by_prefix = {
+                    str(item["path"]).split("/", 1)[0]: item
+                    for item in completed
+                    if isinstance(item, dict) and "path" in item
+                }
+                try:
+                    source_item = by_prefix["source_tables"]
+                    entities_item = by_prefix["entities"]
+                    page_item = by_prefix["page_refs"]
+                    image_item = by_prefix["direct_image_refs"]
+                    failure_item = by_prefix["structural_failures"]
+                    validated_item = next(
+                        item
+                        for item in completed
+                        if str(item["path"]).startswith("selection/")
+                    )
+                except (KeyError, StopIteration, TypeError) as error:
+                    raise ValueError(
+                        f"structural resume manifest is incomplete: {manifest_path}"
+                    ) from error
+                restored.append(
+                    StructuralExpansionResult(
+                        source_tables=structural_root / str(source_item["path"]),
+                        entities=structural_root / str(entities_item["path"]),
+                        page_refs=structural_root / str(page_item["path"]),
+                        direct_image_refs=structural_root
+                        / str(image_item["path"]),
+                        structural_failures=structural_root
+                        / str(failure_item["path"]),
+                        validated_selection=structural_root
+                        / str(validated_item["path"]),
+                        manifest=manifest_path,
+                        tables=int(source_item["records"]),
+                        entities_count=int(entities_item["records"]),
+                        page_references=int(page_item["records"]),
+                        direct_image_references=int(image_item["records"]),
+                    )
+                )
+            if (
+                restored
+                and finalized_manifest is not None
+                and finalized_path is not None
+                and finalized_tables == config.max_source_tables
+            ):
+                restored.sort(key=lambda item: item.manifest.as_posix())
+                counters = dict(registry.counters)
+                reporter.update(
+                    stage="structural",
+                    detail="resume structural artifacts",
+                    completed_shards=finalized_tables,
+                    total_shards=selected_count,
+                    counters=counters,
+                    known_work_bytes=counters.get("structural_output_bytes"),
+                )
+                reporter.update(
+                    detail="structural resume complete",
+                    completed_shards=finalized_tables,
+                    total_shards=selected_count,
+                    counters=counters,
+                )
+                return (
+                    tuple(restored),
+                    FinalizedSelectionResult(
+                        validated_selection=finalized_path,
+                        manifest=finalized_manifest,
+                        tables=finalized_tables,
+                    ),
+                    counters,
+                )
+
     reserve_path = selection_dir / "reserve_tables.jsonl"
     reserve_database = selection_dir / "reserve.sqlite3"
     if pre_write_guard is not None:
@@ -4771,16 +4987,7 @@ def _run_sampling(
         structural_output_root=config.work_dir / "structural",
         structural_manifests=tuple(item.manifest for item in structural),
         output_root=config.work_dir / "sampling",
-        policy=SamplingPolicy(
-            sampled_entities_per_table=config.sampled_entities_per_table,
-            entity_sampling_seed=config.entity_sampling_seed,
-            query_rows_per_table=config.query_rows_per_table,
-            min_column_non_empty_ratio=config.min_column_non_empty_ratio,
-            min_recovered_value_ratio=config.min_recovered_value_ratio,
-            min_recovery_denominator=config.min_recovery_denominator,
-            min_rows_per_output_table=config.min_rows_per_output_table,
-            global_entity_budget=config.global_entity_budget,
-        ),
+        policy=_sampling_policy(config),
         per_table_entity_limits=expansion.limits,
         progress_callback=report_sampling,
         pre_write_guard=pre_write_guard,
@@ -5506,6 +5713,10 @@ def _run_materialize(
                     "completed_sources",
                     "total_sources",
                     "explicit_query_count",
+                    "workers",
+                    "batch",
+                    "prepare_ms",
+                    "write_ms",
                 )
                 if event.get(key) is not None
             }
@@ -5646,7 +5857,18 @@ def _run_pipeline_once(
                 image_transport=image_transport,
                 extractor=extractor,
             )
-        _validate_existing_registry_chain(config, archives)
+        if _fast_structural_resume_candidate(config):
+            try:
+                _validate_fast_structural_resume_chain(config, archives)
+            except (OSError, ValueError) as error:
+                logging.info(
+                    "pipeline structural fast resume unavailable (%s); "
+                    "falling back to strict registry validation",
+                    error,
+                )
+                _validate_existing_registry_chain(config, archives)
+        else:
+            _validate_existing_registry_chain(config, archives)
     elif any(_producer_registry_path(config, stage).exists() for stage in STAGES):
         raise ValueError(
             "pipeline state exists; use --resume or --from_stage selection"
@@ -6065,6 +6287,53 @@ def _sampling_registry_matches_expansion(
     )
 
 
+def _sampling_policy(config: PipelineConfig) -> SamplingPolicy:
+    return SamplingPolicy(
+        sampled_entities_per_table=config.sampled_entities_per_table,
+        entity_sampling_seed=config.entity_sampling_seed,
+        query_rows_per_table=config.query_rows_per_table,
+        min_column_non_empty_ratio=config.min_column_non_empty_ratio,
+        min_recovered_value_ratio=config.min_recovered_value_ratio,
+        min_recovery_denominator=config.min_recovery_denominator,
+        min_rows_per_output_table=config.min_rows_per_output_table,
+        global_entity_budget=config.global_entity_budget,
+    )
+
+
+def _partial_sampling_matches_expansion(
+    config: PipelineConfig,
+    expansion: SamplingExpansionState,
+) -> bool:
+    """Return whether an interrupted sampling manifest can be resumed."""
+    manifest_path = config.work_dir / "sampling" / "manifest.json"
+    structural_registry_path = _producer_registry_path(config, "structural")
+    if not manifest_path.is_file() or not structural_registry_path.is_file():
+        return False
+    try:
+        structural_registry = _load_stage_registry(structural_registry_path)
+        structural_manifests = []
+        for reference in structural_registry.producer_manifests:
+            payload = json.loads(reference.path.read_text(encoding="utf-8"))
+            if payload.get("stage") == "wdc200k_structural":
+                structural_manifests.append(reference.path)
+        expected = sampling_stage_fingerprint(
+            structural_manifests,
+            _sampling_policy(config),
+            per_table_entity_limits=expansion.limits,
+        )
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return (
+            payload.get("stage") == expected.stage
+            and payload.get("input_fingerprint")
+            == expected.input_fingerprint
+            and payload.get("parameter_fingerprint")
+            == expected.parameter_fingerprint
+            and payload.get("schema_version") == expected.schema_version
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _drop_recovery_failure(
     config: PipelineConfig,
     *,
@@ -6385,6 +6654,7 @@ def run_pipeline(
         expansion.round_index > 0
         and effective.from_stage is None
         and not _sampling_registry_matches_expansion(effective)
+        and not _partial_sampling_matches_expansion(effective, expansion)
     ):
         # The next per-table cap state was committed after the preceding
         # dataset. URL and model caches remain outside the archived stages.

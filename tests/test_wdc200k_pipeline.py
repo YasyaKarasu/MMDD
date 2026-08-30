@@ -1629,6 +1629,31 @@ def test_completed_sampling_resume_does_not_iterate_source_tables_to_count(
     assert resumed.stage == "sampling"
 
 
+def test_fast_structural_resume_accepts_compacted_derivatives(
+    tmp_path: Path,
+) -> None:
+    config = replace(_full_pipeline_config(tmp_path), stop_after="structural")
+    assert run_pipeline(config).stage == "structural"
+    for directory in (
+        "entities",
+        "page_refs",
+        "direct_image_refs",
+    ):
+        for path in (config.work_dir / "structural" / directory).glob(
+            "*.jsonl"
+        ):
+            path.unlink()
+    for path in (config.work_dir / "structural/selection").glob(
+        "validated-[0-9]*.jsonl"
+    ):
+        path.unlink()
+
+    pipeline_module._validate_fast_structural_resume_chain(
+        config,
+        pipeline_module._statistics_archives(config.input_dir),
+    )
+
+
 def test_pipeline_resumes_incomplete_sampling_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1652,6 +1677,121 @@ def test_pipeline_resumes_incomplete_sampling_manifest(
     resumed = run_pipeline(config)
 
     assert resumed.stage == "sampling"
+
+
+def test_partial_sampling_manifest_matches_current_expansion(
+    tmp_path: Path,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    manifest_root = config.work_dir / "structural" / "stage_manifests"
+    manifest_root.mkdir(parents=True)
+    structural_manifest = manifest_root / "structural-00000.json"
+    structural_manifest.write_text(
+        json.dumps({"stage": "wdc200k_structural"}) + "\n",
+        encoding="utf-8",
+    )
+    registry_path = config.work_dir / "stage_manifests/pipeline-structural.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "stage": "structural",
+                "producer_type": "wdc200k-structural-barrier",
+                "producer_manifests": [
+                    {"path": str(structural_manifest), "sha256": "unused"}
+                ],
+                "upstream_identity": "selection",
+                "config_fingerprint": "structural",
+                "counters": {},
+                "complete": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    expansion = pipeline_module.SamplingExpansionState(
+        round_index=1,
+        path=config.work_dir / "sampling_expansion/round-00001.json",
+        limits={"table-1": 12},
+    )
+    fingerprint = pipeline_module.sampling_stage_fingerprint(
+        (structural_manifest,),
+        pipeline_module._sampling_policy(config),
+        per_table_entity_limits=expansion.limits,
+    )
+    sampling_manifest = config.work_dir / "sampling/manifest.json"
+    sampling_manifest.parent.mkdir(parents=True)
+    sampling_manifest.write_text(
+        json.dumps(
+            {
+                "stage": fingerprint.stage,
+                "input_fingerprint": fingerprint.input_fingerprint,
+                "parameter_fingerprint": fingerprint.parameter_fingerprint,
+                "schema_version": fingerprint.schema_version,
+                "completed_shards": [],
+                "complete": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert pipeline_module._partial_sampling_matches_expansion(
+        config, expansion
+    )
+    assert not pipeline_module._partial_sampling_matches_expansion(
+        config,
+        replace(expansion, limits={"table-1": 20}),
+    )
+
+
+def test_run_pipeline_preserves_matching_partial_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _full_pipeline_config(tmp_path)
+    expansion = pipeline_module.SamplingExpansionState(
+        round_index=1,
+        path=config.work_dir / "sampling_expansion/round-00001.json",
+        limits={"table-1": 12},
+    )
+    effective_configs: list[PipelineConfig] = []
+
+    monkeypatch.setattr(
+        pipeline_module, "_promote_legacy_model_cache", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_load_active_recovery_selection", lambda _config: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_load_sampling_expansion_state", lambda _config: expansion
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_sampling_registry_matches_expansion", lambda _config: False
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_partial_sampling_matches_expansion",
+        lambda _config, _expansion: True,
+    )
+
+    def stop_after_capture(effective: PipelineConfig, **_kwargs):
+        effective_configs.append(effective)
+        return pipeline_module.PipelineResult(
+            status="stopped",
+            stage="sampling",
+            statistics_archives=1,
+            counters={},
+        )
+
+    monkeypatch.setattr(pipeline_module, "_run_pipeline_once", stop_after_capture)
+
+    result = run_pipeline(config)
+
+    assert result.stage == "sampling"
+    assert len(effective_configs) == 1
+    assert effective_configs[0].sampling_expansion_round_index == 1
+    assert effective_configs[0].from_stage is None
 
 
 def test_structural_registry_validates_compact_authority_once_for_many_refs(

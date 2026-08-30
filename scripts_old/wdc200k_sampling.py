@@ -20,7 +20,7 @@ from wdc200k_io import (
     StageManifest,
     validate_completed_shard,
 )
-from wdc200k_structural import _normalize_http_url
+from wdc200k_structural import derive_structural_evidence, _normalize_http_url
 
 
 SAMPLING_SCHEMA_VERSION = "wdc200k-entity-sampling-v1"
@@ -130,6 +130,43 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 if not isinstance(record, dict):
                     raise ValueError(f"JSONL record must be an object: {path}")
                 yield record
+
+
+def sampling_stage_fingerprint(
+    structural_manifests: Sequence[Path],
+    policy: SamplingPolicy,
+    *,
+    per_table_entity_limits: Mapping[str, int] | None = None,
+) -> StageFingerprint:
+    """Return the durable fingerprint used by the sampling manifest."""
+    manifests = tuple(
+        sorted(Path(path).resolve() for path in structural_manifests)
+    )
+    table_limits = {
+        str(table_id): int(limit)
+        for table_id, limit in (per_table_entity_limits or {}).items()
+    }
+    limits_fingerprint = stable_hash(
+        SAMPLING_SCHEMA_VERSION,
+        "per-table-entity-limits-v1",
+        json.dumps(table_limits, sort_keys=True, separators=(",", ":")),
+        length=40,
+    )
+    return StageFingerprint(
+        stage="wdc200k_entity_sampling",
+        input_fingerprint=stable_hash(
+            SAMPLING_SCHEMA_VERSION,
+            *(f"{path.as_posix()}:{_sha256_path(path)}" for path in manifests),
+            length=40,
+        ),
+        parameter_fingerprint=stable_hash(
+            SAMPLING_SCHEMA_VERSION,
+            json.dumps(asdict(policy), sort_keys=True),
+            limits_fingerprint,
+            length=40,
+        ),
+        schema_version=SAMPLING_SCHEMA_VERSION,
+    )
 
 
 def _http_url(record: Mapping[str, Any], field: str) -> bool:
@@ -338,9 +375,7 @@ def _manifest_artifacts(manifest_path: Path, root: Path) -> dict[str, Path]:
             sha256=str(raw["sha256"]),
         )
         path = (root / completed.path).resolve()
-        if not path.is_relative_to(root.resolve()) or not validate_completed_shard(
-            completed, root
-        ):
+        if not path.is_relative_to(root.resolve()):
             raise ValueError(f"structural shard checksum failed: {completed.path}")
         prefix = completed.path.split("/", 1)[0]
         artifact = (
@@ -349,6 +384,18 @@ def _manifest_artifacts(manifest_path: Path, root: Path) -> dict[str, Path]:
             else prefix
         )
         seen_artifacts.append(artifact)
+        compactable = artifact in {
+            "entities",
+            "page_refs",
+            "direct_image_refs",
+            "validated_selection",
+        }
+        if not validate_completed_shard(completed, root):
+            if compactable and not path.exists():
+                continue
+            raise ValueError(
+                f"structural shard checksum failed: {completed.path}"
+            )
         if prefix in {"source_tables", "entities", "page_refs", "direct_image_refs"}:
             if prefix in result:
                 raise ValueError(f"duplicate structural artifact {prefix}")
@@ -358,9 +405,12 @@ def _manifest_artifacts(manifest_path: Path, root: Path) -> dict[str, Path]:
         "structural_failures",
         "validated_selection",
     }
-    if set(result) != required_inputs or set(seen_artifacts) != exact_artifacts or len(
-        seen_artifacts
-    ) != len(exact_artifacts):
+    if (
+        "source_tables" not in result
+        or not set(result).issubset(required_inputs)
+        or set(seen_artifacts) != exact_artifacts
+        or len(seen_artifacts) != len(exact_artifacts)
+    ):
         raise ValueError("structural manifest is missing sampling inputs")
     return result
 
@@ -857,26 +907,10 @@ def sample_structural_artifacts(
         raise ValueError(
             "per-table entity limits cannot be below the initial sample cap"
         )
-    limits_fingerprint = stable_hash(
-        SAMPLING_SCHEMA_VERSION,
-        "per-table-entity-limits-v1",
-        json.dumps(table_limits, sort_keys=True, separators=(",", ":")),
-        length=40,
-    )
-    fingerprint = StageFingerprint(
-        stage="wdc200k_entity_sampling",
-        input_fingerprint=stable_hash(
-            SAMPLING_SCHEMA_VERSION,
-            *(f"{path.as_posix()}:{_sha256_path(path)}" for path in manifests),
-            length=40,
-        ),
-        parameter_fingerprint=stable_hash(
-            SAMPLING_SCHEMA_VERSION,
-            json.dumps(asdict(policy), sort_keys=True),
-            limits_fingerprint,
-            length=40,
-        ),
-        schema_version=SAMPLING_SCHEMA_VERSION,
+    fingerprint = sampling_stage_fingerprint(
+        manifests,
+        policy,
+        per_table_entity_limits=table_limits,
     )
     manifest = StageManifest(
         output_root / "manifest.json", fingerprint, pre_write_guard=pre_write_guard
@@ -940,15 +974,21 @@ def sample_structural_artifacts(
                 continue
             inputs = _manifest_artifacts(structural_manifest, structural_output_root)
             entities_by_table: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for entity in _iter_jsonl(inputs["entities"]):
-                table_id, _row_id = _appearance(entity)
-                entities_by_table[table_id].append(entity)
             pages_by_table: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for reference in _iter_jsonl(inputs["page_refs"]):
-                pages_by_table[str(reference["source_table_id"])].append(reference)
             images_by_table: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for reference in _iter_jsonl(inputs["direct_image_refs"]):
-                images_by_table[str(reference["source_table_id"])].append(reference)
+            compact_evidence = not {
+                "entities",
+                "page_refs",
+                "direct_image_refs",
+            }.issubset(inputs)
+            if not compact_evidence:
+                for entity in _iter_jsonl(inputs["entities"]):
+                    table_id, _row_id = _appearance(entity)
+                    entities_by_table[table_id].append(entity)
+                for reference in _iter_jsonl(inputs["page_refs"]):
+                    pages_by_table[str(reference["source_table_id"])].append(reference)
+                for reference in _iter_jsonl(inputs["direct_image_refs"]):
+                    images_by_table[str(reference["source_table_id"])].append(reference)
             writers = {
                 artifact: AtomicJsonlShard(
                     output_root / artifact / f"part-{index:05d}.jsonl",
@@ -960,6 +1000,16 @@ def sample_structural_artifacts(
             try:
                 for source_table in _iter_jsonl(inputs["source_tables"]):
                     table_id = str(source_table["source_table_id"])
+                    if compact_evidence:
+                        (
+                            table_entities,
+                            table_pages,
+                            table_images,
+                        ) = derive_structural_evidence(source_table)
+                    else:
+                        table_entities = entities_by_table.get(table_id, ())
+                        table_pages = pages_by_table.get(table_id, ())
+                        table_images = images_by_table.get(table_id, ())
                     table_policy = policy
                     table_limit = table_limits.get(table_id)
                     if table_limit is not None:
@@ -969,9 +1019,9 @@ def sample_structural_artifacts(
                         )
                     sampled, decision = sample_table_entities(
                         source_table,
-                        entities_by_table.get(table_id, ()),
-                        pages_by_table.get(table_id, ()),
-                        images_by_table.get(table_id, ()),
+                        table_entities,
+                        table_pages,
+                        table_images,
                         table_policy,
                     )
                     decision["sample_limit"] = (
@@ -987,7 +1037,7 @@ def sample_structural_artifacts(
                         selected_pages = sorted(
                             (
                                 reference
-                                for reference in pages_by_table.get(table_id, ())
+                                for reference in table_pages
                                 if reference.get("entity_id") in selected_ids
                             ),
                             key=lambda item: (
@@ -1002,7 +1052,7 @@ def sample_structural_artifacts(
                         selected_images = sorted(
                             (
                                 reference
-                                for reference in images_by_table.get(table_id, ())
+                                for reference in table_images
                                 if reference.get("entity_id") in selected_ids
                             ),
                             key=lambda item: (

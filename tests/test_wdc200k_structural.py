@@ -1445,6 +1445,50 @@ def test_resume_after_mid_commit_failure_rewrites_a_complete_artifact_set(
     )
 
     assert resumed.tables == 1
+
+
+def test_resume_rebuilds_certified_compact_structural_derivatives(
+    tmp_path: Path,
+) -> None:
+    path = write_wdc_gzip(
+        tmp_path,
+        rows=[{"name": "A", "page_url": "https://example.test/a"}],
+    )
+    records = [selection_record(path, tmp_path, rows=1, columns=2)]
+    output_root = tmp_path / "structural"
+    result = expand_selected_shard(
+        records,
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    # Materialization cleanup retires only the large derived shards while the
+    # source-table authority and complete manifest remain durable.
+    for path in (result.entities, result.page_refs, result.direct_image_refs):
+        path.unlink()
+    result.validated_selection.unlink()
+
+    resumed = expand_selected_shard(
+        records,
+        output_root=output_root,
+        input_root=tmp_path,
+    )
+
+    assert resumed.tables == 1
+    assert resumed.entities_count == 1
+    assert resumed.page_references == 1
+    assert resumed.direct_image_references == 0
+    assert all(
+        path.is_file()
+        for path in (
+            resumed.source_tables,
+            resumed.entities,
+            resumed.page_refs,
+            resumed.direct_image_refs,
+            resumed.validated_selection,
+            resumed.manifest,
+        )
+    )
     assert len(read_records(resumed.source_tables)) == 1
     assert len(read_records(resumed.validated_selection)) == 1
     assert json.loads(resumed.manifest.read_text(encoding="utf-8"))[

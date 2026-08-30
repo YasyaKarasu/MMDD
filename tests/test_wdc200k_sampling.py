@@ -26,6 +26,7 @@ import build_wdc200k_mm_joinability_dataset as pipeline
 import build_mm_joinability_dataset as join_builder
 import wdc200k_sampling as sampling_module
 from stage1_io import stable_hash
+from wdc200k_structural import derive_structural_evidence
 
 
 def _entity_id(row_id: int) -> str:
@@ -438,6 +439,113 @@ def test_stage_resume_reuses_valid_shards_without_duplicate_writes(tmp_path: Pat
     assert second.manifest_path.read_bytes() == before
     assert {path: path.read_bytes() for paths in second.artifact_paths.values() for path in paths} == shard_bytes
     assert len(list(iter_sampled_records(second, "sampled_entities"))) == 8
+
+
+def test_sampling_reconstructs_compacted_evidence_from_source_tables(
+    tmp_path: Path,
+) -> None:
+    structural_root = tmp_path / "structural"
+    source = _source()
+    source["columns"].extend(
+        [
+            {"column_index": 3, "column_name": "page_url"},
+            {"column_index": 4, "column_name": "image"},
+        ]
+    )
+    source["num_cols"] = 5
+    for row in source["rows"]:
+        row_id = int(row["row_id"])
+        page_url = f"https://example.test/entity-{row_id}"
+        image_url = f"https://images.test/entity-{row_id}.jpg"
+        row["cells"].extend(
+            [
+                {
+                    "column_index": 3,
+                    "column_name": "page_url",
+                    "raw": page_url,
+                    "text": page_url,
+                },
+                {
+                    "column_index": 4,
+                    "column_name": "image",
+                    "raw": image_url,
+                    "text": image_url,
+                },
+            ]
+        )
+    entities, pages, images = derive_structural_evidence(source)
+    completed = [
+        _write_shard(
+            structural_root,
+            "source_tables/part-00000.jsonl",
+            [source],
+        ),
+        _write_shard(
+            structural_root,
+            "entities/part-00000.jsonl",
+            entities,
+        ),
+        _write_shard(
+            structural_root,
+            "page_refs/part-00000.jsonl",
+            pages,
+        ),
+        _write_shard(
+            structural_root,
+            "direct_image_refs/part-00000.jsonl",
+            images,
+        ),
+        _write_shard(
+            structural_root,
+            "structural_failures/part-00000.jsonl",
+            [],
+        ),
+        _write_shard(
+            structural_root,
+            "selection/validated-00000.jsonl",
+            [{"source_table_id": "table-1", "rows": 8}],
+        ),
+    ]
+    structural_manifest = StageManifest(
+        structural_root / "structural-00000.json",
+        StageFingerprint(
+            "wdc200k_structural",
+            "input",
+            "parameters",
+            "wdc200k-structural-v2",
+        ),
+    )
+    for shard in completed:
+        structural_manifest.record_shard(shard)
+    structural_manifest.mark_complete()
+
+    baseline = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest.path],
+        output_root=tmp_path / "baseline",
+        policy=SamplingPolicy(),
+    )
+    for relative in (
+        "entities/part-00000.jsonl",
+        "page_refs/part-00000.jsonl",
+        "direct_image_refs/part-00000.jsonl",
+        "selection/validated-00000.jsonl",
+    ):
+        (structural_root / relative).unlink()
+    compact = sample_structural_artifacts(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest.path],
+        output_root=tmp_path / "compact",
+        policy=SamplingPolicy(),
+    )
+
+    assert {
+        artifact: [path.read_bytes() for path in paths]
+        for artifact, paths in compact.artifact_paths.items()
+    } == {
+        artifact: [path.read_bytes() for path in paths]
+        for artifact, paths in baseline.artifact_paths.items()
+    }
 
 
 def test_completed_resume_does_not_repeat_full_source_closure(
