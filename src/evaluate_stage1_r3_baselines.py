@@ -272,7 +272,7 @@ def _markdown(payload: dict[str, Any]) -> str:
     recall_ks = payload["parameters"]["recall_ks"]
     max_k = max(recall_ks)
     rows = [
-        "# Task E: round-3 baselines",
+        f"# {payload.get('title', 'Task E: round-3 baselines')}",
         "",
         "Teacher-ensemble rows use direct Q→T reranking of an independently retrieved "
         "`gamma × k` candidate pool. Coverage is therefore not applicable to them; the "
@@ -453,7 +453,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         assert raw_indices is not None
         full_system("raw", "Raw embedding", raw_indices)
     if "student" in args.systems:
-        full_system("student", "Final Student (epoch 0)", student_indices)
+        full_system(
+            "student",
+            getattr(args, "student_label", "Final Student (epoch 0)"),
+            student_indices,
+        )
 
     if any(name in args.systems for name in ("raw_ensemble", "student_ensemble")):
         teacher_path = Path(args.teacher_checkpoint)
@@ -524,6 +528,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     payload = {
         "format_version": 1,
+        "title": getattr(args, "title", "Task E: round-3 baselines"),
         "selection": str(Path(args.selection).resolve()),
         "student_checkpoint": str(checkpoint_path.resolve()),
         "student_checkpoint_sha256": checkpoint_sha256,
@@ -575,6 +580,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--teacher-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--title", default="Task E: round-3 baselines")
+    parser.add_argument("--student-label", default="Final Student (epoch 0)")
     parser.add_argument("--systems", type=_system_names, default=SYSTEMS)
     parser.add_argument("--recall-ks", type=_positive_ints, default=(10, 20, 30, 40, 50))
     parser.add_argument("--gamma", type=int, default=4)
