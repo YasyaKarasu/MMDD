@@ -2525,6 +2525,54 @@ def test_production_transport_pins_first_validated_dns_answer(tmp_path):
     assert pinned_calls == [("93.184.216.34", "rebind.test")]
 
 
+def test_production_transport_passes_explicit_proxy_after_target_validation(
+    tmp_path,
+):
+    calls: list[tuple[str, str, str | None]] = []
+
+    def pinned_request(
+        url: str,
+        *,
+        pinned_ip: str,
+        server_hostname: str,
+        proxy_url: str | None,
+        **_kwargs,
+    ):
+        calls.append((pinned_ip, server_hostname, proxy_url))
+        return FakeResponse(b"<p>Proxied public response.</p>", url=url)
+
+    client = WdcWebClient(
+        tmp_path,
+        host_delay=0,
+        max_retries=0,
+        resolve_host_fn=lambda _host: ["93.184.216.34"],
+        pinned_request_fn=pinned_request,
+        proxy_url="http://127.0.0.1:7890",
+    )
+
+    assert client.fetch_page("https://proxy-target.test/page") is not None
+    assert calls == [
+        (
+            "93.184.216.34",
+            "proxy-target.test",
+            "http://127.0.0.1:7890",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "https://127.0.0.1:7890",
+        "http://user:password@127.0.0.1:7890",
+        "http://127.0.0.1:7890/path",
+    ],
+)
+def test_web_client_rejects_unsupported_proxy_urls(tmp_path, proxy_url):
+    with pytest.raises(ValueError, match="proxy_url"):
+        WdcWebClient(tmp_path, proxy_url=proxy_url)
+
+
 def test_total_image_byte_quota_stops_cache_growth(tmp_path):
     body = png_bytes()
     failures: list[dict[str, Any]] = []

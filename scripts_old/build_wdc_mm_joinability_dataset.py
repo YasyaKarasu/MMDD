@@ -64,6 +64,37 @@ class _ValidatedTarget:
     pinned_ip: str
 
 
+@dataclass(frozen=True)
+class _HttpProxy:
+    host: str
+    port: int
+
+
+def _parse_http_proxy(value: str | None) -> _HttpProxy | None:
+    proxy_url = clean_text(value)
+    if not proxy_url:
+        return None
+    try:
+        parsed = urlsplit(proxy_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"malformed HTTP proxy URL: {exc}") from exc
+    if (
+        parsed.scheme.casefold() != "http"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "proxy_url must be an http://host[:port] URL without credentials"
+        )
+    return _HttpProxy(host=host, port=int(port or 80))
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """Connect TCP to a vetted IP while retaining hostname TLS verification."""
 
@@ -85,6 +116,35 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         http.client.HTTPConnection.connect(self)
+        assert self.sock is not None
+        self.sock = self._context.wrap_socket(
+            self.sock,
+            server_hostname=self._verified_server_hostname,
+        )
+
+
+class _PinnedProxyHTTPSConnection(http.client.HTTPConnection):
+    """CONNECT to a vetted target IP, then verify TLS for its hostname."""
+
+    def __init__(
+        self,
+        proxy: _HttpProxy,
+        *,
+        pinned_ip: str,
+        target_port: int,
+        server_hostname: str,
+        timeout: float,
+    ) -> None:
+        super().__init__(proxy.host, proxy.port, timeout=timeout)
+        tunnel_host = (
+            f"[{pinned_ip}]" if ipaddress.ip_address(pinned_ip).version == 6 else pinned_ip
+        )
+        self.set_tunnel(tunnel_host, target_port)
+        self._verified_server_hostname = server_hostname
+        self._context = ssl.create_default_context()
+
+    def connect(self) -> None:
+        super().connect()
         assert self.sock is not None
         self.sock = self._context.wrap_socket(
             self.sock,
@@ -161,6 +221,7 @@ def _pinned_http_get(
     timeout: tuple[float, float],
     deadline: float,
     monotonic_fn: Callable[[], float],
+    proxy_url: str | None = None,
     **_kwargs: Any,
 ) -> _PinnedResponse:
     parsed = urlsplit(url)
@@ -168,8 +229,27 @@ def _pinned_http_get(
     if remaining <= 0:
         raise TimeoutError("response deadline exceeded")
     connect_timeout = min(float(timeout[0]), remaining)
+    proxy = _parse_http_proxy(proxy_url)
     connection: http.client.HTTPConnection
-    if parsed.scheme.casefold() == "https":
+    if proxy is not None and parsed.scheme.casefold() == "https":
+        connection = _PinnedProxyHTTPSConnection(
+            proxy,
+            pinned_ip=pinned_ip,
+            target_port=port,
+            server_hostname=server_hostname,
+            timeout=connect_timeout,
+        )
+    elif proxy is not None:
+        connection = http.client.HTTPConnection(
+            proxy.host,
+            proxy.port,
+            timeout=connect_timeout,
+        )
+        tunnel_host = (
+            f"[{pinned_ip}]" if ipaddress.ip_address(pinned_ip).version == 6 else pinned_ip
+        )
+        connection.set_tunnel(tunnel_host, port)
+    elif parsed.scheme.casefold() == "https":
         connection = _PinnedHTTPSConnection(
             pinned_ip,
             port,
@@ -422,6 +502,7 @@ class WdcWebClient:
         monotonic_fn: Any = time.monotonic,
         resolve_host_fn: Callable[[str], Iterable[str]] | None = None,
         pinned_request_fn: Callable[..., Any] | None = None,
+        proxy_url: str | None = None,
         web_failure_callback: Callable[[dict[str, Any]], None] | None = None,
         media_failure_callback: Callable[[dict[str, Any]], None] | None = None,
         network_policy_version: str = "wdc-web-v1",
@@ -503,6 +584,8 @@ class WdcWebClient:
         self.network_policy_version = clean_text(network_policy_version) or "wdc-web-v1"
         self.resolve_host_fn = resolve_host_fn
         self.pinned_request_fn = pinned_request_fn
+        self.proxy_url = clean_text(proxy_url) or None
+        _parse_http_proxy(self.proxy_url)
         self._host_map_lock = threading.Lock()
         self._host_locks: dict[str, threading.Lock] = {}
         self._last_request_by_host: dict[str, float] = {}
@@ -971,6 +1054,7 @@ class WdcWebClient:
             timeout=self.timeout,
             deadline=deadline,
             monotonic_fn=self.monotonic_fn,
+            proxy_url=self.proxy_url,
             **transport_kwargs,
         )
 

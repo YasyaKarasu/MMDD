@@ -199,6 +199,7 @@ class PipelineConfig:
     web_max_response_seconds: float = 8.0
     web_global_concurrency: int = 128
     web_per_host_concurrency: int = 2
+    web_proxy_url: str | None = None
     max_image_attempts_per_entity: int = 3
     max_images_per_entity: int = 3
     sampled_entities_per_table: int = 8
@@ -366,6 +367,7 @@ class PipelineConfig:
             web_max_response_seconds=args.web_max_response_seconds,
             web_global_concurrency=args.web_global_concurrency,
             web_per_host_concurrency=args.web_per_host_concurrency,
+            web_proxy_url=args.web_proxy_url or None,
             max_image_attempts_per_entity=(
                 args.max_image_attempts_per_entity
             ),
@@ -2454,6 +2456,7 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "web_max_response_seconds",
         "web_global_concurrency",
         "web_per_host_concurrency",
+        "web_proxy_url",
         "web_max_page_bytes",
     ),
     "asset_planning": (
@@ -2465,6 +2468,7 @@ _STAGE_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
         "web_max_response_seconds",
         "web_global_concurrency",
         "web_per_host_concurrency",
+        "web_proxy_url",
         "web_max_image_bytes",
         "max_image_attempts_per_entity",
         "max_images_per_entity",
@@ -4919,6 +4923,7 @@ def _new_web_transport(
         min_free_disk_bytes=config.min_free_disk_bytes,
         max_response_seconds=config.web_max_response_seconds,
         host_delay=0.0,
+        proxy_url=config.web_proxy_url,
         pre_write_guard=pre_write_guard,
     )
 
@@ -6826,6 +6831,14 @@ def parse_args(
     parser.add_argument("--web_max_response_seconds", type=float, default=8.0)
     parser.add_argument("--web_global_concurrency", type=int, default=128)
     parser.add_argument("--web_per_host_concurrency", type=int, default=2)
+    parser.add_argument(
+        "--web_proxy_url",
+        help=(
+            "Explicit HTTP CONNECT proxy for page and image downloads. "
+            "The target hostname is still resolved and checked locally, and "
+            "the proxy connects to the validated target IP."
+        ),
+    )
     parser.add_argument(
         "--max_image_attempts_per_entity", type=int, default=3
     )

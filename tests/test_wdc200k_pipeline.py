@@ -150,6 +150,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.web_max_response_seconds == 8
     assert args.web_global_concurrency == 128
     assert args.web_per_host_concurrency == 2
+    assert args.web_proxy_url is None
     assert args.max_image_attempts_per_entity == 3
     assert args.max_images_per_entity == 3
     assert tuple(args.sampled_entity_expansion_schedule) == (12, 20, 25)
@@ -165,6 +166,23 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.unrecoverable_drop_probability == 0.5
     assert args.materialization_workers == 1
     assert args.materialization_validation_workers == 3
+
+
+def test_cli_configures_explicit_web_proxy(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--input_dir",
+            str(tmp_path / "input"),
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--web_proxy_url",
+            "http://127.0.0.1:7890",
+        ]
+    )
+
+    assert PipelineConfig.from_args(args).web_proxy_url == (
+        "http://127.0.0.1:7890"
+    )
 
 
 def test_progressive_sampling_expands_failed_tables_before_replacement(
