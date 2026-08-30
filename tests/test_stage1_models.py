@@ -67,8 +67,10 @@ from mmdd_stage1.scoring import (
     score_target_direct_batch_in_batch,
 )
 from mmdd_stage1.teacher_logits import (
+    FROZEN_COSINE_TARGET_SHA256,
     has_teacher_logits,
     load_teacher_logits,
+    score_and_cache_cosine_logits,
     score_and_cache_teacher_logits,
 )
 from mmdd_stage1.teacher_rerank import z_scores
@@ -3112,6 +3114,79 @@ def test_teacher_logit_sidecars_cache_path_ensemble_targets_separately(tmp_path)
     assert loaded[0].teacher_evidence_logits == pytest.approx(
         z_scores(raw_evidence_target)
     )
+
+
+def test_pure_cosine_kd_cache_does_not_need_a_teacher(tmp_path):
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.25),
+            "negative": feature("negative", "table", 0.9),
+            "positive_evidence": feature("positive_evidence", "text", 0.3),
+            "negative_evidence": feature("negative_evidence", "text", 0.75),
+        }
+    )
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("positive_evidence",)),
+                TargetCandidate("negative", ("negative_evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        )
+    ]
+    aggregator = PathAggregator()
+
+    cached, path = score_and_cache_cosine_logits(
+        examples,
+        store,
+        tmp_path,
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=aggregator,
+    )
+    loaded, loaded_path, hit = load_teacher_logits(
+        examples,
+        tmp_path,
+        FROZEN_COSINE_TARGET_SHA256,
+        aggregator,
+        ensemble_alpha=0.0,
+    )
+
+    assert hit
+    assert loaded_path == path
+    assert loaded == cached
+    assert path.parent.name == FROZEN_COSINE_TARGET_SHA256
+    assert loaded[0].teacher_logit_mode == "ensemble"
+    assert loaded[0].teacher_ensemble_alpha == 0.0
+
+
+def test_kd_target_teacher_alpha_is_the_canonical_cli_name(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_stage1.py",
+            "student-path",
+            "--features",
+            "features",
+            "--base-data",
+            "train.jsonl",
+            "--dev-data",
+            "dev.jsonl",
+            "--output",
+            "student.pt",
+            "--kd-target-teacher-alpha",
+            "0.3",
+        ],
+    )
+
+    args = train_stage1.parse_args()
+
+    assert args.kd_target_teacher_alpha == pytest.approx(0.3)
+    assert args.teacher_ensemble_alpha is None
 
 
 def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_tier(

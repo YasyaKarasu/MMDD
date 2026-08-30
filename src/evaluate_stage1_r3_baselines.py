@@ -53,6 +53,19 @@ def _system_names(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _modality_weight(value: str) -> tuple[str, float]:
+    modality, separator, raw_weight = value.partition("=")
+    if separator != "=" or modality not in {"text", "image"}:
+        raise argparse.ArgumentTypeError("modality weights must use text=VALUE or image=VALUE")
+    try:
+        weight = float(raw_weight)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("modality weight must be numeric") from exc
+    if weight < 0:
+        raise argparse.ArgumentTypeError("modality weight must be non-negative")
+    return modality, weight
+
+
 def _examples(paths: Sequence[str], max_queries: int | None) -> list[TargetExample]:
     examples = [
         example
@@ -346,6 +359,10 @@ def _markdown(payload: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    evidence_modality_weights = dict(
+        getattr(args, "evidence_modality_weights", [])
+    )
+    evidence_types = tuple(getattr(args, "evidence_types", ("text", "image")))
     if args.gamma <= 0 or args.gamma_evidence <= 0 or args.teacher_batch_size <= 0:
         raise ValueError("gamma, gamma-evidence, and teacher-batch-size must be positive")
     if not 0 <= args.teacher_alpha <= 1:
@@ -432,8 +449,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             recall_ks=args.recall_ks,
             gamma=args.gamma,
             gamma_evidence=args.gamma_evidence,
+            evidence_types=evidence_types,
             evidence_aggregation=aggregation,
             evidence_top_k=evidence_top_k,
+            evidence_modality_weights=evidence_modality_weights,
             fusion_mode="weighted_rrf",
             evidence_weight=0.05,
             return_per_query=True,
@@ -544,6 +563,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "teacher_batch_size": args.teacher_batch_size,
             "evidence_aggregation": aggregation,
             "evidence_top_k": evidence_top_k,
+            "evidence_types": list(evidence_types),
+            "evidence_modality_weights": evidence_modality_weights,
             "bootstrap_iterations": args.bootstrap_iterations,
             "bootstrap_seed": args.bootstrap_seed,
             "max_queries": args.max_queries,
@@ -595,6 +616,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ef-search", type=int, default=100)
     parser.add_argument("--evidence-aggregation")
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument(
+        "--evidence-types",
+        nargs="+",
+        choices=["text", "image"],
+        default=["text", "image"],
+    )
+    parser.add_argument(
+        "--evidence-modality-weights",
+        nargs="*",
+        type=_modality_weight,
+        default=[],
+        metavar="MODALITY=WEIGHT",
+    )
     parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=13)
     parser.add_argument("--max-queries", type=int)

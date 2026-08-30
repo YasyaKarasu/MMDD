@@ -26,6 +26,7 @@ from mmdd_stage1.retrieval import (
     load_or_build_raw_embedding_indices,
 )
 from mmdd_stage1.selection import write_json
+from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.teacher_rerank import (
     evaluate_teacher_reranking,
     spearman_correlation,
@@ -161,6 +162,10 @@ def _markdown(payload: dict[str, Any]) -> str:
             "",
             f"- Decision: `{payload['decision']}`",
             f"- R@10 delta: {payload['recall@10_delta']:+.2%}",
+            "- Paired R@10 delta / 95% CI: "
+            f"{payload['paired_recall@10_vs_raw']['mean']:+.2%} "
+            f"[{payload['paired_recall@10_vs_raw']['ci_low']:+.2%}, "
+            f"{payload['paired_recall@10_vs_raw']['ci_high']:+.2%}]",
             f"- Mean per-query Spearman(raw, Teacher): {payload['spearman']['mean']:.4f}",
             f"- Median per-query Spearman(raw, Teacher): {payload['spearman']['median']:.4f}",
             "",
@@ -359,6 +364,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
         batch_size=args.teacher_batch_size,
         ensemble_alphas=args.ensemble_alphas,
+        return_per_query=True,
     )
     raw_metrics = evaluation["raw_direct"]
     teacher_metrics = evaluation["teacher_reranked"]
@@ -372,6 +378,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "raw_direct": raw_metrics,
         "teacher_reranked": teacher_metrics,
         "recall@10_delta": evaluation["recall@10_delta"],
+        "paired_recall@10_vs_raw": paired_bootstrap_delta(
+            teacher_metrics["per_query"]["recall@10"],
+            raw_metrics["per_query"]["recall@10"],
+            iterations=args.bootstrap_iterations,
+            seed=args.bootstrap_seed,
+        ),
         "spearman": evaluation["spearman"],
         "decision": _branch(
             float(raw_metrics["recall@10"]),
@@ -389,6 +401,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             device=device,
             batch_size=args.teacher_batch_size,
             ensemble_alphas=args.ensemble_alphas,
+            return_per_query=True,
         )
     selection = payload["ensemble_selection"]
     if selection is not None and selection["accepted"]:
@@ -421,6 +434,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "raw_direct": raw_metrics,
                 "teacher_reranked": teacher_metrics,
                 "recall@10_delta": payload["recall@10_delta"],
+                "paired_recall@10_vs_raw": payload["paired_recall@10_vs_raw"],
                 "spearman": payload["spearman"],
                 "decision": payload["decision"],
                 "ensembles": payload["ensembles"],
@@ -465,6 +479,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--ef-search", type=int, default=100)
+    parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
+    parser.add_argument("--bootstrap-seed", type=int, default=13)
     return parser.parse_args()
 
 

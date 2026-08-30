@@ -204,6 +204,59 @@ def _teacher_scores(
     return [score_cache[(query_id, candidate_id)] for candidate_id in candidate_ids]
 
 
+class TeacherRerankedANNIndices:
+    """Rerank each fixed raw ANN edge pool with a frozen Teacher."""
+
+    def __init__(
+        self,
+        raw_indices: Any,
+        teacher: TeacherJoinabilityModel,
+        store: FeatureStore,
+        *,
+        device: torch.device,
+        batch_size: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.raw_indices = raw_indices
+        self.teacher = teacher.eval()
+        self.store = store
+        self.device = device
+        self.batch_size = batch_size
+        self.score_cache: dict[tuple[str, str], float] = {}
+
+    def search(
+        self, source_id: str, destination_type: str, k: int
+    ) -> list[tuple[str, float]]:
+        raw_hits = self.raw_indices.search(source_id, destination_type, k)
+        candidate_ids = [object_id for object_id, _score in raw_hits]
+        scores = _teacher_scores(
+            self.teacher,
+            source_id,
+            candidate_ids,
+            self.store,
+            self.device,
+            self.batch_size,
+            self.score_cache,
+        )
+        order = sorted(
+            range(len(candidate_ids)),
+            key=lambda index: (-scores[index], candidate_ids[index]),
+        )
+        return [(candidate_ids[index], scores[index]) for index in order]
+
+    def search_many(
+        self,
+        source_ids: Sequence[str],
+        destination_type: str,
+        k: int,
+    ) -> list[list[tuple[str, float]]]:
+        return [
+            self.search(source_id, destination_type, k)
+            for source_id in source_ids
+        ]
+
+
 def evaluate_teacher_reranking(
     teacher: TeacherJoinabilityModel,
     examples: Sequence[TargetExample],

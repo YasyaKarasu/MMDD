@@ -160,6 +160,80 @@ def test_align_target_record_attaches_query_hard_evidence_to_raw_targets():
     assert len(aligned["candidates"]) == 4
 
 
+def test_align_target_record_can_bind_ann_targets_to_their_own_evidence():
+    record = {
+        "query_id": "q",
+        "direct_positive_target_id": "positive",
+        "evidence_positive_target_id": "positive",
+        "positive_target_ids": ["positive"],
+        "candidates": [
+            {"target_id": "positive", "evidence_ids": ["positive_text"]},
+            {"target_id": "hand1", "evidence_ids": ["hand_text"]},
+        ],
+        "dataset": "data",
+        "split": "train",
+    }
+
+    aligned = align_target_record(
+        record,
+        StaticIndices(),
+        _object_type,
+        list_width=4,
+        handcrafted_negatives=1,
+        evidence_per_type=1,
+        evidence_binding="target-bound",
+        target_evidence={
+            "raw_t1": ["raw_t1_text", "raw_t1_image"],
+            "raw_t2": ["raw_t2_text", "raw_t2_image"],
+        },
+    )
+
+    by_target = {value["target_id"]: value for value in aligned["candidates"]}
+    assert by_target["raw_t1"]["evidence_ids"] == [
+        "raw_t1_text",
+        "raw_t1_image",
+    ]
+    assert by_target["raw_t2"]["evidence_ids"] == [
+        "raw_t2_text",
+        "raw_t2_image",
+    ]
+    assert by_target["raw_t1"]["evidence_ids"] != by_target["raw_t2"][
+        "evidence_ids"
+    ]
+
+
+def test_align_target_record_text_only_removes_image_evidence():
+    record = {
+        "query_id": "q",
+        "direct_positive_target_id": "positive",
+        "evidence_positive_target_id": "positive",
+        "positive_target_ids": ["positive"],
+        "candidates": [
+            {
+                "target_id": "positive",
+                "evidence_ids": ["positive_text", "positive_image"],
+            }
+        ],
+        "dataset": "data",
+        "split": "train",
+    }
+
+    aligned = align_target_record(
+        record,
+        StaticIndices(),
+        _object_type,
+        list_width=3,
+        handcrafted_negatives=0,
+        evidence_per_type=1,
+        evidence_types=("text",),
+    )
+
+    assert all(
+        all("image" not in evidence_id for evidence_id in candidate["evidence_ids"])
+        for candidate in aligned["candidates"]
+    )
+
+
 def test_teacher_rerank_metrics_preserve_dataset_breakdown(monkeypatch):
     candidates = [(f"target_{index}", 1.0 - index / 20) for index in range(11)]
     example = TargetExample(
@@ -192,12 +266,129 @@ def test_teacher_rerank_metrics_preserve_dataset_breakdown(monkeypatch):
         object(),
         device=None,
         batch_size=4,
+        return_per_query=True,
     )
 
     assert metrics["raw_direct"]["recall@10"] == 1.0
     assert metrics["teacher_reranked"]["recall@10"] == 0.0
     assert metrics["teacher_reranked"]["by_dataset"]["data"]["queries"] == 1
+    assert metrics["raw_direct"]["per_query"]["recall@10"] == [1.0]
+    assert metrics["teacher_reranked"]["per_query"]["recall@10"] == [0.0]
     assert not teacher.training
+
+
+def test_teacher_reranked_indices_preserve_the_fixed_raw_pool(monkeypatch):
+    class RawIndices:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, source_id, destination_type, k):
+            self.calls.append((source_id, destination_type, k))
+            return [("low", 0.9), ("high", 0.8)][:k]
+
+    class Teacher:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(
+        teacher_rerank,
+        "_teacher_scores",
+        lambda _teacher, _source, candidate_ids, *_args: [
+            {"low": -1.0, "high": 2.0}[candidate_id]
+            for candidate_id in candidate_ids
+        ],
+    )
+    raw = RawIndices()
+    indices = teacher_rerank.TeacherRerankedANNIndices(
+        raw,
+        Teacher(),
+        object(),
+        device=None,
+        batch_size=2,
+    )
+
+    hits = indices.search("q", "table", 2)
+
+    assert raw.calls == [("q", "table", 2)]
+    assert hits == [("high", 2.0), ("low", -1.0)]
+
+
+def test_teacher_retrieval_feature_view_uses_explicit_pooled_fallback():
+    import torch
+
+    from evaluate_stage1_teacher_retrieval import _TeacherFeatureView
+    from mmdd_stage1.features import ObjectFeatures
+
+    class Store:
+        def get(self, object_id, *, include_hidden=True):
+            return ObjectFeatures(
+                object_id=object_id,
+                object_type="text",
+                embedding=torch.tensor([3.0, 4.0]),
+                hidden_states=(
+                    torch.tensor([[1.0, 2.0]])
+                    if object_id == "cached" and include_hidden
+                    else None
+                ),
+            )
+
+    view = _TeacherFeatureView(Store(), missing_policy="pooled_embedding")
+
+    cached = view.get("cached", include_hidden=True)
+    fallback = view.get("missing", include_hidden=True)
+
+    assert cached.hidden_states.tolist() == [[1.0, 2.0]]
+    assert fallback.hidden_states.tolist() == [[3.0, 4.0]]
+    assert view.missing_ids() == ["missing"]
+    assert view.coverage() == {
+        "policy": "pooled_embedding",
+        "unique_objects_scored": 2,
+        "cached_hidden_objects": 1,
+        "pooled_embedding_fallback_objects": 1,
+        "allowed_pooled_embedding_fallback_objects": 0,
+        "unexpected_pooled_embedding_fallback_objects": 1,
+        "cached_hidden_fraction": 0.5,
+    }
+
+
+def test_teacher_retrieval_feature_view_only_allows_audited_fallback():
+    import torch
+
+    from evaluate_stage1_teacher_retrieval import _TeacherFeatureView
+    from mmdd_stage1.features import ObjectFeatures
+
+    class Store:
+        def get(self, object_id, *, include_hidden=True):
+            return ObjectFeatures(
+                object_id=object_id,
+                object_type="image",
+                embedding=torch.tensor([3.0, 4.0]),
+                hidden_states=None,
+            )
+
+    view = _TeacherFeatureView(
+        Store(), missing_policy="error", allowed_fallback_ids={"invalid"}
+    )
+
+    allowed = view.get("invalid", include_hidden=True)
+    strict_view = _TeacherFeatureView(
+        Store(), missing_policy="error", allowed_fallback_ids={"invalid"}
+    )
+    disallowed = strict_view.get("unexpected", include_hidden=True)
+
+    assert allowed.hidden_states.tolist() == [[3.0, 4.0]]
+    assert disallowed.hidden_states is None
+    assert view.allowed_ids_used() == ["invalid"]
+    assert view.missing_ids() == []
+    assert view.coverage() == {
+        "policy": "error",
+        "unique_objects_scored": 1,
+        "cached_hidden_objects": 0,
+        "pooled_embedding_fallback_objects": 1,
+        "allowed_pooled_embedding_fallback_objects": 1,
+        "unexpected_pooled_embedding_fallback_objects": 0,
+        "cached_hidden_fraction": 0.0,
+    }
 
 
 def test_teacher_cache_staging_merge_is_atomic_and_preserves_records(tmp_path):

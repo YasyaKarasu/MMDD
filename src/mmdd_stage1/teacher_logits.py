@@ -27,6 +27,9 @@ from .teacher_rerank import ensemble_scores
 
 TrainingExample = EdgeExample | TargetExample
 ENSEMBLE_TARGET_VERSION = 2
+FROZEN_COSINE_TARGET_SHA256 = hashlib.sha256(
+    b"frozen-embedding-cosine-target-v1"
+).hexdigest()
 
 
 def _raw_target_edges(
@@ -539,6 +542,100 @@ def score_and_cache_teacher_logits(
             [torch.tensor(example.teacher_evidence_logits) for example in result],
             batch_first=True,
         ).float()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    return result, path
+
+
+@torch.no_grad()
+def score_and_cache_cosine_logits(
+    examples: Sequence[TargetExample],
+    store: FeatureStore,
+    cache_dir: Path,
+    *,
+    device: torch.device,
+    batch_size: int,
+    aggregator: PathAggregator,
+) -> tuple[list[TargetExample], Path]:
+    """Cache pure frozen-embedding cosine targets without loading a Teacher."""
+
+    result = list(examples)
+    missing = [
+        index
+        for index, example in enumerate(result)
+        if not has_teacher_logits(
+            [example],
+            FROZEN_COSINE_TARGET_SHA256,
+            aggregator,
+            ensemble_alpha=0.0,
+        )
+    ]
+    starts = range(0, len(missing), batch_size)
+    for start in progress(
+        starts,
+        total=len(starts),
+        desc="Cosine KD targets",
+        unit="batch",
+        leave=False,
+    ):
+        indices = missing[start : start + batch_size]
+        batch = [result[index] for index in indices]
+        raw_direct, raw_edges = _raw_target_edges(batch, store, device)
+        scores = TargetScores(
+            direct=_ensemble_list_scores(raw_direct, raw_direct, 0.0),
+            evidence=_ensemble_evidence_scores(
+                raw_edges, raw_edges, batch, aggregator, 0.0
+            ),
+        )
+        for row, index in enumerate(indices):
+            example = result[index]
+            count = len(example.candidates)
+            result[index] = replace(
+                example,
+                teacher_direct_logits=tuple(
+                    float(value)
+                    for value in scores.direct.logits[row, :count].cpu().tolist()
+                ),
+                teacher_evidence_logits=tuple(
+                    float(value)
+                    for value in scores.evidence.logits[row, :count].cpu().tolist()
+                ),
+                teacher_score_config=TeacherScoreConfig(
+                    aggregator.evidence_aggregation, aggregator.top_k
+                ),
+                teacher_checkpoint_sha256=FROZEN_COSINE_TARGET_SHA256,
+                teacher_logit_mode="ensemble",
+                teacher_ensemble_alpha=0.0,
+            )
+
+    path = _cache_path(
+        cache_dir,
+        result,
+        FROZEN_COSINE_TARGET_SHA256,
+        aggregator,
+        0.0,
+    )
+    payload: dict[str, Any] = {
+        "format_version": 1,
+        "teacher_checkpoint_sha256": FROZEN_COSINE_TARGET_SHA256,
+        "examples_sha256": examples_fingerprint(result),
+        "teacher_logit_mode": "ensemble",
+        "teacher_ensemble_alpha": 0.0,
+        "ensemble_target_version": ENSEMBLE_TARGET_VERSION,
+        "target_source": "frozen_embedding_cosine",
+        "evidence_aggregation": aggregator.evidence_aggregation,
+        "evidence_top_k": aggregator.top_k,
+        "teacher_direct_logits": pad_sequence(
+            [torch.tensor(example.teacher_direct_logits) for example in result],
+            batch_first=True,
+        ).float(),
+        "teacher_evidence_logits": pad_sequence(
+            [torch.tensor(example.teacher_evidence_logits) for example in result],
+            batch_first=True,
+        ).float(),
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)

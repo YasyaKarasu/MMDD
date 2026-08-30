@@ -91,8 +91,9 @@ def _limited_evidence(
     evidence_ids: Sequence[str],
     object_type: Callable[[str], str],
     max_per_type: int,
+    evidence_types: Sequence[str] = ("text", "image"),
 ) -> list[str]:
-    counts = {"text": 0, "image": 0}
+    counts = {evidence_type: 0 for evidence_type in evidence_types}
     selected = []
     for evidence_id in evidence_ids:
         evidence_type = normalize_object_type(object_type(evidence_id))
@@ -112,11 +113,22 @@ def align_target_record(
     handcrafted_negatives: int,
     evidence_per_type: int,
     unavailable_ids: set[str] | None = None,
+    evidence_binding: str = "query-hard",
+    target_evidence: dict[str, Sequence[str]] | None = None,
+    evidence_types: Sequence[str] = ("text", "image"),
 ) -> dict[str, Any]:
-    """Build a wide direct list and attach query-hard evidence to ANN targets."""
+    """Build a wide direct list and bind evidence to newly mined ANN targets."""
 
     if list_width < 2 or handcrafted_negatives < 0 or evidence_per_type < 0:
         raise ValueError("list_width must be at least 2 and quotas non-negative")
+    if evidence_binding not in {"query-hard", "target-bound"}:
+        raise ValueError("evidence_binding must be query-hard or target-bound")
+    evidence_types = tuple(dict.fromkeys(evidence_types))
+    if not evidence_types or any(
+        evidence_type not in {"text", "image"}
+        for evidence_type in evidence_types
+    ):
+        raise ValueError("evidence_types must contain text and/or image")
     unavailable_ids = unavailable_ids or set()
     query_id = str(record["query_id"])
     direct_positive = str(record["direct_positive_target_id"])
@@ -159,7 +171,7 @@ def align_target_record(
     )
 
     hard_evidence = []
-    for evidence_type in ("text", "image"):
+    for evidence_type in evidence_types:
         if evidence_per_type:
             hard_evidence.extend(
                 _raw_negatives(
@@ -174,8 +186,34 @@ def align_target_record(
     for target_id in target_ids:
         if target_id in original_candidates:
             evidence_ids = _limited_evidence(
-                original_candidates[target_id], object_type, evidence_per_type
+                original_candidates[target_id],
+                object_type,
+                evidence_per_type,
+                evidence_types,
             )
+        elif evidence_binding == "target-bound":
+            evidence_ids = _limited_evidence(
+                (target_evidence or {}).get(target_id, ()),
+                object_type,
+                evidence_per_type,
+                evidence_types,
+            )
+            present_types = {
+                normalize_object_type(object_type(evidence_id))
+                for evidence_id in evidence_ids
+            }
+            for evidence_type in evidence_types:
+                if evidence_type in present_types or not evidence_per_type:
+                    continue
+                evidence_ids.extend(
+                    _raw_negatives(
+                        indices,
+                        target_id,
+                        evidence_type,
+                        excluded={target_id, *unavailable_ids, *evidence_ids},
+                        count=evidence_per_type,
+                    )
+                )
         else:
             evidence_ids = hard_evidence
         candidates.append(

@@ -40,8 +40,10 @@ from mmdd_stage1.selection import (
 )
 from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.teacher_logits import (
+    FROZEN_COSINE_TARGET_SHA256,
     has_teacher_logits,
     load_teacher_logits,
+    score_and_cache_cosine_logits,
     score_and_cache_teacher_logits,
 )
 from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
@@ -686,6 +688,8 @@ class _EpochController:
                 self.stop_reason = (
                     f"early_stopping_patience_{self.gate.patience}"
                 )
+            if self.stage == "student-path":
+                self.prune_indices()
             return should_stop
         decision = self.gate.observe(epoch, gate_metrics)
         record["gate"] = {
@@ -701,6 +705,8 @@ class _EpochController:
             self.manager.update_best(candidate)
             self.best_metrics = gate_metrics
             self.best_index = index_dir
+        if self.stage == "student-path":
+            self.prune_indices()
         if decision.should_stop:
             self.stop_reason = f"early_stopping_patience_{self.gate.patience}"
         return decision.should_stop
@@ -796,6 +802,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_hot_fraction": 0.8,
         "per_dataset_gate": [],
         "distillation_datasets": [],
+        "kd_target_teacher_alpha": None,
         "teacher_ensemble_alpha": None,
         "recall_ks": (10, 20, 30, 40, 50),
         "train_eval_ks": None,
@@ -811,6 +818,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for name, default in optional_defaults.items():
         if not hasattr(args, name):
             setattr(args, name, default)
+    if args.kd_target_teacher_alpha is not None:
+        if (
+            args.teacher_ensemble_alpha is not None
+            and args.teacher_ensemble_alpha != args.kd_target_teacher_alpha
+        ):
+            raise ValueError(
+                "--kd-target-teacher-alpha and --teacher-ensemble-alpha disagree"
+            )
+        args.teacher_ensemble_alpha = args.kd_target_teacher_alpha
     if not isinstance(args.evidence_modality_weights, dict):
         args.evidence_modality_weights = dict(args.evidence_modality_weights)
     if not isinstance(args.edge_type_oversample, dict):
@@ -836,7 +852,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.stage != "student-path":
             raise ValueError("--teacher-ensemble-alpha is only valid for student-path")
         if not 0 <= args.teacher_ensemble_alpha <= 1:
-            raise ValueError("--teacher-ensemble-alpha must be in [0, 1]")
+            raise ValueError("--kd-target-teacher-alpha must be in [0, 1]")
     if args.anchor_weight < 0:
         raise ValueError("--anchor-weight must be non-negative")
     if args.anchor_weight_evidence is not None and args.anchor_weight_evidence < 0:
@@ -986,12 +1002,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.stage.startswith("student") and (
         args.distillation_weight > 0 or hard_examples
     ):
-        teacher_path = _required_path(
-            args.teacher_checkpoint, "--teacher-checkpoint", args.stage
+        pure_cosine_target = (
+            args.stage == "student-path"
+            and args.teacher_ensemble_alpha == 0.0
+            and not hard_examples
         )
-        teacher_sha256 = checkpoint_fingerprint(teacher_path)
+        teacher_path = (
+            None
+            if pure_cosine_target
+            else _required_path(
+                args.teacher_checkpoint, "--teacher-checkpoint", args.stage
+            )
+        )
+        teacher_sha256 = (
+            FROZEN_COSINE_TARGET_SHA256
+            if pure_cosine_target
+            else checkpoint_fingerprint(teacher_path)
+        )
         cache_aggregator = aggregator if is_path else None
         if hard_examples:
+            assert teacher_path is not None
             source_checkpoint = _required_path(
                 args.hard_source_checkpoint,
                 "--hard-source-checkpoint",
@@ -1043,47 +1073,69 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.teacher_ensemble_alpha,
         )
         if not train_logits_ready or not dev_logits_ready:
-            frozen_teacher = load_teacher(teacher_path, device)
-            _configure_teacher_compute(
-                frozen_teacher, args.teacher_amp, device
-            )
             teacher_cache_generated = True
-            hidden_dim = store.teacher_dimension()
-            if hidden_dim is None:
-                raise ValueError(
-                    "Teacher logit cache is incomplete and the feature cache has no hidden_states"
+            if pure_cosine_target:
+                assert cache_aggregator is not None
+                if not train_logits_ready:
+                    examples, train_cache_path = score_and_cache_cosine_logits(
+                        examples,
+                        store,
+                        cache_dir,
+                        device=device,
+                        batch_size=args.teacher_logit_batch_size,
+                        aggregator=cache_aggregator,
+                    )
+                if not dev_logits_ready:
+                    dev_examples, dev_cache_path = score_and_cache_cosine_logits(
+                        dev_examples,
+                        store,
+                        cache_dir,
+                        device=device,
+                        batch_size=args.teacher_logit_batch_size,
+                        aggregator=cache_aggregator,
+                    )
+            else:
+                assert teacher_path is not None
+                frozen_teacher = load_teacher(teacher_path, device)
+                _configure_teacher_compute(
+                    frozen_teacher, args.teacher_amp, device
                 )
-            if frozen_teacher.input_dim != hidden_dim:
-                raise ValueError(
-                    "Teacher checkpoint input dimension does not match the feature cache"
-                )
-            if not train_logits_ready:
-                examples, train_cache_path = score_and_cache_teacher_logits(
-                    examples,
-                    frozen_teacher,
-                    store,
-                    cache_dir,
-                    teacher_sha256,
-                    device=device,
-                    batch_size=args.teacher_logit_batch_size,
-                    aggregator=cache_aggregator,
-                    ensemble_alpha=args.teacher_ensemble_alpha,
-                )
-            if not dev_logits_ready:
-                dev_examples, dev_cache_path = score_and_cache_teacher_logits(
-                    dev_examples,
-                    frozen_teacher,
-                    store,
-                    cache_dir,
-                    teacher_sha256,
-                    device=device,
-                    batch_size=args.teacher_logit_batch_size,
-                    aggregator=cache_aggregator,
-                    ensemble_alpha=args.teacher_ensemble_alpha,
-                )
-            del frozen_teacher
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                hidden_dim = store.teacher_dimension()
+                if hidden_dim is None:
+                    raise ValueError(
+                        "Teacher logit cache is incomplete and the feature cache has no hidden_states"
+                    )
+                if frozen_teacher.input_dim != hidden_dim:
+                    raise ValueError(
+                        "Teacher checkpoint input dimension does not match the feature cache"
+                    )
+                if not train_logits_ready:
+                    examples, train_cache_path = score_and_cache_teacher_logits(
+                        examples,
+                        frozen_teacher,
+                        store,
+                        cache_dir,
+                        teacher_sha256,
+                        device=device,
+                        batch_size=args.teacher_logit_batch_size,
+                        aggregator=cache_aggregator,
+                        ensemble_alpha=args.teacher_ensemble_alpha,
+                    )
+                if not dev_logits_ready:
+                    dev_examples, dev_cache_path = score_and_cache_teacher_logits(
+                        dev_examples,
+                        frozen_teacher,
+                        store,
+                        cache_dir,
+                        teacher_sha256,
+                        device=device,
+                        batch_size=args.teacher_logit_batch_size,
+                        aggregator=cache_aggregator,
+                        ensemble_alpha=args.teacher_ensemble_alpha,
+                    )
+                del frozen_teacher
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
         teacher_cache_paths = [train_cache_path, dev_cache_path]
 
         if args.preload_embeddings:
@@ -1331,6 +1383,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else args.anchor_weight_evidence
         ),
         "distillation_datasets": args.distillation_datasets,
+        "kd_target_teacher_alpha": args.teacher_ensemble_alpha,
         "teacher_ensemble_alpha": args.teacher_ensemble_alpha,
         "per_dataset_gate": args.per_dataset_gate,
         "gate_unsatisfied": controller.gate_unsatisfied,
@@ -1638,11 +1691,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
     parser.add_argument(
+        "--kd-target-teacher-alpha",
+        type=float,
+        help=(
+            "Teacher coefficient tau for path KD targets: "
+            "tau*z(Teacher) + (1-tau)*z(frozen cosine). "
+            "At tau=0 no Teacher checkpoint or hidden-state cache is needed."
+        ),
+    )
+    parser.add_argument(
         "--teacher-ensemble-alpha",
         type=float,
         help=(
-            "Cache per-list z-score raw/Teacher ensemble targets for path KD; "
-            "omit for ordinary Teacher-logit distillation."
+            "Deprecated alias for --kd-target-teacher-alpha."
         ),
     )
     parser.add_argument(
