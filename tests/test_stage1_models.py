@@ -71,6 +71,7 @@ from mmdd_stage1.teacher_logits import (
     load_teacher_logits,
     score_and_cache_teacher_logits,
 )
+from mmdd_stage1.teacher_rerank import z_scores
 from mmdd_stage1.training import (
     checkpoint,
     sample_balanced_epoch,
@@ -1916,6 +1917,49 @@ def test_raw_embedding_ann_uses_frozen_vectors_without_student_head(tmp_path):
         assert score == pytest.approx(expected[target_id], abs=1e-5)
 
 
+def test_ann_search_raises_ef_to_the_requested_k():
+    class FakeIndex:
+        def __init__(self):
+            self.ef_values = []
+
+        def set_ef(self, value):
+            self.ef_values.append(value)
+
+        def knn_query(self, _queries, k):
+            return [list(range(k))], [[0.0] * k]
+
+    object_ids = [f"t{index}" for index in range(10)]
+    raw_index = FakeIndex()
+    raw = object.__new__(RawEmbeddingANNIndices)
+    raw.store = feature_store()
+    raw.embedding_dim = 4
+    raw.ef_search = 5
+    raw.indices = {"table": raw_index}
+    raw.object_ids = {"table": object_ids}
+
+    raw.search_many(["q"], "table", 8)
+
+    student_index = FakeIndex()
+    student = object.__new__(StudentANNIndices)
+    student.store = feature_store()
+    student.device = torch.device("cpu")
+    student.ef_search = 5
+    student.indices = {"table": student_index}
+    student.object_ids = {"table": object_ids}
+    student._relation_queries = {}
+
+    class IdentityRelations:
+        @staticmethod
+        def relation_query(embeddings, _source_type, _destination_type):
+            return embeddings
+
+    student.model = IdentityRelations()
+    student.search_many(["q"], "table", 8)
+
+    assert raw_index.ef_values == [8]
+    assert student_index.ef_values == [8]
+
+
 def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path):
     store = feature_store()
     corpus = tmp_path / "corpus.jsonl"
@@ -2010,6 +2054,29 @@ def test_online_retrieval_uses_configured_aggregation_and_unique_modalities():
     assert "direct_score" not in result
     assert "direct_rank" not in result
     assert "evidence_rank" not in result
+
+
+def test_online_retrieval_derives_pools_and_result_limit_from_k():
+    calls = []
+
+    class StaticIndices(_BatchedSearchMixin):
+        def search(self, source_id, destination_type, k):
+            calls.append((source_id, destination_type, k))
+            if source_id == "q" and destination_type == "table":
+                return [(f"t{index}", float(10 - index)) for index in range(6)]
+            return []
+
+    results = retrieve_zero_one_hop(
+        "q",
+        StaticIndices(),
+        k=2,
+        gamma=3,
+        gamma_evidence=1,
+        evidence_types=(),
+    )
+
+    assert [result["target_id"] for result in results] == ["t0", "t1"]
+    assert calls == [("q", "table", 6)]
 
 
 def test_weighted_rrf_can_preserve_direct_ranking_when_evidence_is_noisy():
@@ -2905,6 +2972,92 @@ def test_teacher_logit_sidecars_support_teacher_free_student_training(tmp_path):
     )
 
 
+def test_teacher_logit_sidecars_cache_path_ensemble_targets_separately(tmp_path):
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.25),
+            "negative": feature("negative", "table", 0.9),
+            "positive_evidence": feature("positive_evidence", "text", 0.3),
+            "negative_evidence": feature("negative_evidence", "text", 0.75),
+        }
+    )
+    teacher_model = teacher()
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("positive_evidence",)),
+                TargetCandidate("negative", ("negative_evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        )
+    ]
+    aggregator = PathAggregator()
+    ordinary, ordinary_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=aggregator,
+    )
+    ensemble, ensemble_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=aggregator,
+        ensemble_alpha=0.0,
+    )
+    loaded, loaded_path, hit = load_teacher_logits(
+        examples,
+        tmp_path,
+        "teacher-sha",
+        aggregator,
+        ensemble_alpha=0.0,
+    )
+
+    assert ordinary_path != ensemble_path
+    assert "ensemble-edge-v2" in ensemble_path.name
+    assert ordinary[0].teacher_logit_mode == "teacher"
+    assert ensemble[0].teacher_logit_mode == "ensemble"
+    assert ensemble[0].teacher_ensemble_alpha == 0.0
+    assert has_teacher_logits(loaded, "teacher-sha", aggregator, ensemble_alpha=0.0)
+    assert not has_teacher_logits(loaded, "teacher-sha", aggregator)
+    assert hit
+    assert loaded_path == ensemble_path
+    raw_direct = [
+        torch.nn.functional.cosine_similarity(
+            store.embedding_features("q").embedding,
+            store.embedding_features(object_id).embedding,
+            dim=0,
+        ).item()
+        for object_id in ("positive", "negative")
+    ]
+    assert loaded[0].teacher_direct_logits == pytest.approx(z_scores(raw_direct))
+    raw_evidence_target = [
+        torch.nn.functional.cosine_similarity(
+            store.embedding_features(evidence_id).embedding,
+            store.embedding_features(target_id).embedding,
+            dim=0,
+        ).item()
+        for evidence_id, target_id in (
+            ("positive_evidence", "positive"),
+            ("negative_evidence", "negative"),
+        )
+    ]
+    assert loaded[0].teacher_evidence_logits == pytest.approx(
+        z_scores(raw_evidence_target)
+    )
+
+
 def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_tier(
     tmp_path, monkeypatch
 ):
@@ -3023,7 +3176,14 @@ def test_retrieval_batches_all_evidence_to_target_queries():
 
         def search_many(self, source_ids, destination_type, k):
             self.batch_calls.append((source_ids, destination_type, k))
-            return [[("target", 0.5)] for _source_id in source_ids]
+            values = {
+                ("q", "table"): [("direct", 1.0)],
+                ("q", "text"): [("e1", 2.0), ("e2", 1.0)],
+            }
+            return [
+                values.get((source_id, destination_type), [("target", 0.5)])
+                for source_id in source_ids
+            ]
 
     indices = BatchIndices()
     retrieve_zero_one_hop_detailed(
@@ -3035,7 +3195,11 @@ def test_retrieval_batches_all_evidence_to_target_queries():
         evidence_types=("text",),
     )
 
-    assert indices.batch_calls == [(["e1", "e2"], "table", 3)]
+    assert indices.batch_calls == [
+        (["q"], "table", 1),
+        (["q"], "text", 2),
+        (["e1", "e2"], "table", 3),
+    ]
 
 
 def test_epoch_controller_prunes_only_non_best_non_latest_indices(tmp_path):

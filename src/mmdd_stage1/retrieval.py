@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -233,6 +233,7 @@ class StudentANNIndices:
         self.device = device
         self.indices = {}
         self.object_ids = {}
+        self.ef_search = int(manifest["ef_search"])
         self._relation_queries: dict[tuple[str, str], np.ndarray] = {}
         selected_types = (
             set(OBJECT_TYPES)
@@ -244,7 +245,7 @@ class StudentANNIndices:
                 continue
             index = hnswlib.Index(space="ip", dim=model.student_dim)
             index.load_index(str(index_dir / record["index_path"]), max_elements=int(record["objects"]))
-            index.set_ef(int(manifest["ef_search"]))
+            index.set_ef(self.ef_search)
             object_ids = json.loads((index_dir / record["ids_path"]).read_text(encoding="utf-8"))
             if len(object_ids) != int(record["objects"]):
                 raise ValueError(f"{index_dir / record['ids_path']}: object count does not match the manifest")
@@ -264,6 +265,7 @@ class StudentANNIndices:
             return []
         if k <= 0 or destination_type not in self.indices:
             return [[] for _source_id in source_ids]
+        self.indices[destination_type].set_ef(max(self.ef_search, int(k)))
 
         missing_by_type: dict[str, list[Any]] = defaultdict(list)
         for source_id in dict.fromkeys(source_ids):
@@ -326,6 +328,7 @@ class RawEmbeddingANNIndices:
             raise ValueError(f"{manifest_path}: raw embedding index belongs to a different corpus")
         self.store = store
         self.embedding_dim = int(manifest["embedding_dim"])
+        self.ef_search = int(manifest["ef_search"])
         self.indices = {}
         self.object_ids = {}
         selected_types = (
@@ -341,7 +344,7 @@ class RawEmbeddingANNIndices:
                 str(index_dir / record["index_path"]),
                 max_elements=int(record["objects"]),
             )
-            index.set_ef(int(manifest["ef_search"]))
+            index.set_ef(self.ef_search)
             object_ids = json.loads(
                 (index_dir / record["ids_path"]).read_text(encoding="utf-8")
             )
@@ -365,6 +368,7 @@ class RawEmbeddingANNIndices:
             return []
         if k <= 0 or destination_type not in self.indices:
             return [[] for _source_id in source_ids]
+        self.indices[destination_type].set_ef(max(self.ef_search, int(k)))
         embeddings = torch.stack(
             [
                 self.store.embedding_features(source_id).embedding
@@ -569,10 +573,13 @@ def retrieve_zero_one_hop(
     query_id: str,
     indices: StudentANNIndices,
     *,
-    direct_k: int = 100,
-    evidence_k: int = 50,
-    targets_per_evidence: int = 50,
-    result_k: int = 100,
+    k: int = 10,
+    gamma: int = 4,
+    gamma_evidence: int = 2,
+    direct_k: int | None = None,
+    evidence_k: int | None = None,
+    targets_per_evidence: int | None = None,
+    result_k: int | None = None,
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
@@ -588,6 +595,9 @@ def retrieve_zero_one_hop(
 ) -> list[dict[str, Any]]:
     """Retrieve and rank with all paths, then retain only Stage-2 path detail."""
 
+    if k <= 0:
+        raise ValueError("k must be positive")
+    result_k = k if result_k is None else result_k
     if min(result_k, path_result_k) < 0:
         raise ValueError("Retrieval k values must be non-negative")
     if evidence_path_k is not None and evidence_path_k < 0:
@@ -595,6 +605,9 @@ def retrieve_zero_one_hop(
     ranked = retrieve_zero_one_hop_detailed(
         query_id,
         indices,
+        k=k,
+        gamma=gamma,
+        gamma_evidence=gamma_evidence,
         direct_k=direct_k,
         evidence_k=evidence_k,
         targets_per_evidence=targets_per_evidence,
@@ -626,84 +639,17 @@ def retrieve_zero_one_hop(
     return results
 
 
-def retrieve_zero_one_hop_detailed(
-    query_id: str,
-    indices: StudentANNIndices,
+def _rank_detailed_paths(
+    paths_by_target: dict[str, list[dict[str, Any]]],
     *,
-    direct_k: int = 100,
-    evidence_k: int = 50,
-    targets_per_evidence: int = 50,
-    evidence_types: tuple[str, ...] = ("text", "image"),
-    evidence_aggregation: str = "logsumexp",
-    evidence_top_k: int = 4,
-    rrf_k: int = 60,
-    fusion_mode: str = "rrf",
-    direct_weight: float = 1.0,
-    evidence_weight: float = 1.0,
-    gated_evidence_min_paths: int = 2,
-    gated_evidence_quantile: float = 0.75,
-    evidence_modality_weights: dict[str, float] | None = None,
+    aggregator: PathAggregator,
+    rrf_k: int,
+    fusion_mode: str,
+    direct_weight: float,
+    evidence_weight: float,
+    gated_evidence_min_paths: int,
+    gated_evidence_quantile: float,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return full fused/direct/evidence rankings for evaluation."""
-
-    if min(direct_k, evidence_k, targets_per_evidence) < 0:
-        raise ValueError("Retrieval k values must be non-negative")
-    if rrf_k < 0:
-        raise ValueError("rrf_k must be non-negative")
-    if fusion_mode not in {"rrf", "weighted_rrf", "gated"}:
-        raise ValueError("fusion_mode must be one of: rrf, weighted_rrf, gated")
-    if direct_weight < 0 or evidence_weight < 0:
-        raise ValueError("fusion weights must be non-negative")
-    if fusion_mode != "rrf" and direct_weight == evidence_weight == 0:
-        raise ValueError("at least one fusion weight must be positive")
-    if gated_evidence_min_paths <= 0:
-        raise ValueError("gated_evidence_min_paths must be positive")
-    if not 0 <= gated_evidence_quantile <= 1:
-        raise ValueError("gated_evidence_quantile must be in [0, 1]")
-    aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
-    paths_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for target_id, score in indices.search(query_id, "table", direct_k):
-        paths_by_target[target_id].append({"kind": "direct", "path_score": score})
-
-    normalized_evidence_types = dict.fromkeys(
-        normalize_object_type(value) for value in evidence_types
-    )
-    modality_weights = {
-        normalize_object_type(key): float(value)
-        for key, value in (evidence_modality_weights or {}).items()
-    }
-    if any(value < 0 for value in modality_weights.values()):
-        raise ValueError("evidence modality weights must be non-negative")
-    evidence_hits = [
-        (
-            evidence_id,
-            query_evidence_score + math.log(modality_weights.get(evidence_type, 1.0)),
-            evidence_type,
-        )
-        for evidence_type in normalized_evidence_types
-        if modality_weights.get(evidence_type, 1.0) > 0
-        for evidence_id, query_evidence_score in indices.search(
-            query_id, evidence_type, evidence_k
-        )
-    ]
-    target_hits = indices.search_many(
-        [evidence_id for evidence_id, _score, _type in evidence_hits],
-        "table",
-        targets_per_evidence,
-    )
-    for (evidence_id, query_evidence_score, evidence_type), evidence_targets in zip(
-        evidence_hits, target_hits
-    ):
-        for target_id, evidence_target_score in evidence_targets:
-            paths_by_target[target_id].append(
-                {
-                    "kind": "evidence",
-                    "evidence_id": evidence_id,
-                    "evidence_type": evidence_type,
-                    "path_score": query_evidence_score + evidence_target_score,
-                }
-            )
-
     results = []
     for target_id, paths in paths_by_target.items():
         paths.sort(key=lambda path: path["path_score"], reverse=True)
@@ -741,3 +687,204 @@ def retrieve_zero_one_hop_detailed(
         gated_evidence_quantile=gated_evidence_quantile,
     )
     return {"fused": fused, "direct": direct, "evidence": evidence}
+
+
+def retrieve_zero_one_hop_detailed_many(
+    query_ids: Sequence[str],
+    indices: StudentANNIndices | RawEmbeddingANNIndices,
+    *,
+    k: int = 10,
+    gamma: int = 4,
+    gamma_evidence: int = 2,
+    direct_k: int | None = None,
+    evidence_k: int | None = None,
+    targets_per_evidence: int | None = None,
+    evidence_types: tuple[str, ...] = ("text", "image"),
+    evidence_aggregation: str = "logsumexp",
+    evidence_top_k: int = 4,
+    rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+    evidence_modality_weights: dict[str, float] | None = None,
+    query_batch_size: int = 32,
+) -> list[dict[str, list[dict[str, Any]]]]:
+    """Return full rankings for many queries with batched ANN searches."""
+
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if gamma <= 0 or gamma_evidence <= 0:
+        raise ValueError("gamma and gamma_evidence must be positive")
+    if query_batch_size <= 0:
+        raise ValueError("query_batch_size must be positive")
+    direct_k = direct_k if direct_k is not None else math.ceil(gamma * k)
+    evidence_k = evidence_k if evidence_k is not None else math.ceil(gamma_evidence * k)
+    targets_per_evidence = (
+        targets_per_evidence
+        if targets_per_evidence is not None
+        else math.ceil(gamma_evidence * k)
+    )
+    if min(direct_k, evidence_k, targets_per_evidence) < 0:
+        raise ValueError("Retrieval k values must be non-negative")
+    if rrf_k < 0:
+        raise ValueError("rrf_k must be non-negative")
+    if fusion_mode not in {"rrf", "weighted_rrf", "gated"}:
+        raise ValueError("fusion_mode must be one of: rrf, weighted_rrf, gated")
+    if direct_weight < 0 or evidence_weight < 0:
+        raise ValueError("fusion weights must be non-negative")
+    if fusion_mode != "rrf" and direct_weight == evidence_weight == 0:
+        raise ValueError("at least one fusion weight must be positive")
+    if gated_evidence_min_paths <= 0:
+        raise ValueError("gated_evidence_min_paths must be positive")
+    if not 0 <= gated_evidence_quantile <= 1:
+        raise ValueError("gated_evidence_quantile must be in [0, 1]")
+    if not query_ids:
+        return []
+    if len(query_ids) > query_batch_size:
+        return [
+            result
+            for start in range(0, len(query_ids), query_batch_size)
+            for result in retrieve_zero_one_hop_detailed_many(
+                query_ids[start : start + query_batch_size],
+                indices,
+                k=k,
+                gamma=gamma,
+                gamma_evidence=gamma_evidence,
+                direct_k=direct_k,
+                evidence_k=evidence_k,
+                targets_per_evidence=targets_per_evidence,
+                evidence_types=evidence_types,
+                evidence_aggregation=evidence_aggregation,
+                evidence_top_k=evidence_top_k,
+                rrf_k=rrf_k,
+                fusion_mode=fusion_mode,
+                direct_weight=direct_weight,
+                evidence_weight=evidence_weight,
+                gated_evidence_min_paths=gated_evidence_min_paths,
+                gated_evidence_quantile=gated_evidence_quantile,
+                evidence_modality_weights=evidence_modality_weights,
+                query_batch_size=query_batch_size,
+            )
+        ]
+    aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
+    paths_by_query = [defaultdict(list) for _query_id in query_ids]
+    for paths_by_target, direct_hits in zip(
+        paths_by_query, indices.search_many(list(query_ids), "table", direct_k)
+    ):
+        for target_id, score in direct_hits:
+            paths_by_target[target_id].append(
+                {"kind": "direct", "path_score": score}
+            )
+
+    normalized_evidence_types = dict.fromkeys(
+        normalize_object_type(value) for value in evidence_types
+    )
+    modality_weights = {
+        normalize_object_type(key): float(value)
+        for key, value in (evidence_modality_weights or {}).items()
+    }
+    if any(value < 0 for value in modality_weights.values()):
+        raise ValueError("evidence modality weights must be non-negative")
+    evidence_hits_by_query: list[list[tuple[str, float, str]]] = [
+        [] for _query_id in query_ids
+    ]
+    for evidence_type in normalized_evidence_types:
+        modality_weight = modality_weights.get(evidence_type, 1.0)
+        if modality_weight <= 0:
+            continue
+        offset = math.log(modality_weight)
+        for evidence_hits, hits in zip(
+            evidence_hits_by_query,
+            indices.search_many(list(query_ids), evidence_type, evidence_k),
+        ):
+            evidence_hits.extend(
+                (evidence_id, query_evidence_score + offset, evidence_type)
+                for evidence_id, query_evidence_score in hits
+            )
+    flattened_evidence = [
+        (query_index, evidence_id, query_evidence_score, evidence_type)
+        for query_index, evidence_hits in enumerate(evidence_hits_by_query)
+        for evidence_id, query_evidence_score, evidence_type in evidence_hits
+    ]
+    target_hits = indices.search_many(
+        [entry[1] for entry in flattened_evidence],
+        "table",
+        targets_per_evidence,
+    )
+    for (
+        query_index,
+        evidence_id,
+        query_evidence_score,
+        evidence_type,
+    ), evidence_targets in zip(
+        flattened_evidence, target_hits
+    ):
+        for target_id, evidence_target_score in evidence_targets:
+            paths_by_query[query_index][target_id].append(
+                {
+                    "kind": "evidence",
+                    "evidence_id": evidence_id,
+                    "evidence_type": evidence_type,
+                    "path_score": query_evidence_score + evidence_target_score,
+                }
+            )
+    return [
+        _rank_detailed_paths(
+            paths_by_target,
+            aggregator=aggregator,
+            rrf_k=rrf_k,
+            fusion_mode=fusion_mode,
+            direct_weight=direct_weight,
+            evidence_weight=evidence_weight,
+            gated_evidence_min_paths=gated_evidence_min_paths,
+            gated_evidence_quantile=gated_evidence_quantile,
+        )
+        for paths_by_target in paths_by_query
+    ]
+
+
+def retrieve_zero_one_hop_detailed(
+    query_id: str,
+    indices: StudentANNIndices | RawEmbeddingANNIndices,
+    *,
+    k: int = 10,
+    gamma: int = 4,
+    gamma_evidence: int = 2,
+    direct_k: int | None = None,
+    evidence_k: int | None = None,
+    targets_per_evidence: int | None = None,
+    evidence_types: tuple[str, ...] = ("text", "image"),
+    evidence_aggregation: str = "logsumexp",
+    evidence_top_k: int = 4,
+    rrf_k: int = 60,
+    fusion_mode: str = "rrf",
+    direct_weight: float = 1.0,
+    evidence_weight: float = 1.0,
+    gated_evidence_min_paths: int = 2,
+    gated_evidence_quantile: float = 0.75,
+    evidence_modality_weights: dict[str, float] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return full fused/direct/evidence rankings for one query."""
+
+    return retrieve_zero_one_hop_detailed_many(
+        [query_id],
+        indices,
+        k=k,
+        gamma=gamma,
+        gamma_evidence=gamma_evidence,
+        direct_k=direct_k,
+        evidence_k=evidence_k,
+        targets_per_evidence=targets_per_evidence,
+        evidence_types=evidence_types,
+        evidence_aggregation=evidence_aggregation,
+        evidence_top_k=evidence_top_k,
+        rrf_k=rrf_k,
+        fusion_mode=fusion_mode,
+        direct_weight=direct_weight,
+        evidence_weight=evidence_weight,
+        gated_evidence_min_paths=gated_evidence_min_paths,
+        gated_evidence_quantile=gated_evidence_quantile,
+        evidence_modality_weights=evidence_modality_weights,
+    )[0]

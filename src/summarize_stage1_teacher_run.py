@@ -11,10 +11,27 @@ from typing import Any
 from mmdd_stage1.selection import write_json
 
 
-def _row(scope: str, raw: dict[str, Any], teacher: dict[str, Any]) -> str:
+def _max_recall_k(metrics: dict[str, Any]) -> int:
+    values = [
+        int(key.split("@", 1)[1])
+        for key in metrics
+        if key.startswith("recall@")
+    ]
+    if not values:
+        raise ValueError("retrieval metrics contain no recall cutoff")
+    return max(values)
+
+
+def _row(
+    scope: str,
+    raw: dict[str, Any],
+    teacher: dict[str, Any],
+    max_k: int,
+) -> str:
     return (
         f"| {scope} | {raw['recall@10']:.2%} | {teacher['recall@10']:.2%} | "
-        f"{teacher['recall@100']:.2%} | {teacher['mrr@100']:.4f} |"
+        f"{teacher[f'recall@{max_k}']:.2%} | "
+        f"{teacher[f'mrr@{max_k}']:.4f} |"
     )
 
 
@@ -90,6 +107,7 @@ def run(args: argparse.Namespace) -> str:
         )
     raw = evaluation["raw_direct"]
     teacher = evaluation["teacher_reranked"]
+    max_k = _max_recall_k(teacher)
     dataset_passes = {
         dataset: (
             teacher["by_dataset"][dataset]["recall@10"]
@@ -107,9 +125,9 @@ def run(args: argparse.Namespace) -> str:
         "",
         f"Best epoch: {best_epoch}; dev loss: {best['dev_loss']:.4f}.",
         "",
-        "| Scope | Raw R@10 | Teacher R@10 | Teacher R@100 | Teacher MRR@100 |",
+        f"| Scope | Raw R@10 | Teacher R@10 | Teacher R@{max_k} | Teacher MRR@{max_k} |",
         "| --- | ---: | ---: | ---: | ---: |",
-        _row("overall", raw, teacher),
+        _row("overall", raw, teacher, max_k),
     ]
     for dataset in raw["by_dataset"]:
         lines.append(
@@ -117,6 +135,7 @@ def run(args: argparse.Namespace) -> str:
                 dataset,
                 raw["by_dataset"][dataset],
                 teacher["by_dataset"][dataset],
+                max_k,
             )
         )
     lines.extend(
@@ -132,16 +151,17 @@ def run(args: argparse.Namespace) -> str:
         evidence_to_table = diagnostic["evidence_to_table"]
         evidence_raw = evidence_to_table["raw_direct"]
         evidence_teacher = evidence_to_table["teacher_reranked"]
+        evidence_max_k = _max_recall_k(evidence_teacher)
         lines.extend(
             [
                 "## Evidence-to-table rerank",
                 "",
-                "| Raw R@10 | Teacher R@10 | Teacher R@100 | Teacher MRR@100 |",
+                f"| Raw R@10 | Teacher R@10 | Teacher R@{evidence_max_k} | Teacher MRR@{evidence_max_k} |",
                 "| ---: | ---: | ---: | ---: |",
                 f"| {evidence_raw['recall@10']:.2%} | "
                 f"{evidence_teacher['recall@10']:.2%} | "
-                f"{evidence_teacher['recall@100']:.2%} | "
-                f"{evidence_teacher['mrr@100']:.4f} |",
+                f"{evidence_teacher[f'recall@{evidence_max_k}']:.2%} | "
+                f"{evidence_teacher[f'mrr@{evidence_max_k}']:.4f} |",
                 "",
                 "Evidence-to-table acceptance (Teacher R@10 > raw): "
                 f"**{'PASS' if evidence_to_table_pass else 'FAIL'}**.",

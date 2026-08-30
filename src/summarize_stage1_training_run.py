@@ -9,19 +9,34 @@ from pathlib import Path
 from typing import Any
 
 
-def _metrics_row(scope: str, ranking: str, channel: dict[str, Any]) -> str:
+def _max_recall_k(metrics: dict[str, Any]) -> int:
+    values = [
+        int(key.split("@", 1)[1])
+        for key in metrics
+        if key.startswith("recall@")
+    ]
+    if not values:
+        raise ValueError("retrieval metrics contain no recall cutoff")
+    return max(values)
+
+
+def _metrics_row(
+    scope: str, ranking: str, channel: dict[str, Any], max_k: int
+) -> str:
     coverage = channel.get("positive_evidence_path_coverage@10")
     rendered_coverage = "-" if coverage is None else f"{coverage:.2%}"
     return (
         f"| {scope} | {ranking} | {channel['recall@10']:.2%} | "
-        f"{channel['recall@100']:.2%} | {channel['mrr@100']:.4f} | "
+        f"{channel[f'recall@{max_k}']:.2%} | "
+        f"{channel[f'mrr@{max_k}']:.4f} | "
         f"{rendered_coverage} |"
     )
 
 
 def _metric_table(metrics: dict[str, Any]) -> list[str]:
+    max_k = _max_recall_k(metrics)
     lines = [
-        "| Scope | Channel | R@10 | R@100 | MRR@100 | Coverage@10 |",
+        f"| Scope | Channel | R@10 | R@{max_k} | MRR@{max_k} | Coverage@10 |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
     channels = ["direct", "evidence", "fused"]
@@ -32,7 +47,7 @@ def _metric_table(metrics: dict[str, Any]) -> list[str]:
     )
     for channel in channels:
         values = metrics if channel == "fused" else metrics[channel]
-        lines.append(_metrics_row("overall", channel, values))
+        lines.append(_metrics_row("overall", channel, values, max_k))
     for dataset, dataset_metrics in metrics.get("by_dataset", {}).items():
         for channel in channels:
             if channel == "fused":
@@ -41,7 +56,7 @@ def _metric_table(metrics: dict[str, Any]) -> list[str]:
                 values = metrics[channel]["by_dataset"][dataset]
             else:
                 values = dataset_metrics[channel]
-            lines.append(_metrics_row(dataset, channel, values))
+            lines.append(_metrics_row(dataset, channel, values, max_k))
     return lines
 
 

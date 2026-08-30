@@ -53,6 +53,9 @@ def run(args: argparse.Namespace) -> None:
     results = retrieve_zero_one_hop(
         args.query_id,
         indices,
+        k=args.k,
+        gamma=args.gamma,
+        gamma_evidence=args.gamma_evidence,
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
@@ -75,6 +78,9 @@ def run(args: argparse.Namespace) -> None:
             "query_id": args.query_id,
             "student_checkpoint_sha256": checkpoint_fingerprint(checkpoint_path),
             "path_aggregation": {
+                "k": args.k,
+                "gamma": args.gamma,
+                "gamma_evidence": args.gamma_evidence,
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
                 "target_fusion": args.fusion_mode,
@@ -119,10 +125,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=128)
-    parser.add_argument("--direct-k", type=int, default=100)
-    parser.add_argument("--evidence-k", type=int, default=50)
-    parser.add_argument("--targets-per-evidence", type=int, default=50)
-    parser.add_argument("--result-k", type=int, default=100)
+    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--gamma", type=int, default=4)
+    parser.add_argument("--gamma-evidence", type=int, default=2)
+    parser.add_argument("--direct-k", type=int)
+    parser.add_argument("--evidence-k", type=int)
+    parser.add_argument("--targets-per-evidence", type=int)
+    parser.add_argument(
+        "--result-k",
+        type=int,
+        help="Advanced serialized-result limit; defaults to --k.",
+    )
     parser.add_argument(
         "--path-result-k",
         type=int,

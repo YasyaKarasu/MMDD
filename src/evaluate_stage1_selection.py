@@ -23,6 +23,13 @@ from mmdd_stage1.retrieval import (
 from mmdd_stage1.selection import load_stage1_selection, write_json
 
 
+def _parse_recall_ks(value: str) -> tuple[int, ...]:
+    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("--recall-ks must contain positive integers")
+    return tuple(sorted(dict.fromkeys(values)))
+
+
 def _examples(paths: list[str]) -> list[Any]:
     return [
         example
@@ -86,6 +93,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     raw_metrics = evaluate_student_retrieval(
         examples,
         raw_indices,
+        recall_ks=args.recall_ks,
+        gamma=args.gamma,
+        gamma_evidence=args.gamma_evidence,
+        direct_k=args.direct_k,
+        evidence_k=args.evidence_k,
+        targets_per_evidence=args.targets_per_evidence,
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
         fusion_mode="weighted_rrf",
@@ -94,6 +107,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     metrics = evaluate_student_retrieval(
         examples,
         indices,
+        recall_ks=args.recall_ks,
+        gamma=args.gamma,
+        gamma_evidence=args.gamma_evidence,
+        direct_k=args.direct_k,
+        evidence_k=args.evidence_k,
+        targets_per_evidence=args.targets_per_evidence,
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
         fusion_mode="weighted_rrf",
@@ -130,6 +149,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--ef-search", type=int, default=100)
+    parser.add_argument("--recall-ks", type=_parse_recall_ks, default=(10, 20, 30, 40, 50))
+    parser.add_argument("--gamma", type=int, default=4)
+    parser.add_argument("--gamma-evidence", type=int, default=2)
+    parser.add_argument("--direct-k", type=int)
+    parser.add_argument("--evidence-k", type=int)
+    parser.add_argument("--targets-per-evidence", type=int)
     return parser.parse_args()
 
 

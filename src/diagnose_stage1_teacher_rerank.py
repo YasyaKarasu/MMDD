@@ -31,6 +31,29 @@ from mmdd_stage1.teacher_rerank import (
     spearman_correlation,
 )
 
+
+def _max_recall_k(metrics: dict[str, Any]) -> int:
+    values = [
+        int(key.split("@", 1)[1])
+        for key in metrics
+        if key.startswith("recall@")
+    ]
+    if not values:
+        raise ValueError("retrieval metrics contain no recall cutoff")
+    return max(values)
+
+
+def _max_mrr_k(metrics: dict[str, Any]) -> int:
+    values = [
+        int(key.split("@", 1)[1])
+        for key in metrics
+        if key.startswith("mrr@")
+    ]
+    if not values:
+        raise ValueError("retrieval metrics contain no MRR cutoff")
+    return max(values)
+
+
 def _branch(raw_recall: float, reranked_recall: float) -> str:
     delta = reranked_recall - raw_recall
     if delta > 0.02:
@@ -68,7 +91,7 @@ def _select_ensemble(payload: dict[str, Any]) -> dict[str, Any] | None:
         eligible,
         key=lambda metrics: (
             float(metrics["recall@10"]),
-            float(metrics["mrr@100"]),
+            float(metrics[f"mrr@{_max_mrr_k(metrics)}"]),
             -float(metrics["alpha"]),
         ),
     )
@@ -111,13 +134,17 @@ def _evidence_to_table_examples(args: argparse.Namespace) -> list[TargetExample]
 def _markdown(payload: dict[str, Any]) -> str:
     raw = payload["raw_direct"]
     reranked = payload["teacher_reranked"]
+    max_k = _max_recall_k(reranked)
     rows = [
         "# Task 2b: Teacher rerank diagnostic",
         "",
-        "| Scope | Ranking | R@10 | R@100 | MRR@100 |",
+        f"| Scope | Ranking | R@10 | R@{max_k} | MRR@{max_k} |",
         "| --- | --- | ---: | ---: | ---: |",
-        f"| overall | raw | {raw['recall@10']:.2%} | {raw['recall@100']:.2%} | {raw['mrr@100']:.4f} |",
-        f"| overall | teacher | {reranked['recall@10']:.2%} | {reranked['recall@100']:.2%} | {reranked['mrr@100']:.4f} |",
+        f"| overall | raw | {raw['recall@10']:.2%} | "
+        f"{raw[f'recall@{max_k}']:.2%} | {raw[f'mrr@{max_k}']:.4f} |",
+        f"| overall | teacher | {reranked['recall@10']:.2%} | "
+        f"{reranked[f'recall@{max_k}']:.2%} | "
+        f"{reranked[f'mrr@{max_k}']:.4f} |",
     ]
     for dataset in payload["raw_direct"]["by_dataset"]:
         for name, metrics in (
@@ -126,7 +153,8 @@ def _markdown(payload: dict[str, Any]) -> str:
         ):
             rows.append(
                 f"| {dataset} | {name} | {metrics['recall@10']:.2%} | "
-                f"{metrics['recall@100']:.2%} | {metrics['mrr@100']:.4f} |"
+                f"{metrics[f'recall@{max_k}']:.2%} | "
+                f"{metrics[f'mrr@{max_k}']:.4f} |"
             )
     rows.extend(
         [
@@ -143,7 +171,7 @@ def _markdown(payload: dict[str, Any]) -> str:
             [
                 "## Raw + Teacher z-score ensemble",
                 "",
-                "| Alpha | Scope | R@10 | R@100 | MRR@100 |",
+                f"| Alpha | Scope | R@10 | R@{max_k} | MRR@{max_k} |",
                 "| ---: | --- | ---: | ---: | ---: |",
             ]
         )
@@ -151,12 +179,14 @@ def _markdown(payload: dict[str, Any]) -> str:
             alpha = float(ensemble["alpha"])
             rows.append(
                 f"| {alpha:g} | overall | {ensemble['recall@10']:.2%} | "
-                f"{ensemble['recall@100']:.2%} | {ensemble['mrr@100']:.4f} |"
+                f"{ensemble[f'recall@{max_k}']:.2%} | "
+                f"{ensemble[f'mrr@{max_k}']:.4f} |"
             )
             for dataset, metrics in ensemble["by_dataset"].items():
                 rows.append(
                     f"| {alpha:g} | {dataset} | {metrics['recall@10']:.2%} | "
-                    f"{metrics['recall@100']:.2%} | {metrics['mrr@100']:.4f} |"
+                    f"{metrics[f'recall@{max_k}']:.2%} | "
+                    f"{metrics[f'mrr@{max_k}']:.4f} |"
                 )
         selection = payload["ensemble_selection"]
         rows.extend(
@@ -170,32 +200,34 @@ def _markdown(payload: dict[str, Any]) -> str:
         )
     evidence_to_table = payload.get("evidence_to_table")
     if evidence_to_table is not None:
+        evidence_max_k = _max_recall_k(evidence_to_table["teacher_reranked"])
         rows.extend(
             [
                 "## Evidence→table rerank",
                 "",
-                "| Scope | Ranking | R@10 | R@100 | MRR@100 |",
+                f"| Scope | Ranking | R@10 | R@{evidence_max_k} | MRR@{evidence_max_k} |",
                 "| --- | --- | ---: | ---: | ---: |",
                 f"| overall | raw | {evidence_to_table['raw_direct']['recall@10']:.2%} | "
-                f"{evidence_to_table['raw_direct']['recall@100']:.2%} | "
-                f"{evidence_to_table['raw_direct']['mrr@100']:.4f} |",
+                f"{evidence_to_table['raw_direct'][f'recall@{evidence_max_k}']:.2%} | "
+                f"{evidence_to_table['raw_direct'][f'mrr@{evidence_max_k}']:.4f} |",
                 f"| overall | teacher | {evidence_to_table['teacher_reranked']['recall@10']:.2%} | "
-                f"{evidence_to_table['teacher_reranked']['recall@100']:.2%} | "
-                f"{evidence_to_table['teacher_reranked']['mrr@100']:.4f} |",
+                f"{evidence_to_table['teacher_reranked'][f'recall@{evidence_max_k}']:.2%} | "
+                f"{evidence_to_table['teacher_reranked'][f'mrr@{evidence_max_k}']:.4f} |",
                 "",
             ]
         )
         if evidence_to_table.get("ensembles"):
             rows.extend(
                 [
-                    "| Alpha | Ensemble R@10 | R@100 | MRR@100 |",
+                    f"| Alpha | Ensemble R@10 | R@{evidence_max_k} | MRR@{evidence_max_k} |",
                     "| ---: | ---: | ---: | ---: |",
                 ]
             )
             for ensemble in evidence_to_table["ensembles"]:
                 rows.append(
                     f"| {ensemble['alpha']:g} | {ensemble['recall@10']:.2%} | "
-                    f"{ensemble['recall@100']:.2%} | {ensemble['mrr@100']:.4f} |"
+                    f"{ensemble[f'recall@{evidence_max_k}']:.2%} | "
+                    f"{ensemble[f'mrr@{evidence_max_k}']:.4f} |"
                 )
             rows.append("")
     return "\n".join(rows)

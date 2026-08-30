@@ -15,7 +15,7 @@ from .data import TargetExample
 from .features import FeatureStore, ObjectFeatures
 from .models import TeacherJoinabilityModel
 
-RECALL_KS = (10, 100)
+RECALL_KS = (10, 20, 30, 40, 50)
 
 
 def z_scores(values: Sequence[float]) -> list[float]:
@@ -83,25 +83,41 @@ def spearman_correlation(left: Sequence[float], right: Sequence[float]) -> float
 
 
 def _retrieval_metrics(
-    rankings: Sequence[Sequence[str]], positives: Sequence[set[str]]
+    rankings: Sequence[Sequence[str]],
+    positives: Sequence[set[str]],
+    recall_ks: Sequence[int] = RECALL_KS,
+    *,
+    return_per_query: bool = False,
 ) -> dict[str, float | int]:
     metrics: dict[str, float | int] = {"queries": len(rankings)}
-    for k in RECALL_KS:
+    recall_ks = tuple(sorted(dict.fromkeys(int(k) for k in recall_ks)))
+    if not recall_ks:
+        raise ValueError("recall_ks must not be empty")
+    for k in recall_ks:
         metrics[f"recall@{k}"] = statistics.fmean(
             len(set(ranking[:k]) & relevant) / len(relevant)
             for ranking, relevant in zip(rankings, positives)
         )
-    metrics["mrr@100"] = statistics.fmean(
+    max_k = max(recall_ks)
+    metrics[f"mrr@{max_k}"] = statistics.fmean(
         next(
             (
                 1.0 / rank
-                for rank, target_id in enumerate(ranking[:100], 1)
+                for rank, target_id in enumerate(ranking[:max_k], 1)
                 if target_id in relevant
             ),
             0.0,
         )
         for ranking, relevant in zip(rankings, positives)
     )
+    if return_per_query:
+        metrics["per_query"] = {
+            f"recall@{k}": [
+                len(set(ranking[:k]) & relevant) / len(relevant)
+                for ranking, relevant in zip(rankings, positives)
+            ]
+            for k in recall_ks
+        }
     return metrics
 
 
@@ -109,6 +125,9 @@ def _metrics_by_dataset(
     examples: Sequence[TargetExample],
     rankings: Sequence[Sequence[str]],
     positives: Sequence[set[str]],
+    recall_ks: Sequence[int] = RECALL_KS,
+    *,
+    return_per_query: bool = False,
 ) -> dict[str, dict[str, float | int]]:
     return {
         dataset: _retrieval_metrics(
@@ -122,6 +141,8 @@ def _metrics_by_dataset(
                 for relevant, example in zip(positives, examples)
                 if example.dataset == dataset
             ],
+            recall_ks,
+            return_per_query=return_per_query,
         )
         for dataset in sorted({example.dataset for example in examples})
     }
@@ -148,12 +169,18 @@ def _teacher_scores(
     store: FeatureStore,
     device: torch.device,
     batch_size: int,
+    score_cache: dict[tuple[str, str], float] | None = None,
 ) -> list[float]:
     query = _device_features(teacher, store, query_id, device)
     compression_cache: dict[str, torch.Tensor] = {}
-    values = []
-    for start in range(0, len(candidate_ids), batch_size):
-        batch_ids = candidate_ids[start : start + batch_size]
+    computed_scores: dict[str, float] = {}
+    missing_ids = [
+        candidate_id
+        for candidate_id in candidate_ids
+        if score_cache is None or (query_id, candidate_id) not in score_cache
+    ]
+    for start in range(0, len(missing_ids), batch_size):
+        batch_ids = missing_ids[start : start + batch_size]
         candidates = [
             _device_features(teacher, store, candidate_id, device)
             for candidate_id in batch_ids
@@ -163,8 +190,18 @@ def _teacher_scores(
             candidates,
             compression_cache=compression_cache,
         )
-        values.extend(float(value) for value in scores.cpu())
-    return values
+        destination = score_cache if score_cache is not None else computed_scores
+        destination.update(
+            {
+                (query_id, candidate_id)
+                if score_cache is not None
+                else candidate_id: float(score)
+                for candidate_id, score in zip(batch_ids, scores.cpu())
+            }
+        )
+    if score_cache is None:
+        return [computed_scores[candidate_id] for candidate_id in candidate_ids]
+    return [score_cache[(query_id, candidate_id)] for candidate_id in candidate_ids]
 
 
 def evaluate_teacher_reranking(
@@ -176,6 +213,9 @@ def evaluate_teacher_reranking(
     device: torch.device,
     batch_size: int,
     ensemble_alphas: Sequence[float] = (),
+    recall_ks: Sequence[int] = RECALL_KS,
+    return_per_query: bool = False,
+    score_cache: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     """Rerank fixed raw candidates and return overall and per-dataset metrics."""
 
@@ -207,6 +247,7 @@ def evaluate_teacher_reranking(
             store,
             device,
             batch_size,
+            score_cache,
         )
         raw_rankings.append(candidate_ids)
         teacher_rankings.append(
@@ -232,27 +273,38 @@ def evaluate_teacher_reranking(
         positive_sets.append(set(example.positive_target_ids))
         correlations.append(spearman_correlation(raw_scores, teacher_scores))
 
-    raw_metrics = _retrieval_metrics(raw_rankings, positive_sets)
-    raw_metrics["by_dataset"] = _metrics_by_dataset(
-        examples, raw_rankings, positive_sets
+    raw_metrics = _retrieval_metrics(
+        raw_rankings, positive_sets, recall_ks, return_per_query=return_per_query
     )
-    teacher_metrics = _retrieval_metrics(teacher_rankings, positive_sets)
+    raw_metrics["by_dataset"] = _metrics_by_dataset(
+        examples, raw_rankings, positive_sets, recall_ks,
+        return_per_query=return_per_query,
+    )
+    teacher_metrics = _retrieval_metrics(
+        teacher_rankings, positive_sets, recall_ks, return_per_query=return_per_query
+    )
     teacher_metrics["by_dataset"] = _metrics_by_dataset(
-        examples, teacher_rankings, positive_sets
+        examples, teacher_rankings, positive_sets, recall_ks,
+        return_per_query=return_per_query,
     )
     ensembles = []
     for alpha in alphas:
-        metrics = _retrieval_metrics(ensemble_rankings[alpha], positive_sets)
+        metrics = _retrieval_metrics(
+            ensemble_rankings[alpha], positive_sets, recall_ks,
+            return_per_query=return_per_query,
+        )
         metrics["by_dataset"] = _metrics_by_dataset(
-            examples, ensemble_rankings[alpha], positive_sets
+            examples, ensemble_rankings[alpha], positive_sets, recall_ks,
+            return_per_query=return_per_query,
         )
         ensembles.append({"alpha": alpha, **metrics})
-    return {
+    delta_k = 10 if 10 in recall_ks else min(recall_ks)
+    result = {
         "raw_direct": raw_metrics,
         "teacher_reranked": teacher_metrics,
-        "recall@10_delta": (
-            float(teacher_metrics["recall@10"])
-            - float(raw_metrics["recall@10"])
+        f"recall@{delta_k}_delta": (
+            float(teacher_metrics[f"recall@{delta_k}"])
+            - float(raw_metrics[f"recall@{delta_k}"])
         ),
         "spearman": {
             "mean": statistics.fmean(correlations),
@@ -260,3 +312,4 @@ def evaluate_teacher_reranking(
         },
         "ensembles": ensembles,
     }
+    return result

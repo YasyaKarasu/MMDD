@@ -22,6 +22,8 @@ class EdgeExample:
     split: str | None = None
     teacher_logits: tuple[float, ...] | None = None
     teacher_checkpoint_sha256: str | None = None
+    teacher_logit_mode: str | None = None
+    teacher_ensemble_alpha: float | None = None
     source_type: str | None = None
     destination_type: str | None = None
 
@@ -51,6 +53,8 @@ class TargetExample:
     positive_target_ids: tuple[str, ...] = ()
     teacher_score_config: TeacherScoreConfig | None = None
     teacher_checkpoint_sha256: str | None = None
+    teacher_logit_mode: str | None = None
+    teacher_ensemble_alpha: float | None = None
 
 
 def _records(path: Path, split: str | None) -> Iterable[tuple[int, dict[str, Any]]]:

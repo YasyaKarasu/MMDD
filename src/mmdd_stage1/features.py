@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -164,10 +164,14 @@ class FeatureStore:
         *,
         cache_size: int = 128,
         cache_bytes: int | None = None,
+        teacher_paths: Sequence[Path] = (),
     ) -> FeatureStore:
         if path.is_dir():
             return cls._from_directory(
-                path, cache_size=cache_size, cache_bytes=cache_bytes
+                path,
+                cache_size=cache_size,
+                cache_bytes=cache_bytes,
+                teacher_paths=teacher_paths,
             )
         payload = _load_tensor_file(path)
         if not isinstance(payload, Mapping):
@@ -192,6 +196,7 @@ class FeatureStore:
         *,
         cache_size: int,
         cache_bytes: int | None,
+        teacher_paths: Sequence[Path] = (),
     ) -> FeatureStore:
         manifest = root / "manifest.jsonl"
         if not manifest.is_file():
@@ -244,6 +249,48 @@ class FeatureStore:
                             f"{teacher_manifest}:{line_number}: duplicate object_id {object_id!r}"
                         )
                     teacher_index[object_id] = feature_path
+        # Teacher-only caches may be staged separately from the retrieval cache.
+        # Their manifests contain paths relative to each staging directory; the
+        # base manifest remains authoritative for object IDs and types.
+        for teacher_root_value in teacher_paths:
+            teacher_root = Path(teacher_root_value).resolve()
+            manifest_path = (
+                teacher_root
+                if teacher_root.name == "teacher_manifest.jsonl"
+                else teacher_root / "teacher_manifest.jsonl"
+            )
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"Missing Teacher feature manifest: {manifest_path}")
+            manifest_root = manifest_path.parent
+            with manifest_path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    object_id = str(record["object_id"])
+                    if object_id not in index:
+                        raise ValueError(
+                            f"{manifest_path}:{line_number}: Teacher object {object_id!r} "
+                            "is absent from the base manifest"
+                        )
+                    declared_type = normalize_object_type(str(record["object_type"]))
+                    if declared_type != index[object_id][0]:
+                        raise ValueError(
+                            f"{manifest_path}:{line_number}: object type disagrees with "
+                            "the base manifest"
+                        )
+                    relative_path = Path(record["teacher_feature_path"])
+                    feature_path = (manifest_root / relative_path).resolve()
+                    if not feature_path.is_relative_to(manifest_root):
+                        raise ValueError(
+                            f"{manifest_path}:{line_number}: teacher_feature_path escapes "
+                            "the Teacher feature directory"
+                        )
+                    # A staged shard may duplicate an object already present in
+                    # the base cache. Keep the base entry, whose path has already
+                    # been validated, and only fill genuinely missing objects.
+                    if object_id not in teacher_index:
+                        teacher_index[object_id] = feature_path
         return cls(
             index=index,
             teacher_index=teacher_index,

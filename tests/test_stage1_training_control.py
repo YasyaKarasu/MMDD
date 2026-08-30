@@ -16,12 +16,14 @@ import refresh_stage1_hard_negatives
 import run_stage1_rounds
 import diagnose_stage1_teacher_rerank
 import train_stage1
+import mmdd_stage1.evaluation as evaluation_module
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.models import TeacherJoinabilityModel
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import checkpoint_fingerprint
+from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.selection import (
     CheckpointManager,
     MetricGate,
@@ -77,6 +79,47 @@ def test_per_dataset_gate_parses_alias_and_evaluates_nested_metric():
 def test_per_dataset_gate_rejects_invalid_syntax():
     with pytest.raises(argparse.ArgumentTypeError, match="DATASET:METRIC"):
         train_stage1._parse_per_dataset_gate("wdc2k_v2=0.609")
+
+
+def test_paired_bootstrap_resamples_query_pairs_and_reports_ci():
+    same = paired_bootstrap_delta([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], iterations=500, seed=7)
+    assert same["mean"] == 0.0
+    assert same["ci_low"] == 0.0
+    assert same["ci_high"] == 0.0
+
+    improved = paired_bootstrap_delta([1.0, 1.0, 0.0], [0.0, 0.0, 0.0], iterations=500, seed=7)
+    assert improved["mean"] == pytest.approx(2 / 3)
+    assert improved["ci_low"] >= 0.0
+    assert improved["p_delta_lt_0"] == 0.0
+
+
+def test_per_dataset_gate_uses_paired_ci_against_raw_baseline():
+    constraint = train_stage1._parse_per_dataset_gate(
+        "wdc2k_v2:direct_recall@10>=0.609"
+    )
+    metrics = {
+        "by_dataset": {
+            "wdc2k_v2": {
+                "direct": {"recall@10": 0.50},
+                "per_query": {"direct": {"recall@10": [1.0, 0.0, 1.0]}},
+            }
+        },
+        "raw_embedding": {
+            "by_dataset": {
+                "wdc2k_v2": {
+                    "per_query": {"direct": {"recall@10": [1.0, 0.0, 1.0]}}
+                }
+            }
+        },
+    }
+
+    result = train_stage1._per_dataset_gate_results(
+        metrics, [constraint], bootstrap_iterations=500
+    )[0]
+
+    assert result["gate_mode"] == "paired_bootstrap_ci"
+    assert result["satisfied"] is True
+    assert result["bootstrap"]["ci_low"] == 0.0
 
 
 def test_per_dataset_gate_falls_back_to_epoch_zero_when_never_satisfied(tmp_path):
@@ -342,10 +385,11 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     )
 
     assert metrics["recall@10"] == 1.0
-    assert metrics["mrr@100"] == 1.0
-    assert metrics["direct"]["recall@1"] == 0.0
-    assert metrics["direct"]["mrr@100"] == pytest.approx(0.5)
-    assert metrics["evidence"]["recall@1"] == 1.0
+    assert metrics["mrr@50"] == 1.0
+    assert metrics["direct"]["mrr@50"] == pytest.approx(0.5)
+    assert metrics["evidence"]["recall@10"] == 1.0
+    assert "recall@100" not in metrics
+    assert "mrr@100" not in metrics
     assert metrics["positive_evidence_path_queries@10"] == 1
     assert metrics["positive_evidence_path_coverage@10"] == 1.0
     assert metrics["by_dataset"]["EntiTables"]["queries"] == 1
@@ -356,6 +400,72 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert metrics["evidence_identity_baseline"]["by_dataset"]["EntiTables"][
         "recall@10"
     ] == 0.5
+
+
+def test_path_coverage_uses_an_independent_k10_pool(monkeypatch):
+    calls = []
+
+    def fake_retrieve(query_ids, _indices, *, k, **_kwargs):
+        calls.append(k)
+        evidence_paths = (
+            [{"kind": "evidence", "evidence_id": "e", "path_score": 1.0}]
+            if k == 20
+            else []
+        )
+        direct = [
+            {
+                "target_id": "positive",
+                "direct_score": 1.0,
+                "evidence_score": None,
+                "score": 1.0,
+                "paths": [{"kind": "direct", "path_score": 1.0}],
+            }
+        ]
+        evidence = (
+            [
+                {
+                    "target_id": "positive",
+                    "direct_score": None,
+                    "evidence_score": 1.0,
+                    "score": 1.0,
+                    "paths": evidence_paths,
+                }
+            ]
+            if evidence_paths
+            else []
+        )
+        fused = [
+            {
+                "target_id": "positive",
+                "direct_score": 1.0,
+                "evidence_score": 1.0 if evidence_paths else None,
+                "score": 1.0,
+                "paths": [*direct[0]["paths"], *evidence_paths],
+            }
+        ]
+        return [{"direct": direct, "evidence": evidence, "fused": fused}]
+
+    monkeypatch.setattr(
+        evaluation_module, "retrieve_zero_one_hop_detailed_many", fake_retrieve
+    )
+    example = TargetExample(
+        "q",
+        (TargetCandidate("positive", ("e",)),),
+        direct_positive_index=0,
+        evidence_positive_index=0,
+        split="dev",
+        positive_target_ids=("positive",),
+        dataset="data",
+    )
+
+    metrics = evaluate_student_retrieval(
+        [example], object(), recall_ks=(20,), gamma=4, gamma_evidence=2
+    )
+
+    assert calls == [10, 20]
+    assert metrics["recall@20"] == 1.0
+    assert metrics["positive_evidence_path_coverage@10"] == 0.0
+    assert metrics["retrieval_budget"]["coverage_k"] == 10
 
 
 def test_teacher_feature_readiness_requires_actual_hidden_states(tmp_path):

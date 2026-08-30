@@ -252,16 +252,17 @@ Training records are filtered to `train`; the fixed gate records are filtered
 to `dev`. Teacher edge/path and Student edge stages select on their matching dev
 listwise objective and never build an ANN index. Every Student path epoch saves
 a candidate checkpoint, rebuilds indexes over the same complete shared corpus,
-and evaluates the fixed dev queries. Its retrieval record contains Recall@1/5/
-10/50/100 and MRR@100 for fused, direct, and evidence rankings, both overall
-and under `by_dataset`, plus the number
+and evaluates the fixed dev queries. Its retrieval record contains the
+requested `--train-eval-ks` cutoffs (defaulting to `--recall-ks` =
+10/20/30/40/50) and MRR at the maximum requested cutoff for fused, direct, and
+evidence rankings, both overall and under `by_dataset`, plus the number
 and fraction of dev queries whose global top 10 contains a labeled positive
 evidence path. The same record includes a `raw_embedding` baseline that runs
 the identical zero/one-hop retrieval directly on the frozen normalized Qwen
 embeddings, without the Student projection or relation matrices. This
 corpus-bound raw index is built once and reused across epochs and mining rounds.
 `--primary-metric` also accepts nested names such as
-`direct.recall@10` or `evidence.mrr@100`.
+`direct.recall@10` or `evidence.mrr@50`.
 Student-path evaluation records epoch 0 before the first optimizer step by
 default, and this initial checkpoint participates in best-checkpoint selection.
 If `--student-checkpoint` is omitted, path training starts directly from
@@ -395,12 +396,16 @@ Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
 on each path, and restores the two-level path aggregation from the Student
 checkpoint. Explicit retrieval flags may override that saved configuration.
 All paths participate in channel aggregation and RRF ranking, but they are not
-all serialized. By default, Recall@100 keeps 100 ranked target IDs/scores while
-only the first 10 targets retain a direct marker and the top four aggregated
-evidence paths. `--path-result-k` and `--evidence-path-k` control those two
-limits; they must be at least the corresponding Stage-2 `--max-targets` and
-`--top-k-evidence` values. Each target keeps only its final fusion `score`, a non-null
-`evidence_score` when available for Stage 2, and compact paths:
+all serialized. By default, `k=10`, the direct pool is `gamma*k=40`, and both
+the evidence and evidence-to-target pools are `gamma_evidence*k=20`.
+`--direct-k`, `--evidence-k`, and `--targets-per-evidence` remain explicit
+advanced overrides. The first `k` target IDs/scores are returned unless
+`--result-k` overrides that serialization limit; only the first 10 targets
+retain a direct marker and the top four aggregated evidence paths.
+`--path-result-k` and `--evidence-path-k` control those two path-detail limits;
+they must be at least the corresponding Stage-2 `--max-targets` and
+`--top-k-evidence` values. Each target keeps only its final fusion `score`, a
+non-null `evidence_score` when available for Stage 2, and compact paths:
 `{"kind":"direct"}` or
 `{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
 

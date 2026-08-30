@@ -14,9 +14,11 @@ from mmdd_stage1.retrieval_aligned import align_edge_record, align_target_record
 from mmdd_stage1.data import TargetCandidate, TargetExample
 from mmdd_stage1 import teacher_rerank
 import audit_stage1_teacher_images
+import evaluate_stage1_r3_baselines
 import merge_stage1_teacher_cache
 import partition_stage1_teacher_work
 import summarize_stage1_teacher_run
+import sweep_stage1_fusion
 
 
 class StaticIndices:
@@ -27,6 +29,75 @@ class StaticIndices:
             "image": [("raw_image", 0.7)],
         }
         return values[destination_type][:k]
+
+
+def test_fusion_metrics_preserve_custom_cutoffs_and_dataset_breakdown():
+    examples = [
+        TargetExample(
+            "q1",
+            (TargetCandidate("p1", ()),),
+            0,
+            0,
+            dataset="alpha",
+            positive_target_ids=("p1",),
+        ),
+        TargetExample(
+            "q2",
+            (TargetCandidate("p2", ()),),
+            0,
+            0,
+            dataset="beta",
+            positive_target_ids=("p2",),
+        ),
+    ]
+
+    metrics = sweep_stage1_fusion._with_datasets(
+        examples,
+        [["p1", "n1"], ["n2", "p2"]],
+        [{"p1"}, {"p2"}],
+        (1, 2),
+        [True, False],
+    )
+
+    assert metrics["recall@1"] == 0.5
+    assert metrics["recall@2"] == 1.0
+    assert metrics["mrr@2"] == 0.75
+    assert metrics["positive_evidence_path_coverage@10"] == 0.5
+    assert metrics["by_dataset"]["alpha"]["recall@1"] == 1.0
+    assert metrics["by_dataset"]["beta"]["recall@1"] == 0.0
+
+
+def test_r3_baseline_comparison_view_selects_the_requested_path_channel():
+    metrics = {
+        "queries": 2,
+        "per_query": {
+            "fused": {"recall@10": [0.0, 1.0]},
+            "direct": {"recall@10": [1.0, 0.0]},
+        },
+        "by_dataset": {
+            "data": {
+                "queries": 2,
+                "per_query": {
+                    "fused": {"recall@10": [0.0, 1.0]},
+                    "direct": {"recall@10": [1.0, 0.0]},
+                },
+            }
+        },
+    }
+
+    fused = evaluate_stage1_r3_baselines._comparison_view(metrics, channel="fused")
+    direct = evaluate_stage1_r3_baselines._comparison_view(metrics, channel="direct")
+    comparison = evaluate_stage1_r3_baselines._comparison(
+        fused,
+        direct,
+        recall_ks=(10,),
+        iterations=10,
+        seed=13,
+    )
+
+    assert fused["per_query"]["recall@10"] == [0.0, 1.0]
+    assert direct["per_query"]["recall@10"] == [1.0, 0.0]
+    assert comparison["overall"]["recall@10"]["mean"] == 0.0
 
 
 def _object_type(object_id: str) -> str:

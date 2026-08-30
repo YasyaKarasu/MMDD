@@ -12,10 +12,17 @@ from .retrieval import (
     RawEmbeddingANNIndices,
     StudentANNIndices,
     fuse_ranked_channels,
-    retrieve_zero_one_hop_detailed,
+    retrieve_zero_one_hop_detailed_many,
 )
 
-RECALL_KS = (1, 5, 10, 50, 100)
+DEFAULT_RECALL_KS = (10, 20, 30, 40, 50)
+
+
+def _validate_recall_ks(recall_ks: Sequence[int]) -> tuple[int, ...]:
+    values = tuple(dict.fromkeys(int(value) for value in recall_ks))
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("recall_ks must contain positive integers")
+    return tuple(sorted(values))
 
 
 def _recall(ranked_ids: Sequence[str], positives: set[str], k: int) -> float:
@@ -34,73 +41,98 @@ def _reciprocal_rank(ranked_ids: Sequence[str], positives: set[str], k: int) -> 
 
 
 def _channel_metrics(
-    rankings: Sequence[Sequence[str]], positives: Sequence[set[str]]
+    rankings_by_k: dict[int, Sequence[Sequence[str]]],
+    positives: Sequence[set[str]],
+    recall_ks: tuple[int, ...],
 ) -> dict[str, float]:
-    query_count = len(rankings)
+    query_count = len(positives)
     values = {
         f"recall@{k}": sum(
             _recall(ranking, relevant, k)
-            for ranking, relevant in zip(rankings, positives)
+            for ranking, relevant in zip(rankings_by_k[k], positives)
         )
         / query_count
-        for k in RECALL_KS
+        for k in recall_ks
     }
-    values["mrr@100"] = (
-        sum(
-            _reciprocal_rank(ranking, relevant, 100)
-            for ranking, relevant in zip(rankings, positives)
-        )
-        / query_count
-    )
+    max_k = max(recall_ks)
+    values[f"mrr@{max_k}"] = sum(
+        _reciprocal_rank(ranking, relevant, max_k)
+        for ranking, relevant in zip(rankings_by_k[max_k], positives)
+    ) / query_count
     return values
 
 
 def _retrieval_metrics(
     query_indices: Sequence[int],
-    rankings: dict[str, list[list[str]]],
+    rankings: dict[str, dict[int, list[list[str]]]],
     positive_sets: Sequence[set[str]],
-    positive_evidence_hits: dict[str, Sequence[bool]],
+    positive_evidence_hits: dict[str, dict[int, list[bool]]],
+    recall_ks: tuple[int, ...],
+    *,
+    return_per_query: bool = False,
 ) -> dict[str, Any]:
     selected_positives = [positive_sets[index] for index in query_indices]
     selected_rankings = {
-        channel: [values[index] for index in query_indices]
-        for channel, values in rankings.items()
-    }
-    def fused_metrics(channel: str) -> dict[str, Any]:
-        count = sum(positive_evidence_hits[channel][index] for index in query_indices)
-        return {
-            **_channel_metrics(selected_rankings[channel], selected_positives),
-            "positive_evidence_path_queries@10": count,
-            "positive_evidence_path_coverage@10": count / len(query_indices),
+        channel: {
+            k: [values[index] for index in query_indices]
+            for k, values in channel_values.items()
         }
+        for channel, channel_values in rankings.items()
+    }
+    coverage_k = 10
+
+    def fused_metrics(channel: str) -> dict[str, Any]:
+        count = sum(
+            positive_evidence_hits[channel][coverage_k][index]
+            for index in query_indices
+        )
+        values = _channel_metrics(
+            selected_rankings[channel], selected_positives, recall_ks
+        )
+        values.update(
+            {
+                "positive_evidence_path_queries@10": count,
+                "positive_evidence_path_coverage@10": count / len(query_indices),
+            }
+        )
+        return values
 
     primary_fused = fused_metrics("fused")
-    fused = _channel_metrics(selected_rankings["fused"], selected_positives)
-    return {
+    result: dict[str, Any] = {
         "queries": len(query_indices),
-        **fused,
-        "direct": _channel_metrics(selected_rankings["direct"], selected_positives),
-        "evidence": _channel_metrics(
-            selected_rankings["evidence"], selected_positives
-        ),
+        **_channel_metrics(selected_rankings["fused"], selected_positives, recall_ks),
+        "direct": _channel_metrics(selected_rankings["direct"], selected_positives, recall_ks),
+        "evidence": _channel_metrics(selected_rankings["evidence"], selected_positives, recall_ks),
         "fused_e0": fused_metrics("fused_e0"),
         "fused_e005": fused_metrics("fused_e005"),
-        "positive_evidence_path_queries@10": primary_fused[
-            "positive_evidence_path_queries@10"
-        ],
-        "positive_evidence_path_coverage@10": primary_fused[
-            "positive_evidence_path_coverage@10"
-        ],
+        "positive_evidence_path_queries@10": primary_fused["positive_evidence_path_queries@10"],
+        "positive_evidence_path_coverage@10": primary_fused["positive_evidence_path_coverage@10"],
     }
+    if return_per_query:
+        result["per_query"] = {
+            channel: {
+                f"recall@{k}": [
+                    _recall(ranking, relevant, k)
+                    for ranking, relevant in zip(selected_rankings[channel][k], selected_positives)
+                ]
+                for k in recall_ks
+            }
+            for channel in rankings
+        }
+    return result
 
 
 def evaluate_student_retrieval(
     examples: Sequence[TargetExample],
     indices: StudentANNIndices | RawEmbeddingANNIndices,
     *,
-    direct_k: int = 100,
-    evidence_k: int = 50,
-    targets_per_evidence: int = 50,
+    recall_ks: tuple[int, ...] = DEFAULT_RECALL_KS,
+    k: int | None = None,
+    gamma: int = 4,
+    gamma_evidence: int = 2,
+    direct_k: int | None = None,
+    evidence_k: int | None = None,
+    targets_per_evidence: int | None = None,
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
@@ -112,33 +144,47 @@ def evaluate_student_retrieval(
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
     identity_baseline_metrics: dict[str, Any] | None = None,
+    return_per_query: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate fixed queries against the shared full-corpus ANN indexes."""
+    """Evaluate each requested k with an independent gamma-derived retrieval pool."""
 
     if not examples:
         raise ValueError("Retrieval evaluation requires at least one query")
-    positive_sets: list[set[str]] = []
-    rankings: dict[str, list[list[str]]] = {
-        "fused": [],
-        "direct": [],
-        "evidence": [],
-        "fused_e0": [],
-        "fused_e005": [],
+    recall_ks = _validate_recall_ks(recall_ks)
+    if k is not None and k <= 0:
+        raise ValueError("k must be positive")
+    if gamma <= 0 or gamma_evidence <= 0:
+        raise ValueError("gamma and gamma_evidence must be positive")
+    if k is not None:
+        recall_ks = (int(k),)
+    retrieval_ks = tuple(sorted({*recall_ks, 10}))
+    positive_sets = [set(example.positive_target_ids) for example in examples]
+    rankings: dict[str, dict[int, list[list[str]]]] = {
+        channel: {requested_k: [] for requested_k in retrieval_ks}
+        for channel in ("fused", "direct", "evidence", "fused_e0", "fused_e005")
     }
-    positive_evidence_hits: dict[str, list[bool]] = {
-        "fused": [],
-        "fused_e0": [],
-        "fused_e005": [],
+    positive_evidence_hits: dict[str, dict[int, list[bool]]] = {
+        channel: {requested_k: [] for requested_k in retrieval_ks}
+        for channel in ("fused", "fused_e0", "fused_e005")
     }
-    for example in progress(
-        examples, desc="Retrieval evaluation", unit="query", leave=False
-    ):
-        positives = set(example.positive_target_ids)
-        positive_sets.append(positives)
-        result = retrieve_zero_one_hop_detailed(
-            example.query_id,
+
+    for requested_k in retrieval_ks:
+        query_ids = [
+            example.query_id
+            for example in progress(
+                examples,
+                desc=f"Prepare retrieval evaluation k={requested_k}",
+                unit="query",
+                leave=False,
+            )
+        ]
+        results = retrieve_zero_one_hop_detailed_many(
+            query_ids,
             indices,
-            direct_k=max(direct_k, max(RECALL_KS)),
+            k=requested_k,
+            gamma=gamma,
+            gamma_evidence=gamma_evidence,
+            direct_k=direct_k,
             evidence_k=evidence_k,
             targets_per_evidence=targets_per_evidence,
             evidence_types=evidence_types,
@@ -152,69 +198,84 @@ def evaluate_student_retrieval(
             gated_evidence_quantile=gated_evidence_quantile,
             evidence_modality_weights=evidence_modality_weights,
         )
-        result["fused_e0"] = fuse_ranked_channels(
-            result["direct"],
-            result["evidence"],
-            rrf_k=rrf_k,
-            fusion_mode="weighted_rrf",
-            direct_weight=direct_weight,
-            evidence_weight=0.0,
-        )
-        result["fused_e005"] = fuse_ranked_channels(
-            result["direct"],
-            result["evidence"],
-            rrf_k=rrf_k,
-            fusion_mode="weighted_rrf",
-            direct_weight=direct_weight,
-            evidence_weight=0.05,
-        )
-        for channel in rankings:
-            rankings[channel].append(
-                [str(item["target_id"]) for item in result[channel]]
+        for example, result in zip(
+            examples,
+            results,
+        ):
+            result["fused_e0"] = fuse_ranked_channels(
+                result["direct"], result["evidence"], rrf_k=rrf_k,
+                fusion_mode="weighted_rrf", direct_weight=direct_weight,
+                evidence_weight=0.0,
             )
-
-        positive_evidence = {
-            candidate.target_id: set(candidate.evidence_ids)
-            for candidate in example.candidates
-            if candidate.target_id in positives and candidate.evidence_ids
-        }
-        for channel in positive_evidence_hits:
-            positive_evidence_hits[channel].append(any(
-                str(item["target_id"]) in positive_evidence
-                and any(
-                    path["kind"] == "evidence"
-                    and str(path["evidence_id"])
-                    in positive_evidence[str(item["target_id"])]
-                    for path in item["paths"]
+            result["fused_e005"] = fuse_ranked_channels(
+                result["direct"], result["evidence"], rrf_k=rrf_k,
+                fusion_mode="weighted_rrf", direct_weight=direct_weight,
+                evidence_weight=0.05,
+            )
+            for channel in rankings:
+                rankings[channel][requested_k].append(
+                    [str(item["target_id"]) for item in result[channel]]
                 )
-                for item in result[channel][:10]
-            ))
+            positives = set(example.positive_target_ids)
+            positive_evidence = {
+                candidate.target_id: set(candidate.evidence_ids)
+                for candidate in example.candidates
+                if candidate.target_id in positives and candidate.evidence_ids
+            }
+            for channel in positive_evidence_hits:
+                positive_evidence_hits[channel][requested_k].append(
+                    any(
+                        str(item["target_id"]) in positive_evidence
+                        and any(
+                            path["kind"] == "evidence"
+                            and str(path["evidence_id"]) in positive_evidence[str(item["target_id"])]
+                            for path in item["paths"]
+                        )
+                        for item in result[channel][:10]
+                    )
+                )
 
     metrics = _retrieval_metrics(
-        list(range(len(examples))), rankings, positive_sets, positive_evidence_hits
+        list(range(len(examples))), rankings, positive_sets,
+        positive_evidence_hits, recall_ks, return_per_query=return_per_query,
     )
     datasets = sorted({example.dataset for example in examples})
     metrics["by_dataset"] = {
         dataset: _retrieval_metrics(
-            [
-                index
-                for index, example in enumerate(examples)
-                if example.dataset == dataset
-            ],
-            rankings,
-            positive_sets,
-            positive_evidence_hits,
+            [index for index, example in enumerate(examples) if example.dataset == dataset],
+            rankings, positive_sets, positive_evidence_hits, recall_ks,
+            return_per_query=return_per_query,
         )
         for dataset in datasets
     }
+    metrics["retrieval_budget"] = {
+        "recall_ks": list(recall_ks),
+        "coverage_k": 10,
+        "gamma": gamma,
+        "gamma_evidence": gamma_evidence,
+        "direct_k_override": direct_k,
+        "evidence_k_override": evidence_k,
+        "targets_per_evidence_override": targets_per_evidence,
+        "per_k": {
+            str(requested_k): {
+                "direct_k": direct_k if direct_k is not None else gamma * requested_k,
+                "evidence_k": evidence_k if evidence_k is not None else gamma_evidence * requested_k,
+                "targets_per_evidence": targets_per_evidence if targets_per_evidence is not None else gamma_evidence * requested_k,
+            }
+            for requested_k in retrieval_ks
+        },
+    }
+    if return_per_query:
+        metrics["per_query_by_dataset"] = {
+            dataset: metrics["by_dataset"][dataset].get("per_query", {})
+            for dataset in datasets
+        }
     if identity_baseline_metrics is not None:
         metrics["evidence_identity_baseline"] = {
             **identity_baseline_metrics["evidence"],
             "by_dataset": {
                 dataset: values["evidence"]
-                for dataset, values in identity_baseline_metrics[
-                    "by_dataset"
-                ].items()
+                for dataset, values in identity_baseline_metrics["by_dataset"].items()
             },
         }
     return metrics
@@ -224,21 +285,27 @@ def evaluate_direct_retrieval(
     examples: Sequence[TargetExample],
     indices: StudentANNIndices | RawEmbeddingANNIndices,
     *,
-    direct_k: int = 100,
+    recall_ks: tuple[int, ...] = DEFAULT_RECALL_KS,
+    k: int | None = None,
+    direct_k: int | None = None,
 ) -> dict[str, float | int]:
-    """Evaluate only direct Q-to-table retrieval with the Stage-1 metric contract."""
+    """Evaluate only direct Q-to-table retrieval with independent requested k pools."""
 
     if not examples:
         raise ValueError("Retrieval evaluation requires at least one query")
-    rankings = []
-    positives = []
-    for example in progress(
-        examples, desc="Direct retrieval evaluation", unit="query", leave=False
-    ):
-        ranked = sorted(
-            indices.search(example.query_id, "table", max(direct_k, max(RECALL_KS))),
-            key=lambda item: (-item[1], item[0]),
-        )
-        rankings.append([target_id for target_id, _score in ranked])
-        positives.append(set(example.positive_target_ids))
-    return {"queries": len(examples), **_channel_metrics(rankings, positives)}
+    recall_ks = _validate_recall_ks(recall_ks)
+    if k is not None:
+        recall_ks = (int(k),)
+    rankings = {requested_k: [] for requested_k in recall_ks}
+    positives = [set(example.positive_target_ids) for example in examples]
+    for requested_k in recall_ks:
+        budget = direct_k if direct_k is not None else requested_k
+        for example in progress(
+            examples, desc=f"Direct retrieval evaluation k={requested_k}", unit="query", leave=False
+        ):
+            ranked = sorted(
+                indices.search(example.query_id, "table", max(budget, requested_k)),
+                key=lambda item: (-item[1], item[0]),
+            )
+            rankings[requested_k].append([target_id for target_id, _score in ranked])
+    return {"queries": len(examples), **_channel_metrics(rankings, positives, recall_ks)}

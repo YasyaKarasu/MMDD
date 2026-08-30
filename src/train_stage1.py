@@ -38,6 +38,7 @@ from mmdd_stage1.selection import (
     metric_value,
     write_json,
 )
+from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.teacher_logits import (
     has_teacher_logits,
     load_teacher_logits,
@@ -77,6 +78,10 @@ def _parse_per_dataset_gate(
 def _per_dataset_gate_results(
     metrics: dict[str, Any],
     constraints: list[tuple[str, str, str, float]],
+    *,
+    gate_tolerance: float = 0.02,
+    bootstrap_iterations: int = 10_000,
+    bootstrap_seed: int = 13,
 ) -> list[dict[str, Any]]:
     comparisons = {
         ">=": lambda value, threshold: value >= threshold,
@@ -92,6 +97,34 @@ def _per_dataset_gate_results(
                 f"Per-dataset gate references absent dataset {dataset!r}"
             )
         value = metric_value(by_dataset[dataset], metric)
+        raw_dataset = metrics.get("raw_embedding", {}).get("by_dataset", {}).get(dataset)
+        student_per_query = (
+            by_dataset[dataset].get("per_query", {})
+            .get(metric.split(".", 1)[0], {})
+            .get(metric.split(".", 1)[1])
+            if "." in metric
+            else by_dataset[dataset].get("per_query", {}).get(metric)
+        )
+        raw_per_query = (
+            raw_dataset.get("per_query", {})
+            .get(metric.split(".", 1)[0], {})
+            .get(metric.split(".", 1)[1])
+            if raw_dataset is not None and "." in metric
+            else None
+        )
+        bootstrap = None
+        if student_per_query is not None and raw_per_query is not None:
+            bootstrap = paired_bootstrap_delta(
+                student_per_query,
+                raw_per_query,
+                iterations=bootstrap_iterations,
+                seed=bootstrap_seed,
+            )
+        satisfied = (
+            bootstrap["ci_low"] >= -gate_tolerance
+            if bootstrap is not None
+            else comparisons[comparison](value, threshold)
+        )
         results.append(
             {
                 "dataset": dataset,
@@ -99,7 +132,10 @@ def _per_dataset_gate_results(
                 "comparison": comparison,
                 "threshold": threshold,
                 "value": value,
-                "satisfied": comparisons[comparison](value, threshold),
+                "satisfied": satisfied,
+                "gate_mode": "paired_bootstrap_ci" if bootstrap is not None else "point_estimate_legacy",
+                "gate_tolerance": gate_tolerance,
+                "bootstrap": bootstrap,
             }
         )
     return results
@@ -124,6 +160,16 @@ def _parse_modality_weight(value: str) -> tuple[str, float]:
     if weight < 0:
         raise argparse.ArgumentTypeError("modality weight must be non-negative")
     return modality, weight
+
+
+def _parse_recall_ks(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--recall-ks must be comma-separated integers") from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("--recall-ks must contain positive integers")
+    return tuple(sorted(dict.fromkeys(values)))
 
 
 def _parse_edge_oversample(value: str) -> tuple[str, int]:
@@ -514,6 +560,9 @@ class _EpochController:
                 self.raw_embedding_metrics = evaluate_student_retrieval(
                     self.dev_examples,
                     raw_indices,
+                    recall_ks=tuple(getattr(self.args, "train_eval_ks", None) or getattr(self.args, "recall_ks", (10, 20, 30, 40, 50))),
+                    gamma=getattr(self.args, "gamma", 4),
+                    gamma_evidence=getattr(self.args, "gamma_evidence", 2),
                     direct_k=self.args.direct_k,
                     evidence_k=self.args.evidence_k,
                     targets_per_evidence=self.args.targets_per_evidence,
@@ -535,10 +584,14 @@ class _EpochController:
                     evidence_modality_weights=getattr(
                         self.args, "evidence_modality_weights", None
                     ),
+                    return_per_query=True,
                 )
             retrieval_metrics = evaluate_student_retrieval(
                 self.dev_examples,
                 indices,
+                recall_ks=tuple(getattr(self.args, "train_eval_ks", None) or getattr(self.args, "recall_ks", (10, 20, 30, 40, 50))),
+                gamma=getattr(self.args, "gamma", 4),
+                gamma_evidence=getattr(self.args, "gamma_evidence", 2),
                 direct_k=self.args.direct_k,
                 evidence_k=self.args.evidence_k,
                 targets_per_evidence=self.args.targets_per_evidence,
@@ -559,6 +612,7 @@ class _EpochController:
                     self.args, "evidence_modality_weights", None
                 ),
                 identity_baseline_metrics=self.raw_embedding_metrics,
+                return_per_query=True,
             )
             retrieval_metrics["raw_embedding"] = self.raw_embedding_metrics
             record["dev_retrieval"] = retrieval_metrics
@@ -600,7 +654,11 @@ class _EpochController:
         if epoch == 0:
             self.epoch_zero_fallback = (candidate, gate_metrics, index_dir)
         constraint_results = _per_dataset_gate_results(
-            gate_metrics, self.per_dataset_gates
+            gate_metrics,
+            self.per_dataset_gates,
+            gate_tolerance=getattr(self.args, "gate_tolerance", 0.02),
+            bootstrap_iterations=getattr(self.args, "bootstrap_iterations", 10_000),
+            bootstrap_seed=getattr(self.args, "bootstrap_seed", 13),
         )
         constraints_satisfied = all(
             result["satisfied"] for result in constraint_results
@@ -723,6 +781,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_hot_fraction": 0.8,
         "per_dataset_gate": [],
         "distillation_datasets": [],
+        "teacher_ensemble_alpha": None,
+        "recall_ks": (10, 20, 30, 40, 50),
+        "train_eval_ks": None,
+        "gamma": 4,
+        "gamma_evidence": 2,
+        "direct_k": None,
+        "evidence_k": None,
+        "targets_per_evidence": None,
+        "gate_tolerance": 0.02,
+        "bootstrap_iterations": 10_000,
+        "bootstrap_seed": 13,
     }
     for name, default in optional_defaults.items():
         if not hasattr(args, name):
@@ -748,6 +817,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--distillation-weight must be non-negative")
     if args.distillation_datasets and args.stage != "student-path":
         raise ValueError("--distillation-datasets is only valid for student-path")
+    if args.teacher_ensemble_alpha is not None:
+        if args.stage != "student-path":
+            raise ValueError("--teacher-ensemble-alpha is only valid for student-path")
+        if not 0 <= args.teacher_ensemble_alpha <= 1:
+            raise ValueError("--teacher-ensemble-alpha must be in [0, 1]")
     if args.anchor_weight < 0:
         raise ValueError("--anchor-weight must be non-negative")
     if args.anchor_weight_evidence is not None and args.anchor_weight_evidence < 0:
@@ -756,6 +830,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--relation-learning-rate must be positive")
     if args.in_batch_max_negatives < 0:
         raise ValueError("--in-batch-max-negatives must be non-negative")
+    if args.gamma <= 0 or args.gamma_evidence <= 0:
+        raise ValueError("--gamma and --gamma-evidence must be positive")
+    if args.gate_tolerance < 0:
+        raise ValueError("--gate-tolerance must be non-negative")
+    if args.bootstrap_iterations <= 0:
+        raise ValueError("--bootstrap-iterations must be positive")
     if args.direct_weight < 0 or args.evidence_weight < 0:
         raise ValueError("Fusion weights must be non-negative")
     if not 0 <= args.gated_evidence_quantile <= 1:
@@ -908,26 +988,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 aggregator=aggregator,
             )
             if not has_teacher_logits(
-                hard_examples, teacher_sha256, cache_aggregator
+                hard_examples,
+                teacher_sha256,
+                cache_aggregator,
+                args.teacher_ensemble_alpha,
             ):
                 raise ValueError(
-                    "Hard-negative data must contain matching cached Teacher logits"
+                    "Hard-negative data must contain matching cached Teacher/ensemble logits"
                 )
 
         cache_dir = _teacher_logit_cache_dir(args)
         examples, train_cache_path, train_cache_hit = load_teacher_logits(
-            examples, cache_dir, teacher_sha256, cache_aggregator
+            examples,
+            cache_dir,
+            teacher_sha256,
+            cache_aggregator,
+            args.teacher_ensemble_alpha,
         )
         dev_examples, dev_cache_path, dev_cache_hit = load_teacher_logits(
-            dev_examples, cache_dir, teacher_sha256, cache_aggregator
+            dev_examples,
+            cache_dir,
+            teacher_sha256,
+            cache_aggregator,
+            args.teacher_ensemble_alpha,
         )
         teacher_cache_hits = int(train_cache_hit) + int(dev_cache_hit)
 
         train_logits_ready = has_teacher_logits(
-            examples, teacher_sha256, cache_aggregator
+            examples,
+            teacher_sha256,
+            cache_aggregator,
+            args.teacher_ensemble_alpha,
         )
         dev_logits_ready = has_teacher_logits(
-            dev_examples, teacher_sha256, cache_aggregator
+            dev_examples,
+            teacher_sha256,
+            cache_aggregator,
+            args.teacher_ensemble_alpha,
         )
         if not train_logits_ready or not dev_logits_ready:
             frozen_teacher = load_teacher(teacher_path, device)
@@ -954,6 +1051,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     device=device,
                     batch_size=args.teacher_logit_batch_size,
                     aggregator=cache_aggregator,
+                    ensemble_alpha=args.teacher_ensemble_alpha,
                 )
             if not dev_logits_ready:
                 dev_examples, dev_cache_path = score_and_cache_teacher_logits(
@@ -965,6 +1063,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     device=device,
                     batch_size=args.teacher_logit_batch_size,
                     aggregator=cache_aggregator,
+                    ensemble_alpha=args.teacher_ensemble_alpha,
                 )
             del frozen_teacher
             if device.type == "cuda":
@@ -1212,6 +1311,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else args.anchor_weight_evidence
         ),
         "distillation_datasets": args.distillation_datasets,
+        "teacher_ensemble_alpha": args.teacher_ensemble_alpha,
         "per_dataset_gate": args.per_dataset_gate,
         "gate_unsatisfied": controller.gate_unsatisfied,
         "in_batch_negatives": args.in_batch_negatives,
@@ -1509,6 +1609,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
     parser.add_argument(
+        "--teacher-ensemble-alpha",
+        type=float,
+        help=(
+            "Cache per-list z-score raw/Teacher ensemble targets for path KD; "
+            "omit for ordinary Teacher-logit distillation."
+        ),
+    )
+    parser.add_argument(
         "--distillation-datasets",
         nargs="*",
         default=[],
@@ -1516,9 +1624,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
-    parser.add_argument("--direct-k", type=int, default=100)
-    parser.add_argument("--evidence-k", type=int, default=50)
-    parser.add_argument("--targets-per-evidence", type=int, default=50)
+    parser.add_argument("--recall-ks", type=_parse_recall_ks, default=(10, 20, 30, 40, 50))
+    parser.add_argument(
+        "--train-eval-ks", type=_parse_recall_ks,
+        help="Optional reduced per-epoch evaluation k set; final evaluation should use --recall-ks.",
+    )
+    parser.add_argument("--gamma", type=int, default=4)
+    parser.add_argument("--gamma-evidence", type=int, default=2)
+    parser.add_argument("--direct-k", type=int, help="Advanced direct-pool override; otherwise gamma * k.")
+    parser.add_argument("--evidence-k", type=int, help="Advanced evidence-pool override; otherwise gamma_evidence * k.")
+    parser.add_argument("--targets-per-evidence", type=int, help="Advanced E-to-table pool override; otherwise gamma_evidence * k.")
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
     parser.add_argument(
         "--evidence-modality-weights",
@@ -1541,6 +1656,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--ef-search", type=int, default=100)
+    parser.add_argument("--gate-tolerance", type=float, default=0.02)
+    parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
+    parser.add_argument("--bootstrap-seed", type=int, default=13)
     args = parser.parse_args()
     args.feature_cache_size = _feature_cache_size(
         args.stage, args.feature_cache_size

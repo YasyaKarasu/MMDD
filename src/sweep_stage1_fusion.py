@@ -23,26 +23,44 @@ from mmdd_stage1.retrieval import (
 )
 from mmdd_stage1.selection import write_json
 
-RECALL_KS = (10, 100)
+DEFAULT_RECALL_KS = (10, 20, 30, 40, 50)
+
+
+def _parse_recall_ks(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(
+            int(part.strip()) for part in value.split(",") if part.strip()
+        )
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--recall-ks must be comma-separated integers"
+        ) from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError(
+            "--recall-ks must contain positive integers"
+        )
+    return tuple(sorted(dict.fromkeys(values)))
 
 
 def _metrics(
     indices: Sequence[int],
     rankings: Sequence[Sequence[str]],
     positives: Sequence[set[str]],
+    recall_ks: Sequence[int],
     evidence_hits: Sequence[bool] | None = None,
 ) -> dict[str, float | int]:
     values: dict[str, float | int] = {"queries": len(indices)}
-    for k in RECALL_KS:
+    for k in recall_ks:
         values[f"recall@{k}"] = statistics.fmean(
             len(set(rankings[index][:k]) & positives[index]) / len(positives[index])
             for index in indices
         )
-    values["mrr@100"] = statistics.fmean(
+    max_k = max(recall_ks)
+    values[f"mrr@{max_k}"] = statistics.fmean(
         next(
             (
                 1.0 / rank
-                for rank, target_id in enumerate(rankings[index][:100], 1)
+                for rank, target_id in enumerate(rankings[index][:max_k], 1)
                 if target_id in positives[index]
             ),
             0.0,
@@ -60,10 +78,11 @@ def _with_datasets(
     examples: Sequence[TargetExample],
     rankings: Sequence[Sequence[str]],
     positives: Sequence[set[str]],
+    recall_ks: Sequence[int],
     evidence_hits: Sequence[bool] | None = None,
 ) -> dict[str, Any]:
     overall = _metrics(
-        list(range(len(examples))), rankings, positives, evidence_hits
+        list(range(len(examples))), rankings, positives, recall_ks, evidence_hits
     )
     overall["by_dataset"] = {
         dataset: _metrics(
@@ -74,6 +93,7 @@ def _with_datasets(
             ],
             rankings,
             positives,
+            recall_ks,
             evidence_hits,
         )
         for dataset in sorted({example.dataset for example in examples})
@@ -189,8 +209,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _positive_evidence_hit(example, fused)
             )
 
-    direct_metrics = _with_datasets(examples, direct_rankings, positives)
-    evidence_metrics = _with_datasets(examples, evidence_rankings, positives)
+    direct_metrics = _with_datasets(
+        examples, direct_rankings, positives, args.recall_ks
+    )
+    evidence_metrics = _with_datasets(
+        examples, evidence_rankings, positives, args.recall_ks
+    )
     results = []
     for config in configs:
         name = config["name"]
@@ -198,7 +222,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {
                 **config,
                 "metrics": _with_datasets(
-                    examples, rankings[name], positives, evidence_hits[name]
+                    examples,
+                    rankings[name],
+                    positives,
+                    args.recall_ks,
+                    evidence_hits[name],
                 ),
             }
         )
@@ -237,17 +265,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "metrics.json", payload)
+    max_k = max(args.recall_ks)
     lines = [
         "# Task 4: raw fusion sweep",
         "",
-        "| Config | Fused R@10 | R@100 | MRR@100 | Positive evidence coverage@10 |",
+        f"| Config | Fused R@10 | R@{max_k} | MRR@{max_k} | Positive evidence coverage@10 |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         metrics = result["metrics"]
         lines.append(
             f"| {result['name']} | {metrics['recall@10']:.2%} | "
-            f"{metrics['recall@100']:.2%} | {metrics['mrr@100']:.4f} | "
+            f"{metrics[f'recall@{max_k}']:.2%} | "
+            f"{metrics[f'mrr@{max_k}']:.4f} | "
             f"{metrics['positive_evidence_path_coverage@10']:.2%} |"
         )
     lines.extend(
@@ -274,6 +304,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-index-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dev-split", default="dev", choices=["dev"])
+    parser.add_argument(
+        "--recall-ks", type=_parse_recall_ks, default=DEFAULT_RECALL_KS
+    )
     parser.add_argument("--evidence-weights", type=float, nargs="+", default=[1.0, 0.5, 0.25, 0.1])
     parser.add_argument("--max-direct-drop", type=float, default=0.005)
     parser.add_argument("--direct-k", type=int, default=100)
