@@ -152,6 +152,16 @@ def load_edge_examples(
                     record.get("teacher_checkpoint_sha256")
                     or metadata.get("teacher_checkpoint_sha256")
                 ),
+                teacher_logit_mode=(
+                    record.get("teacher_logit_mode")
+                    or metadata.get("teacher_edge_logit_mode")
+                    or metadata.get("teacher_logit_mode")
+                ),
+                teacher_ensemble_alpha=(
+                    record.get("teacher_ensemble_alpha")
+                    if record.get("teacher_ensemble_alpha") is not None
+                    else metadata.get("teacher_edge_ensemble_alpha")
+                ),
                 source_type=(
                     normalize_object_type(str(record["source_type"]))
                     if record.get("source_type") is not None
@@ -278,6 +288,16 @@ def load_target_examples(
                 teacher_checkpoint_sha256=(
                     record.get("teacher_checkpoint_sha256")
                     or metadata.get("teacher_checkpoint_sha256")
+                ),
+                teacher_logit_mode=(
+                    record.get("teacher_logit_mode")
+                    or metadata.get("teacher_target_logit_mode")
+                    or metadata.get("teacher_logit_mode")
+                ),
+                teacher_ensemble_alpha=(
+                    record.get("teacher_ensemble_alpha")
+                    if record.get("teacher_ensemble_alpha") is not None
+                    else metadata.get("teacher_target_ensemble_alpha")
                 ),
             )
         )

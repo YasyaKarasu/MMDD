@@ -15,6 +15,7 @@ from .models import TeacherJoinabilityModel
 from .objectives import PathAggregator
 from .retrieval import StudentANNIndices
 from .scoring import score_edge_batch, score_target_batch
+from .teacher_logits import _score_target_ensemble_logits
 
 
 @dataclass(frozen=True)
@@ -334,6 +335,7 @@ def score_hard_candidate_sets(
     *,
     device: torch.device,
     batch_size: int,
+    ensemble_alpha: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -361,7 +363,13 @@ def score_hard_candidate_sets(
         edge_examples = [
             example for item_examples in edge_examples_by_item for example in item_examples
         ]
-        teacher_targets = score_target_batch(teacher, batch, store, device, aggregator)
+        teacher_targets = (
+            _score_target_ensemble_logits(
+                batch, teacher, store, device, aggregator, ensemble_alpha
+            )
+            if ensemble_alpha is not None
+            else score_target_batch(teacher, batch, store, device, aggregator)
+        )
         teacher_edges = score_edge_batch(teacher, edge_examples, store, device)
         edge_offset = 0
         for index, (item, item_edge_examples) in enumerate(zip(batch, edge_examples_by_item)):
@@ -375,6 +383,11 @@ def score_hard_candidate_sets(
                     index, :target_count
                 ].cpu().tolist(),
             )
+            if ensemble_alpha is not None:
+                target_record.update(
+                    teacher_logit_mode="ensemble",
+                    teacher_ensemble_alpha=ensemble_alpha,
+                )
             target_records.append(target_record)
             for edge_example in item_edge_examples:
                 edge_count = len(edge_example.candidate_ids)
@@ -397,6 +410,7 @@ def score_pending_hard_examples(
     *,
     device: torch.device,
     batch_size: int,
+    ensemble_alpha: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Score persisted hard candidates without repeating ANN retrieval."""
 
@@ -414,7 +428,13 @@ def score_pending_hard_examples(
         leave=False,
     ):
         batch = target_examples[start : start + batch_size]
-        scores = score_target_batch(teacher, batch, store, device, aggregator)
+        scores = (
+            _score_target_ensemble_logits(
+                batch, teacher, store, device, aggregator, ensemble_alpha
+            )
+            if ensemble_alpha is not None
+            else score_target_batch(teacher, batch, store, device, aggregator)
+        )
         for index, example in enumerate(batch):
             candidate_count = len(example.candidates)
             record = _target_record(example)
@@ -426,6 +446,11 @@ def score_pending_hard_examples(
                     index, :candidate_count
                 ].cpu().tolist(),
             )
+            if ensemble_alpha is not None:
+                record.update(
+                    teacher_logit_mode="ensemble",
+                    teacher_ensemble_alpha=ensemble_alpha,
+                )
             target_records.append(record)
 
     # One mined target produces roughly four directly supervised edge lists.

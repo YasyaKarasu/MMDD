@@ -2491,6 +2491,22 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     }
     assert "student_logits" not in edge_records[0]
 
+    ensemble_targets, ensemble_edges = score_hard_candidate_sets(
+        [candidate_set],
+        teacher(),
+        store,
+        PathAggregator(),
+        device=torch.device("cpu"),
+        batch_size=1,
+        ensemble_alpha=0.7,
+    )
+    assert ensemble_targets[0]["teacher_logit_mode"] == "ensemble"
+    assert ensemble_targets[0]["teacher_ensemble_alpha"] == pytest.approx(0.7)
+    assert "teacher_logit_mode" not in ensemble_edges[0]
+    assert ensemble_targets[0]["teacher_direct_logits"] != pytest.approx(
+        target_records[0]["teacher_direct_logits"]
+    )
+
     target_path = tmp_path / "hard_targets.jsonl"
     edge_path = tmp_path / "hard_edges.jsonl"
     target_path.write_text(json.dumps(target_records[0]) + "\n", encoding="utf-8")
@@ -2518,6 +2534,46 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     assert loaded_target.teacher_checkpoint_sha256 == "synthetic"
     assert loaded_edge.teacher_logits == pytest.approx(edge_records[0]["teacher_logits"])
     assert loaded_edge.teacher_checkpoint_sha256 == "synthetic"
+
+
+def test_hard_target_loader_preserves_ensemble_provenance(tmp_path):
+    path = tmp_path / "hard_targets.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "direct_positive_target_id": "positive",
+                "evidence_positive_target_id": "positive",
+                "candidates": [
+                    {"target_id": "positive", "evidence_ids": []},
+                    {"target_id": "negative", "evidence_ids": []},
+                ],
+                "teacher_direct_logits": [1.0, 0.0],
+                "teacher_evidence_logits": [1.0, 0.0],
+                "dataset": "data",
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.with_suffix(".jsonl.metadata.json").write_text(
+        json.dumps(
+            {
+                "teacher_checkpoint_sha256": "teacher-sha",
+                "evidence_aggregation": "logsumexp",
+                "evidence_top_k": 4,
+                "teacher_target_logit_mode": "ensemble",
+                "teacher_target_ensemble_alpha": 0.7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_target_examples(path)[0]
+
+    assert loaded.teacher_logit_mode == "ensemble"
+    assert loaded.teacher_ensemble_alpha == pytest.approx(0.7)
 
 
 def test_hard_negative_refresh_scores_pending_candidates_without_remining(
@@ -3202,17 +3258,19 @@ def test_retrieval_batches_all_evidence_to_target_queries():
     ]
 
 
-def test_epoch_controller_prunes_only_non_best_non_latest_indices(tmp_path):
-    paths = [tmp_path / f"epoch_{epoch:03d}" for epoch in range(1, 4)]
+def test_epoch_controller_retains_epoch_zero_best_and_latest_indices(tmp_path):
+    paths = [tmp_path / f"epoch_{epoch:03d}" for epoch in range(4)]
     for path in paths:
         path.mkdir()
     controller = object.__new__(train_stage1._EpochController)
     controller.created_indices = paths
-    controller.best_index = paths[0]
-    controller.latest_index = paths[2]
+    controller.epoch_zero_fallback = (tmp_path / "epoch_000.pt", {}, paths[0])
+    controller.best_index = paths[1]
+    controller.latest_index = paths[3]
 
     controller.prune_indices()
 
     assert paths[0].is_dir()
-    assert not paths[1].exists()
-    assert paths[2].is_dir()
+    assert paths[1].is_dir()
+    assert not paths[2].exists()
+    assert paths[3].is_dir()

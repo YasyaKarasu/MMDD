@@ -62,6 +62,7 @@ def _validate_pending_metadata(
 
 
 def run(args: argparse.Namespace) -> None:
+    teacher_ensemble_alpha = getattr(args, "teacher_ensemble_alpha", None)
     pending_target_value = getattr(args, "pending_target_lists", None)
     pending_edge_value = getattr(args, "pending_edge_lists", None)
     if bool(pending_target_value) != bool(pending_edge_value):
@@ -81,13 +82,21 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--teacher-checkpoint is required unless --mine-only is set")
     if not args.mine_only and args.teacher_batch_size <= 0:
         raise ValueError("Teacher batch size must be positive")
+    if teacher_ensemble_alpha is not None and not 0 <= teacher_ensemble_alpha <= 1:
+        raise ValueError("--teacher-ensemble-alpha must be in [0, 1]")
     if min(args.hard_evidence_per_type, args.hard_paths_per_query) < 0:
         raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
     validate_protocol_split("mining", args.split)
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     split = args.split
     target_paths = [Path(value) for value in args.target_lists]
-    store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
+    store = FeatureStore.from_path(
+        Path(args.features),
+        cache_size=args.feature_cache_size,
+        teacher_paths=tuple(
+            Path(value) for value in getattr(args, "teacher_features", [])
+        ),
+    )
     student_path = Path(args.student_checkpoint)
     saved_aggregation, saved_top_k = load_path_aggregation(student_path)
     evidence_aggregation = args.evidence_aggregation or saved_aggregation
@@ -122,6 +131,7 @@ def run(args: argparse.Namespace) -> None:
                 "evidence_k": args.evidence_k,
                 "targets_per_evidence": args.targets_per_evidence,
                 "evidence_types": list(evidence_types),
+                "teacher_ensemble_alpha": teacher_ensemble_alpha,
             },
         )
         pending_targets = load_target_examples(pending_target_path, split=split)
@@ -183,6 +193,7 @@ def run(args: argparse.Namespace) -> None:
                 aggregator,
                 device=device,
                 batch_size=args.teacher_batch_size,
+                ensemble_alpha=teacher_ensemble_alpha,
             )
         else:
             target_records, edge_records = score_hard_candidate_sets(
@@ -192,6 +203,7 @@ def run(args: argparse.Namespace) -> None:
                 aggregator,
                 device=device,
                 batch_size=args.teacher_batch_size,
+                ensemble_alpha=teacher_ensemble_alpha,
             )
     _write_jsonl(Path(args.output_target_lists), target_records)
     if args.output_edge_lists:
@@ -216,10 +228,16 @@ def run(args: argparse.Namespace) -> None:
         "evidence_k": args.evidence_k,
         "targets_per_evidence": args.targets_per_evidence,
         "evidence_types": list(evidence_types),
+        "teacher_ensemble_alpha": teacher_ensemble_alpha,
     }
     if teacher_sha256 is not None:
         metadata["teacher_checkpoint_sha256"] = teacher_sha256
         metadata["teacher_scoring"] = "complete"
+        metadata["teacher_target_logit_mode"] = (
+            "ensemble" if teacher_ensemble_alpha is not None else "teacher"
+        )
+        metadata["teacher_target_ensemble_alpha"] = teacher_ensemble_alpha
+        metadata["teacher_edge_logit_mode"] = "teacher"
     else:
         metadata["teacher_scoring"] = "pending"
     output_paths = [Path(args.output_target_lists)]
@@ -244,6 +262,12 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", required=True)
+    parser.add_argument(
+        "--teacher-features",
+        nargs="*",
+        default=[],
+        help="Optional Teacher-only cache directories or manifest paths.",
+    )
     parser.add_argument("--teacher-checkpoint")
     parser.add_argument("--student-checkpoint", required=True)
     parser.add_argument("--index-dir", required=True)
@@ -263,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=128)
     parser.add_argument("--teacher-batch-size", type=int, default=4)
+    parser.add_argument("--teacher-ensemble-alpha", type=float)
     parser.add_argument(
         "--mine-only",
         action="store_true",
