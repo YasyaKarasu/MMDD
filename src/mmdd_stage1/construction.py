@@ -6,8 +6,9 @@ import math
 import random
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from mmdd_dataset.utils import clean_text, get_cell, read_jsonl
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
@@ -15,6 +16,7 @@ from mmdd_progress import progress
 
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 DEFAULT_MAX_CELL_CHARS = 1024
+TABLE_ROW_FORMATS = ("values", "named_cells")
 
 
 def _artifact_records(root: Path, name: str, *, required: bool = True) -> list[dict[str, Any]]:
@@ -35,7 +37,13 @@ def serialize_table_parts(
     table: dict[str, Any],
     max_rows: int,
     max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
+    *,
+    row_format: str = "values",
 ) -> list[str]:
+    if row_format not in TABLE_ROW_FORMATS:
+        raise ValueError(
+            f"row_format must be one of: {', '.join(TABLE_ROW_FORMATS)}"
+        )
     headers = [clean_text(column.get("column_name")) for column in table["columns"]]
     parts = ["Columns: " + " | ".join(headers)]
     for row in table["rows"][:max_rows]:
@@ -45,6 +53,11 @@ def serialize_table_parts(
                 get_cell(row, int(column["column_index"])).get("text")
             )
             values.append(value[:max_cell_chars].rstrip())
+        if row_format == "named_cells":
+            values = [
+                f"{header or f'column_{index}'}: {value}"
+                for index, (header, value) in enumerate(zip(headers, values))
+            ]
         parts.append("Row: " + " | ".join(values))
     return parts
 
@@ -55,8 +68,14 @@ def _table_object(
     max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
     *,
     embedding_role: str,
+    row_format: str = "values",
 ) -> dict[str, Any]:
-    parts = serialize_table_parts(table, max_rows, max_cell_chars)
+    parts = serialize_table_parts(
+        table,
+        max_rows,
+        max_cell_chars,
+        row_format=row_format,
+    )
     record = {
         "object_id": str(table["table_id"]),
         "object_type": "table",
@@ -245,10 +264,15 @@ def build_stage1_training_artifacts(
     dataset_name: str,
     max_rows: int = 12,
     max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
+    table_row_format: str = "values",
     seed: int = 13,
 ) -> dict[str, list[dict[str, Any]]]:
     if max_rows <= 0 or max_cell_chars <= 0:
         raise ValueError("max_rows and max_cell_chars must be positive")
+    if table_row_format not in TABLE_ROW_FORMATS:
+        raise ValueError(
+            f"table_row_format must be one of: {', '.join(TABLE_ROW_FORMATS)}"
+        )
     queries = {
         str(record["table_id"]): record
         for record in _artifact_records(dataset_root, "query_tables")
@@ -281,6 +305,7 @@ def build_stage1_training_artifacts(
             max_rows,
             max_cell_chars,
             embedding_role="query",
+            row_format=table_row_format,
         )
         for query_id, table in queries.items()
     }
@@ -290,6 +315,7 @@ def build_stage1_training_artifacts(
             max_rows,
             max_cell_chars,
             embedding_role="target",
+            row_format=table_row_format,
         )
         for target_id, table in targets.items()
     }

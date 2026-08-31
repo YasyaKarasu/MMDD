@@ -458,11 +458,32 @@ def _aggregate_path_channels(
         return direct_score, None
     if aggregator.evidence_aggregation == "logsumexp":
         evidence_score = _logsumexp(evidence_scores)
-    else:
+    elif aggregator.evidence_aggregation == "max":
+        evidence_score = max(evidence_scores)
+    elif aggregator.evidence_aggregation in {"topk_mean", "topk_sum"}:
         selected = sorted(evidence_scores, reverse=True)[: aggregator.top_k]
         evidence_score = sum(selected)
         if aggregator.evidence_aggregation == "topk_mean":
             evidence_score /= len(selected)
+    elif aggregator.evidence_aggregation == "softmax_weighted_mean":
+        maximum = max(evidence_scores)
+        weights = [
+            math.exp((value - maximum) / aggregator.temperature)
+            for value in evidence_scores
+        ]
+        evidence_score = sum(
+            value * weight for value, weight in zip(evidence_scores, weights)
+        ) / sum(weights)
+    elif aggregator.evidence_aggregation == "power_mean":
+        minimum = min(evidence_scores)
+        evidence_score = minimum + (
+            sum((value - minimum) ** aggregator.power for value in evidence_scores)
+            / len(evidence_scores)
+        ) ** (1.0 / aggregator.power)
+    else:
+        evidence_score = sum(evidence_scores) * sum(
+            value != 0.0 for value in evidence_scores
+        )
     return direct_score, evidence_score
 
 
@@ -485,6 +506,51 @@ def _quantile(values: list[float], quantile: float) -> float:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def _normalize_values(
+    values: list[float], method: str, *, temperature: float = 1.0
+) -> list[float]:
+    if method == "none":
+        return list(values)
+    if method == "zscore":
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        std = math.sqrt(variance)
+        return [0.0 for _value in values] if std <= 1e-12 else [
+            (value - mean) / std for value in values
+        ]
+    if method == "minmax":
+        minimum = min(values)
+        width = max(values) - minimum
+        return [0.0 for _value in values] if width <= 1e-12 else [
+            (value - minimum) / width for value in values
+        ]
+    if method == "softmax":
+        if temperature <= 0:
+            raise ValueError("score normalization temperature must be positive")
+        maximum = max(values)
+        exponentials = [
+            math.exp((value - maximum) / temperature) for value in values
+        ]
+        total = sum(exponentials)
+        return [value / total for value in exponentials]
+    raise ValueError("score normalization must be one of: none, zscore, minmax, softmax")
+
+
+def _normalized_channel_scores(
+    results: list[dict[str, Any]],
+    score_key: str,
+    method: str,
+    *,
+    temperature: float,
+) -> dict[str, float]:
+    values = [float(result[score_key]) for result in results]
+    normalized = _normalize_values(values, method, temperature=temperature)
+    return {
+        str(result["target_id"]): value
+        for result, value in zip(results, normalized)
+    }
+
+
 def fuse_ranked_channels(
     direct: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
@@ -495,8 +561,30 @@ def fuse_ranked_channels(
     evidence_weight: float = 1.0,
     gated_evidence_min_paths: int = 2,
     gated_evidence_quantile: float = 0.75,
+    score_normalization: str = "none",
+    score_temperature: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Fuse pre-ranked channels without repeating ANN retrieval."""
+
+    if fusion_mode not in {
+        "gated",
+        "normalized_rrc",
+        "normalized_score",
+        "rrf",
+        "weighted_rrf",
+    }:
+        raise ValueError(
+            "fusion_mode must be one of: rrf, weighted_rrf, gated, "
+            "normalized_score, normalized_rrc"
+        )
+    if score_normalization not in {"none", "zscore", "minmax", "softmax"}:
+        raise ValueError(
+            "score_normalization must be one of: none, zscore, minmax, softmax"
+        )
+    if fusion_mode in {"normalized_score", "normalized_rrc"} and score_normalization == "none":
+        raise ValueError("normalized fusion requires score_normalization")
+    if score_temperature <= 0:
+        raise ValueError("score_temperature must be positive")
 
     direct_ranks = {
         str(result["target_id"]): rank for rank, result in enumerate(direct, 1)
@@ -518,6 +606,52 @@ def fuse_ranked_channels(
         if fusion_mode == "rrf"
         else (direct_weight, evidence_weight)
     )
+    direct_values = (
+        _normalized_channel_scores(
+            direct,
+            "direct_score",
+            score_normalization,
+            temperature=score_temperature,
+        )
+        if fusion_mode in {"normalized_score", "normalized_rrc"} and direct
+        else {}
+    )
+    evidence_normalized_values = (
+        _normalized_channel_scores(
+            evidence,
+            "evidence_score",
+            score_normalization,
+            temperature=score_temperature,
+        )
+        if fusion_mode in {"normalized_score", "normalized_rrc"} and evidence
+        else {}
+    )
+    if fusion_mode == "normalized_rrc":
+        direct_unit = (
+            dict(
+                zip(
+                    direct_values,
+                    _normalize_values(list(direct_values.values()), "minmax"),
+                )
+            )
+            if direct_values
+            else {}
+        )
+        evidence_unit = (
+            dict(
+                zip(
+                    evidence_normalized_values,
+                    _normalize_values(
+                        list(evidence_normalized_values.values()), "minmax"
+                    ),
+                )
+            )
+            if evidence_normalized_values
+            else {}
+        )
+    else:
+        direct_unit = {}
+        evidence_unit = {}
     fused = []
     for target_id, result in results_by_id.items():
         direct_rank = direct_ranks.get(target_id)
@@ -537,9 +671,25 @@ def fuse_ranked_channels(
         )
         contributions = []
         if direct_rank is not None and weights[0] > 0:
-            contributions.append(weights[0] / (rrf_k + direct_rank))
+            if fusion_mode == "normalized_score":
+                contributions.append(weights[0] * direct_values[target_id])
+            elif fusion_mode == "normalized_rrc":
+                denominator = max(rrf_k + 1.0 - direct_unit[target_id], 1e-12)
+                contributions.append(weights[0] / denominator)
+            else:
+                contributions.append(weights[0] / (rrf_k + direct_rank))
         if evidence_rank is not None and evidence_allowed and weights[1] > 0:
-            contributions.append(weights[1] / (rrf_k + evidence_rank))
+            if fusion_mode == "normalized_score":
+                contributions.append(
+                    weights[1] * evidence_normalized_values[target_id]
+                )
+            elif fusion_mode == "normalized_rrc":
+                denominator = max(
+                    rrf_k + 1.0 - evidence_unit[target_id], 1e-12
+                )
+                contributions.append(weights[1] / denominator)
+            else:
+                contributions.append(weights[1] / (rrf_k + evidence_rank))
         if contributions:
             result["score"] = sum(contributions)
             fused.append(result)
@@ -583,10 +733,15 @@ def retrieve_zero_one_hop(
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
+    evidence_temperature: float = 1.0,
+    evidence_power: float = 2.0,
+    path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
     direct_weight: float = 1.0,
     evidence_weight: float = 1.0,
+    fusion_score_normalization: str = "none",
+    fusion_score_temperature: float = 1.0,
     gated_evidence_min_paths: int = 2,
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
@@ -614,10 +769,15 @@ def retrieve_zero_one_hop(
         evidence_types=evidence_types,
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
+        evidence_temperature=evidence_temperature,
+        evidence_power=evidence_power,
+        path_edge_normalization=path_edge_normalization,
         rrf_k=rrf_k,
         fusion_mode=fusion_mode,
         direct_weight=direct_weight,
         evidence_weight=evidence_weight,
+        fusion_score_normalization=fusion_score_normalization,
+        fusion_score_temperature=fusion_score_temperature,
         gated_evidence_min_paths=gated_evidence_min_paths,
         gated_evidence_quantile=gated_evidence_quantile,
         evidence_modality_weights=evidence_modality_weights,
@@ -639,17 +799,85 @@ def retrieve_zero_one_hop(
     return results
 
 
-def _rank_detailed_paths(
+def _normalize_path_edges(
+    paths_by_target: dict[str, list[dict[str, Any]]], normalization: str
+) -> dict[str, list[dict[str, Any]]]:
+    if normalization == "none":
+        return {
+            target_id: [dict(path) for path in paths]
+            for target_id, paths in paths_by_target.items()
+        }
+    if normalization != "zscore":
+        raise ValueError("path_edge_normalization must be one of: none, zscore")
+
+    query_edges: dict[str, dict[str, float]] = defaultdict(dict)
+    target_edges: dict[str, list[float]] = defaultdict(list)
+    for paths in paths_by_target.values():
+        for path in paths:
+            if path["kind"] != "evidence":
+                continue
+            evidence_type = str(path["evidence_type"])
+            query_edges[evidence_type][str(path["evidence_id"])] = float(
+                path["query_evidence_score"]
+            )
+            target_edges[evidence_type].append(float(path["evidence_target_score"]))
+
+    normalized_query_edges = {
+        evidence_type: dict(
+            zip(
+                values,
+                _normalize_values(list(values.values()), normalization),
+            )
+        )
+        for evidence_type, values in query_edges.items()
+    }
+    target_stats: dict[str, tuple[float, float]] = {}
+    for evidence_type, values in target_edges.items():
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        target_stats[evidence_type] = (mean, math.sqrt(variance))
+
+    normalized = {}
+    for target_id, paths in paths_by_target.items():
+        normalized_paths = []
+        for source in paths:
+            path = dict(source)
+            if path["kind"] == "evidence":
+                evidence_type = str(path["evidence_type"])
+                query_score = normalized_query_edges[evidence_type][
+                    str(path["evidence_id"])
+                ]
+                mean, std = target_stats[evidence_type]
+                target_score = (
+                    0.0
+                    if std <= 1e-12
+                    else (float(path["evidence_target_score"]) - mean) / std
+                )
+                path["normalized_query_evidence_score"] = query_score
+                path["normalized_evidence_target_score"] = target_score
+                path["path_score"] = query_score + target_score
+            normalized_paths.append(path)
+        normalized[target_id] = normalized_paths
+    return normalized
+
+
+def rank_detailed_paths(
     paths_by_target: dict[str, list[dict[str, Any]]],
     *,
     aggregator: PathAggregator,
+    path_edge_normalization: str = "none",
     rrf_k: int,
     fusion_mode: str,
     direct_weight: float,
     evidence_weight: float,
+    fusion_score_normalization: str = "none",
+    fusion_score_temperature: float = 1.0,
     gated_evidence_min_paths: int,
     gated_evidence_quantile: float,
 ) -> dict[str, list[dict[str, Any]]]:
+    paths_by_target = _normalize_path_edges(
+        paths_by_target, path_edge_normalization
+    )
     results = []
     for target_id, paths in paths_by_target.items():
         paths.sort(key=lambda path: path["path_score"], reverse=True)
@@ -685,6 +913,8 @@ def _rank_detailed_paths(
         evidence_weight=evidence_weight,
         gated_evidence_min_paths=gated_evidence_min_paths,
         gated_evidence_quantile=gated_evidence_quantile,
+        score_normalization=fusion_score_normalization,
+        score_temperature=fusion_score_temperature,
     )
     return {"fused": fused, "direct": direct, "evidence": evidence}
 
@@ -702,10 +932,15 @@ def retrieve_zero_one_hop_detailed_many(
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
+    evidence_temperature: float = 1.0,
+    evidence_power: float = 2.0,
+    path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
     direct_weight: float = 1.0,
     evidence_weight: float = 1.0,
+    fusion_score_normalization: str = "none",
+    fusion_score_temperature: float = 1.0,
     gated_evidence_min_paths: int = 2,
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
@@ -730,8 +965,25 @@ def retrieve_zero_one_hop_detailed_many(
         raise ValueError("Retrieval k values must be non-negative")
     if rrf_k < 0:
         raise ValueError("rrf_k must be non-negative")
-    if fusion_mode not in {"rrf", "weighted_rrf", "gated"}:
-        raise ValueError("fusion_mode must be one of: rrf, weighted_rrf, gated")
+    if fusion_mode not in {
+        "rrf",
+        "weighted_rrf",
+        "gated",
+        "normalized_score",
+        "normalized_rrc",
+    }:
+        raise ValueError(
+            "fusion_mode must be one of: rrf, weighted_rrf, gated, "
+            "normalized_score, normalized_rrc"
+        )
+    if path_edge_normalization not in {"none", "zscore"}:
+        raise ValueError("path_edge_normalization must be one of: none, zscore")
+    if fusion_score_normalization not in {"none", "zscore", "minmax", "softmax"}:
+        raise ValueError(
+            "fusion_score_normalization must be one of: none, zscore, minmax, softmax"
+        )
+    if fusion_score_temperature <= 0:
+        raise ValueError("fusion_score_temperature must be positive")
     if direct_weight < 0 or evidence_weight < 0:
         raise ValueError("fusion weights must be non-negative")
     if fusion_mode != "rrf" and direct_weight == evidence_weight == 0:
@@ -758,17 +1010,27 @@ def retrieve_zero_one_hop_detailed_many(
                 evidence_types=evidence_types,
                 evidence_aggregation=evidence_aggregation,
                 evidence_top_k=evidence_top_k,
+                evidence_temperature=evidence_temperature,
+                evidence_power=evidence_power,
+                path_edge_normalization=path_edge_normalization,
                 rrf_k=rrf_k,
                 fusion_mode=fusion_mode,
                 direct_weight=direct_weight,
                 evidence_weight=evidence_weight,
+                fusion_score_normalization=fusion_score_normalization,
+                fusion_score_temperature=fusion_score_temperature,
                 gated_evidence_min_paths=gated_evidence_min_paths,
                 gated_evidence_quantile=gated_evidence_quantile,
                 evidence_modality_weights=evidence_modality_weights,
                 query_batch_size=query_batch_size,
             )
         ]
-    aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
+    aggregator = PathAggregator(
+        evidence_aggregation,
+        evidence_top_k,
+        temperature=evidence_temperature,
+        power=evidence_power,
+    )
     paths_by_query = [defaultdict(list) for _query_id in query_ids]
     for paths_by_target, direct_hits in zip(
         paths_by_query, indices.search_many(list(query_ids), "table", direct_k)
@@ -827,17 +1089,22 @@ def retrieve_zero_one_hop_detailed_many(
                     "kind": "evidence",
                     "evidence_id": evidence_id,
                     "evidence_type": evidence_type,
+                    "query_evidence_score": query_evidence_score,
+                    "evidence_target_score": evidence_target_score,
                     "path_score": query_evidence_score + evidence_target_score,
                 }
             )
     return [
-        _rank_detailed_paths(
+        rank_detailed_paths(
             paths_by_target,
             aggregator=aggregator,
+            path_edge_normalization=path_edge_normalization,
             rrf_k=rrf_k,
             fusion_mode=fusion_mode,
             direct_weight=direct_weight,
             evidence_weight=evidence_weight,
+            fusion_score_normalization=fusion_score_normalization,
+            fusion_score_temperature=fusion_score_temperature,
             gated_evidence_min_paths=gated_evidence_min_paths,
             gated_evidence_quantile=gated_evidence_quantile,
         )
@@ -858,10 +1125,15 @@ def retrieve_zero_one_hop_detailed(
     evidence_types: tuple[str, ...] = ("text", "image"),
     evidence_aggregation: str = "logsumexp",
     evidence_top_k: int = 4,
+    evidence_temperature: float = 1.0,
+    evidence_power: float = 2.0,
+    path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
     direct_weight: float = 1.0,
     evidence_weight: float = 1.0,
+    fusion_score_normalization: str = "none",
+    fusion_score_temperature: float = 1.0,
     gated_evidence_min_paths: int = 2,
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
@@ -880,10 +1152,15 @@ def retrieve_zero_one_hop_detailed(
         evidence_types=evidence_types,
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
+        evidence_temperature=evidence_temperature,
+        evidence_power=evidence_power,
+        path_edge_normalization=path_edge_normalization,
         rrf_k=rrf_k,
         fusion_mode=fusion_mode,
         direct_weight=direct_weight,
         evidence_weight=evidence_weight,
+        fusion_score_normalization=fusion_score_normalization,
+        fusion_score_temperature=fusion_score_temperature,
         gated_evidence_min_paths=gated_evidence_min_paths,
         gated_evidence_quantile=gated_evidence_quantile,
         evidence_modality_weights=evidence_modality_weights,

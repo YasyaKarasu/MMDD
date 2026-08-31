@@ -58,12 +58,13 @@ explicitly stated facts in text, and visually grounded facts in images.
 
 Each table is encoded once for its Teacher/Student features. The cache uses
 tokenizer offsets to retain the schema/row tokens from that same sequence and
-immediately mean-pools them to one float32 vector per schema/example-row group.
-This is the exact first operation performed by the Teacher and avoids retaining
-the much larger token matrix. The Student uses the final embedding from the
-same forward pass. For query objects, the cache derives one `schema + row`
-routing view per example row. Those short views are embedded in one additional
-batch and cached in the base tier for Stage-2 evidence assignment.
+mean-pools them into ordered contiguous segments. By default it stores one
+float32 vector per schema/example-row group; `--table-tokens-per-group` can keep
+several segments per group for table-token-budget ablations without retaining
+the full token matrix. The Student uses the final embedding from the same
+forward pass. For query objects, the cache derives one `schema + row` routing
+view per example row. Those short views are embedded in one additional batch
+and cached in the base tier for Stage-2 evidence assignment.
 
 Build a lazy per-object feature cache with the local 8B encoder:
 
@@ -150,6 +151,11 @@ conda run -n MMDD python src/train_stage1.py student-path \
   --primary-metric recall@10 --min-delta 0.001 --patience 3 \
   --output checkpoints/student_path.pt
 ```
+
+For a multi-token table cache, pass the same
+`--teacher-table-tokens-per-group K` to both Teacher stages. Fresh Teachers use
+one token per group when the flag is omitted; loaded checkpoints otherwise keep
+their saved token budget.
 
 Student stages with a nonzero `--distillation-weight` automatically cache all
 base-train and fixed-dev Teacher logits before optimization. `--distillation-weight 0`

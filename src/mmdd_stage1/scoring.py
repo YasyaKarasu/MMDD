@@ -325,6 +325,7 @@ def score_target_batch(
     store: FeatureStore,
     device: torch.device,
     aggregator: PathAggregator,
+    relation_loss_weights: dict[str, float] | None = None,
 ) -> TargetScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
     hidden_dtype = (
@@ -340,6 +341,8 @@ def score_target_batch(
     target_sources = []
     target_destinations = []
     evidence_lengths = []
+    query_evidence_relation_keys = []
+    evidence_target_relation_keys = []
 
     for example in examples:
         query = _device_features(
@@ -375,6 +378,12 @@ def score_target_batch(
                 evidence_destinations.append(evidence)
                 target_sources.append(evidence)
                 target_destinations.append(target)
+                query_evidence_relation_keys.append(
+                    f"{query.object_type}_to_{evidence.object_type}"
+                )
+                evidence_target_relation_keys.append(
+                    f"{evidence.object_type}_to_{target.object_type}"
+                )
 
     if isinstance(model, TeacherJoinabilityModel):
         compression_cache: dict[str, torch.Tensor] = {}
@@ -408,6 +417,25 @@ def score_target_batch(
         )
         direct_scores, query_evidence_scores, evidence_target_edge_scores = (
             scores.split((len(direct_sources), evidence_count, evidence_count))
+        )
+
+    if relation_loss_weights and not isinstance(model, TeacherJoinabilityModel):
+        if any(value <= 0 for value in relation_loss_weights.values()):
+            raise ValueError("relation loss weights must be positive")
+
+        def scale_gradient(
+            values: torch.Tensor, relation_keys: Sequence[str]
+        ) -> torch.Tensor:
+            weights = values.new_tensor(
+                [relation_loss_weights.get(key, 1.0) for key in relation_keys]
+            )
+            return values.detach() + weights * (values - values.detach())
+
+        query_evidence_scores = scale_gradient(
+            query_evidence_scores, query_evidence_relation_keys
+        )
+        evidence_target_edge_scores = scale_gradient(
+            evidence_target_edge_scores, evidence_target_relation_keys
         )
 
     query_evidence_rows = pad_sequence(

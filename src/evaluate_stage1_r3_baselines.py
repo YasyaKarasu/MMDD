@@ -480,7 +480,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if any(name in args.systems for name in ("raw_ensemble", "student_ensemble")):
         teacher_path = Path(args.teacher_checkpoint)
-        teacher = load_teacher(teacher_path, device)
+        teacher = load_teacher(
+            teacher_path,
+            device,
+            table_tokens_per_group=getattr(
+                args, "teacher_table_tokens_per_group", None
+            ),
+        )
         if store.teacher_dimension() != teacher.input_dim:
             raise ValueError("Teacher checkpoint does not match the feature store hidden dimension")
         teacher.eval()
@@ -561,6 +567,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "gamma_evidence": args.gamma_evidence,
             "teacher_alpha": args.teacher_alpha,
             "teacher_batch_size": args.teacher_batch_size,
+            "teacher_table_tokens_per_group": getattr(
+                args, "teacher_table_tokens_per_group", None
+            ),
             "evidence_aggregation": aggregation,
             "evidence_top_k": evidence_top_k,
             "evidence_types": list(evidence_types),
@@ -609,6 +618,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma-evidence", type=int, default=2)
     parser.add_argument("--teacher-alpha", type=float, default=0.7)
     parser.add_argument("--teacher-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--teacher-table-tokens-per-group",
+        type=int,
+        help="Override the checkpoint's table schema/row token budget.",
+    )
     parser.add_argument("--feature-cache-size", type=int, default=60_000)
     parser.add_argument("--index-batch-size", type=int, default=1024)
     parser.add_argument("--hnsw-m", type=int, default=32)

@@ -14,7 +14,12 @@ from typing import Any
 import torch
 
 from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
-from mmdd_stage1.data import EdgeExample, TargetExample, load_edge_examples, load_target_examples
+from mmdd_stage1.data import (
+    EdgeExample,
+    TargetExample,
+    load_edge_examples,
+    load_target_examples,
+)
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.models import (
@@ -29,8 +34,8 @@ from mmdd_stage1.retrieval import (
     StudentANNIndices,
     build_indices,
     checkpoint_fingerprint,
-    load_or_build_raw_embedding_indices,
     load_corpus_ids,
+    load_or_build_raw_embedding_indices,
 )
 from mmdd_stage1.selection import (
     CheckpointManager,
@@ -190,6 +195,24 @@ def _parse_edge_oversample(value: str) -> tuple[str, int]:
     if factor < 1:
         raise argparse.ArgumentTypeError("oversampling factor must be at least 1")
     return type_pair, factor
+
+
+def _parse_relation_loss_weight(value: str) -> tuple[str, float]:
+    relation, separator, raw_weight = value.partition("=")
+    parts = relation.split("_to_")
+    if separator != "=" or len(parts) != 2 or any(
+        part not in {"table", "text", "image"} for part in parts
+    ):
+        raise argparse.ArgumentTypeError(
+            "relation loss weights must use SOURCE_to_DESTINATION=WEIGHT"
+        )
+    try:
+        weight = float(raw_weight)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("relation loss weight must be numeric") from exc
+    if weight <= 0:
+        raise argparse.ArgumentTypeError("relation loss weight must be positive")
+    return relation, weight
 
 
 def _student_optimizer(
@@ -792,12 +815,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_modality_weights": [],
         "min_dev_evidence_path_coverage_by_dataset": 0.0,
         "edge_type_oversample": [],
+        "relation_loss_weights": [],
         "teacher_rerank": False,
         "teacher_rerank_dev_data": [],
         "teacher_rerank_top_k": 100,
         "teacher_rerank_batch_size": 16,
         "teacher_rerank_interval": 1,
         "teacher_amp": "off",
+        "teacher_table_tokens_per_group": None,
         "feature_cache_gb": None,
         "feature_hot_fraction": 0.8,
         "per_dataset_gate": [],
@@ -831,6 +856,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.evidence_modality_weights = dict(args.evidence_modality_weights)
     if not isinstance(args.edge_type_oversample, dict):
         args.edge_type_oversample = dict(args.edge_type_oversample)
+    if not isinstance(args.relation_loss_weights, dict):
+        args.relation_loss_weights = dict(args.relation_loss_weights)
     if args.batch_size is None:
         args.batch_size = 64 if args.stage.startswith("student") else 8
     args.feature_cache_size = _feature_cache_size(
@@ -848,6 +875,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--distillation-weight must be non-negative")
     if args.distillation_datasets and args.stage != "student-path":
         raise ValueError("--distillation-datasets is only valid for student-path")
+    if args.relation_loss_weights and args.stage != "student-path":
+        raise ValueError("--relation-loss-weight is only valid for student-path")
     if args.teacher_ensemble_alpha is not None:
         if args.stage != "student-path":
             raise ValueError("--teacher-ensemble-alpha is only valid for student-path")
@@ -897,6 +926,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Teacher rerank top-k and batch size must be positive")
     if args.teacher_amp not in {"off", "bf16"}:
         raise ValueError("--teacher-amp must be off or bf16")
+    if (
+        args.teacher_table_tokens_per_group is not None
+        and args.teacher_table_tokens_per_group <= 0
+    ):
+        raise ValueError("--teacher-table-tokens-per-group must be positive")
     if args.feature_cache_gb is not None and args.feature_cache_gb <= 0:
         raise ValueError("--feature-cache-gb must be positive")
     if not 0 <= args.feature_hot_fraction <= 1:
@@ -1214,7 +1248,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.stage == "teacher-edge":
         teacher = (
-            load_teacher(Path(args.teacher_checkpoint), device)
+            load_teacher(
+                Path(args.teacher_checkpoint),
+                device,
+                table_tokens_per_group=(
+                    args.teacher_table_tokens_per_group or 1
+                ),
+            )
             if args.teacher_checkpoint
             else TeacherJoinabilityModel(
                 input_dim=hidden_dim,
@@ -1224,6 +1264,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 text_latents=args.text_latents,
                 image_latents=args.image_latents,
                 dropout=args.dropout,
+                table_tokens_per_group=args.teacher_table_tokens_per_group,
             ).to(device)
         )
         if teacher.input_dim != hidden_dim:
@@ -1237,7 +1278,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         teacher_path = _required_path(
             args.teacher_checkpoint, "--teacher-checkpoint", args.stage
         )
-        teacher = load_teacher(teacher_path, device)
+        teacher = load_teacher(
+            teacher_path,
+            device,
+            table_tokens_per_group=args.teacher_table_tokens_per_group,
+        )
         if teacher.input_dim != hidden_dim:
             raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
         _configure_teacher_compute(teacher, args.teacher_amp, device)
@@ -1332,6 +1377,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 in_batch_negatives=args.in_batch_negatives,
                 in_batch_max_negatives=args.in_batch_max_negatives,
+                relation_loss_weights=args.relation_loss_weights,
                 **common,
             )
         if epoch_zero_record is not None:
@@ -1390,6 +1436,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "in_batch_negatives": args.in_batch_negatives,
         "in_batch_max_negatives": args.in_batch_max_negatives,
         "edge_type_oversample": args.edge_type_oversample,
+        "relation_loss_weights": args.relation_loss_weights,
         "eval_epoch_zero": args.eval_epoch_zero,
         "initialize_only": args.initialize_only,
         "fusion": {
@@ -1408,6 +1455,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "interval": args.teacher_rerank_interval,
         },
         "teacher_amp": args.teacher_amp,
+        "teacher_table_tokens_per_group": args.teacher_table_tokens_per_group,
         "feature_cache": {
             "object_limit": args.feature_cache_size,
             "hot_object_limit": hot_cache_objects,
@@ -1588,6 +1636,15 @@ def parse_args() -> argparse.Namespace:
         help="Run Teacher model compute under CUDA BF16 autocast; weights stay FP32.",
     )
     parser.add_argument(
+        "--teacher-table-tokens-per-group",
+        type=int,
+        help=(
+            "Retain this many ordered pooled tokens per table schema/row group "
+            "inside the Teacher. Fresh models default to 1; loaded checkpoints "
+            "keep their saved value when omitted."
+        ),
+    )
+    parser.add_argument(
         "--teacher-rerank",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1714,6 +1771,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument(
+        "--relation-loss-weight",
+        dest="relation_loss_weights",
+        nargs="*",
+        type=_parse_relation_loss_weight,
+        default=[],
+        metavar="SOURCE_to_DESTINATION=WEIGHT",
+        help=(
+            "Scale Student path gradients for selected directed relations without "
+            "changing forward scores."
+        ),
+    )
     parser.add_argument("--recall-ks", type=_parse_recall_ks, default=(10, 20, 30, 40, 50))
     parser.add_argument(
         "--train-eval-ks", type=_parse_recall_ks,

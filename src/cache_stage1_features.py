@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
+
 from mmdd_progress import progress
 from mmdd_stage1.features import normalize_object_type
-from mmdd_stage1.models import structural_table_pool
-from torch.nn import functional as F
+from mmdd_stage1.models import structural_table_pool_with_groups
 
 PROMPT_VERSION = "role_modality_v2_object_only"
 TEACHER_MANIFEST = "teacher_manifest.jsonl"
@@ -229,7 +230,13 @@ def build_object_features(
     storage_dtype: torch.dtype,
     include_hidden: bool = True,
     include_row_embeddings: bool = True,
+    table_row_batch_size: int = 8,
+    table_tokens_per_group: int = 1,
 ) -> dict[str, torch.Tensor]:
+    if table_row_batch_size <= 0:
+        raise ValueError("table_row_batch_size must be positive")
+    if table_tokens_per_group <= 0:
+        raise ValueError("table_tokens_per_group must be positive")
     object_type = normalize_object_type(str(record["object_type"]))
     object_instruction, row_instruction, embedding_role = embedding_instructions(
         record, object_type, instruction
@@ -298,22 +305,32 @@ def build_object_features(
         selected_hidden = hidden_states.index_select(0, indices).to(
             dtype=storage_dtype
         ).float()
-        pooled_hidden = structural_table_pool(selected_hidden, groups)
+        pooled_hidden, pooled_groups = structural_table_pool_with_groups(
+            selected_hidden,
+            groups,
+            table_tokens_per_group,
+        )
         payload["hidden_states"] = pooled_hidden
+        if table_tokens_per_group > 1:
+            assert pooled_groups is not None
+            payload["token_groups"] = pooled_groups
 
     if embedding_role == "query" and include_row_embeddings:
-        routing_outputs = encode_inputs(
-            embedder,
-            [
-                {
-                    "text": text,
-                    "instruction": row_instruction,
-                }
-                for text in (
-                    f"{parts[0]}\n{row}" for row in parts[1:]
-                )
-            ],
-        )
+        routing_items = [
+            {
+                "text": f"{parts[0]}\n{row}",
+                "instruction": row_instruction,
+            }
+            for row in parts[1:]
+        ]
+        routing_outputs = [
+            output
+            for start in range(0, len(routing_items), table_row_batch_size)
+            for output in encode_inputs(
+                embedder,
+                routing_items[start : start + table_row_batch_size],
+            )
+        ]
         payload["row_embeddings"] = torch.stack(
             [embedding for embedding, _, _ in routing_outputs]
         )
@@ -415,6 +432,7 @@ def run(args: argparse.Namespace) -> None:
         teacher_dir.mkdir(parents=True, exist_ok=True)
 
     model_dir = Path(args.model_dir).resolve()
+    table_tokens_per_group = getattr(args, "table_tokens_per_group", 1)
     metadata = {
         "format_version": 5,
         "model_dir": str(model_dir),
@@ -428,13 +446,26 @@ def run(args: argparse.Namespace) -> None:
         "feature_tiers": ["retrieval", "teacher"],
         "table_pooling": "prepooled_schema_rows",
     }
-    metadata_path = output_dir / "metadata.json"
-    if metadata_path.exists():
-        existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if existing_metadata != metadata:
-            raise ValueError(f"{metadata_path}: cache settings differ from this run")
-    else:
-        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if table_tokens_per_group > 1:
+        metadata.update(
+            {
+                "format_version": 6,
+                "table_pooling": "contiguous_mean_segments",
+                "table_tokens_per_group": table_tokens_per_group,
+            }
+        )
+    for metadata_root in dict.fromkeys([output_dir, teacher_output_dir]):
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        metadata_path = metadata_root / "metadata.json"
+        if metadata_path.exists():
+            existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if existing_metadata != metadata:
+                raise ValueError(f"{metadata_path}: cache settings differ from this run")
+        else:
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
     pending_base_ids = set()
     pending_teacher_ids = set()
     base_skipped = 0
@@ -547,6 +578,8 @@ def run(args: argparse.Namespace) -> None:
                 storage_dtype=torch_dtype,
                 include_hidden=needs_teacher,
                 include_row_embeddings=needs_base,
+                table_row_batch_size=getattr(args, "table_row_batch_size", 8),
+                table_tokens_per_group=table_tokens_per_group,
             )
             name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
             if needs_base:
@@ -571,6 +604,8 @@ def run(args: argparse.Namespace) -> None:
                 base_written += 1
             if needs_teacher:
                 teacher_payload = {"hidden_states": payload["hidden_states"]}
+                if "token_groups" in payload:
+                    teacher_payload["token_groups"] = payload["token_groups"]
                 relative_path = Path("teacher_objects") / name
                 destination = teacher_output_dir / relative_path
                 temporary = destination.with_suffix(".pt.tmp")
@@ -623,6 +658,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument(
+        "--table-row-batch-size",
+        type=int,
+        default=8,
+        help="Maximum query-table rows encoded together for routing embeddings.",
+    )
+    parser.add_argument(
+        "--table-tokens-per-group",
+        type=int,
+        default=1,
+        help="Keep this many contiguous pooled tokens per table schema/row group.",
+    )
+    parser.add_argument(
         "--teacher-data",
         nargs="+",
         default=[],
@@ -640,7 +687,12 @@ def parse_args() -> argparse.Namespace:
         "--instruction",
         help="Explicitly override all role- and modality-specific embedding instructions.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.table_row_batch_size <= 0:
+        parser.error("--table-row-batch-size must be positive")
+    if args.table_tokens_per_group <= 0:
+        parser.error("--table-tokens-per-group must be positive")
+    return args
 
 
 if __name__ == "__main__":

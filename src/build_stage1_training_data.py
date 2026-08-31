@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from mmdd_progress import progress
-
 from mmdd_stage1.construction import (
     DEFAULT_MAX_CELL_CHARS,
+    TABLE_ROW_FORMATS,
     build_stage1_training_artifacts,
 )
 
@@ -43,6 +44,7 @@ def run(args: argparse.Namespace) -> None:
         dataset_name=args.dataset_name or dataset_root.name,
         max_rows=args.max_rows,
         max_cell_chars=args.max_cell_chars,
+        table_row_format=args.table_row_format,
         seed=args.seed,
     )
     counts = {
@@ -58,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset-name")
     parser.add_argument("--max-rows", type=int, default=12)
+    parser.add_argument(
+        "--table-row-format",
+        choices=TABLE_ROW_FORMATS,
+        default="values",
+        help="Serialize rows as bare values or repeat each column name before its value.",
+    )
     parser.add_argument(
         "--max-cell-chars",
         type=int,

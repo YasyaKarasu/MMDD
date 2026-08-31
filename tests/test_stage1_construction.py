@@ -54,6 +54,19 @@ def test_serialize_table_parts_limits_cleaned_cell_text():
     ]
 
 
+def test_serialize_table_parts_can_repeat_column_names():
+    parts = serialize_table_parts(
+        _table("q", ["Entity", "", "Value"], [["Messi", "Argentina", "10"]]),
+        max_rows=1,
+        row_format="named_cells",
+    )
+
+    assert parts == [
+        "Columns: Entity |  | Value",
+        "Row: Entity: Messi | column_1: Argentina | Value: 10",
+    ]
+
+
 def test_artifact_records_prefers_manifest_over_stale_flat_file(tmp_path: Path):
     stale = {"table_id": "stale"}
     listed = {"table_id": "listed"}

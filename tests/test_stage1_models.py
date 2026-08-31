@@ -43,8 +43,8 @@ from mmdd_stage1.mining import (
     score_hard_candidate_sets,
 )
 from mmdd_stage1.models import (
-    IdentityStudentJoinabilityModel,
     TYPE_TO_ID,
+    IdentityStudentJoinabilityModel,
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
     structural_table_pool,
@@ -166,6 +166,43 @@ def test_structural_table_pool_returns_schema_and_row_tokens():
     pooled = structural_table_pool(hidden, groups)
 
     assert torch.equal(pooled, torch.tensor([[2.0, 2.0], [6.0, 4.0]]))
+
+
+def test_structural_table_pool_keeps_contiguous_segments_per_group():
+    hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    groups = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+
+    pooled = structural_table_pool(hidden, groups, tokens_per_group=2)
+
+    expected = torch.stack(
+        [hidden[0:2].mean(0), hidden[2:4].mean(0), hidden[4:6].mean(0), hidden[6:8].mean(0)]
+    )
+    torch.testing.assert_close(pooled, expected)
+
+
+def test_teacher_retains_multiple_schema_and_row_tokens():
+    model = TeacherJoinabilityModel(
+        input_dim=2,
+        model_dim=4,
+        num_heads=2,
+        num_layers=1,
+        text_latents=2,
+        image_latents=2,
+        table_tokens_per_group=2,
+        dropout=0.0,
+    )
+    hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    table = ObjectFeatures(
+        "table",
+        "table",
+        torch.ones(2),
+        hidden,
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+    )
+
+    tokens = model.compress(table)
+
+    assert tokens.shape == (4, 4)
 
 
 def test_teacher_pools_table_groups_before_the_equivalent_adapter_projection():
@@ -1001,12 +1038,37 @@ def test_train_stage1_uses_stage_specific_feature_cache_defaults(monkeypatch):
         ],
     )
 
-    assert train_stage1.parse_args().feature_cache_size == 8_000
+    teacher_args = train_stage1.parse_args()
+    assert teacher_args.feature_cache_size == 8_000
+    assert teacher_args.teacher_table_tokens_per_group is None
 
     monkeypatch.setattr(
         sys, "argv", [sys.argv[0], "student-edge", *sys.argv[2:]]
     )
     assert train_stage1.parse_args().feature_cache_size == 60_000
+
+
+def test_train_stage1_accepts_multiple_teacher_table_tokens(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_stage1.py",
+            "teacher-edge",
+            "--features",
+            "features",
+            "--base-data",
+            "train.jsonl",
+            "--dev-data",
+            "dev.jsonl",
+            "--output",
+            "teacher.pt",
+            "--teacher-table-tokens-per-group",
+            "4",
+        ],
+    )
+
+    assert train_stage1.parse_args().teacher_table_tokens_per_group == 4
 
 
 def test_lazy_feature_store_and_target_jsonl(tmp_path):
@@ -1526,7 +1588,7 @@ def test_qwen_cache_builder_skips_table_teacher_features_for_base_only(
     )
     monkeypatch.setattr(
         stage1_cache,
-        "structural_table_pool",
+        "structural_table_pool_with_groups",
         lambda *_args, **_kwargs: pytest.fail("base-only build pooled table tokens"),
     )
 
@@ -1568,6 +1630,25 @@ def test_qwen_cache_builder_skips_query_rows_for_teacher_only(tmp_path):
     assert "hidden_states" in payload
     assert "row_embeddings" not in payload
     assert embedder.forward_calls == 1
+
+
+def test_qwen_cache_builder_keeps_multiple_tokens_per_table_group(tmp_path):
+    payload = build_object_features(
+        FakeQwenEmbedder(),
+        {
+            "object_id": "t",
+            "object_type": "table",
+            "embedding_role": "target",
+            "table_parts": ["schema player country", "row Messi Argentina"],
+        },
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+        table_tokens_per_group=2,
+    )
+
+    assert payload["hidden_states"].shape == (4, 4)
+    assert payload["token_groups"].tolist() == [0, 0, 1, 1]
 
 
 def test_teacher_object_ids_collects_only_the_selected_split(tmp_path):
@@ -1648,6 +1729,26 @@ def test_qwen_cache_builder_adds_query_row_routing_embeddings(tmp_path):
         EMBEDDING_INSTRUCTIONS[("query_row", "table")],
         EMBEDDING_INSTRUCTIONS[("query_row", "table")],
     ]
+
+
+def test_qwen_cache_builder_batches_query_row_routing_embeddings(tmp_path):
+    embedder = FakeQwenEmbedder()
+    payload = build_object_features(
+        embedder,
+        {
+            "object_id": "q",
+            "object_type": "table",
+            "embedding_role": "query",
+            "table_parts": ["schema", *[f"row {index}" for index in range(5)]],
+        },
+        input_dir=tmp_path,
+        instruction=None,
+        storage_dtype=torch.float16,
+        table_row_batch_size=2,
+    )
+
+    assert embedder.forward_calls == 4
+    assert payload["row_embeddings"].shape == (5, 4)
 
 
 def test_qwen_cache_builder_truncates_oversized_table_parts_and_pools_each_group(tmp_path):
@@ -1800,6 +1901,45 @@ def test_qwen_cache_run_writes_base_tier_and_incremental_teacher_tier(
     teacher_features = store.get("t", include_hidden=True)
     assert teacher_features.hidden_states.shape == (2, 4)
     assert teacher_features.token_groups is None
+
+
+def test_qwen_cache_run_persists_multi_token_table_groups(tmp_path, monkeypatch):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        json.dumps(
+            {
+                "object_id": "t",
+                "object_type": "table",
+                "embedding_role": "target",
+                "table_parts": ["schema player country", "row Messi Argentina"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selected = tmp_path / "selected.jsonl"
+    selected.write_text(json.dumps({"object_id": "t"}) + "\n", encoding="utf-8")
+    output = tmp_path / "features"
+    args = argparse.Namespace(
+        input_jsonl=str(objects),
+        output_dir=str(output),
+        model_dir=str(tmp_path / "model"),
+        device="cpu",
+        dtype="fp16",
+        instruction=None,
+        teacher_data=[str(selected)],
+        teacher_split="all",
+        table_tokens_per_group=2,
+    )
+    monkeypatch.setattr(stage1_cache, "_load_embedder_class", lambda _path: FakeQwenEmbedder)
+
+    stage1_cache.run(args)
+
+    features = FeatureStore.from_path(output).get("t", include_hidden=True)
+    assert features.hidden_states.shape == (4, 4)
+    assert features.token_groups.tolist() == [0, 0, 1, 1]
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["table_tokens_per_group"] == 2
 
 
 def test_embedding_instructions_distinguish_role_modality_and_query_rows():

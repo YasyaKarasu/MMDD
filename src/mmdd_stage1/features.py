@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
 from mmdd_progress import progress
 
 OBJECT_TYPES = ("table", "text", "image")
@@ -36,9 +37,10 @@ class ObjectFeatures:
     """The two frozen feature granularities consumed by Teacher and Student.
 
     ``hidden_states`` contains the frozen states consumed by the Teacher.
-    Current table caches store one already-pooled vector per schema/example-row
-    group. Historical raw-token caches identify those groups with
-    ``token_groups``.
+    Table caches may store one or several already-pooled vectors per
+    schema/example-row group. ``token_groups`` identifies the group of each
+    retained vector when more than one token is kept; historical raw-token
+    caches use the same field.
     """
 
     object_id: str

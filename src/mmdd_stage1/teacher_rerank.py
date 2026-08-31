@@ -205,7 +205,7 @@ def _teacher_scores(
 
 
 class TeacherRerankedANNIndices:
-    """Rerank each fixed raw ANN edge pool with a frozen Teacher."""
+    """Rerank each fixed raw ANN edge pool with a frozen Teacher ensemble."""
 
     def __init__(
         self,
@@ -215,22 +215,28 @@ class TeacherRerankedANNIndices:
         *,
         device: torch.device,
         batch_size: int,
+        alpha: float | None = None,
+        score_cache: dict[tuple[str, str], float] | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if alpha is not None and not 0 <= alpha <= 1:
+            raise ValueError("alpha must be in [0, 1]")
         self.raw_indices = raw_indices
         self.teacher = teacher.eval()
         self.store = store
         self.device = device
         self.batch_size = batch_size
-        self.score_cache: dict[tuple[str, str], float] = {}
+        self.alpha = None if alpha is None else float(alpha)
+        self.score_cache = score_cache if score_cache is not None else {}
 
     def search(
         self, source_id: str, destination_type: str, k: int
     ) -> list[tuple[str, float]]:
         raw_hits = self.raw_indices.search(source_id, destination_type, k)
         candidate_ids = [object_id for object_id, _score in raw_hits]
-        scores = _teacher_scores(
+        raw_scores = [float(score) for _object_id, score in raw_hits]
+        teacher_scores = _teacher_scores(
             self.teacher,
             source_id,
             candidate_ids,
@@ -238,6 +244,11 @@ class TeacherRerankedANNIndices:
             self.device,
             self.batch_size,
             self.score_cache,
+        )
+        scores = (
+            teacher_scores
+            if self.alpha is None
+            else ensemble_scores(raw_scores, teacher_scores, self.alpha)
         )
         order = sorted(
             range(len(candidate_ids)),

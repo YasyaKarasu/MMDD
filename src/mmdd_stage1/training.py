@@ -965,6 +965,7 @@ def train_student_paths(
     distillation_datasets: set[str] | None = None,
     in_batch_negatives: bool = False,
     in_batch_max_negatives: int = 256,
+    relation_loss_weights: dict[str, float] | None = None,
     dataset_sampling_alpha: float = 0.0,
     hard_examples: Sequence[TargetExample] = (),
     hard_fraction: float = 0.5,
@@ -1017,7 +1018,14 @@ def train_student_paths(
                 if distillation_weight > 0
                 else None
             )
-            student_scores = score_target_batch(student, batch, store, device, aggregator)
+            student_scores = score_target_batch(
+                student,
+                batch,
+                store,
+                device,
+                aggregator,
+                relation_loss_weights=relation_loss_weights,
+            )
             supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
                 student_scores
             )

@@ -7,17 +7,42 @@ from torch import nn
 from torch.nn import functional as F
 
 
+PATH_AGGREGATIONS = {
+    "comb_mnz",
+    "logsumexp",
+    "max",
+    "power_mean",
+    "softmax_weighted_mean",
+    "topk_mean",
+    "topk_sum",
+}
+
+
 class PathAggregator(nn.Module):
     """Aggregate Q->evidence->target paths within the evidence channel."""
 
-    def __init__(self, evidence_aggregation: str = "logsumexp", top_k: int = 4) -> None:
+    def __init__(
+        self,
+        evidence_aggregation: str = "logsumexp",
+        top_k: int = 4,
+        *,
+        temperature: float = 1.0,
+        power: float = 2.0,
+    ) -> None:
         super().__init__()
-        if evidence_aggregation not in {"logsumexp", "topk_mean", "topk_sum"}:
-            raise ValueError("evidence_aggregation must be logsumexp, topk_mean, or topk_sum")
+        if evidence_aggregation not in PATH_AGGREGATIONS:
+            choices = ", ".join(sorted(PATH_AGGREGATIONS))
+            raise ValueError(f"evidence_aggregation must be one of: {choices}")
         if top_k <= 0:
             raise ValueError("top_k must be positive")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if power <= 0:
+            raise ValueError("power must be positive")
         self.evidence_aggregation = evidence_aggregation
         self.top_k = top_k
+        self.temperature = float(temperature)
+        self.power = float(power)
 
     def forward(
         self,
@@ -39,13 +64,38 @@ class PathAggregator(nn.Module):
         if self.evidence_aggregation == "logsumexp":
             safe_paths = masked_paths.masked_fill(~has_evidence.unsqueeze(-1), 0.0)
             evidence_scores = torch.logsumexp(safe_paths, dim=-1)
-        else:
+        elif self.evidence_aggregation == "max":
+            evidence_scores = masked_paths.max(dim=-1).values
+        elif self.evidence_aggregation in {"topk_mean", "topk_sum"}:
             count = min(self.top_k, path_scores.shape[-1])
             values = torch.topk(masked_paths, k=count, dim=-1).values
             valid = torch.isfinite(values)
             evidence_scores = values.masked_fill(~valid, 0.0).sum(dim=-1)
             if self.evidence_aggregation == "topk_mean":
                 evidence_scores = evidence_scores / valid.sum(dim=-1).clamp_min(1)
+        elif self.evidence_aggregation == "softmax_weighted_mean":
+            safe_paths = masked_paths.masked_fill(~has_evidence.unsqueeze(-1), 0.0)
+            weights = torch.softmax(safe_paths / self.temperature, dim=-1)
+            weights = weights.masked_fill(~evidence_mask, 0.0)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
+            evidence_scores = (weights * safe_paths).sum(dim=-1)
+        elif self.evidence_aggregation == "power_mean":
+            safe_paths = masked_paths.masked_fill(~evidence_mask, torch.inf)
+            minimum = safe_paths.min(dim=-1).values
+            minimum = torch.where(has_evidence, minimum, torch.zeros_like(minimum))
+            shifted = (path_scores - minimum.unsqueeze(-1)).clamp_min(0.0)
+            shifted = shifted.masked_fill(~evidence_mask, 0.0)
+            count = evidence_mask.sum(dim=-1).clamp_min(1)
+            evidence_scores = (
+                shifted.pow(self.power).sum(dim=-1) / count
+            ).pow(1.0 / self.power) + minimum
+        else:
+            valid_paths = path_scores.masked_fill(~evidence_mask, 0.0)
+            evidence_scores = (
+                valid_paths.sum(dim=-1) * evidence_mask.sum(dim=-1)
+            )
 
         return torch.where(has_evidence, evidence_scores, torch.zeros_like(evidence_scores))
 

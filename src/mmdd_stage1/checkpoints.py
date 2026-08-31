@@ -17,12 +17,21 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
     return payload
 
 
-def load_teacher(path: Path, device: torch.device) -> TeacherJoinabilityModel:
+def load_teacher(
+    path: Path,
+    device: torch.device,
+    *,
+    table_tokens_per_group: int | None = None,
+) -> TeacherJoinabilityModel:
     payload = load_checkpoint(path)
     if payload.get("model_kind") != "teacher":
         raise ValueError(f"{path}: expected a Teacher checkpoint")
     model = TeacherJoinabilityModel(**payload["config"])
     model.load_state_dict(payload["state_dict"])
+    if table_tokens_per_group is not None:
+        if table_tokens_per_group <= 0:
+            raise ValueError("table_tokens_per_group must be positive")
+        model.table_tokens_per_group = table_tokens_per_group
     return model.to(device)
 
 

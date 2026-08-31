@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import Sequence
 
 import torch
 from torch import nn
@@ -23,17 +23,46 @@ STUDENT_INITIALIZATIONS = (
 )
 
 
-def structural_table_pool(
-    hidden_states: torch.Tensor, token_groups: torch.Tensor | None
-) -> torch.Tensor:
-    """Return one token per table schema/example-row group."""
+def structural_table_pool_with_groups(
+    hidden_states: torch.Tensor,
+    token_groups: torch.Tensor | None,
+    tokens_per_group: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Pool each schema/row into ordered contiguous semantic segments."""
 
     if hidden_states.shape[0] == 0:
         raise ValueError("A table must contain at least one hidden-state token")
+    if tokens_per_group <= 0:
+        raise ValueError("tokens_per_group must be positive")
     if token_groups is None:
-        return hidden_states
-    groups = torch.unique(token_groups, sorted=True)
-    return torch.stack([hidden_states[token_groups == group].mean(dim=0) for group in groups])
+        return hidden_states, None
+    pooled = []
+    pooled_groups = []
+    for group in torch.unique(token_groups, sorted=True):
+        values = hidden_states[token_groups == group]
+        chunks = torch.tensor_split(values, min(tokens_per_group, values.shape[0]))
+        pooled.extend(chunk.mean(dim=0) for chunk in chunks)
+        pooled_groups.extend([int(group)] * len(chunks))
+    return torch.stack(pooled), torch.tensor(
+        pooled_groups,
+        dtype=token_groups.dtype,
+        device=token_groups.device,
+    )
+
+
+def structural_table_pool(
+    hidden_states: torch.Tensor,
+    token_groups: torch.Tensor | None,
+    tokens_per_group: int = 1,
+) -> torch.Tensor:
+    """Return up to ``tokens_per_group`` tokens per schema/example-row group."""
+
+    pooled, _ = structural_table_pool_with_groups(
+        hidden_states,
+        token_groups,
+        tokens_per_group,
+    )
+    return pooled
 
 
 class LearnedQueryPooler(nn.Module):
@@ -89,17 +118,21 @@ class TeacherJoinabilityModel(nn.Module):
         num_layers: int = 3,
         text_latents: int = 16,
         image_latents: int = 24,
+        table_tokens_per_group: int = 1,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         if model_dim % num_heads:
             raise ValueError("model_dim must be divisible by num_heads")
+        if table_tokens_per_group <= 0:
+            raise ValueError("table_tokens_per_group must be positive")
         self.input_dim = input_dim
         self.model_dim = model_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.text_latents = text_latents
         self.image_latents = image_latents
+        self.table_tokens_per_group = table_tokens_per_group
         self.dropout = dropout
         self.compute_dtype: torch.dtype | None = None
 
@@ -151,6 +184,7 @@ class TeacherJoinabilityModel(nn.Module):
             "num_layers": self.num_layers,
             "text_latents": self.text_latents,
             "image_latents": self.image_latents,
+            "table_tokens_per_group": self.table_tokens_per_group,
             "dropout": self.dropout,
         }
 
@@ -172,12 +206,21 @@ class TeacherJoinabilityModel(nn.Module):
         if features.hidden_states is None:
             raise ValueError(f"{features.object_id}: Teacher requires hidden_states")
         if object_type == "table":
-            # Group pooling is a mean, so it commutes with the affine adapter.
-            # Pool first to avoid projecting table-token detail that is discarded.
-            tokens = structural_table_pool(features.hidden_states, features.token_groups)
+            # Segment pooling commutes with the affine adapter. Pool first to
+            # avoid projecting table-token detail that is discarded.
+            tokens, groups = structural_table_pool_with_groups(
+                features.hidden_states,
+                features.token_groups,
+                self.table_tokens_per_group,
+            )
             tokens = self.adapters[object_type](tokens)
-            token_kinds = torch.ones(tokens.shape[0], dtype=torch.long, device=tokens.device)
-            token_kinds[0] = 0
+            if groups is None:
+                token_kinds = torch.ones(
+                    tokens.shape[0], dtype=torch.long, device=tokens.device
+                )
+                token_kinds[0] = 0
+            else:
+                token_kinds = groups.ne(0).long()
             return tokens + self.table_token_embeddings(token_kinds)
         hidden = self.adapters[object_type](features.hidden_states)
         return self.poolers[object_type](hidden)
@@ -223,18 +266,38 @@ class TeacherJoinabilityModel(nn.Module):
 
         table_features = grouped.pop("table", [])
         if table_features:
-            pooled = [
-                structural_table_pool(item.hidden_states, item.token_groups)
+            pooled_with_groups = [
+                structural_table_pool_with_groups(
+                    item.hidden_states,
+                    item.token_groups,
+                    self.table_tokens_per_group,
+                )
                 for item in table_features
             ]
+            pooled = [tokens for tokens, _groups in pooled_with_groups]
             lengths = [tokens.shape[0] for tokens in pooled]
             projected = self.adapters["table"](
                 pad_sequence(pooled, batch_first=True)
             )
-            token_kinds = torch.ones(
-                projected.shape[:2], dtype=torch.long, device=projected.device
+            token_kinds = pad_sequence(
+                [
+                    groups.ne(0).long()
+                    if groups is not None
+                    else torch.cat(
+                        [
+                            torch.zeros(1, dtype=torch.long, device=tokens.device),
+                            torch.ones(
+                                tokens.shape[0] - 1,
+                                dtype=torch.long,
+                                device=tokens.device,
+                            ),
+                        ]
+                    )
+                    for tokens, groups in pooled_with_groups
+                ],
+                batch_first=True,
+                padding_value=1,
             )
-            token_kinds[:, 0] = 0
             projected = projected + self.table_token_embeddings(token_kinds)
             for item, tokens, length in zip(table_features, projected, lengths):
                 compression_cache[item.object_id] = tokens[:length]
