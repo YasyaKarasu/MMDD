@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stage-1 六轮实验主线</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=Noto+Serif+SC:wght@600&family=Noto+Sans+SC:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#EFF1F0; --surface:#FAFBFA; --surface-2:#E7EAE8;
+  --ink:#14201F; --ink-2:#3E4C49; --muted:#66736F;
+  --rule:#D5DAD8; --rule-2:#C2C9C6;
+  --petrol:#0F5257; --petrol-soft:#0F525714;
+  --enti:#A9631A; --wdc:#0E6BA8;
+  --pass:#2F6B3F; --fail:#9E2F27;
+  --display:"Spectral","Noto Serif SC",Georgia,serif;
+  --body:"Noto Sans SC","Helvetica Neue",Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#141817; --surface:#1B201F; --surface-2:#232927;
+    --ink:#E8EBEA; --ink-2:#B7C0BD; --muted:#8A9491;
+    --rule:#2B3230; --rule-2:#3A4240;
+    --petrol:#5FA8A5; --petrol-soft:#5FA8A51F;
+    --enti:#C08039; --wdc:#3E8FC0;
+    --pass:#6FAE7C; --fail:#DE8078;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#141817; --surface:#1B201F; --surface-2:#232927;
+  --ink:#E8EBEA; --ink-2:#B7C0BD; --muted:#8A9491;
+  --rule:#2B3230; --rule-2:#3A4240;
+  --petrol:#5FA8A5; --petrol-soft:#5FA8A51F;
+  --enti:#C08039; --wdc:#3E8FC0;
+  --pass:#6FAE7C; --fail:#DE8078;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--body); font-size:16px; line-height:1.75;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:0 28px}
+.spine{max-width:720px}
+p{margin:0 0 1.1rem}
+strong{font-weight:500; color:var(--ink)}
+a{color:var(--petrol)}
+</style>
+<style>
+/* ---------- masthead ---------- */
+.masthead{border-bottom:1px solid var(--rule); background:var(--surface)}
+.masthead .wrap{padding-top:52px; padding-bottom:40px}
+.eyebrow{
+  font-family:var(--mono); font-size:11.5px; font-weight:500;
+  letter-spacing:.16em; text-transform:uppercase; color:var(--petrol);
+  margin:0 0 18px;
+}
+h1{
+  font-family:var(--display); font-weight:600; font-size:clamp(30px,4.4vw,45px);
+  line-height:1.16; letter-spacing:-.008em; margin:0 0 20px; text-wrap:balance;
+}
+.standfirst{font-size:18.5px; line-height:1.68; color:var(--ink-2); max-width:64ch; margin:0}
+.meta-row{
+  display:flex; flex-wrap:wrap; gap:10px 28px; margin-top:30px;
+  padding-top:22px; border-top:1px solid var(--rule);
+  font-family:var(--mono); font-size:12.5px; color:var(--muted);
+}
+.meta-row b{color:var(--ink-2); font-weight:500}
+
+/* ---------- section headings ---------- */
+.sec{padding:56px 0 8px}
+h2{
+  font-family:var(--display); font-weight:600; font-size:26px; line-height:1.28;
+  margin:0 0 14px; letter-spacing:-.005em; text-wrap:balance;
+}
+h3{
+  font-family:var(--display); font-weight:600; font-size:19px;
+  margin:34px 0 12px; line-height:1.35;
+}
+.lede{font-size:17px; color:var(--ink-2); max-width:66ch}
+</style>
+<style>
+/* ---------- round stations on the spine ---------- */
+.chain{position:relative; padding-left:64px; margin-top:20px}
+.chain::before{
+  content:""; position:absolute; left:19px; top:14px; bottom:60px;
+  width:1px; background:linear-gradient(180deg,var(--rule-2) 0%,var(--rule-2) 92%,transparent 100%);
+}
+.round{position:relative; padding:0 0 52px}
+.round::before{
+  content:attr(data-n);
+  position:absolute; left:-64px; top:0;
+  width:39px; height:39px; border-radius:50%;
+  background:var(--surface); border:1px solid var(--rule-2); color:var(--petrol);
+  font-family:var(--mono); font-size:13px; font-weight:500;
+  display:flex; align-items:center; justify-content:center;
+}
+.round-tag{
+  font-family:var(--mono); font-size:11.5px; letter-spacing:.13em;
+  text-transform:uppercase; color:var(--muted); margin:0 0 7px;
+}
+.round h2{font-size:23px; margin-bottom:16px}
+
+/* labelled blocks inside a round */
+.block{margin:0 0 20px}
+.block-label{
+  font-family:var(--mono); font-size:11px; letter-spacing:.13em;
+  text-transform:uppercase; color:var(--petrol);
+  display:flex; align-items:center; gap:9px; margin:0 0 7px;
+}
+.block-label::after{content:""; flex:1; height:1px; background:var(--rule)}
+.block p:last-child{margin-bottom:0}
+.block ul{margin:0; padding-left:1.15rem}
+.block li{margin-bottom:.42rem}
+.block li::marker{color:var(--rule-2)}
+</style>
+<style>
+/* ---------- verdict callout ---------- */
+.verdict{
+  background:var(--petrol-soft); border-left:2px solid var(--petrol);
+  padding:15px 19px; margin:0 0 20px; border-radius:0 3px 3px 0;
+}
+.verdict .block-label{color:var(--petrol)}
+.verdict .block-label::after{background:color-mix(in srgb,var(--petrol) 30%,transparent)}
+.verdict p{margin:0; font-size:15.5px; line-height:1.7}
+
+/* ---------- tables ---------- */
+.tbl-wrap{overflow-x:auto; margin:18px 0 22px; border:1px solid var(--rule); border-radius:3px; background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:13.5px; min-width:520px}
+caption{
+  caption-side:top; text-align:left; padding:13px 16px 11px;
+  font-family:var(--mono); font-size:11px; letter-spacing:.11em;
+  text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--rule);
+}
+th,td{padding:9px 16px; text-align:left; border-bottom:1px solid var(--rule)}
+thead th{
+  font-family:var(--mono); font-weight:500; font-size:11px; letter-spacing:.07em;
+  text-transform:uppercase; color:var(--muted); background:var(--surface-2);
+  white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:none}
+td.num,th.num{text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; white-space:nowrap}
+td.name{color:var(--ink-2)}
+tr.hi td{background:var(--petrol-soft)}
+tr.hi td.name{color:var(--ink); font-weight:500}
+.lake-e{color:var(--enti); font-weight:500}
+.lake-w{color:var(--wdc); font-weight:500}
+.gate{font-family:var(--mono); font-size:11.5px; white-space:nowrap}
+.gate-p{color:var(--pass)}
+.gate-f{color:var(--fail)}
+</style>
+<style>
+/* ---------- chart ---------- */
+figure{margin:22px 0 26px; background:var(--surface); border:1px solid var(--rule); border-radius:3px; padding:20px 20px 14px}
+.fig-title{font-family:var(--display); font-weight:600; font-size:17px; margin:0 0 4px}
+.fig-sub{font-size:13.5px; color:var(--muted); margin:0 0 16px; max-width:60ch}
+figcaption{font-size:13px; color:var(--muted); margin-top:12px; padding-top:12px; border-top:1px solid var(--rule); line-height:1.6}
+.legend{display:flex; flex-wrap:wrap; gap:8px 22px; margin:0 0 12px}
+.legend span{display:flex; align-items:center; gap:7px; font-size:13px; color:var(--ink-2)}
+.swatch{width:22px; height:3px; border-radius:2px; flex:none}
+#scissors{display:block; width:100%; height:auto; overflow:visible; touch-action:pan-y}
+.grid-line{stroke:var(--rule); stroke-width:1}
+.axis-text{font-family:var(--mono); font-size:10.5px; fill:var(--muted)}
+.axis-title{font-family:var(--mono); font-size:10.5px; fill:var(--muted); letter-spacing:.08em; text-transform:uppercase}
+.series-line{fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round}
+.dot{stroke:var(--surface); stroke-width:2}
+.dlabel{font-family:var(--mono); font-size:11.5px; font-weight:500}
+.hover-band{fill:transparent}
+.crosshair{stroke:var(--rule-2); stroke-width:1; stroke-dasharray:3 3; opacity:0; pointer-events:none}
+.tip{
+  position:absolute; z-index:5; pointer-events:none; opacity:0; transform:translate(-50%,-118%);
+  background:var(--surface); border:1px solid var(--rule-2); border-radius:3px;
+  padding:8px 11px; font-size:12.5px; line-height:1.55; white-space:nowrap;
+  box-shadow:0 3px 12px #00000018; transition:opacity .1s;
+}
+.tip b{font-family:var(--mono); font-weight:500; font-variant-numeric:tabular-nums}
+.tip .r{display:flex; align-items:center; gap:7px; justify-content:space-between}
+.tip .k{display:flex; align-items:center; gap:7px}
+.tip i{width:9px; height:9px; border-radius:2px; flex:none; display:inline-block}
+.fig-body{position:relative}
+</style>
+<style>
+/* ---------- lake cards / closing ---------- */
+.lakes{display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:18px; margin:22px 0 8px}
+.lake{background:var(--surface); border:1px solid var(--rule); border-top-width:2px; border-radius:3px; padding:18px 20px}
+.lake.e{border-top-color:var(--enti)}
+.lake.w{border-top-color:var(--wdc)}
+.lake h4{margin:0 0 3px; font-family:var(--display); font-size:17px; font-weight:600}
+.lake .sub{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0 0 14px}
+.stat{display:flex; justify-content:space-between; align-items:baseline; gap:14px; padding:6px 0; border-bottom:1px dotted var(--rule)}
+.stat:last-child{border-bottom:none}
+.stat .k{font-size:13.5px; color:var(--ink-2)}
+.stat .v{font-family:var(--mono); font-size:13.5px; font-weight:500; font-variant-numeric:tabular-nums; white-space:nowrap}
+.divider{height:1px; background:var(--rule); margin:44px 0 0}
+.qlist{counter-reset:q; list-style:none; padding:0; margin:18px 0 0}
+.qlist li{counter-increment:q; position:relative; padding-left:38px; margin-bottom:17px}
+.qlist li::before{
+  content:"Q" counter(q); position:absolute; left:0; top:2px;
+  font-family:var(--mono); font-size:11.5px; font-weight:500; color:var(--petrol);
+}
+.qlist b{display:block; font-weight:500; margin-bottom:2px}
+.qlist span{color:var(--ink-2); font-size:15px}
+footer{border-top:1px solid var(--rule); margin-top:52px; background:var(--surface)}
+footer .wrap{padding:26px 28px 40px}
+footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0 0 5px; line-height:1.7}
+@media(max-width:640px){
+  .wrap{padding:0 18px}
+  .chain{padding-left:0}
+  .chain::before{display:none}
+  .round::before{position:static; margin-bottom:11px}
+  .masthead .wrap{padding-top:36px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}
+:focus-visible{outline:2px solid var(--petrol); outline-offset:2px}
+</style>
+</head>
+<body>
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">Stage-1 优化 · R1–R6 复盘</p>
+    <h1>六轮实验的一条主线：<br>训练为什么在破坏检索，以及怎么修</h1>
+    <p class="standfirst">
+      全部六轮可以串成一个问题的逐层归因：<strong>为什么在冻结 embedding 上做训练，反而让检索变差。</strong>
+      每一轮的动机都是上一轮的结论。这份复盘只保留这条主线上的实验，旁支消融省略。
+    </p>
+    <div class="meta-row">
+      <span><b>时间</b> 2026-08-28 → 08-31</span>
+      <span><b>数据湖</b> EntiTables · WDC</span>
+      <span><b>口径</b> recall@{10…50} · γ=10 · 配对 bootstrap CI</span>
+      <span><b>当前</b> R7 进行中</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="sec spine">
+    <h2>起点：一个反直觉的观察</h2>
+    <p class="lede">
+      系统是两通道检索：<strong>direct</strong>(Q→T) 与 <strong>evidence</strong>(Q→E→T 一跳路径)，
+      底座是冻结的 Qwen3-VL-Embedding 4096 维向量，Student 学的是每个 type-pair 的关系矩阵 R。
+    </p>
+    <p>
+      冻结底座本身很强：mixed dev 上 raw direct R@10 = <strong>36.84%</strong>。零训练的 PCA-1024 投影几乎不掉点
+      (35.26%,raw 的 95.7%),说明降维不是瓶颈。但只要开始训练,identity-4096 初始化的 Student 在 epoch 1
+      就掉到 direct <strong>14.3%</strong>,并逐 epoch 继续变差。
+    </p>
+    <div class="verdict">
+      <p class="block-label">起点判断</p>
+      <p>训练目标(2–5 候选的窄列表 CE + 蒸馏一个过拟合 Teacher)的梯度方向,与"保持全局近邻结构"相互对抗。
+      后面六轮都在追这一件事的责任归属。</p>
+    </div>
+  </section>
+
+  <div class="chain">
+    <article class="round" data-n="R1">
+      <p class="round-tag">08-28 · 责任归属</p>
+      <h2>破坏源在哪:是正则不够,还是 Teacher 有毒?</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>两个候选假设:(A) 可训空间太大而监督太窄,加正则约束住就行;(B) 蒸馏目标本身有毒。
+        先补一个基础设施——<strong>epoch-0 评测</strong>,否则无法判断训练是在改善还是破坏。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>插桩 epoch-0 基准 + 分数据集指标,验收线定为"任何 epoch 不得低于 epoch-0"</li>
+          <li>冻结投影 P、只训 R,锚定正则 μ‖R−I‖²_F 扫 {0, 0.01, 0.1, 1.0}</li>
+          <li>KD 归因消融:同配置下 KD=1 vs KD=0</li>
+          <li>Teacher-as-reranker 诊断(零训练):直接测 Teacher 在检索口径上的价值</li>
+        </ul>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>R1 anchor sweep 与 KD 归因 · overall direct R@10</caption>
+          <thead><tr><th>配置</th><th class="num">epoch-0</th><th class="num">best</th><th class="num">best epoch</th></tr></thead>
+          <tbody>
+            <tr><td class="name">KD=1, anchor 0</td><td class="num">9.12%</td><td class="num">9.12%</td><td class="num">0</td></tr>
+            <tr><td class="name">KD=1, anchor 0.01</td><td class="num">9.39%</td><td class="num">9.39%</td><td class="num">0</td></tr>
+            <tr><td class="name">KD=1, anchor 0.1</td><td class="num">8.86%</td><td class="num">8.86%</td><td class="num">0</td></tr>
+            <tr><td class="name">KD=1, anchor 1.0</td><td class="num">9.04%</td><td class="num">9.04%</td><td class="num">0</td></tr>
+            <tr class="hi"><td class="name">KD=0, anchor 0.1</td><td class="num">35.53%</td><td class="num">36.05%</td><td class="num">2</td></tr>
+            <tr><td class="name">Raw 对照</td><td class="num">36.67%</td><td class="num">36.67%</td><td class="num">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论</p>
+        <p>假设 B 成立。关掉 KD 一步恢复 <strong>+26.66pt</strong>,旧 Teacher 是主要污染源(用它重排 −16.2pt);
+        窄列表 CE 只造成后期小幅回退。<strong>方法论教训:</strong>四组 anchor 全都建立在被 KD 毁掉的 9% 基座上,
+        等于没测——在错误基座上做的消融是无效消融。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">同时发现 → 引出 R2</p>
+        <p>用检索对齐负样本重训 Teacher 后,重排 overall 到 40.18% (+3.25),且与 raw 的 per-query
+        Spearman ≈ <strong>0.015</strong>(近似正交的独立信号);但 WDC −13.9pt、E→T 27.65% 低于 raw 33.13%。
+        <strong>Teacher 有真信号但严重偏科,单独用不行 → 试组合用。</strong></p>
+      </div>
+    </article>
+    <article class="round" data-n="R2">
+      <p class="round-tag">08-29 · 健康基座上重测</p>
+      <h2>在修好的基座上重测 anchor,发现一条单一 trade-off 曲线</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>R1 的 anchor 结论作废,必须在健康配方(fresh PCA-1024 + 冻结 P + 跳过 student-edge +
+        path-only + KD=0 + in-batch)上重测。同时 R1 暴露另一个贯穿性症状:<strong>所有训练都让 WDC 回退</strong>
+        (raw 61.88% → 最优 student 54.46%),而 overall 被 938/1140 的 EntiTables 权重稀释,gate 看不见。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>真正的 anchor × dataset-α sweep,并把每个 type-pair 的 ‖R−I‖_F 逐 epoch 落盘(<code>relation_drift</code>)</li>
+          <li>checkpoint gate 改为<strong>分数据集</strong>约束,不再只看 overall</li>
+          <li>Teacher z-score ensemble:重排分 = α·z(s_T) + (1−α)·z(cos),α 扫 {0.3…0.7}</li>
+          <li>按数据集门控的 KD 消融(EntiTables 权重 0.3 / WDC 0)</li>
+        </ul>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">核心结论:trade-off 是结构性的</p>
+        <p>训练沿<strong>同一条曲线</strong>移动:‖R−I‖ 每增加,EntiTables 单调涨、WDC 以约<strong>两倍幅度</strong>跌。
+        anchor 只能减速、不能改方向;dataset-α 无关(过采样假设排除)。在 WDC gate 下唯一合规的选择是
+        <strong>epoch-0,即不训练</strong>。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">另一半:ensemble 成立</p>
+        <p>因为 Teacher 与 raw 近似正交,组合使用两者互补——raw 兜住 WDC 与 MRR,Teacher 贡献 EntiTables 的语义增益。
+        α=0.7 时 overall <strong>47.37%</strong>(raw 36.93%,+10.7pt)、WDC 64.85% ≥ raw、E→T 43.69%(raw 33.13%)。
+        在线架构由此确立为两级:<strong>student ANN 召回 → teacher-ensemble 重排</strong>。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">引出 R3</p>
+        <p>KD(蒸 teacher logits、按数据集门控)全 epoch 在 WDC gate 失败,KD 方向存疑。同时注意到
+        <strong>WDC dev 只有 202 查询、每查询 1 个正例 → 1pt = 2 条查询</strong>,历次 "gate fail" 可能只是噪声。
+        gate 判据本身需要统计化。</p>
+      </div>
+    </article>
+    <article class="round" data-n="R3">
+      <p class="round-tag">08-29 · 评测口径与统计判据</p>
+      <h2>把口径和判据修对,然后 KD 交出真实轨迹</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>三个都会影响结论可信度的问题:(1) 评测用 recall@100/mrr@100,不是领域惯例口径;
+        (2) 检索预算 <code>direct_k=100</code> 等是写死的绝对常量,论文里是无法辩护的死参数;
+        (3) WDC gate 工作在噪声量级(R2 结论)。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>口径切到 recall@{10,20,30,40,50} + mrr@50,对齐 joinability discovery 惯例</li>
+          <li>检索预算改为 <strong>k 驱动</strong>:direct = γ·k、evidence = γ_e·k,γ 用敏感性曲线辩护;每个被测 k 独立跑</li>
+          <li>gate 改为<strong>配对 bootstrap 95% CI</strong>(10,000 次, seed 13, tolerance −0.02),替代裸点估计</li>
+          <li>四基线重建 + γ/γ_e 扫描 + ensemble-KD 两组剂量</li>
+        </ul>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>R3 四系统主表 · overall(mixed 语料,γ=10)</caption>
+          <thead><tr><th>系统</th><th class="num">R@10</th><th class="num">R@50</th><th class="num">MRR@50</th><th>vs raw / 95% CI</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Raw embedding</td><td class="num">36.14%</td><td class="num">51.84%</td><td class="num">0.2574</td><td class="gate">—</td></tr>
+            <tr><td class="name">Student (epoch 0)</td><td class="num">35.61%</td><td class="num">48.95%</td><td class="num">0.2409</td><td class="gate">−0.53 [−1.23, +0.18]</td></tr>
+            <tr><td class="name">Raw + Teacher ensemble</td><td class="num">47.28%</td><td class="num">66.32%</td><td class="num">0.3712</td><td class="gate gate-p">+10.61 [+8.68, +12.72]</td></tr>
+            <tr class="hi"><td class="name">Student + Teacher ensemble</td><td class="num">46.40%</td><td class="num">65.70%</td><td class="num">0.3561</td><td class="gate gate-p">+9.74 [+7.81, +11.75]</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论</p>
+        <p>γ*=10、γ_e*=2 定稿(R@50 仍未饱和 → 召回深度是已记录的瓶颈)。<strong>紧凑索引主张成立:</strong>
+        student 索引只有 raw 的 <strong>1/3.79</strong>(1.15 vs 4.34 GiB),两级系统只差 −0.88pt [−1.84, 0.00]。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">Task H 的真实读法 → 引出 R4</p>
+        <p>ensemble-KD 两组权重都在 WDC CI gate 失败,但把轨迹摊开看:KD=0.3 让 EntiTables 从 29.74%
+        涨到 ep8 的 <strong>35.39% (+5.65pt,项目至今最大训练增益)</strong>,而 WDC 同步沿老曲线从 60.4% 掉到 48%。
+        <strong>失败的不是蒸馏信号,是"单个共享 R 同时服务两个机制不同的数据湖"这个前提。</strong></p>
+      </div>
+    </article>
+    <article class="round" data-n="R4">
+      <p class="round-tag">08-29/30 · 转折点</p>
+      <h2>按湖实例化:训练增益第一次真正拿到</h2>
+
+      <div class="block">
+        <p class="block-label">动机(一)· 这条曲线本身</p>
+        <p>R2/R3 反复观察到的同一现象,画出来就是一把剪刀。两条线是<strong>同一次训练</strong>里的两个湖:
+        梯度让一个湖单调涨,同时让另一个湖单调跌。</p>
+      </div>
+
+      <figure>
+        <p class="fig-title">一次训练,两个方向</p>
+        <p class="fig-sub">共享模型下的 KD 训练轨迹(R2 Task D)。同一次训练中 EntiTables 与 WDC 的 direct R@10 反向移动——
+        这不是调参问题,是两个湖要求相反的 R。</p>
+        <div class="legend">
+          <span><i class="swatch" style="background:var(--enti)"></i>EntiTables <span style="color:var(--muted)">(938 查询)</span></span>
+          <span><i class="swatch" style="background:var(--wdc)"></i>WDC <span style="color:var(--muted)">(202 查询)</span></span>
+        </div>
+        <div class="fig-body">
+          <svg id="scissors" viewBox="0 0 744 336" role="img"
+               aria-label="折线图:共享模型 KD 训练中,EntiTables direct R@10 从 29.64% 升到 36.57%,WDC 同期从 60.89% 降到 39.60%。">
+          </svg>
+          <div class="tip" id="tip" aria-hidden="true"></div>
+        </div>
+        <figcaption>
+          两条线共用一个纵轴(同一指标 direct R@10),因此可以直接比较。虚线为各湖的 raw 基线:
+          两湖 epoch-0 都已略低于自己的 raw(PCA-1024 压缩代价约 1pt)。此后 EntiTables 一路涨到 epoch 9 见顶 (+7.35pt),
+          WDC 则单调下行、10 个 epoch 掉 <b>21.29pt</b>。全部 11 个 epoch 的 WDC gate 都是 fail。
+        </figcaption>
+      </figure>
+
+      <div class="block">
+        <p class="block-label">动机(二)· 领域惯例查证</p>
+        <p>查了 Snoopy (TKDE'25) 与 LakeBench (PVLDB'24):<strong>两篇都按数据湖分别训练、分湖建索引、分湖报离线成本,
+        没有任何一篇跨湖联合训练。</strong>我们把 EntiTables + WDC 合并成 27.9 万对象的混合语料,
+        导致 EntiTables 查询会检回 WDC 表作干扰项——既不符合惯例,也不符合部署现实。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>语料/PCA/索引/训练列表<strong>全部按湖拆分</strong>(校验两湖 ID 精确互斥且并集等于混合语料)</li>
+          <li>gate 改为湖级独立;每湖重建四条基线</li>
+          <li>分湖训练 + 蒸馏 ablation(EntiTables 3 组 / WDC 2 组),再按需重训分湖 Teacher(Task M)</li>
+          <li>结果反常后追加一次<strong>独立只读审计</strong>(五项)</li>
+        </ul>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <caption>R4 分湖训练结果 · 训练期 gate 视角(raw 列为该 run 的 gate 对照,与最终评测的 30.92% 相差 0.42pt 属评测上下文差异)</caption>
+          <thead><tr><th>run</th><th class="num">raw</th><th class="num">选中</th><th class="num">epoch</th><th class="num">‖R−I‖</th><th>gate</th></tr></thead>
+          <tbody>
+            <tr class="hi"><td class="name"><span class="lake-e">Enti</span> 监督 (KD=0)</td><td class="num">31.34%</td><td class="num">37.42%</td><td class="num">8</td><td class="num">3.13</td><td class="gate gate-p">pass +6.08 [+3.84, +8.42]</td></tr>
+            <tr><td class="name"><span class="lake-e">Enti</span> KD 0.3</td><td class="num">31.34%</td><td class="num">37.42%</td><td class="num">7</td><td class="num">2.89</td><td class="gate gate-p">pass</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span> 监督 (KD=0)</td><td class="num">63.37%</td><td class="num">61.88%</td><td class="num">0</td><td class="num">0.00</td><td class="gate">fallback ep-0</td></tr>
+            <tr class="hi"><td class="name"><span class="lake-w">WDC</span> KD 0.3(本湖 Teacher)</td><td class="num">63.37%</td><td class="num">64.85%</td><td class="num">5</td><td class="num">0.75</td><td class="gate gate-p">pass +1.49 [−0.99, +3.96]</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论:约束解除,训练增益成立</p>
+        <p>EntiTables 监督训练<strong>首次真正有效:30.92% → 37.42% (+6.50pt [+4.26, +8.85])</strong>。
+        WDC 纯监督仍停在 epoch-0(预期内,记录为"框架自适应复杂度":湖由表面相似主导时自动退化为 raw 检索),
+        但换成本湖 Teacher 的蒸馏后能训到 epoch 5 并<strong>转正到 64.36%</strong>。
+        两湖 ‖R−I‖ 差一个数量级(3.13 vs 0.75),量化了"湖的机制差异"。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">审计结论 + 新悖论 → 引出 R5</p>
+        <p>审计排除了数据 bug(拆分精确互斥、负样本来源正确、provenance 无误配)。但同池复算确认:
+        <strong>WDC 的 Teacher 纯重排是 −18.32% [−25.25, −11.39](混合)/ −23.27%(WDC-only),是真实信号而非噪声</strong>,
+        判定为"Teacher 与 WDC 湖类型不匹配"。于此产生本项目最有意思的问题:
+        <strong>Teacher 自己重排掉 18–23pt,为什么蒸馏它反而给出 +2.48 的增益?</strong></p>
+      </div>
+    </article>
+    <article class="round" data-n="R5">
+      <p class="round-tag">08-30 · 机制归因</p>
+      <h2>蒸馏增益到底来自哪:Teacher 的知识,还是 cos 的锚定?</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>回答 R4 留下的悖论。可检验的假设:蒸馏目标是 <code>τ·z(s_T) + (1−τ)·z(cos)</code>,
+        其中的 <strong>cos 锚 + 低容量 student + 锚定正则</strong>把 Teacher 的错误结构性过滤掉了——
+        Teacher 提供的更多是"让训练变稳"的锚,而非可迁移知识。做法很直接:<strong>把 τ 扫开</strong>。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>τ ∈ {0, 0.3, 0.7, 1.0} 逐湖归因消融(τ=0 即纯 cosine 目标,完全不含 Teacher)</li>
+          <li>用混合负样本重训 WDC Teacher,检验"湖内负样本多样性不足"假设</li>
+          <li>evidence-binding / modality-balance 消融(image 关系在 WDC 极度稀疏:149 条 vs text 4,680 条)</li>
+        </ul>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>R5 τ 归因曲线 · fused R@10(每湖各自最优 epoch)</caption>
+          <thead><tr><th>τ (Teacher 系数)</th><th class="num">0.0 纯 cos</th><th class="num">0.3</th><th class="num">0.7</th><th class="num">1.0 纯 Teacher</th></tr></thead>
+          <tbody>
+            <tr><td class="name"><span class="lake-e">EntiTables</span></td><td class="num">37.21%</td><td class="num">37.53%</td><td class="num">37.53%</td><td class="num">37.74%</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span></td><td class="num">61.88%</td><td class="num">62.87%</td><td class="num">64.36%</td><td class="num">62.87%</td></tr>
+            <tr><td class="name">WDC 选中 epoch</td><td class="num">1</td><td class="num">1</td><td class="num">5</td><td class="num">1</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论:两个湖的答案不同,悖论解开</p>
+        <p><strong>EntiTables:</strong>τ 单调升到 1.0 → Teacher 知识确实可迁移,线上重排也全程正向 (+15.25pt)。
+        <strong>WDC:</strong>τ 曲线<strong>非单调</strong>(0.7 处见顶,1.0 回落)→ Teacher 有知识但噪声大,0.7 是判别力与噪声的平衡点;
+        τ=0.7 相对纯 cos 的 "Teacher 残差" = <strong>+2.48pt [0.00, 4.95]</strong>,是真实独立贡献。
+        <br><br><strong>悖论的答案:</strong>蒸馏能挑出 Teacher 的部分知识而把噪声滤掉,在线重排则要为噪声<strong>全额付费</strong>。
+        直接证据是 WDC 纯监督恒回退到 epoch-0,而带蒸馏目标能训到 epoch 5 并转正——这正是"锚定作用"。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">同轮否定 + 引出 R6</p>
+        <p>混合负样本重训 WDC Teacher <strong>更差</strong>(−29.70% vs −23.27%),排除多样性假设,
+        WDC 线上重排定性为 <strong>no-op / 负资产</strong>(诚实负结果,不再投入)。
+        另一头,evidence 通道仍然很弱(EntiTables evidence R@10 仅 4.05%、coverage 3.41%),
+        而且只能靠把 <code>evidence_weight</code> 硬压到 0.05 才不伤 fused ——<strong>怀疑分数尺度错配。</strong></p>
+      </div>
+    </article>
+    <article class="round" data-n="R6">
+      <p class="round-tag">08-30/31 · evidence 通道与合成教训</p>
+      <h2>尺度假设被证伪,但归一化仍然有效——原因不同</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>evidence 路径分数 = <code>s(Q,E) + s(E,T)</code>,两段走<strong>独立学习</strong>的关系矩阵、各有独立尺度。
+        训练后 R 漂移(EntiTables ‖R−I‖ 达 3),若两侧幅值被拉开,则 (a) 路径聚合被幅值大的一侧主导、
+        (b) RRF 只按 rank 丢弃幅值 → evidence 分数不可信。若假设成立,归一化是零训练的根治。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>先做零成本的<strong>每关系分数尺度诊断</strong>(先证伪再动手,避免在错问题上白忙)</li>
+          <li>融合方案:RRF vs 归一化分数加权(z-score / min-max)</li>
+          <li>路径聚合变体:logsumexp / topk_sum × 每边归一化开关</li>
+          <li>τ 自适应启发式(免调参);保留 image 的模态平衡;表表示增强 F1/F2</li>
+        </ul>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论(一):假设错了,但改动对了</p>
+        <p><strong>尺度错配被证伪</strong>——student 各 type-pair 的分数统计与 raw 几乎一致,无 &gt;2× 失配(μ=0.1 的 anchor 已经把尺度漂移压住了)。
+        然而归一化融合<strong>确实有效</strong>:WDC 65.35% vs RRF 64.36%。
+        <strong>所以收益的机制是"利用了幅值信息",不是"修正了尺度"——论文表述必须按此修正。</strong></p>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>R6 evidence 通道改善 · 按湖异质的最优聚合</caption>
+          <thead><tr><th>湖</th><th>最优聚合</th><th class="num">evidence R@10</th><th class="num">→ 改善后</th></tr></thead>
+          <tbody>
+            <tr><td class="name"><span class="lake-e">EntiTables</span></td><td class="name">logsumexp + 每边 z-score</td><td class="num">4.05%</td><td class="num">9.70%</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span></td><td class="name">topk_sum(无归一化)</td><td class="num">23.27%</td><td class="num">44.06%</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论(二):本轮最重要的方法论教训</p>
+        <p><strong>组件贪心选择 ≠ 联合最优。</strong>fusion / 聚合 / relation-weight / τ 各自单独为正,
+        合成后相对 r5 却是 EntiTables 0.00、WDC <strong>−1.49</strong>。
+        根因:Task E 用 "evidence 优先" 规则选了 relation weight 2,牺牲了 WDC fused(64.36 → 62.38),
+        而各组件从未做联合验证。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">附:两条值得保留的负结果</p>
+        <p>τ 自适应启发式可行(自动选 Enti 0.7 / WDC 0.5,落在高性能平台区,可作免调参默认)。
+        <strong>表 token 预算不是瓶颈</strong>:F1(更多行 + 命名单元格)在 WDC 伤 student evidence −6.44,F2(每行 4 token + 重训 Teacher)增益不显著,此方向关闭。</p>
+      </div>
+    </article>
+  </div>
+  <div class="divider"></div>
+
+  <section class="sec">
+    <h2>当前状态:r5 配置仍是论文级默认</h2>
+    <p class="lede">r6 的组件收益未能通过联合验证,r7(低秩残差 <code>R = I + A·Bᵀ</code> + 配置联合选择)进行中且尚未超过 r5 锚点,
+    因此下面这两组数字是目前可引用的主表。</p>
+
+    <div class="lakes">
+      <div class="lake e">
+        <h4>EntiTables</h4>
+        <p class="sub">241,707 对象 · 938 dev 查询 · PCA 保留 92.89%</p>
+        <div class="stat"><span class="k">Raw embedding</span><span class="v">30.92%</span></div>
+        <div class="stat"><span class="k">Student epoch-0(零训练)</span><span class="v">29.74%</span></div>
+        <div class="stat"><span class="k">监督 Student</span><span class="v">37.42%</span></div>
+        <div class="stat"><span class="k">KD Student(最终)</span><span class="v" style="color:var(--enti)">37.74%</span></div>
+        <div class="stat"><span class="k">+ 在线重排</span><span class="v" style="color:var(--enti)">46.16%</span></div>
+        <div class="stat"><span class="k">索引 raw → student</span><span class="v">3.758 → 0.991 GiB</span></div>
+        <div class="stat"><span class="k">延迟 raw → 部署链</span><span class="v">72.8 → 21.3 ms</span></div>
+      </div>
+      <div class="lake w">
+        <h4>WDC</h4>
+        <p class="sub">37,666 对象 · 202 dev 查询 · PCA 保留 93.14%</p>
+        <div class="stat"><span class="k">Raw embedding</span><span class="v">62.38%</span></div>
+        <div class="stat"><span class="k">Student epoch-0(零训练)</span><span class="v">60.89%</span></div>
+        <div class="stat"><span class="k">监督 Student</span><span class="v">61.88%</span></div>
+        <div class="stat"><span class="k">KD Student(最终)</span><span class="v" style="color:var(--wdc)">64.36%</span></div>
+        <div class="stat"><span class="k">+ 在线重排</span><span class="v" style="color:var(--muted)">no-op(负结果)</span></div>
+        <div class="stat"><span class="k">索引 raw → student</span><span class="v">0.586 → 0.155 GiB</span></div>
+        <div class="stat"><span class="k">延迟 raw → 部署链</span><span class="v">32.5 → 26.1 ms</span></div>
+      </div>
+    </div>
+
+    <div class="spine">
+      <h3>一句话串起来的主线</h3>
+      <p>
+        训练破坏检索几何 → <strong>责任在 KD 而非正则</strong>(R1) → 在健康基座上重测,发现两湖<strong>单一 trade-off 曲线</strong>,
+        同时 Teacher 正交信号支撑两级架构(R2) → 修口径与统计判据,KD 交出<strong>"蒸馏有效、共享模型不行"</strong>的真实轨迹(R3) →
+        <strong>按湖实例化</strong>解除约束,训练增益首次成立(R4) → τ 归因说明蒸馏的作用主要是<strong>锚定而非知识搬运</strong>,
+        并解释"重排弱但蒸馏增"(R5) → evidence 通道靠<strong>归一化利用幅值</strong>改善,但暴露<strong>贪心 ≠ 联合最优</strong>(R6) →
+        关系参数化的<strong>方向约束</strong>(低秩残差)正在验证(R7)。
+      </p>
+      <p>
+        方法论上有三条反复起作用的纪律:<strong>epoch-0 基准</strong>(否则分不清改善与破坏)、
+        <strong>分湖 / 分数据集 gate</strong>(否则大数据集权重会稀释掉小数据集的回退)、
+        <strong>同候选池 + 配对 CI</strong>(否则 202 条查询上的 1pt 波动会被读成结论)。
+      </p>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <section class="sec spine">
+    <h2>明天可以讨论的几个点</h2>
+    <p class="lede">都是从现有结果里直接长出来的开放问题,不是新提案。</p>
+    <ol class="qlist">
+      <li><b>召回深度瓶颈怎么写</b><span>γ=10 时 R@50 仍未饱和,是已记录的瓶颈。是继续加深召回池,还是承认它并把它写成 two-stage 的固有取舍?</span></li>
+      <li><b>WDC 的统计功效</b><span>202 查询、每查询 1 正例,1pt = 2 条查询。所有 WDC 结论的 CI 都很宽(如 +1.98 [−0.50, +4.95])。是否需要扩 dev 集才能支撑论文级断言?</span></li>
+      <li><b>两条负结果的呈现方式</b><span>WDC 线上重排 no-op、表 token 预算非瓶颈、尺度假设证伪——建议作为 negative results 单独成节,还是并入各自章节?</span></li>
+      <li><b>evidence 通道的定位</b><span>evidence R@10 已从 4.05% 提到 9.70%(WDC 23.27% → 44.06%),但 coverage@10 仍只有 3.62%。这个通道在论文里是主张之一,还是仅作 Stage-2 的入口?</span></li>
+      <li><b>低秩残差的去留</b><span>目前 WDC k=256 只能追平 r5(64.36%)、EntiTables 仍低于 37.74% 锚点。是作为主叙事(受控方向性校正)还是降为参数效率消融?</span></li>
+    </ol>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>数据来源:work/stage1_optimization_{20260828, r2…r7} 各轮 RESULTS.md / FINAL.md</p>
+    <p>口径:recall@{10,20,30,40,50} · mrr@50 · γ=10 · γ_e=2 · 配对 bootstrap 10,000 次 seed 13 · 湖级 CI tolerance −0.02</p>
+    <p>R1–R3 为混合语料口径,R4 起为分湖口径,两者数字不可直接比较</p>
+  </div>
+</footer>
+<script>
+(function(){
+  var SVG="http://www.w3.org/2000/svg";
+  var svg=document.getElementById("scissors"), tip=document.getElementById("tip");
+  if(!svg) return;
+
+  var epochs=[0,1,2,3,4,5,6,7,8,9,10];
+  var enti=[29.64,31.02,32.62,33.48,34.86,36.14,35.93,36.78,36.89,36.99,36.57];
+  var wdc =[60.89,58.91,57.92,54.46,51.49,50.99,50.50,49.50,45.54,41.58,39.60];
+  var baseE=31.24, baseW=61.88;
+  var css=function(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();};
+
+  var VBW=744, L=46,R=632,T=16,B=288, lo=25, hi=65;
+  var x=function(e){return L+(e/10)*(R-L);};
+  var y=function(v){return B-((v-lo)/(hi-lo))*(B-T);};
+  var el=function(t,a){var n=document.createElementNS(SVG,t);for(var k in a)n.setAttribute(k,a[k]);return n;};
+
+  // grid + y axis
+  [30,40,50,60].forEach(function(v){
+    svg.appendChild(el("line",{x1:L,x2:R,y1:y(v),y2:y(v),class:"grid-line"}));
+    var t=el("text",{x:L-9,y:y(v)+3.5,class:"axis-text","text-anchor":"end"});
+    t.textContent=v+"%"; svg.appendChild(t);
+  });
+  // x axis
+  svg.appendChild(el("line",{x1:L,x2:R,y1:B,y2:B,class:"grid-line"}));
+  epochs.forEach(function(e){
+    var t=el("text",{x:x(e),y:B+18,class:"axis-text","text-anchor":"middle"});
+    t.textContent=e; svg.appendChild(t);
+  });
+  var xt=el("text",{x:L,y:B+36,class:"axis-title"}); xt.textContent="EPOCH"; svg.appendChild(xt);
+  var yt=el("text",{x:L-9,y:T+2,class:"axis-title","text-anchor":"end"}); yt.textContent="R@10"; svg.appendChild(yt);
+
+  // raw baselines (recessive) — shows WDC crossing below its own baseline
+  [[baseE,"enti"],[baseW,"wdc"]].forEach(function(p){
+    svg.appendChild(el("line",{x1:L,x2:R,y1:y(p[0]),y2:y(p[0]),
+      stroke:css("--"+p[1]),"stroke-width":1,"stroke-dasharray":"5 4",opacity:.42}));
+    var t=el("text",{x:L+5,y:y(p[0])-6,class:"axis-text",fill:css("--"+p[1]),opacity:.85});
+    t.textContent="raw "+p[0].toFixed(2)+"%"; svg.appendChild(t);
+  });
+
+  function draw(vals,varname,label){
+    var d=vals.map(function(v,i){return (i?"L":"M")+x(epochs[i])+" "+y(v);}).join(" ");
+    svg.appendChild(el("path",{d:d,class:"series-line",stroke:css(varname)}));
+    vals.forEach(function(v,i){
+      svg.appendChild(el("circle",{cx:x(epochs[i]),cy:y(v),r:3.6,fill:css(varname),class:"dot"}));
+    });
+    var last=vals.length-1;
+    var t=el("text",{x:x(epochs[last])+11,y:y(vals[last])+4,class:"dlabel",fill:css(varname)});
+    t.textContent=label; svg.appendChild(t);
+  }
+  draw(enti,"--enti","EntiTables");
+  draw(wdc,"--wdc","WDC");
+
+  // hover layer
+  var cross=el("line",{y1:T,y2:B,class:"crosshair"}); svg.appendChild(cross);
+  var bw=(R-L)/10;
+  epochs.forEach(function(e,i){
+    var band=el("rect",{x:x(e)-bw/2,y:T,width:bw,height:B-T,class:"hover-band"});
+    function show(){
+      cross.setAttribute("x1",x(e)); cross.setAttribute("x2",x(e));
+      cross.style.opacity=1;
+      tip.innerHTML='<div style="color:var(--muted);margin-bottom:3px">epoch '+e+'</div>'+
+        '<div class="r"><span class="k"><i style="background:'+css("--enti")+'"></i>EntiTables</span><b>'+enti[i].toFixed(2)+'%</b></div>'+
+        '<div class="r"><span class="k"><i style="background:'+css("--wdc")+'"></i>WDC</span><b>'+wdc[i].toFixed(2)+'%</b></div>';
+      var rect=svg.getBoundingClientRect(), sc=rect.width/VBW;
+      var half=tip.offsetWidth/2+4;
+      var px=Math.max(half,Math.min(x(e)*sc,rect.width-half));
+      tip.style.left=px+"px";
+      tip.style.top=(Math.min(y(enti[i]),y(wdc[i]))*sc)+"px";
+      tip.style.opacity=1;
+    }
+    band.addEventListener("mouseenter",show);
+    band.addEventListener("mousemove",show);
+    band.addEventListener("mouseleave",function(){tip.style.opacity=0; cross.style.opacity=0;});
+    svg.appendChild(band);
+  });
+})();
+</script>
+</body>
+</html>
