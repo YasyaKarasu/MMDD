@@ -24,6 +24,7 @@ from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.models import (
     STUDENT_INITIALIZATIONS,
+    STUDENT_RELATION_PARAMS,
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
 )
@@ -224,7 +225,7 @@ def _student_optimizer(
 ) -> torch.optim.AdamW:
     groups: list[dict[str, Any]] = [
         {
-            "params": list(student.relations.parameters()),
+            "params": student.relation_parameters(),
             "lr": relation_learning_rate,
         }
     ]
@@ -269,6 +270,8 @@ def _initialize_student(
         initialization_noise_std=getattr(args, "student_init_noise_std", 0.01),
         initialization_basis=initialization_basis,
         freeze_projections=bool(args.freeze_projection),
+        relation_param=getattr(args, "relation_param", "full"),
+        relation_rank=getattr(args, "relation_rank", 16),
     ).to(device)
 
 
@@ -802,6 +805,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "anchor_weight": 0.0,
         "anchor_weight_evidence": None,
         "relation_learning_rate": None,
+        "relation_param": "full",
+        "relation_rank": 16,
         "freeze_projection": None,
         "in_batch_negatives": False,
         "in_batch_max_negatives": 256,
@@ -888,6 +893,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--anchor-weight-evidence must be non-negative")
     if args.relation_learning_rate is not None and args.relation_learning_rate <= 0:
         raise ValueError("--relation-learning-rate must be positive")
+    if args.relation_rank <= 0:
+        raise ValueError("--relation-rank must be positive")
     if args.in_batch_max_negatives < 0:
         raise ValueError("--in-batch-max-negatives must be non-negative")
     if args.gamma <= 0 or args.gamma_evidence <= 0:
@@ -1698,6 +1705,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--student-init-noise-std", type=float, default=0.01)
     parser.add_argument("--student-pca-basis")
+    parser.add_argument(
+        "--relation-param",
+        choices=STUDENT_RELATION_PARAMS,
+        default="full",
+        help="Directed Student relation parameterization.",
+    )
+    parser.add_argument(
+        "--relation-rank",
+        type=int,
+        default=16,
+        help="Residual rank k used when --relation-param lowrank.",
+    )
     parser.add_argument(
         "--freeze-projection",
         action=argparse.BooleanOptionalAction,

@@ -264,6 +264,75 @@ def test_student_score_is_exact_ann_inner_product():
     assert not torch.allclose(score, model.score_pairs([target], [query])[0])
 
 
+def test_lowrank_student_starts_at_identity_and_matches_explicit_residual():
+    torch.manual_seed(5)
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=4,
+        initialization="identity",
+        freeze_projections=True,
+        relation_param="lowrank",
+        relation_rank=2,
+    )
+    source = torch.tensor([0.2, -0.3, 0.5, 0.7])
+    destination = torch.tensor([-0.1, 0.4, 0.6, -0.2])
+    key = "table_to_image"
+
+    torch.testing.assert_close(
+        model.score_embeddings(source, "table", destination, "image"),
+        torch.dot(source, destination),
+    )
+    assert model.ann_dim == 6
+    assert model.config()["relation_param"] == "lowrank"
+    assert model.config()["relation_rank"] == 2
+    assert stage1_training.student_relation_drift(model)[key] == 0.0
+    torch.testing.assert_close(
+        model.index_vector(destination, "image", source_type="table")[4:],
+        torch.zeros(2),
+    )
+
+    with torch.no_grad():
+        model.relation_as[key].copy_(
+            torch.tensor(
+                [[1.0, 0.0], [0.0, 0.5], [-0.5, 0.0], [0.0, 1.0]]
+            )
+        )
+        model.relation_bs[key].copy_(
+            torch.tensor(
+                [[0.1, 0.0], [0.0, -0.2], [0.3, 0.0], [0.0, 0.4]]
+            )
+        )
+
+    relation = torch.eye(4) + model.relation_as[key] @ model.relation_bs[key].T
+    expected = source @ relation @ destination
+    score = model.score_embeddings(source, "table", destination, "image")
+    query = model.relation_query(source, "table", "image")
+    index = model.index_vector(destination, "image", source_type="table")
+    torch.testing.assert_close(score, expected)
+    torch.testing.assert_close(torch.dot(query, index), expected)
+    torch.testing.assert_close(
+        stage1_training.student_relation_drift(model)[key],
+        torch.linalg.vector_norm(relation - torch.eye(4)).item(),
+    )
+
+
+def test_lowrank_student_first_step_updates_the_zero_initialized_factor():
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=4,
+        initialization="identity",
+        relation_param="lowrank",
+        relation_rank=2,
+    )
+    source = torch.tensor([0.2, -0.3, 0.5, 0.7])
+    destination = torch.tensor([-0.1, 0.4, 0.6, -0.2])
+
+    model.score_embeddings(source, "table", destination, "image").backward()
+
+    assert model.relation_bs["table_to_image"].grad is not None
+    assert model.relation_bs["table_to_image"].grad.abs().sum() > 0
+
+
 def test_student_identity_noise_initialization_starts_near_raw_geometry():
     model = StudentJoinabilityModel(
         input_dim=4,
@@ -479,6 +548,48 @@ def test_student_in_batch_scoring_expands_lists_and_respects_maximum():
     assert unexpanded.candidate_mask.sum(dim=1).tolist() == [2, 2]
 
 
+def test_lowrank_in_batch_scoring_matches_pair_scoring_without_expansion():
+    store = FeatureStore(
+        {
+            object_id: feature(object_id, "table", value)
+            for object_id, value in {
+                "q1": 0.1,
+                "q2": 0.2,
+                "p1": 0.3,
+                "p2": 0.4,
+                "n1": 0.5,
+                "n2": 0.6,
+            }.items()
+        }
+    )
+    model = StudentJoinabilityModel(
+        4,
+        3,
+        relation_param="lowrank",
+        relation_rank=2,
+    )
+    with torch.no_grad():
+        model.relation_as["table_to_table"].normal_(std=0.2)
+        model.relation_bs["table_to_table"].normal_(std=0.2)
+    examples = [
+        EdgeExample("q1", ("p1", "n1"), 0),
+        EdgeExample("q2", ("p2", "n2"), 0),
+    ]
+
+    pair_scores = score_edge_batch(
+        model, examples, store, torch.device("cpu")
+    )
+    in_batch_scores = score_edge_batch_in_batch(
+        model,
+        examples,
+        store,
+        torch.device("cpu"),
+        max_negatives=0,
+    )
+
+    torch.testing.assert_close(in_batch_scores.logits, pair_scores.logits)
+
+
 def test_target_in_batch_scoring_excludes_all_known_positive_targets():
     store = FeatureStore(
         {
@@ -536,6 +647,24 @@ def test_student_pca_checkpoint_loads_without_external_basis(tmp_path):
     loaded = load_student(path, torch.device("cpu"))
 
     assert loaded.config()["initialization"] == "pca"
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[key], value)
+
+
+def test_lowrank_student_checkpoint_round_trips(tmp_path):
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        relation_param="lowrank",
+        relation_rank=2,
+    )
+    path = tmp_path / "student_lowrank.pt"
+    torch.save(checkpoint(model, "student-path"), path)
+
+    loaded = load_student(path, torch.device("cpu"))
+
+    assert loaded.config()["relation_param"] == "lowrank"
+    assert loaded.config()["relation_rank"] == 2
     for key, value in model.state_dict().items():
         torch.testing.assert_close(loaded.state_dict()[key], value)
 
@@ -2020,6 +2149,70 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
         assert score == pytest.approx(expected[target_id], abs=1e-5)
     assert {result["target_id"] for result in results} == {"positive", "negative"}
     assert all({path["kind"] for path in result["paths"]} == {"direct", "evidence"} for result in results)
+
+
+def test_lowrank_student_ann_scores_are_exact(tmp_path, monkeypatch):
+    torch.manual_seed(17)
+    store = feature_store()
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        relation_param="lowrank",
+        relation_rank=2,
+    )
+    with torch.no_grad():
+        model.relation_as["table_to_table"].normal_(std=0.2)
+        model.relation_bs["table_to_table"].normal_(std=0.2)
+    ids_by_type = {
+        "table": ["positive", "negative"],
+        "text": ["evidence"],
+        "image": [],
+    }
+    embedding_reads = Counter()
+    embedding_features = store.embedding_features
+
+    def count_embedding_reads(object_id):
+        embedding_reads[object_id] += 1
+        return embedding_features(object_id)
+
+    monkeypatch.setattr(store, "embedding_features", count_embedding_reads)
+    manifest = build_indices(
+        model,
+        store,
+        ids_by_type,
+        tmp_path,
+        device=torch.device("cpu"),
+        checkpoint_sha256="synthetic",
+        batch_size=2,
+        m=8,
+        ef_construction=20,
+        ef_search=20,
+    )
+    assert embedding_reads == Counter(
+        {"positive": 1, "negative": 1, "evidence": 1}
+    )
+    indices = StudentANNIndices(
+        model,
+        store,
+        tmp_path,
+        device=torch.device("cpu"),
+        checkpoint_sha256="synthetic",
+    )
+
+    hits = indices.search("q", "table", 2)
+    expected = {
+        target_id: model.score_pairs(
+            [store.get("q")], [store.get(target_id)]
+        )[0].item()
+        for target_id in ("positive", "negative")
+    }
+
+    assert manifest["relation_param"] == "lowrank"
+    assert manifest["relation_rank"] == 2
+    assert manifest["ann_dim"] == 5
+    assert "table_to_table" in manifest["types"]
+    for target_id, score in hits:
+        assert score == pytest.approx(expected[target_id], abs=1e-5)
 
 
 def test_raw_embedding_ann_uses_frozen_vectors_without_student_head(tmp_path):

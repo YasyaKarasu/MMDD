@@ -352,13 +352,9 @@ def _optimize(loss: torch.Tensor, optimizer: torch.optim.Optimizer) -> None:
 def student_anchor_loss(student: StudentJoinabilityModel) -> torch.Tensor:
     """Return the scale-normalized distance from raw-retrieval geometry."""
 
-    parameter = next(student.parameters())
-    identity = torch.eye(
-        student.student_dim, device=parameter.device, dtype=parameter.dtype
-    )
     relation_anchor = sum(
-        (relation - identity).square().sum() / (student.student_dim**2)
-        for relation in student.relations.values()
+        student.relation_residual_squared_norm(key) / (student.student_dim**2)
+        for key in _student_relation_keys(student)
     )
     if student.freeze_projections:
         return relation_anchor
@@ -377,10 +373,6 @@ def student_evidence_anchor_loss(
 ) -> torch.Tensor:
     """Return the anchor term for the four table/evidence relations."""
 
-    parameter = next(student.parameters())
-    identity = torch.eye(
-        student.student_dim, device=parameter.device, dtype=parameter.dtype
-    )
     evidence_keys = {
         student.relation_key("table", "text"),
         student.relation_key("text", "table"),
@@ -388,8 +380,7 @@ def student_evidence_anchor_loss(
         student.relation_key("image", "table"),
     }
     return sum(
-        (student.relations[key] - identity).square().sum()
-        / (student.student_dim**2)
+        student.relation_residual_squared_norm(key) / (student.student_dim**2)
         for key in evidence_keys
     )
 
@@ -399,15 +390,17 @@ def student_relation_drift(
 ) -> dict[str, float]:
     """Measure the Frobenius distance from identity for every relation."""
 
-    parameter = next(student.parameters())
-    identity = torch.eye(
-        student.student_dim, device=parameter.device, dtype=parameter.dtype
-    )
     with torch.no_grad():
         return {
-            key: float(torch.linalg.vector_norm(relation - identity).cpu())
-            for key, relation in sorted(student.relations.items())
+            key: float(student.relation_residual_squared_norm(key).sqrt().cpu())
+            for key in _student_relation_keys(student)
         }
+
+
+def _student_relation_keys(student: StudentJoinabilityModel) -> list[str]:
+    if student.relation_param == "full":
+        return sorted(student.relations)
+    return sorted(student.relation_as)
 
 
 def _anchor_losses(

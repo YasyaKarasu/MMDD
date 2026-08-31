@@ -21,6 +21,7 @@ STUDENT_INITIALIZATIONS = (
     "random_orthogonal",
     "pca",
 )
+STUDENT_RELATION_PARAMS = ("full", "lowrank")
 
 
 def structural_table_pool_with_groups(
@@ -441,6 +442,8 @@ class StudentJoinabilityModel(nn.Module):
         initialization_noise_std: float = 0.01,
         initialization_basis: torch.Tensor | None = None,
         freeze_projections: bool = False,
+        relation_param: str = "full",
+        relation_rank: int = 16,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or student_dim <= 0:
@@ -451,6 +454,12 @@ class StudentJoinabilityModel(nn.Module):
             )
         if initialization_noise_std < 0:
             raise ValueError("initialization_noise_std must be non-negative")
+        if relation_param not in STUDENT_RELATION_PARAMS:
+            raise ValueError(
+                f"relation_param must be one of {STUDENT_RELATION_PARAMS}"
+            )
+        if relation_rank <= 0:
+            raise ValueError("relation_rank must be positive")
         if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
             raise ValueError(
                 f"{initialization} initialization requires student_dim == input_dim"
@@ -481,6 +490,8 @@ class StudentJoinabilityModel(nn.Module):
         self.initialization = initialization
         self.initialization_noise_std = initialization_noise_std
         self.freeze_projections = bool(freeze_projections)
+        self.relation_param = relation_param
+        self.relation_rank = relation_rank
         self.projections = nn.ModuleDict(
             {object_type: nn.Linear(input_dim, student_dim, bias=False) for object_type in OBJECT_TYPES}
         )
@@ -517,17 +528,30 @@ class StudentJoinabilityModel(nn.Module):
         self.set_projection_frozen(self.freeze_projections)
 
         self.relations = nn.ParameterDict()
+        self.relation_as = nn.ParameterDict()
+        self.relation_bs = nn.ParameterDict()
         for source_type in OBJECT_TYPES:
             for destination_type in OBJECT_TYPES:
-                relation = torch.eye(student_dim)
-                if initialization not in {
-                    "identity",
-                    "orthogonal",
-                    "random_orthogonal",
-                    "pca",
-                }:
-                    relation = relation + 0.01 * torch.randn(student_dim, student_dim)
-                self.relations[self.relation_key(source_type, destination_type)] = nn.Parameter(relation)
+                key = self.relation_key(source_type, destination_type)
+                if relation_param == "full":
+                    relation = torch.eye(student_dim)
+                    if initialization not in {
+                        "identity",
+                        "orthogonal",
+                        "random_orthogonal",
+                        "pca",
+                    }:
+                        relation = relation + 0.01 * torch.randn(
+                            student_dim, student_dim
+                        )
+                    self.relations[key] = nn.Parameter(relation)
+                else:
+                    self.relation_as[key] = nn.Parameter(
+                        0.01 * torch.randn(student_dim, relation_rank)
+                    )
+                    self.relation_bs[key] = nn.Parameter(
+                        torch.zeros(student_dim, relation_rank)
+                    )
 
     @staticmethod
     def relation_key(source_type: str, destination_type: str) -> str:
@@ -540,7 +564,42 @@ class StudentJoinabilityModel(nn.Module):
             "initialization": self.initialization,
             "initialization_noise_std": self.initialization_noise_std,
             "freeze_projections": self.freeze_projections,
+            "relation_param": self.relation_param,
+            "relation_rank": self.relation_rank,
         }
+
+    @property
+    def ann_dim(self) -> int:
+        """Vector dimension used by exact inner-product ANN retrieval."""
+
+        if self.relation_param == "lowrank":
+            return self.student_dim + self.relation_rank
+        return self.student_dim
+
+    def relation_parameters(self) -> list[nn.Parameter]:
+        """Return the trainable parameters of all directed relations."""
+
+        if self.relation_param == "full":
+            return list(self.relations.parameters())
+        return [
+            *self.relation_as.parameters(),
+            *self.relation_bs.parameters(),
+        ]
+
+    def relation_residual_squared_norm(self, key: str) -> torch.Tensor:
+        """Return ``||R - I||_F^2`` without materializing a low-rank matrix."""
+
+        if self.relation_param == "full":
+            relation = self.relations[key]
+            identity = torch.eye(
+                self.student_dim,
+                device=relation.device,
+                dtype=relation.dtype,
+            )
+            return (relation - identity).square().sum()
+        left_gram = self.relation_as[key].T @ self.relation_as[key]
+        right_gram = self.relation_bs[key].T @ self.relation_bs[key]
+        return (left_gram * right_gram).sum()
 
     def set_projection_frozen(self, frozen: bool) -> None:
         """Freeze or unfreeze the object-type projections explicitly."""
@@ -571,8 +630,15 @@ class StudentJoinabilityModel(nn.Module):
     ) -> torch.Tensor:
         source = self.project(source_embedding, source_type)
         destination = self.project(destination_embedding, destination_type)
-        relation = self.relations[self.relation_key(source_type, destination_type)]
-        return ((source @ relation) * destination).sum(dim=-1)
+        key = self.relation_key(source_type, destination_type)
+        if self.relation_param == "full":
+            return ((source @ self.relations[key]) * destination).sum(dim=-1)
+        direct = (source * destination).sum(dim=-1)
+        residual = (
+            (source @ self.relation_as[key])
+            * (destination @ self.relation_bs[key])
+        ).sum(dim=-1)
+        return direct + residual
 
     def score_pairs(
         self,
@@ -621,10 +687,17 @@ class StudentJoinabilityModel(nn.Module):
                     for index in pair_indices
                 ]
             )
-            relation = self.relations[
-                self.relation_key(source_type, destination_type)
-            ]
-            values = ((source_vectors @ relation) * destination_vectors).sum(dim=-1)
+            key = self.relation_key(source_type, destination_type)
+            if self.relation_param == "full":
+                values = (
+                    (source_vectors @ self.relations[key]) * destination_vectors
+                ).sum(dim=-1)
+            else:
+                values = (source_vectors * destination_vectors).sum(dim=-1)
+                values = values + (
+                    (source_vectors @ self.relation_as[key])
+                    * (destination_vectors @ self.relation_bs[key])
+                ).sum(dim=-1)
             indices = torch.tensor(pair_indices, device=scores.device)
             scores = scores.index_copy(0, indices, values)
         return scores
@@ -636,11 +709,26 @@ class StudentJoinabilityModel(nn.Module):
         destination_type: str,
     ) -> torch.Tensor:
         source = self.project(source_embedding, source_type)
-        relation = self.relations[self.relation_key(source_type, destination_type)]
-        return source @ relation
+        key = self.relation_key(source_type, destination_type)
+        if self.relation_param == "full":
+            return source @ self.relations[key]
+        return torch.cat([source, source @ self.relation_as[key]], dim=-1)
 
-    def index_vector(self, destination_embedding: torch.Tensor, destination_type: str) -> torch.Tensor:
-        return self.project(destination_embedding, destination_type)
+    def index_vector(
+        self,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+        source_type: str | None = None,
+    ) -> torch.Tensor:
+        destination = self.project(destination_embedding, destination_type)
+        if self.relation_param == "full":
+            return destination
+        if source_type is None:
+            raise ValueError("lowrank ANN index vectors require source_type")
+        key = self.relation_key(source_type, destination_type)
+        return torch.cat(
+            [destination, destination @ self.relation_bs[key]], dim=-1
+        )
 
 
 class IdentityStudentJoinabilityModel(nn.Module):

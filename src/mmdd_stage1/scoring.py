@@ -209,10 +209,19 @@ def _score_student_candidate_rows(
         ).to(device=parameter.device, dtype=torch.float32)
         query_vectors = student.project(query_embeddings, source_type)
         candidate_vectors = student.project(candidate_embeddings, destination_type)
-        relation = student.relations[
-            student.relation_key(source_type, destination_type)
-        ]
-        score_matrix = query_vectors @ relation @ candidate_vectors.T
+        relation_key = student.relation_key(source_type, destination_type)
+        if student.relation_param == "full":
+            score_matrix = (
+                query_vectors
+                @ student.relations[relation_key]
+                @ candidate_vectors.T
+            )
+        else:
+            score_matrix = query_vectors @ candidate_vectors.T
+            score_matrix = score_matrix + (
+                (query_vectors @ student.relation_as[relation_key])
+                @ (candidate_vectors @ student.relation_bs[relation_key]).T
+            )
         column_by_id = {object_id: column for column, object_id in enumerate(pooled_ids)}
         for matrix_row, row_index in enumerate(row_indices):
             columns = torch.tensor(

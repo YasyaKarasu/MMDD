@@ -70,49 +70,90 @@ def build_indices(
     output_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     type_records = {}
+    relation_param = getattr(model, "relation_param", "full")
+    ann_dim = int(getattr(model, "ann_dim", model.student_dim))
+    destination_embeddings: dict[str, torch.Tensor] = {}
+    for destination_type, object_ids in ids_by_type.items():
+        if object_ids:
+            destination_embeddings[destination_type] = torch.stack(
+                [store.embedding_features(object_id).embedding for object_id in object_ids]
+            )
+    if relation_param == "lowrank":
+        index_specs = [
+            (
+                model.relation_key(source_type, destination_type),
+                source_type,
+                destination_type,
+            )
+            for source_type in OBJECT_TYPES
+            for destination_type in OBJECT_TYPES
+        ]
+    else:
+        index_specs = [
+            (destination_type, None, destination_type)
+            for destination_type in OBJECT_TYPES
+        ]
     with torch.no_grad():
-        for object_type in progress(
-            OBJECT_TYPES, desc="Build Student indexes", unit="type", leave=False
+        for record_key, source_type, destination_type in progress(
+            index_specs,
+            desc="Build Student indexes",
+            unit="index",
+            leave=False,
         ):
-            object_ids = ids_by_type.get(object_type, [])
+            object_ids = ids_by_type.get(destination_type, [])
             if not object_ids:
                 continue
-            index = hnswlib.Index(space="ip", dim=model.student_dim)
+            index = hnswlib.Index(space="ip", dim=ann_dim)
             index.init_index(max_elements=len(object_ids), ef_construction=ef_construction, M=m)
             starts = range(0, len(object_ids), batch_size)
             for start in progress(
                 starts,
                 total=len(starts),
-                desc=f"Index {object_type}",
+                desc=f"Index {record_key}",
                 unit="batch",
                 leave=False,
             ):
                 batch_ids = object_ids[start : start + batch_size]
-                embeddings = torch.stack(
-                    [
-                        store.embedding_features(object_id).embedding.to(
-                            device=device, dtype=torch.float32
-                        )
-                        for object_id in batch_ids
-                    ]
+                embeddings = destination_embeddings[destination_type][
+                    start : start + len(batch_ids)
+                ].to(device=device, dtype=torch.float32)
+                vectors = (
+                    model.index_vector(embeddings, destination_type)
+                    if relation_param == "full"
+                    else model.index_vector(
+                        embeddings,
+                        destination_type,
+                        source_type=source_type,
+                    )
                 )
-                vectors = model.index_vector(embeddings, object_type).detach().cpu().numpy().astype("float32")
+                vectors = (
+                    vectors
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype("float32")
+                )
                 labels = np.arange(start, start + len(batch_ids))
                 index.add_items(vectors, labels)
             index.set_ef(ef_search)
-            index_path = output_dir / f"{object_type}.hnsw"
-            ids_path = output_dir / f"{object_type}_ids.json"
+            index_path = output_dir / f"{record_key}.hnsw"
+            ids_path = output_dir / f"{record_key}_ids.json"
             index.save_index(str(index_path))
             ids_path.write_text(json.dumps(object_ids, ensure_ascii=False) + "\n", encoding="utf-8")
-            type_records[object_type] = {
+            type_records[record_key] = {
                 "index_path": index_path.name,
                 "ids_path": ids_path.name,
                 "objects": len(object_ids),
+                "source_type": source_type,
+                "destination_type": destination_type,
             }
     manifest = {
         "format_version": 1,
         "space": "ip",
         "student_dim": model.student_dim,
+        "ann_dim": ann_dim,
+        "relation_param": relation_param,
+        "relation_rank": getattr(model, "relation_rank", None),
         "student_checkpoint_sha256": checkpoint_sha256,
         "corpus_sha256": corpus_sha256,
         "hnsw_m": m,
@@ -224,6 +265,22 @@ class StudentANNIndices:
             raise ValueError(f"{manifest_path}: unsupported ANN index format")
         if manifest.get("student_dim") != model.student_dim:
             raise ValueError(f"{manifest_path}: Student dimension does not match the checkpoint")
+        relation_param = getattr(model, "relation_param", "full")
+        ann_dim = int(getattr(model, "ann_dim", model.student_dim))
+        if manifest.get("relation_param", "full") != relation_param:
+            raise ValueError(
+                f"{manifest_path}: relation parameterization does not match the checkpoint"
+            )
+        if int(manifest.get("ann_dim", model.student_dim)) != ann_dim:
+            raise ValueError(
+                f"{manifest_path}: ANN dimension does not match the checkpoint"
+            )
+        if relation_param == "lowrank" and int(
+            manifest.get("relation_rank", -1)
+        ) != model.relation_rank:
+            raise ValueError(
+                f"{manifest_path}: relation rank does not match the checkpoint"
+            )
         if manifest.get("student_checkpoint_sha256") != checkpoint_sha256:
             raise ValueError(f"{manifest_path}: indexes were built from a different Student checkpoint")
         if corpus_sha256 is not None and manifest.get("corpus_sha256") != corpus_sha256:
@@ -231,6 +288,7 @@ class StudentANNIndices:
         self.model = model
         self.store = store
         self.device = device
+        self.relation_param = relation_param
         self.indices = {}
         self.object_ids = {}
         self.ef_search = int(manifest["ef_search"])
@@ -240,17 +298,18 @@ class StudentANNIndices:
             if destination_types is None
             else {normalize_object_type(value) for value in destination_types}
         )
-        for object_type, record in manifest["types"].items():
-            if object_type not in selected_types:
+        for record_key, record in manifest["types"].items():
+            destination_type = record.get("destination_type", record_key)
+            if destination_type not in selected_types:
                 continue
-            index = hnswlib.Index(space="ip", dim=model.student_dim)
+            index = hnswlib.Index(space="ip", dim=ann_dim)
             index.load_index(str(index_dir / record["index_path"]), max_elements=int(record["objects"]))
             index.set_ef(self.ef_search)
             object_ids = json.loads((index_dir / record["ids_path"]).read_text(encoding="utf-8"))
             if len(object_ids) != int(record["objects"]):
                 raise ValueError(f"{index_dir / record['ids_path']}: object count does not match the manifest")
-            self.indices[object_type] = index
-            self.object_ids[object_type] = object_ids
+            self.indices[record_key] = index
+            self.object_ids[record_key] = object_ids
 
     @torch.no_grad()
     def search(self, source_id: str, destination_type: str, k: int) -> list[tuple[str, float]]:
@@ -263,15 +322,16 @@ class StudentANNIndices:
         destination_type = normalize_object_type(destination_type)
         if not source_ids:
             return []
-        if k <= 0 or destination_type not in self.indices:
+        if k <= 0:
             return [[] for _source_id in source_ids]
-        self.indices[destination_type].set_ef(max(self.ef_search, int(k)))
 
         missing_by_type: dict[str, list[Any]] = defaultdict(list)
+        source_types = {}
         for source_id in dict.fromkeys(source_ids):
+            source = self.store.embedding_features(source_id)
+            source_types[source_id] = source.object_type
             key = (source_id, destination_type)
             if key not in self._relation_queries:
-                source = self.store.embedding_features(source_id)
                 missing_by_type[source.object_type].append(source)
         for source_type, features in missing_by_type.items():
             embeddings = torch.stack([value.embedding for value in features]).to(
@@ -286,21 +346,46 @@ class StudentANNIndices:
                     (features_value.object_id, destination_type)
                 ] = array
 
-        query_array = np.stack(
-            [self._relation_queries[(source_id, destination_type)] for source_id in source_ids]
-        )
-        count = len(self.object_ids[destination_type])
-        labels, distances = self.indices[destination_type].knn_query(query_array, k=min(k, count))
-        return [
-            [
-                (
-                    self.object_ids[destination_type][int(label)],
-                    1.0 - float(distance),
-                )
-                for label, distance in zip(row_labels, row_distances)
-            ]
-            for row_labels, row_distances in zip(labels, distances)
+        positions_by_index: dict[str, list[int]] = defaultdict(list)
+        for position, source_id in enumerate(source_ids):
+            index_key = (
+                self.model.relation_key(source_types[source_id], destination_type)
+                if getattr(self, "relation_param", "full") == "lowrank"
+                else destination_type
+            )
+            positions_by_index[index_key].append(position)
+
+        results: list[list[tuple[str, float]]] = [
+            [] for _source_id in source_ids
         ]
+        for index_key, positions in positions_by_index.items():
+            if index_key not in self.indices:
+                continue
+            index = self.indices[index_key]
+            index.set_ef(max(self.ef_search, int(k)))
+            query_array = np.stack(
+                [
+                    self._relation_queries[
+                        (source_ids[position], destination_type)
+                    ]
+                    for position in positions
+                ]
+            )
+            count = len(self.object_ids[index_key])
+            labels, distances = index.knn_query(
+                query_array, k=min(k, count)
+            )
+            for position, row_labels, row_distances in zip(
+                positions, labels, distances
+            ):
+                results[position] = [
+                    (
+                        self.object_ids[index_key][int(label)],
+                        1.0 - float(distance),
+                    )
+                    for label, distance in zip(row_labels, row_distances)
+                ]
+        return results
 
 
 class RawEmbeddingANNIndices:
