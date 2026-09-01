@@ -14,7 +14,7 @@ import cache_stage1_features
 import refresh_stage1_hard_negatives
 import train_stage1
 from cache_stage1_features import teacher_object_ids
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
@@ -263,7 +263,7 @@ def _evaluate_final_test(
         for path in map(Path, args.test_data)
         for example in load_target_examples(path, split="test", dataset_name=path.stem)
     ]
-    aggregation, top_k = load_path_aggregation(checkpoint_path)
+    aggregator = load_path_aggregator(checkpoint_path)
     metrics = evaluate_student_retrieval(
         test_examples,
         indices,
@@ -271,8 +271,10 @@ def _evaluate_final_test(
         evidence_k=args.dev_evidence_k,
         targets_per_evidence=args.dev_targets_per_evidence,
         evidence_types=tuple(args.evidence_types),
-        evidence_aggregation=aggregation,
-        evidence_top_k=top_k,
+        evidence_aggregation=aggregator.evidence_aggregation,
+        evidence_top_k=aggregator.top_k,
+        evidence_temperature=aggregator.temperature,
+        evidence_power=aggregator.power,
         rrf_k=args.rrf_k,
     )
     raw_indices = load_or_build_raw_embedding_indices(
@@ -292,8 +294,10 @@ def _evaluate_final_test(
         evidence_k=args.dev_evidence_k,
         targets_per_evidence=args.dev_targets_per_evidence,
         evidence_types=tuple(args.evidence_types),
-        evidence_aggregation=aggregation,
-        evidence_top_k=top_k,
+        evidence_aggregation=aggregator.evidence_aggregation,
+        evidence_top_k=aggregator.top_k,
+        evidence_temperature=aggregator.temperature,
+        evidence_power=aggregator.power,
         rrf_k=args.rrf_k,
     )
     write_json(metrics_path, metrics)

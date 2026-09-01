@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from mmdd_progress import progress
 
 from .features import normalize_object_type
+from .objectives import PATH_AGGREGATIONS
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ class TargetCandidate:
 class TeacherScoreConfig:
     evidence_aggregation: str
     evidence_top_k: int
+    evidence_temperature: float = 1.0
+    evidence_power: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -260,6 +263,8 @@ def load_target_examples(
             raw_score_config = {
                 "evidence_aggregation": metadata["evidence_aggregation"],
                 "evidence_top_k": metadata["evidence_top_k"],
+                "evidence_temperature": metadata.get("evidence_temperature", 1.0),
+                "evidence_power": metadata.get("evidence_power", 2.0),
             }
         teacher_score_config = None
         if raw_score_config is not None:
@@ -268,11 +273,23 @@ def load_target_examples(
             teacher_score_config = TeacherScoreConfig(
                 evidence_aggregation=str(raw_score_config["evidence_aggregation"]),
                 evidence_top_k=int(raw_score_config["evidence_top_k"]),
+                evidence_temperature=float(
+                    raw_score_config.get("evidence_temperature", 1.0)
+                ),
+                evidence_power=float(raw_score_config.get("evidence_power", 2.0)),
             )
-            if teacher_score_config.evidence_aggregation not in {"logsumexp", "topk_mean", "topk_sum"}:
+            if teacher_score_config.evidence_aggregation not in PATH_AGGREGATIONS:
                 raise ValueError(f"{path}:{line_number}: invalid Teacher evidence aggregation")
             if teacher_score_config.evidence_top_k <= 0:
                 raise ValueError(f"{path}:{line_number}: Teacher evidence_top_k must be positive")
+            if teacher_score_config.evidence_temperature <= 0:
+                raise ValueError(
+                    f"{path}:{line_number}: Teacher evidence_temperature must be positive"
+                )
+            if teacher_score_config.evidence_power <= 0:
+                raise ValueError(
+                    f"{path}:{line_number}: Teacher evidence_power must be positive"
+                )
         examples.append(
             TargetExample(
                 query_id,

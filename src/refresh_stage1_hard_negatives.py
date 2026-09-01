@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student, load_teacher
 from mmdd_stage1.data import load_edge_examples, load_target_examples
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.mining import (
@@ -18,7 +18,7 @@ from mmdd_stage1.mining import (
     score_hard_candidate_sets,
     score_pending_hard_examples,
 )
-from mmdd_stage1.objectives import PathAggregator
+from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import StudentANNIndices, checkpoint_fingerprint
 
@@ -54,7 +54,12 @@ def _validate_pending_metadata(
     if target_metadata.get("teacher_scoring") != "pending":
         raise ValueError("Pending hard negatives have already been Teacher-scored")
     for key, value in expected.items():
-        if target_metadata.get(key) != value:
+        default = {
+            "evidence_temperature": 1.0,
+            "evidence_power": 2.0,
+        }.get(key)
+        actual = target_metadata.get(key, default)
+        if actual != value:
             raise ValueError(
                 f"{target_path}: pending metadata {key!r} does not match this run"
             )
@@ -98,9 +103,25 @@ def run(args: argparse.Namespace) -> None:
         ),
     )
     student_path = Path(args.student_checkpoint)
-    saved_aggregation, saved_top_k = load_path_aggregation(student_path)
-    evidence_aggregation = args.evidence_aggregation or saved_aggregation
-    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
+    saved_aggregator = load_path_aggregator(student_path)
+    evidence_aggregation = (
+        args.evidence_aggregation or saved_aggregator.evidence_aggregation
+    )
+    evidence_top_k = (
+        args.evidence_top_k
+        if args.evidence_top_k is not None
+        else saved_aggregator.top_k
+    )
+    evidence_temperature = (
+        getattr(args, "evidence_temperature", None)
+        if getattr(args, "evidence_temperature", None) is not None
+        else saved_aggregator.temperature
+    )
+    evidence_power = (
+        getattr(args, "evidence_power", None)
+        if getattr(args, "evidence_power", None) is not None
+        else saved_aggregator.power
+    )
     student_sha256 = checkpoint_fingerprint(student_path)
     corpus_sha256 = checkpoint_fingerprint(Path(args.corpus))
     evidence_types = tuple(dict.fromkeys(args.evidence_types))
@@ -124,6 +145,8 @@ def run(args: argparse.Namespace) -> None:
                 "index_manifest_sha256": index_manifest_sha256,
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
+                "evidence_temperature": evidence_temperature,
+                "evidence_power": evidence_power,
                 "hard_targets_per_query": args.hard_targets_per_query,
                 "hard_evidence_per_type": args.hard_evidence_per_type,
                 "hard_paths_per_query": args.hard_paths_per_query,
@@ -183,7 +206,12 @@ def run(args: argparse.Namespace) -> None:
         teacher_sha256 = checkpoint_fingerprint(teacher_path)
         if teacher.input_dim != hidden_dim:
             raise ValueError("Teacher input dimension does not match the feature cache")
-        aggregator = PathAggregator(evidence_aggregation, evidence_top_k)
+        aggregator = PathAggregator(
+            evidence_aggregation,
+            evidence_top_k,
+            temperature=evidence_temperature,
+            power=evidence_power,
+        )
         if use_pending:
             target_records, edge_records = score_pending_hard_examples(
                 pending_targets,
@@ -215,6 +243,8 @@ def run(args: argparse.Namespace) -> None:
         "index_manifest_sha256": index_manifest_sha256,
         "evidence_aggregation": evidence_aggregation,
         "evidence_top_k": evidence_top_k,
+        "evidence_temperature": evidence_temperature,
+        "evidence_power": evidence_power,
         "teacher_target_channels": ["direct", "evidence"],
         "hard_negative_mining": {
             "hard_evidence": "query_to_evidence_ann",
@@ -305,9 +335,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets-per-evidence", type=int, default=100)
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
     parser.add_argument(
-        "--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"]
+        "--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS)
     )
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-temperature", type=float)
+    parser.add_argument("--evidence-power", type=float)
     return parser.parse_args()
 
 

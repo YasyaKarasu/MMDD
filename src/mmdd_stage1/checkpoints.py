@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from .models import StudentJoinabilityModel, TeacherJoinabilityModel
+from .objectives import PATH_AGGREGATIONS, PathAggregator
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
@@ -56,6 +57,21 @@ def load_path_aggregation(path: Path) -> tuple[str, int]:
     config = load_checkpoint(path).get("path_aggregation", {})
     aggregation = str(config.get("evidence_aggregation", "logsumexp"))
     top_k = int(config.get("evidence_top_k", 4))
-    if aggregation not in {"logsumexp", "topk_mean", "topk_sum"} or top_k <= 0:
+    if aggregation not in PATH_AGGREGATIONS or top_k <= 0:
         raise ValueError(f"{path}: invalid path aggregation configuration")
     return aggregation, top_k
+
+
+def load_path_aggregator(path: Path) -> PathAggregator:
+    """Load the complete path aggregation configuration from a checkpoint."""
+
+    config = load_checkpoint(path).get("path_aggregation", {})
+    try:
+        return PathAggregator(
+            str(config.get("evidence_aggregation", "logsumexp")),
+            int(config.get("evidence_top_k", 4)),
+            temperature=float(config.get("evidence_temperature", 1.0)),
+            power=float(config.get("evidence_power", 2.0)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}: invalid path aggregation configuration") from exc

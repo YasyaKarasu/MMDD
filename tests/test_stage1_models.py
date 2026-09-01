@@ -26,7 +26,11 @@ from cache_stage1_features import (
     embedding_instructions,
     teacher_object_ids,
 )
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student
+from mmdd_stage1.checkpoints import (
+    load_path_aggregation,
+    load_path_aggregator,
+    load_student,
+)
 from mmdd_stage1.data import (
     EdgeExample,
     TargetCandidate,
@@ -1198,6 +1202,11 @@ def test_train_stage1_accepts_multiple_teacher_table_tokens(monkeypatch):
     )
 
     assert train_stage1.parse_args().teacher_table_tokens_per_group == 4
+
+
+def test_fresh_teacher_defaults_to_one_table_token_per_group():
+    assert train_stage1._fresh_teacher_table_tokens_per_group(None) == 1
+    assert train_stage1._fresh_teacher_table_tokens_per_group(4) == 4
 
 
 def test_lazy_feature_store_and_target_jsonl(tmp_path):
@@ -2521,16 +2530,24 @@ def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
 
 def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):
     path = tmp_path / "student.pt"
+    aggregator = PathAggregator(
+        "softmax_weighted_mean", 2, temperature=0.3, power=3.0
+    )
     torch.save(
         checkpoint(
             StudentJoinabilityModel(input_dim=4, student_dim=3),
             "student-path",
-            PathAggregator("topk_sum", 2),
+            aggregator,
         ),
         path,
     )
 
-    assert load_path_aggregation(path) == ("topk_sum", 2)
+    assert load_path_aggregation(path) == ("softmax_weighted_mean", 2)
+    loaded = load_path_aggregator(path)
+    assert loaded.evidence_aggregation == "softmax_weighted_mean"
+    assert loaded.top_k == 2
+    assert loaded.temperature == pytest.approx(0.3)
+    assert loaded.power == pytest.approx(3.0)
 
 
 def test_dataset_sampling_alpha_balances_or_preserves_natural_mass():
@@ -3361,6 +3378,53 @@ def test_teacher_logit_sidecars_support_teacher_free_student_training(tmp_path):
         "teacher-sha",
         PathAggregator("topk_sum", 1),
     )
+
+
+def test_teacher_logit_sidecars_separate_aggregation_parameters(tmp_path):
+    store = feature_store()
+    teacher_model = teacher()
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        )
+    ]
+    low_temperature = PathAggregator(
+        "softmax_weighted_mean", temperature=0.1
+    )
+    high_temperature = PathAggregator(
+        "softmax_weighted_mean", temperature=1.0
+    )
+
+    cached, low_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=low_temperature,
+    )
+    _other, high_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        aggregator=high_temperature,
+    )
+
+    assert low_path != high_path
+    assert has_teacher_logits(cached, "teacher-sha", low_temperature)
+    assert not has_teacher_logits(cached, "teacher-sha", high_temperature)
 
 
 def test_teacher_logit_sidecars_cache_path_ensemble_targets_separately(tmp_path):

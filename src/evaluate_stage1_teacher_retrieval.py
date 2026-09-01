@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from mmdd_stage1.checkpoints import load_path_aggregation, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregator, load_teacher
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore, ObjectFeatures
@@ -166,15 +166,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             Path(value), split="dev", dataset_name=Path(value).stem
         )
     ]
-    aggregation, top_k = load_path_aggregation(teacher_path)
+    aggregator = load_path_aggregator(teacher_path)
     evidence_modality_weights = dict(args.evidence_modality_weights)
     common = {
         "recall_ks": args.recall_ks,
         "gamma": args.gamma,
         "gamma_evidence": args.gamma_evidence,
         "evidence_types": args.evidence_types,
-        "evidence_aggregation": aggregation,
-        "evidence_top_k": top_k,
+        "evidence_aggregation": aggregator.evidence_aggregation,
+        "evidence_top_k": aggregator.top_k,
+        "evidence_temperature": aggregator.temperature,
+        "evidence_power": aggregator.power,
         "evidence_modality_weights": evidence_modality_weights,
         "fusion_mode": "weighted_rrf",
         "evidence_weight": 0.05,
@@ -227,8 +229,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_weight": 0.05,
             "evidence_types": list(args.evidence_types),
             "evidence_modality_weights": evidence_modality_weights,
-            "evidence_aggregation": aggregation,
-            "evidence_top_k": top_k,
+            "evidence_aggregation": aggregator.evidence_aggregation,
+            "evidence_top_k": aggregator.top_k,
+            "evidence_temperature": aggregator.temperature,
+            "evidence_power": aggregator.power,
             "bootstrap_iterations": args.bootstrap_iterations,
             "bootstrap_seed": args.bootstrap_seed,
             "missing_teacher_feature_policy": args.missing_teacher_feature_policy,

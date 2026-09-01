@@ -32,6 +32,24 @@ FROZEN_COSINE_TARGET_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 
+def _teacher_score_config(aggregator: PathAggregator) -> TeacherScoreConfig:
+    return TeacherScoreConfig(
+        aggregator.evidence_aggregation,
+        aggregator.top_k,
+        aggregator.temperature,
+        aggregator.power,
+    )
+
+
+def _aggregation_cache_suffix(aggregator: PathAggregator) -> str:
+    suffix = f"-{aggregator.evidence_aggregation}-k{aggregator.top_k}"
+    if aggregator.evidence_aggregation == "softmax_weighted_mean":
+        suffix += f"-t{aggregator.temperature:.12g}"
+    elif aggregator.evidence_aggregation == "power_mean":
+        suffix += f"-p{aggregator.power:.12g}"
+    return suffix
+
+
 def _raw_target_edges(
     examples: Sequence[TargetExample],
     store: FeatureStore,
@@ -263,7 +281,7 @@ def _cache_path(
     aggregation = (
         ""
         if aggregator is None
-        else f"-{aggregator.evidence_aggregation}-k{aggregator.top_k}"
+        else _aggregation_cache_suffix(aggregator)
     )
     ensemble = (
         ""
@@ -298,7 +316,7 @@ def has_teacher_logits(
 ) -> bool:
     _validate_ensemble_alpha(ensemble_alpha)
     score_config = (
-        TeacherScoreConfig(aggregator.evidence_aggregation, aggregator.top_k)
+        _teacher_score_config(aggregator)
         if aggregator is not None
         else None
     )
@@ -397,6 +415,9 @@ def load_teacher_logits(
             or payload.get("evidence_aggregation")
             != aggregator.evidence_aggregation
             or payload.get("evidence_top_k") != aggregator.top_k
+            or float(payload.get("evidence_temperature", 1.0))
+            != aggregator.temperature
+            or float(payload.get("evidence_power", 2.0)) != aggregator.power
             or any(
                 direct.shape[1] < len(example.candidates)
                 or evidence.shape[1] < len(example.candidates)
@@ -404,9 +425,7 @@ def load_teacher_logits(
             )
         ):
             raise ValueError(f"{path}: Teacher target logits do not align with examples")
-        config = TeacherScoreConfig(
-            aggregator.evidence_aggregation, aggregator.top_k
-        )
+        config = _teacher_score_config(aggregator)
         loaded = [
             replace(
                 example,
@@ -505,9 +524,7 @@ def score_and_cache_teacher_logits(
                         float(value)
                         for value in scores.evidence.logits[row, :count].cpu().tolist()
                     ),
-                    teacher_score_config=TeacherScoreConfig(
-                        aggregator.evidence_aggregation, aggregator.top_k
-                    ),
+                    teacher_score_config=_teacher_score_config(aggregator),
                     teacher_checkpoint_sha256=teacher_sha256,
                     teacher_logit_mode=("ensemble" if ensemble_alpha is not None else "teacher"),
                     teacher_ensemble_alpha=ensemble_alpha,
@@ -534,6 +551,8 @@ def score_and_cache_teacher_logits(
         assert aggregator is not None
         payload["evidence_aggregation"] = aggregator.evidence_aggregation
         payload["evidence_top_k"] = aggregator.top_k
+        payload["evidence_temperature"] = aggregator.temperature
+        payload["evidence_power"] = aggregator.power
         payload["teacher_direct_logits"] = pad_sequence(
             [torch.tensor(example.teacher_direct_logits) for example in result],
             batch_first=True,
@@ -602,9 +621,7 @@ def score_and_cache_cosine_logits(
                     float(value)
                     for value in scores.evidence.logits[row, :count].cpu().tolist()
                 ),
-                teacher_score_config=TeacherScoreConfig(
-                    aggregator.evidence_aggregation, aggregator.top_k
-                ),
+                teacher_score_config=_teacher_score_config(aggregator),
                 teacher_checkpoint_sha256=FROZEN_COSINE_TARGET_SHA256,
                 teacher_logit_mode="ensemble",
                 teacher_ensemble_alpha=0.0,
@@ -627,6 +644,8 @@ def score_and_cache_cosine_logits(
         "target_source": "frozen_embedding_cosine",
         "evidence_aggregation": aggregator.evidence_aggregation,
         "evidence_top_k": aggregator.top_k,
+        "evidence_temperature": aggregator.temperature,
+        "evidence_power": aggregator.power,
         "teacher_direct_logits": pad_sequence(
             [torch.tensor(example.teacher_direct_logits) for example in result],
             batch_first=True,

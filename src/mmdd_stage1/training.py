@@ -570,6 +570,8 @@ def _validate_cached_path_aggregation(
         if config is not None and (
             config.evidence_aggregation != aggregator.evidence_aggregation
             or config.evidence_top_k != aggregator.top_k
+            or config.evidence_temperature != aggregator.temperature
+            or config.evidence_power != aggregator.power
         ):
             raise ValueError(
                 "Cached Teacher logits use a different evidence aggregation configuration"
@@ -1159,5 +1161,7 @@ def checkpoint(
         payload["path_aggregation"] = {
             "evidence_aggregation": aggregator.evidence_aggregation,
             "evidence_top_k": aggregator.top_k,
+            "evidence_temperature": aggregator.temperature,
+            "evidence_power": aggregator.power,
         }
     return payload

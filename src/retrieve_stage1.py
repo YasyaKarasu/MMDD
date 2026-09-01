@@ -8,13 +8,14 @@ import json
 from pathlib import Path
 
 import torch
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
     checkpoint_fingerprint,
     retrieve_zero_one_hop,
 )
+from mmdd_stage1.objectives import PATH_AGGREGATIONS
 
 
 def _modality_weight(value: str) -> tuple[str, float]:
@@ -34,9 +35,25 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint_path = Path(args.student_checkpoint)
     model = load_student(checkpoint_path, device)
-    saved_aggregation, saved_top_k = load_path_aggregation(checkpoint_path)
-    evidence_aggregation = args.evidence_aggregation or saved_aggregation
-    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
+    saved_aggregator = load_path_aggregator(checkpoint_path)
+    evidence_aggregation = (
+        args.evidence_aggregation or saved_aggregator.evidence_aggregation
+    )
+    evidence_top_k = (
+        args.evidence_top_k
+        if args.evidence_top_k is not None
+        else saved_aggregator.top_k
+    )
+    evidence_temperature = (
+        args.evidence_temperature
+        if args.evidence_temperature is not None
+        else saved_aggregator.temperature
+    )
+    evidence_power = (
+        args.evidence_power
+        if args.evidence_power is not None
+        else saved_aggregator.power
+    )
     model.eval()
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
     corpus_sha256 = (
@@ -63,10 +80,14 @@ def run(args: argparse.Namespace) -> None:
         evidence_types=tuple(args.evidence_types),
         evidence_aggregation=evidence_aggregation,
         evidence_top_k=evidence_top_k,
+        evidence_temperature=evidence_temperature,
+        evidence_power=evidence_power,
         rrf_k=args.rrf_k,
         fusion_mode=args.fusion_mode,
         direct_weight=args.direct_weight,
         evidence_weight=args.evidence_weight,
+        fusion_score_normalization=args.fusion_score_normalization,
+        fusion_score_temperature=args.fusion_score_temperature,
         gated_evidence_min_paths=args.gated_evidence_min_paths,
         gated_evidence_quantile=args.gated_evidence_quantile,
         evidence_modality_weights=dict(args.evidence_modality_weights),
@@ -83,7 +104,11 @@ def run(args: argparse.Namespace) -> None:
                 "gamma_evidence": args.gamma_evidence,
                 "evidence_aggregation": evidence_aggregation,
                 "evidence_top_k": evidence_top_k,
+                "evidence_temperature": evidence_temperature,
+                "evidence_power": evidence_power,
                 "target_fusion": args.fusion_mode,
+                "fusion_score_normalization": args.fusion_score_normalization,
+                "fusion_score_temperature": args.fusion_score_temperature,
                 "rrf_k": args.rrf_k,
                 "direct_weight": args.direct_weight,
                 "evidence_weight": args.evidence_weight,
@@ -148,16 +173,24 @@ def parse_args() -> argparse.Namespace:
         help="Evidence paths retained per target; defaults to the saved evidence top-k.",
     )
     parser.add_argument("--evidence-types", nargs="+", choices=["text", "image"], default=["text", "image"])
-    parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
+    parser.add_argument("--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS))
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-temperature", type=float)
+    parser.add_argument("--evidence-power", type=float)
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument(
         "--fusion-mode",
-        choices=["rrf", "weighted_rrf", "gated"],
+        choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],
         default="weighted_rrf",
     )
     parser.add_argument("--direct-weight", type=float, default=1.0)
     parser.add_argument("--evidence-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--fusion-score-normalization",
+        choices=["none", "zscore", "minmax", "softmax"],
+        default="none",
+    )
+    parser.add_argument("--fusion-score-temperature", type=float, default=1.0)
     parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
     parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
     parser.add_argument("--evidence-modality-weights", nargs="*", type=_modality_weight, default=[])

@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student, load_teacher
 from mmdd_stage1.data import (
     EdgeExample,
     TargetExample,
@@ -28,7 +28,7 @@ from mmdd_stage1.models import (
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
 )
-from mmdd_stage1.objectives import PathAggregator
+from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.pca import load_pca_projection
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import (
@@ -299,6 +299,10 @@ def _required_path(value: str | None, flag: str, stage: str) -> Path:
     return Path(value)
 
 
+def _fresh_teacher_table_tokens_per_group(value: int | None) -> int:
+    return 1 if value is None else value
+
+
 def _load_edge_training_data(paths: list[Path], split: str):
     return [
         example
@@ -429,6 +433,9 @@ def _validate_hard_provenance(
         if aggregator is not None and (
             metadata.get("evidence_aggregation") != aggregator.evidence_aggregation
             or int(metadata.get("evidence_top_k", 0)) != aggregator.top_k
+            or float(metadata.get("evidence_temperature", 1.0))
+            != aggregator.temperature
+            or float(metadata.get("evidence_power", 2.0)) != aggregator.power
         ):
             raise ValueError(f"{path}: hard-negative path aggregation does not match")
         rounds.add(int(metadata.get("mining_round", -1)))
@@ -597,12 +604,20 @@ class _EpochController:
                     evidence_types=tuple(self.args.evidence_types),
                     evidence_aggregation=self.aggregator.evidence_aggregation,
                     evidence_top_k=self.aggregator.top_k,
+                    evidence_temperature=self.aggregator.temperature,
+                    evidence_power=self.aggregator.power,
                     rrf_k=self.args.rrf_k,
                     fusion_mode=getattr(
                         self.args, "fusion_mode", "weighted_rrf"
                     ),
                     direct_weight=getattr(self.args, "direct_weight", 1.0),
                     evidence_weight=getattr(self.args, "evidence_weight", 0.05),
+                    fusion_score_normalization=getattr(
+                        self.args, "fusion_score_normalization", "none"
+                    ),
+                    fusion_score_temperature=getattr(
+                        self.args, "fusion_score_temperature", 1.0
+                    ),
                     gated_evidence_min_paths=getattr(
                         self.args, "gated_evidence_min_paths", 2
                     ),
@@ -626,10 +641,18 @@ class _EpochController:
                 evidence_types=tuple(self.args.evidence_types),
                 evidence_aggregation=self.aggregator.evidence_aggregation,
                 evidence_top_k=self.aggregator.top_k,
+                evidence_temperature=self.aggregator.temperature,
+                evidence_power=self.aggregator.power,
                 rrf_k=self.args.rrf_k,
                 fusion_mode=getattr(self.args, "fusion_mode", "weighted_rrf"),
                 direct_weight=getattr(self.args, "direct_weight", 1.0),
                 evidence_weight=getattr(self.args, "evidence_weight", 0.05),
+                fusion_score_normalization=getattr(
+                    self.args, "fusion_score_normalization", "none"
+                ),
+                fusion_score_temperature=getattr(
+                    self.args, "fusion_score_temperature", 1.0
+                ),
                 gated_evidence_min_paths=getattr(
                     self.args, "gated_evidence_min_paths", 2
                 ),
@@ -813,6 +836,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "eval_epoch_zero": True,
         "initialize_only": False,
         "fusion_mode": "weighted_rrf",
+        "fusion_score_normalization": "none",
+        "fusion_score_temperature": 1.0,
         "direct_weight": 1.0,
         "evidence_weight": 0.05,
         "gated_evidence_min_paths": 2,
@@ -844,6 +869,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "gate_tolerance": 0.02,
         "bootstrap_iterations": 10_000,
         "bootstrap_seed": 13,
+        "evidence_temperature": None,
+        "evidence_power": None,
     }
     for name, default in optional_defaults.items():
         if not hasattr(args, name):
@@ -1020,16 +1047,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     aggregator: PathAggregator | None = None
     if args.stage != "teacher-edge":
         aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
-        saved_aggregation, saved_top_k = (
-            load_path_aggregation(Path(aggregation_checkpoint))
+        saved_aggregator = (
+            load_path_aggregator(Path(aggregation_checkpoint))
             if aggregation_checkpoint
-            else ("logsumexp", 4)
+            else PathAggregator()
         )
         aggregator = PathAggregator(
-            args.evidence_aggregation or saved_aggregation,
+            args.evidence_aggregation or saved_aggregator.evidence_aggregation,
             args.evidence_top_k
             if args.evidence_top_k is not None
-            else saved_top_k,
+            else saved_aggregator.top_k,
+            temperature=(
+                args.evidence_temperature
+                if args.evidence_temperature is not None
+                else saved_aggregator.temperature
+            ),
+            power=(
+                args.evidence_power
+                if args.evidence_power is not None
+                else saved_aggregator.power
+            ),
         )
 
     teacher: TeacherJoinabilityModel | None = None
@@ -1271,7 +1308,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 text_latents=args.text_latents,
                 image_latents=args.image_latents,
                 dropout=args.dropout,
-                table_tokens_per_group=args.teacher_table_tokens_per_group,
+                table_tokens_per_group=_fresh_teacher_table_tokens_per_group(
+                    args.teacher_table_tokens_per_group
+                ),
             ).to(device)
         )
         if teacher.input_dim != hidden_dim:
@@ -1446,10 +1485,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "relation_loss_weights": args.relation_loss_weights,
         "eval_epoch_zero": args.eval_epoch_zero,
         "initialize_only": args.initialize_only,
+        "path_aggregation": (
+            {
+                "evidence_aggregation": aggregator.evidence_aggregation,
+                "evidence_top_k": aggregator.top_k,
+                "evidence_temperature": aggregator.temperature,
+                "evidence_power": aggregator.power,
+            }
+            if aggregator is not None
+            else None
+        ),
         "fusion": {
             "mode": args.fusion_mode,
             "direct_weight": args.direct_weight,
             "evidence_weight": args.evidence_weight,
+            "score_normalization": args.fusion_score_normalization,
+            "score_temperature": args.fusion_score_temperature,
             "gated_evidence_min_paths": args.gated_evidence_min_paths,
             "gated_evidence_quantile": args.gated_evidence_quantile,
             "evidence_modality_weights": args.evidence_modality_weights,
@@ -1523,11 +1574,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "observed_coverage_by_dataset": evidence_coverage_by_dataset,
         },
         "stop_reason": controller.stop_reason,
+        "path_aggregation": (
+            {
+                "evidence_aggregation": aggregator.evidence_aggregation,
+                "evidence_top_k": aggregator.top_k,
+                "evidence_temperature": aggregator.temperature,
+                "evidence_power": aggregator.power,
+            }
+            if aggregator is not None
+            else None
+        ),
         "mining_round": mining_round,
         "fusion": {
             "mode": args.fusion_mode,
             "direct_weight": args.direct_weight,
             "evidence_weight": args.evidence_weight,
+            "score_normalization": args.fusion_score_normalization,
+            "score_temperature": args.fusion_score_temperature,
             "gated_evidence_min_paths": args.gated_evidence_min_paths,
             "gated_evidence_quantile": args.gated_evidence_quantile,
             "evidence_modality_weights": args.evidence_modality_weights,
@@ -1788,8 +1851,10 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Restrict path KD to these dataset names; empty applies KD globally.",
     )
-    parser.add_argument("--evidence-aggregation", choices=["logsumexp", "topk_mean", "topk_sum"])
+    parser.add_argument("--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS))
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-temperature", type=float)
+    parser.add_argument("--evidence-power", type=float)
     parser.add_argument(
         "--relation-loss-weight",
         dest="relation_loss_weights",
@@ -1823,11 +1888,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument(
         "--fusion-mode",
-        choices=["rrf", "weighted_rrf", "gated"],
+        choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],
         default="weighted_rrf",
     )
     parser.add_argument("--direct-weight", type=float, default=1.0)
     parser.add_argument("--evidence-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--fusion-score-normalization",
+        choices=["none", "zscore", "minmax", "softmax"],
+        default="none",
+    )
+    parser.add_argument("--fusion-score-temperature", type=float, default=1.0)
     parser.add_argument("--gated-evidence-min-paths", type=int, default=2)
     parser.add_argument("--gated-evidence-quantile", type=float, default=0.75)
     parser.add_argument("--index-batch-size", type=int, default=1024)

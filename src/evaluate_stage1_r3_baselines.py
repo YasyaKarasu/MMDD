@@ -18,10 +18,11 @@ from typing import Any
 
 import torch
 
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student, load_teacher
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student, load_teacher
 from mmdd_stage1.data import TargetExample, load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.retrieval import (
     RawEmbeddingANNIndices,
     StudentANNIndices,
@@ -437,9 +438,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return payload
     systems: dict[str, dict[str, Any]] = {}
-    saved_aggregation, saved_top_k = load_path_aggregation(checkpoint_path)
-    aggregation = args.evidence_aggregation or saved_aggregation
-    evidence_top_k = args.evidence_top_k if args.evidence_top_k is not None else saved_top_k
+    saved_aggregator = load_path_aggregator(checkpoint_path)
+    evidence_aggregation = getattr(args, "evidence_aggregation", None)
+    evidence_top_k = getattr(args, "evidence_top_k", None)
+    evidence_temperature = getattr(args, "evidence_temperature", None)
+    evidence_power = getattr(args, "evidence_power", None)
+    aggregator = PathAggregator(
+        evidence_aggregation or saved_aggregator.evidence_aggregation,
+        evidence_top_k
+        if evidence_top_k is not None
+        else saved_aggregator.top_k,
+        temperature=(
+            evidence_temperature
+            if evidence_temperature is not None
+            else saved_aggregator.temperature
+        ),
+        power=(
+            evidence_power
+            if evidence_power is not None
+            else saved_aggregator.power
+        ),
+    )
+    fusion_mode = getattr(args, "fusion_mode", "weighted_rrf")
+    direct_weight = getattr(args, "direct_weight", 1.0)
+    evidence_weight = getattr(args, "evidence_weight", 0.05)
+    score_normalization = getattr(args, "fusion_score_normalization", "none")
+    score_temperature = getattr(args, "fusion_score_temperature", 1.0)
 
     def full_system(name: str, label: str, indices: RawEmbeddingANNIndices | StudentANNIndices) -> None:
         start = time.perf_counter()
@@ -450,11 +474,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             gamma=args.gamma,
             gamma_evidence=args.gamma_evidence,
             evidence_types=evidence_types,
-            evidence_aggregation=aggregation,
-            evidence_top_k=evidence_top_k,
+            evidence_aggregation=aggregator.evidence_aggregation,
+            evidence_top_k=aggregator.top_k,
+            evidence_temperature=aggregator.temperature,
+            evidence_power=aggregator.power,
             evidence_modality_weights=evidence_modality_weights,
-            fusion_mode="weighted_rrf",
-            evidence_weight=0.05,
+            fusion_mode=fusion_mode,
+            direct_weight=direct_weight,
+            evidence_weight=evidence_weight,
+            fusion_score_normalization=score_normalization,
+            fusion_score_temperature=score_temperature,
             return_per_query=True,
         )
         elapsed = time.perf_counter() - start
@@ -570,8 +599,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "teacher_table_tokens_per_group": getattr(
                 args, "teacher_table_tokens_per_group", None
             ),
-            "evidence_aggregation": aggregation,
-            "evidence_top_k": evidence_top_k,
+            "evidence_aggregation": aggregator.evidence_aggregation,
+            "evidence_top_k": aggregator.top_k,
+            "evidence_temperature": aggregator.temperature,
+            "evidence_power": aggregator.power,
+            "fusion_mode": fusion_mode,
+            "direct_weight": direct_weight,
+            "evidence_weight": evidence_weight,
+            "fusion_score_normalization": score_normalization,
+            "fusion_score_temperature": score_temperature,
             "evidence_types": list(evidence_types),
             "evidence_modality_weights": evidence_modality_weights,
             "bootstrap_iterations": args.bootstrap_iterations,
@@ -628,8 +664,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--ef-search", type=int, default=100)
-    parser.add_argument("--evidence-aggregation")
+    parser.add_argument("--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS))
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-temperature", type=float)
+    parser.add_argument("--evidence-power", type=float)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],
+        default="weighted_rrf",
+    )
+    parser.add_argument("--direct-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--fusion-score-normalization",
+        choices=["none", "zscore", "minmax", "softmax"],
+        default="none",
+    )
+    parser.add_argument("--fusion-score-temperature", type=float, default=1.0)
     parser.add_argument(
         "--evidence-types",
         nargs="+",

@@ -10,10 +10,11 @@ from typing import Any
 
 import torch
 
-from mmdd_stage1.checkpoints import load_path_aggregation, load_student
+from mmdd_stage1.checkpoints import load_path_aggregator, load_student
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
     checkpoint_fingerprint,
@@ -73,13 +74,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         corpus_sha256=corpus_sha256,
     )
     examples = _examples(args.dev_data)
-    saved_aggregation, saved_top_k = load_path_aggregation(checkpoint_path)
-    evidence_aggregation = args.evidence_aggregation or saved_aggregation
-    evidence_top_k = (
+    saved_aggregator = load_path_aggregator(checkpoint_path)
+    aggregator = PathAggregator(
+        args.evidence_aggregation or saved_aggregator.evidence_aggregation,
         args.evidence_top_k
         if args.evidence_top_k is not None
-        else saved_top_k
+        else saved_aggregator.top_k,
+        temperature=(
+            getattr(args, "evidence_temperature", None)
+            if getattr(args, "evidence_temperature", None) is not None
+            else saved_aggregator.temperature
+        ),
+        power=(
+            getattr(args, "evidence_power", None)
+            if getattr(args, "evidence_power", None) is not None
+            else saved_aggregator.power
+        ),
     )
+    fusion_mode = getattr(args, "fusion_mode", "weighted_rrf")
+    direct_weight = getattr(args, "direct_weight", 1.0)
+    evidence_weight = getattr(args, "evidence_weight", 0.05)
+    score_normalization = getattr(args, "fusion_score_normalization", "none")
+    score_temperature = getattr(args, "fusion_score_temperature", 1.0)
     raw_indices = load_or_build_raw_embedding_indices(
         store,
         load_corpus_ids(corpus_path, store),
@@ -99,10 +115,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
-        evidence_aggregation=evidence_aggregation,
-        evidence_top_k=evidence_top_k,
-        fusion_mode="weighted_rrf",
-        evidence_weight=0.05,
+        evidence_aggregation=aggregator.evidence_aggregation,
+        evidence_top_k=aggregator.top_k,
+        evidence_temperature=aggregator.temperature,
+        evidence_power=aggregator.power,
+        fusion_mode=fusion_mode,
+        direct_weight=direct_weight,
+        evidence_weight=evidence_weight,
+        fusion_score_normalization=score_normalization,
+        fusion_score_temperature=score_temperature,
     )
     metrics = evaluate_student_retrieval(
         examples,
@@ -113,10 +134,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         direct_k=args.direct_k,
         evidence_k=args.evidence_k,
         targets_per_evidence=args.targets_per_evidence,
-        evidence_aggregation=evidence_aggregation,
-        evidence_top_k=evidence_top_k,
-        fusion_mode="weighted_rrf",
-        evidence_weight=0.05,
+        evidence_aggregation=aggregator.evidence_aggregation,
+        evidence_top_k=aggregator.top_k,
+        evidence_temperature=aggregator.temperature,
+        evidence_power=aggregator.power,
+        fusion_mode=fusion_mode,
+        direct_weight=direct_weight,
+        evidence_weight=evidence_weight,
+        fusion_score_normalization=score_normalization,
+        fusion_score_temperature=score_temperature,
         identity_baseline_metrics=raw_metrics,
     )
     payload = {
@@ -126,6 +152,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_sha256": checkpoint_sha256,
         "best_epoch": selection["best_epoch"],
         "corpus_sha256": corpus_sha256,
+        "path_aggregation": {
+            "evidence_aggregation": aggregator.evidence_aggregation,
+            "evidence_top_k": aggregator.top_k,
+            "evidence_temperature": aggregator.temperature,
+            "evidence_power": aggregator.power,
+        },
+        "fusion": {
+            "mode": fusion_mode,
+            "direct_weight": direct_weight,
+            "evidence_weight": evidence_weight,
+            "score_normalization": score_normalization,
+            "score_temperature": score_temperature,
+        },
         "metrics": metrics,
         "raw_embedding": raw_metrics,
     }
@@ -143,8 +182,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=60_000)
-    parser.add_argument("--evidence-aggregation")
+    parser.add_argument("--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS))
     parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-temperature", type=float)
+    parser.add_argument("--evidence-power", type=float)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],
+        default="weighted_rrf",
+    )
+    parser.add_argument("--direct-weight", type=float, default=1.0)
+    parser.add_argument("--evidence-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--fusion-score-normalization",
+        choices=["none", "zscore", "minmax", "softmax"],
+        default="none",
+    )
+    parser.add_argument("--fusion-score-temperature", type=float, default=1.0)
     parser.add_argument("--index-batch-size", type=int, default=1024)
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=200)

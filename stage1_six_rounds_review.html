@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stage-1 六轮实验主线</title>
+<title>Stage-1 七轮实验主线</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=Noto+Serif+SC:wght@600&family=Noto+Sans+SC:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -48,6 +48,7 @@ body{
 p{margin:0 0 1.1rem}
 strong{font-weight:500; color:var(--ink)}
 a{color:var(--petrol)}
+code{font-family:var(--mono); font-size:.88em; background:var(--surface-2,rgba(0,0,0,.05)); padding:.1em .35em; border-radius:2px}
 </style>
 <style>
 /* ---------- masthead ---------- */
@@ -195,6 +196,30 @@ figcaption{font-size:13px; color:var(--muted); margin-top:12px; padding-top:12px
 .stat .k{font-size:13.5px; color:var(--ink-2)}
 .stat .v{font-family:var(--mono); font-size:13.5px; font-weight:500; font-variant-numeric:tabular-nums; white-space:nowrap}
 .divider{height:1px; background:var(--rule); margin:44px 0 0}
+
+/* ---------- config spec sheet ---------- */
+.spec{background:var(--surface); border:1px solid var(--rule); border-radius:3px; margin:22px 0 10px; overflow:hidden}
+.spec-group{border-bottom:1px solid var(--rule)}
+.spec-group:last-child{border-bottom:none}
+.spec-head{
+  display:flex; align-items:baseline; gap:10px; padding:12px 20px 10px;
+  background:var(--surface-2); border-bottom:1px solid var(--rule);
+}
+.spec-head b{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--petrol); font-weight:500}
+.spec-head span{font-size:13px; color:var(--muted)}
+.spec-row{display:grid; grid-template-columns:190px 1fr; gap:6px 20px; padding:9px 20px; border-bottom:1px dotted var(--rule)}
+.spec-row:last-child{border-bottom:none}
+.spec-row dt{font-size:14px; color:var(--ink-2); margin:0}
+.spec-row dd{margin:0; font-family:var(--mono); font-size:13px; color:var(--ink); font-variant-numeric:tabular-nums; line-height:1.6}
+.spec-row dd em{font-family:var(--body); font-style:normal; color:var(--muted); font-size:12.5px}
+.spec dl{margin:0}
+@media(max-width:640px){.spec-row{grid-template-columns:1fr; gap:2px}}
+.split{display:grid; grid-template-columns:1fr 1fr; gap:0}
+.split>div{padding:9px 20px}
+.split>div:first-child{border-right:1px solid var(--rule)}
+.split .sk{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin:0 0 4px}
+.split .sv{font-family:var(--mono); font-size:13px; margin:0; line-height:1.65}
+@media(max-width:640px){.split{grid-template-columns:1fr}.split>div:first-child{border-right:none; border-bottom:1px solid var(--rule)}}
 .qlist{counter-reset:q; list-style:none; padding:0; margin:18px 0 0}
 .qlist li{counter-increment:q; position:relative; padding-left:38px; margin-bottom:17px}
 .qlist li::before{
@@ -220,17 +245,17 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
 <body>
 <header class="masthead">
   <div class="wrap">
-    <p class="eyebrow">Stage-1 优化 · R1–R6 复盘</p>
-    <h1>六轮实验的一条主线：<br>训练为什么在破坏检索，以及怎么修</h1>
+    <p class="eyebrow">Stage-1 优化 · R1–R7 复盘</p>
+    <h1>七轮实验的一条主线：<br>训练为什么在破坏检索，以及怎么修</h1>
     <p class="standfirst">
-      全部六轮可以串成一个问题的逐层归因：<strong>为什么在冻结 embedding 上做训练，反而让检索变差。</strong>
+      七轮可以串成一个问题的逐层归因：<strong>为什么在冻结 embedding 上做训练，反而让检索变差。</strong>
       每一轮的动机都是上一轮的结论。这份复盘只保留这条主线上的实验，旁支消融省略。
     </p>
     <div class="meta-row">
       <span><b>时间</b> 2026-08-28 → 08-31</span>
       <span><b>数据湖</b> EntiTables · WDC</span>
       <span><b>口径</b> recall@{10…50} · γ=10 · 配对 bootstrap CI</span>
-      <span><b>当前</b> R7 进行中</span>
+      <span><b>当前默认</b> r5 配置(R7 门禁未通过)</span>
     </div>
   </div>
 </header>
@@ -250,7 +275,7 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
     <div class="verdict">
       <p class="block-label">起点判断</p>
       <p>训练目标(2–5 候选的窄列表 CE + 蒸馏一个过拟合 Teacher)的梯度方向,与"保持全局近邻结构"相互对抗。
-      后面六轮都在追这一件事的责任归属。</p>
+      后面七轮都在追这一件事的责任归属。</p>
     </div>
   </section>
 
@@ -571,13 +596,184 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
         <strong>表 token 预算不是瓶颈</strong>:F1(更多行 + 命名单元格)在 WDC 伤 student evidence −6.44,F2(每行 4 token + 重训 Teacher)增益不显著,此方向关闭。</p>
       </div>
     </article>
+
+    <article class="round" data-n="R7">
+      <p class="round-tag">08-31 · 关系参数化与联合选择</p>
+      <h2>低秩残差:最后一个结构杠杆,也没能救 WDC</h2>
+
+      <div class="block">
+        <p class="block-label">动机</p>
+        <p>R2 起就知道伤 WDC 的是 R 偏离 I 的<strong>"坏方向"</strong>,而全秩 R 有 1024 个可偏方向,
+        anchor 只能压总幅度、限制不了方向数。把 R 改成<strong>低秩残差 <code>R = I + A·Bᵀ</code></strong>
+        (A 零初始化)可以把可偏方向限制在 k 个,是唯一剩下的、可能结构性抑制 WDC 回退的杠杆;
+        且 step-0 精确等于 raw,天然与 epoch-0 gate 一致。同时修 R6 的教训:配置改为<strong>联合选择</strong>。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">做了什么</p>
+        <ul>
+          <li>Task P:低秩残差 k ∈ {16, 64, 256} × μ ∈ {0, 0.1},每湖分别训练,逐 epoch 记录各 type-pair 残差幅度</li>
+          <li>Task Q:检索侧配置联合评测(2 融合 × 2 路径聚合),对已有 checkpoint 零训练组合</li>
+          <li>Task R:KD 温度 T ∈ {0.5, 2, 4},检查 student / teacher logits 的尺度对齐</li>
+        </ul>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>R7 Task P · 低秩 k 敏感性(每湖各 k 的最优 epoch)</caption>
+          <thead><tr><th>湖</th><th class="num">k</th><th class="num">μ</th><th class="num">epoch</th><th class="num">fused R@10</th><th>direct 不跌破 ep-0</th><th>达 r5 锚点</th></tr></thead>
+          <tbody>
+            <tr><td class="name"><span class="lake-e">Enti</span></td><td class="num">64</td><td class="num">0</td><td class="num">4</td><td class="num">35.18%</td><td class="gate gate-f">否</td><td class="gate gate-f">否</td></tr>
+            <tr><td class="name"><span class="lake-e">Enti</span></td><td class="num">256</td><td class="num">0</td><td class="num">2</td><td class="num">35.07%</td><td class="gate gate-f">否</td><td class="gate gate-f">否</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span></td><td class="num">16</td><td class="num">0</td><td class="num">0</td><td class="num">62.38%</td><td class="gate gate-f">否</td><td class="gate gate-f">否</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span></td><td class="num">16</td><td class="num">0.1</td><td class="num">3</td><td class="num">62.38%</td><td class="gate gate-f">否</td><td class="gate gate-f">否</td></tr>
+            <tr><td class="name"><span class="lake-w">WDC</span></td><td class="num">64</td><td class="num">0</td><td class="num">1</td><td class="num">61.88%</td><td class="gate gate-p">是(唯一一组)</td><td class="gate gate-f">否</td></tr>
+            <tr class="hi"><td class="name"><span class="lake-w">WDC</span></td><td class="num">256</td><td class="num">0</td><td class="num">1</td><td class="num">63.86%</td><td class="gate gate-f">否</td><td class="gate gate-f">否</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">结论(一):"坏方向太多"假设被证伪</p>
+        <p>低秩<strong>没有</strong>消除 WDC 回退——六组里只有 k=64 做到 direct 全程不跌破 epoch-0,
+        而最优的 k=256 仍然回退;<strong>六组全部达不到 r5 锚点</strong>。
+        既然限制可偏方向数不起作用,<strong>根因就不是结构容量,而是数据分布 / 任务本质</strong>。这条结构性路线到此关闭。</p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">结论(二):μ 不能一概去掉——残差轨迹的反证</p>
+        <p>原设想是"低秩本身即结构约束,μ 可以去掉"。WDC k=16 上 μ=0 与 μ=0.1 几乎相同,支持该设想;
+        但 EntiTables k=256 μ=0 的残差轨迹显示<strong>残差单调发散</strong>:‖ΔR‖(table→table) 从 0 一路涨到
+        <strong>10.10</strong>,fused 在 epoch 2 见顶 35.07% 之后崩到 <strong>3.20%</strong>(epoch 6)。
+        真正在兜底的是 early stopping,不是结构约束。
+        <br><span style="color:var(--muted);font-size:14.5px">附带观察:9 个 type-pair 里只有 5 个拿到非零梯度,
+        image↔image、text↔text、image↔text 的残差恒为 0——这些 type-pair 没有训练样本。</span></p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">结论(三):一个被混淆的真实增益 → 引出 R8</p>
+        <p>在选中的 k=256 checkpoint 上,Task Q 把 EntiTables 的 <strong>evidence R@10 从 4.16% 拉到 10.66%</strong>
+        (WDC:24.26% → 44.55%),但 fused 反而只有 35.61%(direct 掉得更多)。
+        拆 knockout 表可见,拉动 evidence 的<strong>完全是路径聚合</strong>
+        (Enti 的 <code>logsumexp_edges_zscore</code>、WDC 的 <code>topk_sum</code>)——
+        同一聚合方式下,换融合模式的 evidence R@10 <strong>一模一样</strong>,变的只有 fused。
+        <strong>这个检索侧增益是真实的,只是混在"低秩"这个变量里没被识别出来——需要拿 r5 的全秩 R 重新验证。</strong></p>
+      </div>
+
+      <div class="block">
+        <p class="block-label">另外两条</p>
+        <p>KD 温度 T={0.5, 2, 4} 全部差于 T=1(−0.50 / −1.98 / −0.99pt),<strong>KD 尺度对齐不是瓶颈</strong>,该线关闭。
+        epoch-0 候选池审计发现<strong>独立重建的 HNSW 索引本身带近似检索的不确定性</strong>
+        (202 条 WDC 查询中 direct / evidence / fused 精确一致仅 93 / 26 / 13,path 池 0 条)——
+        <strong>今后独立重建的 run 不能声称"严格同池对比"</strong>,这条要写进论文的方法论口径。</p>
+      </div>
+
+      <div class="verdict">
+        <p class="block-label">R7 门禁判定</p>
+        <p>EntiTables 最优 35.61%,比 r5 低 <strong>2.13pt [−3.52, −0.75](显著)</strong>;
+        WDC 最优 64.36%,与 r5 <strong>完全打平 [−1.98, +1.98]</strong>。
+        <strong>门禁未通过,r5 保持论文默认配置</strong>,<code>FINAL.md</code> 有意不声明为通过产物。
+        低秩降级为<strong>参数效率消融</strong>保留:k=16 时关系参数 9.44M → 0.29M(<strong>32×</strong>),且检索开销不变。</p>
+      </div>
+    </article>
   </div>
   <div class="divider"></div>
 
   <section class="sec">
-    <h2>当前状态:r5 配置仍是论文级默认</h2>
-    <p class="lede">r6 的组件收益未能通过联合验证,r7(低秩残差 <code>R = I + A·Bᵀ</code> + 配置联合选择)进行中且尚未超过 r5 锚点,
-    因此下面这两组数字是目前可引用的主表。</p>
+    <h2>目前选择的配置:r5 recipe 的完整定义</h2>
+    <p class="lede">
+      r6 的组件收益没通过联合验证、r7 门禁未通过,所以<strong>论文默认配置仍然是 r5</strong>。
+      下面是它的逐项定义(参数取自 <code>run_task1_tau_ablation.sh</code> 的实际训练调用与
+      <code>task4_final/selection.json</code>,不是计划文档的转述)。
+    </p>
+
+    <div class="spec">
+      <div class="spec-group">
+        <div class="spec-head"><b>1 · 实例化粒度</b><span>框架统一,实例按湖</span></div>
+        <dl>
+          <div class="spec-row"><dt>实例化方式</dt><dd>每个数据湖<strong>独立</strong>的语料 / PCA / ANN 索引 / 训练列表 <em>——查询只在本湖内检索</em></dd></div>
+          <div class="spec-row"><dt>共享的部分</dt><dd>冻结 encoder(Qwen3-VL-Embedding)与方法本身 <em>特征缓存与湖无关</em></dd></div>
+        </dl>
+      </div>
+
+      <div class="spec-group">
+        <div class="spec-head"><b>2 · Student 结构</b><span>冻结投影 + 恒等附近的关系矩阵</span></div>
+        <dl>
+          <div class="spec-row"><dt>输入 → Student 维度</dt><dd>4096 → <strong>1024</strong>(<code>--student-dim 1024</code>)</dd></div>
+          <div class="spec-row"><dt>投影 P 初始化</dt><dd><code>--student-initialization pca</code>,本湖 top-1024 主成分 <em>保留方差 Enti 92.89% / WDC 93.14%</em></dd></div>
+          <div class="spec-row"><dt>投影 P 是否训练</dt><dd><code>--freeze-projection</code> → <strong>全程冻结</strong></dd></div>
+          <div class="spec-row"><dt>关系矩阵 R</dt><dd><strong>全秩</strong> 1024×1024,每个 type-pair 一个,初始化为 I<br><em>3 种对象类型(table/text/image)→ 9 个有序对,共 9,437,184 参数</em></dd></div>
+          <div class="spec-row"><dt>可训参数</dt><dd>仅 R(9 个矩阵),P 与 encoder 均冻结</dd></div>
+        </dl>
+      </div>
+
+      <div class="spec-group">
+        <div class="spec-head"><b>3 · 训练目标与超参</b><span>path-only,跳过 student-edge</span></div>
+        <dl>
+          <div class="spec-row"><dt>训练阶段</dt><dd><code>student-path</code> 单阶段 <em>——student-edge 阶段被跳过(R2 结论:in-batch edge 伤 7pt)</em></dd></div>
+          <div class="spec-row"><dt>负样本</dt><dd><code>--in-batch-negatives</code>,<code>--in-batch-max-negatives 256</code></dd></div>
+          <div class="spec-row"><dt>锚定正则</dt><dd>μ‖R−I‖²_F/d²,<code>--anchor-weight 0.1</code>,<code>--anchor-weight-evidence 0.1</code></dd></div>
+          <div class="spec-row"><dt>学习率</dt><dd><code>--learning-rate 1e-4</code>,<code>--relation-learning-rate 1e-5</code></dd></div>
+          <div class="spec-row"><dt>蒸馏目标</dt><dd><code>τ·z(s_T) + (1−τ)·z(cos)</code>,列表内 z-score 归一<br><code>--distillation-weight 0.3</code></dd></div>
+          <div class="spec-row"><dt>蒸馏源 Teacher</dt><dd><strong>本湖 Task-M teacher</strong>(每湖各一个)</dd></div>
+          <div class="spec-row"><dt>其他</dt><dd><code>--epochs 12 --batch-size 64 --patience 4 --dataset-sampling-alpha 0</code></dd></div>
+        </dl>
+      </div>
+
+      <div class="spec-group">
+        <div class="spec-head"><b>4 · 检索与融合</b><span>k 驱动预算</span></div>
+        <dl>
+          <div class="spec-row"><dt>检索预算</dt><dd><code>--gamma 10</code>(direct = 10·k)、<code>--gamma-evidence 2</code>(evidence = 2·k)</dd></div>
+          <div class="spec-row"><dt>路径聚合</dt><dd><code>--evidence-aggregation logsumexp --evidence-top-k 4</code></dd></div>
+          <div class="spec-row"><dt>融合</dt><dd><code>--fusion-mode weighted_rrf</code>,<code>--direct-weight 1</code>,<code>--evidence-weight 0.05</code>,RRF k=60</dd></div>
+          <div class="spec-row"><dt>evidence 模态</dt><dd>text + image <strong>都保留</strong> <em>(硬约束:不允许 text-only 方案)</em></dd></div>
+        </dl>
+      </div>
+
+      <div class="spec-group">
+        <div class="spec-head"><b>5 · 模型选择与统计判据</b><span>湖级 gate</span></div>
+        <dl>
+          <div class="spec-row"><dt>评测口径</dt><dd><code>--recall-ks 10,20,30,40,50</code>,MRR@50,coverage@10</dd></div>
+          <div class="spec-row"><dt>主指标</dt><dd><code>--primary-metric recall@10</code>(fused)</dd></div>
+          <div class="spec-row"><dt>gate</dt><dd>配对 bootstrap 95% CI 下界 ≥ <strong>−0.02</strong>(相对<strong>本湖</strong> raw)<br><code>--bootstrap-iterations 10000 --bootstrap-seed 13</code></dd></div>
+          <div class="spec-row"><dt>checkpoint 选择</dt><dd>满足本湖 gate 的 epoch 中,取本湖 fused R@10 最大者;无一满足则回退 epoch-0 并标记</dd></div>
+        </dl>
+      </div>
+
+      <div class="spec-group">
+        <div class="spec-head"><b>6 · 两湖唯一的差异项</b><span>其余全部相同</span></div>
+        <div class="split">
+          <div>
+            <p class="sk" style="color:var(--enti)">EntiTables</p>
+            <p class="sv">τ = <strong>1.0</strong>(纯 teacher)<br>
+            选中 <strong>epoch 6</strong> · fused 37.74%<br>
+            在线重排:<strong>启用</strong>,本湖 Task-M teacher<br>
+            ensemble α = 0.7 → 46.16%<br>
+            <em>student SHA 06d098c1…</em></p>
+          </div>
+          <div>
+            <p class="sk" style="color:var(--wdc)">WDC</p>
+            <p class="sv">τ = <strong>0.7</strong>(teacher/cos 平衡点)<br>
+            选中 <strong>epoch 5</strong> · fused 64.36%<br>
+            在线重排:<strong>no-op</strong>(teacher gate 失败)<br>
+            <em>诚实负结果,不是待修项</em><br>
+            <em>student SHA 8bb317f5…</em></p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <p style="font-size:14.5px;color:var(--ink-2);max-width:66ch">
+      需要提醒的一点:<strong>两湖的 τ 是手动选的</strong>(r5 口径)。r6 的 τ 自适应启发式会自动选出 Enti 0.7 / WDC 0.5,
+      落在同一高性能平台区,但因为 r6 整体合成未达标,<strong>默认配置仍用手动 τ</strong>。
+    </p>
+  </section>
+
+  <div class="divider"></div>
+
+  <section class="sec">
+    <h2>这套配置目前的成绩</h2>
+    <p class="lede">下面两组是可引用的主表数字;r7 已确认无法替换它们(Enti 显著更低、WDC 打平)。</p>
 
     <div class="lakes">
       <div class="lake e">
@@ -590,6 +786,7 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
         <div class="stat"><span class="k">+ 在线重排</span><span class="v" style="color:var(--enti)">46.16%</span></div>
         <div class="stat"><span class="k">索引 raw → student</span><span class="v">3.758 → 0.991 GiB</span></div>
         <div class="stat"><span class="k">延迟 raw → 部署链</span><span class="v">72.8 → 21.3 ms</span></div>
+        <div class="stat"><span class="k">r7 低秩最优(未采纳)</span><span class="v" style="color:var(--muted)">35.61% · −2.13pt 显著</span></div>
       </div>
       <div class="lake w">
         <h4>WDC</h4>
@@ -601,8 +798,37 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
         <div class="stat"><span class="k">+ 在线重排</span><span class="v" style="color:var(--muted)">no-op(负结果)</span></div>
         <div class="stat"><span class="k">索引 raw → student</span><span class="v">0.586 → 0.155 GiB</span></div>
         <div class="stat"><span class="k">延迟 raw → 部署链</span><span class="v">32.5 → 26.1 ms</span></div>
+        <div class="stat"><span class="k">r7 低秩最优(未采纳)</span><span class="v" style="color:var(--muted)">64.36% · 打平</span></div>
       </div>
     </div>
+
+    <figcaption style="max-width:78ch">
+      <strong style="color:var(--ink)">四行的确切含义。</strong>
+      四行共用同一套 PCA 投影、同一份语料与索引、同一评测口径,唯一差别是关系矩阵 R 怎么得到的。
+      <br><br>
+      <strong style="color:var(--ink)">Student epoch-0</strong>:PCA 初始化后一步未训,R 严格等于单位阵 I,
+      所以它等价于"在 1024 维压缩空间里做 raw 检索"。它比 raw embedding 低约 1pt,这 1pt 就是 PCA 压缩的代价,
+      是训练增益的真实起跑线,也是留存 gate 的门槛。
+      <br><br>
+      <strong style="color:var(--ink)">监督 Student</strong>:<code>--distillation-weight 0</code>,完全不用 Teacher,
+      只用 in-batch 负例(256)的对比损失 + anchor 正则 μ=0.1 训 R。取自 r4 Task K 的
+      <code>{lake}_supervised</code> run。EntiTables 选到 epoch 8(drift 3.13,gate pass);
+      <strong style="color:var(--ink)">WDC 选到 epoch 0、gate 记为 fallback</strong>——即纯监督在 WDC 上每个 epoch 都跌破留存线,
+      最终交回的就是那个没训过的 epoch-0 模型(61.88% 与 60.89% 的差是 HNSW 重建的非确定性,约 2/202 条查询)。
+      <br><br>
+      <strong style="color:var(--ink)">KD Student(最终)</strong>:<code>--distillation-weight 0.3</code>,
+      蒸馏目标为 <code>τ·z(s_T) + (1−τ)·z(cos)</code>,Teacher 是该湖自己的 Task-M Teacher。
+      EntiTables τ=1.0 选 epoch 6 → 37.74%;WDC τ=0.7 选 epoch 5 → 64.36%(drift 0.7502,gate pass)。
+      这一行<strong style="color:var(--ink)">就是我们最终部署的 r5 Student</strong>,上面 spec sheet 描述的正是它。
+      蒸馏链 gate(KD ≥ 监督)两湖都过:Enti +0.32% [−1.07, +1.71](不显著),
+      WDC +2.48% [−0.50, +5.45](p=0.025)。
+      <br><br>
+      <strong style="color:var(--ink)">别和 r5 的 τ=0 消融混淆</strong>:那一组仍然开着
+      <code>distillation-weight 0.3</code>,只是不挂 Teacher,退化为"向 frozen cosine 蒸馏"
+      (Enti 37.21% / WDC 61.88%)。它和这里的"监督 Student"(压根没有蒸馏项)不是一回事,
+      两者的对比正是 R5"锚定 vs 知识搬运"归因的关键:WDC 上光有 cosine 锚定就能把训练从 epoch-0 救回来,
+      Teacher 只再贡献 2.48pt 的残差。
+    </figcaption>
 
     <div class="spine">
       <h3>一句话串起来的主线</h3>
@@ -611,7 +837,12 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
         同时 Teacher 正交信号支撑两级架构(R2) → 修口径与统计判据,KD 交出<strong>"蒸馏有效、共享模型不行"</strong>的真实轨迹(R3) →
         <strong>按湖实例化</strong>解除约束,训练增益首次成立(R4) → τ 归因说明蒸馏的作用主要是<strong>锚定而非知识搬运</strong>,
         并解释"重排弱但蒸馏增"(R5) → evidence 通道靠<strong>归一化利用幅值</strong>改善,但暴露<strong>贪心 ≠ 联合最优</strong>(R6) →
-        关系参数化的<strong>方向约束</strong>(低秩残差)正在验证(R7)。
+        低秩残差把可偏方向限制到 k 个,<strong>WDC 回退依然存在 → "坏方向太多"假设被证伪,根因是数据分布而非结构容量</strong>(R7)。
+      </p>
+      <p>
+        七轮下来,能改善 WDC 的<strong>结构性</strong>杠杆基本用尽:anchor(减速不改向)、按湖实例化(解除跨湖冲突)、
+        低秩(限制方向数)、KD 温度(尺度对齐)都试过了。剩下的唯一变量是<strong>数据本身</strong>——
+        这正是 R8 要先用一张饱和曲线去裁决的问题,而不是直接扩规模。
       </p>
       <p>
         方法论上有三条反复起作用的纪律:<strong>epoch-0 基准</strong>(否则分不清改善与破坏)、
@@ -627,11 +858,11 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
     <h2>明天可以讨论的几个点</h2>
     <p class="lede">都是从现有结果里直接长出来的开放问题,不是新提案。</p>
     <ol class="qlist">
-      <li><b>召回深度瓶颈怎么写</b><span>γ=10 时 R@50 仍未饱和,是已记录的瓶颈。是继续加深召回池,还是承认它并把它写成 two-stage 的固有取舍?</span></li>
-      <li><b>WDC 的统计功效</b><span>202 查询、每查询 1 正例,1pt = 2 条查询。所有 WDC 结论的 CI 都很宽(如 +1.98 [−0.50, +4.95])。是否需要扩 dev 集才能支撑论文级断言?</span></li>
-      <li><b>两条负结果的呈现方式</b><span>WDC 线上重排 no-op、表 token 预算非瓶颈、尺度假设证伪——建议作为 negative results 单独成节,还是并入各自章节?</span></li>
-      <li><b>evidence 通道的定位</b><span>evidence R@10 已从 4.05% 提到 9.70%(WDC 23.27% → 44.06%),但 coverage@10 仍只有 3.62%。这个通道在论文里是主张之一,还是仅作 Stage-2 的入口?</span></li>
-      <li><b>低秩残差的去留</b><span>目前 WDC k=256 只能追平 r5(64.36%)、EntiTables 仍低于 37.74% 锚点。是作为主叙事(受控方向性校正)还是降为参数效率消融?</span></li>
+      <li><b>扩规模做不做,以及先裁决再投算力的顺序</b><span>结构杠杆已用尽,只剩数据这一个变量;而 γ=10 时 R@50 本来就未饱和。R8 想先用 raw 穷举检索画一张饱和曲线来裁决:若还有余量,扩<strong>候选池/语料</strong>才有意义(WDC 现仅 3,540 表,LakeBench 完整 WebTable 约 16M);若已饱和,则扩规模无意义、召回深度写成 two-stage 的固有取舍。<strong>这个"先裁决、再投算力"的顺序想请老师确认。</strong></span></li>
+      <li><b>evidence 通道:定位 + 一个待验证的干净增益</b><span>evidence R@10 已从 4.16% 提到 10.66%(WDC 24.26% → 44.55%),但 coverage@10 仍只有 3.4%,且这个增益混在低秩变量里、需要拿 r5 全秩 R 重验。如果重验成立,这是 evidence 通道第一个干净的正结果——那么它在论文里是独立主张,还是仅作 Stage-2 的入口?</span></li>
+      <li><b>WDC 的统计功效</b><span>202 查询、每查询 1 正例,1pt = 2 条查询,所有 WDC 结论的 CI 都很宽(如 +1.98 [−0.50, +4.95]),R7 的"打平"也是在这个精度下说的。是否需要先扩 dev 集,才能支撑论文级断言?</span></li>
+      <li><b>四条负结果的呈现方式</b><span>WDC 线上重排 no-op、表 token 预算非瓶颈、尺度错配证伪、低秩不作默认(但给出 step-0 = raw 与 32× 参数压缩)。单独成 negative results 一节,还是并入各自章节?</span></li>
+      <li><b>同池对比的口径约束</b><span>HNSW 独立重建带近似不确定性(202 查询精确一致仅 93/26/13,path 池 0 条)。配对 CI 仍可作不确定性汇总,但"严格同池"的措辞要收回。要不要在论文方法节显式写明?</span></li>
     </ol>
   </section>
 </main>
@@ -641,6 +872,8 @@ footer p{font-family:var(--mono); font-size:11.5px; color:var(--muted); margin:0
     <p>数据来源:work/stage1_optimization_{20260828, r2…r7} 各轮 RESULTS.md / FINAL.md</p>
     <p>口径:recall@{10,20,30,40,50} · mrr@50 · γ=10 · γ_e=2 · 配对 bootstrap 10,000 次 seed 13 · 湖级 CI tolerance −0.02</p>
     <p>R1–R3 为混合语料口径,R4 起为分湖口径,两者数字不可直接比较</p>
+    <p>当前默认 = r5 配置;R6 组件未通过联合验证、R7 门禁未通过(FINAL.md 均有意不声明为通过产物)</p>
+    <p>独立重建的 HNSW 索引存在近似检索不确定性,不构成严格同池对比</p>
   </div>
 </footer>
 <script>
