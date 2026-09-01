@@ -9,8 +9,13 @@ from pathlib import Path
 
 import torch
 from mmdd_stage2.checkpoints import save_candidate_scorer
+from mmdd_stage2.oracle import load_oracle_column_data
 from mmdd_stage2.qwen import QwenStage2Backend
-from mmdd_stage2.training import load_column_training_data, train_candidate_scorer
+from mmdd_stage2.training import (
+    ColumnTrainingExample,
+    load_column_training_data,
+    train_candidate_scorer,
+)
 from mmdd_stage2.verifier import CandidateColumnScorer
 from mmdd_stage1.selection import validate_stage2_gate
 
@@ -18,24 +23,51 @@ from mmdd_stage1.selection import validate_stage2_gate
 def run(args: argparse.Namespace) -> None:
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
+    training_source = getattr(args, "training_source", "retrieved")
     stage1_gate = getattr(args, "stage1_gate", None)
-    if not stage1_gate:
-        raise ValueError("--stage1-gate is required")
-    validate_stage2_gate(
-        Path(stage1_gate), [Path(path) for path in args.retrieval_results]
-    )
+    retrieval_results = getattr(args, "retrieval_results", None)
+    if training_source == "retrieved":
+        if not stage1_gate:
+            raise ValueError("--stage1-gate is required for retrieved training")
+        if not retrieval_results:
+            raise ValueError("--retrieval-results is required for retrieved training")
+        validate_stage2_gate(
+            Path(stage1_gate), [Path(path) for path in retrieval_results]
+        )
+    elif training_source != "oracle-positive":
+        raise ValueError(f"Unsupported --training-source: {training_source}")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    examples, objects = load_column_training_data(
+    roots = (
         [Path(path) for path in args.dataset_root]
         if isinstance(args.dataset_root, list)
-        else Path(args.dataset_root),
-        [Path(path) for path in args.retrieval_results],
-        top_k_evidence=args.top_k_evidence,
-        max_targets=args.max_targets,
+        else [Path(args.dataset_root)]
     )
+    if training_source == "retrieved":
+        examples, objects = load_column_training_data(
+            roots,
+            [Path(path) for path in retrieval_results],
+            top_k_evidence=args.top_k_evidence,
+            max_targets=args.max_targets,
+        )
+    else:
+        oracle_examples, objects, _audit = load_oracle_column_data(
+            roots,
+            splits=("train",),
+            top_k_evidence=args.top_k_evidence,
+            strict=True,
+        )
+        examples = [
+            ColumnTrainingExample(
+                query_id=example.query_id,
+                positive_bundle=example.positive_bundle,
+                positive_source_column=example.gold_source_column,
+                table_loss=0.0,
+            )
+            for example in oracle_examples
+        ]
     backend = QwenStage2Backend(
         Path(args.model_dir),
         device=args.device,
@@ -57,6 +89,7 @@ def run(args: argparse.Namespace) -> None:
         Path(args.output),
         scorer,
         metadata={
+            "training_source": training_source.replace("-", "_"),
             "model_dir": str(Path(args.model_dir).resolve()),
             "top_k_evidence": args.top_k_evidence,
             "max_targets": args.max_targets,
@@ -83,15 +116,20 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--training-source",
+        choices=("retrieved", "oracle-positive"),
+        default="retrieved",
+        help="Use gated Stage-1 retrieval or audited gold target/evidence positives.",
+    )
+    parser.add_argument(
         "--dataset-root",
         nargs="+",
         required=True,
         help="One root shared by all retrieval files, or one root per retrieval file.",
     )
-    parser.add_argument("--retrieval-results", nargs="+", required=True)
+    parser.add_argument("--retrieval-results", nargs="+")
     parser.add_argument(
         "--stage1-gate",
-        required=True,
         help="Final dev-gated Stage-1 selection manifest.",
     )
     parser.add_argument("--output", required=True)

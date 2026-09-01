@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+import torch
+
+import train_stage2
+from run_stage2_round1 import _round1_conclusion
+from mmdd_stage2.data import Stage2ObjectIndex
+from mmdd_stage2.oracle import (
+    ORACLE_EVIDENCE_POLICY,
+    OracleColumnExample,
+    OracleDataError,
+    load_oracle_column_data,
+    select_oracle_evidence,
+)
+from mmdd_stage2.reader_cache import build_reader_cache, load_reader_cache
+from mmdd_stage2.verifier import CandidateColumnScorer, EvidenceBundle
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+
+def _dataset(
+    root: Path,
+    *,
+    split: str = "train",
+    query_id: str = "q1",
+    target_id: str = "t1",
+    evidence: list[dict] | None = None,
+) -> Path:
+    evidence = evidence or [
+        {"asset_id": "text_b", "asset_type": "text", "content": "b"},
+        {"asset_id": "text_a", "asset_type": "text", "content": "a"},
+    ]
+    artifact_paths = {
+        "qrels": "qrels.jsonl",
+        "query_tables": "query_tables/part.jsonl",
+        "data_lake_tables": "data_lake_tables/part.jsonl",
+        "bridge_assets": "bridge_assets/part.jsonl",
+        "evidence_recoveries": "evidence_recoveries/part.jsonl",
+    }
+    root.mkdir(parents=True)
+    (root / "dataset_manifest.json").write_text(
+        json.dumps(
+            {
+                "single_files": {"qrels": artifact_paths["qrels"]},
+                "artifacts": {
+                    name: {"path": path}
+                    for name, path in artifact_paths.items()
+                    if name != "qrels"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        root / artifact_paths["qrels"],
+        [
+            {
+                "query_table_id": query_id,
+                "target_table_id": target_id,
+                "split": split,
+                "reason": "model_recoverable_join_column",
+                "source_table_id": f"source_{split}_{query_id}",
+                "chain_id": f"chain_{split}_{query_id}",
+                "join_attribute": {"source_column_index": 7},
+            }
+        ],
+    )
+    _write_jsonl(
+        root / artifact_paths["query_tables"],
+        [
+            {
+                "table_id": query_id,
+                "split": split,
+                "columns": [{"column_index": 0, "column_name": "entity"}],
+                "rows": [],
+            }
+        ],
+    )
+    _write_jsonl(
+        root / artifact_paths["data_lake_tables"],
+        [
+            {
+                "table_id": target_id,
+                "split": split,
+                "columns": [
+                    {
+                        "column_index": 2,
+                        "source_column_index": 9,
+                        "column_name": "other",
+                    },
+                    {
+                        "column_index": 5,
+                        "source_column_index": 7,
+                        "column_name": "gold",
+                    },
+                ],
+                "rows": [],
+            }
+        ],
+    )
+    _write_jsonl(root / artifact_paths["bridge_assets"], evidence)
+    _write_jsonl(
+        root / artifact_paths["evidence_recoveries"],
+        [
+            {
+                "query_table_id": query_id,
+                "target_table_id": target_id,
+                "split": split,
+                "evidence": {
+                    "asset_id": item["asset_id"],
+                    "asset_type": item["asset_type"],
+                },
+            }
+            for item in evidence
+        ],
+    )
+    return root
+
+
+def test_select_oracle_evidence_is_deduplicated_stable_and_multimodal():
+    evidence = {
+        "text_z": {"asset_type": "text"},
+        "text_a": {"asset_type": "text"},
+        "image_z": {"asset_type": "image"},
+        "image_a": {"asset_type": "image"},
+        "text_b": {"asset_type": "text"},
+    }
+
+    selected = select_oracle_evidence(
+        ["text_z", "image_z", "text_a", "image_a", "text_b", "text_z"],
+        evidence,
+        top_k=4,
+    )
+
+    assert selected == ("text_a", "image_a", "image_z", "text_b")
+    assert {evidence[item]["asset_type"] for item in selected} == {"text", "image"}
+
+
+def test_oracle_loader_filters_split_matches_recovery_and_maps_local_column(tmp_path):
+    train = _dataset(tmp_path / "lake_train", split="train", query_id="q_train")
+    examples, objects, audit = load_oracle_column_data(
+        [train], splits=("train",), strict=True
+    )
+
+    assert len(examples) == 1
+    assert examples[0].split == "train"
+    assert examples[0].gold_source_column == 7
+    assert examples[0].gold_local_column == 5
+    assert examples[0].gold_column_position == 1
+    assert examples[0].positive_bundle.evidence_ids == ("text_a", "text_b")
+    assert set(objects.queries) == {"q_train"}
+    assert audit["datasets"]["lake_train"]["splits"]["train"]["usable_examples"] == 1
+
+
+def test_oracle_loader_rejects_recovery_target_mismatch(tmp_path):
+    root = _dataset(tmp_path / "lake")
+    recovery_path = root / "evidence_recoveries/part.jsonl"
+    records = [json.loads(line) for line in recovery_path.read_text().splitlines()]
+    for record in records:
+        record["target_table_id"] = "wrong_target"
+    _write_jsonl(recovery_path, records)
+
+    with pytest.raises(OracleDataError, match="recovery") as error:
+        load_oracle_column_data([root], strict=True)
+
+    assert error.value.audit["datasets"]["lake"]["missing"]["recovery"] == [
+        "q1->t1"
+    ]
+
+
+def test_oracle_loader_audits_missing_image_file(tmp_path):
+    root = _dataset(
+        tmp_path / "lake",
+        evidence=[
+            {
+                "asset_id": "image_a",
+                "asset_type": "image",
+                "local_path": str(tmp_path / "missing.jpg"),
+            }
+        ],
+    )
+
+    with pytest.raises(OracleDataError, match="image_file") as error:
+        load_oracle_column_data([root], strict=True)
+
+    assert error.value.audit["datasets"]["lake"]["missing"]["image_file"] == [
+        "image_a"
+    ]
+
+
+def test_oracle_loader_rejects_cross_dataset_id_conflicts(tmp_path):
+    left = _dataset(tmp_path / "left", query_id="shared", target_id="shared_target")
+    right = _dataset(tmp_path / "right", query_id="shared", target_id="shared_target")
+
+    with pytest.raises(OracleDataError, match="ID conflicts") as error:
+        load_oracle_column_data([left, right], splits=("train",), strict=True)
+
+    kinds = {item["kind"] for item in error.value.audit["id_conflicts"]}
+    assert kinds == {"query", "target", "evidence"}
+
+
+class _FrozenBackend:
+    hidden_dim = 3
+
+    def __init__(self) -> None:
+        self.model = torch.nn.Linear(1, 1).eval()
+        self.model.requires_grad_(False)
+
+    def reader_states(self, _query, target, _evidence):
+        count = len(target["columns"])
+        return torch.ones(count, 3), torch.full((count, 3), 2.0)
+
+
+def test_reader_cache_round_trip_and_metadata_mismatch(tmp_path):
+    example = OracleColumnExample(
+        dataset="lake",
+        dataset_root=str(tmp_path / "dataset"),
+        split="train",
+        query_id="q1",
+        target_id="t1",
+        source_table_id="source",
+        chain_id="chain",
+        gold_source_column=7,
+        gold_local_column=5,
+        gold_column_position=1,
+        candidate_column_indices=(2, 5),
+        positive_bundle=EvidenceBundle("t1", 0.0, ("e1",)),
+        evidence_modalities=("text",),
+        evidence_count_before_truncation=1,
+    )
+    objects = Stage2ObjectIndex(
+        {"q1": {"table_id": "q1"}},
+        {"t1": {"table_id": "t1", "columns": [{}, {}]}},
+        {"e1": {"asset_id": "e1", "asset_type": "text"}},
+    )
+    cache_dir = tmp_path / "cache"
+    manifest = build_reader_cache(
+        _FrozenBackend(),
+        [example],
+        objects,
+        cache_dir,
+        model_path=tmp_path / "model",
+        model_dtype="bf16",
+        top_k_evidence=4,
+        evidence_policy=ORACLE_EVIDENCE_POLICY,
+        shard_size=1,
+    )
+    records, fingerprint = load_reader_cache([cache_dir])
+
+    assert manifest["complete"] is True
+    assert fingerprint
+    assert records[0]["open_states"].shape == (2, 3)
+    assert records[0]["gold_column_position"] == 1
+
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        build_reader_cache(
+            _FrozenBackend(),
+            [example],
+            objects,
+            cache_dir,
+            model_path=tmp_path / "different_model",
+            model_dtype="bf16",
+            top_k_evidence=4,
+            evidence_policy=ORACLE_EVIDENCE_POLICY,
+            shard_size=1,
+        )
+
+
+def test_train_stage2_oracle_mode_does_not_require_gate(tmp_path, monkeypatch):
+    events = []
+    example = OracleColumnExample(
+        dataset="lake",
+        dataset_root="dataset",
+        split="train",
+        query_id="q1",
+        target_id="t1",
+        source_table_id="source",
+        chain_id="chain",
+        gold_source_column=1,
+        gold_local_column=1,
+        gold_column_position=0,
+        candidate_column_indices=(1,),
+        positive_bundle=EvidenceBundle("t1", 0.0, ("e1",)),
+        evidence_modalities=("text",),
+        evidence_count_before_truncation=1,
+    )
+    objects = Stage2ObjectIndex({}, {}, {})
+
+    monkeypatch.setattr(
+        train_stage2,
+        "validate_stage2_gate",
+        lambda *_args: pytest.fail("Oracle mode must not validate a Stage-1 gate"),
+    )
+    monkeypatch.setattr(
+        train_stage2,
+        "load_oracle_column_data",
+        lambda *_args, **_kwargs: ([example], objects, {}),
+    )
+
+    class Backend:
+        hidden_dim = 2
+        device = torch.device("cpu")
+
+        def __init__(self, *_args, **_kwargs):
+            events.append("backend")
+
+    monkeypatch.setattr(train_stage2, "QwenStage2Backend", Backend)
+    monkeypatch.setattr(
+        train_stage2,
+        "train_candidate_scorer",
+        lambda *_args, **_kwargs: events.append("train") or [],
+    )
+    monkeypatch.setattr(
+        train_stage2,
+        "save_candidate_scorer",
+        lambda *_args, **_kwargs: events.append("save"),
+    )
+    args = argparse.Namespace(
+        training_source="oracle-positive",
+        dataset_root=["dataset"],
+        retrieval_results=None,
+        stage1_gate=None,
+        output=str(tmp_path / "candidate.pt"),
+        model_dir="model",
+        device="cpu",
+        dtype="fp32",
+        top_k_evidence=4,
+        max_targets=10,
+        epochs=1,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        seed=13,
+    )
+
+    train_stage2.run(args)
+
+    assert events == ["backend", "train", "save"]
+
+
+def test_round1_conclusion_marks_perfect_position_baseline_as_confounded():
+    per_dataset = {
+        "entitables": {"column_accuracy@1": 1.0},
+        "wdc": {"column_accuracy@1": 1.0},
+    }
+    summary = {
+        "seeds": {
+            str(seed): {"trained": {"test": {"by_dataset": per_dataset}}}
+            for seed in (13, 17, 23)
+        },
+        "baselines_test": {
+            "by_dataset": {
+                dataset: {"majority_column_position_accuracy@1": 1.0}
+                for dataset in per_dataset
+            }
+        },
+        "three_seed": {
+            split: {
+                "macro_column_accuracy@1": {"mean": 1.0},
+                "by_dataset_column_accuracy@1": {
+                    dataset: {"mean": 1.0} for dataset in per_dataset
+                },
+            }
+            for split in ("dev", "test")
+        },
+    }
+    audit = {
+        "datasets": {
+            dataset: {
+                "splits": {
+                    split: {"gold_column_position": {"0": count}}
+                    for split, count in (("train", 3), ("dev", 2), ("test", 1))
+                }
+            }
+            for dataset in per_dataset
+        },
+        "cross_split_intersections": {
+            "train__dev": {"source_table_ids": [], "chain_ids": []}
+        },
+        "id_conflicts": [],
+    }
+
+    conclusion = _round1_conclusion(summary, audit)
+
+    assert conclusion["decision_code"] == "C"
+    assert conclusion["improvement_over_majority_by_dataset"] == {
+        "entitables": 0.0,
+        "wdc": 0.0,
+    }
+    assert conclusion["gold_column_position_counts"] == {"0": 12}
+    assert conclusion["perfect_majority_baseline"] is True
+    assert conclusion["identifiability"] == (
+        "confounded_by_degenerate_gold_column_position"
+    )

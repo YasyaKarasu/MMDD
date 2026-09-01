@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -775,6 +776,34 @@ def test_qwen_reader_places_all_evidence_in_one_forward():
     assert "END RETRIEVED EVIDENCE" in rendered_text
     assert "BEGIN CANDIDATE TARGET TABLE" in rendered_text
     assert "SECRET_" not in rendered_text
+
+
+def test_qwen_image_input_uses_first_rgb_frame_for_animated_gif(tmp_path):
+    path = tmp_path / "animated.gif"
+    first = Image.new("RGB", (4, 3), (255, 0, 0))
+    second = Image.new("RGB", (4, 3), (0, 255, 0))
+    first.save(path, save_all=True, append_images=[second], duration=10, loop=0)
+
+    image = QwenStage2Backend._image_input(
+        {"asset_id": "animated", "asset_type": "image", "local_path": str(path)}
+    )
+
+    assert image.mode == "RGB"
+    assert image.size == (4, 3)
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_qwen_image_input_can_cap_pixels(tmp_path):
+    path = tmp_path / "large.png"
+    Image.new("RGB", (200, 100), (1, 2, 3)).save(path)
+
+    image = QwenStage2Backend._image_input(
+        {"asset_id": "large", "asset_type": "image", "local_path": str(path)},
+        max_pixels=5_000,
+    )
+
+    assert image.size == (100, 50)
+    assert image.width * image.height <= 5_000
 
 
 def test_qwen_reader_escapes_marker_literals_in_evidence():
