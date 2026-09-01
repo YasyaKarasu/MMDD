@@ -33,7 +33,6 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field as dataclass_field, replace
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
-from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import quote
@@ -7003,6 +7002,40 @@ def context_columns(
     return [idx for _non_empty, _unique, idx in candidates[:limit]]
 
 
+def balanced_context_partition(
+    columns: list[int],
+    *,
+    seed: int,
+    source_table_id: str,
+) -> tuple[list[int], list[int]]:
+    """Split ordinary columns once per source with a near-even random ratio."""
+    shuffled = list(columns)
+    rng = random.Random(f"context-pool-split:{seed}:{source_table_id}")
+    rng.shuffle(shuffled)
+    if len(shuffled) <= 1:
+        return shuffled, []
+    target_ratio = min(0.7, max(0.3, rng.gauss(0.5, 0.1)))
+    target_count = min(
+        len(shuffled) - 1,
+        max(1, round(len(shuffled) * target_ratio)),
+    )
+    return shuffled[target_count:], shuffled[:target_count]
+
+
+def shuffled_target_columns(
+    join_col: int,
+    target_context: list[int],
+    *,
+    seed: int,
+    source_table_id: str,
+) -> list[int]:
+    columns = [join_col, *target_context]
+    random.Random(
+        f"target-column-order:{seed}:{source_table_id}:{join_col}"
+    ).shuffle(columns)
+    return columns
+
+
 def _explicit_join_fallback_selected(
     source_table: dict[str, Any], args: argparse.Namespace
 ) -> bool:
@@ -7100,13 +7133,7 @@ def _explicit_join_context_partition(
     profiles: dict[int, dict[str, Any]] | None = None,
     values_by_column: dict[int, list[str]] | None = None,
 ) -> tuple[list[int], list[int]]:
-    """Partition ordinary columns once for a source's explicit variants.
-
-    Every explicit query exposes its own join column.  All other join columns
-    are target-only, while the ordinary context columns are split globally
-    into query-only and target-only pools.  This keeps a query from one
-    variant from sharing a source column with a target from another variant.
-    """
+    """Partition ordinary columns once for a source's explicit variants."""
     min_target_rows = int(getattr(args, "min_rows_per_output_table", 2))
     ordinary = context_columns(
         source_table,
@@ -7130,22 +7157,11 @@ def _explicit_join_context_partition(
         )
         >= min_target_rows
     ]
-    max_target_context = int(getattr(args, "max_target_context_attrs", 2))
-    if max_target_context <= 0:
-        target_context = list(ordinary)
-    else:
-        target_context = ordinary[:max_target_context]
-    query_context_pool = [
-        column_index
-        for column_index in ordinary
-        if column_index not in target_context
-    ]
-    max_query_context = int(getattr(args, "max_query_context_attrs", 1))
-    if max_query_context <= 0:
-        query_context = query_context_pool
-    else:
-        query_context = query_context_pool[:max_query_context]
-    return query_context, target_context
+    return balanced_context_partition(
+        ordinary,
+        seed=int(getattr(args, "seed", 13)),
+        source_table_id=str(source_table["source_table_id"]),
+    )
 
 
 def _build_explicit_join_candidate(
@@ -7165,7 +7181,12 @@ def _build_explicit_join_candidate(
     seed = int(getattr(args, "seed", 13))
     source_table_id = str(source_table["source_table_id"])
     query_cols = [entity_col, join_col, *query_context]
-    target_cols = [join_col, *target_context]
+    target_cols = shuffled_target_columns(
+        join_col,
+        target_context,
+        seed=seed,
+        source_table_id=source_table_id,
+    )
     source_rows = source_table.get("rows", [])
     indexed_source_rows = [
         (fallback, row_id(source_row, fallback), source_row)
@@ -7308,7 +7329,7 @@ def _materialize_explicit_join_candidate(
     query_context = [int(value) for value in candidate.get("query_context_column_indices", [])]
     target_context = [int(value) for value in candidate.get("target_context_column_indices", [])]
     query_cols = [entity_col, join_col, *query_context]
-    target_cols = [join_col, *target_context]
+    target_cols = [int(value) for value in candidate["target_column_indices"]]
     query_rows, query_source_rows = project_selected_rows(
         source_table,
         query_cols,
@@ -7640,12 +7661,7 @@ def multi_attribute_context_layout(
     args: argparse.Namespace,
     profiles: dict[int, dict[str, Any]] | None = None,
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
-    """Assign safe query/target contexts for all qualified bridge columns.
-
-    Every qualified bridge column is target-only. Ordinary context columns are
-    partitioned once per source table so no sibling query and target share a
-    source column. Narrow tables fall back to the single best bridge column.
-    """
+    """Assign one source-level context partition to every bridge variant."""
     if not qualified_cols:
         return []
 
@@ -7669,65 +7685,15 @@ def multi_attribute_context_layout(
         0,
         profiles=profiles,
     )
-    query_context_width = max(
-        1, int(getattr(args, "max_query_context_attrs", 1))
+    query_context, target_context = balanced_context_partition(
+        ordinary_contexts,
+        seed=int(getattr(args, "seed", 13)),
+        source_table_id=str(source_table["source_table_id"]),
     )
-    if (
-        len(ordered_qualified) > 1
-        and len(ordinary_contexts) >= query_context_width + 1
-    ):
-        seed = int(getattr(args, "seed", 13))
-        source_table_id = str(source_table["source_table_id"])
-        ordered_contexts = sorted(
-            ordinary_contexts,
-            key=lambda column_index: (
-                stable_hash(
-                    "multi-attribute-context",
-                    seed,
-                    source_table_id,
-                    column_index,
-                    length=40,
-                ),
-                column_index,
-            ),
-        )
-        target_context = [ordered_contexts[0]]
-        query_context_pool = ordered_contexts[1:]
-        query_contexts = [
-            list(context)
-            for context in combinations(
-                query_context_pool,
-                query_context_width,
-            )
-        ]
-        if query_contexts:
-            return [
-                (
-                    qualified,
-                    query_contexts[index % len(query_contexts)],
-                    target_context,
-                )
-                for index, qualified in enumerate(ordered_qualified)
-            ]
-
-    best = select_best_qualified_column(ordered_qualified)[0]
-    join_col = int(best["column_index"])
-    other_cols = context_columns(
-        source_table,
-        {entity_col, join_col},
-        0,
-        profiles=profiles,
-    )
-    if not other_cols:
-        return []
-    query_context = other_cols[:query_context_width]
-    target_context_pool = [
-        column_index
-        for column_index in other_cols
-        if column_index not in query_context
+    return [
+        (qualified, list(query_context), list(target_context))
+        for qualified in ordered_qualified
     ]
-    target_context = target_context_pool[:1]
-    return [(best, query_context, target_context)]
 
 
 def visible_query_fingerprint(
@@ -7737,9 +7703,14 @@ def visible_query_fingerprint(
     query_rows: list[dict[str, Any]],
 ) -> str:
     visible_payload = {
+        "source_column_indices": query_cols,
         "column_names": [
             get_column_name(source_table, column_index)
             for column_index in query_cols
+        ],
+        "source_row_ids": [
+            int(row["source_row_id"])
+            for row in query_rows
         ],
         "rows": [
             [
@@ -7761,13 +7732,9 @@ def validate_implicit_query_uniqueness(
     *,
     expected_query_count: int | None = None,
 ) -> int:
-    """Reject ambiguous implicit queries with more than one qrel.
-
-    An implicit query does not expose the requested hidden attribute.  Giving
-    identical visible input multiple target labels would therefore make a
-    single-target retrieval evaluation under-specified.
-    """
-    seen: dict[str, tuple[str, str]] = {}
+    """Allow multiple positives per query while rejecting duplicate labels."""
+    seen_queries: set[str] = set()
+    seen_qrels: set[tuple[str, str, str]] = set()
     for qrel in qrels:
         if clean_text(qrel.get("reason")) != "model_recoverable_join_column":
             continue
@@ -7785,21 +7752,24 @@ def validate_implicit_query_uniqueness(
             if join_attribute.get("source_column_index") is not None
             else join_attribute.get("column_name")
         )
-        current = (target_id, attribute)
-        previous = seen.get(query_id)
-        if previous is not None:
+        current = (query_id, target_id, attribute)
+        if current in seen_qrels:
             raise ValueError(
-                "implicit query must have exactly one qrel: "
-                f"query_table_id={query_id!r}, first={previous!r}, "
-                f"second={current!r}"
+                "duplicate implicit query qrel: "
+                f"query_table_id={query_id!r}, target_table_id={target_id!r}, "
+                f"attribute={attribute!r}"
             )
-        seen[query_id] = current
-    if expected_query_count is not None and len(seen) != expected_query_count:
+        seen_qrels.add(current)
+        seen_queries.add(query_id)
+    if (
+        expected_query_count is not None
+        and len(seen_queries) != expected_query_count
+    ):
         raise ValueError(
             "implicit query/qrel count mismatch: "
-            f"queries={expected_query_count}, qrels={len(seen)}"
+            f"queries={expected_query_count}, qrel_queries={len(seen_queries)}"
         )
-    return len(seen)
+    return len(seen_queries)
 
 
 def required_recovered_row_count(
@@ -9674,9 +9644,9 @@ def build_table_join_records(
 
     query_tables: list[dict[str, Any]] = []
     query_by_fingerprint: dict[str, dict[str, Any]] = {}
-    claimed_query_fingerprints: set[str] = set()
     data_lake_tables: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
+    qrel_keys: set[tuple[str, str, int]] = set()
     emitted_qualified_cols: list[dict[str, Any]] = []
     max_query_row_views = (
         configured_max_train_query_row_views_per_join(args)
@@ -9695,9 +9665,12 @@ def build_table_join_records(
         if not selected_source_row_views:
             continue
         query_cols = [entity_col] + query_context
-        target_cols = [join_col] + target_context
-        if len(query_cols) < 2 or not target_cols:
-            continue
+        target_cols = shuffled_target_columns(
+            join_col,
+            target_context,
+            seed=int(getattr(args, "seed", 13)),
+            source_table_id=str(source_table["source_table_id"]),
+        )
         all_source_row_ids = {
             row_id(source_row, fallback)
             for fallback, source_row in enumerate(source_table.get("rows", []))
@@ -9750,10 +9723,6 @@ def build_table_join_records(
                 query_cols=query_cols,
                 query_rows=query_rows,
             )
-            if query_fingerprint in claimed_query_fingerprints:
-                # Only one hidden target may own an identical visible query.
-                continue
-            claimed_query_fingerprints.add(query_fingerprint)
             view_candidates = query_visible_recovery_candidates(
                 (
                     candidate
@@ -9872,32 +9841,42 @@ def build_table_join_records(
             query_table_id = (
                 f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
             )
-            query_table = table_record(
-                table_id=query_table_id,
-                role="query",
-                split=split,
-                source_table=source_table,
-                column_indices=query_cols,
-                rows=query_rows,
-                source_row_indices=query_source_rows,
-                extra={
-                    "chain_id": chain_id,
-                    "chain_ids": [chain_id],
-                    "query_entity_col": entity_col,
-                    "query_entity_col_name": get_column_name(
-                        source_table, entity_col
-                    ),
-                    "hidden_attributes": [view_hidden_attribute],
-                    "target_table_ids": [target_table_id],
-                    "query_context_col_names": [
-                        get_column_name(source_table, col)
-                        for col in query_context
-                    ],
-                    "row_view_index": row_view_index,
-                },
-            )
-            query_by_fingerprint[query_fingerprint] = query_table
-            query_tables.append(query_table)
+            qrel_key = (query_table_id, target_table_id, join_col)
+            if qrel_key in qrel_keys:
+                continue
+            qrel_keys.add(qrel_key)
+            query_table = query_by_fingerprint.get(query_fingerprint)
+            if query_table is None:
+                query_table = table_record(
+                    table_id=query_table_id,
+                    role="query",
+                    split=split,
+                    source_table=source_table,
+                    column_indices=query_cols,
+                    rows=query_rows,
+                    source_row_indices=query_source_rows,
+                    extra={
+                        "chain_id": chain_id,
+                        "chain_ids": [chain_id],
+                        "query_entity_col": entity_col,
+                        "query_entity_col_name": get_column_name(
+                            source_table, entity_col
+                        ),
+                        "hidden_attributes": [view_hidden_attribute],
+                        "target_table_ids": [target_table_id],
+                        "query_context_col_names": [
+                            get_column_name(source_table, col)
+                            for col in query_context
+                        ],
+                        "row_view_index": row_view_index,
+                    },
+                )
+                query_by_fingerprint[query_fingerprint] = query_table
+                query_tables.append(query_table)
+            else:
+                query_table["chain_ids"].append(chain_id)
+                query_table["hidden_attributes"].append(view_hidden_attribute)
+                query_table["target_table_ids"].append(target_table_id)
 
             emitted_view_count += 1
             qrels.append(
@@ -10911,8 +10890,11 @@ def _build_dataset(
             "tables without a candidate entity column or enough linked entity rows for one query are filtered before the seeded global source-table sample",
             "train join chains emit up to max_train_query_row_views_per_join deterministic disjoint row views; dev/test emit one canonical view",
             "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table sampled rows",
-            "wide source tables emit one variant per qualifying bridge attribute; all qualifying bridge columns stay out of every sibling query, and ordinary context columns are partitioned into source-level query-only and target-only sides",
-            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
+            "wide source tables emit one variant per qualifying bridge attribute; "
+            "all qualifying bridge columns stay out of the shared ordinary context "
+            "pool, which is split into source-level query-only and target-only sides",
+            "qualified attributes with the same exact visible query row view are "
+            "merged into one query with multiple positive targets",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "evidence_recoveries record query_table -> multimodal evidence -> target_table paths at entity/row/attribute granularity",
@@ -10965,9 +10947,22 @@ def _build_dataset(
             "min_recovery_denominator": args.min_recovery_denominator,
             "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
             "max_query_context_attrs": args.max_query_context_attrs,
+            "max_target_context_attrs": args.max_target_context_attrs,
+            "context_attr_limit_policy": "compatibility_flags_ignored",
+            "context_partition_policy": (
+                "source_level_seeded_gaussian_target_ratio_mean_0.5_"
+                "std_0.1_clipped_0.3_0.7"
+            ),
             "qualified_attribute_policy": "all_safe_variants",
-            "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
-            "identical_visible_query_policy": "keep_best_recovery_single_target",
+            "sibling_source_column_policy": (
+                "qualified_bridge_columns_excluded_from_shared_context_pools"
+            ),
+            "identical_visible_query_policy": (
+                "merge_exact_row_view_with_all_distinct_positive_targets"
+            ),
+            "target_column_order_policy": (
+                "independently_seeded_shuffle_per_join_column"
+            ),
         },
         "source_sampling": source_sampling,
         "model_endpoints": {
@@ -11199,8 +11194,18 @@ def parse_args(
         help="Minimum valid entity row count for a candidate join column.",
     )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0, help="0 means emit all qualifying join columns.")
-    parser.add_argument("--max_query_context_attrs", type=int, default=1)
-    parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--max_query_context_attrs",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; all query-pool columns are emitted.",
+    )
+    parser.add_argument(
+        "--max_target_context_attrs",
+        type=int,
+        default=2,
+        help="Deprecated compatibility option; all target-pool columns are emitted.",
+    )
     parser.add_argument(
         "--explicit_join_fallback_mode",
         choices=EXPLICIT_JOIN_FALLBACK_MODES,

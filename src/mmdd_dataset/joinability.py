@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,9 @@ from .utils import (
 )
 
 
+JOINABILITY_POLICY_VERSION = "balanced_context_multi_positive_v1"
+
+
 @dataclass(frozen=True)
 class BuildConfig:
     query_rows: int = 5
@@ -25,6 +29,7 @@ class BuildConfig:
     min_column_non_empty_ratio: float = 0.5
     max_query_additional_columns: int = 1
     max_target_additional_columns: int = 2
+    seed: int = 13
 
 
 def _profiles(table: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -123,6 +128,57 @@ def _rank_additional_columns(
             -profiles[index]["unique_ratio"],
             index,
         ),
+    )
+
+
+def _balanced_context_partition(
+    columns: list[int],
+    *,
+    seed: int,
+    source_table_id: str,
+) -> tuple[list[int], list[int]]:
+    """Split ordinary columns once per source with a near-even random ratio."""
+    shuffled = list(columns)
+    rng = random.Random(f"context-pool-split:{seed}:{source_table_id}")
+    rng.shuffle(shuffled)
+    if len(shuffled) <= 1:
+        return shuffled, []
+    target_ratio = min(0.7, max(0.3, rng.gauss(0.5, 0.1)))
+    target_count = min(
+        len(shuffled) - 1,
+        max(1, round(len(shuffled) * target_ratio)),
+    )
+    return shuffled[target_count:], shuffled[:target_count]
+
+
+def _shuffled_target_columns(
+    join_col: int,
+    target_context: list[int],
+    *,
+    seed: int,
+    source_table_id: str,
+) -> list[int]:
+    columns = [join_col, *target_context]
+    random.Random(
+        f"target-column-order:{seed}:{source_table_id}:{join_col}"
+    ).shuffle(columns)
+    return columns
+
+
+def _visible_query_fingerprint(
+    table: dict[str, Any],
+    column_indices: list[int],
+    rows: list[dict[str, Any]],
+) -> str:
+    return stable_hash(
+        "visible-query",
+        table["source_table_id"],
+        column_indices,
+        [row["source_row_id"] for row in rows],
+        [
+            [clean_text(cell.get("text")) for cell in row.get("cells", [])]
+            for row in rows
+        ],
     )
 
 
@@ -225,7 +281,12 @@ def _materialize_join(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     join_col = qualified["column_index"]
     query_columns = [entity_col, *query_additional]
-    target_columns = [join_col, *target_additional]
+    target_columns = _shuffled_target_columns(
+        join_col,
+        target_additional,
+        seed=config.seed,
+        source_table_id=table["source_table_id"],
+    )
 
     query_source_rows = _select_query_rows(qualified, config.query_rows)
     target_source_rows = [
@@ -237,7 +298,8 @@ def _materialize_join(
     target_rows, target_source_rows = _project(table, target_columns, set(target_source_rows))
 
     chain_id = f"chain_{stable_hash(table['source_table_id'], entity_col, join_col)}"
-    query_id = f"query_{stable_hash(chain_id, 'query')}"
+    query_fingerprint = _visible_query_fingerprint(table, query_columns, query_rows)
+    query_id = f"query_{stable_hash(table['source_table_id'], query_fingerprint)}"
     target_id = f"target_{stable_hash(chain_id, 'target')}"
     selected_recovered_rows = sum(
         source_row_id in qualified["recoveries"]
@@ -262,6 +324,7 @@ def _materialize_join(
         source_row_ids=query_source_rows,
         extra={
             "chain_id": chain_id,
+            "chain_ids": [chain_id],
             "query_entity_col": entity_col,
             "query_entity_col_name": get_column_name(table, entity_col),
             "hidden_attributes": [hidden_attribute],
@@ -300,7 +363,9 @@ def _materialize_join(
     for source_row_id in query_source_rows:
         for extraction in qualified["recoveries"].get(source_row_id, []):
             asset = assets_by_id.get(extraction["asset_id"], {})
-            recovery_id = "rec_" + stable_hash(query_id, source_row_id, extraction["asset_id"])
+            recovery_id = "rec_" + stable_hash(
+                query_id, target_id, source_row_id, extraction["asset_id"]
+            )
             recoveries.append(
                 {
                     "recovery_id": recovery_id,
@@ -371,19 +436,21 @@ def _build_joinability_for_table(
             "table_queryability_decisions": decisions,
         }
 
-    candidate = qualified[0]
-    if sum(
-        bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
-        for row in table["rows"]
-    ) >= config.min_target_rows:
-        additional = _rank_additional_columns(
-            table, {entity_col, candidate["column_index"]}
-        )
-        query_width = config.max_query_additional_columns
-        query_additional = additional[:query_width]
-        target_additional = additional[
-            query_width : query_width + config.max_target_additional_columns
-        ]
+    qualified_indices = {int(candidate["column_index"]) for candidate in qualified}
+    additional = _rank_additional_columns(table, {entity_col, *qualified_indices})
+    query_additional, target_additional = _balanced_context_partition(
+        additional,
+        seed=config.seed,
+        source_table_id=table["source_table_id"],
+    )
+    query_by_id: dict[str, dict[str, Any]] = {}
+    qrel_keys: set[tuple[str, str, int]] = set()
+    for candidate in qualified:
+        if sum(
+            bool(clean_text(get_cell(row, candidate["column_index"]).get("text")))
+            for row in table["rows"]
+        ) < config.min_target_rows:
+            continue
         query, target, qrel, paths = _materialize_join(
             table,
             split,
@@ -394,7 +461,22 @@ def _build_joinability_for_table(
             query_additional,
             target_additional,
         )
-        queries.append(query)
+        qrel_key = (
+            qrel["query_table_id"],
+            qrel["target_table_id"],
+            int(candidate["column_index"]),
+        )
+        if qrel_key in qrel_keys:
+            continue
+        qrel_keys.add(qrel_key)
+        existing_query = query_by_id.get(query["table_id"])
+        if existing_query is None:
+            query_by_id[query["table_id"]] = query
+            queries.append(query)
+        else:
+            existing_query["chain_ids"].append(qrel["chain_id"])
+            existing_query["hidden_attributes"].extend(query["hidden_attributes"])
+            existing_query["target_table_ids"].append(target["table_id"])
         targets.append(target)
         qrels.append(qrel)
         recoveries.extend(paths)

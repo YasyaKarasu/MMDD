@@ -3517,7 +3517,8 @@ def build_dataset(
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "query row views balance recoverable evidence while projected targets retain every source row",
             "wide source tables may emit one query variant per qualifying bridge attribute",
-            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
+            "qualified attributes with the same exact visible query row view are "
+            "merged into one query with multiple positive targets",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query/target/qrel/evidence construction is delegated to build_mm_joinability_dataset.py",
             "every local-positive evidence candidate for a final accepted query receives an exhaustive auto-check before evidence_recoveries are materialized",
@@ -3574,9 +3575,22 @@ def build_dataset(
             "min_recovery_denominator": args.min_recovery_denominator,
             "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
             "max_query_context_attrs": args.max_query_context_attrs,
+            "max_target_context_attrs": args.max_target_context_attrs,
+            "context_attr_limit_policy": "compatibility_flags_ignored",
+            "context_partition_policy": (
+                "source_level_seeded_gaussian_target_ratio_mean_0.5_"
+                "std_0.1_clipped_0.3_0.7"
+            ),
             "qualified_attribute_policy": "all_safe_variants",
-            "sibling_source_column_policy": "globally_disjoint_query_and_target_sides",
-            "identical_visible_query_policy": "keep_best_recovery_single_target",
+            "sibling_source_column_policy": (
+                "qualified_bridge_columns_excluded_from_shared_context_pools"
+            ),
+            "identical_visible_query_policy": (
+                "merge_exact_row_view_with_all_distinct_positive_targets"
+            ),
+            "target_column_order_policy": (
+                "independently_seeded_shuffle_per_join_column"
+            ),
         },
         "model_endpoints": {
             "model_endpoint_config": args.model_endpoint_config,
@@ -3757,8 +3771,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
-    parser.add_argument("--max_query_context_attrs", type=int, default=1)
-    parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--max_query_context_attrs",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; all query-pool columns are emitted.",
+    )
+    parser.add_argument(
+        "--max_target_context_attrs",
+        type=int,
+        default=2,
+        help="Deprecated compatibility option; all target-pool columns are emitted.",
+    )
     parser.add_argument(
         "--explicit_join_fallback_mode",
         choices=join_builder.EXPLICIT_JOIN_FALLBACK_MODES,

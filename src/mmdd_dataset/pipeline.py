@@ -10,7 +10,12 @@ from .extraction import (
     auto_check_recoveries,
     build_extractions,
 )
-from .joinability import BuildConfig, build_joinability_dataset, table_asset_links
+from .joinability import (
+    JOINABILITY_POLICY_VERSION,
+    BuildConfig,
+    build_joinability_dataset,
+    table_asset_links,
+)
 from .tables import prepare_entitables, prepare_wdc
 from .utils import read_jsonl, source_splits, write_json, write_jsonl
 
@@ -122,6 +127,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         extractions = []
 
     config = BuildConfig(
+        seed=args.seed,
         query_rows=args.query_rows,
         min_target_rows=args.min_target_rows,
         min_recovered_ratio=args.min_recovered_ratio,
@@ -178,6 +184,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         output_dir / "dataset_manifest.json",
         {
             "format": "mmdd_joinability_research_v2",
+            "query_construction": {
+                "policy_version": JOINABILITY_POLICY_VERSION,
+                "context_attr_limit_policy": "compatibility_flags_ignored",
+                "identical_visible_query_policy": "multiple_positive_targets",
+                "target_column_order_policy": "seeded_shuffle_per_join_column",
+            },
             "artifacts": {
                 artifact: {"path": f"{artifact}.jsonl", "records": counts[artifact]}
                 for artifact in ARTIFACTS
@@ -248,8 +260,18 @@ def parser() -> argparse.ArgumentParser:
     algorithm.add_argument("--min-recovered-ratio", type=float, default=0.6)
     algorithm.add_argument("--min-recovered-rows", type=int, default=3)
     algorithm.add_argument("--min-column-non-empty-ratio", type=float, default=0.5)
-    algorithm.add_argument("--max-query-additional-columns", type=int, default=1)
-    algorithm.add_argument("--max-target-additional-columns", type=int, default=2)
+    algorithm.add_argument(
+        "--max-query-additional-columns",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; all query-pool columns are emitted.",
+    )
+    algorithm.add_argument(
+        "--max-target-additional-columns",
+        type=int,
+        default=2,
+        help="Deprecated compatibility option; all target-pool columns are emitted.",
+    )
     return result
 
 

@@ -208,7 +208,7 @@ def auto_check_recoveries(
     }
     asset_by_id = {asset["asset_id"]: asset for asset in assets}
     checked_recoveries: list[dict[str, Any]] = []
-    supported_rows: dict[str, set[int]] = {}
+    supported_rows: dict[tuple[str, str], set[int]] = {}
 
     for recovery in progress(
         artifacts["evidence_recoveries"],
@@ -309,36 +309,55 @@ def auto_check_recoveries(
                 },
             }
         )
-        supported_rows.setdefault(query_id, set()).add(query_row_id)
+        supported_rows.setdefault(
+            (query_id, recovery["target_table_id"]), set()
+        ).add(query_row_id)
 
-    retained_query_ids: set[str] = set()
-    retained_queries: list[dict[str, Any]] = []
-    for query in artifacts["query_tables"]:
-        hidden = list(query.get("hidden_attributes") or [])
-        required = int(hidden[0].get("required_recovered_rows", 0)) if hidden else 0
-        recovered_rows = len(supported_rows.get(query["table_id"], set()))
+    retained_qrels: list[dict[str, Any]] = []
+    hidden_by_query: dict[str, list[dict[str, Any]]] = {}
+    targets_by_query: dict[str, list[str]] = {}
+    chains_by_query: dict[str, list[str]] = {}
+    retained_pairs: set[tuple[str, str]] = set()
+    for qrel in artifacts["qrels"]:
+        query_id = qrel["query_table_id"]
+        target_id = qrel["target_table_id"]
+        hidden = dict(qrel.get("join_attribute") or {})
+        required = int(hidden.get("required_recovered_rows", 0))
+        recovered_rows = len(supported_rows.get((query_id, target_id), set()))
         if recovered_rows < required:
             continue
-        updated_hidden = [
-            {
-                **item,
-                "recovered_rows": recovered_rows,
-                "recovered_value_ratio": (
-                    recovered_rows / len(query["rows"])
-                    if query["rows"]
-                    else 0.0
-                ),
-            }
-            for item in hidden
-        ]
-        retained_query_ids.add(query["table_id"])
-        retained_queries.append({**query, "hidden_attributes": updated_hidden})
+        query = query_by_id[query_id]
+        updated_hidden = {
+            **hidden,
+            "recovered_rows": recovered_rows,
+            "recovered_value_ratio": (
+                recovered_rows / len(query["rows"])
+                if query["rows"]
+                else 0.0
+            ),
+        }
+        retained_qrels.append({**qrel, "join_attribute": updated_hidden})
+        hidden_by_query.setdefault(query_id, []).append(updated_hidden)
+        targets_by_query.setdefault(query_id, []).append(target_id)
+        chains_by_query.setdefault(query_id, []).append(qrel["chain_id"])
+        retained_pairs.add((query_id, target_id))
 
-    retained_qrels = [
-        qrel
-        for qrel in artifacts["qrels"]
-        if qrel["query_table_id"] in retained_query_ids
-    ]
+    retained_queries = []
+    for query in artifacts["query_tables"]:
+        query_id = query["table_id"]
+        chain_ids = chains_by_query.get(query_id, [])
+        if not chain_ids:
+            continue
+        retained_queries.append(
+            {
+                **query,
+                "chain_id": chain_ids[0],
+                "chain_ids": chain_ids,
+                "hidden_attributes": hidden_by_query[query_id],
+                "target_table_ids": targets_by_query[query_id],
+            }
+        )
+
     retained_target_ids = {qrel["target_table_id"] for qrel in retained_qrels}
     return {
         **artifacts,
@@ -352,6 +371,7 @@ def auto_check_recoveries(
         "evidence_recoveries": [
             recovery
             for recovery in checked_recoveries
-            if recovery["query_table_id"] in retained_query_ids
+            if (recovery["query_table_id"], recovery["target_table_id"])
+            in retained_pairs
         ],
     }

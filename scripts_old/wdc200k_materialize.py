@@ -2553,6 +2553,11 @@ def _parameter_payload(
         ),
         "max_query_context_attrs": int(args.max_query_context_attrs),
         "max_target_context_attrs": int(args.max_target_context_attrs),
+        "context_attr_limit_policy": "compatibility_flags_ignored",
+        "context_partition_policy": (
+            "source_level_seeded_gaussian_target_ratio_mean_0.5_"
+            "std_0.1_clipped_0.3_0.7"
+        ),
         "explicit_join_fallback_mode": (
             join_builder.configured_explicit_join_fallback_mode(args)
         ),
@@ -2567,10 +2572,13 @@ def _parameter_payload(
         "target_row_scope": "all_source_rows",
         "qualified_attribute_policy": "all_safe_variants",
         "sibling_source_column_policy": (
-            "globally_disjoint_query_and_target_sides"
+            "qualified_bridge_columns_excluded_from_shared_context_pools"
         ),
         "identical_visible_query_policy": (
-            "keep_best_recovery_single_target"
+            "merge_exact_row_view_with_all_distinct_positive_targets"
+        ),
+        "target_column_order_policy": (
+            "independently_seeded_shuffle_per_join_column"
         ),
         "auto_check_schema_version": (
             join_builder.MODEL_AUTO_CHECK_SCHEMA_VERSION
@@ -7180,19 +7188,29 @@ def _validate_global_counts(
                 """
             ).fetchone()[0]
         )
-        ambiguous_implicit_queries = int(
+        duplicate_implicit_qrels = int(
             connection.execute(
                 """
                 SELECT COUNT(*) FROM (
-                    SELECT json_extract(
-                        record_json, '$.query_table_id'
-                    ) AS query_table_id
+                    SELECT
+                        json_extract(record_json, '$.query_table_id') AS query_table_id,
+                        json_extract(record_json, '$.target_table_id') AS target_table_id,
+                        COALESCE(
+                            CAST(json_extract(
+                                record_json,
+                                '$.join_attribute.source_column_index'
+                            ) AS TEXT),
+                            json_extract(
+                                record_json,
+                                '$.join_attribute.column_name'
+                            )
+                        ) AS join_attribute
                     FROM materialized_records
                     WHERE artifact = 'qrels'
                       AND json_extract(
                           record_json, '$.reason'
                       ) = 'model_recoverable_join_column'
-                    GROUP BY query_table_id
+                    GROUP BY query_table_id, target_table_id, join_attribute
                     HAVING COUNT(*) > 1
                 )
                 """
@@ -7202,8 +7220,8 @@ def _validate_global_counts(
         raise ValueError("global query table without qrel")
     if invalid_qrel_references:
         raise ValueError("global qrel reference closure is invalid")
-    if ambiguous_implicit_queries:
-        raise ValueError("global implicit query has multiple qrels")
+    if duplicate_implicit_qrels:
+        raise ValueError("global implicit query has a duplicate qrel")
     return counts
 
 
@@ -7531,7 +7549,8 @@ def _stats_payload(
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "wide source tables may emit multiple query variants, one per "
             "qualifying bridge attribute",
-            "when qualified attributes produce identical visible queries, only the highest-recovery deterministic attribute/target is retained so every implicit query has exactly one qrel",
+            "qualified attributes with the same exact visible query row view are "
+            "merged into one query with multiple positive targets",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
             "query construction is delegated to "
             "build_mm_joinability_dataset.py",

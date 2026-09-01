@@ -13,7 +13,12 @@ from typing import Any, Callable, Iterable, Iterator
 from mmdd_progress import progress
 
 from .extraction import OpenAICompatibleExtractor, PROMPT_VERSION
-from .joinability import BuildConfig, build_joinability_for_table, table_asset_links
+from .joinability import (
+    JOINABILITY_POLICY_VERSION,
+    BuildConfig,
+    build_joinability_for_table,
+    table_asset_links,
+)
 from .utils import clean_text, get_cell, get_column_name, stable_hash
 from .wdc_adapter import adapt_table, iter_candidates, iter_gzip_paths, sample_entities
 from .wdc_evidence import (
@@ -1212,6 +1217,7 @@ def _group_by_table(records: Iterable[dict[str, Any]]) -> dict[str, list[dict[st
 
 def _build_config(config: WdcPipelineConfig) -> BuildConfig:
     return BuildConfig(
+        seed=config.seed,
         query_rows=config.query_rows,
         min_target_rows=config.min_target_rows,
         min_recovered_ratio=config.min_recovered_ratio,
@@ -1331,7 +1337,10 @@ def _final_manifest(
             "random_seed": config.seed,
             "target_tables": config.target_tables,
             "records_per_input_shard": config.shard_size,
-            "joinability": asdict(_build_config(config)),
+            "joinability": {
+                **asdict(_build_config(config)),
+                "policy_version": JOINABILITY_POLICY_VERSION,
+            },
             "extraction": extraction_identity,
             "split": {
                 "split_by": "source_table_id",
@@ -1388,6 +1397,7 @@ def run_materialize(
         ),
     )
     parameters["split_policy"] = "query_only_shared_data_lake_v1"
+    parameters["joinability_policy"] = JOINABILITY_POLICY_VERSION
     input_fingerprint = _stage_input_fingerprint(config, *required)
     root.mkdir(parents=True, exist_ok=True)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1571,8 +1581,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-recovered-ratio", type=float, default=0.6)
     result.add_argument("--min-recovered-rows", type=int, default=3)
     result.add_argument("--min-column-non-empty-ratio", type=float, default=0.5)
-    result.add_argument("--max-query-additional-columns", type=int, default=1)
-    result.add_argument("--max-target-additional-columns", type=int, default=2)
+    result.add_argument(
+        "--max-query-additional-columns",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; all query-pool columns are emitted.",
+    )
+    result.add_argument(
+        "--max-target-additional-columns",
+        type=int,
+        default=2,
+        help="Deprecated compatibility option; all target-pool columns are emitted.",
+    )
     result.add_argument("--train-ratio", type=float, default=0.8)
     result.add_argument("--dev-ratio", type=float, default=0.1)
     result.add_argument("--test-ratio", type=float, default=0.1)

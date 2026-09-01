@@ -6889,8 +6889,18 @@ def parse_args(
         ),
     )
     parser.add_argument("--max_query_tables_per_source_table", type=int, default=0)
-    parser.add_argument("--max_query_context_attrs", type=int, default=1)
-    parser.add_argument("--max_target_context_attrs", type=int, default=2)
+    parser.add_argument(
+        "--max_query_context_attrs",
+        type=int,
+        default=1,
+        help="Deprecated compatibility option; all query-pool columns are emitted.",
+    )
+    parser.add_argument(
+        "--max_target_context_attrs",
+        type=int,
+        default=2,
+        help="Deprecated compatibility option; all target-pool columns are emitted.",
+    )
     parser.add_argument(
         "--explicit_join_fallback_mode",
         choices=join_builder.EXPLICIT_JOIN_FALLBACK_MODES,
