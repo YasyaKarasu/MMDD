@@ -162,6 +162,55 @@ def test_oracle_loader_filters_split_matches_recovery_and_maps_local_column(tmp_
     assert audit["datasets"]["lake_train"]["splits"]["train"]["usable_examples"] == 1
 
 
+def test_oracle_loader_accepts_multiple_targets_for_one_query(tmp_path):
+    root = _dataset(tmp_path / "lake", query_id="q", target_id="t1")
+    qrels_path = root / "qrels.jsonl"
+    qrels = [json.loads(line) for line in qrels_path.read_text().splitlines()]
+    qrels.append(
+        {
+            **qrels[0],
+            "target_table_id": "t2",
+            "chain_id": "chain_t2",
+            "join_attribute": {"source_column_index": 8},
+        }
+    )
+    _write_jsonl(qrels_path, qrels)
+
+    targets_path = root / "data_lake_tables/part.jsonl"
+    targets = [json.loads(line) for line in targets_path.read_text().splitlines()]
+    targets.append(
+        {
+            **targets[0],
+            "table_id": "t2",
+            "columns": [
+                {
+                    "column_index": 4,
+                    "source_column_index": 8,
+                    "column_name": "second_gold",
+                }
+            ],
+        }
+    )
+    _write_jsonl(targets_path, targets)
+
+    recoveries_path = root / "evidence_recoveries/part.jsonl"
+    recoveries = [json.loads(line) for line in recoveries_path.read_text().splitlines()]
+    recoveries.append({**recoveries[0], "target_table_id": "t2"})
+    _write_jsonl(recoveries_path, recoveries)
+
+    examples, objects, audit = load_oracle_column_data(
+        [root], splits=("train",), strict=True
+    )
+
+    assert [(example.query_id, example.target_id) for example in examples] == [
+        ("q", "t1"),
+        ("q", "t2"),
+    ]
+    assert [example.gold_source_column for example in examples] == [7, 8]
+    assert set(objects.targets) == {"t1", "t2"}
+    assert audit["datasets"]["lake"]["duplicate_qrel_pairs"] == []
+
+
 def test_oracle_loader_rejects_recovery_target_mismatch(tmp_path):
     root = _dataset(tmp_path / "lake")
     recovery_path = root / "evidence_recoveries/part.jsonl"

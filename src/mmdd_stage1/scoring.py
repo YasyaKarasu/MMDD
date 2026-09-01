@@ -23,6 +23,7 @@ class ListScores:
     logits: torch.Tensor
     candidate_mask: torch.Tensor
     positive_indices: torch.Tensor
+    positive_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,71 @@ def _score_teacher_pairs(
 def _mask(lengths: Sequence[int], width: int, device: torch.device) -> torch.Tensor:
     length_tensor = torch.tensor(lengths, device=device)
     return torch.arange(width, device=device).unsqueeze(0) < length_tensor.unsqueeze(1)
+
+
+def _candidate_positive_mask(
+    candidate_rows: Sequence[Sequence[str]],
+    positive_id_sets: Sequence[set[str]],
+    width: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if len(candidate_rows) != len(positive_id_sets):
+        raise ValueError("Candidate rows and positive ID sets must have equal lengths")
+    mask = pad_sequence(
+        [
+            torch.tensor(
+                [candidate_id in positive_ids for candidate_id in candidate_ids],
+                dtype=torch.bool,
+                device=device,
+            )
+            for candidate_ids, positive_ids in zip(candidate_rows, positive_id_sets)
+        ],
+        batch_first=True,
+        padding_value=False,
+    )
+    if mask.shape != (len(candidate_rows), width):
+        raise ValueError("Positive mask width must match the scored candidate lists")
+    return mask
+
+
+def _target_positive_id_set(
+    example: TargetExample, fallback_index: int
+) -> set[str]:
+    return set(example.positive_target_ids) or {
+        example.candidates[fallback_index].target_id
+    }
+
+
+def target_positive_mask(
+    examples: Sequence[TargetExample],
+    width: int,
+    device: torch.device,
+    *,
+    channel: str,
+) -> torch.Tensor:
+    """Build the complete positive mask for a target-list channel."""
+
+    if channel not in {"direct", "evidence"}:
+        raise ValueError("channel must be 'direct' or 'evidence'")
+    candidate_rows = [
+        [candidate.target_id for candidate in example.candidates]
+        for example in examples
+    ]
+    fallback_indices = [
+        example.direct_positive_index
+        if channel == "direct"
+        else example.evidence_positive_index
+        for example in examples
+    ]
+    return _candidate_positive_mask(
+        candidate_rows,
+        [
+            _target_positive_id_set(example, fallback_index)
+            for example, fallback_index in zip(examples, fallback_indices)
+        ],
+        width,
+        device,
+    )
 
 
 def score_edge_batch(
@@ -179,6 +245,7 @@ def _score_student_candidate_rows(
     candidate_features: dict[str, ObjectFeatures],
     positive_indices: Sequence[int],
     device: torch.device,
+    positive_id_sets: Sequence[set[str]] | None = None,
 ) -> ListScores:
     parameter = next(student.parameters())
     score_rows: list[torch.Tensor | None] = [None] * len(query_features)
@@ -235,10 +302,18 @@ def _score_student_candidate_rows(
         raise RuntimeError("Every in-batch candidate row must be scored")
     logits = pad_sequence(rows, batch_first=True, padding_value=0.0)
     lengths = [len(row) for row in candidate_rows]
+    positive_mask = (
+        _candidate_positive_mask(
+            candidate_rows, positive_id_sets, logits.shape[1], device
+        )
+        if positive_id_sets is not None
+        else None
+    )
     return ListScores(
         logits,
         _mask(lengths, logits.shape[1], device),
         torch.tensor(positive_indices, device=device),
+        positive_mask,
     )
 
 
@@ -325,6 +400,7 @@ def restrict_list_scores(
         scores.logits[:, :width],
         _mask(lengths, width, device),
         scores.positive_indices,
+        None if scores.positive_mask is None else scores.positive_mask[:, :width],
     )
 
 
@@ -494,9 +570,31 @@ def score_target_batch(
     evidence_positive_indices = torch.tensor(
         [example.evidence_positive_index for example in examples], device=device
     )
+    direct_positive_mask = target_positive_mask(
+        examples,
+        direct_rows.shape[1],
+        device,
+        channel="direct",
+    )
+    evidence_positive_mask = target_positive_mask(
+        examples,
+        evidence_rows.shape[1],
+        device,
+        channel="evidence",
+    ) & evidence_mask
     return TargetScores(
-        direct=ListScores(direct_rows, candidate_mask, direct_positive_indices),
-        evidence=ListScores(evidence_rows, evidence_mask, evidence_positive_indices),
+        direct=ListScores(
+            direct_rows,
+            candidate_mask,
+            direct_positive_indices,
+            direct_positive_mask,
+        ),
+        evidence=ListScores(
+            evidence_rows,
+            evidence_mask,
+            evidence_positive_indices,
+            evidence_positive_mask,
+        ),
     )
 
 
@@ -534,11 +632,13 @@ def score_target_direct_batch_in_batch(
             )
 
     candidate_rows = []
+    positive_id_sets = []
     for example in examples:
         original_ids = [candidate.target_id for candidate in example.candidates]
-        positive_ids = set(example.positive_target_ids) or {
-            original_ids[example.direct_positive_index]
-        }
+        positive_ids = _target_positive_id_set(
+            example, example.direct_positive_index
+        )
+        positive_id_sets.append(positive_ids)
         candidate_rows.append(
             _expanded_candidate_ids(
                 original_ids,
@@ -555,4 +655,5 @@ def score_target_direct_batch_in_batch(
         cache,
         [example.direct_positive_index for example in examples],
         device,
+        positive_id_sets,
     )

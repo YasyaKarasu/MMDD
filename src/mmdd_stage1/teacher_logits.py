@@ -164,7 +164,12 @@ def _ensemble_list_scores(
         logits[row, indices] = torch.tensor(
             combined, dtype=logits.dtype, device=logits.device
         )
-    return ListScores(logits, teacher.candidate_mask, teacher.positive_indices)
+    return ListScores(
+        logits,
+        teacher.candidate_mask,
+        teacher.positive_indices,
+        teacher.positive_mask,
+    )
 
 
 def _ensemble_evidence_scores(

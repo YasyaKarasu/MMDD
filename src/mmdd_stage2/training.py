@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,12 +62,23 @@ def load_column_training_data(
         desc="Load Stage-2 data",
         unit="file",
     ):
-        qrels = {
-            str(record["query_table_id"]): record
-            for record in iter_dataset_artifact(output_dir, "qrels")
-            if record.get("reason") == "model_recoverable_join_column"
-            and record.get("split", "train") == "train"
-        }
+        qrels_by_query: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        qrel_pairs: set[tuple[str, str]] = set()
+        for qrel in iter_dataset_artifact(output_dir, "qrels"):
+            if (
+                qrel.get("reason") != "model_recoverable_join_column"
+                or qrel.get("split", "train") != "train"
+            ):
+                continue
+            query_id = str(qrel["query_table_id"])
+            target_id = str(qrel["target_table_id"])
+            pair = (query_id, target_id)
+            if pair in qrel_pairs:
+                raise ValueError(
+                    f"Duplicate Stage-2 training qrel: {query_id} -> {target_id}"
+                )
+            qrel_pairs.add(pair)
+            qrels_by_query[query_id].append(qrel)
         query_ids: set[str] = set()
         target_ids: set[str] = set()
         for record in progress(
@@ -76,8 +88,8 @@ def load_column_training_data(
             leave=False,
         ):
             query_id = str(record["query_id"])
-            qrel = qrels.get(query_id)
-            if qrel is None:
+            qrels = qrels_by_query.get(query_id)
+            if not qrels:
                 continue
             validate_retrieval_path_budget(
                 record,
@@ -85,33 +97,43 @@ def load_column_training_data(
                 top_k_evidence=top_k_evidence,
             )
             bundles = build_evidence_bundles(record["results"][:max_targets], top_k_evidence=top_k_evidence)
-            positive_target = str(qrel["target_table_id"])
-            positive = next(
-                (
-                    (index, bundle)
-                    for index, bundle in enumerate(bundles)
-                    if bundle.target_id == positive_target
-                ),
-                None,
-            )
-            if positive is None:
+            bundle_by_target = {
+                bundle.target_id: (index, bundle)
+                for index, bundle in enumerate(bundles)
+            }
+            retrieved_positives = [
+                (qrel, *bundle_by_target[str(qrel["target_table_id"])])
+                for qrel in qrels
+                if str(qrel["target_table_id"]) in bundle_by_target
+            ]
+            if not retrieved_positives:
                 continue
-            positive_index, positive_bundle = positive
             retrieval_scores = torch.tensor(
                 [bundle.retrieval_score for bundle in bundles], dtype=torch.float32
             )
-            example = ColumnTrainingExample(
-                query_id=query_id,
-                positive_bundle=positive_bundle,
-                positive_source_column=int(qrel["join_attribute"]["source_column_index"]),
-                table_loss=float(
-                    -torch.log_softmax(retrieval_scores, dim=0)[positive_index]
-                ),
+            positive_indices = torch.tensor(
+                [index for _qrel, index, _bundle in retrieved_positives]
             )
-            examples.append(example)
-            query_ids.add(query_id)
-            target_ids.add(positive_target)
-            all_evidence_ids.update(positive_bundle.evidence_ids)
+            table_loss = float(
+                torch.logsumexp(retrieval_scores, dim=0)
+                - torch.logsumexp(
+                    retrieval_scores.index_select(0, positive_indices), dim=0
+                )
+            )
+            for qrel, _positive_index, positive_bundle in retrieved_positives:
+                examples.append(
+                    ColumnTrainingExample(
+                        query_id=query_id,
+                        positive_bundle=positive_bundle,
+                        positive_source_column=int(
+                            qrel["join_attribute"]["source_column_index"]
+                        ),
+                        table_loss=table_loss,
+                    )
+                )
+                query_ids.add(query_id)
+                target_ids.add(positive_bundle.target_id)
+                all_evidence_ids.update(positive_bundle.evidence_ids)
         if query_ids:
             loaded_indices.append(
                 load_stage2_index(

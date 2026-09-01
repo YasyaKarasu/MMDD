@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
 PATH_AGGREGATIONS = {
@@ -100,21 +99,60 @@ class PathAggregator(nn.Module):
         return torch.where(has_evidence, evidence_scores, torch.zeros_like(evidence_scores))
 
 
+def positive_indices_to_mask(
+    positive_indices: torch.Tensor,
+    candidate_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Expand one positive index per list into a boolean candidate mask."""
+
+    if positive_indices.shape != (candidate_mask.shape[0],):
+        raise ValueError("positive_indices must have shape [batch]")
+    rows = torch.arange(candidate_mask.shape[0], device=candidate_mask.device)
+    if not torch.all(candidate_mask[rows, positive_indices]):
+        raise ValueError("Every positive index must identify a valid candidate")
+    positive_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    positive_mask[rows, positive_indices] = True
+    return positive_mask
+
+
+def _resolve_positive_mask(
+    logits: torch.Tensor,
+    positive_indices: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    positive_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if logits.shape != candidate_mask.shape:
+        raise ValueError("candidate_mask must match logits")
+    if positive_mask is None:
+        return positive_indices_to_mask(positive_indices, candidate_mask)
+    if positive_mask.shape != logits.shape:
+        raise ValueError("positive_mask must match logits")
+    positive_mask = positive_mask.to(device=logits.device, dtype=torch.bool)
+    if torch.any(positive_mask & ~candidate_mask):
+        raise ValueError("positive_mask must identify only valid candidates")
+    return positive_mask
+
+
 def listwise_cross_entropy(
     logits: torch.Tensor,
     positive_indices: torch.Tensor,
     candidate_mask: torch.Tensor,
+    positive_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Cross entropy for one positive candidate in each variable-length list."""
+    """Negative log probability assigned to all positives in each list."""
 
-    if logits.shape != candidate_mask.shape:
-        raise ValueError("candidate_mask must match logits")
-    if positive_indices.shape != (logits.shape[0],):
-        raise ValueError("positive_indices must have shape [batch]")
-    rows = torch.arange(logits.shape[0], device=logits.device)
-    if not torch.all(candidate_mask[rows, positive_indices]):
-        raise ValueError("Every positive index must identify a valid candidate")
-    return F.cross_entropy(logits.masked_fill(~candidate_mask, -torch.inf), positive_indices)
+    positive_mask = _resolve_positive_mask(
+        logits, positive_indices, candidate_mask, positive_mask
+    )
+    if not torch.all(positive_mask.any(dim=-1)):
+        raise ValueError("Every candidate list must contain at least one positive")
+    normalizers = torch.logsumexp(
+        logits.masked_fill(~candidate_mask, -torch.inf), dim=-1
+    )
+    positive_mass = torch.logsumexp(
+        logits.masked_fill(~positive_mask, -torch.inf), dim=-1
+    )
+    return (normalizers - positive_mass).mean()
 
 
 def distillation_kl(
@@ -143,26 +181,35 @@ def _usable_list_rows(
     logits: torch.Tensor,
     positive_indices: torch.Tensor,
     candidate_mask: torch.Tensor,
+    positive_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if logits.shape != candidate_mask.shape:
-        raise ValueError("candidate_mask must match logits")
-    if positive_indices.shape != (logits.shape[0],):
-        raise ValueError("positive_indices must have shape [batch]")
-    rows = torch.arange(logits.shape[0], device=logits.device)
-    return candidate_mask[rows, positive_indices] & (candidate_mask.sum(dim=-1) >= 2)
+    positive_mask = _resolve_positive_mask(
+        logits, positive_indices, candidate_mask, positive_mask
+    )
+    has_positive = positive_mask.any(dim=-1)
+    has_negative = (candidate_mask & ~positive_mask).any(dim=-1)
+    return has_positive & has_negative
 
 
 def optional_listwise_cross_entropy(
     logits: torch.Tensor,
     positive_indices: torch.Tensor,
     candidate_mask: torch.Tensor,
+    positive_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Listwise CE over rows with a positive and at least one negative."""
 
-    usable = _usable_list_rows(logits, positive_indices, candidate_mask)
+    usable = _usable_list_rows(
+        logits, positive_indices, candidate_mask, positive_mask
+    )
     if not usable.any().item():
         return logits.sum() * 0.0
-    return listwise_cross_entropy(logits[usable], positive_indices[usable], candidate_mask[usable])
+    return listwise_cross_entropy(
+        logits[usable],
+        positive_indices[usable],
+        candidate_mask[usable],
+        None if positive_mask is None else positive_mask[usable],
+    )
 
 
 def optional_distillation_kl(
@@ -171,12 +218,15 @@ def optional_distillation_kl(
     positive_indices: torch.Tensor,
     candidate_mask: torch.Tensor,
     temperature: float,
+    positive_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Listwise distillation over rows with a usable supervised channel list."""
 
     if student_logits.shape != teacher_logits.shape:
         raise ValueError("Student and Teacher logits must have equal shapes")
-    usable = _usable_list_rows(student_logits, positive_indices, candidate_mask)
+    usable = _usable_list_rows(
+        student_logits, positive_indices, candidate_mask, positive_mask
+    )
     if not usable.any().item():
         return student_logits.sum() * 0.0
     return distillation_kl(

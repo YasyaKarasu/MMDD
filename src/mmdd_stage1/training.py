@@ -29,6 +29,7 @@ from .scoring import (
     score_edge_batch_in_batch,
     score_target_batch,
     score_target_direct_batch_in_batch,
+    target_positive_mask,
 )
 
 Example = TypeVar("Example", EdgeExample, TargetExample)
@@ -183,11 +184,12 @@ def _list_scores(
     rows: list[torch.Tensor],
     positive_indices: torch.Tensor,
     device: torch.device,
+    positive_mask: torch.Tensor | None = None,
 ) -> ListScores:
     logits = pad_sequence(rows, batch_first=True, padding_value=0.0)
     lengths = torch.tensor([len(row) for row in rows], device=device)
     candidate_mask = torch.arange(logits.shape[1], device=device).unsqueeze(0) < lengths.unsqueeze(1)
-    return ListScores(logits, candidate_mask, positive_indices)
+    return ListScores(logits, candidate_mask, positive_indices, positive_mask)
 
 
 def _edge_teacher_scores(
@@ -255,10 +257,31 @@ def _target_teacher_scores(
         batch_first=True,
         padding_value=False,
     )
+    positive_mask = target_positive_mask(
+        examples,
+        direct.logits.shape[1],
+        device,
+        channel="direct",
+    )
+    evidence_positive_mask = target_positive_mask(
+        examples,
+        evidence_logits.shape[1],
+        device,
+        channel="evidence",
+    ) & evidence_mask
+    direct = ListScores(
+        direct.logits,
+        direct.candidate_mask,
+        direct.positive_indices,
+        positive_mask,
+    )
     return TargetScores(
         direct=direct,
         evidence=ListScores(
-            evidence_logits, evidence_mask, evidence_positive_indices
+            evidence_logits,
+            evidence_mask,
+            evidence_positive_indices,
+            evidence_positive_mask,
         ),
     )
 
@@ -268,11 +291,13 @@ def _path_supervised_losses(scores: TargetScores) -> tuple[torch.Tensor, torch.T
         scores.direct.logits,
         scores.direct.positive_indices,
         scores.direct.candidate_mask,
+        scores.direct.positive_mask,
     )
     evidence = optional_listwise_cross_entropy(
         scores.evidence.logits,
         scores.evidence.positive_indices,
         scores.evidence.candidate_mask,
+        scores.evidence.positive_mask,
     )
     return direct + evidence, direct, evidence
 
@@ -294,11 +319,17 @@ def _path_distillation_losses(
                 student.direct.logits[row_mask],
                 student.direct.candidate_mask[row_mask],
                 student.direct.positive_indices[row_mask],
+                None
+                if student.direct.positive_mask is None
+                else student.direct.positive_mask[row_mask],
             ),
             evidence=ListScores(
                 student.evidence.logits[row_mask],
                 student.evidence.candidate_mask[row_mask],
                 student.evidence.positive_indices[row_mask],
+                None
+                if student.evidence.positive_mask is None
+                else student.evidence.positive_mask[row_mask],
             ),
         )
         teacher = TargetScores(
@@ -306,11 +337,17 @@ def _path_distillation_losses(
                 teacher.direct.logits[row_mask],
                 teacher.direct.candidate_mask[row_mask],
                 teacher.direct.positive_indices[row_mask],
+                None
+                if teacher.direct.positive_mask is None
+                else teacher.direct.positive_mask[row_mask],
             ),
             evidence=ListScores(
                 teacher.evidence.logits[row_mask],
                 teacher.evidence.candidate_mask[row_mask],
                 teacher.evidence.positive_indices[row_mask],
+                None
+                if teacher.evidence.positive_mask is None
+                else teacher.evidence.positive_mask[row_mask],
             ),
         )
     direct = distillation_kl(
@@ -325,6 +362,7 @@ def _path_distillation_losses(
         student.evidence.positive_indices,
         student.evidence.candidate_mask,
         temperature,
+        student.evidence.positive_mask,
     )
     return direct + evidence, direct, evidence
 
@@ -622,6 +660,7 @@ def _student_path_objective(
                 expanded_direct.logits,
                 expanded_direct.positive_indices,
                 expanded_direct.candidate_mask,
+                expanded_direct.positive_mask,
             )
             supervised = direct + evidence
         distillation_rows = (
@@ -1037,6 +1076,7 @@ def train_student_paths(
                     expanded_direct.logits,
                     expanded_direct.positive_indices,
                     expanded_direct.candidate_mask,
+                    expanded_direct.positive_mask,
                 )
                 supervised = direct_supervised + evidence_supervised
             if teacher_scores is not None:

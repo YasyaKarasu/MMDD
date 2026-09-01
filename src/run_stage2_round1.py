@@ -139,9 +139,11 @@ def _audit_markdown(audit: dict[str, Any]) -> str:
         for kind, ids in item["missing"].items():
             rendered = ", ".join(ids) if ids else "none"
             lines.append(f"- {kind}: {len(ids)} ({rendered})")
-        duplicates = item["duplicate_qrel_query_ids"]
+        duplicates = item.get(
+            "duplicate_qrel_pairs", item.get("duplicate_qrel_query_ids", [])
+        )
         lines.append(
-            f"- duplicate qrel query IDs: {len(duplicates)} "
+            f"- duplicate qrel pairs: {len(duplicates)} "
             f"({', '.join(duplicates) if duplicates else 'none'})"
         )
         lines.append("")

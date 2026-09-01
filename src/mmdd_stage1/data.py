@@ -237,6 +237,14 @@ def load_target_examples(
             )
         elif not designated_positives <= set(positive_target_ids):
             raise ValueError(f"{path}:{line_number}: positive_target_ids omits a designated positive")
+        if len(set(positive_target_ids)) != len(positive_target_ids):
+            raise ValueError(f"{path}:{line_number}: positive_target_ids contains duplicates")
+        missing_positive_candidates = set(positive_target_ids) - set(target_ids)
+        if missing_positive_candidates:
+            raise ValueError(
+                f"{path}:{line_number}: positive_target_ids references missing candidates: "
+                + ", ".join(sorted(missing_positive_candidates))
+            )
         if "teacher_logits" in record:
             raise ValueError(
                 f"{path}:{line_number}: merged target teacher_logits are obsolete; "

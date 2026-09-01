@@ -18,7 +18,7 @@ import diagnose_stage1_teacher_rerank
 import train_stage1
 import mmdd_stage1.evaluation as evaluation_module
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample
-from mmdd_stage1.evaluation import evaluate_student_retrieval
+from mmdd_stage1.evaluation import evaluate_direct_retrieval, evaluate_student_retrieval
 from mmdd_stage1.models import TeacherJoinabilityModel
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
@@ -400,6 +400,33 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert metrics["evidence_identity_baseline"]["by_dataset"]["EntiTables"][
         "recall@10"
     ] == 0.5
+
+
+def test_direct_retrieval_recall_uses_all_positive_targets():
+    class StaticIndices:
+        @staticmethod
+        def search(_source_id, _destination_type, _k):
+            return [("positive_1", 2.0), ("wrong", 1.0)]
+
+    example = TargetExample(
+        "q",
+        (
+            TargetCandidate("positive_1", ()),
+            TargetCandidate("positive_2", ()),
+            TargetCandidate("wrong", ()),
+        ),
+        direct_positive_index=0,
+        evidence_positive_index=0,
+        split="dev",
+        positive_target_ids=("positive_1", "positive_2"),
+    )
+
+    metrics = evaluate_direct_retrieval(
+        [example], StaticIndices(), recall_ks=(2,)
+    )
+
+    assert metrics["recall@2"] == 0.5
+    assert metrics["mrr@2"] == 1.0
 
 
 def test_path_coverage_uses_an_independent_k10_pool(monkeypatch):

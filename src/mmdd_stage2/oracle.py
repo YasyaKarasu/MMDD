@@ -221,10 +221,14 @@ def load_oracle_column_data(
             if record.get("reason") == "model_recoverable_join_column"
             and str(record.get("split", "train")) in selected_splits
         ]
-        duplicate_qrels = [
-            query_id
-            for query_id, count in Counter(
-                str(record["query_table_id"]) for record in qrels
+        duplicate_qrel_pairs = [
+            f"{query_id}->{target_id}"
+            for (query_id, target_id), count in Counter(
+                (
+                    str(record["query_table_id"]),
+                    str(record["target_table_id"]),
+                )
+                for record in qrels
             ).items()
             if count > 1
         ]
@@ -400,7 +404,7 @@ def load_oracle_column_data(
             }
         dataset_audits[dataset] = {
             "root": str(root.resolve()),
-            "duplicate_qrel_query_ids": sorted(duplicate_qrels),
+            "duplicate_qrel_pairs": sorted(duplicate_qrel_pairs),
             "missing": {key: sorted(value) for key, value in missing.items()},
             "splits": per_split,
         }
@@ -415,7 +419,7 @@ def load_oracle_column_data(
             }
 
     audit = {
-        "format_version": 1,
+        "format_version": 2,
         "training_source": "oracle_positive",
         "evidence_policy": ORACLE_EVIDENCE_POLICY,
         "top_k_evidence": top_k_evidence,
@@ -426,7 +430,7 @@ def load_oracle_column_data(
     }
     failures = []
     for dataset, item in dataset_audits.items():
-        if item["duplicate_qrel_query_ids"]:
+        if item["duplicate_qrel_pairs"]:
             failures.append(f"{dataset}: duplicate qrels")
         for kind, ids in item["missing"].items():
             if ids:

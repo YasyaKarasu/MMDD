@@ -213,6 +213,82 @@ def test_stage2_training_skips_path_budget_validation_without_a_matching_qrel(mo
     assert objects is loaded_index
 
 
+def test_stage2_training_keeps_all_qrels_for_a_multi_positive_query(monkeypatch):
+    qrels = [
+        {
+            "query_table_id": "q",
+            "target_table_id": target_id,
+            "reason": "model_recoverable_join_column",
+            "join_attribute": {"source_column_index": source_column},
+        }
+        for target_id, source_column in (("positive_1", 3), ("positive_2", 5))
+    ]
+    retrieval = {
+        "query_id": "q",
+        "results": [
+            {
+                "target_id": target_id,
+                "evidence_score": score,
+                "paths": [
+                    {
+                        "kind": "evidence",
+                        "evidence_id": evidence_id,
+                        "path_score": score,
+                    }
+                ],
+            }
+            for target_id, evidence_id, score in (
+                ("positive_1", "e1", 2.0),
+                ("positive_2", "e2", 1.0),
+                ("negative", "e3", 0.0),
+            )
+        ],
+    }
+    loaded_index = Stage2ObjectIndex(
+        {"q": {"table_id": "q"}},
+        {
+            "positive_1": {"table_id": "positive_1"},
+            "positive_2": {"table_id": "positive_2"},
+        },
+        {},
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_dataset_artifact",
+        lambda _root, artifact: iter(qrels) if artifact == "qrels" else iter(()),
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.iter_retrieval_results", lambda _path: iter([retrieval])
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.load_stage2_index",
+        lambda *_args, **_kwargs: loaded_index,
+    )
+    monkeypatch.setattr(
+        "mmdd_stage2.training.load_stage2_evidence",
+        lambda _roots, evidence_ids: {
+            evidence_id: {"asset_id": evidence_id} for evidence_id in evidence_ids
+        },
+    )
+
+    examples, objects = load_column_training_data(
+        Path("dataset"),
+        [Path("retrieval.jsonl")],
+        max_targets=3,
+        top_k_evidence=1,
+    )
+
+    assert [example.positive_bundle.target_id for example in examples] == [
+        "positive_1",
+        "positive_2",
+    ]
+    assert [example.positive_source_column for example in examples] == [3, 5]
+    expected = torch.logsumexp(torch.tensor([2.0, 1.0, 0.0]), dim=0) - torch.logsumexp(
+        torch.tensor([2.0, 1.0]), dim=0
+    )
+    assert all(example.table_loss == pytest.approx(expected.item()) for example in examples)
+    assert set(objects.evidence) == {"e1", "e2"}
+
+
 def test_stage2_training_pairs_multiple_dataset_roots_with_retrieval_files(monkeypatch):
     def qrels(root, artifact):
         assert artifact == "qrels"

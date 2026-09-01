@@ -53,7 +53,12 @@ from mmdd_stage1.models import (
     TeacherJoinabilityModel,
     structural_table_pool,
 )
-from mmdd_stage1.objectives import PathAggregator, listwise_cross_entropy
+from mmdd_stage1.objectives import (
+    PathAggregator,
+    listwise_cross_entropy,
+    optional_listwise_cross_entropy,
+    positive_indices_to_mask,
+)
 from mmdd_stage1.pca import compute_pca_projection, load_pca_projection
 from mmdd_stage1.retrieval import (
     RawEmbeddingANNIndices,
@@ -814,6 +819,117 @@ def test_target_scoring_and_listwise_loss_backpropagate_through_paths():
     assert model.relations["text_to_table"].grad is not None
 
 
+def test_listwise_cross_entropy_preserves_single_positive_behavior():
+    logits = torch.tensor([[2.0, -1.0, 0.5], [0.5, 1.5, 0.0]])
+    candidate_mask = torch.tensor([[True, True, False], [True, True, True]])
+    positive_indices = torch.tensor([0, 1])
+
+    actual = listwise_cross_entropy(logits, positive_indices, candidate_mask)
+    expected = torch.nn.functional.cross_entropy(
+        logits.masked_fill(~candidate_mask, -torch.inf), positive_indices
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert torch.equal(
+        positive_indices_to_mask(positive_indices, candidate_mask),
+        torch.tensor([[True, False, False], [False, True, False]]),
+    )
+
+
+def test_listwise_cross_entropy_uses_all_positive_probability_mass():
+    logits = torch.tensor([[2.0, 1.0, -1.0]])
+    candidate_mask = torch.ones_like(logits, dtype=torch.bool)
+    positive_indices = torch.tensor([0])
+    positive_mask = torch.tensor([[True, True, False]])
+
+    single_positive = listwise_cross_entropy(
+        logits, positive_indices, candidate_mask
+    )
+    multi_positive = listwise_cross_entropy(
+        logits, positive_indices, candidate_mask, positive_mask
+    )
+    expected = torch.logsumexp(logits, dim=-1) - torch.logsumexp(
+        logits[:, :2], dim=-1
+    )
+
+    torch.testing.assert_close(multi_positive, expected.mean())
+    assert multi_positive < single_positive
+
+
+def test_optional_listwise_cross_entropy_skips_rows_without_a_negative():
+    logits = torch.tensor([[2.0, 1.0]], requires_grad=True)
+    candidate_mask = torch.ones_like(logits, dtype=torch.bool)
+    positive_mask = torch.ones_like(logits, dtype=torch.bool)
+
+    loss = optional_listwise_cross_entropy(
+        logits, torch.tensor([0]), candidate_mask, positive_mask
+    )
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
+def test_multi_positive_student_path_smoke_has_finite_losses():
+    store = FeatureStore(
+        {
+            "q_multi": feature("q_multi", "table", 0.1),
+            "positive_1": feature("positive_1", "table", 0.2),
+            "positive_2": feature("positive_2", "table", 0.3),
+            "negative_multi": feature("negative_multi", "table", 0.8),
+            "evidence_multi": feature("evidence_multi", "text", 0.4),
+        }
+    )
+    example = TargetExample(
+        "q_multi",
+        (
+            TargetCandidate("positive_1", ()),
+            TargetCandidate("positive_2", ("evidence_multi",)),
+            TargetCandidate("negative_multi", ("evidence_multi",)),
+        ),
+        direct_positive_index=0,
+        evidence_positive_index=1,
+        dataset="multi",
+        teacher_direct_logits=(2.0, 1.0, -1.0),
+        teacher_evidence_logits=(1.5, 1.0, -0.5),
+        positive_target_ids=("positive_1", "positive_2"),
+    )
+    student = StudentJoinabilityModel(input_dim=4, student_dim=3)
+
+    scores = score_target_batch(
+        student, [example], store, torch.device("cpu"), PathAggregator()
+    )
+    assert scores.direct.positive_mask.tolist() == [[True, True, False]]
+    assert scores.evidence.positive_mask.tolist() == [[False, True, False]]
+
+    history = train_student_paths(
+        student,
+        [example],
+        store,
+        torch.optim.AdamW(student.parameters(), lr=1e-3),
+        PathAggregator(),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.5,
+        in_batch_negatives=True,
+    )
+
+    assert len(history) == 1
+    assert all(
+        torch.isfinite(torch.tensor(history[0][name]))
+        for name in (
+            "loss",
+            "supervised_loss",
+            "distillation_loss",
+            "direct_supervised_loss",
+            "evidence_supervised_loss",
+        )
+    )
+
+
 def test_teacher_target_scoring_compresses_each_object_once(monkeypatch):
     model = teacher()
     examples = [
@@ -1238,11 +1354,12 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
                         "target_id": "positive",
                         "evidence_ids": [f"e{index}" for index in range(10)],
                     },
+                    {"target_id": "another_positive", "evidence_ids": []},
                     {"target_id": "negative", "evidence_ids": []},
                 ],
                 "positive_target_ids": ["positive", "another_positive"],
-                "teacher_direct_logits": [2.0, -1.0],
-                "teacher_evidence_logits": [1.5, 0.0],
+                "teacher_direct_logits": [2.0, 1.0, -1.0],
+                "teacher_evidence_logits": [1.5, 0.0, 0.0],
                 "dataset": "2k",
                 "split": "train",
             }
@@ -1266,9 +1383,33 @@ def test_lazy_feature_store_and_target_jsonl(tmp_path):
         f"e{index}" for index in range(10)
     )
     assert examples[0].dataset == "2k"
-    assert examples[0].teacher_direct_logits == (2.0, -1.0)
-    assert examples[0].teacher_evidence_logits == (1.5, 0.0)
+    assert examples[0].teacher_direct_logits == (2.0, 1.0, -1.0)
+    assert examples[0].teacher_evidence_logits == (1.5, 0.0, 0.0)
     assert examples[0].positive_target_ids == ("positive", "another_positive")
+
+
+def test_target_loader_rejects_positive_missing_from_candidates(tmp_path):
+    path = tmp_path / "targets.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "direct_positive_target_id": "positive",
+                "evidence_positive_target_id": "positive",
+                "positive_target_ids": ["positive", "missing_positive"],
+                "candidates": [
+                    {"target_id": "positive", "evidence_ids": []},
+                    {"target_id": "negative", "evidence_ids": []},
+                ],
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing candidates: missing_positive"):
+        load_target_examples(path)
 
 
 def test_lazy_feature_store_loads_teacher_tier_only_when_requested(tmp_path):
