@@ -209,6 +209,10 @@ PAGE_TEMPLATE = """
         <option value="canonical" {{ "selected" if row_view == "canonical" else "" }}>canonical views</option>
         <option value="augmented" {{ "selected" if row_view == "augmented" else "" }}>augmented views</option>
       </select>
+      <select name="positive_only">
+        <option value="" {{ "selected" if not positive_only else "" }}>all pairs</option>
+        <option value="1" {{ "selected" if positive_only else "" }}>recoverable pairs only</option>
+      </select>
       <select name="asset_type">
         <option value="">all assets</option>
         {% for t in asset_types %}
@@ -370,6 +374,7 @@ PAGE_TEMPLATE = """
         <input type="hidden" name="q" value="{{ query }}">
         <input type="hidden" name="split" value="{{ split }}">
         <input type="hidden" name="row_view" value="{{ row_view }}">
+        <input type="hidden" name="positive_only" value="{{ '1' if positive_only else '' }}">
         <input type="hidden" name="asset_type" value="{{ asset_type }}">
         <input type="number" name="page" min="1" max="{{ pages }}" value="{{ page }}">
         <button type="submit">Go</button>
@@ -1589,6 +1594,7 @@ class ViewerDataset:
         split: str,
         asset_type: str,
         row_view: str,
+        positive_only: bool,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         parameters: list[Any] = []
@@ -1610,6 +1616,9 @@ class ViewerDataset:
             clauses.append("pairs.row_view_index = 0")
         elif row_view == "augmented":
             clauses.append("pairs.row_view_index > 0")
+        if positive_only:
+            clauses.append("pairs.reason = ?")
+            parameters.append(IMPLICIT_JOIN_REASON)
         if query:
             clauses.append("instr(pairs.search_text, ?) > 0")
             parameters.append(query.casefold())
@@ -1623,6 +1632,7 @@ class ViewerDataset:
         split: str,
         asset_type: str,
         row_view: str,
+        positive_only: bool,
         page: int,
     ) -> tuple[dict[str, Any] | None, int]:
         where, parameters = self._filter_sql(
@@ -1630,6 +1640,7 @@ class ViewerDataset:
             split=split,
             asset_type=asset_type,
             row_view=row_view,
+            positive_only=positive_only,
         )
         with self._connect() as connection:
             total = int(
@@ -1873,6 +1884,7 @@ def create_app(
         row_view = clean_text(request.args.get("row_view", "all"))
         if row_view not in {"all", "canonical", "augmented"}:
             row_view = "all"
+        positive_only = clean_text(request.args.get("positive_only", "")) == "1"
         try:
             page = max(1, int(request.args.get("page", "1") or "1"))
         except ValueError:
@@ -1886,6 +1898,7 @@ def create_app(
                 split=split,
                 asset_type=asset_type,
                 row_view=row_view,
+                positive_only=positive_only,
                 page=page,
             )
         pages = max(1, math.ceil(total))
@@ -1899,6 +1912,7 @@ def create_app(
                 q=query,
                 split=split,
                 row_view=row_view,
+                positive_only="1" if positive_only else None,
                 asset_type=asset_type,
             )
 
@@ -1911,6 +1925,7 @@ def create_app(
             query=query,
             split=split,
             row_view=row_view,
+            positive_only=positive_only,
             asset_type=asset_type,
             splits=splits,
             asset_types=asset_types,

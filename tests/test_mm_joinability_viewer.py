@@ -241,6 +241,7 @@ def test_viewer_groups_and_filters_disjoint_train_row_views(
                 "row_view_index": 1,
                 "source_table_id": "source_1",
                 "join_attribute": {"column_name": "Country"},
+                "reason": "explicit_visible_join_column",
             },
             {
                 "query_table_id": "query_z_canonical",
@@ -251,6 +252,7 @@ def test_viewer_groups_and_filters_disjoint_train_row_views(
                 "row_view_index": 0,
                 "source_table_id": "source_1",
                 "join_attribute": {"column_name": "Country"},
+                "reason": "model_recoverable_join_column",
             },
         ],
     )
@@ -301,6 +303,7 @@ def test_viewer_groups_and_filters_disjoint_train_row_views(
     canonical = client.get("/?row_view=canonical")
     augmented = client.get("/?row_view=augmented")
     searched = client.get("/?q=AugmentedNeedle")
+    positive = client.get("/?positive_only=1")
 
     assert canonical.status_code == 200
     assert b"query_z_canonical" in canonical.data
@@ -313,6 +316,10 @@ def test_viewer_groups_and_filters_disjoint_train_row_views(
     assert b"2 of 2" in augmented.data
     assert b"query_a_augmented" in searched.data
     assert b"Multi-view chains" in searched.data
+    assert positive.status_code == 200
+    assert b"query_z_canonical" in positive.data
+    assert b"query_a_augmented" not in positive.data
+    assert b"recoverable pairs only" in positive.data
 
     def fail_rebuild(*_args, **_kwargs):
         raise AssertionError("current viewer index should be reused")
