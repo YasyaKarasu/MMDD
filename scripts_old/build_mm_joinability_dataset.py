@@ -7157,6 +7157,8 @@ def _explicit_join_context_partition(
         )
         >= min_target_rows
     ]
+    if len(ordinary) == 1:
+        return [], ordinary
     return balanced_context_partition(
         ordinary,
         seed=int(getattr(args, "seed", 13)),
@@ -7522,10 +7524,10 @@ def build_explicit_join_fallback_candidates(
 ) -> list[dict[str, Any]]:
     """Build all viable explicit query candidates for one source table.
 
-    Candidate join columns are target-only for every sibling variant.  The
-    ordinary context columns are partitioned once into a query-only pool and a
-    target-only pool, so a query from one variant cannot accidentally match a
-    target produced for another variant from the same source table.
+    Candidate join columns are initially excluded from the shared context
+    partition.  After balancing, the selected subset is rebuilt together so
+    unselected join candidates return to the ordinary context pool while the
+    materialized sibling joins remain disjoint.
     """
     if entity_col is None or (
         not force
@@ -7586,6 +7588,87 @@ def build_explicit_join_fallback_candidates(
         if candidate is not None:
             output.append(candidate)
     return output
+
+
+def rebuild_selected_explicit_join_candidates(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    candidate_decisions: list[dict[str, Any]],
+    args: argparse.Namespace,
+    profiles: dict[int, dict[str, Any]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Repartition context around only the explicit joins selected to emit."""
+    if not candidate_decisions:
+        return []
+    source_table_id = str(source_table["source_table_id"])
+    entity_cols = {
+        int(candidate["entity_column_index"])
+        for candidate in candidate_decisions
+    }
+    if len(entity_cols) != 1:
+        raise ValueError(
+            "selected explicit candidates disagree on entity column: "
+            f"{source_table_id}"
+        )
+    join_columns = [
+        int(candidate["join_column_index"])
+        for candidate in candidate_decisions
+    ]
+    if len(set(join_columns)) != len(join_columns):
+        raise ValueError(
+            f"selected explicit candidates repeat a join column: {source_table_id}"
+        )
+    if any(
+        str(candidate.get("source_table_id")) != source_table_id
+        for candidate in candidate_decisions
+    ):
+        raise ValueError(
+            f"selected explicit candidate belongs to another source: {source_table_id}"
+        )
+
+    if values_by_column is None:
+        values_by_column = table_column_values(source_table)
+    entity_col = next(iter(entity_cols))
+    query_context, target_context = _explicit_join_context_partition(
+        source_table=source_table,
+        entity_col=entity_col,
+        join_columns=join_columns,
+        args=args,
+        profiles=profiles,
+        values_by_column=values_by_column,
+    )
+    rebuilt: list[dict[str, Any]] = []
+    for candidate in candidate_decisions:
+        refreshed = _build_explicit_join_candidate(
+            source_table=source_table,
+            split=split,
+            entity_col=entity_col,
+            join_col=int(candidate["join_column_index"]),
+            query_context=list(query_context),
+            target_context=list(target_context),
+            rejected_multimodal_reason=str(
+                candidate.get("rejected_multimodal_reason") or ""
+            ),
+            rejected_multimodal_decision=(
+                candidate.get("rejected_multimodal_decision")
+                if isinstance(candidate.get("rejected_multimodal_decision"), dict)
+                else None
+            ),
+            args=args,
+            values_by_column=values_by_column,
+        )
+        if refreshed is None:
+            raise ValueError(
+                f"selected explicit candidate is no longer viable: {source_table_id}"
+            )
+        if refreshed["candidate_id"] != candidate.get("candidate_id"):
+            raise ValueError(
+                f"selected explicit candidate identity changed: {source_table_id}"
+            )
+        rebuilt.append({**candidate, **refreshed})
+    return rebuilt
 
 
 def rejected_table_join_records(
@@ -10734,15 +10817,23 @@ def _build_dataset(
                     explicit_targets: list[dict[str, Any]] = []
                     explicit_qrels: list[dict[str, Any]] = []
                     explicit_decisions: list[dict[str, Any]] = []
-                    selected_candidates: list[dict[str, Any]] = []
-                    for candidate_id in selected_candidate_ids:
-                        candidate_decision = next(
+                    selected_candidate_decisions = [
+                        next(
                             candidate
                             for candidate in original_decision[
                                 "explicit_join_candidates"
                             ]
                             if candidate.get("candidate_id") == candidate_id
                         )
+                        for candidate_id in selected_candidate_ids
+                    ]
+                    selected_candidates = rebuild_selected_explicit_join_candidates(
+                        source_table=source_table,
+                        split=split,
+                        candidate_decisions=selected_candidate_decisions,
+                        args=args,
+                    )
+                    for candidate_decision in selected_candidates:
                         (
                             candidate_queries,
                             candidate_targets,
@@ -10758,7 +10849,6 @@ def _build_dataset(
                         explicit_targets.extend(candidate_targets)
                         explicit_qrels.extend(candidate_qrels)
                         explicit_decisions.append(candidate_result_decision)
-                        selected_candidates.append(candidate_decision)
                     explicit_decision = {
                         **original_decision,
                         **explicit_decisions[0],
@@ -10952,6 +11042,9 @@ def _build_dataset(
             "context_partition_policy": (
                 "source_level_seeded_gaussian_target_ratio_mean_0.5_"
                 "std_0.1_clipped_0.3_0.7"
+            ),
+            "explicit_context_partition_scope": (
+                "post_balance_selected_join_columns_only"
             ),
             "qualified_attribute_policy": "all_safe_variants",
             "sibling_source_column_policy": (

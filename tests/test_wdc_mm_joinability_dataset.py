@@ -2074,7 +2074,7 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert manifest["query_construction"]["qualified_attribute_policy"] == "all_safe_variants"
     assert (
         manifest["query_construction"]["identical_visible_query_policy"]
-        == "keep_best_recovery_single_target"
+        == "merge_exact_row_view_with_all_distinct_positive_targets"
     )
     assert manifest["web_cache"]["database"].endswith("wdc_web.sqlite3")
     assert manifest["artifacts"]["bridge_assets"]["total_records"] == 30

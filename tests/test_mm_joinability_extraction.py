@@ -277,7 +277,7 @@ def build_multi_attribute_join_records(
     return query_tables, target_tables, qrels, decision, recovery_writer.records
 
 
-def test_multi_attribute_queries_use_globally_disjoint_context_sides(
+def test_multi_attribute_query_merges_distinct_positive_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     query_tables, target_tables, qrels, decision, recovery_records = (
@@ -289,9 +289,15 @@ def test_multi_attribute_queries_use_globally_disjoint_context_sides(
     )
 
     assert decision["reason"] == "queryable"
-    assert len(query_tables) == 2
+    assert len(query_tables) == 1
     assert len(target_tables) == 2
     assert len(qrels) == 2
+    assert {qrel["query_table_id"] for qrel in qrels} == {
+        query_tables[0]["table_id"]
+    }
+    assert set(query_tables[0]["target_table_ids"]) == {
+        target["table_id"] for target in target_tables
+    }
     assert {target["join_col_name"] for target in target_tables} == {
         "Bridge B",
         "Bridge C",
@@ -1443,7 +1449,7 @@ def test_query_recovery_image_checks_use_local_and_remote_pools() -> None:
     assert sorted(calls) == ["local", "remote"]
 
 
-def test_identical_visible_multi_attribute_queries_keep_one_best_target(
+def test_identical_visible_multi_attribute_query_keeps_all_positive_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     query_tables, target_tables, qrels, decision, _recovery_records = (
@@ -1456,17 +1462,24 @@ def test_identical_visible_multi_attribute_queries_keep_one_best_target(
 
     assert decision["reason"] == "queryable"
     assert len(query_tables) == 1
-    assert len(target_tables) == 1
-    assert len(qrels) == 1
-    assert qrels[0]["query_table_id"] == query_tables[0]["table_id"]
-    assert [item["column_name"] for item in query_tables[0]["hidden_attributes"]] == [
-        "Bridge B"
-    ]
-    assert query_tables[0]["target_table_ids"] == [target_tables[0]["table_id"]]
-    assert target_tables[0]["join_col_name"] == "Bridge B"
+    assert len(target_tables) == 2
+    assert len(qrels) == 2
+    assert {qrel["query_table_id"] for qrel in qrels} == {
+        query_tables[0]["table_id"]
+    }
+    assert {
+        item["column_name"] for item in query_tables[0]["hidden_attributes"]
+    } == {"Bridge B", "Bridge C"}
+    assert set(query_tables[0]["target_table_ids"]) == {
+        target["table_id"] for target in target_tables
+    }
+    assert {target["join_col_name"] for target in target_tables} == {
+        "Bridge B",
+        "Bridge C",
+    }
 
 
-def test_implicit_query_uniqueness_validator_rejects_multiple_targets() -> None:
+def test_implicit_query_uniqueness_validator_allows_multiple_targets() -> None:
     qrels = [
         {
             "query_table_id": "query_same",
@@ -1482,8 +1495,10 @@ def test_implicit_query_uniqueness_validator_rejects_multiple_targets() -> None:
         },
     ]
 
-    with pytest.raises(ValueError, match="exactly one qrel"):
-        joinability_dataset.validate_implicit_query_uniqueness(qrels)
+    assert joinability_dataset.validate_implicit_query_uniqueness(qrels) == 1
+
+    with pytest.raises(ValueError, match="duplicate implicit query qrel"):
+        joinability_dataset.validate_implicit_query_uniqueness([*qrels, qrels[0]])
 
 
 def test_implicit_query_uniqueness_validator_requires_one_qrel_per_query() -> None:
@@ -1503,7 +1518,7 @@ def test_implicit_query_uniqueness_validator_requires_one_qrel_per_query() -> No
         )
 
 
-def test_multi_attribute_split_falls_back_to_best_column_when_context_is_too_narrow(
+def test_multi_attribute_split_keeps_all_targets_when_context_is_narrow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     query_tables, target_tables, qrels, decision, _recovery_records = (
@@ -1515,7 +1530,8 @@ def test_multi_attribute_split_falls_back_to_best_column_when_context_is_too_nar
     )
 
     assert decision["reason"] == "queryable"
-    assert len(query_tables) == len(target_tables) == len(qrels) == 1
+    assert len(query_tables) == 1
+    assert len(target_tables) == len(qrels) == 2
 
 
 def build_rejected_table_with_explicit_join(
@@ -1888,10 +1904,10 @@ def test_train_emits_multiple_disjoint_row_views_but_dev_stays_canonical(
     )
 
     assert len(train_queries) == 4
-    assert len(train_targets) == 1
-    assert len(train_qrels) == 4
+    assert len(train_targets) == 2
+    assert len(train_qrels) == 8
     assert len({qrel["query_table_id"] for qrel in train_qrels}) == 4
-    assert len({qrel["target_table_id"] for qrel in train_qrels}) == 1
+    assert len({qrel["target_table_id"] for qrel in train_qrels}) == 2
     assert {item["row_views"] for item in decision["qualified_columns"]} == {4}
     train_row_sets = [set(query["source_row_indices"]) for query in train_queries]
     assert all(
@@ -1900,8 +1916,8 @@ def test_train_emits_multiple_disjoint_row_views_but_dev_stays_canonical(
         for right in train_row_sets[index + 1 :]
     )
     assert len(dev_queries) == 1
-    assert len(dev_targets) == 1
-    assert len(dev_qrels) == 1
+    assert len(dev_targets) == 2
+    assert len(dev_qrels) == 2
 
 
 @pytest.mark.parametrize(

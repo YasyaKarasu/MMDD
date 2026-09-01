@@ -2558,6 +2558,9 @@ def _parameter_payload(
             "source_level_seeded_gaussian_target_ratio_mean_0.5_"
             "std_0.1_clipped_0.3_0.7"
         ),
+        "explicit_context_partition_scope": (
+            "post_balance_selected_join_columns_only"
+        ),
         "explicit_join_fallback_mode": (
             join_builder.configured_explicit_join_fallback_mode(args)
         ),
@@ -4753,8 +4756,13 @@ def _materialize_balance_work_item(
     explicit_targets: list[dict[str, Any]] = []
     explicit_qrels: list[dict[str, Any]] = []
     explicit_decisions: list[dict[str, Any]] = []
-    selected_candidates: list[dict[str, Any]] = []
-    for candidate_decision in item.candidate_decisions:
+    selected_candidates = join_builder.rebuild_selected_explicit_join_candidates(
+        source_table=source_table,
+        split=item.split,
+        candidate_decisions=list(item.candidate_decisions),
+        args=args,
+    )
+    for candidate_decision in selected_candidates:
         (
             candidate_queries,
             candidate_targets,
@@ -4770,7 +4778,6 @@ def _materialize_balance_work_item(
         explicit_targets.extend(candidate_targets)
         explicit_qrels.extend(candidate_qrels)
         explicit_decisions.append(candidate_result_decision)
-        selected_candidates.append(candidate_decision)
     if not explicit_decisions:
         raise ValueError(
             f"balanced explicit source has no selected candidates: "

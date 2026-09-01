@@ -3351,15 +3351,25 @@ def build_dataset(
                     explicit_targets: list[dict[str, Any]] = []
                     explicit_qrels: list[dict[str, Any]] = []
                     explicit_decisions: list[dict[str, Any]] = []
-                    selected_candidates: list[dict[str, Any]] = []
-                    for candidate_id in selected_candidate_ids:
-                        candidate = next(
+                    selected_candidate_decisions = [
+                        next(
                             item
                             for item in original_decision[
                                 "explicit_join_candidates"
                             ]
                             if item.get("candidate_id") == candidate_id
                         )
+                        for candidate_id in selected_candidate_ids
+                    ]
+                    selected_candidates = (
+                        join_builder.rebuild_selected_explicit_join_candidates(
+                            source_table=source_table,
+                            split=split,
+                            candidate_decisions=selected_candidate_decisions,
+                            args=args,
+                        )
+                    )
+                    for candidate in selected_candidates:
                         (
                             candidate_queries,
                             candidate_targets,
@@ -3375,7 +3385,6 @@ def build_dataset(
                         explicit_targets.extend(candidate_targets)
                         explicit_qrels.extend(candidate_qrels)
                         explicit_decisions.append(candidate_result_decision)
-                        selected_candidates.append(candidate)
                     explicit_decision = {
                         **original_decision,
                         **explicit_decisions[0],
@@ -3580,6 +3589,9 @@ def build_dataset(
             "context_partition_policy": (
                 "source_level_seeded_gaussian_target_ratio_mean_0.5_"
                 "std_0.1_clipped_0.3_0.7"
+            ),
+            "explicit_context_partition_scope": (
+                "post_balance_selected_join_columns_only"
             ),
             "qualified_attribute_policy": "all_safe_variants",
             "sibling_source_column_policy": (
