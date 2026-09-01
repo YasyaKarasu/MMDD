@@ -49,6 +49,7 @@ from mmdd_stage1.mining import (
 from mmdd_stage1.models import (
     TYPE_TO_ID,
     IdentityStudentJoinabilityModel,
+    ProjectedIdentityStudentJoinabilityModel,
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
     structural_table_pool,
@@ -70,6 +71,7 @@ from mmdd_stage1.retrieval import (
     retrieve_zero_one_hop_detailed,
 )
 from mmdd_stage1.scoring import (
+    ListScores,
     score_edge_batch,
     score_edge_batch_in_batch,
     score_target_batch,
@@ -323,6 +325,39 @@ def test_lowrank_student_starts_at_identity_and_matches_explicit_residual():
         stage1_training.student_relation_drift(model)[key],
         torch.linalg.vector_norm(relation - torch.eye(4)).item(),
     )
+
+
+@pytest.mark.parametrize("relation_param", ["full", "lowrank"])
+def test_student_embedding_matrix_matches_inline_relation_formula(relation_param):
+    torch.manual_seed(19)
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        relation_param=relation_param,
+        relation_rank=2,
+    )
+    sources = torch.randn(3, 4)
+    destinations = torch.randn(5, 4)
+    source_vectors = model.project(sources, "table")
+    destination_vectors = model.project(destinations, "image")
+    key = model.relation_key("table", "image")
+    if relation_param == "full":
+        expected = source_vectors @ model.relations[key] @ destination_vectors.T
+    else:
+        expected = source_vectors @ destination_vectors.T
+        expected = expected + (
+            (source_vectors @ model.relation_as[key])
+            @ (destination_vectors @ model.relation_bs[key]).T
+        )
+
+    actual = model.score_embedding_matrix(
+        sources,
+        "table",
+        destinations,
+        "image",
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_lowrank_student_first_step_updates_the_zero_initialized_factor():
@@ -741,11 +776,19 @@ def test_identity_student_uses_raw_inner_product_for_every_type_pair():
             relation_query = model.relation_query(
                 query, source_type, destination_type
             )
-            index_vector = model.index_vector(target, destination_type)
+            index_vector = model.index_vector(
+                target, destination_type, source_type=source_type
+            )
 
             assert relation_query is query
             assert index_vector is target
             assert torch.dot(relation_query, index_vector) == torch.dot(query, target)
+
+    projected = ProjectedIdentityStudentJoinabilityModel(torch.eye(4))
+    torch.testing.assert_close(
+        projected.index_vector(target, "image", source_type="table"),
+        target,
+    )
 
 
 def test_path_aggregator_accumulates_only_evidence_paths():
@@ -1032,6 +1075,32 @@ def test_teacher_batched_compression_matches_individual_compression():
     assert actual.keys() == expected.keys()
     for object_id, expected_tokens in expected.items():
         torch.testing.assert_close(actual[object_id], expected_tokens)
+
+
+def test_list_scores_selects_every_row_field():
+    scores = ListScores(
+        logits=torch.arange(12).reshape(3, 4),
+        candidate_mask=torch.tensor(
+            [[True, True, True, True], [True, True, False, False], [True, False, False, False]]
+        ),
+        positive_indices=torch.tensor([1, 0, 0]),
+        positive_mask=torch.tensor(
+            [[False, True, False, True], [True, False, False, False], [True, False, False, False]]
+        ),
+    )
+
+    selected = scores.select(torch.tensor([True, False, True]))
+
+    torch.testing.assert_close(selected.logits, scores.logits[[0, 2]])
+    torch.testing.assert_close(
+        selected.candidate_mask, scores.candidate_mask[[0, 2]]
+    )
+    torch.testing.assert_close(
+        selected.positive_indices, scores.positive_indices[[0, 2]]
+    )
+    torch.testing.assert_close(
+        selected.positive_mask, scores.positive_mask[[0, 2]]
+    )
 
 
 def test_teacher_vectorized_pair_packing_matches_reference_assembly():
@@ -2709,6 +2778,49 @@ def test_dataset_sampling_alpha_balances_or_preserves_natural_mass():
     assert [example.query_id for example in balanced] == [example.query_id for example in repeated]
 
 
+@pytest.mark.parametrize(
+    ("dataset_sampling_alpha", "expected_ids"),
+    [
+        (0.0, ["a2", "b0", "a0", "a1", "b1", "b1"]),
+        (0.5, ["b1", "a3", "a0", "a1", "b0", "a2"]),
+        (1.0, ["a0", "b1", "a1", "a2", "a3", "b0"]),
+    ],
+)
+def test_balanced_epoch_preserves_seeded_sampling_sequence(
+    dataset_sampling_alpha, expected_ids
+):
+    examples = [
+        EdgeExample(f"a{index}", ("positive", "negative"), 0, dataset="a")
+        for index in range(4)
+    ] + [
+        EdgeExample(f"b{index}", ("positive", "negative"), 0, dataset="b")
+        for index in range(2)
+    ]
+
+    sampled = sample_balanced_epoch(
+        examples,
+        random.Random(17),
+        dataset_sampling_alpha=dataset_sampling_alpha,
+    )
+
+    assert [example.query_id for example in sampled] == expected_ids
+
+
+def test_balanced_epoch_preserves_single_dataset_sampling_sequence():
+    examples = [
+        EdgeExample(f"a{index}", ("positive", "negative"), 0, dataset="a")
+        for index in range(4)
+    ]
+
+    sampled = sample_balanced_epoch(
+        examples,
+        random.Random(17),
+        dataset_sampling_alpha=0.5,
+    )
+
+    assert [example.query_id for example in sampled] == ["a0", "a2", "a1", "a3"]
+
+
 def test_student_edge_distillation_reuses_cached_teacher_logits():
     store = feature_store()
     student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
@@ -3814,6 +3926,30 @@ def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_ti
 
     assert not second["teacher_cache_generated"]
     assert second["teacher_logit_cache_hits"] == 2
+
+
+def test_programmatic_training_args_use_cli_defaults():
+    cli = train_stage1._argument_parser().parse_args(
+        [
+            "student-edge",
+            "--features",
+            "features.pt",
+            "--dev-data",
+            "dev.jsonl",
+            "--output",
+            "student.pt",
+        ]
+    )
+    programmatic = argparse.Namespace(
+        stage="student-edge",
+        features="features.pt",
+        dev_data=["dev.jsonl"],
+        output="student.pt",
+    )
+
+    train_stage1._apply_argument_defaults(programmatic)
+
+    assert vars(programmatic) == vars(cli)
 
 
 def test_feature_store_preloads_contiguous_training_embeddings():

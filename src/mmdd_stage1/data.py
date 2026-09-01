@@ -127,6 +127,83 @@ def _teacher_logits(
     return logits
 
 
+def _provenance_value(
+    record: dict[str, Any],
+    metadata: dict[str, Any],
+    record_key: str,
+    *metadata_keys: str,
+    fallback_on_falsy: bool,
+) -> Any:
+    sources_and_keys = (
+        (record, record_key),
+        *((metadata, key) for key in metadata_keys),
+    )
+    if fallback_on_falsy:
+        for source, key in sources_and_keys[:-1]:
+            value = source.get(key)
+            if value:
+                return value
+        source, key = sources_and_keys[-1]
+        return source.get(key)
+    for source, key in sources_and_keys:
+        value = source.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_positive_targets(
+    path: Path,
+    line_number: int,
+    record: dict[str, Any],
+    target_ids: list[str],
+) -> tuple[int, int, tuple[str, ...]]:
+    required_positive_keys = {
+        "direct_positive_target_id",
+        "evidence_positive_target_id",
+    }
+    if "positive_target_id" in record or not required_positive_keys <= record.keys():
+        raise ValueError(
+            f"{path}:{line_number}: target lists require separate "
+            "direct_positive_target_id and evidence_positive_target_id; regenerate this file"
+        )
+    direct_positive_index = _positive_index(
+        path, line_number, record, target_ids, "direct_positive_target_id"
+    )
+    evidence_positive_index = _positive_index(
+        path, line_number, record, target_ids, "evidence_positive_target_id"
+    )
+    positive_target_ids = tuple(
+        str(value) for value in record.get("positive_target_ids", [])
+    )
+    designated_positives = {
+        target_ids[direct_positive_index],
+        target_ids[evidence_positive_index],
+    }
+    if not positive_target_ids:
+        positive_target_ids = tuple(
+            dict.fromkeys(
+                target_ids[index]
+                for index in (direct_positive_index, evidence_positive_index)
+            )
+        )
+    elif not designated_positives <= set(positive_target_ids):
+        raise ValueError(
+            f"{path}:{line_number}: positive_target_ids omits a designated positive"
+        )
+    if len(set(positive_target_ids)) != len(positive_target_ids):
+        raise ValueError(
+            f"{path}:{line_number}: positive_target_ids contains duplicates"
+        )
+    missing_positive_candidates = set(positive_target_ids) - set(target_ids)
+    if missing_positive_candidates:
+        raise ValueError(
+            f"{path}:{line_number}: positive_target_ids references missing candidates: "
+            + ", ".join(sorted(missing_positive_candidates))
+        )
+    return direct_positive_index, evidence_positive_index, positive_target_ids
+
+
 def load_edge_examples(
     path: Path,
     *,
@@ -151,19 +228,27 @@ def load_edge_examples(
                 dataset=str(record.get("dataset") or dataset_name or "default"),
                 split=record.get("split"),
                 teacher_logits=_teacher_logits(path, line_number, record, len(candidate_ids)),
-                teacher_checkpoint_sha256=(
-                    record.get("teacher_checkpoint_sha256")
-                    or metadata.get("teacher_checkpoint_sha256")
+                teacher_checkpoint_sha256=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_checkpoint_sha256",
+                    "teacher_checkpoint_sha256",
+                    fallback_on_falsy=True,
                 ),
-                teacher_logit_mode=(
-                    record.get("teacher_logit_mode")
-                    or metadata.get("teacher_edge_logit_mode")
-                    or metadata.get("teacher_logit_mode")
+                teacher_logit_mode=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_logit_mode",
+                    "teacher_edge_logit_mode",
+                    "teacher_logit_mode",
+                    fallback_on_falsy=True,
                 ),
-                teacher_ensemble_alpha=(
-                    record.get("teacher_ensemble_alpha")
-                    if record.get("teacher_ensemble_alpha") is not None
-                    else metadata.get("teacher_edge_ensemble_alpha")
+                teacher_ensemble_alpha=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_ensemble_alpha",
+                    "teacher_edge_ensemble_alpha",
+                    fallback_on_falsy=False,
                 ),
                 source_type=(
                     normalize_object_type(str(record["source_type"]))
@@ -208,43 +293,11 @@ def load_target_examples(
         target_ids = [candidate.target_id for candidate in candidates]
         if len(set(target_ids)) != len(target_ids):
             raise ValueError(f"{path}:{line_number}: target candidates contain duplicates")
-        required_positive_keys = {
-            "direct_positive_target_id",
-            "evidence_positive_target_id",
-        }
-        if "positive_target_id" in record or not required_positive_keys <= record.keys():
-            raise ValueError(
-                f"{path}:{line_number}: target lists require separate "
-                "direct_positive_target_id and evidence_positive_target_id; regenerate this file"
-            )
-        direct_positive_index = _positive_index(
-            path, line_number, record, target_ids, "direct_positive_target_id"
-        )
-        evidence_positive_index = _positive_index(
-            path, line_number, record, target_ids, "evidence_positive_target_id"
-        )
-        positive_target_ids = tuple(str(value) for value in record.get("positive_target_ids", []))
-        designated_positives = {
-            target_ids[direct_positive_index],
-            target_ids[evidence_positive_index],
-        }
-        if not positive_target_ids:
-            positive_target_ids = tuple(
-                dict.fromkeys(
-                    target_ids[index]
-                    for index in (direct_positive_index, evidence_positive_index)
-                )
-            )
-        elif not designated_positives <= set(positive_target_ids):
-            raise ValueError(f"{path}:{line_number}: positive_target_ids omits a designated positive")
-        if len(set(positive_target_ids)) != len(positive_target_ids):
-            raise ValueError(f"{path}:{line_number}: positive_target_ids contains duplicates")
-        missing_positive_candidates = set(positive_target_ids) - set(target_ids)
-        if missing_positive_candidates:
-            raise ValueError(
-                f"{path}:{line_number}: positive_target_ids references missing candidates: "
-                + ", ".join(sorted(missing_positive_candidates))
-            )
+        (
+            direct_positive_index,
+            evidence_positive_index,
+            positive_target_ids,
+        ) = _resolve_positive_targets(path, line_number, record, target_ids)
         if "teacher_logits" in record:
             raise ValueError(
                 f"{path}:{line_number}: merged target teacher_logits are obsolete; "
@@ -310,19 +363,27 @@ def load_target_examples(
                 teacher_evidence_logits=teacher_evidence_logits,
                 positive_target_ids=positive_target_ids,
                 teacher_score_config=teacher_score_config,
-                teacher_checkpoint_sha256=(
-                    record.get("teacher_checkpoint_sha256")
-                    or metadata.get("teacher_checkpoint_sha256")
+                teacher_checkpoint_sha256=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_checkpoint_sha256",
+                    "teacher_checkpoint_sha256",
+                    fallback_on_falsy=True,
                 ),
-                teacher_logit_mode=(
-                    record.get("teacher_logit_mode")
-                    or metadata.get("teacher_target_logit_mode")
-                    or metadata.get("teacher_logit_mode")
+                teacher_logit_mode=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_logit_mode",
+                    "teacher_target_logit_mode",
+                    "teacher_logit_mode",
+                    fallback_on_falsy=True,
                 ),
-                teacher_ensemble_alpha=(
-                    record.get("teacher_ensemble_alpha")
-                    if record.get("teacher_ensemble_alpha") is not None
-                    else metadata.get("teacher_target_ensemble_alpha")
+                teacher_ensemble_alpha=_provenance_value(
+                    record,
+                    metadata,
+                    "teacher_ensemble_alpha",
+                    "teacher_target_ensemble_alpha",
+                    fallback_on_falsy=False,
                 ),
             )
         )

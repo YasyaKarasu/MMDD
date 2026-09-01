@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -18,7 +19,11 @@ import diagnose_stage1_teacher_rerank
 import train_stage1
 import mmdd_stage1.evaluation as evaluation_module
 from mmdd_stage1.data import EdgeExample, TargetCandidate, TargetExample
-from mmdd_stage1.evaluation import evaluate_direct_retrieval, evaluate_student_retrieval
+from mmdd_stage1.evaluation import (
+    evaluate_direct_retrieval,
+    evaluate_student_retrieval,
+    retrieval_metric_values,
+)
 from mmdd_stage1.models import TeacherJoinabilityModel
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
@@ -31,7 +36,11 @@ from mmdd_stage1.selection import (
     write_json,
 )
 from mmdd_stage1.training import oversample_student_edges, sample_mixed_epoch
-from mmdd_stage1.teacher_rerank import ensemble_scores, z_scores
+from mmdd_stage1.teacher_rerank import (
+    _retrieval_metrics as teacher_retrieval_metrics,
+    ensemble_scores,
+    z_scores,
+)
 from mmdd_stage1.workflow import RoundStep, validate_round_index, workflow_fingerprint
 
 
@@ -427,6 +436,32 @@ def test_direct_retrieval_recall_uses_all_positive_targets():
 
     assert metrics["recall@2"] == 0.5
     assert metrics["mrr@2"] == 1.0
+
+
+def test_shared_retrieval_metric_values_preserve_historical_aggregation():
+    positives = [
+        {f"p{query}_{index}" for index in range(10)}
+        for query in range(3)
+    ]
+    rankings = [
+        [f"p{query}_{index}" for index in range(hit_count)]
+        for query, hit_count in enumerate((1, 2, 3))
+    ]
+
+    per_query = retrieval_metric_values(rankings, positives, (10,))
+    evaluation_metrics = evaluation_module._channel_metrics(
+        {10: rankings}, positives, (10,)
+    )
+    teacher_metrics = teacher_retrieval_metrics(rankings, positives, (10,))
+
+    assert per_query == {
+        "recall@10": [0.1, 0.2, 0.3],
+        "mrr@10": [1.0, 1.0, 1.0],
+    }
+    assert evaluation_metrics["recall@10"] == sum(per_query["recall@10"]) / 3
+    assert teacher_metrics["recall@10"] == statistics.fmean(
+        per_query["recall@10"]
+    )
 
 
 def test_path_coverage_uses_an_independent_k10_pool(monkeypatch):

@@ -12,6 +12,7 @@ from typing import Any
 
 from mmdd_progress import progress
 from mmdd_stage1.data import TargetExample, load_target_examples
+from mmdd_stage1.evaluation import DEFAULT_RECALL_KS
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import (
@@ -22,9 +23,6 @@ from mmdd_stage1.retrieval import (
     retrieve_zero_one_hop_detailed,
 )
 from mmdd_stage1.selection import write_json
-
-DEFAULT_RECALL_KS = (10, 20, 30, 40, 50)
-
 
 def _parse_recall_ks(value: str) -> tuple[int, ...]:
     try:

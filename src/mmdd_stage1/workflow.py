@@ -7,8 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .retrieval import checkpoint_fingerprint
-from .selection import write_json
+from .artifacts import checkpoint_fingerprint, write_json
 
 
 def workflow_fingerprint(

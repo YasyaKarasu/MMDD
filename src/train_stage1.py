@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import shutil
@@ -13,6 +14,7 @@ from typing import Any
 
 import torch
 
+from mmdd_stage1.artifacts import checkpoint_fingerprint, write_json
 from mmdd_stage1.checkpoints import load_path_aggregator, load_student, load_teacher
 from mmdd_stage1.data import (
     EdgeExample,
@@ -20,7 +22,7 @@ from mmdd_stage1.data import (
     load_edge_examples,
     load_target_examples,
 )
-from mmdd_stage1.evaluation import evaluate_student_retrieval
+from mmdd_stage1.evaluation import DEFAULT_RECALL_KS, evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.models import (
     STUDENT_INITIALIZATIONS,
@@ -32,9 +34,9 @@ from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.pca import load_pca_projection
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import (
+    FUSION_MODES,
     StudentANNIndices,
     build_indices,
-    checkpoint_fingerprint,
     load_corpus_ids,
     load_or_build_raw_embedding_indices,
 )
@@ -42,7 +44,6 @@ from mmdd_stage1.selection import (
     CheckpointManager,
     MetricGate,
     metric_value,
-    write_json,
 )
 from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.teacher_logits import (
@@ -247,8 +248,8 @@ def _initialize_student(
     embedding_dim: int,
     device: torch.device,
 ) -> StudentJoinabilityModel:
-    initialization = getattr(args, "student_initialization", "random")
-    pca_basis_path = getattr(args, "student_pca_basis", None)
+    initialization = args.student_initialization
+    pca_basis_path = args.student_pca_basis
     if initialization == "pca":
         if pca_basis_path is None:
             raise ValueError("--student-pca-basis is required for PCA initialization")
@@ -267,11 +268,11 @@ def _initialize_student(
         embedding_dim,
         args.student_dim,
         initialization=initialization,
-        initialization_noise_std=getattr(args, "student_init_noise_std", 0.01),
+        initialization_noise_std=args.student_init_noise_std,
         initialization_basis=initialization_basis,
         freeze_projections=bool(args.freeze_projection),
-        relation_param=getattr(args, "relation_param", "full"),
-        relation_rank=getattr(args, "relation_rank", 16),
+        relation_param=args.relation_param,
+        relation_rank=args.relation_rank,
     ).to(device)
 
 
@@ -281,6 +282,7 @@ def _load_or_initialize_student(
     embedding_dim: int,
     device: torch.device,
 ) -> tuple[StudentJoinabilityModel, str]:
+    _apply_argument_defaults(args)
     if args.student_checkpoint:
         student = load_student(Path(args.student_checkpoint), device)
         if args.freeze_projection is not None:
@@ -462,6 +464,7 @@ class _EpochController:
         raw_index_root: Path | None,
         args: argparse.Namespace,
     ) -> None:
+        _apply_argument_defaults(args)
         self.stage = stage
         self.aggregator = aggregator
         self.manager = CheckpointManager(output)
@@ -478,7 +481,7 @@ class _EpochController:
         self.latest_index: Path | None = None
         self.created_indices: list[Path] = []
         self.raw_embedding_metrics: dict[str, Any] | None = None
-        self.per_dataset_gates = list(getattr(args, "per_dataset_gate", []))
+        self.per_dataset_gates = list(args.per_dataset_gate)
         self.gate_unsatisfied = False
         self.epoch_zero_fallback: tuple[
             Path, dict[str, Any], Path | None
@@ -595,9 +598,11 @@ class _EpochController:
                 self.raw_embedding_metrics = evaluate_student_retrieval(
                     self.dev_examples,
                     raw_indices,
-                    recall_ks=tuple(getattr(self.args, "train_eval_ks", None) or getattr(self.args, "recall_ks", (10, 20, 30, 40, 50))),
-                    gamma=getattr(self.args, "gamma", 4),
-                    gamma_evidence=getattr(self.args, "gamma_evidence", 2),
+                    recall_ks=tuple(
+                        self.args.train_eval_ks or self.args.recall_ks
+                    ),
+                    gamma=self.args.gamma,
+                    gamma_evidence=self.args.gamma_evidence,
                     direct_k=self.args.direct_k,
                     evidence_k=self.args.evidence_k,
                     targets_per_evidence=self.args.targets_per_evidence,
@@ -607,34 +612,24 @@ class _EpochController:
                     evidence_temperature=self.aggregator.temperature,
                     evidence_power=self.aggregator.power,
                     rrf_k=self.args.rrf_k,
-                    fusion_mode=getattr(
-                        self.args, "fusion_mode", "weighted_rrf"
-                    ),
-                    direct_weight=getattr(self.args, "direct_weight", 1.0),
-                    evidence_weight=getattr(self.args, "evidence_weight", 0.05),
-                    fusion_score_normalization=getattr(
-                        self.args, "fusion_score_normalization", "none"
-                    ),
-                    fusion_score_temperature=getattr(
-                        self.args, "fusion_score_temperature", 1.0
-                    ),
-                    gated_evidence_min_paths=getattr(
-                        self.args, "gated_evidence_min_paths", 2
-                    ),
-                    gated_evidence_quantile=getattr(
-                        self.args, "gated_evidence_quantile", 0.75
-                    ),
-                    evidence_modality_weights=getattr(
-                        self.args, "evidence_modality_weights", None
-                    ),
+                    fusion_mode=self.args.fusion_mode,
+                    direct_weight=self.args.direct_weight,
+                    evidence_weight=self.args.evidence_weight,
+                    fusion_score_normalization=self.args.fusion_score_normalization,
+                    fusion_score_temperature=self.args.fusion_score_temperature,
+                    gated_evidence_min_paths=self.args.gated_evidence_min_paths,
+                    gated_evidence_quantile=self.args.gated_evidence_quantile,
+                    evidence_modality_weights=self.args.evidence_modality_weights,
                     return_per_query=True,
                 )
             retrieval_metrics = evaluate_student_retrieval(
                 self.dev_examples,
                 indices,
-                recall_ks=tuple(getattr(self.args, "train_eval_ks", None) or getattr(self.args, "recall_ks", (10, 20, 30, 40, 50))),
-                gamma=getattr(self.args, "gamma", 4),
-                gamma_evidence=getattr(self.args, "gamma_evidence", 2),
+                recall_ks=tuple(
+                    self.args.train_eval_ks or self.args.recall_ks
+                ),
+                gamma=self.args.gamma,
+                gamma_evidence=self.args.gamma_evidence,
                 direct_k=self.args.direct_k,
                 evidence_k=self.args.evidence_k,
                 targets_per_evidence=self.args.targets_per_evidence,
@@ -644,24 +639,14 @@ class _EpochController:
                 evidence_temperature=self.aggregator.temperature,
                 evidence_power=self.aggregator.power,
                 rrf_k=self.args.rrf_k,
-                fusion_mode=getattr(self.args, "fusion_mode", "weighted_rrf"),
-                direct_weight=getattr(self.args, "direct_weight", 1.0),
-                evidence_weight=getattr(self.args, "evidence_weight", 0.05),
-                fusion_score_normalization=getattr(
-                    self.args, "fusion_score_normalization", "none"
-                ),
-                fusion_score_temperature=getattr(
-                    self.args, "fusion_score_temperature", 1.0
-                ),
-                gated_evidence_min_paths=getattr(
-                    self.args, "gated_evidence_min_paths", 2
-                ),
-                gated_evidence_quantile=getattr(
-                    self.args, "gated_evidence_quantile", 0.75
-                ),
-                evidence_modality_weights=getattr(
-                    self.args, "evidence_modality_weights", None
-                ),
+                fusion_mode=self.args.fusion_mode,
+                direct_weight=self.args.direct_weight,
+                evidence_weight=self.args.evidence_weight,
+                fusion_score_normalization=self.args.fusion_score_normalization,
+                fusion_score_temperature=self.args.fusion_score_temperature,
+                gated_evidence_min_paths=self.args.gated_evidence_min_paths,
+                gated_evidence_quantile=self.args.gated_evidence_quantile,
+                evidence_modality_weights=self.args.evidence_modality_weights,
                 identity_baseline_metrics=self.raw_embedding_metrics,
                 return_per_query=True,
             )
@@ -707,9 +692,9 @@ class _EpochController:
         constraint_results = _per_dataset_gate_results(
             gate_metrics,
             self.per_dataset_gates,
-            gate_tolerance=getattr(self.args, "gate_tolerance", 0.02),
-            bootstrap_iterations=getattr(self.args, "bootstrap_iterations", 10_000),
-            bootstrap_seed=getattr(self.args, "bootstrap_seed", 13),
+            gate_tolerance=self.args.gate_tolerance,
+            bootstrap_iterations=self.args.bootstrap_iterations,
+            bootstrap_seed=self.args.bootstrap_seed,
         )
         constraints_satisfied = all(
             result["satisfied"] for result in constraint_results
@@ -786,19 +771,19 @@ class _EpochController:
 
 
 def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[Path]]:
-    legacy = getattr(args, "train_data", None)
-    base = getattr(args, "base_data", None)
+    legacy = args.train_data
+    base = args.base_data
     if legacy and base:
         raise ValueError("Use --base-data, not both --base-data and legacy --train-data")
     base_values = base or legacy
     if not base_values:
         raise ValueError("--base-data is required")
-    dev_values = getattr(args, "dev_data", None)
+    dev_values = args.dev_data
     if not dev_values:
         raise ValueError("--dev-data is required for per-epoch checkpoint gating")
     return (
         [Path(value) for value in base_values],
-        [Path(value) for value in getattr(args, "hard_data", [])],
+        [Path(value) for value in args.hard_data],
         [Path(value) for value in dev_values],
     )
 
@@ -824,57 +809,7 @@ def _validate_initialize_only(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    optional_defaults = {
-        "anchor_weight": 0.0,
-        "anchor_weight_evidence": None,
-        "relation_learning_rate": None,
-        "relation_param": "full",
-        "relation_rank": 16,
-        "freeze_projection": None,
-        "in_batch_negatives": False,
-        "in_batch_max_negatives": 256,
-        "eval_epoch_zero": True,
-        "initialize_only": False,
-        "fusion_mode": "weighted_rrf",
-        "fusion_score_normalization": "none",
-        "fusion_score_temperature": 1.0,
-        "direct_weight": 1.0,
-        "evidence_weight": 0.05,
-        "gated_evidence_min_paths": 2,
-        "gated_evidence_quantile": 0.75,
-        "evidence_modality_weights": [],
-        "min_dev_evidence_path_coverage_by_dataset": 0.0,
-        "edge_type_oversample": [],
-        "relation_loss_weights": [],
-        "teacher_rerank": False,
-        "teacher_rerank_dev_data": [],
-        "teacher_rerank_top_k": 100,
-        "teacher_rerank_batch_size": 16,
-        "teacher_rerank_interval": 1,
-        "teacher_amp": "off",
-        "teacher_table_tokens_per_group": None,
-        "feature_cache_gb": None,
-        "feature_hot_fraction": 0.8,
-        "per_dataset_gate": [],
-        "distillation_datasets": [],
-        "kd_target_teacher_alpha": None,
-        "teacher_ensemble_alpha": None,
-        "recall_ks": (10, 20, 30, 40, 50),
-        "train_eval_ks": None,
-        "gamma": 4,
-        "gamma_evidence": 2,
-        "direct_k": None,
-        "evidence_k": None,
-        "targets_per_evidence": None,
-        "gate_tolerance": 0.02,
-        "bootstrap_iterations": 10_000,
-        "bootstrap_seed": 13,
-        "evidence_temperature": None,
-        "evidence_power": None,
-    }
-    for name, default in optional_defaults.items():
-        if not hasattr(args, name):
-            setattr(args, name, default)
+    _apply_argument_defaults(args)
     if args.kd_target_teacher_alpha is not None:
         if (
             args.teacher_ensemble_alpha is not None
@@ -1456,6 +1391,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for coverage in evidence_coverage_by_dataset.values()
         )
     )
+    path_aggregation_metadata = (
+        aggregator.config() if aggregator is not None else None
+    )
+    fusion_metadata = {
+        "mode": args.fusion_mode,
+        "direct_weight": args.direct_weight,
+        "evidence_weight": args.evidence_weight,
+        "score_normalization": args.fusion_score_normalization,
+        "score_temperature": args.fusion_score_temperature,
+        "gated_evidence_min_paths": args.gated_evidence_min_paths,
+        "gated_evidence_quantile": args.gated_evidence_quantile,
+        "evidence_modality_weights": args.evidence_modality_weights,
+    }
+    teacher_rerank_gate_metadata = {
+        "enabled": args.teacher_rerank,
+        "dev_data": args.teacher_rerank_dev_data,
+        "top_k": args.teacher_rerank_top_k,
+        "batch_size": args.teacher_rerank_batch_size,
+        "interval": args.teacher_rerank_interval,
+    }
     history_payload = {
         "format_version": 1,
         "completed_stage": args.stage,
@@ -1485,33 +1440,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "relation_loss_weights": args.relation_loss_weights,
         "eval_epoch_zero": args.eval_epoch_zero,
         "initialize_only": args.initialize_only,
-        "path_aggregation": (
-            {
-                "evidence_aggregation": aggregator.evidence_aggregation,
-                "evidence_top_k": aggregator.top_k,
-                "evidence_temperature": aggregator.temperature,
-                "evidence_power": aggregator.power,
-            }
-            if aggregator is not None
-            else None
-        ),
-        "fusion": {
-            "mode": args.fusion_mode,
-            "direct_weight": args.direct_weight,
-            "evidence_weight": args.evidence_weight,
-            "score_normalization": args.fusion_score_normalization,
-            "score_temperature": args.fusion_score_temperature,
-            "gated_evidence_min_paths": args.gated_evidence_min_paths,
-            "gated_evidence_quantile": args.gated_evidence_quantile,
-            "evidence_modality_weights": args.evidence_modality_weights,
-        },
-        "teacher_rerank_gate": {
-            "enabled": args.teacher_rerank,
-            "dev_data": args.teacher_rerank_dev_data,
-            "top_k": args.teacher_rerank_top_k,
-            "batch_size": args.teacher_rerank_batch_size,
-            "interval": args.teacher_rerank_interval,
-        },
+        "path_aggregation": path_aggregation_metadata,
+        "fusion": fusion_metadata,
+        "teacher_rerank_gate": teacher_rerank_gate_metadata,
         "teacher_amp": args.teacher_amp,
         "teacher_table_tokens_per_group": args.teacher_table_tokens_per_group,
         "feature_cache": {
@@ -1574,34 +1505,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "observed_coverage_by_dataset": evidence_coverage_by_dataset,
         },
         "stop_reason": controller.stop_reason,
-        "path_aggregation": (
-            {
-                "evidence_aggregation": aggregator.evidence_aggregation,
-                "evidence_top_k": aggregator.top_k,
-                "evidence_temperature": aggregator.temperature,
-                "evidence_power": aggregator.power,
-            }
-            if aggregator is not None
-            else None
-        ),
+        "path_aggregation": path_aggregation_metadata,
         "mining_round": mining_round,
-        "fusion": {
-            "mode": args.fusion_mode,
-            "direct_weight": args.direct_weight,
-            "evidence_weight": args.evidence_weight,
-            "score_normalization": args.fusion_score_normalization,
-            "score_temperature": args.fusion_score_temperature,
-            "gated_evidence_min_paths": args.gated_evidence_min_paths,
-            "gated_evidence_quantile": args.gated_evidence_quantile,
-            "evidence_modality_weights": args.evidence_modality_weights,
-        },
-        "teacher_rerank_gate": {
-            "enabled": args.teacher_rerank,
-            "dev_data": args.teacher_rerank_dev_data,
-            "top_k": args.teacher_rerank_top_k,
-            "batch_size": args.teacher_rerank_batch_size,
-            "interval": args.teacher_rerank_interval,
-        },
+        "fusion": fusion_metadata,
+        "teacher_rerank_gate": teacher_rerank_gate_metadata,
     }
     if student is not None:
         history_payload["student_config"] = student.config()
@@ -1626,7 +1533,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
-def parse_args() -> argparse.Namespace:
+def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=STAGES)
     parser.add_argument("--features", required=True)
@@ -1867,7 +1774,7 @@ def parse_args() -> argparse.Namespace:
             "changing forward scores."
         ),
     )
-    parser.add_argument("--recall-ks", type=_parse_recall_ks, default=(10, 20, 30, 40, 50))
+    parser.add_argument("--recall-ks", type=_parse_recall_ks, default=DEFAULT_RECALL_KS)
     parser.add_argument(
         "--train-eval-ks", type=_parse_recall_ks,
         help="Optional reduced per-epoch evaluation k set; final evaluation should use --recall-ks.",
@@ -1888,7 +1795,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument(
         "--fusion-mode",
-        choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],
+        choices=FUSION_MODES,
         default="weighted_rrf",
     )
     parser.add_argument("--direct-weight", type=float, default=1.0)
@@ -1908,7 +1815,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-tolerance", type=float, default=0.02)
     parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=13)
-    args = parser.parse_args()
+    return parser
+
+
+def _apply_argument_defaults(args: argparse.Namespace) -> None:
+    """Fill programmatic Namespaces from the CLI's single default source."""
+
+    for action in _argument_parser()._actions:
+        if action.dest == "help" or action.default is argparse.SUPPRESS:
+            continue
+        if not hasattr(args, action.dest):
+            setattr(args, action.dest, copy.deepcopy(action.default))
+
+
+def parse_args() -> argparse.Namespace:
+    args = _argument_parser().parse_args()
     args.feature_cache_size = _feature_cache_size(
         args.stage, args.feature_cache_size
     )

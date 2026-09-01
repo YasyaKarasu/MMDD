@@ -18,6 +18,7 @@ import torch
 from evaluate_stage1_teacher_retrieval import _TeacherFeatureView, _load_object_ids
 from mmdd_stage1.checkpoints import load_student, load_teacher
 from mmdd_stage1.data import TargetExample, load_target_examples
+from mmdd_stage1.evaluation import DEFAULT_RECALL_KS
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.retrieval import (
@@ -34,7 +35,7 @@ from mmdd_stage1.selection import load_stage1_selection
 from mmdd_stage1.significance import paired_bootstrap_delta
 from mmdd_stage1.teacher_rerank import TeacherRerankedANNIndices
 
-RECALL_KS = (10, 20, 30, 40, 50)
+RECALL_KS = DEFAULT_RECALL_KS
 
 
 @dataclass(frozen=True)

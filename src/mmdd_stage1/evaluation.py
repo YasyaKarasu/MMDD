@@ -40,26 +40,48 @@ def _reciprocal_rank(ranked_ids: Sequence[str], positives: set[str], k: int) -> 
     )
 
 
+def retrieval_metric_values(
+    rankings: Sequence[Sequence[str]],
+    positives: Sequence[set[str]],
+    recall_ks: Sequence[int],
+) -> dict[str, list[float]]:
+    """Return per-query recall@k and mrr@max(k) values."""
+
+    values = {
+        f"recall@{k}": [
+            _recall(ranking, relevant, k)
+            for ranking, relevant in zip(rankings, positives)
+        ]
+        for k in recall_ks
+    }
+    max_k = max(recall_ks)
+    values[f"mrr@{max_k}"] = [
+        _reciprocal_rank(ranking, relevant, max_k)
+        for ranking, relevant in zip(rankings, positives)
+    ]
+    return values
+
+
 def _channel_metrics(
     rankings_by_k: dict[int, Sequence[Sequence[str]]],
     positives: Sequence[set[str]],
     recall_ks: tuple[int, ...],
 ) -> dict[str, float]:
     query_count = len(positives)
-    values = {
-        f"recall@{k}": sum(
-            _recall(ranking, relevant, k)
-            for ranking, relevant in zip(rankings_by_k[k], positives)
-        )
-        / query_count
+    per_query = {
+        f"recall@{k}": retrieval_metric_values(
+            rankings_by_k[k], positives, (k,)
+        )[f"recall@{k}"]
         for k in recall_ks
     }
     max_k = max(recall_ks)
-    values[f"mrr@{max_k}"] = sum(
-        _reciprocal_rank(ranking, relevant, max_k)
-        for ranking, relevant in zip(rankings_by_k[max_k], positives)
-    ) / query_count
-    return values
+    per_query[f"mrr@{max_k}"] = retrieval_metric_values(
+        rankings_by_k[max_k], positives, (max_k,)
+    )[f"mrr@{max_k}"]
+    return {
+        metric: sum(metric_values) / query_count
+        for metric, metric_values in per_query.items()
+    }
 
 
 def _retrieval_metrics(
@@ -111,10 +133,9 @@ def _retrieval_metrics(
     if return_per_query:
         result["per_query"] = {
             channel: {
-                f"recall@{k}": [
-                    _recall(ranking, relevant, k)
-                    for ranking, relevant in zip(selected_rankings[channel][k], selected_positives)
-                ]
+                f"recall@{k}": retrieval_metric_values(
+                    selected_rankings[channel][k], selected_positives, (k,)
+                )[f"recall@{k}"]
                 for k in recall_ks
             }
             for channel in rankings

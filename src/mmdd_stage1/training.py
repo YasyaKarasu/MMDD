@@ -49,34 +49,16 @@ def sample_balanced_epoch(
         raise ValueError("dataset_sampling_alpha must be between 0 and 1")
     if not examples:
         raise ValueError("Cannot sample an empty training set")
-    groups: dict[str, list[Example]] = defaultdict(list)
-    for example in examples:
-        groups[example.dataset].append(example)
-    if len(groups) == 1 or dataset_sampling_alpha == 1:
+    if len({example.dataset for example in examples}) == 1 or dataset_sampling_alpha == 1:
         sampled = list(examples)
         rng.shuffle(sampled)
         return sampled
-
-    datasets = sorted(groups)
-    weights = {dataset: len(groups[dataset]) ** dataset_sampling_alpha for dataset in datasets}
-    total_weight = sum(weights.values())
-    exact = {dataset: len(examples) * weights[dataset] / total_weight for dataset in datasets}
-    quotas = {dataset: int(exact[dataset]) for dataset in datasets}
-    remaining = len(examples) - sum(quotas.values())
-    by_fraction = sorted(datasets, key=lambda dataset: (exact[dataset] - quotas[dataset], dataset), reverse=True)
-    for dataset in by_fraction[:remaining]:
-        quotas[dataset] += 1
-
-    sampled = []
-    for dataset in datasets:
-        pool = groups[dataset]
-        needed = quotas[dataset]
-        while needed:
-            cycle = list(pool)
-            rng.shuffle(cycle)
-            take = min(needed, len(cycle))
-            sampled.extend(cycle[:take])
-            needed -= take
+    sampled = _sample_balanced_count(
+        examples,
+        len(examples),
+        rng,
+        dataset_sampling_alpha,
+    )
     rng.shuffle(sampled)
     return sampled
 
@@ -302,6 +284,15 @@ def _path_supervised_losses(scores: TargetScores) -> tuple[torch.Tensor, torch.T
     return direct + evidence, direct, evidence
 
 
+def _teacher_edge_loss(scores: ListScores) -> torch.Tensor:
+    return listwise_cross_entropy(
+        scores.logits,
+        scores.positive_indices,
+        scores.candidate_mask,
+        scores.positive_mask,
+    )
+
+
 def _path_distillation_losses(
     student: TargetScores,
     teacher: TargetScores,
@@ -315,40 +306,12 @@ def _path_distillation_losses(
             zero = student.direct.logits.sum() * 0.0
             return zero, zero, zero
         student = TargetScores(
-            direct=ListScores(
-                student.direct.logits[row_mask],
-                student.direct.candidate_mask[row_mask],
-                student.direct.positive_indices[row_mask],
-                None
-                if student.direct.positive_mask is None
-                else student.direct.positive_mask[row_mask],
-            ),
-            evidence=ListScores(
-                student.evidence.logits[row_mask],
-                student.evidence.candidate_mask[row_mask],
-                student.evidence.positive_indices[row_mask],
-                None
-                if student.evidence.positive_mask is None
-                else student.evidence.positive_mask[row_mask],
-            ),
+            direct=student.direct.select(row_mask),
+            evidence=student.evidence.select(row_mask),
         )
         teacher = TargetScores(
-            direct=ListScores(
-                teacher.direct.logits[row_mask],
-                teacher.direct.candidate_mask[row_mask],
-                teacher.direct.positive_indices[row_mask],
-                None
-                if teacher.direct.positive_mask is None
-                else teacher.direct.positive_mask[row_mask],
-            ),
-            evidence=ListScores(
-                teacher.evidence.logits[row_mask],
-                teacher.evidence.candidate_mask[row_mask],
-                teacher.evidence.positive_indices[row_mask],
-                None
-                if teacher.evidence.positive_mask is None
-                else teacher.evidence.positive_mask[row_mask],
-            ),
+            direct=teacher.direct.select(row_mask),
+            evidence=teacher.evidence.select(row_mask),
         )
     direct = distillation_kl(
         student.direct.logits,
@@ -465,6 +428,91 @@ def _anchor_losses(
     return anchor, weighted
 
 
+def _student_edge_losses(
+    student: StudentJoinabilityModel,
+    student_scores: ListScores,
+    teacher_scores: ListScores | None,
+    supervised_scores: ListScores | None,
+    *,
+    temperature: float,
+    distillation_weight: float,
+    anchor_weight: float,
+    anchor_weight_evidence: float | None,
+) -> dict[str, torch.Tensor]:
+    supervised = (
+        _teacher_edge_loss(supervised_scores)
+        if supervised_scores is not None
+        else student_scores.logits.new_zeros(())
+    )
+    distillation = (
+        distillation_kl(
+            student_scores.logits,
+            teacher_scores.logits,
+            student_scores.candidate_mask,
+            temperature,
+        )
+        if teacher_scores is not None
+        else student_scores.logits.new_zeros(())
+    )
+    anchor, weighted_anchor = _anchor_losses(
+        student, anchor_weight, anchor_weight_evidence
+    )
+    return {
+        "loss": supervised + distillation_weight * distillation + weighted_anchor,
+        "supervised_loss": supervised,
+        "distillation_loss": distillation,
+        "anchor_loss": anchor,
+        "weighted_anchor_loss": weighted_anchor,
+    }
+
+
+def _student_path_losses(
+    student: StudentJoinabilityModel,
+    student_scores: TargetScores,
+    teacher_scores: TargetScores | None,
+    expanded_direct_scores: ListScores | None,
+    *,
+    temperature: float,
+    distillation_weight: float,
+    anchor_weight: float,
+    anchor_weight_evidence: float | None,
+    distillation_rows: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
+        student_scores
+    )
+    if expanded_direct_scores is not None:
+        direct_supervised = _teacher_edge_loss(expanded_direct_scores)
+        supervised = direct_supervised + evidence_supervised
+    if teacher_scores is not None:
+        distillation, direct_distillation, evidence_distillation = (
+            _path_distillation_losses(
+                student_scores,
+                teacher_scores,
+                temperature,
+                distillation_rows,
+            )
+        )
+    else:
+        distillation = supervised.new_zeros(())
+        direct_distillation = supervised.new_zeros(())
+        evidence_distillation = supervised.new_zeros(())
+    anchor, weighted_anchor = _anchor_losses(
+        student, anchor_weight, anchor_weight_evidence
+    )
+    return {
+        "loss": supervised + distillation_weight * distillation + weighted_anchor,
+        "supervised_loss": supervised,
+        "distillation_loss": distillation,
+        "direct_supervised_loss": direct_supervised,
+        "evidence_supervised_loss": evidence_supervised,
+        "direct_distillation_loss": direct_distillation,
+        "evidence_distillation_loss": evidence_distillation,
+        "anchor_loss": anchor,
+        "weighted_anchor_loss": weighted_anchor,
+    }
+
+
 def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
@@ -504,13 +552,7 @@ def _teacher_edge_objective(
         _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
     ):
         scores = score_edge_batch(model, batch, store, device)
-        losses.append(
-            float(
-                listwise_cross_entropy(
-                    scores.logits, scores.positive_indices, scores.candidate_mask
-                )
-            )
-        )
+        losses.append(float(_teacher_edge_loss(scores)))
     return _mean(losses)
 
 
@@ -573,30 +615,21 @@ def _student_edge_objective(
                 [len(example.candidate_ids) for example in batch],
                 device,
             )
-            supervised = listwise_cross_entropy(
-                expanded_scores.logits,
-                expanded_scores.positive_indices,
-                expanded_scores.candidate_mask,
-            )
+            supervised_scores = expanded_scores
         else:
             student_scores = score_edge_batch(student, batch, store, device)
-            supervised = student_scores.logits.new_zeros(())
-        distillation = (
-            distillation_kl(
-                student_scores.logits,
-                teacher_scores.logits,
-                student_scores.candidate_mask,
-                temperature,
-            )
-            if teacher_scores is not None
-            else student_scores.logits.new_zeros(())
+            supervised_scores = None
+        objective = _student_edge_losses(
+            student,
+            student_scores,
+            teacher_scores,
+            supervised_scores,
+            temperature=temperature,
+            distillation_weight=distillation_weight,
+            anchor_weight=anchor_weight,
+            anchor_weight_evidence=anchor_weight_evidence,
         )
-        _anchor, weighted_anchor = _anchor_losses(
-            student, anchor_weight, anchor_weight_evidence
-        )
-        losses.append(
-            float(supervised + distillation_weight * distillation + weighted_anchor)
-        )
+        losses.append(float(objective["loss"]))
     return _mean(losses)
 
 
@@ -646,9 +679,9 @@ def _student_path_objective(
         student_scores = score_target_batch(
             student, batch, store, device, aggregator
         )
-        supervised, direct, evidence = _path_supervised_losses(student_scores)
+        expanded_direct_scores = None
         if in_batch_negatives:
-            expanded_direct = score_target_direct_batch_in_batch(
+            expanded_direct_scores = score_target_direct_batch_in_batch(
                 student,
                 batch,
                 store,
@@ -656,13 +689,6 @@ def _student_path_objective(
                 max_negatives=in_batch_max_negatives,
                 rng=rng,
             )
-            direct = listwise_cross_entropy(
-                expanded_direct.logits,
-                expanded_direct.positive_indices,
-                expanded_direct.candidate_mask,
-                expanded_direct.positive_mask,
-            )
-            supervised = direct + evidence
         distillation_rows = (
             torch.tensor(
                 [example.dataset in distillation_datasets for example in batch],
@@ -672,22 +698,18 @@ def _student_path_objective(
             if distillation_datasets is not None
             else None
         )
-        distillation = (
-            _path_distillation_losses(
-                student_scores,
-                teacher_scores,
-                temperature,
-                distillation_rows,
-            )[0]
-            if teacher_scores is not None
-            else supervised.new_zeros(())
+        objective = _student_path_losses(
+            student,
+            student_scores,
+            teacher_scores,
+            expanded_direct_scores,
+            temperature=temperature,
+            distillation_weight=distillation_weight,
+            anchor_weight=anchor_weight,
+            anchor_weight_evidence=anchor_weight_evidence,
+            distillation_rows=distillation_rows,
         )
-        _anchor, weighted_anchor = _anchor_losses(
-            student, anchor_weight, anchor_weight_evidence
-        )
-        losses.append(
-            float(supervised + distillation_weight * distillation + weighted_anchor)
-        )
+        losses.append(float(objective["loss"]))
     return _mean(losses)
 
 
@@ -730,7 +752,7 @@ def train_teacher_edges(
         )
         for step, batch in enumerate(batch_bar, 1):
             scores = score_edge_batch(model, batch, store, device)
-            loss = listwise_cross_entropy(scores.logits, scores.positive_indices, scores.candidate_mask)
+            loss = _teacher_edge_loss(scores)
             _optimize(loss, optimizer)
             pending_losses.append(loss.detach())
             if _loss_refresh_due(step, len(batches)):
@@ -905,38 +927,33 @@ def train_student_edges(
                     [len(example.candidate_ids) for example in batch],
                     device,
                 )
-                supervised = listwise_cross_entropy(
-                    expanded_scores.logits,
-                    expanded_scores.positive_indices,
-                    expanded_scores.candidate_mask,
-                )
+                supervised_scores = expanded_scores
             else:
                 student_scores = score_edge_batch(student, batch, store, device)
-                supervised = student_scores.logits.new_zeros(())
-            distillation = (
-                distillation_kl(
-                    student_scores.logits,
-                    teacher_scores.logits,
-                    student_scores.candidate_mask,
-                    temperature,
-                )
-                if teacher_scores is not None
-                else student_scores.logits.new_zeros(())
+                supervised_scores = None
+            objective = _student_edge_losses(
+                student,
+                student_scores,
+                teacher_scores,
+                supervised_scores,
+                temperature=temperature,
+                distillation_weight=distillation_weight,
+                anchor_weight=anchor_weight,
+                anchor_weight_evidence=anchor_weight_evidence,
             )
-            anchor, weighted_anchor = _anchor_losses(
-                student, anchor_weight, anchor_weight_evidence
-            )
-            total = (
-                supervised
-                + distillation_weight * distillation
-                + weighted_anchor
-            )
+            total = objective["loss"]
             _optimize(total, optimizer)
             pending_losses.append(total.detach())
-            pending_supervised_losses.append(supervised.detach())
-            pending_distillation_losses.append(distillation.detach())
-            pending_anchor_losses.append(anchor.detach())
-            pending_weighted_anchor_losses.append(weighted_anchor.detach())
+            pending_supervised_losses.append(
+                objective["supervised_loss"].detach()
+            )
+            pending_distillation_losses.append(
+                objective["distillation_loss"].detach()
+            )
+            pending_anchor_losses.append(objective["anchor_loss"].detach())
+            pending_weighted_anchor_losses.append(
+                objective["weighted_anchor_loss"].detach()
+            )
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_losses, losses)
                 _flush_loss_values(pending_supervised_losses, supervised_losses)
@@ -1060,11 +1077,9 @@ def train_student_paths(
                 aggregator,
                 relation_loss_weights=relation_loss_weights,
             )
-            supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
-                student_scores
-            )
+            expanded_direct_scores = None
             if in_batch_negatives:
-                expanded_direct = score_target_direct_batch_in_batch(
+                expanded_direct_scores = score_target_direct_batch_in_batch(
                     student,
                     batch,
                     store,
@@ -1072,56 +1087,54 @@ def train_student_paths(
                     max_negatives=in_batch_max_negatives,
                     rng=rng,
                 )
-                direct_supervised = listwise_cross_entropy(
-                    expanded_direct.logits,
-                    expanded_direct.positive_indices,
-                    expanded_direct.candidate_mask,
-                    expanded_direct.positive_mask,
+            distillation_rows = (
+                torch.tensor(
+                    [
+                        example.dataset in distillation_datasets
+                        for example in batch
+                    ],
+                    dtype=torch.bool,
+                    device=device,
                 )
-                supervised = direct_supervised + evidence_supervised
-            if teacher_scores is not None:
-                distillation_rows = (
-                    torch.tensor(
-                        [
-                            example.dataset in distillation_datasets
-                            for example in batch
-                        ],
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                    if distillation_datasets is not None
-                    else None
-                )
-                distillation, direct_distillation, evidence_distillation = (
-                    _path_distillation_losses(
-                        student_scores,
-                        teacher_scores,
-                        temperature,
-                        distillation_rows,
-                    )
-                )
-            else:
-                distillation = supervised.new_zeros(())
-                direct_distillation = supervised.new_zeros(())
-                evidence_distillation = supervised.new_zeros(())
-            anchor, weighted_anchor = _anchor_losses(
-                student, anchor_weight, anchor_weight_evidence
+                if distillation_datasets is not None
+                else None
             )
-            total = (
-                supervised
-                + distillation_weight * distillation
-                + weighted_anchor
+            objective = _student_path_losses(
+                student,
+                student_scores,
+                teacher_scores,
+                expanded_direct_scores,
+                temperature=temperature,
+                distillation_weight=distillation_weight,
+                anchor_weight=anchor_weight,
+                anchor_weight_evidence=anchor_weight_evidence,
+                distillation_rows=distillation_rows,
             )
+            total = objective["loss"]
             _optimize(total, optimizer)
             pending_totals.append(total.detach())
-            pending_supervised_losses.append(supervised.detach())
-            pending_distillation_losses.append(distillation.detach())
-            pending_direct_supervised_losses.append(direct_supervised.detach())
-            pending_evidence_supervised_losses.append(evidence_supervised.detach())
-            pending_direct_distillation_losses.append(direct_distillation.detach())
-            pending_evidence_distillation_losses.append(evidence_distillation.detach())
-            pending_anchor_losses.append(anchor.detach())
-            pending_weighted_anchor_losses.append(weighted_anchor.detach())
+            pending_supervised_losses.append(
+                objective["supervised_loss"].detach()
+            )
+            pending_distillation_losses.append(
+                objective["distillation_loss"].detach()
+            )
+            pending_direct_supervised_losses.append(
+                objective["direct_supervised_loss"].detach()
+            )
+            pending_evidence_supervised_losses.append(
+                objective["evidence_supervised_loss"].detach()
+            )
+            pending_direct_distillation_losses.append(
+                objective["direct_distillation_loss"].detach()
+            )
+            pending_evidence_distillation_losses.append(
+                objective["evidence_distillation_loss"].detach()
+            )
+            pending_anchor_losses.append(objective["anchor_loss"].detach())
+            pending_weighted_anchor_losses.append(
+                objective["weighted_anchor_loss"].detach()
+            )
             if _loss_refresh_due(step, len(batches)):
                 _flush_loss_values(pending_totals, totals)
                 _flush_loss_values(pending_supervised_losses, supervised_losses)
@@ -1198,10 +1211,5 @@ def checkpoint(
         "state_dict": model.state_dict(),
     }
     if aggregator is not None:
-        payload["path_aggregation"] = {
-            "evidence_aggregation": aggregator.evidence_aggregation,
-            "evidence_top_k": aggregator.top_k,
-            "evidence_temperature": aggregator.temperature,
-            "evidence_power": aggregator.power,
-        }
+        payload["path_aggregation"] = aggregator.config()
     return payload

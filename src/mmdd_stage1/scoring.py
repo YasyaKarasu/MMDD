@@ -25,6 +25,20 @@ class ListScores:
     positive_indices: torch.Tensor
     positive_mask: torch.Tensor | None = None
 
+    def select(self, row_mask: torch.Tensor) -> ListScores:
+        """Return the selected batch rows for every score field."""
+
+        return ListScores(
+            logits=self.logits[row_mask],
+            candidate_mask=self.candidate_mask[row_mask],
+            positive_indices=self.positive_indices[row_mask],
+            positive_mask=(
+                None
+                if self.positive_mask is None
+                else self.positive_mask[row_mask]
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class TargetScores:
@@ -274,21 +288,12 @@ def _score_student_candidate_rows(
         candidate_embeddings = torch.stack(
             [candidate_features[object_id].embedding for object_id in pooled_ids]
         ).to(device=parameter.device, dtype=torch.float32)
-        query_vectors = student.project(query_embeddings, source_type)
-        candidate_vectors = student.project(candidate_embeddings, destination_type)
-        relation_key = student.relation_key(source_type, destination_type)
-        if student.relation_param == "full":
-            score_matrix = (
-                query_vectors
-                @ student.relations[relation_key]
-                @ candidate_vectors.T
-            )
-        else:
-            score_matrix = query_vectors @ candidate_vectors.T
-            score_matrix = score_matrix + (
-                (query_vectors @ student.relation_as[relation_key])
-                @ (candidate_vectors @ student.relation_bs[relation_key]).T
-            )
+        score_matrix = student.score_embedding_matrix(
+            query_embeddings,
+            source_type,
+            candidate_embeddings,
+            destination_type,
+        )
         column_by_id = {object_id: column for column, object_id in enumerate(pooled_ids)}
         for matrix_row, row_index in enumerate(row_indices):
             columns = torch.tensor(

@@ -82,6 +82,8 @@ class ObjectFeatures:
         include_hidden: bool,
         hidden_dtype: torch.dtype | None = torch.float32,
     ) -> ObjectFeatures:
+        """Move tensors used by Stage-1 scoring and omit table row embeddings."""
+
         hidden = self.hidden_states
         groups = self.token_groups
         if include_hidden:
@@ -126,6 +128,48 @@ def _feature_from_payload(object_id: str, object_type: str, payload: Mapping[str
 
 def _load_tensor_file(path: Path) -> Any:
     return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _extend_teacher_index(
+    manifest_path: Path,
+    base_index: Mapping[str, tuple[str, Path]],
+    teacher_index: dict[str, Path],
+    *,
+    allow_existing: bool,
+    directory_label: str,
+) -> None:
+    manifest_root = manifest_path.parent
+    with manifest_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            object_id = str(record["object_id"])
+            if object_id not in base_index:
+                raise ValueError(
+                    f"{manifest_path}:{line_number}: Teacher object {object_id!r} "
+                    "is absent from the base manifest"
+                )
+            declared_type = normalize_object_type(str(record["object_type"]))
+            if declared_type != base_index[object_id][0]:
+                raise ValueError(
+                    f"{manifest_path}:{line_number}: object type disagrees with "
+                    "the base manifest"
+                )
+            relative_path = Path(record["teacher_feature_path"])
+            feature_path = (manifest_root / relative_path).resolve()
+            if not feature_path.is_relative_to(manifest_root):
+                raise ValueError(
+                    f"{manifest_path}:{line_number}: teacher_feature_path escapes "
+                    f"the {directory_label}"
+                )
+            if object_id in teacher_index:
+                if allow_existing:
+                    continue
+                raise ValueError(
+                    f"{manifest_path}:{line_number}: duplicate object_id {object_id!r}"
+                )
+            teacher_index[object_id] = feature_path
 
 
 class FeatureStore:
@@ -222,35 +266,13 @@ class FeatureStore:
         teacher_index: dict[str, Path] = {}
         teacher_manifest = root / "teacher_manifest.jsonl"
         if teacher_manifest.is_file():
-            with teacher_manifest.open(encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, 1):
-                    if not line.strip():
-                        continue
-                    record = json.loads(line)
-                    object_id = str(record["object_id"])
-                    if object_id not in index:
-                        raise ValueError(
-                            f"{teacher_manifest}:{line_number}: Teacher object {object_id!r} "
-                            "is absent from the base manifest"
-                        )
-                    declared_type = normalize_object_type(str(record["object_type"]))
-                    if declared_type != index[object_id][0]:
-                        raise ValueError(
-                            f"{teacher_manifest}:{line_number}: object type disagrees with "
-                            "the base manifest"
-                        )
-                    relative_path = Path(record["teacher_feature_path"])
-                    feature_path = (root / relative_path).resolve()
-                    if not feature_path.is_relative_to(root):
-                        raise ValueError(
-                            f"{teacher_manifest}:{line_number}: teacher_feature_path escapes "
-                            "the feature directory"
-                        )
-                    if object_id in teacher_index:
-                        raise ValueError(
-                            f"{teacher_manifest}:{line_number}: duplicate object_id {object_id!r}"
-                        )
-                    teacher_index[object_id] = feature_path
+            _extend_teacher_index(
+                teacher_manifest,
+                index,
+                teacher_index,
+                allow_existing=False,
+                directory_label="feature directory",
+            )
         # Teacher-only caches may be staged separately from the retrieval cache.
         # Their manifests contain paths relative to each staging directory; the
         # base manifest remains authoritative for object IDs and types.
@@ -263,36 +285,15 @@ class FeatureStore:
             )
             if not manifest_path.is_file():
                 raise FileNotFoundError(f"Missing Teacher feature manifest: {manifest_path}")
-            manifest_root = manifest_path.parent
-            with manifest_path.open(encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, 1):
-                    if not line.strip():
-                        continue
-                    record = json.loads(line)
-                    object_id = str(record["object_id"])
-                    if object_id not in index:
-                        raise ValueError(
-                            f"{manifest_path}:{line_number}: Teacher object {object_id!r} "
-                            "is absent from the base manifest"
-                        )
-                    declared_type = normalize_object_type(str(record["object_type"]))
-                    if declared_type != index[object_id][0]:
-                        raise ValueError(
-                            f"{manifest_path}:{line_number}: object type disagrees with "
-                            "the base manifest"
-                        )
-                    relative_path = Path(record["teacher_feature_path"])
-                    feature_path = (manifest_root / relative_path).resolve()
-                    if not feature_path.is_relative_to(manifest_root):
-                        raise ValueError(
-                            f"{manifest_path}:{line_number}: teacher_feature_path escapes "
-                            "the Teacher feature directory"
-                        )
-                    # A staged shard may duplicate an object already present in
-                    # the base cache. Keep the base entry, whose path has already
-                    # been validated, and only fill genuinely missing objects.
-                    if object_id not in teacher_index:
-                        teacher_index[object_id] = feature_path
+            # A staged shard may duplicate an object already present in the
+            # base cache. Keep the validated base entry.
+            _extend_teacher_index(
+                manifest_path,
+                index,
+                teacher_index,
+                allow_existing=True,
+                directory_label="Teacher feature directory",
+            )
         return cls(
             index=index,
             teacher_index=teacher_index,

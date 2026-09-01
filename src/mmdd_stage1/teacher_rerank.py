@@ -12,10 +12,11 @@ import torch
 from mmdd_progress import progress
 
 from .data import TargetExample
+from .evaluation import DEFAULT_RECALL_KS, retrieval_metric_values
 from .features import FeatureStore, ObjectFeatures
 from .models import TeacherJoinabilityModel
 
-RECALL_KS = (10, 20, 30, 40, 50)
+RECALL_KS = DEFAULT_RECALL_KS
 
 
 def z_scores(values: Sequence[float]) -> list[float]:
@@ -93,30 +94,18 @@ def _retrieval_metrics(
     recall_ks = tuple(sorted(dict.fromkeys(int(k) for k in recall_ks)))
     if not recall_ks:
         raise ValueError("recall_ks must not be empty")
-    for k in recall_ks:
-        metrics[f"recall@{k}"] = statistics.fmean(
-            len(set(ranking[:k]) & relevant) / len(relevant)
-            for ranking, relevant in zip(rankings, positives)
-        )
-    max_k = max(recall_ks)
-    metrics[f"mrr@{max_k}"] = statistics.fmean(
-        next(
-            (
-                1.0 / rank
-                for rank, target_id in enumerate(ranking[:max_k], 1)
-                if target_id in relevant
-            ),
-            0.0,
-        )
-        for ranking, relevant in zip(rankings, positives)
+    per_query = retrieval_metric_values(rankings, positives, recall_ks)
+    metrics.update(
+        {
+            metric: statistics.fmean(values)
+            for metric, values in per_query.items()
+        }
     )
     if return_per_query:
         metrics["per_query"] = {
-            f"recall@{k}": [
-                len(set(ranking[:k]) & relevant) / len(relevant)
-                for ranking, relevant in zip(rankings, positives)
-            ]
-            for k in recall_ks
+            metric: values
+            for metric, values in per_query.items()
+            if metric.startswith("recall@")
         }
     return metrics
 

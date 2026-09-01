@@ -640,6 +640,26 @@ class StudentJoinabilityModel(nn.Module):
         ).sum(dim=-1)
         return direct + residual
 
+    def score_embedding_matrix(
+        self,
+        source_embeddings: torch.Tensor,
+        source_type: str,
+        destination_embeddings: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        """Score every source/destination pair in two embedding batches."""
+
+        sources = self.project(source_embeddings, source_type)
+        destinations = self.project(destination_embeddings, destination_type)
+        key = self.relation_key(source_type, destination_type)
+        if self.relation_param == "full":
+            return sources @ self.relations[key] @ destinations.T
+        scores = sources @ destinations.T
+        return scores + (
+            (sources @ self.relation_as[key])
+            @ (destinations @ self.relation_bs[key]).T
+        )
+
     def score_pairs(
         self,
         sources: Sequence[ObjectFeatures],
@@ -767,8 +787,13 @@ class IdentityStudentJoinabilityModel(nn.Module):
         return self.project(source_embedding, source_type)
 
     def index_vector(
-        self, destination_embedding: torch.Tensor, destination_type: str
+        self,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+        source_type: str | None = None,
     ) -> torch.Tensor:
+        if source_type is not None:
+            normalize_object_type(source_type)
         return self.project(destination_embedding, destination_type)
 
 
@@ -820,6 +845,18 @@ class ProjectedIdentityStudentJoinabilityModel(nn.Module):
         return self.project(source_embedding, source_type)
 
     def index_vector(
-        self, destination_embedding: torch.Tensor, destination_type: str
+        self,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+        source_type: str | None = None,
     ) -> torch.Tensor:
+        if source_type is not None:
+            normalize_object_type(source_type)
         return self.project(destination_embedding, destination_type)
+
+
+StudentANNModel = (
+    StudentJoinabilityModel
+    | IdentityStudentJoinabilityModel
+    | ProjectedIdentityStudentJoinabilityModel
+)

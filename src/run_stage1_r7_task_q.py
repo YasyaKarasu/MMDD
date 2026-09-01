@@ -14,6 +14,7 @@ import torch
 
 from mmdd_stage1.checkpoints import load_student
 from mmdd_stage1.data import TargetExample, load_target_examples
+from mmdd_stage1.evaluation import DEFAULT_RECALL_KS
 from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.retrieval import (
@@ -31,7 +32,7 @@ from run_stage1_r6_sweeps import (
     _query_values,
 )
 
-RECALL_KS = (10, 20, 30, 40, 50)
+RECALL_KS = DEFAULT_RECALL_KS
 
 
 def _label(value: float) -> str:

@@ -43,6 +43,14 @@ class PathAggregator(nn.Module):
         self.temperature = float(temperature)
         self.power = float(power)
 
+    def config(self) -> dict[str, str | int | float]:
+        return {
+            "evidence_aggregation": self.evidence_aggregation,
+            "evidence_top_k": self.top_k,
+            "evidence_temperature": self.temperature,
+            "evidence_power": self.power,
+        }
+
     def forward(
         self,
         query_evidence_scores: torch.Tensor,

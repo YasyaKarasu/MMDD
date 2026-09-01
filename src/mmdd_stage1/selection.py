@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from .retrieval import checkpoint_fingerprint
+from .artifacts import checkpoint_fingerprint, write_json
 
 
 def metric_value(metrics: dict[str, Any], name: str) -> float:
@@ -122,16 +122,6 @@ class CheckpointManager:
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         shutil.copyfile(source, temporary)
         temporary.replace(destination)
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def load_stage1_selection(path: Path) -> dict[str, Any]:

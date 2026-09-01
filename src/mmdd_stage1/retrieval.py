@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections import defaultdict
@@ -14,17 +13,26 @@ import numpy as np
 import torch
 from mmdd_progress import progress
 
+from .artifacts import checkpoint_fingerprint
 from .features import OBJECT_TYPES, FeatureStore, normalize_object_type
-from .models import StudentJoinabilityModel
+from .models import StudentANNModel
 from .objectives import PathAggregator
 
+FUSION_MODES = (
+    "rrf",
+    "weighted_rrf",
+    "gated",
+    "normalized_score",
+    "normalized_rrc",
+)
 
-def checkpoint_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+
+def _validate_fusion_mode(fusion_mode: str) -> None:
+    if fusion_mode not in FUSION_MODES:
+        raise ValueError(
+            "fusion_mode must be one of: rrf, weighted_rrf, gated, "
+            "normalized_score, normalized_rrc"
+        )
 
 
 def load_corpus_ids(path: Path, store: FeatureStore) -> dict[str, list[str]]:
@@ -50,7 +58,7 @@ def load_corpus_ids(path: Path, store: FeatureStore) -> dict[str, list[str]]:
 
 
 def build_indices(
-    model: StudentJoinabilityModel,
+    model: StudentANNModel,
     store: FeatureStore,
     ids_by_type: dict[str, list[str]],
     output_dir: Path,
@@ -248,7 +256,7 @@ def build_raw_embedding_indices(
 class StudentANNIndices:
     def __init__(
         self,
-        model: StudentJoinabilityModel,
+        model: StudentANNModel,
         store: FeatureStore,
         index_dir: Path,
         *,
@@ -651,17 +659,7 @@ def fuse_ranked_channels(
 ) -> list[dict[str, Any]]:
     """Fuse pre-ranked channels without repeating ANN retrieval."""
 
-    if fusion_mode not in {
-        "gated",
-        "normalized_rrc",
-        "normalized_score",
-        "rrf",
-        "weighted_rrf",
-    }:
-        raise ValueError(
-            "fusion_mode must be one of: rrf, weighted_rrf, gated, "
-            "normalized_score, normalized_rrc"
-        )
+    _validate_fusion_mode(fusion_mode)
     if score_normalization not in {"none", "zscore", "minmax", "softmax"}:
         raise ValueError(
             "score_normalization must be one of: none, zscore, minmax, softmax"
@@ -1050,17 +1048,7 @@ def retrieve_zero_one_hop_detailed_many(
         raise ValueError("Retrieval k values must be non-negative")
     if rrf_k < 0:
         raise ValueError("rrf_k must be non-negative")
-    if fusion_mode not in {
-        "rrf",
-        "weighted_rrf",
-        "gated",
-        "normalized_score",
-        "normalized_rrc",
-    }:
-        raise ValueError(
-            "fusion_mode must be one of: rrf, weighted_rrf, gated, "
-            "normalized_score, normalized_rrc"
-        )
+    _validate_fusion_mode(fusion_mode)
     if path_edge_normalization not in {"none", "zscore"}:
         raise ValueError("path_edge_normalization must be one of: none, zscore")
     if fusion_score_normalization not in {"none", "zscore", "minmax", "softmax"}:

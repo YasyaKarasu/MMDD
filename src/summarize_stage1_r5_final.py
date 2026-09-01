@@ -8,12 +8,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mmdd_stage1.evaluation import DEFAULT_RECALL_KS
 from mmdd_stage1.retrieval import checkpoint_fingerprint
 from mmdd_stage1.selection import write_json
 from mmdd_stage1.significance import paired_bootstrap_delta
 
 
-RECALL_KS = (10, 20, 30, 40, 50)
+RECALL_KS = DEFAULT_RECALL_KS
 
 
 def _read(path: Path) -> dict[str, Any]:
