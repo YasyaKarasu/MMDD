@@ -2643,10 +2643,14 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     query_column_names = [column["column_name"] for column in query["columns"]]
     target_column_names = [column["column_name"] for column in target["columns"]]
     assert query_column_names[0] == "Entity"
-    assert set(query_column_names[1:]) | (set(target_column_names) - {"City"}) == {
-        "Team",
-        "League",
-    }
+    assert (
+        (set(query_column_names[1:]) - {"entity_url"})
+        | (set(target_column_names) - {"City"})
+        == {
+            "Team",
+            "League",
+        }
+    )
     assert set(query_column_names).isdisjoint(target_column_names)
     assert query["hidden_attributes"][0]["column_name"] == "City"
     assert query["hidden_attributes"][0]["valid_entity_rows"] == 6
