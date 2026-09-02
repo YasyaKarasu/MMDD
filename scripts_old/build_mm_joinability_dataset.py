@@ -134,6 +134,7 @@ DEFAULT_IMAGE_REQUEST_MAX_PIXELS = 512_000
 DEFAULT_IMAGE_MODEL_MAX_TOKENS = 384
 DEFAULT_EXPLICIT_JOIN_FALLBACK_RATIO = 0.2
 DEFAULT_EXPLICIT_JOIN_FALLBACK_MODE = "ratio"
+MIN_IMPLICIT_CONTEXT_COLUMNS = 2
 EXPLICIT_JOIN_FALLBACK_MODES = (
     "disabled",
     "ratio",
@@ -6854,6 +6855,49 @@ def project_selected_rows(
     return rows, source_rows
 
 
+def append_entity_url_column(
+    query_rows: list[dict[str, Any]],
+    source_table: dict[str, Any],
+    entity_col: int,
+) -> list[dict[str, Any]]:
+    """Append a synthetic ``entity_url`` cell (derived from ``wiki_title``) to each query row.
+
+    The URL is computed at build time from the entity cell's ``wiki_title`` field
+    (never via network I/O): ``canonicalurl`` is not available at this stage, so we
+    reuse the same fallback formula used for bridge asset URLs. Rows whose entity
+    cell has no ``wiki_title`` (non-entity values) get an empty string, not an error.
+    The new column is appended as an extra column positioned after the last
+    projected column, with its own explicit ``column_name`` so downstream code
+    never needs to reverse-lookup ``source_table["columns"]`` for it.
+    """
+    new_out_idx = 0
+    for row in query_rows:
+        cells = row.get("cells") or []
+        new_out_idx = max(new_out_idx, len(cells))
+    for row in query_rows:
+        cells = row.get("cells") or []
+        entity_cell = next(
+            (cell for cell in cells if cell.get("source_column_index") == entity_col),
+            None,
+        )
+        wiki_title = clean_text((entity_cell or {}).get("wiki_title"))
+        if wiki_title:
+            url = f"https://en.wikipedia.org/wiki/{quote(wiki_title.replace(' ', '_'))}"
+        else:
+            url = ""
+        cells.append(
+            {
+                "column_index": new_out_idx,
+                "source_column_index": -1,
+                "column_name": "entity_url",
+                "text": url,
+                "synthetic": True,
+            }
+        )
+        row["cells"] = cells
+    return query_rows
+
+
 def query_visible_row_attributes(
     query_row: dict[str, Any],
     *,
@@ -7338,6 +7382,7 @@ def _materialize_explicit_join_candidate(
         {int(value) for value in candidate["selected_source_row_ids"]},
         min_required_cols=2,
     )
+    query_rows = append_entity_url_column(query_rows, source_table, entity_col)
     all_source_rows = {
         row_id(source_row, fallback)
         for fallback, source_row in enumerate(source_table.get("rows", []))
@@ -7385,6 +7430,14 @@ def _materialize_explicit_join_candidate(
             "row_view_index": 0,
         },
     )
+    query_table["columns"] = [
+        *query_table["columns"],
+        {
+            "column_index": len(query_table["columns"]),
+            "source_column_index": -1,
+            "column_name": "entity_url",
+        },
+    ]
     target_table = table_record(
         table_id=target_table_id,
         role="target_data_lake_table",
@@ -7744,7 +7797,7 @@ def multi_attribute_context_layout(
     args: argparse.Namespace,
     profiles: dict[int, dict[str, Any]] | None = None,
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
-    """Assign one source-level context partition to every bridge variant."""
+    """Reserve two context columns before emitting implicit bridge variants."""
     if not qualified_cols:
         return []
 
@@ -7759,8 +7812,9 @@ def multi_attribute_context_layout(
         int(qualified["column_index"]) for qualified in ordered_qualified
     }
     max_variants = int(getattr(args, "max_query_tables_per_source_table", 0))
+    emitted_qualified = list(ordered_qualified)
     if max_variants > 0:
-        ordered_qualified = ordered_qualified[:max_variants]
+        emitted_qualified = emitted_qualified[:max_variants]
 
     ordinary_contexts = context_columns(
         source_table,
@@ -7768,6 +7822,28 @@ def multi_attribute_context_layout(
         0,
         profiles=profiles,
     )
+    emitted_indices = {
+        int(qualified["column_index"]) for qualified in emitted_qualified
+    }
+    # Prefer unselected and weakly recovered bridges as context while keeping
+    # the strongest emitted bridge hidden as the target join attribute.
+    for qualified in reversed(ordered_qualified):
+        if len(ordinary_contexts) >= MIN_IMPLICIT_CONTEXT_COLUMNS:
+            break
+        column_index = int(qualified["column_index"])
+        if column_index in emitted_indices:
+            if len(emitted_indices) == 1:
+                continue
+            emitted_indices.remove(column_index)
+        ordinary_contexts.append(column_index)
+    if len(ordinary_contexts) < MIN_IMPLICIT_CONTEXT_COLUMNS:
+        return []
+
+    emitted_qualified = [
+        qualified
+        for qualified in emitted_qualified
+        if int(qualified["column_index"]) in emitted_indices
+    ]
     query_context, target_context = balanced_context_partition(
         ordinary_contexts,
         seed=int(getattr(args, "seed", 13)),
@@ -7775,7 +7851,7 @@ def multi_attribute_context_layout(
     )
     return [
         (qualified, list(query_context), list(target_context))
-        for qualified in ordered_qualified
+        for qualified in emitted_qualified
     ]
 
 
@@ -9797,6 +9873,7 @@ def build_table_join_records(
                 selected_source_row_set,
                 min_required_cols=1,
             )
+            query_rows = append_entity_url_column(query_rows, source_table, entity_col)
             if not set(query_source_rows).issubset(target_source_rows):
                 continue
             if len(query_rows) != query_rows_per_table:
@@ -9954,6 +10031,14 @@ def build_table_join_records(
                         "row_view_index": row_view_index,
                     },
                 )
+                query_table["columns"] = [
+                    *query_table["columns"],
+                    {
+                        "column_index": len(query_table["columns"]),
+                        "source_column_index": -1,
+                        "column_name": "entity_url",
+                    },
+                ]
                 query_by_fingerprint[query_fingerprint] = query_table
                 query_tables.append(query_table)
             else:
@@ -10957,6 +11042,7 @@ def _build_dataset(
         "wikipedia_workers": 1,
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
+        "min_implicit_context_columns": MIN_IMPLICIT_CONTEXT_COLUMNS,
         "query_rows_per_table": args.query_rows_per_table,
         "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,
         "explicit_join_fallback_mode": args.explicit_join_fallback_mode,
@@ -10980,9 +11066,11 @@ def _build_dataset(
             "tables without a candidate entity column or enough linked entity rows for one query are filtered before the seeded global source-table sample",
             "train join chains emit up to max_train_query_row_views_per_join deterministic disjoint row views; dev/test emit one canonical view",
             "query_tables use a capped recovery threshold over valid entity rows and contain exactly query_rows_per_table sampled rows",
-            "wide source tables emit one variant per qualifying bridge attribute; "
-            "all qualifying bridge columns stay out of the shared ordinary context "
-            "pool, which is split into source-level query-only and target-only sides",
+            "wide source tables emit variants from the qualifying bridge attributes "
+            "remaining after context allocation; "
+            "ordinary columns form a shared source-level context pool, and the "
+            "weakest qualifying bridge columns are demoted to context when needed "
+            "to give the query and target at least one disjoint context column each",
             "qualified attributes with the same exact visible query row view are "
             "merged into one query with multiple positive targets",
             "generated target data-lake tables retain every source row after column projection; rejected source tables remain raw",
@@ -11035,6 +11123,7 @@ def _build_dataset(
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
+            "min_implicit_context_columns": MIN_IMPLICIT_CONTEXT_COLUMNS,
             "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
             "max_query_context_attrs": args.max_query_context_attrs,
             "max_target_context_attrs": args.max_target_context_attrs,
@@ -11046,9 +11135,11 @@ def _build_dataset(
             "explicit_context_partition_scope": (
                 "post_balance_selected_join_columns_only"
             ),
-            "qualified_attribute_policy": "all_safe_variants",
+            "qualified_attribute_policy": (
+                "recovery_qualified_variants_after_context_floor"
+            ),
             "sibling_source_column_policy": (
-                "qualified_bridge_columns_excluded_from_shared_context_pools"
+                "weakest_qualified_bridges_fill_two_column_context_floor"
             ),
             "identical_visible_query_policy": (
                 "merge_exact_row_view_with_all_distinct_positive_targets"

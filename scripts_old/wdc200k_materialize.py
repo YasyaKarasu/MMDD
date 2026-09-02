@@ -2548,6 +2548,9 @@ def _parameter_payload(
         "min_recovery_denominator": int(
             args.min_recovery_denominator
         ),
+        "min_implicit_context_columns": (
+            join_builder.MIN_IMPLICIT_CONTEXT_COLUMNS
+        ),
         "max_query_tables_per_source_table": int(
             args.max_query_tables_per_source_table
         ),
@@ -2573,9 +2576,11 @@ def _parameter_payload(
         "query_row_selection": "recovery_balanced_disjoint_train_views",
         "evaluation_query_row_views_per_join": 1,
         "target_row_scope": "all_source_rows",
-        "qualified_attribute_policy": "all_safe_variants",
+        "qualified_attribute_policy": (
+            "recovery_qualified_variants_after_context_floor"
+        ),
         "sibling_source_column_policy": (
-            "qualified_bridge_columns_excluded_from_shared_context_pools"
+            "weakest_qualified_bridges_fill_two_column_context_floor"
         ),
         "identical_visible_query_policy": (
             "merge_exact_row_view_with_all_distinct_positive_targets"
@@ -7528,6 +7533,9 @@ def _stats_payload(
         "evidence_recoveries": counts["evidence_recoveries"],
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
+        "min_implicit_context_columns": (
+            join_builder.MIN_IMPLICIT_CONTEXT_COLUMNS
+        ),
         "query_rows_per_table": (
             join_builder.configured_query_rows_per_table(args)
         ),
@@ -7554,8 +7562,11 @@ def _stats_payload(
             "source-table rows are never capped",
             "sampling rejects source tables that cannot fill one query row view",
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
-            "wide source tables may emit multiple query variants, one per "
-            "qualifying bridge attribute",
+            "wide source tables may emit multiple query variants after "
+            "enforcing the context floor",
+            "the weakest qualifying bridge columns are demoted when needed "
+            "to give the query and target at least one disjoint context "
+            "column each",
             "qualified attributes with the same exact visible query row view are "
             "merged into one query with multiple positive targets",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",

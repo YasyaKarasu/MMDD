@@ -383,6 +383,11 @@ def _source_table(
             "column_name": "Category",
             "is_numeric_column": False,
         },
+        {
+            "column_index": 3,
+            "column_name": "Type",
+            "is_numeric_column": False,
+        },
     ]
     rows = []
     for row_id, (name, state) in enumerate(
@@ -413,6 +418,14 @@ def _source_table(
                         "column_name": "Category",
                         "raw": "Place",
                         "text": "Place",
+                        "wiki_title": None,
+                        "has_wiki_link": False,
+                    },
+                    {
+                        "column_index": 3,
+                        "column_name": "Type",
+                        "raw": "Location",
+                        "text": "Location",
                         "wiki_title": None,
                         "has_wiki_link": False,
                     },
@@ -626,7 +639,7 @@ def _extractions(
         cache_key = join_builder.extraction_cache_key(
             asset_id=str(asset["asset_id"]),
             entity_id=entity_id,
-            candidate_attribute_names=["State", "Category"],
+            candidate_attribute_names=["State", "Category", "Type"],
             asset_type="text",
             args=args,
             row_attributes=row_attributes,
@@ -639,7 +652,7 @@ def _extractions(
                 "entity_wiki_title": str(asset["entity_wiki_title"]),
                 "asset_id": asset["asset_id"],
                 "asset_type": "text",
-                "candidate_attribute_names": ["State", "Category"],
+                "candidate_attribute_names": ["State", "Category", "Type"],
                 "row_attributes": row_attributes,
                 "attributes": [
                     {
@@ -869,6 +882,7 @@ def _real_structural_upstream(
             "name": name,
             "State": state,
             "Category": "Place",
+            "Type": "Location",
             "page_url": f"https://example.test/{name.casefold()}",
             "image": "",
         }
@@ -883,7 +897,7 @@ def _real_structural_upstream(
         "host": "example.test",
         "relative_path": table_path.relative_to(input_root).as_posix(),
         "rows": 2,
-        "columns": 5,
+        "columns": 6,
         "rank": "rank",
         "selection_seed": 13,
     }
@@ -1310,7 +1324,7 @@ def _model_tasks(
                     "entity_column_name": "Name",
                 },
                 "asset": asset,
-                "candidate_attribute_names": ["State", "Category"],
+                "candidate_attribute_names": ["State", "Category", "Type"],
             }
         }
         for asset in assets
@@ -2249,8 +2263,9 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     assert manifest["complete"] is True
     assert (
         manifest["query_construction"]["qualified_attribute_policy"]
-        == "all_safe_variants"
+        == "recovery_qualified_variants_after_context_floor"
     )
+    assert manifest["query_construction"]["min_implicit_context_columns"] == 2
     assert (
         manifest["query_construction"]["identical_visible_query_policy"]
         == "merge_exact_row_view_with_all_distinct_positive_targets"

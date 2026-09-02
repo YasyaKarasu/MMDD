@@ -334,7 +334,8 @@ def build_query_auto_check_fixture(
         "columns": [
             {"column_index": 0, "column_name": "Entity"},
             {"column_index": 1, "column_name": "Bridge"},
-            {"column_index": 2, "column_name": "Context"},
+            {"column_index": 2, "column_name": "Context A"},
+            {"column_index": 3, "column_name": "Context B"},
         ],
         "rows": [
             {
@@ -353,8 +354,13 @@ def build_query_auto_check_fixture(
                     },
                     {
                         "column_index": 2,
-                        "column_name": "Context",
-                        "text": f"Context {index}",
+                        "column_name": "Context A",
+                        "text": f"Context A {index}",
+                    },
+                    {
+                        "column_index": 3,
+                        "column_name": "Context B",
+                        "text": f"Context B {index}",
                     },
                 ],
             }
@@ -421,8 +427,14 @@ def build_query_auto_check_fixture(
                 item["name"]
                 for item in task.entity.get("row_attributes") or []
             }
-            assert visible_names == {"Entity", "Context"}
+            assert "Entity" in visible_names
             assert "Bridge" not in visible_names
+            assert "entity_url" in visible_names
+            context_names = {
+                name for name in visible_names if name.startswith("Context ")
+            }
+            assert len(context_names) == 1
+            assert len(visible_names) == 3
             self.calls.append(task.source_row_id)
             supported = task.source_row_id in supported_rows
             return {
@@ -1518,7 +1530,7 @@ def test_implicit_query_uniqueness_validator_requires_one_qrel_per_query() -> No
         )
 
 
-def test_multi_attribute_split_keeps_all_targets_when_context_is_narrow(
+def test_multi_attribute_split_demotes_weakest_join_when_context_is_narrow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     query_tables, target_tables, qrels, decision, _recovery_records = (
@@ -1531,7 +1543,72 @@ def test_multi_attribute_split_keeps_all_targets_when_context_is_narrow(
 
     assert decision["reason"] == "queryable"
     assert len(query_tables) == 1
-    assert len(target_tables) == len(qrels) == 2
+    assert len(target_tables) == len(qrels) == 1
+    query = query_tables[0]
+    target = target_tables[0]
+    assert target["join_col_name"] == "Bridge B"
+    assert set(query["source_column_indices"]) | set(
+        target["source_column_indices"]
+    ) == {0, 1, 2, 3}
+    assert set(query["source_column_indices"]) & set(
+        target["source_column_indices"]
+    ) == set()
+    assert len(query["source_column_indices"]) == 2
+    assert len(target["source_column_indices"]) == 2
+
+
+def test_multi_attribute_context_layout_demotes_join_columns_to_reach_floor() -> None:
+    source_table = {
+        "source_table_id": "context-floor-source",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(
+                ["Entity", "Strong Bridge", "Middle Bridge", "Weak Bridge"]
+            )
+        ],
+        "rows": [],
+    }
+    qualified = [
+        {"column_index": 1, "recovered_value_ratio": 1.0},
+        {"column_index": 2, "recovered_value_ratio": 0.8},
+        {"column_index": 3, "recovered_value_ratio": 0.6},
+    ]
+
+    layouts = joinability_dataset.multi_attribute_context_layout(
+        source_table=source_table,
+        entity_col=0,
+        qualified_cols=qualified,
+        args=SimpleNamespace(seed=13, max_query_tables_per_source_table=0),
+    )
+
+    assert len(layouts) == 1
+    emitted, query_context, target_context = layouts[0]
+    assert emitted["column_index"] == 1
+    assert set(query_context) | set(target_context) == {2, 3}
+    assert set(query_context).isdisjoint(target_context)
+    assert len(query_context) == len(target_context) == 1
+
+
+def test_multi_attribute_context_layout_rejects_unachievable_floor() -> None:
+    source_table = {
+        "source_table_id": "insufficient-context-source",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(["Entity", "Bridge A", "Bridge B"])
+        ],
+        "rows": [],
+    }
+    qualified = [
+        {"column_index": 1, "recovered_value_ratio": 1.0},
+        {"column_index": 2, "recovered_value_ratio": 0.8},
+    ]
+
+    assert joinability_dataset.multi_attribute_context_layout(
+        source_table=source_table,
+        entity_col=0,
+        qualified_cols=qualified,
+        args=SimpleNamespace(seed=13, max_query_tables_per_source_table=0),
+    ) == []
 
 
 def build_rejected_table_with_explicit_join(

@@ -3501,6 +3501,9 @@ def build_dataset(
         "web_fairness_lookahead": args.web_fairness_lookahead,
         "min_recovered_value_ratio": args.min_recovered_value_ratio,
         "min_recovery_denominator": args.min_recovery_denominator,
+        "min_implicit_context_columns": (
+            join_builder.MIN_IMPLICIT_CONTEXT_COLUMNS
+        ),
         "query_rows_per_table": args.query_rows_per_table,
         "max_train_query_row_views_per_join": (
             args.max_train_query_row_views_per_join
@@ -3525,7 +3528,8 @@ def build_dataset(
             "tables without enough linked entity rows for one query are filtered before network and model work",
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "query row views balance recoverable evidence while projected targets retain every source row",
-            "wide source tables may emit one query variant per qualifying bridge attribute",
+            "wide source tables may emit one query variant per qualifying bridge attribute after enforcing the context floor",
+            "the weakest qualifying bridge columns are demoted when needed to give the query and target at least one disjoint context column each",
             "qualified attributes with the same exact visible query row view are "
             "merged into one query with multiple positive targets",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",
@@ -3582,6 +3586,9 @@ def build_dataset(
             "min_rows_per_output_table": args.min_rows_per_output_table,
             "min_recovered_value_ratio": args.min_recovered_value_ratio,
             "min_recovery_denominator": args.min_recovery_denominator,
+            "min_implicit_context_columns": (
+                join_builder.MIN_IMPLICIT_CONTEXT_COLUMNS
+            ),
             "max_query_tables_per_source_table": args.max_query_tables_per_source_table,
             "max_query_context_attrs": args.max_query_context_attrs,
             "max_target_context_attrs": args.max_target_context_attrs,
@@ -3593,9 +3600,11 @@ def build_dataset(
             "explicit_context_partition_scope": (
                 "post_balance_selected_join_columns_only"
             ),
-            "qualified_attribute_policy": "all_safe_variants",
+            "qualified_attribute_policy": (
+                "recovery_qualified_variants_after_context_floor"
+            ),
             "sibling_source_column_policy": (
-                "qualified_bridge_columns_excluded_from_shared_context_pools"
+                "weakest_qualified_bridges_fill_two_column_context_floor"
             ),
             "identical_visible_query_policy": (
                 "merge_exact_row_view_with_all_distinct_positive_targets"

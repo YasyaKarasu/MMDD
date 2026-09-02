@@ -2497,36 +2497,36 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     input_dir.mkdir()
     output_dir = tmp_path / "joinability"
     queryable_table = {
-        "title": ["Entity", "City", "Team"],
-        "numCols": 3,
+        "title": ["Entity", "City", "Team", "League"],
+        "numCols": 4,
         "numericColumns": [],
         "pgTitle": "Queryable Page",
         "numDataRows": 6,
         "secondTitle": "Section",
         "caption": "Caption",
         "data": [
-            ["[Alpha_Page|Alpha]", "Paris", "Red"],
-            ["[Delta_Page|Delta]", "", "Green"],
-            ["[Beta_Page|Beta]", "Paris", "Red"],
-            ["[Epsilon_Page|Epsilon]", "", "Yellow"],
-            ["[Gamma_Page|Gamma]", "Oslo", "Blue"],
-            ["[Zeta_Page|Zeta]", "Madrid", "Black"],
+            ["[Alpha_Page|Alpha]", "Paris", "Red", "One"],
+            ["[Delta_Page|Delta]", "", "Green", "Two"],
+            ["[Beta_Page|Beta]", "Paris", "Red", "One"],
+            ["[Epsilon_Page|Epsilon]", "", "Yellow", "Three"],
+            ["[Gamma_Page|Gamma]", "Oslo", "Blue", "Four"],
+            ["[Zeta_Page|Zeta]", "Madrid", "Black", "Five"],
         ],
     }
     rejected_table = {
-        "title": ["Entity", "City", "Team"],
-        "numCols": 3,
+        "title": ["Entity", "City", "Team", "League"],
+        "numCols": 4,
         "numericColumns": [],
         "pgTitle": "Rejected Page",
         "numDataRows": 5,
         "secondTitle": "Section",
         "caption": "Caption",
         "data": [
-            ["[No_A|No A]", "Madrid", "One"],
-            ["[No_B|No B]", "Berlin", "Two"],
-            ["[No_C|No C]", "Lisbon", "Three"],
-            ["[No_D|No D]", "Dublin", "Four"],
-            ["[No_E|No E]", "Rome", "Five"],
+            ["[No_A|No A]", "Madrid", "One", "A"],
+            ["[No_B|No B]", "Berlin", "Two", "B"],
+            ["[No_C|No C]", "Lisbon", "Three", "C"],
+            ["[No_D|No D]", "Dublin", "Four", "D"],
+            ["[No_E|No E]", "Rome", "Five", "E"],
         ],
     }
     (input_dir / "tables.json").write_text(json.dumps({"table_1": queryable_table, "table_2": rejected_table}), encoding="utf-8")
@@ -2640,7 +2640,14 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     extractions = read_manifest_artifact(output_dir, "attribute_extractions")
     qrels = [json.loads(line) for line in (output_dir / "qrels.jsonl").read_text(encoding="utf-8").splitlines()]
 
-    assert [column["column_name"] for column in query["columns"]] == ["Entity", "Team"]
+    query_column_names = [column["column_name"] for column in query["columns"]]
+    target_column_names = [column["column_name"] for column in target["columns"]]
+    assert query_column_names[0] == "Entity"
+    assert set(query_column_names[1:]) | (set(target_column_names) - {"City"}) == {
+        "Team",
+        "League",
+    }
+    assert set(query_column_names).isdisjoint(target_column_names)
     assert query["hidden_attributes"][0]["column_name"] == "City"
     assert query["hidden_attributes"][0]["valid_entity_rows"] == 6
     assert query["hidden_attributes"][0]["required_recovered_rows"] == 3
@@ -2652,8 +2659,11 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
     assert len(target["rows"]) == 6
     assert query["source_row_indices"] == [0, 1, 2, 3, 4]
     assert target["source_row_indices"] == [0, 1, 2, 3, 4, 5]
-    assert [target["rows"][row_id]["cells"][0]["text"] for row_id in (1, 3)] == ["", ""]
-    assert [column["column_name"] for column in target["columns"]] == ["City"]
+    city_position = target_column_names.index("City")
+    assert [
+        target["rows"][row_id]["cells"][city_position]["text"]
+        for row_id in (1, 3)
+    ] == ["", ""]
     assert rejected["queryable"] is False
     assert rejected["source_table_ref"] == {
         "artifact": "source_tables",
@@ -2680,6 +2690,7 @@ def test_joinability_dataset_maps_evidence_to_query_entity_attribute(tmp_path, m
         == "recovery_balanced_disjoint_train_views"
     )
     assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
+    assert manifest["query_construction"]["min_implicit_context_columns"] == 2
     assert qrels[0]["query_table_id"] == query["table_id"]
     assert qrels[0]["data_lake_table_id"] == target["table_id"]
     assert any(item["attributes"] for item in extractions)

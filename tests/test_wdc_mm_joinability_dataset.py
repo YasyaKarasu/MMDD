@@ -2071,7 +2071,11 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     assert manifest["query_construction"]["max_train_query_row_views_per_join"] == 5
     assert manifest["query_construction"]["evaluation_query_row_views_per_join"] == 1
     assert manifest["query_construction"]["target_row_scope"] == "all_source_rows"
-    assert manifest["query_construction"]["qualified_attribute_policy"] == "all_safe_variants"
+    assert (
+        manifest["query_construction"]["qualified_attribute_policy"]
+        == "recovery_qualified_variants_after_context_floor"
+    )
+    assert manifest["query_construction"]["min_implicit_context_columns"] == 2
     assert (
         manifest["query_construction"]["identical_visible_query_policy"]
         == "merge_exact_row_view_with_all_distinct_positive_targets"
