@@ -100,6 +100,100 @@ def test_r3_baseline_comparison_view_selects_the_requested_path_channel():
     assert comparison["overall"]["recall@10"]["mean"] == 0.0
 
 
+def test_baseline_cli_accepts_reference_path_edge_normalization(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_stage1_r3_baselines.py",
+            "--selection",
+            "selection.json",
+            "--features",
+            "features",
+            "--dev-data",
+            "dev.jsonl",
+            "--corpus",
+            "corpus.jsonl",
+            "--teacher-checkpoint",
+            "teacher.pt",
+            "--output-dir",
+            "output",
+            "--path-edge-normalization",
+            "zscore",
+        ],
+    )
+
+    assert evaluate_stage1_r3_baselines.parse_args().path_edge_normalization == "zscore"
+
+
+def test_teacher_rerank_preflight_materializes_only_missing_objects(tmp_path):
+    example = TargetExample(
+        "q",
+        (TargetCandidate("positive", ()),),
+        direct_positive_index=0,
+        evidence_positive_index=0,
+    )
+
+    class Indices:
+        def search_many(self, query_ids, destination_type, k):
+            assert query_ids == ["q"]
+            assert destination_type == "table"
+            assert k == 10
+            return [[("retrieved", 1.0)]]
+
+    class Store:
+        def __init__(self, available):
+            self.available = set(available)
+
+        def has_teacher_features(self, object_id):
+            return object_id in self.available
+
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        json.dumps({"object_id": "q", "object_type": "table"})
+        + "\n"
+        + json.dumps({"object_id": "retrieved", "object_type": "table"})
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "missing"
+    output.mkdir()
+    with pytest.raises(ValueError, match="1 additional objects"):
+        evaluate_stage1_r3_baselines._teacher_feature_preflight(
+            [example],
+            {"student_ensemble": Indices()},
+            Store({"q"}),
+            recall_ks=(10,),
+            gamma=1,
+            output_dir=output,
+            objects_path=objects,
+        )
+
+    payload = json.loads((output / "teacher_preflight.json").read_text())
+    assert payload["missing_teacher_objects"] == 1
+    assert json.loads((output / "missing_teacher_ids.jsonl").read_text()) == {
+        "object_id": "retrieved"
+    }
+    assert json.loads((output / "missing_teacher_input.jsonl").read_text())[
+        "object_id"
+    ] == "retrieved"
+
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    evaluate_stage1_r3_baselines._teacher_feature_preflight(
+        [example],
+        {"student_ensemble": Indices()},
+        Store({"q", "retrieved"}),
+        recall_ks=(10,),
+        gamma=1,
+        output_dir=complete,
+        objects_path=objects,
+    )
+    assert json.loads((complete / "teacher_preflight.json").read_text())[
+        "missing_teacher_objects"
+    ] == 0
+
+
 def _object_type(object_id: str) -> str:
     return "image" if "image" in object_id else "text"
 

@@ -56,6 +56,7 @@ from mmdd_stage1.teacher_logits import (
 from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
 from mmdd_stage1.training import (
     checkpoint,
+    student_projection_drift,
     student_relation_drift,
     train_student_edges,
     train_student_paths,
@@ -240,6 +241,17 @@ def _student_optimizer(
             {"params": projection_parameters, "lr": projection_learning_rate}
         )
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
+def _student_relation_learning_rate(
+    student: StudentJoinabilityModel,
+    *,
+    configured: float | None,
+    projection_learning_rate: float,
+) -> float:
+    if configured is not None:
+        return configured
+    return 1e-5 if student.freeze_projections else projection_learning_rate
 
 
 def _initialize_student(
@@ -547,6 +559,7 @@ class _EpochController:
         record: dict[str, Any],
     ) -> bool:
         if isinstance(model, StudentJoinabilityModel):
+            record["projection_drift"] = student_projection_drift(model)
             record["relation_drift"] = student_relation_drift(model)
         candidate = self.manager.save_candidate(
             epoch, checkpoint(model, self.stage, self.aggregator)
@@ -845,16 +858,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.relation_loss_weights and args.stage != "student-path":
         raise ValueError("--relation-loss-weight is only valid for student-path")
     if args.teacher_ensemble_alpha is not None:
-        if args.stage != "student-path":
-            raise ValueError("--teacher-ensemble-alpha is only valid for student-path")
+        if args.stage not in {"student-edge", "student-path"}:
+            raise ValueError(
+                "--teacher-ensemble-alpha is only valid for Student training"
+            )
         if not 0 <= args.teacher_ensemble_alpha <= 1:
             raise ValueError("--kd-target-teacher-alpha must be in [0, 1]")
     if args.anchor_weight < 0:
         raise ValueError("--anchor-weight must be non-negative")
     if args.anchor_weight_evidence is not None and args.anchor_weight_evidence < 0:
         raise ValueError("--anchor-weight-evidence must be non-negative")
-    if args.relation_learning_rate is not None and args.relation_learning_rate <= 0:
-        raise ValueError("--relation-learning-rate must be positive")
+    if args.relation_learning_rate is not None and args.relation_learning_rate < 0:
+        raise ValueError("--relation-learning-rate must be non-negative")
     if args.relation_rank <= 0:
         raise ValueError("--relation-rank must be positive")
     if args.in_batch_max_negatives < 0:
@@ -1290,8 +1305,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if student.input_dim != embedding_dim:
             raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        relation_learning_rate = args.relation_learning_rate or (
-            1e-5 if student.freeze_projections else learning_rate
+        relation_learning_rate = _student_relation_learning_rate(
+            student,
+            configured=args.relation_learning_rate,
+            projection_learning_rate=learning_rate,
         )
         optimizer = _student_optimizer(
             student,
@@ -1319,8 +1336,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if student.input_dim != embedding_dim:
             raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        relation_learning_rate = args.relation_learning_rate or (
-            1e-5 if student.freeze_projections else learning_rate
+        relation_learning_rate = _student_relation_learning_rate(
+            student,
+            configured=args.relation_learning_rate,
+            projection_learning_rate=learning_rate,
         )
         optimizer = _student_optimizer(
             student,

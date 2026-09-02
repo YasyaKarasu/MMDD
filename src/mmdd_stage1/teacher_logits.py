@@ -50,6 +50,42 @@ def _aggregation_cache_suffix(aggregator: PathAggregator) -> str:
     return suffix
 
 
+def _raw_edge_scores(
+    examples: Sequence[EdgeExample],
+    store: FeatureStore,
+    device: torch.device,
+) -> ListScores:
+    """Return frozen-embedding cosine lists for edge KD targets."""
+
+    rows = []
+    for example in examples:
+        source = store.embedding_features(example.query_id).embedding.to(device)
+        rows.append(
+            torch.stack(
+                [
+                    F.cosine_similarity(
+                        source,
+                        store.embedding_features(candidate_id).embedding.to(device),
+                        dim=0,
+                    )
+                    for candidate_id in example.candidate_ids
+                ]
+            )
+        )
+    logits = pad_sequence(rows, batch_first=True, padding_value=0.0)
+    candidate_mask = torch.arange(
+        logits.shape[1], device=device
+    ).unsqueeze(0) < torch.tensor(
+        [len(example.candidate_ids) for example in examples],
+        device=device,
+    ).unsqueeze(1)
+    return ListScores(
+        logits,
+        candidate_mask,
+        torch.tensor([example.positive_index for example in examples], device=device),
+    )
+
+
 def _raw_target_edges(
     examples: Sequence[TargetExample],
     store: FeatureStore,
@@ -468,10 +504,6 @@ def score_and_cache_teacher_logits(
     ensemble_alpha: float | None = None,
 ) -> tuple[list[TrainingExample], Path]:
     _validate_ensemble_alpha(ensemble_alpha)
-    if ensemble_alpha is not None and any(
-        isinstance(example, EdgeExample) for example in examples
-    ):
-        raise ValueError("ensemble logits are only supported for target/path examples")
     result = list(examples)
     missing = [
         index
@@ -492,7 +524,16 @@ def score_and_cache_teacher_logits(
         indices = missing[start : start + batch_size]
         batch = [result[index] for index in indices]
         if isinstance(batch[0], EdgeExample):
-            scores = score_edge_batch(teacher, batch, store, device)
+            teacher_scores = score_edge_batch(teacher, batch, store, device)
+            scores = (
+                _ensemble_list_scores(
+                    _raw_edge_scores(batch, store, device),
+                    teacher_scores,
+                    ensemble_alpha,
+                )
+                if ensemble_alpha is not None
+                else teacher_scores
+            )
             for row, index in enumerate(indices):
                 example = result[index]
                 assert isinstance(example, EdgeExample)
@@ -504,7 +545,10 @@ def score_and_cache_teacher_logits(
                     example,
                     teacher_logits=logits,
                     teacher_checkpoint_sha256=teacher_sha256,
-                    teacher_logit_mode="teacher",
+                    teacher_logit_mode=(
+                        "ensemble" if ensemble_alpha is not None else "teacher"
+                    ),
+                    teacher_ensemble_alpha=ensemble_alpha,
                 )
         else:
             assert aggregator is not None

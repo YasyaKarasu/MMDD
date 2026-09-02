@@ -31,6 +31,7 @@ class HardCandidateSet:
 
     target_example: TargetExample
     evidence_negative_ids: tuple[str, ...]
+    pool_counts: tuple[tuple[str, int], ...] = ()
 
 
 def _known_positive_target_ids(example: TargetExample) -> tuple[str, ...]:
@@ -130,7 +131,61 @@ def build_hard_candidate_set(
             if evidence_id not in positive_evidence_ids
         )
     )
-    return HardCandidateSet(target_example, evidence_negative_ids)
+    base_negative_ids = {
+        candidate.target_id
+        for candidate in example.candidates
+        if candidate.target_id not in known_positives
+    }
+    direct_target_set = set(selected_target_ids)
+    path_target_set = set(path_evidence_by_target)
+    pool_counts = (
+        ("direct_target_candidates", len(selected_target_ids)),
+        ("evidence_candidates", len(evidence_negative_ids)),
+        ("path_target_candidates", len(path_evidence_by_target)),
+        ("fallback_target_candidates", len(fallback_candidates)),
+        ("direct_path_overlap", len(direct_target_set & path_target_set)),
+        ("base_negative_overlap", len(set(negative_target_ids) & base_negative_ids)),
+        ("merged_negative_targets", len(negative_target_ids)),
+    )
+    return HardCandidateSet(target_example, evidence_negative_ids, pool_counts)
+
+
+def summarize_hard_candidate_sets(
+    candidate_sets: Sequence[HardCandidateSet],
+) -> dict[str, int | float]:
+    """Aggregate the three mining pools and their target-level deduplication."""
+
+    totals: dict[str, int] = {}
+    for candidate_set in candidate_sets:
+        for key, value in candidate_set.pool_counts:
+            totals[key] = totals.get(key, 0) + value
+    raw_target_candidates = sum(
+        totals.get(key, 0)
+        for key in (
+            "direct_target_candidates",
+            "path_target_candidates",
+            "fallback_target_candidates",
+        )
+    )
+    merged = totals.get("merged_negative_targets", 0)
+    totals.update(
+        {
+            "queries": len(candidate_sets),
+            "raw_target_candidates": raw_target_candidates,
+            "target_candidates_removed_by_dedup": raw_target_candidates - merged,
+        }
+    )
+    return {
+        **totals,
+        "target_pool_dedup_rate": (
+            (raw_target_candidates - merged) / raw_target_candidates
+            if raw_target_candidates
+            else 0.0
+        ),
+        "merged_targets_overlapping_base_rate": (
+            totals.get("base_negative_overlap", 0) / merged if merged else 0.0
+        ),
+    }
 
 
 def _edge_examples_for_candidate_set(

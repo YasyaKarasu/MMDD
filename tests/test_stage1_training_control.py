@@ -24,7 +24,7 @@ from mmdd_stage1.evaluation import (
     evaluate_student_retrieval,
     retrieval_metric_values,
 )
-from mmdd_stage1.models import TeacherJoinabilityModel
+from mmdd_stage1.models import StudentJoinabilityModel, TeacherJoinabilityModel
 from mmdd_stage1.objectives import PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import checkpoint_fingerprint
@@ -88,6 +88,44 @@ def test_per_dataset_gate_parses_alias_and_evaluates_nested_metric():
 def test_per_dataset_gate_rejects_invalid_syntax():
     with pytest.raises(argparse.ArgumentTypeError, match="DATASET:METRIC"):
         train_stage1._parse_per_dataset_gate("wdc2k_v2=0.609")
+
+
+def test_explicit_zero_relation_learning_rate_is_preserved():
+    student = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="pca",
+        initialization_basis=torch.eye(2, 4),
+    )
+
+    assert train_stage1._student_relation_learning_rate(
+        student,
+        configured=0.0,
+        projection_learning_rate=1e-5,
+    ) == 0.0
+
+
+def test_training_validation_accepts_zero_relation_learning_rate(tmp_path):
+    args = train_stage1._argument_parser().parse_args(
+        [
+            "student-edge",
+            "--features",
+            str(tmp_path / "missing_features"),
+            "--base-data",
+            str(tmp_path / "missing_edges.jsonl"),
+            "--dev-data",
+            str(tmp_path / "missing_edges.jsonl"),
+            "--output",
+            str(tmp_path / "student.pt"),
+            "--relation-learning-rate",
+            "0",
+            "--kd-target-teacher-alpha",
+            "1",
+        ]
+    )
+
+    with pytest.raises(FileNotFoundError):
+        train_stage1.run(args)
 
 
 def test_paired_bootstrap_resamples_query_pairs_and_reports_ci():

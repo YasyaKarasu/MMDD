@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
@@ -395,6 +396,26 @@ def student_relation_drift(
         return {
             key: float(student.relation_residual_squared_norm(key).sqrt().cpu())
             for key in _student_relation_keys(student)
+        }
+
+
+def student_projection_drift(
+    student: StudentJoinabilityModel,
+) -> dict[str, float]:
+    """Measure normalized projection drift from the initialization basis."""
+
+    normalizer = math.sqrt(student.input_dim * student.student_dim)
+    with torch.no_grad():
+        return {
+            object_type: float(
+                torch.linalg.vector_norm(
+                    student.projections[object_type].weight - initial
+                ).cpu()
+                / normalizer
+            )
+            for object_type, initial in zip(
+                OBJECT_TYPES, student.initial_projection_weights
+            )
         }
 
 

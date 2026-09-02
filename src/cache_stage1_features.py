@@ -8,10 +8,13 @@ import hashlib
 import importlib.util
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image
 from torch.nn import functional as F
 
 from mmdd_progress import progress
@@ -113,20 +116,14 @@ def _load_embedder_class(model_dir: Path):
 
 
 @torch.inference_mode()
-def encode_inputs(
-    embedder: Any, items: list[dict[str, Any]]
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Return embeddings, unpooled valid hidden states, and their token IDs."""
+def encode_preprocessed_inputs(
+    embedder: Any,
+    inputs: dict[str, torch.Tensor],
+    *,
+    include_hidden: bool = True,
+) -> list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]:
+    """Run already-preprocessed inputs and return their requested CPU payload."""
 
-    conversations = [
-        embedder.format_model_input(
-            text=item.get("text"),
-            image=item.get("image"),
-            instruction=item.get("instruction"),
-        )
-        for item in items
-    ]
-    inputs = embedder._preprocess_inputs(conversations)
     inputs = {name: tensor.to(embedder.model.device) for name, tensor in inputs.items()}
     outputs = embedder.forward(inputs)
     hidden_states = outputs["last_hidden_state"]
@@ -136,6 +133,11 @@ def encode_inputs(
         attention_mask.to(dtype=torch.long),
     )
     embeddings = F.normalize(pooled.float(), p=2, dim=-1)
+    if not include_hidden:
+        return [
+            (embeddings[index].cpu(), None, None)
+            for index in range(hidden_states.shape[0])
+        ]
     return [
         (
             embeddings[index].cpu(),
@@ -144,6 +146,37 @@ def encode_inputs(
         )
         for index in range(hidden_states.shape[0])
     ]
+
+
+def preprocess_input_items(
+    embedder: Any, items: list[dict[str, Any]]
+) -> dict[str, torch.Tensor]:
+    """Format and preprocess model items on CPU."""
+
+    conversations = [
+        embedder.format_model_input(
+            text=item.get("text"),
+            image=item.get("image"),
+            instruction=item.get("instruction"),
+        )
+        for item in items
+    ]
+    return embedder._preprocess_inputs(conversations)
+
+
+def encode_inputs(
+    embedder: Any,
+    items: list[dict[str, Any]],
+    *,
+    include_hidden: bool = True,
+) -> list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]:
+    """Return embeddings and, when requested, valid hidden states and token IDs."""
+
+    return encode_preprocessed_inputs(
+        embedder,
+        preprocess_input_items(embedder, items),
+        include_hidden=include_hidden,
+    )
 
 
 def _table_token_groups(
@@ -255,7 +288,11 @@ def build_object_features(
         "image": _resolve_image(record, input_dir),
         "instruction": object_instruction,
     }
-    embedding, hidden_states, input_ids = encode_inputs(embedder, [item])[0]
+    embedding, hidden_states, input_ids = encode_inputs(
+        embedder,
+        [item],
+        include_hidden=include_hidden,
+    )[0]
     payload = {"embedding": embedding.float()}
 
     if object_type != "table":
@@ -265,6 +302,8 @@ def build_object_features(
 
     assert isinstance(parts, list)
     if include_hidden:
+        assert hidden_states is not None
+        assert input_ids is not None
         try:
             indices, groups = _table_token_groups(embedder, item, parts, input_ids)
         except ValueError as error:
@@ -279,6 +318,8 @@ def build_object_features(
                     continue
                 teacher_item = {**item, "text": "\n".join(truncated_parts)}
                 _, hidden_states, input_ids = encode_inputs(embedder, [teacher_item])[0]
+                assert hidden_states is not None
+                assert input_ids is not None
                 try:
                     indices, groups = _table_token_groups(
                         embedder, teacher_item, truncated_parts, input_ids
@@ -329,6 +370,7 @@ def build_object_features(
             for output in encode_inputs(
                 embedder,
                 routing_items[start : start + table_row_batch_size],
+                include_hidden=False,
             )
         ]
         payload["row_embeddings"] = torch.stack(
@@ -336,6 +378,118 @@ def build_object_features(
         )
 
     return payload
+
+
+def build_base_object_features_batch(
+    embedder: Any,
+    records: list[dict[str, Any]],
+    *,
+    input_dir: Path,
+    instruction: str | None,
+    preprocessed_inputs: dict[str, torch.Tensor] | None = None,
+) -> list[dict[str, torch.Tensor]]:
+    """Build retrieval-only features for a batch of non-table objects."""
+
+    items = []
+    for record in records:
+        object_type = normalize_object_type(str(record["object_type"]))
+        if object_type == "table":
+            raise ValueError("Object batching only supports non-table retrieval features")
+        object_instruction, _row_instruction, _embedding_role = embedding_instructions(
+            record, object_type, instruction
+        )
+        items.append(
+            {
+                "text": record.get("text"),
+                "image": _resolve_image(record, input_dir),
+                "instruction": object_instruction,
+            }
+        )
+
+    outputs = (
+        encode_inputs(embedder, items, include_hidden=False)
+        if preprocessed_inputs is None
+        else encode_preprocessed_inputs(
+            embedder,
+            preprocessed_inputs,
+            include_hidden=False,
+        )
+    )
+    if len(outputs) != len(records):
+        # The official wrapper converts a whole malformed vision batch into one
+        # NULL item. Retry those rare batches individually so one bad image does
+        # not change the features of its valid neighbors.
+        print(
+            json.dumps(
+                {
+                    "event": "base_batch_fell_back_to_individual",
+                    "batch_size": len(records),
+                }
+            )
+        )
+        if preprocessed_inputs is not None:
+            return []
+        return [
+            build_object_features(
+                embedder,
+                record,
+                input_dir=input_dir,
+                instruction=instruction,
+                storage_dtype=torch.float32,
+                include_hidden=False,
+                include_row_embeddings=False,
+            )
+            for record in records
+        ]
+    return [{"embedding": embedding.float()} for embedding, _, _ in outputs]
+
+
+def preprocess_base_object_batch(
+    embedder: Any,
+    records: list[dict[str, Any]],
+    *,
+    input_dir: Path,
+    instruction: str | None,
+) -> dict[str, torch.Tensor]:
+    """Prepare a retrieval-only non-table batch without touching the GPU."""
+
+    items = []
+    for record in records:
+        object_type = normalize_object_type(str(record["object_type"]))
+        object_instruction, _row_instruction, _embedding_role = embedding_instructions(
+            record, object_type, instruction
+        )
+        items.append(
+            {
+                "text": record.get("text"),
+                "image": _resolve_image(record, input_dir),
+                "instruction": object_instruction,
+            }
+        )
+    return preprocess_input_items(embedder, items)
+
+
+def _base_object_batch_cost(
+    record: dict[str, Any],
+    *,
+    input_dir: Path,
+    max_image_pixels: int,
+) -> int:
+    """Estimate padded sequence cost for grouping similarly sized objects."""
+
+    object_type = normalize_object_type(str(record["object_type"]))
+    if object_type == "text":
+        return len(str(record.get("text") or ""))
+    if object_type != "image":
+        raise ValueError("Batch cost is only defined for text and image objects")
+    image_path = _resolve_image(record, input_dir)
+    assert image_path is not None
+    try:
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except (OSError, Image.DecompressionBombError):
+        return -1
+    return min(width * height, max_image_pixels)
 
 
 def teacher_object_ids(
@@ -550,7 +704,31 @@ def run(args: argparse.Namespace) -> None:
 
     base_written = 0
     teacher_written = 0
+    object_batch_size = getattr(args, "object_batch_size", 1)
+    if object_batch_size <= 0:
+        raise ValueError("object_batch_size must be positive")
+    object_batch_buffer_size = getattr(args, "object_batch_buffer_size", 32)
+    if object_batch_buffer_size < object_batch_size:
+        raise ValueError("object_batch_buffer_size must be at least object_batch_size")
+    prefetch_base_objects = getattr(args, "prefetch_base_objects", False)
+    base_prefetch_workers = getattr(args, "base_prefetch_workers", 1)
+    if base_prefetch_workers <= 0:
+        raise ValueError("base_prefetch_workers must be positive")
+    if prefetch_base_objects and object_batch_buffer_size < 2:
+        raise ValueError("prefetch_base_objects requires object_batch_buffer_size>=2")
+    async_write_workers = getattr(args, "async_write_workers", 0)
+    async_write_queue_size = getattr(args, "async_write_queue_size", 4)
+    if async_write_workers < 0:
+        raise ValueError("async_write_workers cannot be negative")
+    if async_write_queue_size <= 0:
+        raise ValueError("async_write_queue_size must be positive")
+    writer_context = (
+        ThreadPoolExecutor(max_workers=async_write_workers)
+        if async_write_workers
+        else nullcontext(None)
+    )
     with (
+        writer_context as writer_executor,
         input_path.open(encoding="utf-8") as source,
         manifest.open("a", encoding="utf-8") as manifest_handle,
         teacher_manifest.open("a", encoding="utf-8") as teacher_manifest_handle,
@@ -561,6 +739,179 @@ def run(args: argparse.Namespace) -> None:
             desc="Cache Stage-1 features",
             unit="object",
         )
+        pending_writes = []
+
+        def save_payload_files(
+            writes: list[tuple[Path, dict[str, torch.Tensor]]],
+        ) -> None:
+            for destination, saved_payload in writes:
+                temporary = destination.with_suffix(".pt.tmp")
+                torch.save(saved_payload, temporary)
+                temporary.replace(destination)
+
+        def commit_write(
+            base_record: dict[str, Any] | None,
+            teacher_record: dict[str, Any] | None,
+        ) -> None:
+            nonlocal base_written, teacher_written
+            if base_record is not None:
+                manifest_handle.write(json.dumps(base_record, ensure_ascii=False) + "\n")
+                manifest_handle.flush()
+                base_written += 1
+            if teacher_record is not None:
+                teacher_manifest_handle.write(
+                    json.dumps(teacher_record, ensure_ascii=False) + "\n"
+                )
+                teacher_manifest_handle.flush()
+                teacher_written += 1
+            lines.set_postfix(
+                base=base_written,
+                teacher=teacher_written,
+                skipped=base_skipped + teacher_skipped,
+            )
+
+        def finish_oldest_write() -> None:
+            future, base_record, teacher_record = pending_writes.pop(0)
+            future.result()
+            commit_write(base_record, teacher_record)
+
+        def write_payload(
+            record: dict[str, Any],
+            object_type: str,
+            source_fingerprint: str,
+            *,
+            needs_base: bool,
+            needs_teacher: bool,
+            payload: dict[str, torch.Tensor],
+        ) -> None:
+            object_id = str(record["object_id"])
+            name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
+            writes = []
+            base_record = None
+            teacher_record = None
+            if needs_base:
+                base_payload = {"embedding": payload["embedding"]}
+                if "row_embeddings" in payload:
+                    base_payload["row_embeddings"] = payload["row_embeddings"]
+                relative_path = Path("objects") / name
+                destination = output_dir / relative_path
+                writes.append((destination, base_payload))
+                base_record = {
+                    "object_id": object_id,
+                    "object_type": object_type,
+                    "feature_path": relative_path.as_posix(),
+                    "source_fingerprint": source_fingerprint,
+                }
+            if needs_teacher:
+                teacher_payload = {"hidden_states": payload["hidden_states"]}
+                if "token_groups" in payload:
+                    teacher_payload["token_groups"] = payload["token_groups"]
+                relative_path = Path("teacher_objects") / name
+                destination = teacher_output_dir / relative_path
+                writes.append((destination, teacher_payload))
+                teacher_record = {
+                    "object_id": object_id,
+                    "object_type": object_type,
+                    "teacher_feature_path": relative_path.as_posix(),
+                    "source_fingerprint": source_fingerprint,
+                }
+            if writer_executor is None:
+                save_payload_files(writes)
+                commit_write(base_record, teacher_record)
+                return
+            pending_writes.append(
+                (writer_executor.submit(save_payload_files, writes), base_record, teacher_record)
+            )
+            if len(pending_writes) >= async_write_queue_size:
+                finish_oldest_write()
+
+        base_batch: list[tuple[dict[str, Any], str, str]] = []
+
+        def flush_base_batch() -> None:
+            if not base_batch:
+                return
+            ordered = sorted(
+                base_batch,
+                key=lambda entry: _base_object_batch_cost(
+                    entry[0],
+                    input_dir=input_path.parent,
+                    max_image_pixels=int(getattr(embedder, "max_pixels", 2**63 - 1)),
+                ),
+            )
+            chunks = [
+                ordered[start : start + object_batch_size]
+                for start in range(0, len(ordered), object_batch_size)
+            ]
+
+            def prepare(entries: list[tuple[dict[str, Any], str, str]]):
+                return preprocess_base_object_batch(
+                    embedder,
+                    [entry[0] for entry in entries],
+                    input_dir=input_path.parent,
+                    instruction=args.instruction,
+                )
+
+            with ThreadPoolExecutor(max_workers=base_prefetch_workers) as executor:
+                futures = {}
+                next_to_submit = 0
+
+                def fill_prefetch_queue() -> None:
+                    nonlocal next_to_submit
+                    while (
+                        prefetch_base_objects
+                        and next_to_submit < len(chunks)
+                        and len(futures) < base_prefetch_workers + 1
+                    ):
+                        futures[next_to_submit] = executor.submit(
+                            prepare, chunks[next_to_submit]
+                        )
+                        next_to_submit += 1
+
+                fill_prefetch_queue()
+                for index, entries in enumerate(chunks):
+                    if not prefetch_base_objects:
+                        prepared_inputs = None
+                    else:
+                        prepared_inputs = futures.pop(index).result()
+                        fill_prefetch_queue()
+                    payloads = build_base_object_features_batch(
+                        embedder,
+                        [entry[0] for entry in entries],
+                        input_dir=input_path.parent,
+                        instruction=args.instruction,
+                        preprocessed_inputs=prepared_inputs,
+                    )
+                    if not payloads:
+                        # A malformed image makes the official wrapper collapse
+                        # a whole batch into one NULL item. Finish queued CPU
+                        # preprocessing before retrying this batch individually.
+                        for pending in futures.values():
+                            pending.result()
+                        payloads = [
+                            build_object_features(
+                                embedder,
+                                entry[0],
+                                input_dir=input_path.parent,
+                                instruction=args.instruction,
+                                storage_dtype=torch_dtype,
+                                include_hidden=False,
+                                include_row_embeddings=False,
+                            )
+                            for entry in entries
+                        ]
+                    for (record, object_type, source_fingerprint), payload in zip(
+                        entries, payloads, strict=True
+                    ):
+                        write_payload(
+                            record,
+                            object_type,
+                            source_fingerprint,
+                            needs_base=True,
+                            needs_teacher=False,
+                            payload=payload,
+                        )
+            base_batch.clear()
+
         for line in lines:
             record = json.loads(line)
             object_id = str(record["object_id"])
@@ -570,6 +921,19 @@ def run(args: argparse.Namespace) -> None:
                 continue
             object_type = normalize_object_type(str(record["object_type"]))
             source_fingerprint = _source_fingerprint(record)
+            batchable = (
+                (object_batch_size > 1 or prefetch_base_objects)
+                and needs_base
+                and not needs_teacher
+                and object_type != "table"
+            )
+            if batchable:
+                if base_batch and base_batch[-1][1] != object_type:
+                    flush_base_batch()
+                base_batch.append((record, object_type, source_fingerprint))
+                if len(base_batch) == object_batch_buffer_size:
+                    flush_base_batch()
+                continue
             payload = build_object_features(
                 embedder,
                 record,
@@ -581,52 +945,17 @@ def run(args: argparse.Namespace) -> None:
                 table_row_batch_size=getattr(args, "table_row_batch_size", 8),
                 table_tokens_per_group=table_tokens_per_group,
             )
-            name = hashlib.sha256(object_id.encode("utf-8")).hexdigest() + ".pt"
-            if needs_base:
-                base_payload = {"embedding": payload["embedding"]}
-                if "row_embeddings" in payload:
-                    base_payload["row_embeddings"] = payload["row_embeddings"]
-                relative_path = Path("objects") / name
-                destination = output_dir / relative_path
-                temporary = destination.with_suffix(".pt.tmp")
-                torch.save(base_payload, temporary)
-                temporary.replace(destination)
-                manifest_record = {
-                    "object_id": object_id,
-                    "object_type": object_type,
-                    "feature_path": relative_path.as_posix(),
-                    "source_fingerprint": source_fingerprint,
-                }
-                manifest_handle.write(
-                    json.dumps(manifest_record, ensure_ascii=False) + "\n"
-                )
-                manifest_handle.flush()
-                base_written += 1
-            if needs_teacher:
-                teacher_payload = {"hidden_states": payload["hidden_states"]}
-                if "token_groups" in payload:
-                    teacher_payload["token_groups"] = payload["token_groups"]
-                relative_path = Path("teacher_objects") / name
-                destination = teacher_output_dir / relative_path
-                temporary = destination.with_suffix(".pt.tmp")
-                torch.save(teacher_payload, temporary)
-                temporary.replace(destination)
-                manifest_record = {
-                    "object_id": object_id,
-                    "object_type": object_type,
-                    "teacher_feature_path": relative_path.as_posix(),
-                    "source_fingerprint": source_fingerprint,
-                }
-                teacher_manifest_handle.write(
-                    json.dumps(manifest_record, ensure_ascii=False) + "\n"
-                )
-                teacher_manifest_handle.flush()
-                teacher_written += 1
-            lines.set_postfix(
-                base=base_written,
-                teacher=teacher_written,
-                skipped=base_skipped + teacher_skipped,
+            write_payload(
+                record,
+                object_type,
+                source_fingerprint,
+                needs_base=needs_base,
+                needs_teacher=needs_teacher,
+                payload=payload,
             )
+        flush_base_batch()
+        while pending_writes:
+            finish_oldest_write()
 
     print(
         json.dumps(
@@ -664,6 +993,42 @@ def parse_args() -> argparse.Namespace:
         help="Maximum query-table rows encoded together for routing embeddings.",
     )
     parser.add_argument(
+        "--object-batch-size",
+        type=int,
+        default=1,
+        help="Batch retrieval-only non-table objects; Teacher and table objects remain individual.",
+    )
+    parser.add_argument(
+        "--object-batch-buffer-size",
+        type=int,
+        default=32,
+        help="Sort this many retrieval-only objects by estimated sequence cost before batching.",
+    )
+    parser.add_argument(
+        "--prefetch-base-objects",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Overlap CPU preprocessing of the next base-only object with the current GPU forward.",
+    )
+    parser.add_argument(
+        "--base-prefetch-workers",
+        type=int,
+        default=1,
+        help="CPU preprocessing workers used by --prefetch-base-objects.",
+    )
+    parser.add_argument(
+        "--async-write-workers",
+        type=int,
+        default=0,
+        help="CPU workers that overlap atomic feature writes with GPU inference.",
+    )
+    parser.add_argument(
+        "--async-write-queue-size",
+        type=int,
+        default=4,
+        help="Maximum number of scheduled feature writes kept in flight.",
+    )
+    parser.add_argument(
         "--table-tokens-per-group",
         type=int,
         default=1,
@@ -690,6 +1055,18 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.table_row_batch_size <= 0:
         parser.error("--table-row-batch-size must be positive")
+    if args.object_batch_size <= 0:
+        parser.error("--object-batch-size must be positive")
+    if args.object_batch_buffer_size < args.object_batch_size:
+        parser.error("--object-batch-buffer-size must be at least --object-batch-size")
+    if args.base_prefetch_workers <= 0:
+        parser.error("--base-prefetch-workers must be positive")
+    if args.async_write_workers < 0:
+        parser.error("--async-write-workers cannot be negative")
+    if args.async_write_queue_size <= 0:
+        parser.error("--async-write-queue-size must be positive")
+    if args.prefetch_base_objects and args.object_batch_buffer_size < 2:
+        parser.error("--prefetch-base-objects requires --object-batch-buffer-size >= 2")
     if args.table_tokens_per_group <= 0:
         parser.error("--table-tokens-per-group must be positive")
     return args

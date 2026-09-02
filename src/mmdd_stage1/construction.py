@@ -423,8 +423,7 @@ def build_stage1_training_artifacts(
         candidate_ids = list(
             dict.fromkeys(
                 [
-                    direct_positive_target_ids[0],
-                    evidence_positive_target_ids[0],
+                    *positive_target_ids,
                     *negative_ids,
                 ]
             )

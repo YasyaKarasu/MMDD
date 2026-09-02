@@ -464,6 +464,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     evidence_weight = getattr(args, "evidence_weight", 0.05)
     score_normalization = getattr(args, "fusion_score_normalization", "none")
     score_temperature = getattr(args, "fusion_score_temperature", 1.0)
+    path_edge_normalization = getattr(args, "path_edge_normalization", "none")
 
     def full_system(name: str, label: str, indices: RawEmbeddingANNIndices | StudentANNIndices) -> None:
         start = time.perf_counter()
@@ -484,6 +485,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             evidence_weight=evidence_weight,
             fusion_score_normalization=score_normalization,
             fusion_score_temperature=score_temperature,
+            path_edge_normalization=path_edge_normalization,
             return_per_query=True,
         )
         elapsed = time.perf_counter() - start
@@ -608,6 +610,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_weight": evidence_weight,
             "fusion_score_normalization": score_normalization,
             "fusion_score_temperature": score_temperature,
+            "path_edge_normalization": path_edge_normalization,
             "evidence_types": list(evidence_types),
             "evidence_modality_weights": evidence_modality_weights,
             "bootstrap_iterations": args.bootstrap_iterations,
@@ -668,6 +671,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument(
+        "--path-edge-normalization",
+        choices=["none", "zscore"],
+        default="none",
+        help="Reference-only normalization of edge scores before path aggregation.",
+    )
     parser.add_argument(
         "--fusion-mode",
         choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],

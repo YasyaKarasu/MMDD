@@ -5,11 +5,13 @@ import hashlib
 import json
 import random
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -45,6 +47,7 @@ from mmdd_stage1.mining import (
     hard_candidate_records,
     retrieve_hard_candidate_sets,
     score_hard_candidate_sets,
+    summarize_hard_candidate_sets,
 )
 from mmdd_stage1.models import (
     TYPE_TO_ID,
@@ -325,6 +328,33 @@ def test_lowrank_student_starts_at_identity_and_matches_explicit_residual():
         stage1_training.student_relation_drift(model)[key],
         torch.linalg.vector_norm(relation - torch.eye(4)).item(),
     )
+
+
+def test_student_projection_drift_is_normalized_per_object_type():
+    basis = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=2,
+        initialization="pca",
+        initialization_basis=basis,
+        freeze_projections=True,
+    )
+
+    assert stage1_training.student_projection_drift(model) == {
+        "table": 0.0,
+        "text": 0.0,
+        "image": 0.0,
+    }
+
+    with torch.no_grad():
+        model.projections["table"].weight.add_(1.0)
+
+    drift = stage1_training.student_projection_drift(model)
+    assert drift["table"] == pytest.approx(1.0)
+    assert drift["text"] == 0.0
+    assert drift["image"] == 0.0
 
 
 @pytest.mark.parametrize("relation_param", ["full", "lowrank"])
@@ -1925,6 +1955,53 @@ def test_qwen_cache_builder_structurally_pools_table_parts(tmp_path):
     assert "token_groups" not in payload
 
 
+def test_qwen_cache_encoder_skips_hidden_state_cpu_payload_when_not_requested():
+    outputs = stage1_cache.encode_inputs(
+        FakeQwenEmbedder(),
+        [{"text": "base-only object", "instruction": "represent"}],
+        include_hidden=False,
+    )
+
+    embedding, hidden_states, input_ids = outputs[0]
+    assert embedding.shape == (4,)
+    assert hidden_states is None
+    assert input_ids is None
+
+
+def test_qwen_cache_builder_batches_base_only_non_table_objects(tmp_path):
+    embedder = FakeQwenEmbedder()
+    payloads = stage1_cache.build_base_object_features_batch(
+        embedder,
+        [
+            {"object_id": "a", "object_type": "text", "text": "short"},
+            {"object_id": "b", "object_type": "text", "text": "longer text"},
+        ],
+        input_dir=tmp_path,
+        instruction=None,
+    )
+
+    assert embedder.forward_calls == 1
+    assert len(payloads) == 2
+    assert all(set(payload) == {"embedding"} for payload in payloads)
+    assert all(payload["embedding"].shape == (4,) for payload in payloads)
+
+
+def test_qwen_cache_batch_cost_uses_capped_image_pixels(tmp_path):
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (20, 10)).save(image_path)
+
+    assert stage1_cache._base_object_batch_cost(
+        {"object_id": "i", "object_type": "image", "image": str(image_path)},
+        input_dir=tmp_path,
+        max_image_pixels=150,
+    ) == 150
+    assert stage1_cache._base_object_batch_cost(
+        {"object_id": "t", "object_type": "text", "text": "12345"},
+        input_dir=tmp_path,
+        max_image_pixels=150,
+    ) == 5
+
+
 def test_qwen_cache_builder_skips_table_teacher_features_for_base_only(
     tmp_path, monkeypatch
 ):
@@ -2251,6 +2328,212 @@ def test_qwen_cache_run_writes_base_tier_and_incremental_teacher_tier(
     assert teacher_features.token_groups is None
 
 
+def test_qwen_cache_run_batches_base_only_non_table_objects(tmp_path, monkeypatch):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "object_id": f"text_{index}",
+                    "object_type": "text",
+                    "text": f"evidence {index}",
+                }
+            )
+            + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
+    instances = []
+
+    class TrackingFakeQwenEmbedder(FakeQwenEmbedder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+    monkeypatch.setattr(
+        stage1_cache,
+        "_load_embedder_class",
+        lambda _path: TrackingFakeQwenEmbedder,
+    )
+    stage1_cache.run(
+        argparse.Namespace(
+            input_jsonl=str(objects),
+            output_dir=str(tmp_path / "features"),
+            model_dir=str(tmp_path / "model"),
+            device="cpu",
+            dtype="fp16",
+            instruction=None,
+            teacher_data=[],
+            teacher_split="train",
+            object_batch_size=2,
+        )
+    )
+
+    assert instances[0].forward_calls == 2
+    assert len((tmp_path / "features" / "manifest.jsonl").read_text().splitlines()) == 3
+
+
+def test_qwen_cache_run_prefetches_base_objects_off_the_gpu_thread(
+    tmp_path, monkeypatch
+):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "object_id": f"text_{index}",
+                    "object_type": "text",
+                    "text": f"evidence {index}",
+                }
+            )
+            + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
+    preprocess_threads = []
+    forward_threads = []
+
+    class TrackingFakeQwenEmbedder(FakeQwenEmbedder):
+        def _preprocess_inputs(self, conversations):
+            preprocess_threads.append(threading.current_thread().name)
+            return super()._preprocess_inputs(conversations)
+
+        def forward(self, inputs):
+            forward_threads.append(threading.current_thread().name)
+            return super().forward(inputs)
+
+    monkeypatch.setattr(
+        stage1_cache,
+        "_load_embedder_class",
+        lambda _path: TrackingFakeQwenEmbedder,
+    )
+    stage1_cache.run(
+        argparse.Namespace(
+            input_jsonl=str(objects),
+            output_dir=str(tmp_path / "features"),
+            model_dir=str(tmp_path / "model"),
+            device="cpu",
+            dtype="fp16",
+            instruction=None,
+            teacher_data=[],
+            teacher_split="train",
+            object_batch_size=1,
+            object_batch_buffer_size=2,
+            prefetch_base_objects=True,
+        )
+    )
+
+    assert len(preprocess_threads) == 3
+    assert all(name != "MainThread" for name in preprocess_threads)
+    assert forward_threads == ["MainThread"] * 3
+
+
+def test_qwen_cache_prefetched_batch_falls_back_without_dropping_neighbors(
+    tmp_path, monkeypatch
+):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "object_id": f"text_{index}",
+                    "object_type": "text",
+                    "text": f"evidence {index}",
+                }
+            )
+            + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
+    instances = []
+
+    class CollapsingFakeQwenEmbedder(FakeQwenEmbedder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+        def _preprocess_inputs(self, conversations):
+            if len(conversations) > 1:
+                conversations = conversations[:1]
+            return super()._preprocess_inputs(conversations)
+
+    monkeypatch.setattr(
+        stage1_cache,
+        "_load_embedder_class",
+        lambda _path: CollapsingFakeQwenEmbedder,
+    )
+    output = tmp_path / "features"
+    stage1_cache.run(
+        argparse.Namespace(
+            input_jsonl=str(objects),
+            output_dir=str(output),
+            model_dir=str(tmp_path / "model"),
+            device="cpu",
+            dtype="fp16",
+            instruction=None,
+            teacher_data=[],
+            teacher_split="train",
+            object_batch_size=2,
+            object_batch_buffer_size=3,
+            prefetch_base_objects=True,
+            base_prefetch_workers=1,
+        )
+    )
+
+    assert len((output / "manifest.jsonl").read_text().splitlines()) == 3
+    assert instances[0].forward_calls == 4
+
+
+def test_qwen_cache_run_can_write_features_off_the_gpu_thread(tmp_path, monkeypatch):
+    objects = tmp_path / "objects.jsonl"
+    objects.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "object_id": f"text_{index}",
+                    "object_type": "text",
+                    "text": f"evidence {index}",
+                }
+            )
+            + "\n"
+            for index in range(3)
+        ),
+        encoding="utf-8",
+    )
+    save_threads = []
+    original_save = stage1_cache.torch.save
+
+    def tracking_save(*args, **kwargs):
+        save_threads.append(threading.current_thread().name)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(stage1_cache, "_load_embedder_class", lambda _path: FakeQwenEmbedder)
+    monkeypatch.setattr(stage1_cache.torch, "save", tracking_save)
+    output = tmp_path / "features"
+    stage1_cache.run(
+        argparse.Namespace(
+            input_jsonl=str(objects),
+            output_dir=str(output),
+            model_dir=str(tmp_path / "model"),
+            device="cpu",
+            dtype="fp16",
+            instruction=None,
+            teacher_data=[],
+            teacher_split="train",
+            object_batch_size=1,
+            async_write_workers=1,
+            async_write_queue_size=2,
+        )
+    )
+
+    assert len((output / "manifest.jsonl").read_text().splitlines()) == 3
+    assert len(save_threads) == 3
+    assert all(name != "MainThread" for name in save_threads)
+
+
 def test_qwen_cache_run_persists_multi_token_table_groups(tmp_path, monkeypatch):
     objects = tmp_path / "objects.jsonl"
     objects.write_text(
@@ -2565,6 +2848,9 @@ def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path
 
     controller(0, StudentJoinabilityModel(4, 3), record)
 
+    assert set(record["projection_drift"]) == {"table", "text", "image"}
+    assert all(value == 0.0 for value in record["projection_drift"].values())
+    assert "relation_drift" in record
     assert record["dev_retrieval"]["raw_embedding"]["queries"] == 1
     assert record["gate"]["improved"]
     assert controller.gate.best_epoch == 0
@@ -2991,6 +3277,20 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         TargetCandidate("hard_target", ()),
         TargetCandidate("path_target", ("positive_evidence",)),
     )
+    assert summarize_hard_candidate_sets([mined]) == {
+        "direct_target_candidates": 1,
+        "evidence_candidates": 1,
+        "path_target_candidates": 1,
+        "fallback_target_candidates": 0,
+        "direct_path_overlap": 0,
+        "base_negative_overlap": 0,
+        "merged_negative_targets": 2,
+        "queries": 1,
+        "raw_target_candidates": 2,
+        "target_candidates_removed_by_dedup": 0,
+        "target_pool_dedup_rate": 0.0,
+        "merged_targets_overlapping_base_rate": 0.0,
+    }
 
     store = FeatureStore(
         {
@@ -3680,6 +3980,61 @@ def test_teacher_logit_sidecars_separate_aggregation_parameters(tmp_path):
     assert not has_teacher_logits(cached, "teacher-sha", high_temperature)
 
 
+def test_teacher_logit_sidecars_cache_path_ensemble_edges_separately(tmp_path):
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.25),
+            "negative": feature("negative", "table", 0.9),
+        }
+    )
+    teacher_model = teacher()
+    examples = [EdgeExample("q", ("positive", "negative"), 0)]
+    ordinary, ordinary_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+    ensemble, ensemble_path = score_and_cache_teacher_logits(
+        examples,
+        teacher_model,
+        store,
+        tmp_path,
+        "teacher-sha",
+        device=torch.device("cpu"),
+        batch_size=1,
+        ensemble_alpha=0.0,
+    )
+    loaded, loaded_path, hit = load_teacher_logits(
+        examples,
+        tmp_path,
+        "teacher-sha",
+        ensemble_alpha=0.0,
+    )
+
+    assert ordinary_path != ensemble_path
+    assert ordinary[0].teacher_logit_mode == "teacher"
+    assert ensemble[0].teacher_logit_mode == "ensemble"
+    assert ensemble[0].teacher_ensemble_alpha == 0.0
+    assert has_teacher_logits(loaded, "teacher-sha", ensemble_alpha=0.0)
+    assert not has_teacher_logits(loaded, "teacher-sha")
+    assert hit
+    assert loaded_path == ensemble_path
+    raw = [
+        torch.nn.functional.cosine_similarity(
+            store.embedding_features("q").embedding,
+            store.embedding_features(object_id).embedding,
+            dim=0,
+        ).item()
+        for object_id in ("positive", "negative")
+    ]
+    assert loaded[0].teacher_logits == pytest.approx(z_scores(raw))
+
+
 def test_teacher_logit_sidecars_cache_path_ensemble_targets_separately(tmp_path):
     store = FeatureStore(
         {
@@ -3839,7 +4194,7 @@ def test_kd_target_teacher_alpha_is_the_canonical_cli_name(monkeypatch):
     assert args.teacher_ensemble_alpha is None
 
 
-def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_tier(
+def test_student_edge_entrypoint_reuses_ensemble_logits_without_teacher_hidden_tier(
     tmp_path, monkeypatch
 ):
     features_path = tmp_path / "features.pt"
@@ -3895,6 +4250,8 @@ def test_student_entrypoint_reuses_base_and_dev_logits_without_teacher_hidden_ti
                 str(teacher_path),
                 "--teacher-logit-cache",
                 str(cache_dir),
+                "--kd-target-teacher-alpha",
+                "1.0",
                 "--output",
                 str(output),
                 "--device",

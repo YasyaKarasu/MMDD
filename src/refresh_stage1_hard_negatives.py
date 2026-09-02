@@ -17,6 +17,7 @@ from mmdd_stage1.mining import (
     retrieve_hard_candidate_sets,
     score_hard_candidate_sets,
     score_pending_hard_examples,
+    summarize_hard_candidate_sets,
 )
 from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.protocol import validate_protocol_split
@@ -270,6 +271,10 @@ def run(args: argparse.Namespace) -> None:
         metadata["teacher_edge_logit_mode"] = "teacher"
     else:
         metadata["teacher_scoring"] = "pending"
+    if candidate_sets:
+        metadata["mining_pool_statistics"] = summarize_hard_candidate_sets(
+            candidate_sets
+        )
     output_paths = [Path(args.output_target_lists)]
     if args.output_edge_lists:
         output_paths.append(Path(args.output_edge_lists))

@@ -318,6 +318,38 @@ def test_stage1_constructor_uses_path_only_target_as_direct_hard_negative(tmp_pa
     assert "direct" in evidence_target_edge["candidate_ids"]
 
 
+def test_stage1_constructor_candidates_cover_all_multi_positive_targets(tmp_path):
+    query = _table("q", ["Entity"], [["A"]])
+    positive_a = _table("positive_a", ["Key"], [["A"]])
+    positive_b = _table("positive_b", ["Value"], [["1"]])
+    negative = _table("negative", ["Other"], [["2"]])
+    _write_jsonl(tmp_path / "query_tables.jsonl", [query])
+    _write_jsonl(
+        tmp_path / "data_lake_tables.jsonl",
+        [positive_a, positive_b, negative],
+    )
+    _write_jsonl(
+        tmp_path / "bridge_assets.jsonl",
+        [{"asset_id": "unused", "asset_type": "text", "content": "unrelated"}],
+    )
+    _write_jsonl(
+        tmp_path / "qrels.jsonl",
+        [
+            {"query_table_id": "q", "target_table_id": "positive_a", "split": "train"},
+            {"query_table_id": "q", "target_table_id": "positive_b", "split": "train"},
+        ],
+    )
+
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="synthetic")
+
+    target_list = artifacts["target_lists"][0]
+    assert target_list["positive_target_ids"] == ["positive_a", "positive_b"]
+    assert [candidate["target_id"] for candidate in target_list["candidates"]][:2] == [
+        "positive_a",
+        "positive_b",
+    ]
+
+
 def test_stage1_constructor_keeps_direct_training_without_recovery(tmp_path):
     query = _table("q", ["Entity"], [["A"]])
     direct = _table("direct", ["Key"], [["A"]])
