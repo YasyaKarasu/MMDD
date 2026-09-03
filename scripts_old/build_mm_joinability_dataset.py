@@ -3460,45 +3460,55 @@ class LocalAttributeExtractor:
             headers["Authorization"] = f"Bearer {api_key}"
         models_url = f"{base_url.rstrip('/')}/models"
         transport_error: RuntimeError | None = None
+        response: requests.Response | None = None
         try:
-            response = requests.get(models_url, headers=headers, timeout=request_timeout)
-        except Exception as exc:
-            message = (
-                f"{model_kind} model endpoint {base_url} readiness check failed "
-                f"({type(exc).__name__})"
-            )
-            if is_transient_request_exception(exc):
-                transport_error = TransientModelEndpointError(message)
-            else:
-                transport_error = RuntimeError(message)
-        if transport_error is not None:
-            raise transport_error from None
+            try:
+                response = requests.get(
+                    models_url,
+                    headers=headers,
+                    timeout=request_timeout,
+                )
+            except Exception as exc:
+                message = (
+                    f"{model_kind} model endpoint {base_url} readiness check failed "
+                    f"({type(exc).__name__})"
+                )
+                if is_transient_request_exception(exc):
+                    transport_error = TransientModelEndpointError(message)
+                else:
+                    transport_error = RuntimeError(message)
+            if transport_error is not None:
+                raise transport_error from None
 
-        status_code = int(getattr(response, "status_code", 200) or 200)
-        if status_code == 429 or status_code >= 500:
-            raise TransientModelEndpointError(
-                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
-            )
-        if status_code < 200 or status_code >= 300:
-            raise RuntimeError(
-                f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
-            )
-        try:
-            payload = response.json()
-            data = payload["data"]
-            served_models = {
-                clean_text(item.get("id"))
-                for item in data
-                if isinstance(item, dict) and clean_text(item.get("id"))
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"{model_kind} model endpoint {base_url} returned invalid models JSON"
-            ) from exc
-        if model not in served_models:
-            raise RuntimeError(
-                f"{model_kind} model endpoint {base_url} does not serve configured model {model!r}"
-            )
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            if status_code == 429 or status_code >= 500:
+                raise TransientModelEndpointError(
+                    f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+                )
+            if status_code < 200 or status_code >= 300:
+                raise RuntimeError(
+                    f"{model_kind} model endpoint {base_url} readiness check returned HTTP {status_code}"
+                )
+            try:
+                payload = response.json()
+                data = payload["data"]
+                served_models = {
+                    clean_text(item.get("id"))
+                    for item in data
+                    if isinstance(item, dict) and clean_text(item.get("id"))
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{model_kind} model endpoint {base_url} returned invalid models JSON"
+                ) from exc
+            if model not in served_models:
+                raise RuntimeError(
+                    f"{model_kind} model endpoint {base_url} does not serve configured model {model!r}"
+                )
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                close_response()
 
     def ensure_endpoints_ready(
         self,
@@ -3663,6 +3673,7 @@ class LocalAttributeExtractor:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             started = time.perf_counter()
+            response: requests.Response | None = None
             try:
                 response = requests.post(
                     f"{base_url}/chat/completions",
@@ -3711,6 +3722,10 @@ class LocalAttributeExtractor:
                     usage=usage if isinstance(usage, dict) else None,
                 )
                 return content
+            finally:
+                close_response = getattr(response, "close", None)
+                if callable(close_response):
+                    close_response()
         message = f"Local {model_kind} model call to {base_url} failed: {last_error}"
         if isinstance(last_error, TransientModelEndpointError):
             raise TransientModelEndpointError(

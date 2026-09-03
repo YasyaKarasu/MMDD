@@ -2931,17 +2931,26 @@ def test_normalize_extracted_attributes_discards_explanatory_fields():
 
 def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
     captured = []
+    responses = []
 
     class Response:
+        def __init__(self):
+            self.closed = False
+
         def raise_for_status(self):
             return None
 
         def json(self):
             return {"choices": [{"message": {"content": '{"attributes":[]}'}}]}
 
+        def close(self):
+            self.closed = True
+
     def fake_post(url, headers, json, timeout):
         captured.append(json)
-        return Response()
+        response = Response()
+        responses.append(response)
+        return response
 
     monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
     extractor = LocalAttributeExtractor(
@@ -2993,10 +3002,41 @@ def test_chat_payload_disables_qwen_thinking_without_prompt_text(monkeypatch):
     assert "connection_evidence" not in prompt
     assert "Do not rely on Wikipedia page provenance" not in prompt
     assert len(captured) == 2
+    assert all(response.closed for response in responses)
     assert all(
         payload["chat_template_kwargs"] == {"enable_thinking": False}
         for payload in captured
     )
+
+
+def test_chat_closes_response_after_http_failure(monkeypatch):
+    class Response:
+        status_code = 503
+        text = "temporarily unavailable"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+
+    def fake_post(url, headers, json, timeout):
+        return response
+
+    monkeypatch.setattr("build_mm_joinability_dataset.requests.post", fake_post)
+    extractor = LocalAttributeExtractor(_extractor_args(model_max_retries=0))
+
+    with pytest.raises(joinability_dataset.TransientModelEndpointError):
+        extractor.chat(
+            base_url="http://localhost:8001/v1",
+            model="Qwen3.5-9B",
+            api_key=None,
+            messages=[],
+        )
+
+    assert response.closed is True
 
 
 def test_extraction_prompt_requires_short_empty_json_response():
