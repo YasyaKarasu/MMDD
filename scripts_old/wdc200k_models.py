@@ -14,13 +14,20 @@ import hashlib
 import json
 import logging
 import os
+import pickle
+import shutil
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from contextlib import ExitStack
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -90,11 +97,17 @@ STRUCTURAL_STAGE_SCHEMA_VERSION = "wdc200k-structural-v2"
 _PREVIEW_LIMIT = 16
 _ENQUEUE_BATCH_SIZE = 1_000
 _ROLLING_CLAIM_GROUPS = 8
+_CACHE_LOOKUP_BATCH_SIZE = 500
+# Cache-hit commits are intentionally serialized inside this process.  A
+# single SQLite writer is faster than letting many large JSON transactions
+# contend until their busy timeout expires.
+_MODEL_BATCH_WRITE_LOCK = threading.Lock()
 _ADAPTER_INDEX_SCHEMA_VERSION = "wdc200k-model-task-adapter-index-v1"
 _ADAPTER_CHECKPOINT_SCHEMA_VERSION = (
     "wdc200k-model-task-adapter-checkpoint-v1"
 )
 _ADAPTER_INDEX_BATCH_SIZE = 10_000
+_ADAPTER_WORK_QUEUE_FACTOR = 2
 _ADAPTER_CHECKPOINT_SOURCE_SHARDS = 32
 
 
@@ -327,8 +340,8 @@ class StructuralStageBarrier:
         object.__setattr__(self, "final_selection", final_selection)
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=30.0)
+def _connect(path: Path, *, timeout: float = 30.0) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=timeout)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -1225,6 +1238,14 @@ def _decode_checked(encoded: str, expected_digest: str) -> dict[str, Any]:
     return payload
 
 
+@dataclass(frozen=True)
+class _CacheHit:
+    """A validated model record and whether it came from the durable cache."""
+
+    record: dict[str, Any]
+    durable: bool
+
+
 class _PersistentCache:
     def __init__(self, database_path: Path, delegate: Any = None) -> None:
         self.database_path = database_path
@@ -1232,17 +1253,46 @@ class _PersistentCache:
         self._lock = threading.Lock()
 
     def get(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        model_call_key = str(payload["model_call_key"])
+        hit = self.get_many([payload])[0]
+        return None if hit is None else hit.record
+
+    def get_many(
+        self,
+        payloads: Iterable[dict[str, Any]],
+    ) -> list[_CacheHit | None]:
+        """Read and validate a group of model-call cache entries at once."""
+        payload_list = list(payloads)
+        if not payload_list:
+            return []
+
+        keys = [str(payload["model_call_key"]) for payload in payload_list]
+        rows_by_key: dict[str, sqlite3.Row] = {}
         with _connect(self.database_path) as connection:
-            row = connection.execute(
-                """
-                SELECT record_json, record_sha256
-                FROM model_call_cache
-                WHERE model_call_key = ?
-                """,
-                (model_call_key,),
-            ).fetchone()
-        if row is not None:
+            # Keep the IN list below SQLite's conservative host-parameter
+            # limit; a caller may configure groups larger than the default.
+            for start in range(0, len(keys), _CACHE_LOOKUP_BATCH_SIZE):
+                batch = keys[start : start + _CACHE_LOOKUP_BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT model_call_key, record_json, record_sha256
+                    FROM model_call_cache
+                    WHERE model_call_key IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                rows_by_key.update(
+                    {str(row["model_call_key"]): row for row in rows}
+                )
+
+        hits: list[_CacheHit | None] = []
+        delegate_misses: list[tuple[int, dict[str, Any]]] = []
+        for index, payload in enumerate(payload_list):
+            row = rows_by_key.get(str(payload["model_call_key"]))
+            if row is None:
+                delegate_misses.append((index, payload))
+                hits.append(None)
+                continue
             record = _decode_checked(
                 str(row["record_json"]),
                 str(row["record_sha256"]),
@@ -1251,13 +1301,24 @@ class _PersistentCache:
                 raise ValueError(
                     "model-call cache provenance does not match its key"
                 )
-            return record
-        if self.delegate is None:
-            return None
-        legacy = self.delegate.get(str(payload["cache_key"]))
-        if legacy is None or not _record_matches_payload(legacy, payload):
-            return None
-        return dict(legacy)
+            hits.append(_CacheHit(record=record, durable=True))
+
+        if self.delegate is not None and delegate_misses:
+            # Legacy JSONL caches are typically backed by a mutable in-memory
+            # index.  Keep its reads serialized while avoiding any SQLite
+            # connection per job.
+            with self._lock:
+                for index, payload in delegate_misses:
+                    legacy = self.delegate.get(str(payload["cache_key"]))
+                    if legacy is None or not _record_matches_payload(
+                        legacy, payload
+                    ):
+                        continue
+                    hits[index] = _CacheHit(
+                        record=dict(legacy),
+                        durable=False,
+                    )
+        return hits
 
     def put(
         self,
@@ -1337,6 +1398,313 @@ def _canonical_extraction_record(
     if not _record_matches_payload(canonical, payload):
         raise ValueError("canonical extraction provenance mismatch")
     return canonical
+
+
+@dataclass(frozen=True)
+class _PreparedCachedRecord:
+    """A cache hit prepared for the durable two-phase job commit."""
+
+    job: Any
+    canonical: dict[str, Any]
+    encoded: str
+    digest: str
+    status: str
+    durable_cache: bool
+
+
+def _fenced_commit_cached_model_records(
+    database_path: Path,
+    *,
+    hits: Iterable[tuple[Any, _CacheHit]],
+    heartbeat: _LeaseHeartbeat,
+    lease_status: str = "leased",
+    after_cache_write: (
+        Callable[[str, dict[str, Any]], None] | None
+    ),
+    after_result_write: (
+        Callable[[str, dict[str, Any]], None] | None
+    ),
+    write_tracker: GuardedWriteTracker | None = None,
+) -> list[tuple[Any, str]]:
+    """Commit validated cache hits with one prepare and one finish transaction.
+
+    Cache hits already have a durable source record, so a normal hit does not
+    need another model-call-cache write.  The model-results prepare remains
+    intentional: if a worker exits between the two transactions,
+    ``_repair_durable_results`` can finish the leased jobs on resume.
+    """
+    prepared: list[_PreparedCachedRecord] = []
+    for job, hit in hits:
+        if heartbeat.is_lost(str(job.job_id)):
+            continue
+        canonical = _canonical_extraction_record(job.payload, hit.record)
+        encoded = _canonical_json(canonical)
+        prepared.append(
+            _PreparedCachedRecord(
+                job=job,
+                canonical=canonical,
+                encoded=encoded,
+                digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                status=(
+                    "terminal"
+                    if clean_text(hit.record.get("error"))
+                    else "success"
+                ),
+                durable_cache=hit.durable,
+            )
+        )
+    if not prepared:
+        return []
+
+    if write_tracker is not None:
+        write_tracker.before_write(
+            sum(
+                8192 + 4 * len(item.encoded.encode("utf-8"))
+                for item in prepared
+            )
+        )
+
+    # Validate payloads before taking SQLite's writer lock.  The claim fence
+    # is checked again below using cheap scalar columns while the transaction
+    # is open, so a job stolen between these two reads is still rejected.
+    payload_valid: list[_PreparedCachedRecord] = []
+    job_ids = [str(item.job.job_id) for item in prepared]
+    with _connect(database_path) as connection:
+        payload_rows: dict[str, sqlite3.Row] = {}
+        for start in range(0, len(job_ids), _CACHE_LOOKUP_BATCH_SIZE):
+            batch = job_ids[start : start + _CACHE_LOOKUP_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT job_id, payload_json
+                FROM jobs
+                WHERE job_id IN ({placeholders})
+                """,
+                batch,
+            ).fetchall()
+            payload_rows.update(
+                {str(row["job_id"]): row for row in rows}
+            )
+        for item in prepared:
+            row = payload_rows.get(str(item.job.job_id))
+            if (
+                row is not None
+                and not heartbeat.is_lost(str(item.job.job_id))
+                and _canonical_json(json.loads(str(row["payload_json"])))
+                == _canonical_json(item.job.payload)
+            ):
+                payload_valid.append(item)
+    if not payload_valid:
+        return []
+
+    atomic_finalize = (
+        after_cache_write is None and after_result_write is None
+    )
+    finalized: list[tuple[Any, str]] = []
+
+    def finish_rows(
+        connection: sqlite3.Connection,
+        items: Iterable[_PreparedCachedRecord],
+    ) -> list[tuple[Any, str]]:
+        finished: list[tuple[Any, str]] = []
+        finish_time = time.time()
+        for item in items:
+            if heartbeat.is_lost(str(item.job.job_id)):
+                continue
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, result_json = ?, owner = NULL,
+                    lease_expires = NULL, lease_id = NULL, updated_at = ?
+                WHERE job_id = ? AND kind = ? AND status = ?
+                  AND owner = ? AND lease_id = ? AND lease_expires > ?
+                  AND EXISTS (
+                        SELECT 1
+                        FROM model_results
+                        WHERE model_results.job_id = jobs.job_id
+                          AND model_results.commit_owner = ?
+                          AND model_results.commit_lease_id = ?
+                          AND model_results.record_sha256 = ?
+                          AND model_results.committed = 0
+                  )
+                """,
+                (
+                    item.status,
+                    item.encoded,
+                    finish_time,
+                    item.job.job_id,
+                    item.job.kind,
+                    lease_status,
+                    item.job.owner,
+                    item.job.lease_id,
+                    finish_time,
+                    item.job.owner,
+                    item.job.lease_id,
+                    item.digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            if item.status == "success" and not item.durable_cache:
+                # A legacy hit is promoted to the durable cache.  Durable
+                # hits never rewrite this table.
+                connection.execute(
+                    """
+                    INSERT INTO model_call_cache (
+                        model_call_key, record_json,
+                        record_sha256, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(model_call_key) DO UPDATE SET
+                        record_json = excluded.record_json,
+                        record_sha256 = excluded.record_sha256,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(item.job.payload["model_call_key"]),
+                        item.encoded,
+                        item.digest,
+                        finish_time,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE model_results
+                SET committed = 1, updated_at = ?
+                WHERE job_id = ? AND commit_owner = ?
+                  AND commit_lease_id = ? AND record_sha256 = ?
+                """,
+                (
+                    finish_time,
+                    item.job.job_id,
+                    item.job.owner,
+                    item.job.lease_id,
+                    item.digest,
+                ),
+            )
+            finished.append((item.job, item.status))
+        return finished
+
+    valid: list[_PreparedCachedRecord] = []
+    # Only one batch transaction at a time is allowed in this process.  This
+    # avoids a convoy of large JSON writes all waiting on SQLite's single
+    # writer and then failing with ``database is locked``.
+    with _MODEL_BATCH_WRITE_LOCK:
+        with _connect(database_path, timeout=120.0) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows_by_id: dict[str, sqlite3.Row] = {}
+            for start in range(
+                0, len(payload_valid), _CACHE_LOOKUP_BATCH_SIZE
+            ):
+                batch = [
+                    str(item.job.job_id)
+                    for item in payload_valid[
+                        start : start + _CACHE_LOOKUP_BATCH_SIZE
+                    ]
+                ]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT job_id, kind, status, owner,
+                           lease_id, lease_expires
+                    FROM jobs
+                    WHERE job_id IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                rows_by_id.update(
+                    {str(row["job_id"]): row for row in rows}
+                )
+
+            now = time.time()
+            for item in payload_valid:
+                row = rows_by_id.get(str(item.job.job_id))
+                if (
+                    row is None
+                    or heartbeat.is_lost(str(item.job.job_id))
+                    or str(row["kind"]) != str(item.job.kind)
+                    or str(row["status"]) != lease_status
+                    or str(row["owner"]) != str(item.job.owner)
+                    or str(row["lease_id"]) != str(item.job.lease_id)
+                    or float(row["lease_expires"] or 0.0) <= now
+                ):
+                    continue
+                valid.append(item)
+
+            for item in valid:
+                row = rows_by_id[str(item.job.job_id)]
+                connection.execute(
+                    """
+                    INSERT INTO model_results (
+                        job_id, jobset_fingerprint, modality, status,
+                        record_json, record_sha256, commit_owner,
+                        commit_lease_id, commit_lease_expires,
+                        committed, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        jobset_fingerprint = excluded.jobset_fingerprint,
+                        modality = excluded.modality,
+                        status = excluded.status,
+                        record_json = excluded.record_json,
+                        record_sha256 = excluded.record_sha256,
+                        commit_owner = excluded.commit_owner,
+                        commit_lease_id = excluded.commit_lease_id,
+                        commit_lease_expires = excluded.commit_lease_expires,
+                        committed = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        item.job.job_id,
+                        str(item.job.payload["jobset_fingerprint"]),
+                        str(item.job.payload["modality"]),
+                        item.status,
+                        item.encoded,
+                        item.digest,
+                        str(item.job.owner),
+                        str(item.job.lease_id),
+                        float(row["lease_expires"]),
+                        now,
+                    ),
+                )
+            if valid and atomic_finalize:
+                finalized = finish_rows(connection, valid)
+            if valid:
+                if write_tracker is not None:
+                    write_tracker.before_commit(0)
+                if atomic_finalize:
+                    if finalized:
+                        connection.commit()
+                    else:
+                        connection.rollback()
+                        return []
+                else:
+                    connection.commit()
+            else:
+                connection.rollback()
+                return []
+
+    if atomic_finalize:
+        return finalized
+
+    # Preserve the existing fault-injection and publication callbacks at the
+    # same prepare-to-finish boundary.  A callback failure leaves every
+    # prepared row repairable by the next resume.
+    for item in valid:
+        if item.status == "success" and after_cache_write is not None:
+            after_cache_write(str(item.job.job_id), item.canonical)
+        if after_result_write is not None:
+            after_result_write(str(item.job.job_id), item.canonical)
+
+    with _MODEL_BATCH_WRITE_LOCK:
+        with _connect(database_path, timeout=120.0) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            finalized = finish_rows(connection, valid)
+            if finalized:
+                if write_tracker is not None:
+                    write_tracker.before_commit(0)
+                connection.commit()
+            else:
+                connection.rollback()
+    return finalized
 
 
 def _repair_durable_results(
@@ -2014,6 +2382,7 @@ def _process_claimed_group(
         lease_seconds=lease_seconds,
         interval=heartbeat_seconds,
     ) as heartbeat:
+        cache_candidates: list[Any] = []
         for job in claimed:
             payload = job.payload
             evidence_error = _image_evidence_error(payload)
@@ -2039,32 +2408,33 @@ def _process_claimed_group(
                     if progress_tracker is not None:
                         progress_tracker.finished(modality, "terminal")
                 continue
-            cached = cache.get(payload)
-            if cached is None:
-                model_jobs.append(job)
-                task = _payload_to_task(payload)
-                task_by_key[task.cache_key] = task
-                job_by_key[task.cache_key] = job
+            cache_candidates.append(job)
+
+        cache_hits = cache.get_many(
+            [job.payload for job in cache_candidates]
+        )
+        cached_jobs: list[tuple[Any, _CacheHit]] = []
+        for job, hit in zip(cache_candidates, cache_hits):
+            if hit is not None:
+                cached_jobs.append((job, hit))
                 continue
-            cached_status = (
-                "terminal"
-                if clean_text(cached.get("error"))
-                else "success"
-            )
-            if _fenced_commit_model_record(
+            model_jobs.append(job)
+            task = _payload_to_task(job.payload)
+            task_by_key[task.cache_key] = task
+            job_by_key[task.cache_key] = job
+
+        if cached_jobs:
+            finalized_cached = _fenced_commit_cached_model_records(
                 store.path,
-                job=job,
-                expected_kind=job.kind,
-                payload=payload,
-                record=cached,
-                status=cached_status,
+                hits=cached_jobs,
                 heartbeat=heartbeat,
                 after_cache_write=after_cache_write,
                 after_result_write=after_result_write,
                 write_tracker=write_tracker,
-            ):
-                handled += 1
-                if progress_tracker is not None:
+            )
+            handled += len(finalized_cached)
+            if progress_tracker is not None:
+                for _job, cached_status in finalized_cached:
                     progress_tracker.finished(modality, cached_status)
         if not model_jobs:
             return handled
@@ -3938,6 +4308,360 @@ class _AdapterShardWriter:
             self.writer.abort()
 
 
+@dataclass(frozen=True)
+class _AdapterWorkerResult:
+    """Checksummed, unmerged output produced for one source shard."""
+
+    source_index: int
+    task_path: Path
+    error_path: Path
+    tasks: int
+    errors: int
+    task_sha256: str
+    error_sha256: str
+
+
+class _AdapterTemporaryDiskSpaceError(RuntimeError):
+    """Raised before a worker temporary output can violate disk reserve."""
+
+
+@dataclass(frozen=True)
+class _AdapterTemporaryDiskGuard:
+    """Pickle-safe reserve guard for process worker output."""
+
+    reserve_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.reserve_bytes < 0:
+            raise ValueError("disk reserve must be non-negative")
+
+    @staticmethod
+    def _existing_ancestor(path: Path) -> Path:
+        probe = Path(path).resolve()
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe
+
+    def __call__(self, path: Path, estimated_bytes: int = 0) -> None:
+        estimated = max(0, int(estimated_bytes))
+        target = Path(path).resolve()
+        free = int(shutil.disk_usage(self._existing_ancestor(target)).free)
+        required = self.reserve_bytes + estimated
+        if free < required:
+            raise _AdapterTemporaryDiskSpaceError(
+                "insufficient disk for adapter temporary output "
+                f"{target}: free={free}, reserve={self.reserve_bytes}, "
+                f"estimated={estimated}, required={required}"
+            )
+
+
+@dataclass(frozen=True)
+class _AdapterCombinedWriteGuard:
+    """Apply pickle-safe worker guards in the same write operation."""
+
+    guards: tuple[PreWriteGuard, ...]
+
+    def __call__(self, path: Path, estimated_bytes: int = 0) -> None:
+        for guard in self.guards:
+            guard(path, estimated_bytes)
+
+
+def _pickleable_pre_write_guard(
+    guard: PreWriteGuard | None,
+) -> PreWriteGuard | None:
+    """Return a process-safe guard, retaining parent checks for closures."""
+    if guard is None:
+        return None
+    try:
+        pickle.dumps(guard)
+    except Exception:
+        return None
+    return guard
+
+
+def _adapter_worker_pre_write_guard(
+    args: argparse.Namespace,
+    pre_write_guard: PreWriteGuard | None,
+    *,
+    process_safe: bool,
+) -> PreWriteGuard | None:
+    """Build the guard used while a worker materializes private JSONL."""
+    guards: list[PreWriteGuard] = []
+    inherited_guard = (
+        _pickleable_pre_write_guard(pre_write_guard)
+        if process_safe
+        else pre_write_guard
+    )
+    if inherited_guard is not None:
+        guards.append(inherited_guard)
+    reserve_bytes = getattr(args, "min_free_disk_bytes", None)
+    if reserve_bytes is not None:
+        guards.append(_AdapterTemporaryDiskGuard(int(reserve_bytes)))
+    if not guards:
+        return None
+    if len(guards) == 1:
+        return guards[0]
+    return _AdapterCombinedWriteGuard(tuple(guards))
+
+
+def _adapter_temporary_paths(
+    temporary_root: Path,
+    source_index: int,
+) -> tuple[Path, Path]:
+    return (
+        temporary_root / f"source-{source_index:08d}-tasks.jsonl",
+        temporary_root / f"source-{source_index:08d}-errors.jsonl",
+    )
+
+
+class _AdapterTempJsonlWriter:
+    """Write one worker result atomically without sharing final shards."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        pre_write_guard: PreWriteGuard | None = None,
+    ) -> None:
+        self.path = path
+        self.temporary = path.with_suffix(path.suffix + ".tmp")
+        self.tracker = GuardedWriteTracker(path, pre_write_guard)
+        self.temporary.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.temporary.open("wb")
+        self.digest = hashlib.sha256()
+        self.records = 0
+
+    def write(self, record: dict[str, Any]) -> None:
+        encoded = (
+            json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
+        )
+        self.tracker.before_write(len(encoded))
+        self.handle.write(encoded)
+        self.digest.update(encoded)
+        self.records += 1
+
+    def close(self) -> tuple[int, str]:
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.tracker.before_commit(0)
+        self.handle.close()
+        self.temporary.replace(self.path)
+        _fsync_directory(self.path.parent)
+        return self.records, self.digest.hexdigest()
+
+    def abort(self) -> None:
+        try:
+            self.handle.close()
+        finally:
+            self.temporary.unlink(missing_ok=True)
+            self.path.unlink(missing_ok=True)
+
+
+def _read_only_index_connection(path: Path) -> sqlite3.Connection:
+    """Open an independent read-only SQLite connection in each worker."""
+    uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _adapter_worker_process_source(
+    source_index: int,
+    source_path: Path,
+    index_path: Path,
+    temporary_root: Path,
+    adapter_args: argparse.Namespace,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> _AdapterWorkerResult:
+    """Build temporary task/error files for one source shard.
+
+    This function intentionally owns its SQLite connection.  It is suitable
+    for both a direct serial call and a ProcessPoolExecutor child, and never
+    writes a final adapter shard.
+    """
+    task_path, error_path = _adapter_temporary_paths(
+        temporary_root,
+        source_index,
+    )
+    task_writer = _AdapterTempJsonlWriter(
+        task_path,
+        pre_write_guard=pre_write_guard,
+    )
+    error_writer = _AdapterTempJsonlWriter(
+        error_path,
+        pre_write_guard=pre_write_guard,
+    )
+    try:
+        with _read_only_index_connection(index_path) as connection:
+            for source_table in _iter_jsonl_paths([source_path]):
+                source_table_id = str(source_table["source_table_id"])
+                link_rows = connection.execute(
+                    """
+                    SELECT
+                        links.entity_id,
+                        links.asset_id,
+                        assets.payload AS asset_payload,
+                        entities.payload AS entity_payload
+                    FROM links
+                    LEFT JOIN assets ON assets.asset_id = links.asset_id
+                    LEFT JOIN entities ON entities.entity_id = links.entity_id
+                    WHERE links.source_table_id = ?
+                    ORDER BY links.entity_id, links.asset_id
+                    """,
+                    (source_table_id,),
+                ).fetchall()
+                entity_to_assets: dict[str, list[str]] = {}
+                assets: dict[str, dict[str, Any]] = {}
+                wiki_to_entity_id: dict[str, str] = {}
+                decoded_entities: dict[str, dict[str, Any]] = {}
+                for link in link_rows:
+                    entity_id = str(link["entity_id"])
+                    asset_id = str(link["asset_id"])
+                    entity_to_assets.setdefault(entity_id, []).append(
+                        asset_id
+                    )
+                    if (
+                        link["asset_payload"] is None
+                        or link["entity_payload"] is None
+                    ):
+                        continue
+                    assets[asset_id] = json.loads(str(link["asset_payload"]))
+                    entity = decoded_entities.get(entity_id)
+                    if entity is None:
+                        entity = json.loads(str(link["entity_payload"]))
+                        decoded_entities[entity_id] = entity
+                    wiki_to_entity_id[str(entity["wiki_title"])] = entity_id
+                tasks = collect_table_extraction_tasks(
+                    source_table=source_table,
+                    assets=assets,
+                    entity_to_assets=entity_to_assets,
+                    wiki_to_entity_id=wiki_to_entity_id,
+                    args=adapter_args,
+                )
+                if link_rows and not tasks:
+                    error_writer.write(
+                        {
+                            "status": "terminal",
+                            "error_class": "no_candidate_attributes",
+                            "source_table_id": source_table_id,
+                        }
+                    )
+                for task in tasks:
+                    if not task.candidate_attribute_names:
+                        raise ValueError(
+                            "adapter produced an empty candidate task"
+                        )
+                    task_writer.write(
+                        {
+                            "extraction_task": {
+                                "order": task.order,
+                                "cache_key": task.cache_key,
+                                "source_table_id": task.source_table_id,
+                                "source_row_id": task.source_row_id,
+                                "entity_column_index": (
+                                    task.entity_column_index
+                                ),
+                                "entity_column_name": (
+                                    task.entity_column_name
+                                ),
+                                "entity": task.entity,
+                                "asset": task.asset,
+                                "candidate_attribute_names": (
+                                    task.candidate_attribute_names
+                                ),
+                            }
+                        }
+                    )
+        tasks, task_sha256 = task_writer.close()
+        errors, error_sha256 = error_writer.close()
+    except BaseException:
+        task_writer.abort()
+        error_writer.abort()
+        raise
+    return _AdapterWorkerResult(
+        source_index=source_index,
+        task_path=task_path,
+        error_path=error_path,
+        tasks=tasks,
+        errors=errors,
+        task_sha256=task_sha256,
+        error_sha256=error_sha256,
+    )
+
+
+def _cleanup_adapter_temporary_root(path: Path) -> None:
+    """Remove only unmerged worker artifacts from the private temp root."""
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_file() and (
+            child.name.endswith(".jsonl")
+            or child.name.endswith(".jsonl.tmp")
+            or child.name.endswith(".tmp")
+        ):
+            child.unlink(missing_ok=True)
+
+
+def _validate_adapter_worker_file(
+    path: Path,
+    *,
+    expected_records: int,
+    expected_sha256: str,
+) -> None:
+    if not path.is_file():
+        raise ValueError("model adapter worker result is missing")
+    digest = hashlib.sha256()
+    records = 0
+    with path.open("rb") as handle:
+        for line in handle:
+            digest.update(line)
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("model adapter worker result is invalid")
+            records += 1
+    if records != expected_records or digest.hexdigest() != expected_sha256:
+        raise ValueError("model adapter worker result checksum mismatch")
+
+
+def _iter_adapter_results_in_source_order(
+    remaining: list[tuple[int, Path]],
+    *,
+    queue_limit: int,
+    submit: Callable[[int, Path], Future[_AdapterWorkerResult]],
+) -> Iterator[_AdapterWorkerResult]:
+    """Refill on any completed worker while yielding deterministic order."""
+    if queue_limit <= 0:
+        raise ValueError("adapter worker queue limit must be positive")
+    if not remaining:
+        return
+    pending: dict[Future[_AdapterWorkerResult], int] = {}
+    completed: dict[int, _AdapterWorkerResult] = {}
+    next_submit = 0
+    next_merge = remaining[0][0]
+
+    def refill() -> None:
+        nonlocal next_submit
+        while len(pending) < queue_limit and next_submit < len(remaining):
+            source_index, source_path = remaining[next_submit]
+            pending[submit(source_index, source_path)] = source_index
+            next_submit += 1
+
+    refill()
+    while pending:
+        future = next(as_completed(pending))
+        source_index = pending.pop(future)
+        result = future.result()
+        if result.source_index != source_index:
+            raise ValueError("model adapter worker source order mismatch")
+        completed[source_index] = result
+        refill()
+        while next_merge in completed:
+            yield completed.pop(next_merge)
+            next_merge += 1
+
+
 def _relative_adapter_shards(
     shards: Iterable[CompletedShard],
     output_root: Path,
@@ -4629,6 +5353,8 @@ def adapt_model_tasks_from_manifests(
     adapter_manifest_path = (
         output_root / "model-task-adapter-manifest.json"
     )
+    temporary_root = output_root / ".adapter_tmp"
+    _cleanup_adapter_temporary_root(temporary_root)
     resumed = _load_completed_adapted_model_tasks(
         output_root=output_root,
         manifest_path=adapter_manifest_path,
@@ -4811,98 +5537,110 @@ def adapt_model_tasks_from_manifests(
     adapter_args = argparse.Namespace(**vars(args))
     if not hasattr(adapter_args, "min_column_non_empty_ratio"):
         adapter_args.min_column_non_empty_ratio = 0.5
+    adapter_workers = int(getattr(adapter_args, "model_adapter_workers", 1))
+    if adapter_workers <= 0:
+        raise ValueError("model_adapter_workers must be positive")
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    _cleanup_adapter_temporary_root(temporary_root)
+    serial_worker_guard = _adapter_worker_pre_write_guard(
+        adapter_args,
+        pre_write_guard,
+        process_safe=False,
+    )
+    parallel_worker_guard = _adapter_worker_pre_write_guard(
+        adapter_args,
+        pre_write_guard,
+        process_safe=True,
+    )
+
+    def merge_source(result: _AdapterWorkerResult) -> None:
+        """Validate and merge one source result in source order."""
+        _validate_adapter_worker_file(
+            result.task_path,
+            expected_records=result.tasks,
+            expected_sha256=result.task_sha256,
+        )
+        _validate_adapter_worker_file(
+            result.error_path,
+            expected_records=result.errors,
+            expected_sha256=result.error_sha256,
+        )
+        for record in _iter_jsonl_paths([result.task_path]):
+            task_writer.write(record)
+        for record in _iter_jsonl_paths([result.error_path]):
+            error_writer.write(record)
+        result.task_path.unlink(missing_ok=True)
+        result.error_path.unlink(missing_ok=True)
+
+    def checkpoint_source(source_index: int) -> None:
+        nonlocal task_count, error_count
+        if (
+            source_index % _ADAPTER_CHECKPOINT_SOURCE_SHARDS != 0
+            and source_index != len(source_paths)
+        ):
+            return
+        task_writer._commit()
+        error_writer._commit()
+        _write_adapter_checkpoint(
+            output_root=output_root,
+            manifest_path=adapter_manifest_path,
+            input_fingerprint=input_fingerprint,
+            parameter_fingerprint=parameter_fingerprint,
+            source_shards_completed=source_index,
+            task_shards=task_writer.completed,
+            error_shards=error_writer.completed,
+            tasks=task_count,
+            errors=error_count,
+            pre_write_guard=pre_write_guard,
+        )
+
     try:
-        with sqlite3.connect(index_path) as connection:
-            connection.row_factory = sqlite3.Row
-            for source_index, source_path in enumerate(
+        remaining = list(
+            enumerate(
                 source_paths[completed_sources:],
                 start=completed_sources + 1,
-            ):
-                for source_table in _iter_jsonl_paths([source_path]):
-                    source_table_id = str(source_table["source_table_id"])
-                    link_rows = connection.execute(
-                        """
-                        SELECT
-                            links.entity_id,
-                            links.asset_id,
-                            assets.payload AS asset_payload,
-                            entities.payload AS entity_payload
-                        FROM links
-                        LEFT JOIN assets ON assets.asset_id = links.asset_id
-                        LEFT JOIN entities ON entities.entity_id = links.entity_id
-                        WHERE links.source_table_id = ?
-                        ORDER BY links.entity_id, links.asset_id
-                        """,
-                        (source_table_id,),
-                    ).fetchall()
-                    entity_to_assets: dict[str, list[str]] = {}
-                    assets: dict[str, dict[str, Any]] = {}
-                    wiki_to_entity_id: dict[str, str] = {}
-                    decoded_entities: dict[str, dict[str, Any]] = {}
-                    for link in link_rows:
-                        entity_id = str(link["entity_id"])
-                        asset_id = str(link["asset_id"])
-                        entity_to_assets.setdefault(entity_id, []).append(
-                            asset_id
-                        )
-                        if (
-                            link["asset_payload"] is None
-                            or link["entity_payload"] is None
-                        ):
-                            continue
-                        assets[asset_id] = json.loads(
-                            str(link["asset_payload"])
-                        )
-                        entity = decoded_entities.get(entity_id)
-                        if entity is None:
-                            entity = json.loads(str(link["entity_payload"]))
-                            decoded_entities[entity_id] = entity
-                        wiki_to_entity_id[str(entity["wiki_title"])] = (
-                            entity_id
-                        )
-                    tasks = collect_table_extraction_tasks(
-                        source_table=source_table,
-                        assets=assets,
-                        entity_to_assets=entity_to_assets,
-                        wiki_to_entity_id=wiki_to_entity_id,
-                        args=adapter_args,
-                    )
-                    if link_rows and not tasks:
-                        error_writer.write(
-                            {
-                                "status": "terminal",
-                                "error_class": "no_candidate_attributes",
-                                "source_table_id": source_table_id,
-                            }
-                        )
-                        error_count += 1
-                    for task in tasks:
-                        if not task.candidate_attribute_names:
-                            raise ValueError(
-                                "adapter produced an empty candidate task"
-                            )
-                        task_writer.write(
-                            {
-                                "extraction_task": {
-                                    "order": task.order,
-                                    "cache_key": task.cache_key,
-                                    "source_table_id": task.source_table_id,
-                                    "source_row_id": task.source_row_id,
-                                    "entity_column_index": (
-                                        task.entity_column_index
-                                    ),
-                                    "entity_column_name": (
-                                        task.entity_column_name
-                                    ),
-                                    "entity": task.entity,
-                                    "asset": task.asset,
-                                    "candidate_attribute_names": (
-                                        task.candidate_attribute_names
-                                    ),
-                                }
-                            }
-                        )
-                        task_count += 1
+            )
+        )
+        queue_limit = max(1, adapter_workers * _ADAPTER_WORK_QUEUE_FACTOR)
+
+        def submit_one(
+            executor: ProcessPoolExecutor,
+            source_index: int,
+            source_path: Path,
+        ) -> Future[_AdapterWorkerResult]:
+            task_path, error_path = _adapter_temporary_paths(
+                temporary_root,
+                source_index,
+            )
+            if pre_write_guard is not None:
+                pre_write_guard(task_path, 0)
+                pre_write_guard(error_path, 0)
+            return executor.submit(
+                _adapter_worker_process_source,
+                source_index,
+                source_path,
+                index_path,
+                temporary_root,
+                adapter_args,
+                parallel_worker_guard,
+            )
+
+        if adapter_workers == 1:
+            # Keep the default path lightweight while retaining the same
+            # independent read-only connection and atomic worker artifacts.
+            for source_index, source_path in remaining:
+                result = _adapter_worker_process_source(
+                    source_index,
+                    source_path,
+                    index_path,
+                    temporary_root,
+                    adapter_args,
+                    serial_worker_guard,
+                )
+                merge_source(result)
+                task_count += result.tasks
+                error_count += result.errors
+                checkpoint_source(source_index)
                 if progress_callback is not None:
                     progress_callback(
                         ModelTaskAdapterProgress(
@@ -4913,29 +5651,43 @@ def adapt_model_tasks_from_manifests(
                             errors=error_count,
                         )
                     )
-                if (
-                    source_index % _ADAPTER_CHECKPOINT_SOURCE_SHARDS == 0
-                    or source_index == len(source_paths)
+        else:
+            executor = ProcessPoolExecutor(max_workers=adapter_workers)
+            try:
+                for result in _iter_adapter_results_in_source_order(
+                    remaining,
+                    queue_limit=queue_limit,
+                    submit=lambda source_index, source_path: submit_one(
+                        executor,
+                        source_index,
+                        source_path,
+                    ),
                 ):
-                    task_writer._commit()
-                    error_writer._commit()
-                    _write_adapter_checkpoint(
-                        output_root=output_root,
-                        manifest_path=adapter_manifest_path,
-                        input_fingerprint=input_fingerprint,
-                        parameter_fingerprint=parameter_fingerprint,
-                        source_shards_completed=source_index,
-                        task_shards=task_writer.completed,
-                        error_shards=error_writer.completed,
-                        tasks=task_count,
-                        errors=error_count,
-                        pre_write_guard=pre_write_guard,
-                    )
+                    merge_source(result)
+                    task_count += result.tasks
+                    error_count += result.errors
+                    checkpoint_source(result.source_index)
+                    if progress_callback is not None:
+                        progress_callback(
+                            ModelTaskAdapterProgress(
+                                phase="tasks",
+                                completed_shards=result.source_index,
+                                total_shards=len(source_paths),
+                                tasks=task_count,
+                                errors=error_count,
+                            )
+                        )
+            except BaseException:
+                executor.shutdown(wait=True, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
         task_shards = task_writer.close()
         error_shards = error_writer.close()
     except BaseException:
         task_writer.abort()
         error_writer.abort()
+        _cleanup_adapter_temporary_root(temporary_root)
         raise
     task_shards = _relative_adapter_shards(task_shards, output_root)
     error_shards = _relative_adapter_shards(error_shards, output_root)

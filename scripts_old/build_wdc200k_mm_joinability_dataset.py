@@ -256,6 +256,7 @@ class PipelineConfig:
     remote_image_model_base_urls: tuple[str, ...] = ()
     remote_image_model_base_urls_file: str | None = None
     remote_image_model_api_key: str | None = None
+    model_adapter_workers: int = 1
     text_model_workers: int = 1
     image_model_workers: int = 1
     remote_text_model_workers: int = 0
@@ -457,6 +458,7 @@ class PipelineConfig:
                 else None
             ),
             remote_image_model_api_key=args.remote_image_model_api_key,
+            model_adapter_workers=args.model_adapter_workers,
             text_model_workers=args.text_model_workers,
             image_model_workers=args.image_model_workers,
             remote_text_model_workers=args.remote_text_model_workers,
@@ -4110,6 +4112,7 @@ def _runtime_args(config: PipelineConfig) -> argparse.Namespace:
         )
     args = legacy_wdc_builder.parse_args(argv)
     args.max_rows_per_source_table = None
+    args.model_adapter_workers = config.model_adapter_workers
     args.model_endpoint_ready_timeout_seconds = (
         config.model_endpoint_ready_timeout_seconds
     )
@@ -7057,6 +7060,7 @@ def parse_args(
     )
     parser.add_argument("--precompute_model_cache", action="store_true")
     parser.add_argument("--precompute_text_model_cache", action="store_true")
+    parser.add_argument("--model_adapter_workers", type=int, default=1)
     parser.add_argument("--text_model_workers", type=int, default=1)
     parser.add_argument("--image_model_workers", type=int, default=1)
     parser.add_argument("--materialization_workers", type=int, default=1)
@@ -7096,6 +7100,8 @@ def parse_args(
         args.max_text_asset_chunks_per_entity,
     ) <= 0:
         parser.error("text asset chunk limits must be positive")
+    if args.model_adapter_workers <= 0:
+        parser.error("--model_adapter_workers must be positive")
     if min(args.text_model_workers, args.image_model_workers) <= 0:
         parser.error("model worker counts must be positive")
     if min(

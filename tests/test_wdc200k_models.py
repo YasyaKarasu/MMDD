@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,217 @@ def model_args(
         text_model_name=text_model_name,
         image_model_name=image_model_name,
     )
+
+
+def _write_worker_fixture(root: Path) -> tuple[Path, Path, argparse.Namespace]:
+    """Create one tiny source shard and adapter index for worker tests."""
+    source_path = root / "source.jsonl"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text(
+        json.dumps(
+            {
+                "source_table_id": "source-worker",
+                "columns": [
+                    {"column_index": 0, "column_name": "Name"},
+                    {"column_index": 1, "column_name": "State"},
+                ],
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "cells": [
+                            {
+                                "column_index": 0,
+                                "column_name": "Name",
+                                "text": "Alpha",
+                                "wiki_title": "Alpha",
+                            },
+                            {
+                                "column_index": 1,
+                                "column_name": "State",
+                                "text": "Texas",
+                                "wiki_title": None,
+                            },
+                        ],
+                    }
+                ],
+                "metadata": {
+                    "candidate_entity_columns": [0],
+                    "column_profiles": [
+                        {"column_index": 0, "non_empty_ratio": 1.0},
+                        {"column_index": 1, "non_empty_ratio": 1.0},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    index_path = root / "index.sqlite3"
+    with sqlite3.connect(index_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE assets (asset_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE entities (entity_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE links (
+                source_table_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                PRIMARY KEY (source_table_id, entity_id, asset_id)
+            );
+            """
+        )
+        entity = {"entity_id": "entity-worker", "wiki_title": "Alpha"}
+        connection.execute(
+            "INSERT INTO assets VALUES (?, ?)",
+            ("asset-worker", json.dumps(asset("asset-worker"))),
+        )
+        connection.execute(
+            "INSERT INTO entities VALUES (?, ?)",
+            ("entity-worker", json.dumps(entity)),
+        )
+        connection.execute(
+            "INSERT INTO links VALUES (?, ?, ?)",
+            ("source-worker", "entity-worker", "asset-worker"),
+        )
+    args = model_args()
+    args.min_column_non_empty_ratio = 0.5
+    args.query_rows_per_table = 1
+    args.min_rows_per_output_table = 1
+    return source_path, index_path, args
+
+
+def test_adapter_worker_process_matches_serial_and_cleans_temp_results(
+    tmp_path: Path,
+) -> None:
+    source_path, index_path, args = _write_worker_fixture(tmp_path / "input")
+    serial_root = tmp_path / "serial-tmp"
+    parallel_root = tmp_path / "parallel-tmp"
+
+    serial = models._adapter_worker_process_source(
+        1, source_path, index_path, serial_root, args
+    )
+    with models.ProcessPoolExecutor(max_workers=2) as executor:
+        parallel = executor.submit(
+            models._adapter_worker_process_source,
+            1,
+            source_path,
+            index_path,
+            parallel_root,
+            args,
+        ).result()
+
+    assert serial.tasks == parallel.tasks == 1
+    assert serial.errors == parallel.errors == 0
+    assert serial.task_path.read_bytes() == parallel.task_path.read_bytes()
+    assert serial.task_sha256 == parallel.task_sha256
+
+    stale = parallel_root / "source-99999999-tasks.jsonl.tmp"
+    stale.write_text("partial", encoding="utf-8")
+    keep = parallel_root / "operator-note.txt"
+    keep.write_text("keep", encoding="utf-8")
+    models._cleanup_adapter_temporary_root(parallel_root)
+    assert not stale.exists()
+    assert keep.read_text(encoding="utf-8") == "keep"
+
+
+def test_adapter_temp_jsonl_writer_honors_write_guard_and_cleans_rejection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker-result.jsonl"
+    calls: list[tuple[Path, int]] = []
+    writer = models._AdapterTempJsonlWriter(
+        path,
+        pre_write_guard=lambda guarded_path, estimated_bytes=0: calls.append(
+            (Path(guarded_path), estimated_bytes)
+        ),
+    )
+
+    writer.write({"value": "x"})
+    records, digest = writer.close()
+
+    expected = b'{"value": "x"}\n'
+    assert records == 1
+    assert digest == hashlib.sha256(expected).hexdigest()
+    assert path.read_bytes() == expected
+    assert calls[0] == (path, 0)
+    assert any(
+        guarded_path == path and estimated_bytes > 0
+        for guarded_path, estimated_bytes in calls
+    )
+    assert calls[-1] == (path, 0)
+
+    def reject_positive_write(_path: Path, estimated_bytes: int = 0) -> None:
+        if estimated_bytes > 0:
+            raise OSError("worker write reserve exhausted")
+
+    blocked_path = tmp_path / "blocked-worker-result.jsonl"
+    blocked_writer = models._AdapterTempJsonlWriter(
+        blocked_path,
+        pre_write_guard=reject_positive_write,
+    )
+    with pytest.raises(OSError, match="worker write reserve"):
+        blocked_writer.write({"value": "x"})
+    blocked_writer.abort()
+    assert not blocked_path.exists()
+    assert not blocked_path.with_suffix(".jsonl.tmp").exists()
+
+
+def test_adapter_worker_queue_refills_before_earlier_source_completes() -> None:
+    first_release = threading.Event()
+    fifth_started = threading.Event()
+    results: list[models._AdapterWorkerResult] = []
+    errors: list[Exception] = []
+
+    def worker(
+        source_index: int,
+        _source_path: Path,
+    ) -> models._AdapterWorkerResult:
+        if source_index == 1:
+            first_release.wait(timeout=5)
+        elif source_index in {3, 4}:
+            fifth_started.wait(timeout=5)
+        elif source_index == 5:
+            fifth_started.set()
+        return models._AdapterWorkerResult(
+            source_index=source_index,
+            task_path=Path(f"task-{source_index}"),
+            error_path=Path(f"error-{source_index}"),
+            tasks=0,
+            errors=0,
+            task_sha256="",
+            error_sha256="",
+        )
+
+    def consume() -> None:
+        try:
+            results.extend(iterator)
+        except Exception as error:
+            errors.append(error)
+
+    remaining = [(index, Path(f"source-{index}")) for index in range(1, 6)]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        iterator = models._iter_adapter_results_in_source_order(
+            remaining,
+            queue_limit=4,
+            submit=lambda source_index, source_path: executor.submit(
+                worker,
+                source_index,
+                source_path,
+            ),
+        )
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        try:
+            assert fifth_started.wait(timeout=1)
+            assert not first_release.is_set()
+        finally:
+            first_release.set()
+            fifth_started.set()
+        consumer.join(timeout=5)
+
+    assert not consumer.is_alive()
+    assert not errors
+    assert [result.source_index for result in results] == [1, 2, 3, 4, 5]
 
 
 def test_model_schema_initialization_commit_uses_live_guard(
@@ -2863,6 +3075,77 @@ def test_model_call_cache_isolated_by_full_payload_provenance(
         assert record["asset_fingerprint"]
 
 
+def test_persistent_cache_hits_batch_without_rewriting_cache_rows(
+    tmp_path: Path,
+) -> None:
+    store = SqliteJobStore(tmp_path / "models.sqlite3")
+    assets = [asset("a"), asset("b"), asset("c")]
+    first_jobset = enqueue_model_tasks(
+        assets,
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v1",
+    )
+    run_model_stage(
+        store,
+        CountingExtractor(),
+        jobset=first_jobset,
+        output_root=tmp_path / "outputs",
+    )
+    with sqlite3.connect(store.path) as connection:
+        before = connection.execute(
+            """
+            SELECT model_call_key, record_json, record_sha256, updated_at
+            FROM model_call_cache
+            ORDER BY model_call_key
+            """
+        ).fetchall()
+
+    second_jobset = enqueue_model_tasks(
+        assets,
+        store,
+        args=model_args(),
+        input_fingerprint="assets-v2",
+    )
+    result = run_model_stage(
+        store,
+        None,
+        jobset=second_jobset,
+        output_root=tmp_path / "outputs",
+    )
+
+    assert result.complete is True
+    assert result.success == len(assets)
+    with sqlite3.connect(store.path) as connection:
+        after = connection.execute(
+            """
+            SELECT model_call_key, record_json, record_sha256, updated_at
+            FROM model_call_cache
+            ORDER BY model_call_key
+            """
+        ).fetchall()
+        statuses = connection.execute(
+            """
+            SELECT status, result_json
+            FROM jobs
+            WHERE job_id IN (?, ?, ?)
+            ORDER BY job_id
+            """,
+            tuple(job.job_id for job in second_jobset.jobs),
+        ).fetchall()
+
+    assert after == before
+    assert [status for status, _result in statuses] == [
+        "success"
+    ] * len(assets)
+    assert all(
+        json.loads(result_json)["job_id"] in {
+            job.job_id for job in second_jobset.jobs
+        }
+        for _status, result_json in statuses
+    )
+
+
 def test_legacy_cache_requires_complete_matching_provenance(
     tmp_path: Path,
 ) -> None:
@@ -4213,6 +4496,24 @@ def test_task3_task5_adapter_builds_real_non_empty_candidate_tasks(
         == "entity-alpha-0"
     )
     assert records[0]["extraction_task"]["source_row_id"] == 0
+    parallel_args = model_args()
+    parallel_args.model_adapter_workers = 2
+    parallel = adapt_model_tasks_from_manifests(
+        structural_output_root=structural_root,
+        structural_manifests=[structural_manifest],
+        finalized_selection_manifest=final_manifest,
+        structural_barrier=structural_barrier,
+        assets_manifest=assets_manifest,
+        assets_barrier=task5_barrier(),
+        output_root=tmp_path / "adapted-parallel",
+        args=parallel_args,
+    )
+    assert [path.read_bytes() for path in parallel.task_paths] == [
+        path.read_bytes() for path in adapted.task_paths
+    ]
+    assert [path.read_bytes() for path in parallel.error_paths] == [
+        path.read_bytes() for path in adapted.error_paths
+    ]
     assert [update.phase for update in adapter_updates] == [
         "index_assets",
         "index_entities",

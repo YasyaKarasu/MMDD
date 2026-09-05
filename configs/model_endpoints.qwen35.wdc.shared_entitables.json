@@ -1,0 +1,26 @@
+{
+  "schema_version": "mmdd-model-endpoints-v1",
+  "served_model_name": "Qwen3.5-9B",
+  "endpoints": [
+    {
+      "endpoint_id": "remote-a100-gpu0-shared-entitables",
+      "base_url": "http://127.0.0.1:18000/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 72,
+        "image": 24,
+        "total": 88
+      }
+    },
+    {
+      "endpoint_id": "remote-a100-gpu6-dedicated-wdc",
+      "base_url": "http://127.0.0.1:18001/v1",
+      "pool": "local",
+      "max_inflight": {
+        "text": 56,
+        "image": 16,
+        "total": 64
+      }
+    }
+  ]
+}

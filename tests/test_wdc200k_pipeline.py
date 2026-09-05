@@ -36,6 +36,7 @@ from build_wdc200k_mm_joinability_dataset import (  # noqa: E402
     run_pipeline,
 )
 import build_wdc200k_mm_joinability_dataset as pipeline_module  # noqa: E402
+import wdc200k_balance_progress as balance_progress  # noqa: E402
 from wdc200k_assets import ImageOutcomeStore  # noqa: E402
 from wdc200k_fetch import (  # noqa: E402
     FetchPolicy,
@@ -164,6 +165,7 @@ def test_cli_defaults_match_approved_policy(tmp_path: Path) -> None:
     assert args.model_cache_database_path is None
     assert args.unrecoverable_replacement_rounds == 0
     assert args.unrecoverable_drop_probability == 0.5
+    assert args.model_adapter_workers == 1
     assert args.materialization_workers == 1
     assert args.materialization_validation_workers == 3
 
@@ -453,6 +455,49 @@ def test_wdc200k_cli_forwards_shared_endpoint_pool_settings(tmp_path: Path) -> N
         "models",
         "materialize",
     )
+
+
+def test_model_adapter_workers_round_trip_to_runtime_args(tmp_path: Path) -> None:
+    config = PipelineConfig.from_args(
+        parse_args(
+            [
+                "--input_dir",
+                str(tmp_path / "input"),
+                "--output_dir",
+                str(tmp_path / "output"),
+                "--model_adapter_workers",
+                "4",
+            ]
+        )
+    )
+
+    runtime_args = pipeline_module._runtime_args(config)
+
+    assert config.model_adapter_workers == 4
+    assert runtime_args.model_adapter_workers == 4
+
+
+def test_balance_view_renders_model_adapter_progress() -> None:
+    rendered = balance_progress.render(
+        {
+            "stage": "models",
+            "detail": "adapter tasks",
+            "completed_shards": 0,
+            "total_shards": 2,
+            "counters": {
+                "model_adapter_shards_completed": 7,
+                "model_adapter_shards_total": 19,
+                "model_adapter_tasks_live": 123,
+                "model_adapter_errors_live": 2,
+            },
+            "elapsed_seconds": 1.0,
+            "disk": {},
+        }
+    )
+
+    assert "adapter " in rendered
+    assert "7/19" in rendered
+    assert "model adapter tasks=123" in rendered
 
 
 def test_remote_model_cli_options_reach_legacy_runtime_args(tmp_path: Path) -> None:

@@ -101,6 +101,10 @@ def _render_stage(payload: dict[str, Any]) -> str:
     completed = int(payload.get("completed_shards") or 0)
     total = int(payload.get("total_shards") or 0)
     counters = payload.get("counters") or {}
+    adapter_completed = int(
+        counters.get("model_adapter_shards_completed", 0)
+    )
+    adapter_total = int(counters.get("model_adapter_shards_total", 0))
     elapsed = float(payload.get("elapsed_seconds") or 0.0)
     rate = completed / elapsed if elapsed > 0 else 0.0
     disk = payload.get("disk") or {}
@@ -113,6 +117,8 @@ def _render_stage(payload: dict[str, Any]) -> str:
         "entities_live",
         "sampling_shards_completed",
         "sampling_shards_total",
+        "model_adapter_tasks_live",
+        "model_adapter_errors_live",
     ):
         if key in counters:
             live.append(f"{key.removesuffix('_live').replace('_', ' ')}={int(counters[key]):,}")
@@ -129,6 +135,12 @@ def _render_stage(payload: dict[str, Any]) -> str:
         f"reserve: {_gib(disk.get('reserve_bytes'))}",
         f"updated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
     ]
+    if stage == "models" and adapter_total:
+        lines.insert(
+            3,
+            f"adapter {_bar(adapter_completed, adapter_total)} "
+            f"{adapter_completed:,}/{adapter_total:,}",
+        )
     return "\n".join(lines)
 
 
