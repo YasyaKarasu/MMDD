@@ -53,15 +53,6 @@ def load_student(path: Path, device: torch.device) -> StudentJoinabilityModel:
     return model.to(device)
 
 
-def load_path_aggregation(path: Path) -> tuple[str, int]:
-    config = load_checkpoint(path).get("path_aggregation", {})
-    aggregation = str(config.get("evidence_aggregation", "logsumexp"))
-    top_k = int(config.get("evidence_top_k", 4))
-    if aggregation not in PATH_AGGREGATIONS or top_k <= 0:
-        raise ValueError(f"{path}: invalid path aggregation configuration")
-    return aggregation, top_k
-
-
 def load_path_aggregator(path: Path) -> PathAggregator:
     """Load the complete path aggregation configuration from a checkpoint."""
 

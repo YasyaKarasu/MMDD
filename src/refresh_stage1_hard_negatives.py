@@ -268,7 +268,10 @@ def run(args: argparse.Namespace) -> None:
             "ensemble" if teacher_ensemble_alpha is not None else "teacher"
         )
         metadata["teacher_target_ensemble_alpha"] = teacher_ensemble_alpha
-        metadata["teacher_edge_logit_mode"] = "teacher"
+        metadata["teacher_edge_logit_mode"] = (
+            "ensemble" if teacher_ensemble_alpha is not None else "teacher"
+        )
+        metadata["teacher_edge_ensemble_alpha"] = teacher_ensemble_alpha
     else:
         metadata["teacher_scoring"] = "pending"
     if candidate_sets:

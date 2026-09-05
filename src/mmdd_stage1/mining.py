@@ -15,7 +15,11 @@ from .models import TeacherJoinabilityModel
 from .objectives import PathAggregator
 from .retrieval import StudentANNIndices
 from .scoring import score_edge_batch, score_target_batch
-from .teacher_logits import _score_target_ensemble_logits
+from .teacher_logits import (
+    _ensemble_list_scores,
+    _raw_edge_scores,
+    _score_target_ensemble_logits,
+)
 
 
 @dataclass(frozen=True)
@@ -426,6 +430,15 @@ def score_hard_candidate_sets(
             else score_target_batch(teacher, batch, store, device, aggregator)
         )
         teacher_edges = score_edge_batch(teacher, edge_examples, store, device)
+        edge_scores = (
+            _ensemble_list_scores(
+                _raw_edge_scores(edge_examples, store, device),
+                teacher_edges,
+                ensemble_alpha,
+            )
+            if ensemble_alpha is not None
+            else teacher_edges
+        )
         edge_offset = 0
         for index, (item, item_edge_examples) in enumerate(zip(batch, edge_examples_by_item)):
             target_count = len(item.candidates)
@@ -447,9 +460,12 @@ def score_hard_candidate_sets(
             for edge_example in item_edge_examples:
                 edge_count = len(edge_example.candidate_ids)
                 edge_record = _edge_record(edge_example)
-                edge_record["teacher_logits"] = teacher_edges.logits[
+                edge_record["teacher_logits"] = edge_scores.logits[
                     edge_offset, :edge_count
                 ].cpu().tolist()
+                if ensemble_alpha is not None:
+                    edge_record["teacher_logit_mode"] = "ensemble"
+                    edge_record["teacher_ensemble_alpha"] = ensemble_alpha
                 edge_records.append(edge_record)
                 edge_offset += 1
     return target_records, edge_records
@@ -521,13 +537,25 @@ def score_pending_hard_examples(
         leave=False,
     ):
         batch = edge_examples[start : start + edge_batch_size]
-        scores = score_edge_batch(teacher, batch, store, device)
+        teacher_scores = score_edge_batch(teacher, batch, store, device)
+        scores = (
+            _ensemble_list_scores(
+                _raw_edge_scores(batch, store, device),
+                teacher_scores,
+                ensemble_alpha,
+            )
+            if ensemble_alpha is not None
+            else teacher_scores
+        )
         for index, example in enumerate(batch):
             candidate_count = len(example.candidate_ids)
             record = _edge_record(example)
             record["teacher_logits"] = scores.logits[
                 index, :candidate_count
             ].cpu().tolist()
+            if ensemble_alpha is not None:
+                record["teacher_logit_mode"] = "ensemble"
+                record["teacher_ensemble_alpha"] = ensemble_alpha
             edge_records.append(record)
 
     return target_records, edge_records

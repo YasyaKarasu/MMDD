@@ -29,7 +29,6 @@ from cache_stage1_features import (
     teacher_object_ids,
 )
 from mmdd_stage1.checkpoints import (
-    load_path_aggregation,
     load_path_aggregator,
     load_student,
 )
@@ -3038,7 +3037,6 @@ def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):
         path,
     )
 
-    assert load_path_aggregation(path) == ("softmax_weighted_mean", 2)
     loaded = load_path_aggregator(path)
     assert loaded.evidence_aggregation == "softmax_weighted_mean"
     assert loaded.top_k == 2
@@ -3407,9 +3405,13 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
     )
     assert ensemble_targets[0]["teacher_logit_mode"] == "ensemble"
     assert ensemble_targets[0]["teacher_ensemble_alpha"] == pytest.approx(0.7)
-    assert "teacher_logit_mode" not in ensemble_edges[0]
+    assert ensemble_edges[0]["teacher_logit_mode"] == "ensemble"
+    assert ensemble_edges[0]["teacher_ensemble_alpha"] == pytest.approx(0.7)
     assert ensemble_targets[0]["teacher_direct_logits"] != pytest.approx(
         target_records[0]["teacher_direct_logits"]
+    )
+    assert ensemble_edges[0]["teacher_logits"] != pytest.approx(
+        edge_records[0]["teacher_logits"]
     )
 
     target_path = tmp_path / "hard_targets.jsonl"
