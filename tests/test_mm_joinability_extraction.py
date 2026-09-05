@@ -4381,6 +4381,42 @@ def test_local_only_auto_check_keeps_primary_result(monkeypatch):
     assert review["terra_triggered"] is False
 
 
+def test_local_only_auto_check_primary_error_is_terminal(monkeypatch):
+    extractor = LocalAttributeExtractor(_extractor_args())
+    extractor.auto_check_luna_reviewer = None
+    extractor.auto_check_terra_reviewer = None
+
+    def _fail(**_kwargs):
+        raise ValueError("model returned invalid JSON")
+
+    monkeypatch.setattr(extractor, "extract_auto_check_value", _fail)
+
+    review = extractor.review_auto_check_attribute(
+        task=_auto_check_task(),
+        attribute_name="State",
+        claimed_value="Alabama",
+    )
+
+    # Terminal fail-closed: reusable by model_auto_check_is_complete so the
+    # record lands in the persistent cache instead of being retried forever.
+    assert review["review_complete"] is True
+    assert review["error_code"] == ""
+    assert review["primary_error_code"]
+    assert review["verdict"] == "insufficient"
+    assert review["comparison"] == "auto_check_failed"
+    assert review["decision_source"] == "primary_local_failed"
+    assert joinability_dataset.model_auto_check_is_complete(
+        {
+            "auto_check": {
+                "schema_version": joinability_dataset.MODEL_AUTO_CHECK_SCHEMA_VERSION,
+                "reviews": [review],
+                "reviewed_attributes": 1,
+            }
+        },
+        required=True,
+    )
+
+
 def test_cascade_reuses_previous_local_result_and_only_adds_luna(monkeypatch):
     extractor = LocalAttributeExtractor(_extractor_args())
 

@@ -4211,13 +4211,17 @@ class LocalAttributeExtractor:
         luna = getattr(self, "auto_check_luna_reviewer", None)
         if luna is None:
             if state["primary_error_code"]:
+                # Without a secondary reviewer no retry can change the
+                # outcome, so fail closed as a terminal decision. The
+                # empty top-level error_code keeps the record reusable
+                # by model_auto_check_is_complete; the cause stays in
+                # primary_error_code for diagnostics.
                 return finish(
                     value=primary_value,
-                    verdict=primary_verdict,
-                    comparison=primary_comparison,
-                    source="primary_local_incomplete",
-                    complete=False,
-                    error_code=state["primary_error_code"],
+                    verdict="insufficient",
+                    comparison="auto_check_failed",
+                    source="primary_local_failed",
+                    complete=True,
                 )
             return finish(
                 value=primary_value,
@@ -5578,6 +5582,9 @@ def model_auto_check_is_complete(
     Malformed reviews, checker errors, and interrupted reviews must be retried.
     A primary-local error is still terminal when the OpenAI secondary completed;
     only the final ``error_code`` and ``review_complete`` fields govern reuse.
+    Without a configured secondary, a primary-local failure is recorded as a
+    terminal fail-closed decision (``review_complete`` set, empty top-level
+    ``error_code``) so it is cached persistently instead of retried forever.
     """
     if "auto_check" not in record:
         return not required
