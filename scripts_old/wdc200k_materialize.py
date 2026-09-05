@@ -129,7 +129,7 @@ except ModuleNotFoundError as error:
         sys.path.remove(scripts_directory)
 
 
-MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v7"
+MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v8-redundant-groups"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -7564,9 +7564,8 @@ def _stats_payload(
             "train join chains emit deterministic disjoint row views while dev/test retain one canonical view",
             "wide source tables may emit multiple query variants after "
             "enforcing the context floor",
-            "the weakest qualifying bridge columns are demoted when needed "
-            "to give the query and target at least one disjoint context "
-            "column each",
+            "exact redundant physical columns share one query bridge and fan "
+            "out to stable 1..k target members",
             "qualified attributes with the same exact visible query row view are "
             "merged into one query with multiple positive targets",
             "match_implicit deterministically selects one viable explicit join per implicit query within each split",

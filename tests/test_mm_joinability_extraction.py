@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -645,6 +646,7 @@ def _completed_query_recovery_record(cache_key: str) -> dict[str, object]:
             joinability_dataset.AUTO_CHECK_REVIEW_POLICY_CASCADE
         ),
         "query_row_attributes": candidate.task.entity["row_attributes"],
+        "masked_attribute_names": [],
         "attribute_name": "State",
         "claimed_value": "Alabama",
         "evidence_identity": (
@@ -723,6 +725,41 @@ def test_query_recovery_auto_check_key_ignores_reviewer_pool_identity() -> None:
     assert joinability_dataset.query_recovery_auto_check_key(
         candidate, first_pool
     ) == joinability_dataset.query_recovery_auto_check_key(candidate, changed_pool)
+
+
+def test_local_auto_check_cache_alias_requires_matching_group_mask() -> None:
+    candidate = _make_query_recovery_candidate()
+    candidate = replace(
+        candidate,
+        task=replace(
+            candidate.task,
+            entity={
+                **candidate.task.entity,
+                "row_attributes": [
+                    {"name": "Entity", "value": "Entity", "is_entity": True},
+                    {"name": "State", "value": "Alabama", "is_entity": False},
+                    {"name": "State alias", "value": "Alabama", "is_entity": False},
+                ],
+            },
+        ),
+        redundancy_group_attribute_names=("State", "State alias"),
+    )
+    record = _completed_query_recovery_record("old-key")
+    record["review_policy"] = joinability_dataset.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    record["auto_check"]["review_policy"] = (
+        joinability_dataset.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    record["auto_check"]["reviews"][0].pop("final_judge_model")
+    record["auto_check"]["reviews"][0]["decision_source"] = "primary_local"
+    record["query_row_attributes"] = candidate.task.entity["row_attributes"]
+    record["masked_attribute_names"] = ["State", "State alias"]
+
+    assert joinability_dataset.query_recovery_auto_check_record_key(
+        record
+    ) == joinability_dataset.query_recovery_auto_check_key(candidate, None)
+
+    record.pop("masked_attribute_names")
+    assert joinability_dataset.query_recovery_auto_check_record_key(record) is None
 
 
 def test_query_recovery_cache_key_separates_local_and_cascade_policies() -> None:
@@ -1609,6 +1646,368 @@ def test_multi_attribute_context_layout_rejects_unachievable_floor() -> None:
         qualified_cols=qualified,
         args=SimpleNamespace(seed=13, max_query_tables_per_source_table=0),
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        (["ab", "c"], ["ab", "c"], [[0, 1]]),
+        (["ab", "c"], ["ab", "d"], []),
+        (["a", "b"], ["b", "a"], []),
+        (["", "a"], ["a", ""], []),
+        (["ab", "c"], ["a", "bc"], []),
+    ],
+)
+def test_exact_redundancy_groups_are_row_aligned_and_length_delimited(
+    left: list[str], right: list[str], expected: list[list[int]]
+) -> None:
+    assert joinability_dataset.exact_redundancy_groups(
+        {0: left, 1: right}
+    ) == expected
+
+
+def test_exact_redundancy_groups_use_final_dataset_serializer() -> None:
+    # URLs are now preserved as-is (no longer collapsed to ``[url]``),
+    # so two different URLs produce distinct cell values and do NOT form
+    # a redundancy group.
+    assert joinability_dataset.exact_redundancy_groups(
+        {
+            0: ["https://a.example/x", "plain"],
+            1: ["https://b.example/y", "plain"],
+        },
+        value_serializer=joinability_dataset.sanitize_cell_text_for_model,
+    ) == []
+
+
+def test_entity_alias_group_is_not_an_implicit_hidden_bridge() -> None:
+    source_table = {
+        "source_table_id": "entity-alias-source",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(
+                ["Entity", "Entity alias", "Bridge", "Context A", "Context B"]
+            )
+        ],
+        "rows": [
+            {
+                "row_id": row_index,
+                "cells": [
+                    {"column_index": 0, "column_name": "Entity", "text": f"e{row_index}"},
+                    {"column_index": 1, "column_name": "Entity alias", "text": f"e{row_index}"},
+                    {"column_index": 2, "column_name": "Bridge", "text": f"b{row_index}"},
+                    {"column_index": 3, "column_name": "Context A", "text": f"a{row_index}"},
+                    {"column_index": 4, "column_name": "Context B", "text": f"c{row_index}"},
+                ],
+            }
+            for row_index in range(4)
+        ],
+    }
+    values = joinability_dataset.table_column_values(source_table)
+    layouts = joinability_dataset.multi_attribute_context_layout(
+        source_table=source_table,
+        entity_col=0,
+        qualified_cols=[
+            {"column_index": 1, "recovered_value_ratio": 1.0},
+            {"column_index": 2, "recovered_value_ratio": 0.9},
+        ],
+        args=SimpleNamespace(seed=13, max_query_tables_per_source_table=0),
+        values_by_column=values,
+    )
+
+    assert [layout[0]["column_index"] for layout in layouts] == [2]
+    assert all(0 not in layout[1] + layout[2] for layout in layouts)
+    assert all(1 not in layout[1] + layout[2] for layout in layouts)
+
+
+def test_query_visible_recovery_candidates_mask_all_redundant_siblings() -> None:
+    task = ExtractionTask(
+        order=0,
+        cache_key="redundant-mask",
+        source_table_id="source",
+        source_row_id=0,
+        entity_column_index=0,
+        entity_column_name="Entity",
+        entity={"row_attributes": []},
+        asset={"asset_id": "asset", "asset_type": "text"},
+        candidate_attribute_names=["A", "B"],
+    )
+    candidate = joinability_dataset.QueryRecoveryCandidate(
+        task=replace(
+            task,
+            entity={
+                "row_attributes": [
+                    {"name": "Entity", "value": "e", "is_entity": True},
+                    {"name": "A", "value": "same", "is_entity": False},
+                    {"name": "B", "value": "same", "is_entity": False},
+                    {"name": "Context", "value": "c", "is_entity": False},
+                ]
+            },
+        ),
+        extraction={"attributes": []},
+        recovery={
+            "source_row_id": 0,
+            "recovered_attribute": {"column_name": "A", "value": "same"},
+        },
+        redundancy_group_attribute_names=("A", "B"),
+    )
+    visible = joinability_dataset.query_visible_recovery_candidates(
+        [candidate],
+        query_rows=[
+            {
+                "source_row_id": 0,
+                "cells": [
+                    {"source_column_index": 0, "column_name": "Entity", "text": "e"},
+                    {"source_column_index": 1, "column_name": "A", "text": "same"},
+                    {"source_column_index": 2, "column_name": "B", "text": "same"},
+                    {"source_column_index": 3, "column_name": "Context", "text": "c"},
+                ],
+            }
+        ],
+        entity_col=0,
+    )
+
+    assert [item["name"] for item in visible[0].task.entity["row_attributes"]] == [
+        "Entity",
+        "Context",
+    ]
+
+
+def _duplicate_bridge_source_table() -> dict[str, object]:
+    names = ["Entity", "Bridge A", "Bridge B", "Context A", "Context B"]
+    rows = []
+    for row_index in range(5):
+        rows.append(
+            {
+                "row_id": row_index,
+                "cells": [
+                    {
+                        "column_index": 0,
+                        "column_name": "Entity",
+                        "text": f"Entity {row_index}",
+                        "wiki_title": f"Entity {row_index}",
+                    },
+                    {
+                        "column_index": 1,
+                        "column_name": "Bridge A",
+                        "text": f"bridge-{row_index}",
+                    },
+                    {
+                        "column_index": 2,
+                        "column_name": "Bridge B",
+                        "text": f"bridge-{row_index}",
+                    },
+                    {
+                        "column_index": 3,
+                        "column_name": "Context A",
+                        "text": f"context-a-{row_index}",
+                    },
+                    {
+                        "column_index": 4,
+                        "column_name": "Context B",
+                        "text": f"context-b-{row_index}",
+                    },
+                ],
+            }
+        )
+    return {
+        "source_table_id": "duplicate-bridge-source",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(names)
+        ],
+        "rows": rows,
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+
+
+def _duplicate_bridge_assets() -> tuple[dict[str, dict[str, object]], dict[str, list[str]], dict[str, str]]:
+    assets = {
+        f"asset-{row_index}": {
+            "asset_id": f"asset-{row_index}",
+            "asset_type": "text",
+            "content": f"Entity {row_index} has bridge-{row_index}.",
+        }
+        for row_index in range(5)
+    }
+    entity_to_assets = {
+        f"entity-{row_index}": [f"asset-{row_index}"]
+        for row_index in range(5)
+    }
+    wiki_to_entity_id = {
+        f"Entity {row_index}": f"entity-{row_index}"
+        for row_index in range(5)
+    }
+    return assets, entity_to_assets, wiki_to_entity_id
+
+
+def test_implicit_exact_group_fanout_reuses_one_query_and_fans_out_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _duplicate_bridge_source_table()
+    assets, entity_to_assets, wiki_to_entity_id = _duplicate_bridge_assets()
+    expected = {
+        row_index: f"bridge-{row_index}" for row_index in range(5)
+    }
+
+    def fake_resolve(**kwargs: object):
+        return [
+            (
+                task,
+                {
+                    "cache_key": task.cache_key,
+                    "attributes": [
+                        {
+                            "name": "Bridge A",
+                            "value": expected[task.source_row_id],
+                        }
+                    ],
+                    "error": "",
+                },
+            )
+            for task in kwargs["tasks"]
+        ]
+
+    monkeypatch.setattr(joinability_dataset, "resolve_extraction_tasks", fake_resolve)
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "5",
+            "--min_rows_per_output_table",
+            "5",
+            "--min_recovered_value_ratio",
+            "0.5",
+            "--seed",
+            "1",
+            "--explicit_join_fallback_ratio",
+            "0",
+        ]
+    )
+    queries, targets, qrels, decision = joinability_dataset.build_table_join_records(
+        source_table=source,
+        split="train",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=None,
+        cache=ExtractionCache(tmp_path / "model-cache.jsonl"),
+        progress=None,
+        concurrency_state=ModelConcurrencyState(text_workers=1, image_workers=1),
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=joinability_dataset.ListRecordWriter(),
+        args=args,
+    )
+
+    assert decision["reason"] == "queryable"
+    assert len(queries) == 1
+    assert 1 <= len(targets) <= 2
+    assert len(qrels) == len(targets)
+    assert {target["join_col_name"] for target in targets} <= {
+        "Bridge A",
+        "Bridge B",
+    }
+    assert not ({1, 2} & set(queries[0]["source_column_indices"]))
+    assert set(queries[0]["target_table_ids"]) == {
+        target["table_id"] for target in targets
+    }
+
+
+def test_explicit_exact_group_has_one_candidate_and_visible_member_target(
+    tmp_path: Path,
+) -> None:
+    source = _duplicate_bridge_source_table()
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "3",
+            "--min_rows_per_output_table",
+            "3",
+            "--explicit_join_fallback_mode",
+            "match_implicit",
+        ]
+    )
+    candidates = joinability_dataset.build_explicit_join_fallback_candidates(
+        source_table=source,
+        split="train",
+        entity_col=0,
+        rejected_multimodal_reason="synthetic",
+        args=args,
+        force=True,
+        join_columns=[1, 2],
+    )
+    group_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["join_group_column_indices"] == [1, 2]
+    ]
+    assert len(group_candidates) == 1
+    candidate = group_candidates[0]
+    queries, targets, qrels, _decision = (
+        joinability_dataset.materialize_balanced_explicit_join_candidate(
+            source_table=source,
+            split="train",
+            candidate_decision=candidate,
+            args=args,
+        )
+    )
+
+    visible = int(candidate["join_column_index"])
+    assert len(queries) == 1
+    assert 1 <= len(targets) <= 2
+    assert len(qrels) == len(targets)
+    assert visible in queries[0]["source_column_indices"]
+    assert visible in {
+        int(target["join_col"]) for target in targets
+    }
+    assert 2 not in candidate["query_context_column_indices"]
+    assert all(
+        not ({"Bridge A", "Bridge B"} & set(target["target_context_col_names"]))
+        for target in targets
+    )
+
+
+def test_explicit_candidate_metadata_excludes_redundant_target_context(
+    tmp_path: Path,
+) -> None:
+    source = _duplicate_bridge_source_table()
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "3",
+            "--min_rows_per_output_table",
+            "3",
+        ]
+    )
+
+    candidate = joinability_dataset._build_explicit_join_candidate(
+        source_table=source,
+        split="train",
+        entity_col=0,
+        join_col=1,
+        query_context=[2, 3],
+        target_context=[0, 2, 3, 4],
+        rejected_multimodal_reason="synthetic",
+        rejected_multimodal_decision=None,
+        args=args,
+        values_by_column=joinability_dataset.table_column_values(source),
+        join_group_members=(1, 2),
+    )
+
+    assert candidate is not None
+    assert candidate["query_context_column_indices"] == [3]
+    assert candidate["target_context_column_indices"] == [3, 4]
+    assert 2 not in candidate["target_column_indices"]
 
 
 def build_rejected_table_with_explicit_join(
@@ -3314,8 +3713,8 @@ def test_joinability_projected_rows_sanitize_cell_urls_for_model_tables():
         min_required_cols=1,
     )
 
-    assert rows[0]["cells"][1]["text"] == "[url]"
-    assert rows[1]["cells"][1]["text"] == "shown at source"
+    assert rows[0]["cells"][1]["text"] == "https://example.com/" + "x" * 200
+    assert rows[1]["cells"][1]["text"] == "shown at https://example.org/image.png?cache=" + "y" * 200 + " source"
 
 
 def test_table_record_accepts_source_provenance_builder():
@@ -3437,7 +3836,7 @@ def test_extraction_row_attributes_use_only_sanitized_cell_content():
     assert attributes == [
         {"name": "Name", "value": "Alpha", "is_entity": True},
         {"name": "State", "value": "Texas", "is_entity": False},
-        {"name": "Reference", "value": "[url]", "is_entity": False},
+        {"name": "Reference", "value": "https://private.example/entity/alpha", "is_entity": False},
     ]
     assert "SECRET_WIKIPEDIA_TITLE" not in json.dumps(attributes)
 

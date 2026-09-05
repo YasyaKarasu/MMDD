@@ -104,7 +104,7 @@ from wikimedia_media import MediaFailureRecorder, MediaPolicyConfig
 
 PROMPT_VERSION = "entity_attribute_extraction_v5_batched_leave_one_out"
 MODEL_AUTO_CHECK_SCHEMA_VERSION = (
-    "model-output-auto-check-v5-entity-evidence-grounding"
+    "model-output-auto-check-v6-redundant-group-mask"
 )
 AUTO_CHECK_REVIEW_POLICY_LOCAL = "local_only"
 AUTO_CHECK_REVIEW_POLICY_LEGACY = (
@@ -257,6 +257,10 @@ class QueryRecoveryCandidate:
     task: ExtractionTask
     extraction: dict[str, Any]
     recovery: dict[str, Any]
+    # Internal-only planning metadata.  It is deliberately not copied to
+    # canonical recovery records; it is used to ensure that a sibling column
+    # from an exact redundancy group never leaks into an auto-check input.
+    redundancy_group_attribute_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5669,9 +5673,19 @@ def _query_recovery_auto_check_key_fields(
     query_row_attributes: Any,
     attribute_name: Any,
     claimed_value: Any,
+    masked_attribute_names: Iterable[Any] = (),
 ) -> str:
+    masked_names = {
+        normalize(name)
+        for name in (*tuple(masked_attribute_names), attribute_name)
+        if normalize(name)
+    }
     query_row = json.dumps(
-        canonical_extraction_row_attributes(query_row_attributes),
+        [
+            item
+            for item in canonical_extraction_row_attributes(query_row_attributes)
+            if normalize(item.get("name")) not in masked_names
+        ],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -5693,13 +5707,19 @@ def _query_recovery_evidence_identity_fields(
     row_attributes: Any,
     attribute_name: Any,
     claimed_value: Any,
+    masked_attribute_names: Iterable[Any] = (),
 ) -> dict[str, Any]:
     """Return the model-independent semantic identity of one evidence check."""
     target_name = normalize(attribute_name)
+    masked_names = {
+        normalize(name)
+        for name in (*tuple(masked_attribute_names), target_name)
+        if normalize(name)
+    }
     masked_row = [
         item
         for item in canonical_extraction_row_attributes(row_attributes)
-        if normalize(item.get("name")) != target_name
+        if normalize(item.get("name")) not in masked_names
     ]
     return {
         "cache_version": QUERY_RECOVERY_REMOTE_EVIDENCE_CACHE_VERSION,
@@ -5740,6 +5760,7 @@ def query_recovery_remote_evidence_identity(
         row_attributes=task.entity.get("row_attributes"),
         attribute_name=recovered.get("column_name"),
         claimed_value=recovered.get("value"),
+        masked_attribute_names=candidate.redundancy_group_attribute_names,
     )
 
 
@@ -5793,6 +5814,7 @@ def query_recovery_auto_check_key(
         query_row_attributes=candidate.task.entity.get("row_attributes"),
         attribute_name=recovered.get("column_name"),
         claimed_value=recovered.get("value"),
+        masked_attribute_names=candidate.redundancy_group_attribute_names,
     )
 
 
@@ -5827,6 +5849,11 @@ def query_recovery_auto_check_record_key(
     query_row_attributes = record.get("query_row_attributes")
     if not isinstance(query_row_attributes, list):
         return None
+    masked_attribute_names = record.get("masked_attribute_names")
+    if not isinstance(masked_attribute_names, (list, tuple)):
+        # A v6 local record without its full group mask cannot safely be
+        # aliased: its stored visible row may have exposed a sibling column.
+        return None
     review_policy = cached_model_auto_check_review_policy(record)
     cache_schema_version = schema_version
     if review_policy != AUTO_CHECK_REVIEW_POLICY_LOCAL:
@@ -5837,6 +5864,7 @@ def query_recovery_auto_check_record_key(
         query_row_attributes=query_row_attributes,
         attribute_name=record.get("attribute_name"),
         claimed_value=record.get("claimed_value"),
+        masked_attribute_names=masked_attribute_names,
     )
 
 
@@ -5926,6 +5954,7 @@ def query_recovery_prior_auto_check(
             query_row_attributes=candidate.task.entity.get("row_attributes"),
             attribute_name=recovered.get("column_name"),
             claimed_value=recovered.get("value"),
+            masked_attribute_names=candidate.redundancy_group_attribute_names,
         ),
     ]
     seen: set[str] = set()
@@ -6486,6 +6515,9 @@ def resolve_query_recovery_auto_check_plans(
             "query_row_attributes": canonical_extraction_row_attributes(
                 candidate.task.entity.get("row_attributes")
             ),
+            "masked_attribute_names": list(
+                candidate.redundancy_group_attribute_names
+            ),
             "attribute_name": candidate.recovery["recovered_attribute"][
                 "column_name"
             ],
@@ -6965,15 +6997,27 @@ def query_visible_recovery_candidates(
         source_row_id = int(candidate.recovery["source_row_id"])
         if source_row_id not in attributes_by_source_row:
             continue
+        blocked_names = {
+            normalize(name)
+            for name in candidate.redundancy_group_attribute_names
+        }
         entity = {
             **candidate.task.entity,
-            "row_attributes": attributes_by_source_row[source_row_id],
+            "row_attributes": [
+                item
+                for item in attributes_by_source_row[source_row_id]
+                if normalize(item.get("name"))
+                not in blocked_names
+            ],
         }
         visible_candidates.append(
             QueryRecoveryCandidate(
                 task=replace(candidate.task, entity=entity),
                 extraction=candidate.extraction,
                 recovery=candidate.recovery,
+                redundancy_group_attribute_names=(
+                    candidate.redundancy_group_attribute_names
+                ),
             )
         )
     return visible_candidates
@@ -7031,6 +7075,76 @@ def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, 
         "queryable": False,
         "reason": "no_column_met_recovered_value_ratio",
     }
+
+
+def exact_redundancy_groups(
+    values_by_column: dict[int, Iterable[Any]],
+    entity_col: int | None = None,
+    *,
+    value_serializer: Callable[[Any], Any] | None = None,
+) -> list[list[int]]:
+    """Return exact, row-aligned duplicate column groups.
+
+    ``values_by_column`` should contain the values after the same serialization
+    step used by the dataset projection; callers may instead provide that
+    step as ``value_serializer`` (the WDC builder uses
+    ``sanitize_cell_text_for_model``).  Values are hashed with row count,
+        row index, and a length prefix so empty cells and concatenation
+        boundaries remain part of the equivalence relation.  The optional
+        ``entity_col`` is accepted for callers that want to document the
+        selected entity column; detection itself intentionally includes entity
+        columns so alias groups can be handled by the planner.
+    """
+    del entity_col  # Detection is table-local and includes entity aliases.
+    buckets: dict[str, list[int]] = defaultdict(list)
+    for raw_index, raw_values in values_by_column.items():
+        try:
+            column_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        values = (
+            raw_values if hasattr(raw_values, "__len__") else list(raw_values)
+        )
+        digest = hashlib.sha256()
+        digest.update(len(values).to_bytes(8, "big", signed=False))
+        for row_index, value in enumerate(values):
+            if value_serializer is not None:
+                value = value_serializer(value)
+            if value is None:
+                text = ""
+            elif isinstance(value, str):
+                text = value
+            else:
+                text = str(value)
+            encoded = text.encode("utf-8")
+            digest.update(row_index.to_bytes(8, "big", signed=False))
+            digest.update(len(encoded).to_bytes(8, "big", signed=False))
+            digest.update(encoded)
+        buckets[digest.hexdigest()].append(column_index)
+
+    # Hash collisions are not expected for SHA-256, but keep deterministic
+    # ordering and avoid exposing singleton buckets to the planner.
+    groups = [
+        sorted(indices) for indices in buckets.values() if len(indices) >= 2
+    ]
+    groups.sort(key=lambda members: members[0])
+    return groups
+
+
+def redundancy_group_map(
+    values_by_column: dict[int, Iterable[Any]],
+    groups: Iterable[Iterable[int]],
+) -> dict[int, tuple[int, ...]]:
+    """Map every column in a detected group to its sorted physical members."""
+    result: dict[int, tuple[int, ...]] = {}
+    for group in groups:
+        members = tuple(sorted({int(index) for index in group}))
+        if len(members) < 2:
+            continue
+        for index in members:
+            if index in values_by_column:
+                result[index] = members
+    return result
 
 
 def context_columns(
@@ -7093,6 +7207,38 @@ def shuffled_target_columns(
         f"target-column-order:{seed}:{source_table_id}:{join_col}"
     ).shuffle(columns)
     return columns
+
+
+def target_context_for_member(
+    target_context: Iterable[int],
+    *,
+    seed: int,
+    source_table_id: str,
+    group_key: str,
+    member_column_index: int,
+    member_ordinal: int = 0,
+    group_size: int = 1,
+    excluded: Iterable[int] = (),
+) -> list[int]:
+    """Choose a stable member-specific target context.
+
+    The candidate pool is already disjoint from the query context.  A stable
+    per-member subset/shuffle avoids sharing one mutable list and yields
+    different sibling contexts whenever the pool has at least two columns,
+    without introducing any extra source scan or persistent state.
+    """
+    blocked = {int(index) for index in excluded}
+    context = [int(index) for index in target_context if int(index) not in blocked]
+    if group_size > 1 and len(context) > 1:
+        # Keep at least one ordinary context column, while making sibling
+        # targets use different subsets whenever the pool permits it.
+        ordered = sorted(context)
+        omit = int(member_ordinal) % len(ordered)
+        context = [value for index, value in enumerate(ordered) if index != omit]
+    random.Random(
+        f"target-context:{seed}:{source_table_id}:{group_key}:{member_column_index}"
+    ).shuffle(context)
+    return context
 
 
 def _explicit_join_fallback_selected(
@@ -7179,8 +7325,21 @@ def _explicit_join_candidate_id(
     source_table_id: str,
     entity_col: int,
     join_col: int,
+    join_group_members: Iterable[int] | None = None,
 ) -> str:
-    return f"explicit_candidate_{stable_hash(source_table_id, entity_col, join_col)}"
+    members = tuple(sorted({int(join_col), *(join_group_members or ())}))
+    return f"explicit_candidate_{stable_hash(source_table_id, entity_col, *members)}"
+
+
+def _redundancy_groups_for_table(
+    source_table: dict[str, Any],
+    values_by_column: dict[int, list[str]],
+) -> tuple[list[list[int]], dict[int, tuple[int, ...]]]:
+    groups = exact_redundancy_groups(
+        values_by_column,
+        value_serializer=sanitize_cell_text_for_model,
+    )
+    return groups, redundancy_group_map(values_by_column, groups)
 
 
 def _explicit_join_context_partition(
@@ -7237,10 +7396,35 @@ def _build_explicit_join_candidate(
     rejected_multimodal_decision: dict[str, Any] | None,
     args: argparse.Namespace,
     values_by_column: dict[int, list[str]] | None = None,
+    join_group_members: Iterable[int] | None = None,
+    target_member_indices: Iterable[int] | None = None,
 ) -> dict[str, Any] | None:
     """Build one deterministic explicit query/target candidate specification."""
     seed = int(getattr(args, "seed", 13))
     source_table_id = str(source_table["source_table_id"])
+    group_members = tuple(
+        sorted({int(join_col), *(int(index) for index in (join_group_members or ()))})
+    )
+    selected_set = {
+        int(index) for index in (target_member_indices or (join_col,))
+    }
+    selected_set.intersection_update(group_members)
+    selected_set.add(join_col)
+    selected_target_members = (
+        join_col,
+        *sorted(index for index in selected_set if index != join_col),
+    )
+    forbidden_group_columns = {entity_col, *group_members}
+    query_context = [
+        column_index
+        for column_index in query_context
+        if column_index not in forbidden_group_columns
+    ]
+    target_context = [
+        column_index
+        for column_index in target_context
+        if column_index not in forbidden_group_columns
+    ]
     query_cols = [entity_col, join_col, *query_context]
     target_cols = shuffled_target_columns(
         join_col,
@@ -7326,9 +7510,14 @@ def _build_explicit_join_candidate(
         return None
 
     join_col_name = get_column_name(source_table, join_col)
-    chain_id = f"chain_explicit_{stable_hash(source_table_id, entity_col, join_col)}"
+    group_key = stable_hash(
+        "redundancy-group", source_table_id, *group_members, length=24
+    )
+    # Keep the candidate/query chain aligned with the mandatory visible target;
+    # sibling targets receive their own physical-member chain at materialize.
+    chain_id = f"chain_explicit_{stable_hash(source_table_id, group_key, join_col)}"
     query_table_id = f"query_{stable_hash(chain_id, 'query')}"
-    target_table_id = f"target_{stable_hash(chain_id, 'target')}"
+    target_table_id = f"target_{stable_hash(chain_id, selected_target_members[0], 'target')}"
     join_attribute = {
         "source_column_index": join_col,
         "column_name": join_col_name,
@@ -7340,13 +7529,19 @@ def _build_explicit_join_candidate(
     return {
         "reason": "explicit_join_fallback",
         "candidate_id": _explicit_join_candidate_id(
-            source_table_id, entity_col, join_col
+            source_table_id, entity_col, join_col, group_members
         ),
         "source_table_id": source_table_id,
         "split": split,
         "entity_column_index": entity_col,
         "join_column_index": join_col,
         "join_column_name": join_col_name,
+        "join_group_column_indices": list(group_members),
+        "join_group_column_names": [
+            get_column_name(source_table, index) for index in group_members
+        ],
+        "redundancy_group_key": group_key,
+        "target_member_indices": list(selected_target_members),
         "query_column_indices": query_cols,
         "target_column_indices": target_cols,
         "query_context_column_indices": query_context,
@@ -7384,13 +7579,35 @@ def _materialize_explicit_join_candidate(
     list[dict[str, Any]],
     dict[str, Any],
 ]:
-    """Materialize one previously certified explicit candidate."""
+    """Materialize one explicit group into one query and 1..k targets."""
     entity_col = int(candidate["entity_column_index"])
     join_col = int(candidate["join_column_index"])
-    query_context = [int(value) for value in candidate.get("query_context_column_indices", [])]
-    target_context = [int(value) for value in candidate.get("target_context_column_indices", [])]
+    group_members = tuple(
+        sorted(
+            {
+                int(value)
+                for value in candidate.get(
+                    "join_group_column_indices", [join_col]
+                )
+            }
+        )
+    )
+    target_members = tuple(
+        dict.fromkeys(
+            int(value)
+            for value in candidate.get("target_member_indices", [join_col])
+            if int(value) in group_members
+        )
+    )
+    if join_col not in target_members:
+        target_members = (join_col, *target_members)
+    query_context = [
+        int(value) for value in candidate.get("query_context_column_indices", [])
+    ]
+    target_context = [
+        int(value) for value in candidate.get("target_context_column_indices", [])
+    ]
     query_cols = [entity_col, join_col, *query_context]
-    target_cols = [int(value) for value in candidate["target_column_indices"]]
     query_rows, query_source_rows = project_selected_rows(
         source_table,
         query_cols,
@@ -7402,24 +7619,14 @@ def _materialize_explicit_join_candidate(
         row_id(source_row, fallback)
         for fallback, source_row in enumerate(source_table.get("rows", []))
     }
-    target_rows, target_source_rows = project_selected_rows(
-        source_table,
-        target_cols,
-        all_source_rows,
-        min_required_cols=1,
-    )
     query_table_id = str(candidate["query_table_id"])
-    target_table_id = str(candidate["target_table_id"])
-    chain_id = str(candidate["chain_id"])
+    source_table_id = str(source_table["source_table_id"])
+    group_key = str(
+        candidate.get("redundancy_group_key")
+        or stable_hash("redundancy-group", source_table_id, *group_members, length=24)
+    )
+    query_chain_id = str(candidate["chain_id"])
     join_col_name = get_column_name(source_table, join_col)
-    join_attribute = {
-        **dict(candidate.get("join_attribute") or {}),
-        "source_column_index": join_col,
-        "column_name": join_col_name,
-        "selected_rows": len(query_rows),
-        "target_rows": len(target_rows),
-        "hidden_in_query": False,
-    }
     query_table = table_record(
         table_id=query_table_id,
         role="query",
@@ -7429,15 +7636,15 @@ def _materialize_explicit_join_candidate(
         rows=query_rows,
         source_row_indices=query_source_rows,
         extra={
-            "chain_id": chain_id,
-            "chain_ids": [chain_id],
+            "chain_id": query_chain_id,
+            "chain_ids": [],
             "construction_type": "explicit_visible_join",
             "query_entity_col": entity_col,
             "query_entity_col_name": get_column_name(source_table, entity_col),
             "join_col": join_col,
             "join_col_name": join_col_name,
             "hidden_attributes": [],
-            "target_table_ids": [target_table_id],
+            "target_table_ids": [],
             "query_context_col_names": [
                 get_column_name(source_table, column_index)
                 for column_index in query_context
@@ -7453,38 +7660,96 @@ def _materialize_explicit_join_candidate(
             "column_name": "entity_url",
         },
     ]
-    target_table = table_record(
-        table_id=target_table_id,
-        role="target_data_lake_table",
-        split=split,
-        source_table=source_table,
-        column_indices=target_cols,
-        rows=target_rows,
-        source_row_indices=target_source_rows,
-        extra={
-            "chain_id": chain_id,
-            "construction_type": "explicit_visible_join",
-            "queryable_source_table": True,
-            "join_col": join_col,
-            "join_col_name": join_col_name,
-            "target_context_col_names": [
-                get_column_name(source_table, column_index)
-                for column_index in target_context
-            ],
-        },
-    )
-    qrel = {
-        "query_table_id": query_table_id,
-        "target_table_id": target_table_id,
-        "data_lake_table_id": target_table_id,
-        "rel": 3,
-        "split": split,
-        "chain_id": chain_id,
-        "row_view_index": 0,
-        "source_table_id": str(source_table["source_table_id"]),
-        "join_attribute": join_attribute,
-        "reason": "explicit_visible_join_column",
-    }
+    targets: list[dict[str, Any]] = []
+    qrels: list[dict[str, Any]] = []
+    for member_ordinal, member_index in enumerate(target_members):
+        member_context = target_context_for_member(
+            target_context,
+            seed=int(getattr(args, "seed", 13)),
+            source_table_id=source_table_id,
+            group_key=group_key,
+            member_column_index=member_index,
+            member_ordinal=member_ordinal,
+            group_size=len(target_members),
+            excluded={entity_col, *group_members},
+        )
+        target_cols = shuffled_target_columns(
+            member_index,
+            member_context,
+            seed=int(getattr(args, "seed", 13)),
+            source_table_id=source_table_id,
+        )
+        target_rows, target_source_rows = project_selected_rows(
+            source_table,
+            target_cols,
+            all_source_rows,
+            min_required_cols=1,
+        )
+        if len(target_rows) < int(getattr(args, "min_rows_per_output_table", 2)):
+            continue
+        member_name = get_column_name(source_table, member_index)
+        chain_id = (
+            f"chain_explicit_{stable_hash(source_table_id, group_key, member_index)}"
+        )
+        target_table_id = (
+            str(candidate["target_table_id"])
+            if member_index == join_col
+            else f"target_{stable_hash(chain_id, 'target')}"
+        )
+        target_table = table_record(
+            table_id=target_table_id,
+            role="target_data_lake_table",
+            split=split,
+            source_table=source_table,
+            column_indices=target_cols,
+            rows=target_rows,
+            source_row_indices=target_source_rows,
+            extra={
+                "chain_id": chain_id,
+                "construction_type": "explicit_visible_join",
+                "queryable_source_table": True,
+                "join_col": member_index,
+                "join_col_name": member_name,
+                "target_context_col_names": [
+                    get_column_name(source_table, column_index)
+                    for column_index in member_context
+                ],
+            },
+        )
+        target_attribute = {
+            **dict(candidate.get("join_attribute") or {}),
+            "source_column_index": member_index,
+            "column_name": member_name,
+            "selected_rows": len(query_rows),
+            "target_rows": len(target_rows),
+            "hidden_in_query": False,
+        }
+        targets.append(target_table)
+        query_table["chain_ids"].append(chain_id)
+        query_table["target_table_ids"].append(target_table_id)
+        qrels.append(
+            {
+                "query_table_id": query_table_id,
+                "target_table_id": target_table_id,
+                "data_lake_table_id": target_table_id,
+                "rel": 3,
+                "split": split,
+                "chain_id": chain_id,
+                "row_view_index": 0,
+                "source_table_id": source_table_id,
+                "join_attribute": target_attribute,
+                "reason": "explicit_visible_join_column",
+            }
+        )
+    if not targets:
+        return [], [], [], {
+            "reason": "explicit_join_fallback",
+            "entity_column_index": entity_col,
+            "join_column_index": join_col,
+            "join_column_name": join_col_name,
+            "qualified_columns": [],
+            "explicit_join_candidate": dict(candidate),
+        }
     decision = {
         "reason": "explicit_join_fallback",
         "rejected_multimodal_reason": candidate.get(
@@ -7496,10 +7761,12 @@ def _materialize_explicit_join_candidate(
         "entity_column_index": entity_col,
         "join_column_index": join_col,
         "join_column_name": join_col_name,
-        "qualified_columns": [join_attribute],
+        "qualified_columns": [
+            qrel["join_attribute"] for qrel in qrels
+        ],
         "explicit_join_candidate": dict(candidate),
     }
-    return [query_table], [target_table], [qrel], decision
+    return [query_table], targets, qrels, decision
 
 
 def build_explicit_join_fallback_records(
@@ -7616,6 +7883,35 @@ def build_explicit_join_fallback_candidates(
         return []
     seed = int(getattr(args, "seed", 13))
     source_table_id = str(source_table["source_table_id"])
+    _groups, group_by_column = _redundancy_groups_for_table(
+        source_table, values_by_column
+    )
+    grouped_candidates: dict[tuple[int, ...], list[int]] = defaultdict(list)
+    for column_index in candidates:
+        members = group_by_column.get(int(column_index), (int(column_index),))
+        # Entity-containing groups may use a non-entity member for explicit
+        # fallback, but the entity itself is never projected as a target.
+        members = tuple(member for member in members if member != entity_col)
+        if not members:
+            continue
+        grouped_candidates[members].append(int(column_index))
+    candidates = []
+    for members, physical_candidates in grouped_candidates.items():
+        visible = min(
+            physical_candidates,
+            key=lambda column_index: (
+                stable_hash(
+                    "explicit-join-column",
+                    seed,
+                    source_table_id,
+                    *members,
+                    column_index,
+                    length=40,
+                ),
+                column_index,
+            ),
+        )
+        candidates.append(visible)
     candidates.sort(
         key=lambda column_index: (
             stable_hash(
@@ -7631,16 +7927,39 @@ def build_explicit_join_fallback_candidates(
     max_variants = int(getattr(args, "max_query_tables_per_source_table", 0))
     if max_variants > 0:
         candidates = candidates[:max_variants]
+    all_join_members = {
+        member
+        for column_index in candidates
+        for member in group_by_column.get(column_index, (column_index,))
+        if member != entity_col
+    }
     query_context, target_context = _explicit_join_context_partition(
         source_table=source_table,
         entity_col=entity_col,
-        join_columns=candidates,
+        join_columns=sorted(all_join_members),
         args=args,
         profiles=profiles,
         values_by_column=values_by_column,
     )
     output: list[dict[str, Any]] = []
     for join_col in candidates:
+        group_members = tuple(
+            member
+            for member in group_by_column.get(join_col, (join_col,))
+            if member != entity_col
+        )
+        # Group fanout is selected once at candidate construction time.  The
+        # visible member is mandatory; siblings are sampled without
+        # replacement with a stable, completion-order-independent seed.
+        fanout_rng = random.Random(
+            f"explicit-target-fanout:{seed}:{split}:{source_table_id}:"
+            f"{stable_hash('redundancy-group', source_table_id, *group_members, length=24)}"
+        )
+        fanout = fanout_rng.randint(1, len(group_members))
+        sibling_order = list(group_members)
+        sibling_order.remove(join_col)
+        fanout_rng.shuffle(sibling_order)
+        target_members = [join_col, *sibling_order[: max(0, fanout - 1)]]
         candidate = _build_explicit_join_candidate(
             source_table=source_table,
             split=split,
@@ -7652,6 +7971,8 @@ def build_explicit_join_fallback_candidates(
             rejected_multimodal_decision=rejected_multimodal_decision,
             args=args,
             values_by_column=values_by_column,
+            join_group_members=group_members,
+            target_member_indices=target_members,
         )
         if candidate is not None:
             output.append(candidate)
@@ -7699,10 +8020,21 @@ def rebuild_selected_explicit_join_candidates(
     if values_by_column is None:
         values_by_column = table_column_values(source_table)
     entity_col = next(iter(entity_cols))
+    all_join_columns = sorted(
+        {
+            member
+            for candidate in candidate_decisions
+            for member in candidate.get(
+                "join_group_column_indices",
+                [int(candidate["join_column_index"])],
+            )
+            if int(member) != entity_col
+        }
+    )
     query_context, target_context = _explicit_join_context_partition(
         source_table=source_table,
         entity_col=entity_col,
-        join_columns=join_columns,
+        join_columns=all_join_columns,
         args=args,
         profiles=profiles,
         values_by_column=values_by_column,
@@ -7726,6 +8058,16 @@ def rebuild_selected_explicit_join_candidates(
             ),
             args=args,
             values_by_column=values_by_column,
+            join_group_members=tuple(
+                int(value)
+                for value in candidate.get(
+                    "join_group_column_indices", [int(candidate["join_column_index"])]
+                )
+                if int(value) != entity_col
+            ),
+            target_member_indices=candidate.get(
+                "target_member_indices", [int(candidate["join_column_index"])]
+            ),
         )
         if refreshed is None:
             raise ValueError(
@@ -7811,54 +8153,123 @@ def multi_attribute_context_layout(
     qualified_cols: list[dict[str, Any]],
     args: argparse.Namespace,
     profiles: dict[int, dict[str, Any]] | None = None,
+    redundancy_groups: list[list[int]] | None = None,
+    values_by_column: dict[int, list[str]] | None = None,
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
-    """Reserve two context columns before emitting implicit bridge variants."""
+    """Reserve two context columns and emit one variant per join family.
+
+    Physical columns remain in ``member_column_indices`` for target fanout,
+    while the returned list contains only one query-level variant per exact
+    redundancy group.  Calls from older code/tests may omit ``redundancy_groups``;
+    in that case the groups are derived from the source table values.
+    """
     if not qualified_cols:
         return []
 
+    if values_by_column is None:
+        values_by_column = table_column_values(source_table)
+    if redundancy_groups is None:
+        # A few legacy callers pass a schema-only table to exercise context
+        # layout.  There are no row values to compare in that case, so retain
+        # the historical physical-column behavior.
+        if source_table.get("rows"):
+            redundancy_groups = exact_redundancy_groups(
+                values_by_column,
+                value_serializer=sanitize_cell_text_for_model,
+            )
+        else:
+            redundancy_groups = []
+    group_by_column = redundancy_group_map(values_by_column, redundancy_groups)
+
+    # Build group-level representatives.  Singleton physical columns are
+    # represented by a one-member family, so existing behavior is preserved.
+    grouped: dict[tuple[int, ...], list[dict[str, Any]]] = defaultdict(list)
+    for qualified in qualified_cols:
+        index = int(qualified["column_index"])
+        members = group_by_column.get(index, (index,))
+        grouped[members].append(qualified)
+
+    group_variants: list[dict[str, Any]] = []
+    for members, member_qualified in grouped.items():
+        if entity_col in members:
+            # Entity aliases cannot be hidden bridges.  They remain physical
+            # source columns and can still be used by explicit fallback.
+            continue
+        representative = min(
+            member_qualified,
+            key=lambda item: (
+                -float(item.get("recovered_value_ratio", 0.0)),
+                int(item["column_index"]),
+            ),
+        )
+        variant = dict(representative)
+        variant["_redundancy_group_members"] = tuple(members)
+        variant["_redundancy_group_key"] = stable_hash(
+            "redundancy-group", source_table["source_table_id"], *members, length=24
+        )
+        variant["_redundancy_group_names"] = tuple(
+            get_column_name(source_table, index) for index in members
+        )
+        group_variants.append(variant)
+
     ordered_qualified = sorted(
-        qualified_cols,
+        group_variants,
         key=lambda item: (
             -float(item["recovered_value_ratio"]),
             int(item["column_index"]),
         ),
     )
     all_qualified_indices = {
-        int(qualified["column_index"]) for qualified in ordered_qualified
+        member
+        for qualified in ordered_qualified
+        for member in qualified["_redundancy_group_members"]
     }
+    all_qualified_indices.update(
+        member
+        for members in group_by_column.values()
+        if entity_col in members
+        for member in members
+    )
     max_variants = int(getattr(args, "max_query_tables_per_source_table", 0))
     emitted_qualified = list(ordered_qualified)
     if max_variants > 0:
         emitted_qualified = emitted_qualified[:max_variants]
 
+    emitted_groups = {
+        tuple(qualified["_redundancy_group_members"])
+        for qualified in emitted_qualified
+    }
     ordinary_contexts = context_columns(
         source_table,
         {entity_col, *all_qualified_indices},
         0,
         profiles=profiles,
     )
-    emitted_indices = {
-        int(qualified["column_index"]) for qualified in emitted_qualified
-    }
-    # Prefer unselected and weakly recovered bridges as context while keeping
-    # the strongest emitted bridge hidden as the target join attribute.
+    # Prefer unselected and weakly recovered families as context while keeping
+    # every member of an emitted family hidden from the query.
     for qualified in reversed(ordered_qualified):
         if len(ordinary_contexts) >= MIN_IMPLICIT_CONTEXT_COLUMNS:
             break
-        column_index = int(qualified["column_index"])
-        if column_index in emitted_indices:
-            if len(emitted_indices) == 1:
+        members = tuple(qualified["_redundancy_group_members"])
+        if members in emitted_groups:
+            if len(emitted_groups) == 1:
                 continue
-            emitted_indices.remove(column_index)
-        ordinary_contexts.append(column_index)
+            emitted_groups.remove(members)
+            emitted_qualified = [
+                item
+                for item in emitted_qualified
+                if tuple(item["_redundancy_group_members"]) != members
+            ]
+            ordinary_contexts.extend(
+                member for member in members if member not in ordinary_contexts
+            )
+            continue
+        ordinary_contexts.extend(
+            member for member in members if member not in ordinary_contexts
+        )
     if len(ordinary_contexts) < MIN_IMPLICIT_CONTEXT_COLUMNS:
         return []
 
-    emitted_qualified = [
-        qualified
-        for qualified in emitted_qualified
-        if int(qualified["column_index"]) in emitted_indices
-    ]
     query_context, target_context = balanced_context_partition(
         ordinary_contexts,
         seed=int(getattr(args, "seed", 13)),
@@ -9583,6 +9994,9 @@ def build_table_join_records(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
     values_by_column = table_column_values(source_table)
+    redundancy_groups, group_by_column = _redundancy_groups_for_table(
+        source_table, values_by_column
+    )
     profiles = column_profiles(
         source_table,
         values_by_column=values_by_column,
@@ -9717,7 +10131,13 @@ def build_table_join_records(
             continue
         for attr_col in attribute_cols:
             attr_name = get_column_name(source_table, attr_col)
-            expected = clean_text(get_cell_text(source_row, attr_col))
+            # Recovery and redundancy semantics are defined over the value
+            # actually written into projected dataset cells.  Keep this in
+            # lockstep with ``project_selected_rows`` so URL stripping and
+            # other model-safe serialization cannot create a false mismatch.
+            expected = sanitize_cell_text_for_model(
+                get_cell_text(source_row, attr_col)
+            )
             if not expected:
                 continue
             predictions = attr_by_name.get(normalize(attr_name), [])
@@ -9769,6 +10189,10 @@ def build_table_join_records(
                     task=task,
                     extraction=extraction,
                     recovery=recovery,
+                    redundancy_group_attribute_names=tuple(
+                        get_column_name(source_table, member)
+                        for member in group_by_column.get(attr_col, (attr_col,))
+                    ),
                 )
             )
 
@@ -9814,6 +10238,8 @@ def build_table_join_records(
         qualified_cols=qualified_cols,
         args=args,
         profiles=profiles,
+        redundancy_groups=redundancy_groups,
+        values_by_column=values_by_column,
     )
 
     query_tables: list[dict[str, Any]] = []
@@ -9829,6 +10255,29 @@ def build_table_join_records(
     )
     for qualified, query_context, target_context in variant_layouts:
         join_col = int(qualified["column_index"])
+        group_members = tuple(
+            int(value)
+            for value in qualified.get(
+                "_redundancy_group_members", (join_col,)
+            )
+        )
+        group_key = str(
+            qualified.get("_redundancy_group_key")
+            or stable_hash(
+                "redundancy-group",
+                source_table["source_table_id"],
+                *group_members,
+                length=24,
+            )
+        )
+        target_rng = random.Random(
+            f"implicit-target-fanout:{getattr(args, 'seed', 13)}:{split}:"
+            f"{source_table['source_table_id']}:{group_key}"
+        )
+        target_count = target_rng.randint(1, len(group_members))
+        shuffled_members = list(group_members)
+        target_rng.shuffle(shuffled_members)
+        target_members = shuffled_members[:target_count]
         selected_source_row_views = select_query_source_row_views(
             source_row_order=valid_entity_source_row_order,
             recovered_source_rows=recovered_rows_by_col.get(join_col, set()),
@@ -9839,31 +10288,56 @@ def build_table_join_records(
         if not selected_source_row_views:
             continue
         query_cols = [entity_col] + query_context
-        target_cols = shuffled_target_columns(
-            join_col,
-            target_context,
-            seed=int(getattr(args, "seed", 13)),
-            source_table_id=str(source_table["source_table_id"]),
-        )
         all_source_row_ids = {
             row_id(source_row, fallback)
             for fallback, source_row in enumerate(source_table.get("rows", []))
         }
-        target_rows, target_source_rows = project_selected_rows(
-            source_table,
-            target_cols,
-            all_source_row_ids,
-            min_required_cols=0,
-        )
-        if len(target_rows) < args.min_rows_per_output_table:
+        target_materializations: list[dict[str, Any]] = []
+        for member_ordinal, member_index in enumerate(target_members):
+            member_context = target_context_for_member(
+                target_context,
+                seed=int(getattr(args, "seed", 13)),
+                source_table_id=str(source_table["source_table_id"]),
+                group_key=group_key,
+                member_column_index=member_index,
+                member_ordinal=member_ordinal,
+                group_size=len(target_members),
+                excluded={entity_col, *group_members},
+            )
+            target_cols = shuffled_target_columns(
+                member_index,
+                member_context,
+                seed=int(getattr(args, "seed", 13)),
+                source_table_id=str(source_table["source_table_id"]),
+            )
+            target_rows, target_source_rows = project_selected_rows(
+                source_table,
+                target_cols,
+                all_source_row_ids,
+                min_required_cols=0,
+            )
+            if len(target_rows) < args.min_rows_per_output_table:
+                continue
+            chain_id = f"chain_{stable_hash(source_table['source_table_id'], group_key, member_index)}"
+            target_table_id = f"target_{stable_hash(chain_id, 'target')}"
+            target_materializations.append(
+                {
+                    "member_index": member_index,
+                    "member_context": member_context,
+                    "target_cols": target_cols,
+                    "target_rows": target_rows,
+                    "target_source_rows": target_source_rows,
+                    "chain_id": chain_id,
+                    "target_table_id": target_table_id,
+                }
+            )
+        if not target_materializations:
             continue
-        chain_id = f"chain_{stable_hash(source_table['source_table_id'], entity_col, join_col)}"
-        target_table_id = f"target_{stable_hash(chain_id, 'target')}"
         emitted_view_count = 0
         emitted_qualified = {
             **qualified,
             "selected_rows": query_rows_per_table,
-            "target_rows": len(target_rows),
+            "target_rows": len(target_materializations[0]["target_rows"]),
             "row_views": 0,
         }
         hidden_attribute = {
@@ -9876,7 +10350,7 @@ def build_table_join_records(
             "required_recovered_rows": qualified["required_recovered_rows"],
             "recovered_value_ratio": qualified["recovered_value_ratio"],
             "selected_rows": query_rows_per_table,
-            "target_rows": len(target_rows),
+            "target_rows": len(target_materializations[0]["target_rows"]),
         }
         for row_view_index, selected_source_rows in enumerate(
             selected_source_row_views
@@ -10007,19 +10481,9 @@ def build_table_join_records(
                                 f"{missing_check_keys[0]}"
                             )
                         continue
-            view_hidden_attribute = {
-                **hidden_attribute,
-                "recovered_rows": len(approved_source_rows),
-                "recovered_value_ratio": len(approved_source_rows)
-                / query_rows_per_table,
-            }
             query_table_id = (
                 f"query_{stable_hash(source_table['source_table_id'], query_fingerprint)}"
             )
-            qrel_key = (query_table_id, target_table_id, join_col)
-            if qrel_key in qrel_keys:
-                continue
-            qrel_keys.add(qrel_key)
             query_table = query_by_fingerprint.get(query_fingerprint)
             if query_table is None:
                 query_table = table_record(
@@ -10031,14 +10495,14 @@ def build_table_join_records(
                     rows=query_rows,
                     source_row_indices=query_source_rows,
                     extra={
-                        "chain_id": chain_id,
-                        "chain_ids": [chain_id],
+                        "chain_id": target_materializations[0]["chain_id"],
+                        "chain_ids": [],
                         "query_entity_col": entity_col,
                         "query_entity_col_name": get_column_name(
                             source_table, entity_col
                         ),
-                        "hidden_attributes": [view_hidden_attribute],
-                        "target_table_ids": [target_table_id],
+                        "hidden_attributes": [],
+                        "target_table_ids": [],
                         "query_context_col_names": [
                             get_column_name(source_table, col)
                             for col in query_context
@@ -10056,103 +10520,149 @@ def build_table_join_records(
                 ]
                 query_by_fingerprint[query_fingerprint] = query_table
                 query_tables.append(query_table)
-            else:
-                query_table["chain_ids"].append(chain_id)
-                query_table["hidden_attributes"].append(view_hidden_attribute)
-                query_table["target_table_ids"].append(target_table_id)
 
-            emitted_view_count += 1
-            qrels.append(
-                {
-                    "query_table_id": query_table_id,
-                    "target_table_id": target_table_id,
-                    "data_lake_table_id": target_table_id,
-                    "rel": 3,
-                    "split": split,
-                    "chain_id": chain_id,
-                    "row_view_index": row_view_index,
-                    "source_table_id": source_table["source_table_id"],
-                    "join_attribute": view_hidden_attribute,
-                    "reason": "model_recoverable_join_column",
-                }
-            )
             source_to_query_row = {
                 row["source_row_id"]: row["row_id"] for row in query_rows
             }
-            source_to_target_rows: dict[int, list[int]] = defaultdict(list)
-            for row in target_rows:
-                source_to_target_rows[int(row["source_row_id"])].append(
-                    int(row["row_id"])
-                )
-            seen_recoveries: set[str] = set()
-            for candidate in approved_candidates:
-                recovery = candidate.recovery
-                source_row_id = int(recovery["source_row_id"])
-                if source_row_id not in source_to_query_row:
-                    continue
-                recovery_id = f"evrec_{stable_hash(query_table_id, target_table_id, source_row_id, recovery['evidence']['asset_id'], recovery['recovered_attribute']['value'])}"
-                if recovery_id in seen_recoveries:
-                    continue
-                seen_recoveries.add(recovery_id)
-                path_id = f"path_{stable_hash(query_table_id, recovery['evidence']['asset_id'], target_table_id, source_row_id)}"
-                recovery_record = {
-                    "recovery_id": recovery_id,
-                    "path_id": path_id,
-                    "query_table_id": query_table_id,
-                    "target_table_id": target_table_id,
-                    "data_lake_table_id": target_table_id,
-                    "query_row_id": source_to_query_row[source_row_id],
-                    "target_row_ids": source_to_target_rows.get(
-                        source_row_id, []
-                    ),
-                    "path_nodes": [
-                        {
-                            "node_id": query_table_id,
-                            "node_type": "query_table",
-                        },
-                        {
-                            "node_id": recovery["evidence"]["asset_id"],
-                            "node_type": f"{recovery['evidence']['asset_type']}_asset",
-                        },
-                        {
-                            "node_id": target_table_id,
-                            "node_type": "target_table",
-                        },
-                    ],
-                    **recovery,
+            view_emitted = False
+            for target_materialization in target_materializations:
+                member_index = int(target_materialization["member_index"])
+                target_table_id = str(target_materialization["target_table_id"])
+                target_rows = target_materialization["target_rows"]
+                target_source_rows = target_materialization["target_source_rows"]
+                member_name = get_column_name(source_table, member_index)
+                view_hidden_attribute = {
+                    **hidden_attribute,
+                    "source_column_index": member_index,
+                    "column_name": member_name,
+                    "recovered_rows": len(approved_source_rows),
+                    "recovered_value_ratio": len(approved_source_rows)
+                    / query_rows_per_table,
+                    "target_rows": len(target_rows),
                 }
-                check = final_check_results.get(
-                    query_recovery_auto_check_key(candidate, extractor), {}
-                ).get("auto_check")
-                if isinstance(check, dict):
-                    recovery_record["auto_check"] = check
-                write_jsonl_record(recovery_writer, recovery_record)
+                qrel_key = (query_table_id, target_table_id, member_index)
+                if qrel_key in qrel_keys:
+                    continue
+                qrel_keys.add(qrel_key)
+                query_table["chain_ids"].append(
+                    str(target_materialization["chain_id"])
+                )
+                query_table["hidden_attributes"].append(view_hidden_attribute)
+                query_table["target_table_ids"].append(target_table_id)
+                view_emitted = True
+                qrels.append(
+                    {
+                        "query_table_id": query_table_id,
+                        "target_table_id": target_table_id,
+                        "data_lake_table_id": target_table_id,
+                        "rel": 3,
+                        "split": split,
+                        "chain_id": str(target_materialization["chain_id"]),
+                        "row_view_index": row_view_index,
+                        "source_table_id": source_table["source_table_id"],
+                        "join_attribute": view_hidden_attribute,
+                        "reason": "model_recoverable_join_column",
+                    }
+                )
+                source_to_target_rows: dict[int, list[int]] = defaultdict(list)
+                for row in target_rows:
+                    source_to_target_rows[int(row["source_row_id"])].append(
+                        int(row["row_id"])
+                    )
+                seen_recoveries: set[str] = set()
+                for candidate in approved_candidates:
+                    recovery = candidate.recovery
+                    source_row_id = int(recovery["source_row_id"])
+                    if source_row_id not in source_to_query_row:
+                        continue
+                    source_row = source_rows_by_id.get(source_row_id)
+                    member_value = (
+                        sanitize_cell_text_for_model(
+                            get_cell_text(source_row, member_index)
+                        )
+                        if source_row is not None
+                        else sanitize_cell_text_for_model(
+                            recovery["recovered_attribute"].get("value")
+                        )
+                    )
+                    recovery_id = f"evrec_{stable_hash(query_table_id, target_table_id, source_row_id, recovery['evidence']['asset_id'], member_value)}"
+                    if recovery_id in seen_recoveries:
+                        continue
+                    seen_recoveries.add(recovery_id)
+                    path_id = f"path_{stable_hash(query_table_id, recovery['evidence']['asset_id'], target_table_id, source_row_id)}"
+                    recovery_record = {
+                        "recovery_id": recovery_id,
+                        "path_id": path_id,
+                        "query_table_id": query_table_id,
+                        "target_table_id": target_table_id,
+                        "data_lake_table_id": target_table_id,
+                        "query_row_id": source_to_query_row[source_row_id],
+                        "target_row_ids": source_to_target_rows.get(
+                            source_row_id, []
+                        ),
+                        "path_nodes": [
+                            {"node_id": query_table_id, "node_type": "query_table"},
+                            {
+                                "node_id": recovery["evidence"]["asset_id"],
+                                "node_type": f"{recovery['evidence']['asset_type']}_asset",
+                            },
+                            {"node_id": target_table_id, "node_type": "target_table"},
+                        ],
+                        **recovery,
+                    }
+                    recovery_record["recovered_attribute"] = {
+                        **recovery["recovered_attribute"],
+                        "column_index": member_index,
+                        "column_name": member_name,
+                        "value": member_value,
+                    }
+                    check = final_check_results.get(
+                        query_recovery_auto_check_key(candidate, extractor), {}
+                    ).get("auto_check")
+                    if isinstance(check, dict):
+                        recovery_record["auto_check"] = check
+                    write_jsonl_record(recovery_writer, recovery_record)
+
+            if not view_emitted:
+                continue
+            # ``row_views`` is a query-view count, not a qrel/target count.
+            # A redundant group may fan out to several physical targets while
+            # still contributing exactly one emitted view for this query.
+            emitted_view_count += 1
 
         if emitted_view_count == 0:
             continue
         emitted_qualified["row_views"] = emitted_view_count
-        emitted_qualified_cols.append(emitted_qualified)
-        data_lake_tables.append(
-            table_record(
-                table_id=target_table_id,
-                role="target_data_lake_table",
-                split=split,
-                source_table=source_table,
-                column_indices=target_cols,
-                rows=target_rows,
-                source_row_indices=target_source_rows,
-                extra={
-                    "chain_id": chain_id,
-                    "queryable_source_table": True,
-                    "join_col": join_col,
-                    "join_col_name": qualified["column_name"],
-                    "target_context_col_names": [
-                        get_column_name(source_table, col)
-                        for col in target_context
-                    ],
-                },
-            )
+        emitted_qualified_cols.append(
+            {
+                key: value
+                for key, value in emitted_qualified.items()
+                if not key.startswith("_")
+            }
         )
+        for target_materialization in target_materializations:
+            member_index = int(target_materialization["member_index"])
+            data_lake_tables.append(
+                table_record(
+                    table_id=str(target_materialization["target_table_id"]),
+                    role="target_data_lake_table",
+                    split=split,
+                    source_table=source_table,
+                    column_indices=list(target_materialization["target_cols"]),
+                    rows=target_materialization["target_rows"],
+                    source_row_indices=target_materialization["target_source_rows"],
+                    extra={
+                        "chain_id": str(target_materialization["chain_id"]),
+                        "queryable_source_table": True,
+                        "join_col": member_index,
+                        "join_col_name": get_column_name(source_table, member_index),
+                        "target_context_col_names": [
+                            get_column_name(source_table, col)
+                            for col in target_materialization["member_context"]
+                        ],
+                    },
+                )
+            )
 
     if not query_tables:
         return rejected_table_join_records(
@@ -10163,7 +10673,11 @@ def build_table_join_records(
                 "reason": "qualified_columns_failed_query_target_split",
                 "entity_column_index": entity_col,
                 "qualified_columns": [
-                    qualified
+                    {
+                        key: value
+                        for key, value in qualified.items()
+                        if not key.startswith("_")
+                    }
                     for qualified, _query_context, _target_context in variant_layouts
                 ],
             },
@@ -11154,7 +11668,7 @@ def _build_dataset(
                 "recovery_qualified_variants_after_context_floor"
             ),
             "sibling_source_column_policy": (
-                "weakest_qualified_bridges_fill_two_column_context_floor"
+                "exact_redundancy_groups_one_query_bridge_with_physical_target_fanout"
             ),
             "identical_visible_query_policy": (
                 "merge_exact_row_view_with_all_distinct_positive_targets"
