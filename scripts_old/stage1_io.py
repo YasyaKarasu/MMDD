@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator
 LOG = logging.getLogger("stage1")
 WHITESPACE_RE = re.compile(r"\s+")
 NUMERIC_RE = re.compile(r"^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?%?$")
-URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+DEFAULT_MAX_CELL_CHARS = 1024
 USELESS_COLUMN_NAMES = {
     "no",
     "no.",
@@ -48,15 +48,11 @@ def clean_text(value: Any) -> str:
     return WHITESPACE_RE.sub(" ", text)
 
 
-def sanitize_cell_text_for_model(value: Any) -> str:
+def sanitize_cell_text_for_model(value: Any, max_chars: int = DEFAULT_MAX_CELL_CHARS) -> str:
     text = clean_text(value)
     if not text:
         return ""
-    if not URL_RE.search(text):
-        return text
-    without_urls = URL_RE.sub(" ", text)
-    without_urls = WHITESPACE_RE.sub(" ", without_urls).strip(" ,;:-|()[]{}")
-    return without_urls or "[url]"
+    return text[:max_chars].rstrip()
 
 
 def stable_hash(*parts: Any, length: int = 16) -> str:
