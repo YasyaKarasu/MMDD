@@ -573,19 +573,12 @@ def _aggregate_path_channels(
             sum((value - minimum) ** aggregator.power for value in evidence_scores)
             / len(evidence_scores)
         ) ** (1.0 / aggregator.power)
+    elif aggregator.evidence_aggregation == "comb_mnz":
+        evidence_score = sum(evidence_scores) * len(evidence_scores)
     else:
-        evidence_score = sum(evidence_scores) * sum(
-            value != 0.0 for value in evidence_scores
-        )
+        raise ValueError(f"Unknown evidence aggregation: {aggregator.evidence_aggregation}")
     return direct_score, evidence_score
 
-
-def _channel_ranks(results: list[dict[str, Any]], score_key: str) -> dict[str, int]:
-    ranked = sorted(
-        (result for result in results if result[score_key] is not None),
-        key=lambda result: (-float(result[score_key]), str(result["target_id"])),
-    )
-    return {str(result["target_id"]): rank for rank, result in enumerate(ranked, 1)}
 
 
 def _quantile(values: list[float], quantile: float) -> float:
@@ -774,8 +767,7 @@ def fuse_ranked_channels(
             else:
                 contributions.append(weights[1] / (rrf_k + evidence_rank))
         if contributions:
-            result["score"] = sum(contributions)
-            fused.append(result)
+            fused.append({**result, "score": sum(contributions)})
     return sorted(
         fused,
         key=lambda result: (-float(result["score"]), str(result["target_id"])),

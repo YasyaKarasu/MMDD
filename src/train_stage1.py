@@ -120,6 +120,8 @@ def _per_dataset_gate_results(
             .get(metric.split(".", 1)[0], {})
             .get(metric.split(".", 1)[1])
             if raw_dataset is not None and "." in metric
+            else raw_dataset.get("per_query", {}).get(metric)
+            if raw_dataset is not None
             else None
         )
         bootstrap = None
@@ -784,18 +786,14 @@ class _EpochController:
 
 
 def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[Path]]:
-    legacy = args.train_data
     base = args.base_data
-    if legacy and base:
-        raise ValueError("Use --base-data, not both --base-data and legacy --train-data")
-    base_values = base or legacy
-    if not base_values:
+    if not base:
         raise ValueError("--base-data is required")
     dev_values = args.dev_data
     if not dev_values:
         raise ValueError("--dev-data is required for per-epoch checkpoint gating")
     return (
-        [Path(value) for value in base_values],
+        [Path(value) for value in base],
         [Path(value) for value in args.hard_data],
         [Path(value) for value in dev_values],
     )
@@ -1189,6 +1187,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.stage == "student-path" or args.teacher_rerank:
         corpus_path = _required_path(args.corpus, "--corpus", args.stage)
         primary_metric = args.primary_metric
+        if args.teacher_rerank and args.stage != "student-path":
+            _valid_prefixes = ("dev_loss", "teacher_rerank.", "raw_direct.", "spearman")
+            if not any(primary_metric == p or primary_metric.startswith(p) for p in _valid_prefixes):
+                raise ValueError(
+                    f"--primary-metric {primary_metric!r} is not available in teacher-rerank mode. "
+                    f"Use one of: dev_loss, teacher_rerank.<metric>, raw_direct.<metric>, spearman"
+                )
         if args.stage == "student-path":
             index_root = (
                 Path(args.index_root)
@@ -1246,7 +1251,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 Path(args.teacher_checkpoint),
                 device,
                 table_tokens_per_group=(
-                    args.teacher_table_tokens_per_group or 1
+                    args.teacher_table_tokens_per_group
                 ),
             )
             if args.teacher_checkpoint
@@ -1558,7 +1563,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--features", required=True)
     parser.add_argument("--base-data", nargs="+", help="Base random/semantic/structural/corrupted lists.")
     parser.add_argument("--hard-data", nargs="*", default=[], help="ANN-mined hard-negative lists.")
-    parser.add_argument("--train-data", nargs="+", help=argparse.SUPPRESS)
     parser.add_argument("--dev-data", required=True, nargs="+", help="Fixed dev edge or target/path lists.")
     parser.add_argument("--output", required=True, help="Best checkpoint path; last uses a distinct sibling path.")
     parser.add_argument("--teacher-checkpoint")

@@ -66,6 +66,8 @@ def align_edge_record(
         if value != positive_id and value not in unavailable_ids
     ]
     candidate_ids = [positive_id, *negatives[:handcrafted_negatives]]
+    if len(candidate_ids) > list_width:
+        raise ValueError("positive and handcrafted quotas exceed list_width")
     excluded = {query_id, *candidate_ids, *unavailable_ids}
     candidate_ids.extend(
         _raw_negatives(

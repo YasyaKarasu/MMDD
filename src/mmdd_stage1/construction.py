@@ -489,7 +489,7 @@ def build_stage1_training_artifacts(
                 seen_type.add(evidence_type)
                 evidence_negatives[evidence_type].append(evidence_id)
 
-        for evidence_type in {asset_types[evidence_id] for evidence_id in positive_evidence_ids}:
+        for evidence_type in sorted({asset_types[evidence_id] for evidence_id in positive_evidence_ids}):
             if evidence_negatives[evidence_type]:
                 continue
             fallback_id = _pick_random(
