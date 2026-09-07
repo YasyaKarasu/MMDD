@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts_old"))
 
 import build_wdc_mm_joinability_dataset as wdc_builder
+import build_mm_joinability_dataset as shared_join_builder
 from build_wdc_mm_joinability_dataset import (
     WdcWebClient,
     extract_html_assets,
@@ -28,6 +29,13 @@ from build_wdc_mm_joinability_dataset import (
     read_wdc_table,
 )
 from stage1_io import get_cell, get_cell_text, stable_hash
+
+
+def test_wdc_legacy_entry_uses_shared_final_layout_builder() -> None:
+    assert (
+        wdc_builder.join_builder.build_table_join_records
+        is shared_join_builder.build_table_join_records
+    )
 
 
 def write_gzip_rows(tmp_path: Path, rows: list[Any], name: str = "Thing_host.json.gz") -> Path:

@@ -1713,6 +1713,130 @@ def test_table_unit_commit_guard_failure_rolls_back_and_resumes(
     )
 
 
+def test_final_layout_migration_reuses_zero_plan_source_units(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    materializer._initialize_index(database_path)
+    with materializer._connect(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO source_units (
+                source_table_id, source_sha256, split,
+                counts_json, layout_version, complete
+            ) VALUES (?, 'sha', 'train', '{}', '', 1)
+            """,
+            [("zero-plan",), ("candidate",), ("balanced",)],
+        )
+        connection.executemany(
+            """
+            INSERT INTO query_auto_check_units (
+                source_table_id, source_sha256, plan_count,
+                cached_check_count, complete
+            ) VALUES (?, 'sha', ?, ?, 1)
+            """,
+            [("zero-plan", 0, 0), ("candidate", 2, 7)],
+        )
+        connection.execute(
+            """
+            INSERT INTO explicit_join_balance_units (
+                source_table_id, selected_candidate_ids_json, complete
+            ) VALUES ('balanced', '[]', 1)
+            """
+        )
+        connection.commit()
+
+    pending = materializer._prepare_final_context_layout_migration(
+        database_path
+    )
+
+    assert pending == 2
+    with materializer._connect(database_path) as connection:
+        versions = {
+            str(row["source_table_id"]): str(row["layout_version"])
+            for row in connection.execute(
+                """
+                SELECT source_table_id, layout_version FROM source_units
+                ORDER BY source_table_id
+                """
+            )
+        }
+        assert connection.execute(
+            "SELECT COUNT(*) FROM explicit_join_balance_units"
+        ).fetchone()[0] == 0
+    assert versions == {
+        "balanced": "",
+        "candidate": "",
+        "zero-plan": materializer.FINAL_CONTEXT_LAYOUT_VERSION,
+    }
+
+
+def test_store_table_unit_replaces_only_legacy_layout_records(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "materialization.sqlite3"
+    materializer._initialize_index(database_path)
+
+    def table(query_id: str) -> materializer.MaterializedTable:
+        return materializer.MaterializedTable(
+            source_table={"source_table_id": "source-1"},
+            entities=[],
+            bridge_assets=[],
+            table_asset_links=[],
+            query_tables=[{"table_id": query_id}],
+            data_lake_tables=[],
+            qrels=[],
+            decision={"query_id": query_id},
+            attribute_extractions=[],
+            evidence_recoveries=[],
+        )
+
+    assert materializer._store_table_unit(
+        database_path,
+        table("old-query"),
+        source_ordinal=0,
+        source_sha256="source-sha",
+        split="train",
+    )
+    with materializer._connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE source_units SET layout_version = ''
+            WHERE source_table_id = 'source-1'
+            """
+        )
+        connection.commit()
+
+    assert materializer._store_table_unit(
+        database_path,
+        table("new-query"),
+        source_ordinal=0,
+        source_sha256="source-sha",
+        split="train",
+    )
+
+    with materializer._connect(database_path) as connection:
+        query_ids = [
+            str(row["table_id"])
+            for row in connection.execute(
+                """
+                SELECT table_id FROM table_ids
+                WHERE artifact = 'query_tables'
+                """
+            )
+        ]
+        layout_version = str(
+            connection.execute(
+                """
+                SELECT layout_version FROM source_units
+                WHERE source_table_id = 'source-1'
+                """
+            ).fetchone()[0]
+        )
+    assert query_ids == ["new-query"]
+    assert layout_version == materializer.FINAL_CONTEXT_LAYOUT_VERSION
+
+
 def test_failure_deduplication_recovers_after_mid_batch_guard_interrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3218,6 +3342,56 @@ def test_final_materialization_loads_query_checks_by_exact_cache_key(
     assert len(materialized.query_tables) == 1
     assert len(materialized.qrels) == 1
     assert len(materialized.evidence_recoveries) == 2
+
+
+def test_final_materialization_fails_closed_when_query_check_is_missing(
+    tmp_path: Path,
+) -> None:
+    inputs, args = _authoritative_inputs(
+        tmp_path,
+        page_success=True,
+        extractor=_StateExtractor(),
+    )
+    args.auto_check_secondary_openai = True
+    materialize_dataset(
+        inputs,
+        output_root=tmp_path / "output",
+        args=args,
+        extractor=_QueryChecker(),
+        records_per_shard=2,
+    )
+    database_path = next(
+        (inputs.work_root / "materialization").glob("index-*.sqlite3")
+    )
+    with materializer._connect(database_path) as connection:
+        supported_key = next(
+            str(row["cache_key"])
+            for row in connection.execute(
+                "SELECT cache_key, record_json FROM query_auto_checks"
+            )
+            if json.loads(str(row["record_json"])).get("supported")
+        )
+        connection.execute(
+            "DELETE FROM query_auto_checks WHERE cache_key = ?",
+            (supported_key,),
+        )
+        connection.commit()
+
+    materialize_args = argparse.Namespace(**vars(args))
+    materialize_args._query_auto_check_required = True
+    materialize_args._query_auto_check_review_policy = (
+        join_builder.AUTO_CHECK_REVIEW_POLICY_LOCAL
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="accepted query evidence auto-check remained incomplete",
+    ):
+        materializer._materialize_from_index(
+            _source_table(),
+            database_path,
+            args=materialize_args,
+            split="train",
+        )
 
 
 @pytest.mark.parametrize("cache_has_missing_check", [False, True])

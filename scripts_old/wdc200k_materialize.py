@@ -130,6 +130,7 @@ except ModuleNotFoundError as error:
 
 
 MATERIALIZATION_SCHEMA_VERSION = "wdc200k-materialization-v8-redundant-groups"
+FINAL_CONTEXT_LAYOUT_VERSION = "final-survivor-context-v1"
 UPSTREAM_CERTIFICATE_SCHEMA_VERSION = (
     "wdc200k-upstream-certificate-v1"
 )
@@ -1570,6 +1571,7 @@ def _initialize_index(
                 source_sha256 TEXT NOT NULL,
                 split TEXT NOT NULL,
                 counts_json TEXT NOT NULL,
+                layout_version TEXT NOT NULL DEFAULT 'final-survivor-context-v1',
                 complete INTEGER NOT NULL
             );
 
@@ -1646,6 +1648,19 @@ def _initialize_index(
                 connection.execute(
                     f"ALTER TABLE source_catalog ADD COLUMN {name} {declaration}"
                 )
+        source_unit_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(source_units)"
+            )
+        }
+        if "layout_version" not in source_unit_columns:
+            connection.execute(
+                """
+                ALTER TABLE source_units
+                ADD COLUMN layout_version TEXT NOT NULL DEFAULT ''
+                """
+            )
         tracker.before_commit(0)
         connection.commit()
     except BaseException:
@@ -5131,7 +5146,7 @@ def _store_table_unit(
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
             """
-            SELECT source_sha256, split, complete
+            SELECT source_sha256, split, layout_version, complete
             FROM source_units WHERE source_table_id = ?
             """,
             (source_table_id,),
@@ -5145,8 +5160,25 @@ def _store_table_unit(
                 raise ValueError(
                     f"source unit identity mismatch: {source_table_id}"
                 )
-            connection.commit()
-            return False
+            if str(existing["layout_version"]) == FINAL_CONTEXT_LAYOUT_VERSION:
+                connection.commit()
+                return False
+            connection.execute(
+                "DELETE FROM evidence WHERE source_table_id = ?",
+                (source_table_id,),
+            )
+            connection.execute(
+                "DELETE FROM table_ids WHERE source_table_id = ?",
+                (source_table_id,),
+            )
+            connection.execute(
+                "DELETE FROM materialized_records WHERE source_table_id = ?",
+                (source_table_id,),
+            )
+            connection.execute(
+                "DELETE FROM source_units WHERE source_table_id = ?",
+                (source_table_id,),
+            )
         decision = {
             **materialized.decision,
             "source_table_id": source_table_id,
@@ -5206,14 +5238,15 @@ def _store_table_unit(
             """
             INSERT INTO source_units (
                 source_table_id, source_sha256, split,
-                counts_json, complete
-            ) VALUES (?, ?, ?, ?, 1)
+                counts_json, layout_version, complete
+            ) VALUES (?, ?, ?, ?, ?, 1)
             """,
             (
                 source_table_id,
                 source_sha256,
                 split,
                 _canonical_json(counts),
+                FINAL_CONTEXT_LAYOUT_VERSION,
             ),
         )
         if write_tracker is not None:
@@ -6088,6 +6121,82 @@ def _run_query_auto_check_prepass(
     )
 
 
+def _prepare_final_context_layout_migration(
+    database_path: Path,
+    *,
+    pre_write_guard: PreWriteGuard | None = None,
+) -> int:
+    """Mark only legacy source units that need final-layout rematerialization."""
+    write_tracker = GuardedWriteTracker(database_path, pre_write_guard)
+    with _connect(database_path) as connection:
+        legacy_units = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM source_units
+                WHERE layout_version != ?
+                """,
+                (FINAL_CONTEXT_LAYOUT_VERSION,),
+            ).fetchone()[0]
+        )
+        if not legacy_units:
+            return 0
+        connection.execute("BEGIN IMMEDIATE")
+        balanced = connection.execute(
+            """
+            SELECT 1 FROM metadata
+            WHERE key = 'explicit_join_balance_v1'
+            """
+        ).fetchone()
+        if balanced is None:
+            connection.execute(
+                """
+                UPDATE source_units
+                SET layout_version = ?
+                WHERE layout_version != ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM query_auto_check_units AS checks
+                    WHERE checks.source_table_id = source_units.source_table_id
+                      AND checks.complete = 1
+                      AND checks.plan_count > 0
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM explicit_join_balance_units AS balance
+                    WHERE balance.source_table_id = source_units.source_table_id
+                      AND balance.complete = 1
+                  )
+                """,
+                (
+                    FINAL_CONTEXT_LAYOUT_VERSION,
+                    FINAL_CONTEXT_LAYOUT_VERSION,
+                ),
+            )
+        connection.execute(
+            "DELETE FROM metadata WHERE key = 'explicit_join_balance_v1'"
+        )
+        connection.execute("DELETE FROM explicit_join_balance_units")
+        connection.execute(
+            "DROP TABLE IF EXISTS explicit_join_balance_candidates"
+        )
+        pending = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM source_units
+                WHERE layout_version != ?
+                """,
+                (FINAL_CONTEXT_LAYOUT_VERSION,),
+            ).fetchone()[0]
+        )
+        write_tracker.before_commit(0)
+        connection.commit()
+    logging.info(
+        "WDC final-context layout migration: legacy_units=%d "
+        "pending_rematerialization=%d",
+        legacy_units,
+        pending,
+    )
+    return pending
+
+
 def _materialize_all_tables(
     database_path: Path,
     *,
@@ -6106,7 +6215,11 @@ def _materialize_all_tables(
     with _connect(database_path) as connection:
         completed_count = int(
             connection.execute(
-                "SELECT COUNT(*) FROM source_units WHERE complete = 1"
+                """
+                SELECT COUNT(*) FROM source_units
+                WHERE complete = 1 AND layout_version = ?
+                """,
+                (FINAL_CONTEXT_LAYOUT_VERSION,),
             ).fetchone()[0]
         )
     observed = completed_count
@@ -6131,6 +6244,8 @@ def _materialize_all_tables(
                                source_units.source_sha256
                                    AS completed_sha256,
                                source_units.split AS completed_split,
+                               source_units.layout_version
+                                   AS completed_layout_version,
                                source_units.complete AS completed
                         FROM source_catalog
                         LEFT JOIN source_units
@@ -6143,12 +6258,14 @@ def _materialize_all_tables(
                             OR source_units.source_sha256 !=
                                source_catalog.record_sha256
                             OR source_units.split != source_catalog.split
+                            OR source_units.layout_version != ?
                           )
                         ORDER BY source_catalog.ordinal
                         LIMIT ?
                         """,
                         (
                             last_ordinal,
+                            FINAL_CONTEXT_LAYOUT_VERSION,
                             _MATERIALIZATION_READ_BATCH_RECORDS,
                         ),
                     )
@@ -6174,7 +6291,11 @@ def _materialize_all_tables(
                         raise ValueError(
                             f"source unit resume mismatch: {source_table_id}"
                         )
-                    continue
+                    if (
+                        str(row["completed_layout_version"])
+                        == FINAL_CONTEXT_LAYOUT_VERSION
+                    ):
+                        continue
                 work_items.append(
                     _MaterializationWorkItem(
                         source_table_id=source_table_id,
@@ -6260,7 +6381,9 @@ def _materialize_all_tables(
             connection.execute(
                 """
                 SELECT COUNT(*) FROM source_units WHERE complete = 1
-                """
+                  AND layout_version = ?
+                """,
+                (FINAL_CONTEXT_LAYOUT_VERSION,),
             ).fetchone()[0]
         )
     if durable_completed_count != expected_tables:
@@ -7682,6 +7805,8 @@ def _load_published_result(
         raise ValueError(
             "published dataset manifest identity validation failed"
         )
+    if payload.get("context_layout_version") != FINAL_CONTEXT_LAYOUT_VERSION:
+        return None
     if payload.get("reference_format") != DATASET_REFERENCE_FORMAT:
         return None
     artifacts = payload.get("artifacts")
@@ -8045,6 +8170,7 @@ def _finalize_dataset(
     manifest = {
         "stage": "wdc200k_materialization",
         "schema_version": MATERIALIZATION_SCHEMA_VERSION,
+        "context_layout_version": FINAL_CONTEXT_LAYOUT_VERSION,
         "reference_format": DATASET_REFERENCE_FORMAT,
         "format": "sharded_jsonl",
         "records_per_shard": records_per_shard,
@@ -8270,6 +8396,11 @@ def materialize_dataset(
     if resumed is not None:
         return resumed
 
+    if fast_resume is not None:
+        _initialize_index(
+            database_path,
+            pre_write_guard=pre_write_guard,
+        )
     if pre_write_guard is not None:
         pre_write_guard(work_root, 0)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -8346,6 +8477,10 @@ def materialize_dataset(
             certificate_path,
             pre_write_guard=pre_write_guard,
         )
+    _prepare_final_context_layout_migration(
+        database_path,
+        pre_write_guard=pre_write_guard,
+    )
     materialize_args = copy.copy(args)
     materialize_args._query_auto_check_required = query_auto_check_required
     materialize_args._query_auto_check_review_policy = review_policy
