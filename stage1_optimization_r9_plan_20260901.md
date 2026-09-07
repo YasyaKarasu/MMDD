@@ -1,4 +1,10 @@
-# Stage-1 第九轮计划:解冻投影 P + student-edge KD 回归 + hard-negative mining 解冻(2026-09-01)
+# [已取消执行] Stage-1 第九轮计划:解冻投影 P + student-edge KD 回归 + hard-negative mining 解冻(2026-09-01)
+
+> 状态更新：2026-09-07，按用户要求，r9 作为独立实验轮次停止执行，由 [r10 实验方案](stage1_optimization_r10_plan_20260907.md) 完整替代。后续实验直接按 r10 的任务、数据版本、评价指标和选择规则执行，不再启动或续跑下文 r9 A/B/C/D/E 调度链。
+>
+> r9 已完成的投影漂移插桩、显式 `relation_learning_rate=0` 修复、多正例适配及相关产物保留；通过 r10 的输入一致性审计后可复用。未完成实验不记为负结果，也不补跑以满足旧门槛。本文以下内容仅供历史追溯，其中的 `evidence_weight=0.05` 主配置、旧数据集绝对分数 gate、条件触发和“方向已证伪”等判读均不再指导新实验。
+>
+> 此处取消的是实验轮次 r9，不是名称包含 v9 的数据集构建任务；数据与模型产物不删除。
 
 ## 背景:r8 与 pipeline unification(work/stage1_pipeline_unification_20260831)已确认的结论
 
