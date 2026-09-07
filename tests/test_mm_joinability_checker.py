@@ -153,7 +153,7 @@ def test_checker_samples_one_percent_and_persists_final_quality_rate(
     client = app.test_client()
     response = client.get("/")
     assert response.status_code == 200
-    assert "唯一 attribute/target".encode() in response.data
+    assert "正例 target 1/1".encode() in response.data
     assert "Query Row → Evidence → Attribute → Target Row".encode() in response.data
     assert b'data-query-row-id="0"' in response.data
     page_html = response.data.decode("utf-8")
@@ -189,15 +189,24 @@ def test_checker_samples_one_percent_and_persists_final_quality_rate(
     assert reopened.config["QUALITY_CHECKER_STORE"].summary()["reviewed"] == 1
 
 
-def test_checker_rejects_ambiguous_implicit_query(tmp_path: Path) -> None:
+def test_checker_displays_all_positive_targets_for_one_implicit_query(
+    tmp_path: Path,
+) -> None:
     write_checker_dataset(tmp_path, implicit_queries=2, ambiguous=True)
+    app = create_checker_app(
+        tmp_path,
+        dataset_name="Multi-positive",
+        sample_rate=1.0,
+        review_db=tmp_path / "reviews.sqlite3",
+    )
 
-    with pytest.raises(ValueError, match="one attribute/target"):
-        create_checker_app(
-            tmp_path,
-            dataset_name="Ambiguous",
-            review_db=tmp_path / "reviews.sqlite3",
-        )
+    response = app.test_client().get("/?page=1")
+
+    assert response.status_code == 200
+    assert "正例 target 1/2".encode() in response.data
+    assert "正例 target 2/2".encode() in response.data
+    assert b"target_000" in response.data
+    assert b"target_duplicate" in response.data
 
 
 def test_seeded_sample_is_exact_and_order_independent() -> None:

@@ -111,30 +111,35 @@ PAGE_TEMPLATE = """
     {% if group.rating %}<button name="rating" value="clear" type="submit">清除判断</button>{% endif %}
   </form>
 
-  {% set pair = group.pair %}
+  {% set first_pair = group.pairs[0].pair %}
   <section class="full-tables">
     <article class="panel full-table">
-      <div class="query-head"><div><span class="badge">QUERY TABLE</span><h2>完整 Query 表</h2></div><div class="muted">{{ pair.query_table_id }}</div></div>
-      <h3>{{ group.full_query_table.page_title or pair.query_table_id }}</h3>
+      <div class="query-head"><div><span class="badge">QUERY TABLE</span><h2>完整 Query 表</h2></div><div class="muted">{{ first_pair.query_table_id }}</div></div>
+      <h3>{{ group.full_query_table.page_title or first_pair.query_table_id }}</h3>
       <div class="muted">{{ group.full_query_table.caption }} {{ group.full_query_table.section_title }} · {{ group.full_query_table.rows|length }} 行</div>
-      <div class="table-box">{{ render_table(group.full_query_table, pair.query_highlight_rows)|safe }}</div>
+      <div class="table-box">{{ render_table(group.full_query_table, group.query_highlight_rows)|safe }}</div>
     </article>
+    {% for target in group.pairs %}
+    {% set pair = target.pair %}
     <article class="panel full-table">
-      <div class="query-head"><div><span class="badge">TARGET TABLE</span><h2>完整 Target 表</h2></div><div class="muted">{{ pair.target_table_id }}</div></div>
-      <h3>{{ group.full_target_table.page_title or pair.target_table_id }}</h3>
-      <div class="muted">{{ group.full_target_table.caption }} {{ group.full_target_table.section_title }} · {{ group.full_target_table.rows|length }} 行</div>
-      <div class="table-box">{{ render_table(group.full_target_table, pair.target_highlight_rows)|safe }}</div>
+      <div class="query-head"><div><span class="badge">TARGET {{ loop.index }}/{{ loop.length }}</span><h2>完整 Target 表</h2></div><div class="muted">{{ pair.target_table_id }}</div></div>
+      <h3>{{ target.full_target_table.page_title or pair.target_table_id }}</h3>
+      <div class="muted">{{ target.full_target_table.caption }} {{ target.full_target_table.section_title }} · {{ target.full_target_table.rows|length }} 行</div>
+      <div class="table-box">{{ render_table(target.full_target_table, pair.target_highlight_rows)|safe }}</div>
     </article>
+    {% endfor %}
   </section>
 
+  {% for target in group.pairs %}
+  {% set pair = target.pair %}
   <section class="panel pair">
     <div class="pair-head">
       <div><h2>Query Row → Evidence → Attribute → Target Row</h2><div class="muted">{{ pair.query_table.page_title or pair.query_table_id }} · {{ pair.path_count }} 条 recovery path</div></div>
-      <div class="muted">{{ pair.query_table_id }} → {{ pair.target_table_id }} · 唯一 attribute/target</div>
+      <div class="muted">{{ pair.query_table_id }} → {{ pair.target_table_id }} · 正例 target {{ loop.index }}/{{ loop.length }}</div>
     </div>
     <div class="recovery-list">
       <div class="recovery-head"><div>Query row</div><div>Multimodal evidence</div><div>Recovered attribute</div><div>Target row</div></div>
-      {% for item in group.review_rows %}
+      {% for item in target.review_rows %}
       <article class="recovery-row" data-query-row-id="{{ item.query_row_id }}">
         <div class="recovery-cell">
           <div class="pair-head"><span class="badge">QUERY ROW {{ item.query_row_id }}</span>{% if item.path %}<span class="muted">{{ item.path.query_entity.entity_column_name }}</span>{% endif %}</div>
@@ -169,6 +174,7 @@ PAGE_TEMPLATE = """
       {% else %}<div class="missing">当前 query 没有可显示的 row。</div>{% endfor %}
     </div>
   </section>
+  {% endfor %}
 
   <nav class="pager"><a class="button" href="{{ page_url(1) }}">首页</a><a class="button" href="{{ page_url(page-1) }}">上一页</a>
     <span>第 {{ page }} / {{ pages }} 页</span><a class="button primary" href="{{ page_url(page+1) }}">下一页</a><a class="button" href="{{ page_url(pages) }}">末页</a></nav>
@@ -432,7 +438,6 @@ def create_checker_app(
 ) -> Flask:
     output_dir = Path(output_dir).resolve()
     dataset = ViewerDataset(output_dir, max_rows, max_paths, max_asset_chars, index_path=index_path)
-    dataset.validate_implicit_query_uniqueness()
     implicit_ids = dataset.implicit_query_ids()
     selected_ids = sampled_query_ids(implicit_ids, sample_rate, seed)
     db_path = review_db or output_dir / f".{dataset_name.casefold()}_quality_checker.sqlite3"
@@ -447,24 +452,32 @@ def create_checker_app(
 
     def hydrate_group(query_id: str) -> dict[str, Any]:
         pair_keys = dataset.pair_keys_for_query(query_id, implicit_only=True)
-        if len(pair_keys) != 1:
-            raise ValueError(
-                "checker requires exactly one implicit qrel for "
-                f"{query_id!r}; found {len(pair_keys)}"
+        if not pair_keys:
+            raise ValueError(f"checker found no implicit qrel for {query_id!r}")
+        pairs = []
+        full_query_table: dict[str, Any] = {}
+        query_highlight_rows: set[int] = set()
+        for pair_key in pair_keys:
+            pair = dataset.hydrate_pair(pair_key)
+            pair_full_query_table, full_target_table = dataset.hydrate_full_pair_tables(
+                pair_key
             )
-        pair = dataset.hydrate_pair(pair_keys[0])
-        full_query_table, full_target_table = dataset.hydrate_full_pair_tables(
-            pair_keys[0]
-        )
+            if not full_query_table:
+                full_query_table = pair_full_query_table
+            query_highlight_rows.update(pair["query_highlight_rows"])
+            pairs.append(
+                {
+                    "pair": pair,
+                    "full_target_table": full_target_table,
+                    "review_rows": build_review_rows(pair),
+                }
+            )
         review_data = store.review_for(query_id)
         return {
             "query_id": query_id,
-            "query_table": pair["query_table"],
-            "query_highlight_rows": pair["query_highlight_rows"],
-            "pair": pair,
+            "pairs": pairs,
+            "query_highlight_rows": sorted(query_highlight_rows),
             "full_query_table": full_query_table,
-            "full_target_table": full_target_table,
-            "review_rows": build_review_rows(pair),
             **review_data,
         }
 
