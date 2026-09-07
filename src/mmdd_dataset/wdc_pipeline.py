@@ -19,7 +19,13 @@ from .joinability import (
     build_joinability_for_table,
     table_asset_links,
 )
-from .utils import clean_text, get_cell, get_column_name, stable_hash
+from .utils import (
+    clean_text,
+    get_cell,
+    get_column_name,
+    sanitize_cell_text,
+    stable_hash,
+)
 from .wdc_adapter import adapt_table, iter_candidates, iter_gzip_paths, sample_entities
 from .wdc_evidence import (
     EvidenceClient,
@@ -855,7 +861,7 @@ def _model_tasks_for_shard(
                 visible_cells = [
                     {
                         "name": get_column_name(table, int(column["column_index"])),
-                        "value": clean_text(
+                        "value": sanitize_cell_text(
                             get_cell(row, int(column["column_index"])).get("text")
                         ),
                     }

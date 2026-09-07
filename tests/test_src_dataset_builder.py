@@ -14,10 +14,15 @@ from mmdd_dataset.extraction import (
     auto_check_recoveries,
     build_extractions,
 )
-from mmdd_dataset.joinability import BuildConfig, build_joinability_dataset
+from mmdd_dataset.joinability import (
+    BuildConfig,
+    _exact_redundancy_groups,
+    _project,
+    build_joinability_dataset,
+)
 from mmdd_dataset.pipeline import main as pipeline_main
 from mmdd_dataset.tables import prepare_entitables, prepare_wdc
-from mmdd_dataset.utils import write_jsonl
+from mmdd_dataset.utils import sanitize_cell_text, write_jsonl
 from mmdd_dataset.workload import generate_query_views
 from build_image_attribute_dataset import build as build_image_attribute_dataset
 from build_table_dataset import main as table_pipeline_main
@@ -27,14 +32,15 @@ def write_entitables(path: Path, table_count: int = 1, row_count: int = 5) -> No
     payload = {}
     for table_index in range(table_count):
         payload[f"table-{table_index}"] = {
-            "title": ["Entity", "Founded", "Category"],
+            "title": ["Entity", "Founded", "Category", "Headquarters"],
             "pgTitle": f"Page {table_index}",
-            "numCols": 3,
+            "numCols": 4,
             "data": [
                 [
                     f"[Entity_{table_index}_{row}|Entity {table_index} {row}]",
                     str(1900 + row),
                     f"Category {row % 2}",
+                    f"City {row % 2}",
                 ]
                 for row in range(row_count)
             ],
@@ -71,6 +77,82 @@ def synthetic_materials(prepared):
             }
         )
     return assets, extractions
+
+
+def write_custom_table(path: Path, title: list[str], rows: list[list[str]]) -> None:
+    payload = {
+        "table-0": {
+            "title": title,
+            "pgTitle": "Page 0",
+            "numCols": len(title),
+            "data": rows,
+        }
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def column_extractions(prepared, matches: dict[str, int]):
+    """Assets per row plus extraction records matching `matches`.
+
+    `matches` maps an attribute (column) name to the number of leading rows
+    whose cell value the extraction reproduces.
+    """
+    table = prepared.source_tables[0]
+    entity_by_title = {entity["wiki_title"]: entity for entity in prepared.entities}
+    columns = {
+        column["column_name"]: column["column_index"] for column in table["columns"]
+    }
+    assets = []
+    extractions = []
+    for row in table["rows"]:
+        entity = entity_by_title[row["cells"][0]["wiki_title"]]
+        asset_id = f"asset-{row['row_id']}"
+        assets.append(
+            {
+                "asset_id": asset_id,
+                "entity_id": entity["entity_id"],
+                "asset_type": "text",
+                "content": "synthetic evidence",
+            }
+        )
+        for attribute_name, match_rows in matches.items():
+            column_index = columns[attribute_name]
+            extractions.append(
+                {
+                    "source_table_id": table["source_table_id"],
+                    "source_row_id": row["row_id"],
+                    "entity_id": entity["entity_id"],
+                    "asset_id": asset_id,
+                    "asset_type": "text",
+                    "attribute_name": attribute_name,
+                    "value": (
+                        row["cells"][column_index]["text"]
+                        if row["row_id"] < match_rows
+                        else "wrong"
+                    ),
+                    "evidence": "synthetic evidence",
+                }
+            )
+    return assets, extractions
+
+
+def build_with(
+    prepared, assets, extractions, **config_overrides
+):
+    table = prepared.source_tables[0]
+    return build_joinability_dataset(
+        prepared.source_tables,
+        assets,
+        extractions,
+        {table["source_table_id"]: "train"},
+        BuildConfig(
+            query_rows=5,
+            min_target_rows=5,
+            min_recovered_ratio=0.6,
+            min_recovered_rows=3,
+            **config_overrides,
+        ),
+    )
 
 
 def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
@@ -127,6 +209,225 @@ def test_entitables_adapter_and_joinability_core(tmp_path: Path) -> None:
     assert "data_lake_table_id" not in result["qrels"][0]
     assert "object_id" not in query
     assert "object_type" not in query
+    assert "entity_url" in [column["column_name"] for column in query["columns"]]
+    assert query["rows"][0]["cells"][-1]["synthetic"] is True
+    assert query["rows"][0]["cells"][-1]["text"].startswith(
+        "https://en.wikipedia.org/wiki/"
+    )
+
+
+def test_exact_redundancy_groups_are_row_aligned_and_length_delimited() -> None:
+    assert _exact_redundancy_groups({0: ["a", "b"], 1: ["a", "b"]}) == [[0, 1]]
+    assert _exact_redundancy_groups({0: ["a", "b"], 1: ["a", "c"]}) == []
+    assert _exact_redundancy_groups({0: ["a", "b"], 1: ["b", "a"]}) == []
+    assert _exact_redundancy_groups({0: ["", "a"], 1: ["a", ""]}) == []
+    assert _exact_redundancy_groups({0: ["ab", "c"], 1: ["a", "bc"]}) == []
+    # Serializer-defined equality: whitespace differences collapse to one group.
+    assert (
+        _exact_redundancy_groups(
+            {0: ["a  b"], 1: ["a b"]}, value_serializer=sanitize_cell_text
+        )
+        == [[0, 1]]
+    )
+    # Distinct URLs stay distinct under the serializer.
+    assert (
+        _exact_redundancy_groups(
+            {0: ["https://a.test/x", "same"], 1: ["https://b.test/x", "same"]},
+            value_serializer=sanitize_cell_text,
+        )
+        == []
+    )
+
+
+def test_redundant_bridge_group_shares_one_query_and_fans_out_targets(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_custom_table(
+        input_dir / "tables.json",
+        ["Entity", "Bridge A", "Bridge B", "Context C", "Context D"],
+        [
+            [
+                f"[Ent_{row}|Entity {row}]",
+                f"Value {row}",
+                f"Value {row}",
+                f"C {row % 2}",
+                f"D {row % 2}",
+            ]
+            for row in range(5)
+        ],
+    )
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = column_extractions(
+        prepared, {"Bridge A": 3, "Bridge B": 3}
+    )
+
+    result = build_with(prepared, assets, extractions)
+
+    queries = result["query_tables"]
+    targets = result["data_lake_tables"]
+    qrels = result["qrels"]
+    assert len(queries) == 1
+    assert 1 <= len(targets) == len(qrels) <= 2
+    query = queries[0]
+    assert not {1, 2} & set(query["source_column_indices"])
+    assert len(set(query["source_column_indices"]) - {0}) == 1
+    assert query["target_table_ids"] == [target["table_id"] for target in targets]
+    assert len(query["hidden_attributes"]) == len(targets)
+    assert {hidden["column_name"] for hidden in query["hidden_attributes"]} <= {
+        "Bridge A",
+        "Bridge B",
+    }
+    assert len({qrel["chain_id"] for qrel in qrels}) == len(qrels)
+    for qrel, target in zip(qrels, targets):
+        assert target["join_col_name"] == qrel["join_attribute"]["column_name"]
+        assert target["join_col_name"] in {"Bridge A", "Bridge B"}
+    member_recoveries = [
+        recovery
+        for recovery in result["evidence_recoveries"]
+    ]
+    assert len(member_recoveries) == 3 * len(targets)
+    for recovery in member_recoveries:
+        assert recovery["recovered_attribute"]["column_name"] in {
+            "Bridge A",
+            "Bridge B"
+        }
+        assert recovery["recovered_attribute"]["value"].startswith("Value ")
+        assert recovery["target_table_id"] in query["target_table_ids"]
+
+
+def test_entity_alias_group_is_not_a_hidden_bridge(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_custom_table(
+        input_dir / "tables.json",
+        ["Entity", "Entity alias", "Bridge", "Context C", "Context D"],
+        [
+            [
+                f"[Ent_{row}|Entity {row}]",
+                f"Entity {row}",
+                f"Value {row}",
+                f"C {row % 2}",
+                f"D {row % 2}",
+            ]
+            for row in range(5)
+        ],
+    )
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = column_extractions(prepared, {"Bridge": 3})
+
+    result = build_with(prepared, assets, extractions)
+
+    assert len(result["query_tables"]) == 1
+    query = result["query_tables"][0]
+    # The alias column is neither a bridge nor context anywhere.
+    assert not {1, 2} & set(query["source_column_indices"])
+    assert [hidden["column_name"] for hidden in query["hidden_attributes"]] == [
+        "Bridge"
+    ]
+    decision = result["table_queryability_decisions"][0]
+    assert decision["reason"] == "queryable"
+    assert [item["column_name"] for item in decision["qualified_columns"]] == [
+        "Bridge"
+    ]
+
+
+def test_implicit_context_floor_rejects_narrow_tables(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_custom_table(
+        input_dir / "tables.json",
+        ["Entity", "Founded", "Category"],
+        [
+            [
+                f"[Ent_{row}|Entity {row}]",
+                str(1900 + row),
+                f"Category {row % 2}",
+            ]
+            for row in range(5)
+        ],
+    )
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = column_extractions(prepared, {"Founded": 3})
+
+    result = build_with(prepared, assets, extractions)
+
+    assert result["query_tables"] == []
+    assert result["qrels"] == []
+    decision = result["table_queryability_decisions"][0]
+    assert decision["reason"] == "context_floor_unreachable"
+    assert [item["column_name"] for item in decision["qualified_columns"]] == [
+        "Founded"
+    ]
+
+
+def test_implicit_context_floor_demotes_weakest_bridge(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_custom_table(
+        input_dir / "tables.json",
+        ["Entity", "Strong Bridge", "Weak Bridge", "Only Context"],
+        [
+            [
+                f"[Ent_{row}|Entity {row}]",
+                f"Value {row}",
+                f"Other {row}",
+                f"C {row % 2}",
+            ]
+            for row in range(5)
+        ],
+    )
+    prepared = prepare_entitables(input_dir)
+    assets, extractions = column_extractions(
+        prepared, {"Strong Bridge": 4, "Weak Bridge": 3}
+    )
+
+    result = build_with(prepared, assets, extractions)
+
+    assert len(result["query_tables"]) == 1
+    query = result["query_tables"][0]
+    assert 1 not in set(query["source_column_indices"])
+    context_columns = set(query["source_column_indices"]) - {0}
+    assert context_columns <= {2, 3}
+    target = result["data_lake_tables"][0]
+    target_columns = {
+        cell["source_column_index"] for cell in target["rows"][0]["cells"]
+    }
+    assert target_columns - {1} == {2, 3} - context_columns
+    decision = result["table_queryability_decisions"][0]
+    assert decision["reason"] == "queryable"
+    assert [item["column_name"] for item in decision["qualified_columns"]] == [
+        "Strong Bridge"
+    ]
+
+
+def test_projected_cell_text_is_truncated_and_keeps_urls() -> None:
+    long_url = "https://example.test/" + "a" * 2000
+    table = {
+        "source_table_id": "st_x",
+        "columns": [
+            {"column_index": 0, "column_name": "A"},
+            {"column_index": 1, "column_name": "B"},
+        ],
+        "rows": [
+            {
+                "row_id": 0,
+                "cells": [
+                    {"column_index": 0, "text": "alpha"},
+                    {"column_index": 1, "text": f"See {long_url} " + "x" * 2000},
+                ],
+            }
+        ],
+        "metadata": {"column_profiles": [], "candidate_entity_columns": []},
+    }
+
+    rows, _ = _project(table, [0, 1], {0})
+    cell = rows[0]["cells"][1]
+    assert len(cell["text"]) == 1024
+    assert "https://example.test/" in cell["text"]
+    assert sanitize_cell_text("  spaced  ") == "spaced"
+    assert sanitize_cell_text(None) == ""
 
 
 def test_table_workload_projects_reproducible_query_views(tmp_path: Path) -> None:
@@ -257,7 +558,12 @@ def test_src_auto_check_uses_only_materialized_query_columns(tmp_path: Path) -> 
     assert terra_calls == []
     assert all(
         {cell["name"] for cell in call["visible_cells"]}
-        == {"Entity", "Category"}
+        == {"Entity", "Category", "entity_url"}
+        for call in local_calls + luna_calls
+    )
+    assert all(
+        call["visible_cells"][-1]["name"] == "entity_url"
+        and call["visible_cells"][-1]["value"].startswith("https://en.wikipedia.org/wiki/")
         for call in local_calls + luna_calls
     )
     assert all(

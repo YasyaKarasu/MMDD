@@ -10,7 +10,14 @@ from typing import Any
 import requests
 from mmdd_progress import progress
 
-from .utils import clean_text, get_cell, get_column_name, stable_hash, values_match
+from .utils import (
+    clean_text,
+    get_cell,
+    get_column_name,
+    sanitize_cell_text,
+    stable_hash,
+    values_match,
+)
 
 PROMPT_VERSION = "leave_one_attribute_out_v4_entity_evidence_grounding"
 AUTO_CHECK_PROMPT_VERSION = "query_visible_row_raw_evidence_only_v2"
@@ -136,7 +143,9 @@ def build_extractions(
                     visible_cells = [
                         {
                             "name": get_column_name(table, column["column_index"]),
-                            "value": clean_text(get_cell(row, column["column_index"]).get("text")),
+                            "value": sanitize_cell_text(
+                                get_cell(row, column["column_index"]).get("text")
+                            ),
                         }
                         for column in table["columns"]
                         if column["column_index"] != attribute_col

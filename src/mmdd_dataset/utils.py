@@ -11,6 +11,8 @@ from typing import Any, Iterable, Iterator, Sized
 
 from mmdd_progress import progress
 
+DEFAULT_MAX_CELL_CHARS = 1024
+
 
 def clean_text(value: Any) -> str:
     if value is None:
@@ -23,6 +25,14 @@ def clean_text(value: Any) -> str:
 def normalize(value: Any) -> str:
     text = clean_text(value).casefold().replace("_", " ")
     return " ".join(re.sub(r"[^\w.%+-]+", " ", text).split())
+
+
+def sanitize_cell_text(value: Any, max_chars: int = DEFAULT_MAX_CELL_CHARS) -> str:
+    """Dataset-visible cell text: cleaned and length-capped for model consumption."""
+    text = clean_text(value)
+    if not text:
+        return ""
+    return text[:max_chars].rstrip()
 
 
 def values_match(predicted: Any, expected: Any) -> bool:

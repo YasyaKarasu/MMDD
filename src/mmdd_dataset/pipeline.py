@@ -12,6 +12,7 @@ from .extraction import (
 )
 from .joinability import (
     JOINABILITY_POLICY_VERSION,
+    MIN_IMPLICIT_CONTEXT_COLUMNS,
     BuildConfig,
     build_joinability_dataset,
     table_asset_links,
@@ -189,6 +190,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "context_attr_limit_policy": "compatibility_flags_ignored",
                 "identical_visible_query_policy": "multiple_positive_targets",
                 "target_column_order_policy": "seeded_shuffle_per_join_column",
+                "min_implicit_context_columns": MIN_IMPLICIT_CONTEXT_COLUMNS,
+                "sibling_source_column_policy": (
+                    "exact_redundancy_groups_one_query_bridge_with_physical_target_fanout"
+                ),
+                "cell_text_policy": "clean_and_truncate_1024",
             },
             "artifacts": {
                 artifact: {"path": f"{artifact}.jsonl", "records": counts[artifact]}

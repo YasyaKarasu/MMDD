@@ -867,3 +867,14 @@ conda run -n MMDD python src/build_dataset.py \
 
 It intentionally keeps its simple in-memory orchestration. Use the WDC entry
 point for corpus-scale, resumable construction.
+
+The joinability construction mirrors the legacy builder's current algorithm:
+implicit queries require at least two ordinary context columns, so the weakest
+qualified bridges are demoted into the shared context pool until the floor is
+met and sources that cannot reach it emit no implicit queries. Exact redundant
+columns (identical row-aligned cell values after serialization) share one query
+bridge that fans out to a seeded 1..k subset of their physical members, each
+with its own chain, target table, qrel, and member-specific evidence
+recoveries. Every materialized query table gains a synthetic `entity_url`
+column derived from the entity cell's wiki title, and dataset cell text is
+cleaned and truncated to 1024 characters with URLs preserved.
