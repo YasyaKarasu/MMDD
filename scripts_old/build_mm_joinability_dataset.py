@@ -5825,6 +5825,26 @@ def query_recovery_auto_check_key(
     )
 
 
+def query_recovery_candidate_identity(
+    candidate: QueryRecoveryCandidate,
+) -> str:
+    """Identify one discovered recovery independently of context layout."""
+    recovered = candidate.recovery["recovered_attribute"]
+    return stable_hash(
+        "query-recovery-candidate-v1",
+        candidate.task.cache_key,
+        candidate.recovery.get("source_table_id"),
+        candidate.recovery.get("source_row_id"),
+        normalize(recovered.get("column_name")),
+        clean_text(recovered.get("value")),
+        *(
+            normalize(name)
+            for name in candidate.redundancy_group_attribute_names
+        ),
+        length=32,
+    )
+
+
 def query_recovery_auto_check_record_key(
     record: dict[str, Any],
 ) -> str | None:
@@ -7187,19 +7207,84 @@ def balanced_context_partition(
     *,
     seed: int,
     source_table_id: str,
+    target_only_columns: Iterable[int] = (),
 ) -> tuple[list[int], list[int]]:
-    """Split ordinary columns once per source with a near-even random ratio."""
+    """Split ordinary columns with the legacy seeded Gaussian ratio.
+
+    ``target_only_columns`` are retained in the table pair but can never be
+    exposed to the query.  This is used for name-equivalent answer aliases;
+    exact value aliases are excluded earlier as members of the hidden join
+    family itself.
+    """
     shuffled = list(columns)
     rng = random.Random(f"context-pool-split:{seed}:{source_table_id}")
     rng.shuffle(shuffled)
     if len(shuffled) <= 1:
         return shuffled, []
+    target_only = {int(index) for index in target_only_columns}
+    forced_target = [index for index in shuffled if index in target_only]
+    safe = [index for index in shuffled if index not in target_only]
     target_ratio = min(0.7, max(0.3, rng.gauss(0.5, 0.1)))
     target_count = min(
         len(shuffled) - 1,
         max(1, round(len(shuffled) * target_ratio)),
     )
-    return shuffled[target_count:], shuffled[:target_count]
+    target_safe_count = max(0, target_count - len(forced_target))
+    target_context = [*forced_target, *safe[:target_safe_count]]
+    query_context = safe[target_safe_count:]
+    return query_context, target_context
+
+
+def preliminary_context_partition(
+    columns: list[int],
+    *,
+    seed: int,
+    source_table_id: str,
+) -> tuple[list[int], list[int]]:
+    """Reproduce the legacy layout used by query-level auto-check keys.
+
+    Candidate qualification historically used this seeded Gaussian split.
+    Keep it stable so a presentation-only final re-layout does not invalidate
+    completed auto-checks.  Changing this function requires an intentional
+    auto-check cache migration.
+    """
+    return balanced_context_partition(
+        columns,
+        seed=seed,
+        source_table_id=source_table_id,
+    )
+
+
+def _column_name_semantic_key(value: Any) -> str:
+    """Canonicalize obvious header aliases for conservative leakage blocking."""
+    text = unicodedata.normalize("NFKC", clean_text(value)).casefold()
+    modifiers = {
+        "a",
+        "alias",
+        "an",
+        "description",
+        "label",
+        "name",
+        "of",
+        "the",
+        "text",
+        "value",
+    }
+    tokens = re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+    canonical: list[str] = []
+    for token in tokens:
+        if token in modifiers:
+            continue
+        if token == "ranking":
+            token = "rank"
+        elif len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        canonical.append(token)
+    if not canonical:
+        canonical = tokens
+    return " ".join(sorted(canonical))
 
 
 def shuffled_target_columns(
@@ -8162,6 +8247,7 @@ def multi_attribute_context_layout(
     profiles: dict[int, dict[str, Any]] | None = None,
     redundancy_groups: list[list[int]] | None = None,
     values_by_column: dict[int, list[str]] | None = None,
+    final_survivor_layout: bool = True,
 ) -> list[tuple[dict[str, Any], list[int], list[int]]]:
     """Reserve two context columns and emit one variant per join family.
 
@@ -8277,11 +8363,36 @@ def multi_attribute_context_layout(
     if len(ordinary_contexts) < MIN_IMPLICIT_CONTEXT_COLUMNS:
         return []
 
-    query_context, target_context = balanced_context_partition(
-        ordinary_contexts,
-        seed=int(getattr(args, "seed", 13)),
-        source_table_id=str(source_table["source_table_id"]),
-    )
+    partition_kwargs = {
+        "seed": int(getattr(args, "seed", 13)),
+        "source_table_id": str(source_table["source_table_id"]),
+    }
+    if final_survivor_layout:
+        hidden_name_keys = {
+            _column_name_semantic_key(get_column_name(source_table, member))
+            for qualified in emitted_qualified
+            for member in qualified["_redundancy_group_members"]
+        }
+        target_only_contexts = [
+            column_index
+            for column_index in ordinary_contexts
+            if _column_name_semantic_key(
+                get_column_name(source_table, column_index)
+            )
+            in hidden_name_keys
+        ]
+        query_context, target_context = balanced_context_partition(
+            ordinary_contexts,
+            target_only_columns=target_only_contexts,
+            **partition_kwargs,
+        )
+        if not query_context or not target_context:
+            return []
+    else:
+        query_context, target_context = preliminary_context_partition(
+            ordinary_contexts,
+            **partition_kwargs,
+        )
     return [
         (qualified, list(query_context), list(target_context))
         for qualified in emitted_qualified
@@ -9979,7 +10090,7 @@ def asset_preview(asset: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def build_table_join_records(
+def _build_table_join_records_once(
     *,
     source_table: dict[str, Any],
     split: str,
@@ -9998,6 +10109,9 @@ def build_table_join_records(
     finalize_query_recoveries: bool = False,
     query_recovery_candidates_out: list[QueryRecoveryCandidate] | None = None,
     query_recovery_plans_out: list[QueryRecoveryAutoCheckPlan] | None = None,
+    qualified_join_column_indices: set[int] | None = None,
+    frozen_query_auto_checks: dict[str, dict[str, Any]] | None = None,
+    final_survivor_layout: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     query_rows_per_table = configured_query_rows_per_table(args)
     values_by_column = table_column_values(source_table)
@@ -10239,6 +10353,39 @@ def build_table_join_records(
             values_by_column=values_by_column,
         )
 
+    preliminary_qualified_cols = qualified_cols
+    if qualified_join_column_indices is not None:
+        qualified_cols = [
+            qualified
+            for qualified in qualified_cols
+            if int(qualified["column_index"])
+            in qualified_join_column_indices
+        ]
+        if not qualified_cols:
+            return rejected_table_join_records(
+                source_table=source_table,
+                split=split,
+                entity_col=entity_col,
+                decision={
+                    "reason": "qualified_columns_failed_query_target_split",
+                    "entity_column_index": entity_col,
+                    "candidate_attribute_columns": candidate_attribute_names,
+                    "attribute_extractions": extraction_count,
+                    "qualified_columns": [],
+                    "preliminary_qualified_columns": [
+                        {
+                            key: value
+                            for key, value in qualified.items()
+                            if not key.startswith("_")
+                        }
+                        for qualified in preliminary_qualified_cols
+                    ],
+                },
+                args=args,
+                profiles=profiles,
+                values_by_column=values_by_column,
+            )
+
     variant_layouts = multi_attribute_context_layout(
         source_table=source_table,
         entity_col=entity_col,
@@ -10247,6 +10394,7 @@ def build_table_join_records(
         profiles=profiles,
         redundancy_groups=redundancy_groups,
         values_by_column=values_by_column,
+        final_survivor_layout=final_survivor_layout,
     )
 
     query_tables: list[dict[str, Any]] = []
@@ -10407,7 +10555,21 @@ def build_table_join_records(
             )
             if query_recovery_plans_out is not None:
                 query_recovery_plans_out.append(auto_check_plan)
-            if apply_query_auto_check and auto_check_required(extractor):
+            if frozen_query_auto_checks is not None:
+                check_results = {}
+                for candidate in view_candidates:
+                    identity = query_recovery_candidate_identity(candidate)
+                    record = frozen_query_auto_checks.get(identity)
+                    if record is not None:
+                        check_results[identity] = record
+                approved_candidates = [
+                    candidate
+                    for candidate in view_candidates
+                    if check_results.get(
+                        query_recovery_candidate_identity(candidate), {}
+                    ).get("supported")
+                ]
+            elif apply_query_auto_check and auto_check_required(extractor):
                 if query_auto_check_cache is None:
                     raise RuntimeError(
                         "query recovery auto-check requires its dedicated cache"
@@ -10442,7 +10604,9 @@ def build_table_join_records(
                 continue
             final_check_results = check_results
             if finalize_query_recoveries:
-                if auto_check_required(extractor):
+                if frozen_query_auto_checks is not None:
+                    final_check_results = check_results
+                elif auto_check_required(extractor):
                     if query_auto_check_cache is None:
                         raise RuntimeError(
                             "final query recovery materialization requires the "
@@ -10623,8 +10787,13 @@ def build_table_join_records(
                         "column_name": member_name,
                         "value": member_value,
                     }
+                    check_result_key = (
+                        query_recovery_candidate_identity(candidate)
+                        if frozen_query_auto_checks is not None
+                        else query_recovery_auto_check_key(candidate, extractor)
+                    )
                     check = final_check_results.get(
-                        query_recovery_auto_check_key(candidate, extractor), {}
+                        check_result_key, {}
                     ).get("auto_check")
                     if isinstance(check, dict):
                         recovery_record["auto_check"] = check
@@ -10702,6 +10871,150 @@ def build_table_join_records(
         "attribute_extractions": extraction_count,
         "qualified_columns": emitted_qualified_cols,
     }
+
+
+def _accepted_implicit_join_columns(decision: dict[str, Any]) -> set[int]:
+    if clean_text(decision.get("reason")) != "queryable":
+        return set()
+    return {
+        int(qualified["column_index"])
+        for qualified in decision.get("qualified_columns", [])
+        if isinstance(qualified, dict) and "column_index" in qualified
+    }
+
+
+def build_table_join_records(
+    *,
+    source_table: dict[str, Any],
+    split: str,
+    assets: dict[str, dict[str, Any]],
+    entity_to_assets: dict[str, list[str]],
+    wiki_to_entity_id: dict[str, str],
+    extractor: LocalAttributeExtractor | None,
+    cache: ExtractionCache,
+    progress: ModelAnalysisProgress | None,
+    concurrency_state: ModelConcurrencyState,
+    extraction_writer: ShardedJsonlWriter,
+    recovery_writer: ShardedJsonlWriter,
+    args: argparse.Namespace,
+    query_auto_check_cache: ExtractionCache | None = None,
+    apply_query_auto_check: bool = True,
+    finalize_query_recoveries: bool = False,
+    query_recovery_candidates_out: list[QueryRecoveryCandidate] | None = None,
+    query_recovery_plans_out: list[QueryRecoveryAutoCheckPlan] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Qualify implicit candidates, freeze verdicts, then lay out records.
+
+    The preliminary layout defines the exact query-visible input reviewed by
+    auto-check.  Once those verdicts determine the surviving join columns,
+    their candidate identities and review records are frozen.  A final layout
+    then returns rejected columns to the safe context pool without feeding that
+    presentation change back into candidate qualification or model calls.
+    """
+    if not apply_query_auto_check or not auto_check_required(extractor):
+        collecting_preliminary_plans = (
+            not apply_query_auto_check
+            and query_recovery_plans_out is not None
+        )
+        return _build_table_join_records_once(
+            source_table=source_table,
+            split=split,
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wiki_to_entity_id=wiki_to_entity_id,
+            extractor=extractor,
+            cache=cache,
+            progress=progress,
+            concurrency_state=concurrency_state,
+            extraction_writer=extraction_writer,
+            recovery_writer=recovery_writer,
+            args=args,
+            query_auto_check_cache=query_auto_check_cache,
+            apply_query_auto_check=apply_query_auto_check,
+            finalize_query_recoveries=finalize_query_recoveries,
+            query_recovery_candidates_out=query_recovery_candidates_out,
+            query_recovery_plans_out=query_recovery_plans_out,
+            final_survivor_layout=not collecting_preliminary_plans,
+        )
+
+    if query_auto_check_cache is None:
+        raise RuntimeError(
+            "query recovery auto-check requires its dedicated cache"
+        )
+
+    preliminary_candidates: list[QueryRecoveryCandidate] = []
+    preliminary_plans: list[QueryRecoveryAutoCheckPlan] = []
+    _queries, _targets, _qrels, preliminary_decision = (
+        _build_table_join_records_once(
+            source_table=source_table,
+            split=split,
+            assets=assets,
+            entity_to_assets=entity_to_assets,
+            wiki_to_entity_id=wiki_to_entity_id,
+            extractor=extractor,
+            cache=cache,
+            progress=None,
+            concurrency_state=concurrency_state,
+            extraction_writer=ListRecordWriter(),
+            recovery_writer=ListRecordWriter(),
+            args=args,
+            query_auto_check_cache=query_auto_check_cache,
+            apply_query_auto_check=True,
+            finalize_query_recoveries=False,
+            query_recovery_candidates_out=preliminary_candidates,
+            query_recovery_plans_out=preliminary_plans,
+            final_survivor_layout=False,
+        )
+    )
+    if query_recovery_plans_out is not None:
+        query_recovery_plans_out.extend(preliminary_plans)
+    if query_recovery_candidates_out is not None:
+        query_recovery_candidates_out.extend(preliminary_candidates)
+
+    accepted_columns = _accepted_implicit_join_columns(preliminary_decision)
+    if finalize_query_recoveries and preliminary_plans:
+        finalize_query_recovery_auto_checks(
+            plans=preliminary_plans,
+            extractor=extractor,
+            cache=query_auto_check_cache,
+            args=args,
+            concurrency_state=concurrency_state,
+        )
+
+    frozen_checks: dict[str, dict[str, Any]] = {}
+    for plan in preliminary_plans:
+        for candidate in plan.candidates:
+            record = query_recovery_cached_check(
+                query_recovery_auto_check_key(candidate, extractor),
+                query_auto_check_cache,
+                candidate,
+                extractor=extractor,
+            )
+            if record is not None:
+                frozen_checks[
+                    query_recovery_candidate_identity(candidate)
+                ] = record
+
+    return _build_table_join_records_once(
+        source_table=source_table,
+        split=split,
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=extractor,
+        cache=cache,
+        progress=progress,
+        concurrency_state=concurrency_state,
+        extraction_writer=extraction_writer,
+        recovery_writer=recovery_writer,
+        args=args,
+        query_auto_check_cache=query_auto_check_cache,
+        apply_query_auto_check=True,
+        finalize_query_recoveries=finalize_query_recoveries,
+        qualified_join_column_indices=accepted_columns,
+        frozen_query_auto_checks=frozen_checks,
+        final_survivor_layout=True,
+    )
 
 
 def load_assets(paths: Iterable[Path]) -> dict[str, dict[str, Any]]:

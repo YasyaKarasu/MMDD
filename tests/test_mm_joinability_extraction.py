@@ -489,6 +489,322 @@ def build_query_auto_check_fixture(
     return records, recovery_writer.records, extractor.calls
 
 
+def build_final_layout_auto_check_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_table_id: str = "st_table_0273_773_dff7c4861c",
+    include_leakage_aliases: bool = False,
+):
+    column_names = [
+        "Image",
+        "Name",
+        "Service",
+        "Rank",
+        "Place of action",
+        "Date of action",
+        "Notes",
+    ]
+    if include_leakage_aliases:
+        column_names.extend(["Service alias", "Service name"])
+    preliminary_names = ["Service", "Rank", "Place of action", "Notes"]
+    rows = []
+    assets = {}
+    entity_to_assets = {}
+    wiki_to_entity_id = {}
+    for row_index in range(5):
+        wiki_title = f"Entity {row_index}"
+        entity_id = f"entity-{row_index}"
+        asset_id = f"asset-{row_index}"
+        values = {
+            "Image": wiki_title,
+            "Name": f"Name {row_index}",
+            "Service": f"Service {row_index}",
+            "Rank": f"Rank {row_index}",
+            "Place of action": f"Place {row_index}",
+            "Date of action": f"Date {row_index}",
+            "Notes": f"Notes {row_index}",
+            "Service alias": f"Service {row_index}",
+            "Service name": f"untrusted alias {row_index}",
+        }
+        rows.append(
+            {
+                "row_id": row_index,
+                "cells": [
+                    {
+                        "column_index": column_index,
+                        "column_name": column_name,
+                        "text": values[column_name],
+                        "wiki_title": (
+                            wiki_title if column_index == 0 else None
+                        ),
+                    }
+                    for column_index, column_name in enumerate(column_names)
+                ],
+            }
+        )
+        assets[asset_id] = {
+            "asset_id": asset_id,
+            "asset_type": "text",
+            "content": f"Evidence for {wiki_title}",
+        }
+        entity_to_assets[entity_id] = [asset_id]
+        wiki_to_entity_id[wiki_title] = entity_id
+
+    source_table = {
+        "source_table_id": source_table_id,
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(column_names)
+        ],
+        "rows": rows,
+        "metadata": {"candidate_entity_columns": [0]},
+    }
+
+    def fake_resolve_extraction_tasks(**kwargs: object):
+        return [
+            (
+                task,
+                {
+                    "cache_key": task.cache_key,
+                    "attributes": [
+                        {
+                            "name": name,
+                            "value": next(
+                                cell["text"]
+                                for cell in rows[task.source_row_id]["cells"]
+                                if cell["column_name"] == name
+                            ),
+                        }
+                        for name in preliminary_names
+                    ],
+                    "error": "",
+                },
+            )
+            for task in kwargs["tasks"]
+        ]
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "resolve_extraction_tasks",
+        fake_resolve_extraction_tasks,
+    )
+
+    class Extractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[str, ...]]] = []
+            self.model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(
+            self,
+            *,
+            task: ExtractionTask,
+            attribute_name: str,
+            claimed_value: str,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            visible_names = tuple(
+                item["name"]
+                for item in task.entity.get("row_attributes") or []
+            )
+            self.calls.append((attribute_name, visible_names))
+            supported = attribute_name == "Service"
+            return {
+                "extracted_value": claimed_value if supported else "",
+                "verdict": "supported" if supported else "insufficient",
+                "comparison": (
+                    "normalized_values_match"
+                    if supported
+                    else "empty_extraction"
+                ),
+                "decision_source": "primary_local",
+                "review_complete": True,
+                "error_code": "",
+            }
+
+    args = joinability_dataset.parse_args(
+        [
+            "--input_dir",
+            str(tmp_path),
+            "--output_dir",
+            str(tmp_path / "output"),
+            "--query_rows_per_table",
+            "5",
+            "--min_rows_per_output_table",
+            "5",
+            "--min_recovered_value_ratio",
+            "0.6",
+            "--max_query_tables_per_source_table",
+            "0",
+            "--explicit_join_fallback_ratio",
+            "0",
+        ]
+    )
+    extractor = Extractor()
+    query_cache = ExtractionCache(tmp_path / "query-checks.jsonl")
+    recovery_writer = joinability_dataset.ListRecordWriter()
+    result = joinability_dataset.build_table_join_records(
+        source_table=source_table,
+        split="test",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=extractor,
+        cache=ExtractionCache(tmp_path / "extractions.jsonl"),
+        progress=None,
+        concurrency_state=ModelConcurrencyState(
+            text_workers=1, image_workers=1
+        ),
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=recovery_writer,
+        args=args,
+        query_auto_check_cache=query_cache,
+    )
+    return (
+        source_table,
+        result,
+        recovery_writer.records,
+        extractor.calls,
+        args,
+        assets,
+        entity_to_assets,
+        wiki_to_entity_id,
+        query_cache,
+    )
+
+
+def test_final_layout_returns_rejected_candidates_to_context_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, (queries, targets, qrels, decision), recoveries, calls, *_rest = (
+        build_final_layout_auto_check_fixture(tmp_path, monkeypatch)
+    )
+
+    assert decision["reason"] == "queryable"
+    assert [item["column_name"] for item in decision["qualified_columns"]] == [
+        "Service"
+    ]
+    assert len(queries) == len(targets) == len(qrels) == 1
+    query = queries[0]
+    target = targets[0]
+    assert set(query["source_column_indices"]) | set(
+        target["source_column_indices"]
+    ) == set(range(len(source["columns"])))
+    assert set(query["source_column_indices"]).isdisjoint(
+        target["source_column_indices"]
+    )
+    assert 2 not in query["source_column_indices"]
+    assert {3, 4, 6}.issubset(
+        set(query["source_column_indices"])
+        | set(target["source_column_indices"])
+    )
+    assert abs(
+        len(query["source_column_indices"])
+        - len(target["source_column_indices"])
+    ) <= 1
+    assert {record["target_table_id"] for record in recoveries} == {
+        target["table_id"]
+    }
+    assert all(qrel["query_table_id"] == query["table_id"] for qrel in qrels)
+
+    call_names = [name for name, _visible in calls]
+    assert call_names.count("Service") == 3
+    assert call_names.count("Rank") == 3
+    assert call_names.count("Place of action") == 3
+    assert call_names.count("Notes") == 3
+
+
+def test_final_layout_blocks_duplicate_and_same_name_join_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, (queries, targets, _qrels, decision), *_rest = (
+        build_final_layout_auto_check_fixture(
+            tmp_path,
+            monkeypatch,
+            include_leakage_aliases=True,
+        )
+    )
+
+    assert decision["reason"] == "queryable"
+    query_columns = set(queries[0]["source_column_indices"])
+    target_columns = {
+        column
+        for target in targets
+        for column in target["source_column_indices"]
+    }
+    # Column 7 is an exact value alias; column 8 has a synonymous header.
+    assert not ({2, 7, 8} & query_columns)
+    assert 8 in target_columns
+    assert {2, 7} & target_columns
+    assert set(range(7)).issubset(query_columns | target_columns)
+
+
+def test_final_layout_freezes_preliminary_auto_check_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        source,
+        first,
+        _recoveries,
+        first_calls,
+        args,
+        assets,
+        entity_to_assets,
+        wiki_to_entity_id,
+        query_cache,
+    ) = build_final_layout_auto_check_fixture(tmp_path, monkeypatch)
+
+    first_service_inputs = {
+        visible for name, visible in first_calls if name == "Service"
+    }
+    assert len(first_service_inputs) == 1
+    assert all(
+        rejected not in next(iter(first_service_inputs))
+        for rejected in ("Rank", "Place of action", "Notes")
+    )
+    assert all(
+        sum(name == rejected for name, _visible in first_calls) == 3
+        for rejected in ("Rank", "Place of action", "Notes")
+    )
+
+    class NoCallExtractor:
+        auto_check_enabled = True
+        auto_check_luna_reviewer = None
+        auto_check_terra_reviewer = None
+        model_auto_check_stats = ModelAutoCheckStats()
+
+        def review_auto_check_attribute(self, **_kwargs: object):
+            pytest.fail("frozen preliminary checks should be reused")
+
+    second = joinability_dataset.build_table_join_records(
+        source_table=source,
+        split="test",
+        assets=assets,
+        entity_to_assets=entity_to_assets,
+        wiki_to_entity_id=wiki_to_entity_id,
+        extractor=NoCallExtractor(),
+        cache=ExtractionCache(tmp_path / "extractions.jsonl"),
+        progress=None,
+        concurrency_state=ModelConcurrencyState(
+            text_workers=1, image_workers=1
+        ),
+        extraction_writer=joinability_dataset.ListRecordWriter(),
+        recovery_writer=joinability_dataset.ListRecordWriter(),
+        args=args,
+        query_auto_check_cache=query_cache,
+    )
+    assert [table["table_id"] for table in second[0]] == [
+        table["table_id"] for table in first[0]
+    ]
+    assert [table["source_column_indices"] for table in second[0]] == [
+        table["source_column_indices"] for table in first[0]
+    ]
+
+
 def test_auto_check_runs_only_for_recoveries_in_selected_query_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1624,6 +1940,119 @@ def test_multi_attribute_context_layout_demotes_join_columns_to_reach_floor() ->
     assert set(query_context) | set(target_context) == {2, 3}
     assert set(query_context).isdisjoint(target_context)
     assert len(query_context) == len(target_context) == 1
+
+
+def test_preliminary_context_layout_preserves_legacy_auto_check_partition() -> None:
+    source_table = {
+        "source_table_id": "legacy-cache-layout",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(
+                ["Entity", "Bridge", "Context A", "Context B", "Context C", "Context D"]
+            )
+        ],
+        "rows": [],
+    }
+    kwargs = {
+        "source_table": source_table,
+        "entity_col": 0,
+        "qualified_cols": [
+            {"column_index": 1, "recovered_value_ratio": 1.0}
+        ],
+        "args": SimpleNamespace(
+            seed=13,
+            max_query_tables_per_source_table=0,
+        ),
+    }
+
+    preliminary = joinability_dataset.multi_attribute_context_layout(
+        **kwargs,
+        final_survivor_layout=False,
+    )
+    final = joinability_dataset.multi_attribute_context_layout(**kwargs)
+
+    assert preliminary[0][1:] == ([5], [2, 4, 3])
+    assert final[0][1:] == preliminary[0][1:]
+
+
+def test_semantic_target_only_columns_do_not_change_preliminary_cache_layout() -> None:
+    source_table = {
+        "source_table_id": "semantic-alias-layout-0",
+        "columns": [
+            {"column_index": index, "column_name": name}
+            for index, name in enumerate(
+                [
+                    "Entity",
+                    "Bridge",
+                    "Bridge name",
+                    "Context A",
+                    "Context B",
+                    "Context C",
+                ]
+            )
+        ],
+        "rows": [],
+    }
+    kwargs = {
+        "source_table": source_table,
+        "entity_col": 0,
+        "qualified_cols": [
+            {"column_index": 1, "recovered_value_ratio": 1.0}
+        ],
+        "args": SimpleNamespace(
+            seed=13,
+            max_query_tables_per_source_table=0,
+        ),
+    }
+
+    preliminary = joinability_dataset.multi_attribute_context_layout(
+        **kwargs,
+        final_survivor_layout=False,
+    )
+    final = joinability_dataset.multi_attribute_context_layout(**kwargs)
+
+    assert 2 in preliminary[0][1]
+    assert 2 not in final[0][1]
+    assert 2 in final[0][2]
+
+
+def test_query_auto_check_plan_collection_uses_preliminary_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout_phases: list[bool] = []
+
+    def fake_build_once(**kwargs: object):
+        layout_phases.append(bool(kwargs["final_survivor_layout"]))
+        return [], [], [], {"reason": "not_queryable"}
+
+    monkeypatch.setattr(
+        joinability_dataset,
+        "_build_table_join_records_once",
+        fake_build_once,
+    )
+    common = {
+        "source_table": {},
+        "split": "test",
+        "assets": {},
+        "entity_to_assets": {},
+        "wiki_to_entity_id": {},
+        "extractor": None,
+        "cache": object(),
+        "progress": None,
+        "concurrency_state": object(),
+        "extraction_writer": object(),
+        "recovery_writer": object(),
+        "args": SimpleNamespace(),
+    }
+
+    joinability_dataset.build_table_join_records(
+        **common,
+        apply_query_auto_check=False,
+        query_recovery_plans_out=[],
+    )
+    joinability_dataset.build_table_join_records(**common)
+
+    assert layout_phases == [False, True]
 
 
 def test_multi_attribute_context_layout_rejects_unachievable_floor() -> None:
