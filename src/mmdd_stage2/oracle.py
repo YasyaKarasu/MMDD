@@ -13,6 +13,7 @@ from typing import Any
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
 
 from .data import Stage2ObjectIndex, local_column_index
+from .metrics import evidence_modality_bucket
 from .verifier import EvidenceBundle
 
 ORACLE_EVIDENCE_POLICY = (
@@ -58,17 +59,6 @@ def dataset_name(root: Path) -> str:
 
 def _distribution(values: Sequence[int]) -> dict[str, int]:
     return {str(key): value for key, value in sorted(Counter(values).items())}
-
-
-def _modality_bucket(modalities: Sequence[str]) -> str:
-    kinds = set(modalities)
-    if kinds == {"text"}:
-        return "text_only"
-    if kinds == {"image"}:
-        return "image_only"
-    if kinds == {"text", "image"}:
-        return "text_image"
-    return "unknown"
 
 
 def select_oracle_evidence(
@@ -393,7 +383,12 @@ def load_oracle_column_data(
                     [len(item.positive_bundle.evidence_ids) for item in split_examples]
                 ),
                 "modality": dict(
-                    sorted(Counter(_modality_bucket(item.evidence_modalities) for item in split_examples).items())
+                    sorted(
+                        Counter(
+                            evidence_modality_bucket(item.evidence_modalities)
+                            for item in split_examples
+                        ).items()
+                    )
                 ),
                 "candidate_column_count": _distribution(
                     [len(item.candidate_column_indices) for item in split_examples]

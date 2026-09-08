@@ -57,10 +57,11 @@ def build_evidence_bundles(
                 f"{result['target_id']}: retrieval result has evidence paths but no evidence_score; "
                 "regenerate it with the current Stage-1 retriever"
             )
+        table_score = result.get("stage2_table_score", evidence_score)
         bundles.append(
             EvidenceBundle(
                 target_id=str(result["target_id"]),
-                retrieval_score=float(evidence_score),
+                retrieval_score=float(table_score),
                 evidence_ids=evidence_ids,
             )
         )

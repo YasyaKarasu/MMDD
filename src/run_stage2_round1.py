@@ -8,13 +8,13 @@ import hashlib
 import json
 from collections import Counter
 from pathlib import Path
-from statistics import mean
 from typing import Any
 
 import torch
 from mmdd_stage1.retrieval import checkpoint_fingerprint
 from mmdd_stage1.selection import validate_stage2_gate
 from mmdd_stage2.checkpoints import load_candidate_scorer
+from mmdd_stage2.metrics import macro_dataset_accuracy
 from mmdd_stage2.oracle import (
     ORACLE_EVIDENCE_POLICY,
     OracleDataError,
@@ -374,13 +374,6 @@ def run_smoke_train(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
 
 
-def _macro(metrics: dict[str, Any]) -> float:
-    return mean(
-        float(item["column_accuracy@1"])
-        for item in metrics["by_dataset"].values()
-    )
-
-
 def run_evaluate(args: argparse.Namespace) -> None:
     records, cache_fingerprint = load_reader_cache(
         _cache_dirs(args.cache_root, ("train", "dev", "test"))
@@ -420,12 +413,13 @@ def run_evaluate(args: argparse.Namespace) -> None:
             "trained": split_metrics,
             "epoch_0_seeded_head_test": epoch_zero_metrics,
             "macro_accuracy": {
-                split: _macro(metrics) for split, metrics in split_metrics.items()
+                split: macro_dataset_accuracy(metrics)
+                for split, metrics in split_metrics.items()
             },
-            "macro_train_dev_gap": _macro(split_metrics["train"])
-            - _macro(split_metrics["dev"]),
-            "macro_dev_test_gap": _macro(split_metrics["dev"])
-            - _macro(split_metrics["test"]),
+            "macro_train_dev_gap": macro_dataset_accuracy(split_metrics["train"])
+            - macro_dataset_accuracy(split_metrics["dev"]),
+            "macro_dev_test_gap": macro_dataset_accuracy(split_metrics["dev"])
+            - macro_dataset_accuracy(split_metrics["test"]),
         }
         write_json_atomic(seed_dir / "metrics.json", seed_results[str(seed)])
 

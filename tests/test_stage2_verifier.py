@@ -107,6 +107,29 @@ def test_stage2_preserves_global_rrf_order_while_using_route_scores():
     assert bundles[0].retrieval_score == pytest.approx(0.9)
 
 
+def test_stage2_uses_explicit_fused_table_score_when_exported():
+    bundles = build_evidence_bundles(
+        [
+            {
+                "target_id": "f4-target",
+                "score": 0.7,
+                "stage2_table_score": 0.7,
+                "evidence_score": 0.2,
+                "paths": [
+                    {
+                        "kind": "evidence",
+                        "evidence_id": "e1",
+                        "path_score": 0.2,
+                    }
+                ],
+            }
+        ],
+        top_k_evidence=1,
+    )
+
+    assert bundles[0].retrieval_score == pytest.approx(0.7)
+
+
 def test_stage2_rejects_settings_above_compact_retrieval_path_budget():
     record = {
         "path_aggregation": {"path_result_k": 1, "evidence_path_k": 1},

@@ -19,6 +19,7 @@ from torch.nn import functional as F
 
 from .checkpoints import save_candidate_scorer
 from .data import Stage2ObjectIndex
+from .metrics import evidence_modality_bucket, macro_dataset_accuracy
 from .oracle import OracleColumnExample, oracle_examples_fingerprint
 from .pipeline import Stage2Backend
 from .verifier import CandidateColumnScorer
@@ -226,7 +227,7 @@ def build_reader_cache(
 def load_reader_cache(cache_dirs: Sequence[Path]) -> tuple[list[dict[str, Any]], str]:
     records: list[dict[str, Any]] = []
     manifests = []
-    seen_samples: set[tuple[str, str]] = set()
+    seen_samples: set[tuple[str, str, str]] = set()
     hidden_dims = set()
     for cache_dir in cache_dirs:
         manifest_path = cache_dir / "manifest.json"
@@ -260,14 +261,27 @@ def load_reader_cache(cache_dirs: Sequence[Path]) -> tuple[list[dict[str, Any]],
             if payload.get("metadata_fingerprint") != manifest["metadata_fingerprint"]:
                 raise ValueError(f"{shard_path}: reader cache shard metadata mismatch")
             for record in payload["records"]:
-                key = (str(record["dataset"]), str(record["query_id"]))
+                key = (
+                    str(record["dataset"]),
+                    str(record["query_id"]),
+                    str(record["target_id"]),
+                )
                 if key in seen_samples:
-                    raise ValueError(f"Duplicate reader-cache sample: {key[0]}:{key[1]}")
+                    raise ValueError(
+                        "Duplicate reader-cache sample: " + ":".join(key)
+                    )
                 seen_samples.add(key)
                 records.append(record)
     if len(hidden_dims) != 1:
         raise ValueError("Reader cache hidden dimensions do not match")
-    records.sort(key=lambda item: (item["dataset"], item["split"], item["query_id"]))
+    records.sort(
+        key=lambda item: (
+            item["dataset"],
+            item["split"],
+            item["query_id"],
+            item["target_id"],
+        )
+    )
     cache_fingerprint = _json_fingerprint(
         [manifest["metadata_fingerprint"] for manifest in manifests]
     )
@@ -296,17 +310,6 @@ def _balanced_epoch_order(
             order.append(indices[position % len(indices)])
             seen[dataset] += 1
     return order, dict(seen)
-
-
-def _modality_bucket(record: dict[str, Any]) -> str:
-    kinds = set(record["evidence_modalities"])
-    if kinds == {"text"}:
-        return "text_only"
-    if kinds == {"image"}:
-        return "image_only"
-    if kinds == {"text", "image"}:
-        return "text_image"
-    return "unknown"
 
 
 def _column_count_bucket(count: int) -> str:
@@ -352,7 +355,9 @@ def evaluate_scorer(
                 "candidate_column_count": int(record["candidate_column_count"]),
                 "evidence_ids": list(record["evidence_ids"]),
                 "evidence_modalities": list(record["evidence_modalities"]),
-                "modality_bucket": _modality_bucket(record),
+                "modality_bucket": evidence_modality_bucket(
+                    record["evidence_modalities"]
+                ),
                 "column_count_bucket": _column_count_bucket(
                     int(record["candidate_column_count"])
                 ),
@@ -388,14 +393,6 @@ def evaluate_scorer(
     return metrics, results if include_predictions else []
 
 
-def _macro_dev_accuracy(metrics: dict[str, Any]) -> float:
-    values = [
-        float(item["column_accuracy@1"])
-        for item in metrics["by_dataset"].values()
-    ]
-    return mean(values)
-
-
 def train_cached_scorer(
     train_records: Sequence[dict[str, Any]],
     dev_records: Sequence[dict[str, Any]],
@@ -421,6 +418,7 @@ def train_cached_scorer(
     history = []
     best_key: tuple[float, float, int] | None = None
     best_state: dict[str, torch.Tensor] | None = None
+    best_epoch: int | None = None
     started = time.monotonic()
     for epoch in range(1, epochs + 1):
         scorer.train()
@@ -440,7 +438,7 @@ def train_cached_scorer(
             optimizer.step()
             total_loss += float(loss.detach())
         dev_metrics, _ = evaluate_scorer(scorer, dev_records)
-        macro_accuracy = _macro_dev_accuracy(dev_metrics)
+        macro_accuracy = macro_dataset_accuracy(dev_metrics)
         key = (macro_accuracy, -float(dev_metrics["column_nll"]), -epoch)
         history.append(
             {
@@ -454,17 +452,10 @@ def train_cached_scorer(
         if best_key is None or key > best_key:
             best_key = key
             best_state = copy.deepcopy(scorer.state_dict())
-    if best_state is None:
+            best_epoch = epoch
+    if best_state is None or best_epoch is None:
         raise RuntimeError("No Stage-2 checkpoint was selected")
     scorer.load_state_dict(best_state)
-    best_epoch = max(
-        history,
-        key=lambda item: (
-            item["dev_macro_column_accuracy@1"],
-            -item["dev"]["column_nll"],
-            -item["epoch"],
-        ),
-    )["epoch"]
     head_updated = any(
         not torch.equal(initial_state[name], scorer.state_dict()[name])
         for name in initial_state

@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 import torch
 
+import mmdd_stage2.reader_cache as reader_cache_module
 import train_stage2
-from run_stage2_round1 import _round1_conclusion
 from mmdd_stage2.data import Stage2ObjectIndex
 from mmdd_stage2.oracle import (
     ORACLE_EVIDENCE_POLICY,
@@ -17,8 +17,13 @@ from mmdd_stage2.oracle import (
     load_oracle_column_data,
     select_oracle_evidence,
 )
-from mmdd_stage2.reader_cache import build_reader_cache, load_reader_cache
-from mmdd_stage2.verifier import CandidateColumnScorer, EvidenceBundle
+from mmdd_stage2.reader_cache import (
+    build_reader_cache,
+    load_reader_cache,
+    train_cached_scorer,
+)
+from mmdd_stage2.verifier import EvidenceBundle
+from run_stage2_round1 import _round1_conclusion
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -323,6 +328,105 @@ def test_reader_cache_round_trip_and_metadata_mismatch(tmp_path):
             evidence_policy=ORACLE_EVIDENCE_POLICY,
             shard_size=1,
         )
+
+
+def test_reader_cache_allows_multiple_gold_targets_for_one_query(tmp_path):
+    examples = [
+        OracleColumnExample(
+            dataset="lake",
+            dataset_root=str(tmp_path / "dataset"),
+            split="train",
+            query_id="q1",
+            target_id=target_id,
+            source_table_id="source",
+            chain_id=f"chain-{target_id}",
+            gold_source_column=source_column,
+            gold_local_column=source_column,
+            gold_column_position=0,
+            candidate_column_indices=(source_column,),
+            positive_bundle=EvidenceBundle(target_id, 0.0, (evidence_id,)),
+            evidence_modalities=("text",),
+            evidence_count_before_truncation=1,
+        )
+        for target_id, evidence_id, source_column in (
+            ("t1", "e1", 1),
+            ("t2", "e2", 2),
+        )
+    ]
+    objects = Stage2ObjectIndex(
+        {"q1": {"table_id": "q1"}},
+        {
+            "t1": {"table_id": "t1", "columns": [{}]},
+            "t2": {"table_id": "t2", "columns": [{}]},
+        },
+        {
+            "e1": {"asset_id": "e1", "asset_type": "text"},
+            "e2": {"asset_id": "e2", "asset_type": "text"},
+        },
+    )
+    cache_dir = tmp_path / "cache"
+    build_reader_cache(
+        _FrozenBackend(),
+        examples,
+        objects,
+        cache_dir,
+        model_path=tmp_path / "model",
+        model_dtype="bf16",
+        top_k_evidence=4,
+        evidence_policy=ORACLE_EVIDENCE_POLICY,
+        shard_size=1,
+    )
+
+    records, _fingerprint = load_reader_cache([cache_dir])
+
+    assert [(record["query_id"], record["target_id"]) for record in records] == [
+        ("q1", "t1"),
+        ("q1", "t2"),
+    ]
+
+
+def test_cached_scorer_selects_earlier_tied_nonfinal_epoch(tmp_path, monkeypatch):
+    record = {
+        "dataset": "lake",
+        "open_states": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "close_states": torch.tensor([[0.5, 0.0], [0.0, 0.5]]),
+        "gold_column_position": 0,
+    }
+    dev_values = [(0.8, 0.5), (0.9, 0.4), (0.9, 0.4)]
+    observed_states = []
+
+    def fake_evaluate(scorer, _records, **_kwargs):
+        observed_states.append(
+            {name: value.detach().clone() for name, value in scorer.state_dict().items()}
+        )
+        accuracy, nll = dev_values[len(observed_states) - 1]
+        return {
+            "column_nll": nll,
+            "by_dataset": {"lake": {"column_accuracy@1": accuracy}},
+        }, []
+
+    monkeypatch.setattr(reader_cache_module, "evaluate_scorer", fake_evaluate)
+    monkeypatch.setattr(
+        reader_cache_module,
+        "save_candidate_scorer",
+        lambda *_args, **_kwargs: None,
+    )
+
+    scorer, summary, _epoch_zero = train_cached_scorer(
+        [record],
+        [record],
+        hidden_dim=2,
+        seed=13,
+        epochs=3,
+        learning_rate=1e-2,
+        weight_decay=0.0,
+        output_dir=tmp_path,
+        checkpoint_metadata={},
+    )
+
+    assert summary["selected_epoch"] == 2
+    for name, value in scorer.state_dict().items():
+        torch.testing.assert_close(value, observed_states[1][name])
 
 
 def test_train_stage2_oracle_mode_does_not_require_gate(tmp_path, monkeypatch):
