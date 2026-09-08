@@ -5,33 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from mmdd_stage1.experiment_process import run_logged_subprocess
 from mmdd_stage1.significance import paired_bootstrap_delta
-
-
-def _run(command: Sequence[str], log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    environment = dict(os.environ)
-    root = Path(__file__).resolve().parents[1]
-    environment["PYTHONPATH"] = str(root / "src")
-    environment["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write("COMMAND " + " ".join(command) + "\n")
-        handle.flush()
-        subprocess.run(
-            list(command),
-            cwd=root,
-            env=environment,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            check=True,
-        )
 
 
 def _lake_inputs(root: Path, lake: str) -> dict[str, Path]:
@@ -175,7 +155,7 @@ def run(args: argparse.Namespace) -> None:
     original_selection = _load(inputs["selection"])
     student_index = output_dir / "student_index"
     if not (student_index / "manifest.json").is_file():
-        _run(
+        run_logged_subprocess(
             [
                 sys.executable,
                 str(root / "src/build_stage1_index.py"),
@@ -193,6 +173,7 @@ def run(args: argparse.Namespace) -> None:
                 "16000",
             ],
             output_dir / "build_student_index.log",
+            root=root,
         )
 
     selection = dict(original_selection)
@@ -207,7 +188,7 @@ def run(args: argparse.Namespace) -> None:
     evaluation = output_dir / "evaluation"
     metrics = evaluation / "metrics.json"
     if not metrics.is_file():
-        _run(
+        run_logged_subprocess(
             [
                 sys.executable,
                 str(root / "src/evaluate_stage1_r3_baselines.py"),
@@ -251,6 +232,7 @@ def run(args: argparse.Namespace) -> None:
                 args.device,
             ],
             output_dir / "evaluation.log",
+            root=root,
         )
     payload = summarize(
         metrics,

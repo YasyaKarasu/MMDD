@@ -55,17 +55,26 @@ def align_edge_record(
         raise ValueError("list_width must be at least 2 and quotas non-negative")
     query_id = str(record["query_id"])
     positive_id = str(record["positive_id"])
+    positive_ids = list(
+        dict.fromkeys(str(value) for value in record.get("positive_ids", [positive_id]))
+    )
     destination_type = normalize_object_type(str(record["destination_type"]))
     original = [str(value) for value in record["candidate_ids"]]
     if positive_id not in original:
         raise ValueError(f"{query_id}: edge positive is absent from candidates")
+    if positive_id not in positive_ids or not set(positive_ids) <= set(original):
+        raise ValueError(f"{query_id}: edge positive_ids do not align with candidates")
     unavailable_ids = unavailable_ids or set()
     negatives = [
         value
         for value in original
-        if value != positive_id and value not in unavailable_ids
+        if value not in set(positive_ids) and value not in unavailable_ids
     ]
-    candidate_ids = [positive_id, *negatives[:handcrafted_negatives]]
+    candidate_ids = [
+        positive_id,
+        *(value for value in positive_ids if value != positive_id),
+        *negatives[:handcrafted_negatives],
+    ]
     if len(candidate_ids) > list_width:
         raise ValueError("positive and handcrafted quotas exceed list_width")
     excluded = {query_id, *candidate_ids, *unavailable_ids}
@@ -78,15 +87,25 @@ def align_edge_record(
             count=list_width - len(candidate_ids),
         )
     )
-    return {
+    aligned = {
         "query_id": query_id,
         "source_type": normalize_object_type(str(record["source_type"])),
         "positive_id": positive_id,
+        "positive_ids": positive_ids,
         "candidate_ids": candidate_ids,
         "destination_type": destination_type,
         "dataset": str(record.get("dataset", "default")),
         "split": str(record["split"]),
     }
+    if "confirmed_labels" in record:
+        raw_labels = record["confirmed_labels"]
+        if not isinstance(raw_labels, list) or len(raw_labels) != len(original):
+            raise ValueError(f"{query_id}: confirmed_labels do not align with candidates")
+        label_by_id = dict(zip(original, raw_labels))
+        aligned["confirmed_labels"] = [
+            label_by_id.get(candidate_id) for candidate_id in candidate_ids
+        ]
+    return aligned
 
 
 def _limited_evidence(

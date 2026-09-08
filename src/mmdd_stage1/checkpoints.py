@@ -63,6 +63,18 @@ def load_path_aggregator(path: Path) -> PathAggregator:
             int(config.get("evidence_top_k", 4)),
             temperature=float(config.get("evidence_temperature", 1.0)),
             power=float(config.get("evidence_power", 2.0)),
+            path_combination=str(config.get("path_combination", "sum")),
+            threshold=float(config.get("evidence_threshold", 0.0)),
+            target_temperature=float(
+                config.get("evidence_target_temperature", 1.0)
+            ),
+            row_support_model=config.get("row_support_model"),
+            row_support_model_sha256=config.get("row_support_model_sha256"),
+            row_support_top_l=int(config.get("row_support_top_l", 20)),
+            evidence_content_keys=config.get("evidence_content_keys"),
+            evidence_content_keys_sha256=config.get(
+                "evidence_content_keys_sha256"
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{path}: invalid path aggregation configuration") from exc

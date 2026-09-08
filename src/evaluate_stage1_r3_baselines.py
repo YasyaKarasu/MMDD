@@ -32,7 +32,7 @@ from mmdd_stage1.retrieval import (
 )
 from mmdd_stage1.selection import load_stage1_selection, write_json
 from mmdd_stage1.significance import paired_bootstrap_delta
-from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
+from mmdd_stage1.teacher_rerank import teacher_ensemble_metrics as _teacher_ensemble_metrics
 
 SYSTEMS = ("raw", "student", "raw_ensemble", "student_ensemble")
 
@@ -138,90 +138,6 @@ def _teacher_feature_preflight(
             f"Teacher reranking requires hidden states for {len(missing)} additional objects"
         )
     write_json(output_dir / "teacher_preflight.json", payload)
-
-
-def _metric_bundle_from_per_k(
-    per_k: dict[int, dict[str, Any]], recall_ks: Sequence[int]
-) -> dict[str, Any]:
-    recall_ks = tuple(recall_ks)
-    max_k = max(recall_ks)
-    first = per_k[recall_ks[0]]
-    bundle: dict[str, Any] = {
-        "queries": first["queries"],
-        **{f"recall@{k}": per_k[k][f"recall@{k}"] for k in recall_ks},
-        f"mrr@{max_k}": per_k[max_k][f"mrr@{max_k}"],
-        "per_query": {
-            f"recall@{k}": per_k[k]["per_query"][f"recall@{k}"]
-            for k in recall_ks
-        },
-        "by_dataset": {},
-    }
-    for dataset in sorted(first["by_dataset"]):
-        bundle["by_dataset"][dataset] = {
-            "queries": first["by_dataset"][dataset]["queries"],
-            **{
-                f"recall@{k}": per_k[k]["by_dataset"][dataset][f"recall@{k}"]
-                for k in recall_ks
-            },
-            f"mrr@{max_k}": per_k[max_k]["by_dataset"][dataset][
-                f"mrr@{max_k}"
-            ],
-            "per_query": {
-                f"recall@{k}": per_k[k]["by_dataset"][dataset]["per_query"][
-                    f"recall@{k}"
-                ]
-                for k in recall_ks
-            },
-        }
-    return bundle
-
-
-def _teacher_ensemble_metrics(
-    teacher: torch.nn.Module,
-    examples: Sequence[TargetExample],
-    indices: RawEmbeddingANNIndices | StudentANNIndices,
-    store: FeatureStore,
-    *,
-    recall_ks: Sequence[int],
-    gamma: int,
-    alpha: float,
-    device: torch.device,
-    batch_size: int,
-    score_cache: dict[tuple[str, str], float],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Rerank a fresh gamma*k ANN pool at every requested k."""
-
-    query_ids = [example.query_id for example in examples]
-    per_k: dict[int, dict[str, Any]] = {}
-    retrieval_seconds = 0.0
-    rerank_seconds = 0.0
-    for k in recall_ks:
-        start = time.perf_counter()
-        hits = indices.search_many(query_ids, "table", gamma * k)
-        retrieval_seconds += time.perf_counter() - start
-        start = time.perf_counter()
-        result = evaluate_teacher_reranking(
-            teacher,
-            examples,
-            hits,
-            store,
-            device=device,
-            batch_size=batch_size,
-            ensemble_alphas=(alpha,),
-            recall_ks=(k,),
-            return_per_query=True,
-            score_cache=score_cache,
-        )
-        rerank_seconds += time.perf_counter() - start
-        per_k[k] = result["ensembles"][0]
-    total = retrieval_seconds + rerank_seconds
-    return _metric_bundle_from_per_k(per_k, recall_ks), {
-        "ann_retrieval_seconds": retrieval_seconds,
-        "teacher_rerank_seconds": rerank_seconds,
-        "total_seconds": total,
-        "average_seconds_per_query_per_k": total / (len(examples) * len(recall_ks)),
-        "teacher_pair_score_cache_entries": len(score_cache),
-    }
 
 
 def _comparison(
@@ -443,6 +359,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     evidence_top_k = getattr(args, "evidence_top_k", None)
     evidence_temperature = getattr(args, "evidence_temperature", None)
     evidence_power = getattr(args, "evidence_power", None)
+    path_combination = getattr(args, "path_combination", None)
+    evidence_threshold = getattr(args, "evidence_threshold", None)
     aggregator = PathAggregator(
         evidence_aggregation or saved_aggregator.evidence_aggregation,
         evidence_top_k
@@ -457,6 +375,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             evidence_power
             if evidence_power is not None
             else saved_aggregator.power
+        ),
+        path_combination=(
+            path_combination
+            if path_combination is not None
+            else saved_aggregator.path_combination
+        ),
+        threshold=(
+            evidence_threshold
+            if evidence_threshold is not None
+            else saved_aggregator.threshold
         ),
     )
     fusion_mode = getattr(args, "fusion_mode", "weighted_rrf")
@@ -474,11 +402,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             recall_ks=args.recall_ks,
             gamma=args.gamma,
             gamma_evidence=args.gamma_evidence,
+            direct_k=args.direct_k,
+            evidence_k=args.evidence_k,
+            targets_per_evidence=args.targets_per_evidence,
             evidence_types=evidence_types,
             evidence_aggregation=aggregator.evidence_aggregation,
             evidence_top_k=aggregator.top_k,
             evidence_temperature=aggregator.temperature,
             evidence_power=aggregator.power,
+            path_combination=aggregator.path_combination,
+            evidence_threshold=aggregator.threshold,
             evidence_modality_weights=evidence_modality_weights,
             fusion_mode=fusion_mode,
             direct_weight=direct_weight,
@@ -596,6 +529,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "recall_ks": list(args.recall_ks),
             "gamma": args.gamma,
             "gamma_evidence": args.gamma_evidence,
+            "direct_k": args.direct_k,
+            "evidence_k": args.evidence_k,
+            "targets_per_evidence": args.targets_per_evidence,
             "teacher_alpha": args.teacher_alpha,
             "teacher_batch_size": args.teacher_batch_size,
             "teacher_table_tokens_per_group": getattr(
@@ -605,6 +541,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_top_k": aggregator.top_k,
             "evidence_temperature": aggregator.temperature,
             "evidence_power": aggregator.power,
+            "path_combination": aggregator.path_combination,
+            "evidence_threshold": aggregator.threshold,
             "fusion_mode": fusion_mode,
             "direct_weight": direct_weight,
             "evidence_weight": evidence_weight,
@@ -655,6 +593,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recall-ks", type=_positive_ints, default=(10, 20, 30, 40, 50))
     parser.add_argument("--gamma", type=int, default=4)
     parser.add_argument("--gamma-evidence", type=int, default=2)
+    parser.add_argument("--direct-k", type=int)
+    parser.add_argument("--evidence-k", type=int)
+    parser.add_argument("--targets-per-evidence", type=int)
     parser.add_argument("--teacher-alpha", type=float, default=0.7)
     parser.add_argument("--teacher-batch-size", type=int, default=16)
     parser.add_argument(
@@ -671,6 +612,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument("--path-combination", choices=["sum", "min", "product"])
+    parser.add_argument("--evidence-threshold", type=float)
     parser.add_argument(
         "--path-edge-normalization",
         choices=["none", "zscore"],

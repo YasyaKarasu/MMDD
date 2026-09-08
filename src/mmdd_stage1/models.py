@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import nullcontext
+import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from .features import OBJECT_TYPES, ObjectFeatures, normalize_object_type
@@ -22,6 +24,7 @@ STUDENT_INITIALIZATIONS = (
     "pca",
 )
 STUDENT_RELATION_PARAMS = ("full", "lowrank")
+STUDENT_SCORE_SPACES = ("raw_logit", "confidence_logit", "confidence")
 
 
 def structural_table_pool_with_groups(
@@ -121,12 +124,16 @@ class TeacherJoinabilityModel(nn.Module):
         image_latents: int = 24,
         table_tokens_per_group: int = 1,
         dropout: float = 0.1,
+        confidence_transform: bool = False,
+        confidence_epsilon: float = 1e-6,
     ) -> None:
         super().__init__()
         if model_dim % num_heads:
             raise ValueError("model_dim must be divisible by num_heads")
         if table_tokens_per_group <= 0:
             raise ValueError("table_tokens_per_group must be positive")
+        if not 0 < confidence_epsilon < 1:
+            raise ValueError("confidence_epsilon must be between 0 and 1")
         self.input_dim = input_dim
         self.model_dim = model_dim
         self.num_heads = num_heads
@@ -135,6 +142,8 @@ class TeacherJoinabilityModel(nn.Module):
         self.image_latents = image_latents
         self.table_tokens_per_group = table_tokens_per_group
         self.dropout = dropout
+        self.confidence_transform = False
+        self.confidence_epsilon = float(confidence_epsilon)
         self.compute_dtype: torch.dtype | None = None
 
         self.adapters = nn.ModuleDict(
@@ -174,10 +183,20 @@ class TeacherJoinabilityModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(model_dim, 1),
         )
+        self.confidence_alphas = nn.ParameterDict()
+        self.confidence_biases = nn.ParameterDict()
         nn.init.normal_(self.rel_token, std=0.02)
         nn.init.normal_(self.sep_token, std=0.02)
+        self.set_confidence_transform(confidence_transform)
 
-    def config(self) -> dict[str, int | float]:
+    @staticmethod
+    def relation_key(source_type: str, destination_type: str) -> str:
+        return (
+            f"{normalize_object_type(source_type)}_to_"
+            f"{normalize_object_type(destination_type)}"
+        )
+
+    def config(self) -> dict[str, int | float | bool]:
         return {
             "input_dim": self.input_dim,
             "model_dim": self.model_dim,
@@ -187,7 +206,101 @@ class TeacherJoinabilityModel(nn.Module):
             "image_latents": self.image_latents,
             "table_tokens_per_group": self.table_tokens_per_group,
             "dropout": self.dropout,
+            "confidence_transform": self.confidence_transform,
+            "confidence_epsilon": self.confidence_epsilon,
         }
+
+    def set_confidence_transform(self, enabled: bool) -> None:
+        """Enable monotonic type-pair confidence logits for Teacher edges."""
+
+        enabled = bool(enabled)
+        if enabled == self.confidence_transform:
+            return
+        if not enabled:
+            self.confidence_alphas = nn.ParameterDict()
+            self.confidence_biases = nn.ParameterDict()
+            self.confidence_transform = False
+            return
+        parameter = next(self.parameters())
+        initial_alpha = math.log(math.expm1(1.0 - self.confidence_epsilon))
+        self.confidence_alphas = nn.ParameterDict(
+            {
+                self.relation_key(source_type, destination_type): nn.Parameter(
+                    parameter.new_tensor(initial_alpha)
+                )
+                for source_type in OBJECT_TYPES
+                for destination_type in OBJECT_TYPES
+            }
+        )
+        self.confidence_biases = nn.ParameterDict(
+            {
+                self.relation_key(source_type, destination_type): nn.Parameter(
+                    parameter.new_tensor(0.0)
+                )
+                for source_type in OBJECT_TYPES
+                for destination_type in OBJECT_TYPES
+            }
+        )
+        self.confidence_transform = True
+
+    def confidence_scale(
+        self, source_type: str, destination_type: str
+    ) -> torch.Tensor:
+        key = self.relation_key(source_type, destination_type)
+        if self.confidence_transform:
+            return F.softplus(self.confidence_alphas[key]) + self.confidence_epsilon
+        return next(self.parameters()).new_tensor(1.0)
+
+    def transform_edge_scores(
+        self,
+        raw_scores: torch.Tensor,
+        source_type: str,
+        destination_type: str,
+        score_space: str,
+    ) -> torch.Tensor:
+        """Map raw Teacher scores to confidence logits or confidences."""
+
+        if score_space not in STUDENT_SCORE_SPACES:
+            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
+        if score_space == "raw_logit":
+            return raw_scores
+        logits = raw_scores
+        if self.confidence_transform:
+            key = self.relation_key(source_type, destination_type)
+            logits = (
+                self.confidence_scale(source_type, destination_type) * raw_scores
+                + self.confidence_biases[key]
+            )
+        return logits if score_space == "confidence_logit" else torch.sigmoid(logits)
+
+    def transform_pair_scores(
+        self,
+        raw_scores: torch.Tensor,
+        source_types: Sequence[str],
+        destination_types: Sequence[str],
+        score_space: str,
+    ) -> torch.Tensor:
+        """Transform a heterogeneous batch without changing pair order."""
+
+        if raw_scores.shape != (len(source_types),) or len(source_types) != len(
+            destination_types
+        ):
+            raise ValueError("Pair score and type inputs must have equal lengths")
+        if score_space == "raw_logit" or not source_types:
+            return raw_scores
+        transformed = torch.empty_like(raw_scores)
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for index, pair in enumerate(zip(source_types, destination_types)):
+            groups[pair].append(index)
+        for (source_type, destination_type), indices in groups.items():
+            index_tensor = torch.tensor(indices, device=raw_scores.device)
+            transformed[index_tensor] = self.transform_edge_scores(
+                raw_scores.index_select(0, index_tensor),
+                source_type,
+                destination_type,
+                score_space,
+            )
+        return transformed
 
     def set_compute_dtype(self, dtype: torch.dtype | None) -> None:
         """Select optional autocast compute without changing checkpoint weights."""
@@ -444,6 +557,8 @@ class StudentJoinabilityModel(nn.Module):
         freeze_projections: bool = False,
         relation_param: str = "full",
         relation_rank: int = 16,
+        confidence_transform: bool = False,
+        confidence_epsilon: float = 1e-6,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or student_dim <= 0:
@@ -460,6 +575,8 @@ class StudentJoinabilityModel(nn.Module):
             )
         if relation_rank <= 0:
             raise ValueError("relation_rank must be positive")
+        if not 0 < confidence_epsilon < 1:
+            raise ValueError("confidence_epsilon must be between 0 and 1")
         if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
             raise ValueError(
                 f"{initialization} initialization requires student_dim == input_dim"
@@ -492,6 +609,8 @@ class StudentJoinabilityModel(nn.Module):
         self.freeze_projections = bool(freeze_projections)
         self.relation_param = relation_param
         self.relation_rank = relation_rank
+        self.confidence_transform = False
+        self.confidence_epsilon = float(confidence_epsilon)
         self.projections = nn.ModuleDict(
             {object_type: nn.Linear(input_dim, student_dim, bias=False) for object_type in OBJECT_TYPES}
         )
@@ -530,6 +649,8 @@ class StudentJoinabilityModel(nn.Module):
         self.relations = nn.ParameterDict()
         self.relation_as = nn.ParameterDict()
         self.relation_bs = nn.ParameterDict()
+        self.confidence_alphas = nn.ParameterDict()
+        self.confidence_biases = nn.ParameterDict()
         for source_type in OBJECT_TYPES:
             for destination_type in OBJECT_TYPES:
                 key = self.relation_key(source_type, destination_type)
@@ -552,6 +673,7 @@ class StudentJoinabilityModel(nn.Module):
                     self.relation_bs[key] = nn.Parameter(
                         torch.zeros(student_dim, relation_rank)
                     )
+        self.set_confidence_transform(confidence_transform)
 
     @staticmethod
     def relation_key(source_type: str, destination_type: str) -> str:
@@ -566,6 +688,8 @@ class StudentJoinabilityModel(nn.Module):
             "freeze_projections": self.freeze_projections,
             "relation_param": self.relation_param,
             "relation_rank": self.relation_rank,
+            "confidence_transform": self.confidence_transform,
+            "confidence_epsilon": self.confidence_epsilon,
         }
 
     @property
@@ -579,12 +703,88 @@ class StudentJoinabilityModel(nn.Module):
     def relation_parameters(self) -> list[nn.Parameter]:
         """Return the trainable parameters of all directed relations."""
 
-        if self.relation_param == "full":
-            return list(self.relations.parameters())
+        relation_parameters = (
+            list(self.relations.parameters())
+            if self.relation_param == "full"
+            else [
+                *self.relation_as.parameters(),
+                *self.relation_bs.parameters(),
+            ]
+        )
+        return [*relation_parameters, *self.confidence_parameters()]
+
+    def confidence_parameters(self) -> list[nn.Parameter]:
+        """Return the optional monotonic type-pair calibration parameters."""
+
         return [
-            *self.relation_as.parameters(),
-            *self.relation_bs.parameters(),
+            *self.confidence_alphas.parameters(),
+            *self.confidence_biases.parameters(),
         ]
+
+    def set_confidence_transform(self, enabled: bool) -> None:
+        """Enable or disable trainable monotonic type-pair calibration."""
+
+        enabled = bool(enabled)
+        if enabled == self.confidence_transform:
+            return
+        if not enabled:
+            self.confidence_alphas = nn.ParameterDict()
+            self.confidence_biases = nn.ParameterDict()
+            self.confidence_transform = False
+            return
+        parameter = next(self.parameters())
+        initial_alpha = math.log(math.expm1(1.0 - self.confidence_epsilon))
+        self.confidence_alphas = nn.ParameterDict(
+            {
+                self.relation_key(source_type, destination_type): nn.Parameter(
+                    parameter.new_tensor(initial_alpha)
+                )
+                for source_type in OBJECT_TYPES
+                for destination_type in OBJECT_TYPES
+            }
+        )
+        self.confidence_biases = nn.ParameterDict(
+            {
+                self.relation_key(source_type, destination_type): nn.Parameter(
+                    parameter.new_tensor(0.0)
+                )
+                for source_type in OBJECT_TYPES
+                for destination_type in OBJECT_TYPES
+            }
+        )
+        self.confidence_transform = True
+
+    def confidence_scale(
+        self, source_type: str, destination_type: str
+    ) -> torch.Tensor:
+        """Return the positive affine scale for one ordered type pair."""
+
+        key = self.relation_key(source_type, destination_type)
+        if self.confidence_transform:
+            return F.softplus(self.confidence_alphas[key]) + self.confidence_epsilon
+        return next(self.parameters()).new_tensor(1.0)
+
+    def transform_edge_scores(
+        self,
+        raw_scores: torch.Tensor,
+        source_type: str,
+        destination_type: str,
+        score_space: str,
+    ) -> torch.Tensor:
+        """Map raw bilinear scores to explicit logits or sigmoid confidence."""
+
+        if score_space not in STUDENT_SCORE_SPACES:
+            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
+        if score_space == "raw_logit":
+            return raw_scores
+        key = self.relation_key(source_type, destination_type)
+        logits = raw_scores
+        if self.confidence_transform:
+            logits = (
+                self.confidence_scale(source_type, destination_type) * raw_scores
+                + self.confidence_biases[key]
+            )
+        return logits if score_space == "confidence_logit" else torch.sigmoid(logits)
 
     def relation_residual_squared_norm(self, key: str) -> torch.Tensor:
         """Return ``||R - I||_F^2`` without materializing a low-rank matrix."""
@@ -621,6 +821,23 @@ class StudentJoinabilityModel(nn.Module):
     def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
         return self.projections[normalize_object_type(object_type)](embedding)
 
+    def _score_projected_pairs(
+        self,
+        sources: torch.Tensor,
+        destinations: torch.Tensor,
+        relation_key: str,
+    ) -> torch.Tensor:
+        if self.relation_param == "full":
+            return (
+                (sources @ self.relations[relation_key]) * destinations
+            ).sum(dim=-1)
+        direct = (sources * destinations).sum(dim=-1)
+        residual = (
+            (sources @ self.relation_as[relation_key])
+            * (destinations @ self.relation_bs[relation_key])
+        ).sum(dim=-1)
+        return direct + residual
+
     def score_embeddings(
         self,
         source_embedding: torch.Tensor,
@@ -631,14 +848,57 @@ class StudentJoinabilityModel(nn.Module):
         source = self.project(source_embedding, source_type)
         destination = self.project(destination_embedding, destination_type)
         key = self.relation_key(source_type, destination_type)
-        if self.relation_param == "full":
-            return ((source @ self.relations[key]) * destination).sum(dim=-1)
-        direct = (source * destination).sum(dim=-1)
-        residual = (
-            (source @ self.relation_as[key])
-            * (destination @ self.relation_bs[key])
-        ).sum(dim=-1)
-        return direct + residual
+        return self._score_projected_pairs(source, destination, key)
+
+    def raw_score_embeddings(
+        self,
+        source_embedding: torch.Tensor,
+        source_type: str,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        """Return the unbounded bilinear logit used for ANN ordering."""
+
+        return self.score_embeddings(
+            source_embedding,
+            source_type,
+            destination_embedding,
+            destination_type,
+        )
+
+    def confidence_logit_embeddings(
+        self,
+        source_embedding: torch.Tensor,
+        source_type: str,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_embeddings(
+            source_embedding,
+            source_type,
+            destination_embedding,
+            destination_type,
+        )
+        return self.transform_edge_scores(
+            raw_scores, source_type, destination_type, "confidence_logit"
+        )
+
+    def confidence_embeddings(
+        self,
+        source_embedding: torch.Tensor,
+        source_type: str,
+        destination_embedding: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_embeddings(
+            source_embedding,
+            source_type,
+            destination_embedding,
+            destination_type,
+        )
+        return self.transform_edge_scores(
+            raw_scores, source_type, destination_type, "confidence"
+        )
 
     def score_embedding_matrix(
         self,
@@ -658,6 +918,74 @@ class StudentJoinabilityModel(nn.Module):
         return scores + (
             (sources @ self.relation_as[key])
             @ (destinations @ self.relation_bs[key]).T
+        )
+
+    def raw_score_embedding_matrix(
+        self,
+        source_embeddings: torch.Tensor,
+        source_type: str,
+        destination_embeddings: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        """Return raw bilinear logits for every source/destination pair."""
+
+        return self.score_embedding_matrix(
+            source_embeddings,
+            source_type,
+            destination_embeddings,
+            destination_type,
+        )
+
+    def confidence_logit_embedding_matrix(
+        self,
+        source_embeddings: torch.Tensor,
+        source_type: str,
+        destination_embeddings: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_embedding_matrix(
+            source_embeddings,
+            source_type,
+            destination_embeddings,
+            destination_type,
+        )
+        return self.transform_edge_scores(
+            raw_scores, source_type, destination_type, "confidence_logit"
+        )
+
+    def confidence_embedding_matrix(
+        self,
+        source_embeddings: torch.Tensor,
+        source_type: str,
+        destination_embeddings: torch.Tensor,
+        destination_type: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_embedding_matrix(
+            source_embeddings,
+            source_type,
+            destination_embeddings,
+            destination_type,
+        )
+        return self.transform_edge_scores(
+            raw_scores, source_type, destination_type, "confidence"
+        )
+
+    def score_embedding_matrix_in_space(
+        self,
+        source_embeddings: torch.Tensor,
+        source_type: str,
+        destination_embeddings: torch.Tensor,
+        destination_type: str,
+        score_space: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_embedding_matrix(
+            source_embeddings,
+            source_type,
+            destination_embeddings,
+            destination_type,
+        )
+        return self.transform_edge_scores(
+            raw_scores, source_type, destination_type, score_space
         )
 
     def score_pairs(
@@ -708,19 +1036,78 @@ class StudentJoinabilityModel(nn.Module):
                 ]
             )
             key = self.relation_key(source_type, destination_type)
-            if self.relation_param == "full":
-                values = (
-                    (source_vectors @ self.relations[key]) * destination_vectors
-                ).sum(dim=-1)
-            else:
-                values = (source_vectors * destination_vectors).sum(dim=-1)
-                values = values + (
-                    (source_vectors @ self.relation_as[key])
-                    * (destination_vectors @ self.relation_bs[key])
-                ).sum(dim=-1)
+            values = self._score_projected_pairs(
+                source_vectors, destination_vectors, key
+            )
             indices = torch.tensor(pair_indices, device=scores.device)
             scores = scores.index_copy(0, indices, values)
         return scores
+
+    def raw_score_pairs(
+        self,
+        sources: Sequence[ObjectFeatures],
+        destinations: Sequence[ObjectFeatures],
+    ) -> torch.Tensor:
+        """Return raw bilinear logits for directed object pairs."""
+
+        return self.score_pairs(sources, destinations)
+
+    def _transform_pair_scores(
+        self,
+        raw_scores: torch.Tensor,
+        sources: Sequence[ObjectFeatures],
+        destinations: Sequence[ObjectFeatures],
+        score_space: str,
+    ) -> torch.Tensor:
+        if score_space not in STUDENT_SCORE_SPACES:
+            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
+        if len(sources) != len(destinations) or len(sources) != len(raw_scores):
+            raise ValueError("Pair inputs and raw_scores must have equal lengths")
+        if score_space == "raw_logit" or not sources:
+            return raw_scores
+        transformed = raw_scores.new_empty(raw_scores.shape)
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for index, (source, destination) in enumerate(zip(sources, destinations)):
+            groups[(source.object_type, destination.object_type)].append(index)
+        for (source_type, destination_type), pair_indices in groups.items():
+            indices = torch.tensor(pair_indices, device=raw_scores.device)
+            values = raw_scores.index_select(0, indices)
+            values = self.transform_edge_scores(
+                values, source_type, destination_type, score_space
+            )
+            transformed = transformed.index_copy(0, indices, values)
+        return transformed
+
+    def confidence_logit_pairs(
+        self,
+        sources: Sequence[ObjectFeatures],
+        destinations: Sequence[ObjectFeatures],
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_pairs(sources, destinations)
+        return self._transform_pair_scores(
+            raw_scores, sources, destinations, "confidence_logit"
+        )
+
+    def confidence_pairs(
+        self,
+        sources: Sequence[ObjectFeatures],
+        destinations: Sequence[ObjectFeatures],
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_pairs(sources, destinations)
+        return self._transform_pair_scores(
+            raw_scores, sources, destinations, "confidence"
+        )
+
+    def score_pairs_in_space(
+        self,
+        sources: Sequence[ObjectFeatures],
+        destinations: Sequence[ObjectFeatures],
+        score_space: str,
+    ) -> torch.Tensor:
+        raw_scores = self.raw_score_pairs(sources, destinations)
+        return self._transform_pair_scores(
+            raw_scores, sources, destinations, score_space
+        )
 
     def relation_query(
         self,

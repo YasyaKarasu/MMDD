@@ -463,6 +463,7 @@ class FeatureStore:
                 object_id=object_id,
                 object_type=features.object_type,
                 embedding=embeddings[row],
+                row_embeddings=features.row_embeddings,
             )
         self._preloaded_features = preloaded
         self._preloaded_embeddings = embeddings

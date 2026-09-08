@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,11 +31,13 @@ class HardPath:
 
 @dataclass(frozen=True)
 class HardCandidateSet:
-    """Target/path candidates plus independently mined Q->E negatives."""
+    """Merged candidates plus provenance for independently mined edge pools."""
 
     target_example: TargetExample
     evidence_negative_ids: tuple[str, ...]
     pool_counts: tuple[tuple[str, int], ...] = ()
+    direct_target_negative_ids: tuple[str, ...] = ()
+    evidence_target_negative_ids: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _known_positive_target_ids(example: TargetExample) -> tuple[str, ...]:
@@ -46,6 +48,22 @@ def _known_positive_target_ids(example: TargetExample) -> tuple[str, ...]:
     )
 
 
+def _known_positive_candidates(example: TargetExample) -> tuple[TargetCandidate, ...]:
+    positive_ids = _known_positive_target_ids(example)
+    candidates_by_id = {
+        candidate.target_id: candidate
+        for candidate in example.candidates
+        if candidate.target_id in positive_ids
+    }
+    missing = set(positive_ids) - set(candidates_by_id)
+    if missing:
+        raise ValueError(
+            f"{example.query_id}: positive targets are absent from candidates: "
+            f"{sorted(missing)}"
+        )
+    return tuple(candidates_by_id[target_id] for target_id in positive_ids)
+
+
 def build_hard_candidate_set(
     example: TargetExample,
     hard_target_ids: Sequence[str],
@@ -53,8 +71,9 @@ def build_hard_candidate_set(
     hard_paths: Sequence[HardPath],
     *,
     hard_targets_per_query: int,
+    hard_evidence_target_ids: Mapping[str, Sequence[str]] | None = None,
 ) -> HardCandidateSet:
-    """Merge the three independently ranked hard-negative pools."""
+    """Merge independently ranked Q-T, Q-E, E-T, and complete-path pools."""
 
     if hard_targets_per_query <= 0:
         raise ValueError("hard_targets_per_query must be positive")
@@ -77,6 +96,24 @@ def build_hard_candidate_set(
         if len(selected_target_ids) >= hard_targets_per_query:
             break
 
+    evidence_target_ids_by_evidence: list[tuple[str, tuple[str, ...]]] = []
+    evidence_path_by_target: dict[str, list[str]] = {}
+    for evidence_id, target_ids in (hard_evidence_target_ids or {}).items():
+        selected = []
+        for target_id in target_ids:
+            target_id = str(target_id)
+            if (
+                target_id == example.query_id
+                or target_id in known_positives
+                or target_id in selected
+            ):
+                continue
+            selected.append(target_id)
+            evidence_ids = evidence_path_by_target.setdefault(target_id, [])
+            if evidence_id not in evidence_ids:
+                evidence_ids.append(str(evidence_id))
+        evidence_target_ids_by_evidence.append((str(evidence_id), tuple(selected)))
+
     path_evidence_by_target: dict[str, list[str]] = {}
     for path in hard_paths:
         if path.target_id == example.query_id or path.target_id in known_positives:
@@ -85,7 +122,11 @@ def build_hard_candidate_set(
         if path.evidence_id not in evidence_ids:
             evidence_ids.append(path.evidence_id)
 
-    selected_ids = set(selected_target_ids) | set(path_evidence_by_target)
+    selected_ids = (
+        set(selected_target_ids)
+        | set(evidence_path_by_target)
+        | set(path_evidence_by_target)
+    )
     fallback_candidates = []
     for candidate in example.candidates:
         if len(selected_target_ids) + len(fallback_candidates) >= hard_targets_per_query:
@@ -99,16 +140,24 @@ def build_hard_candidate_set(
         dict.fromkeys(
             (
                 *selected_target_ids,
+                *evidence_path_by_target,
                 *path_evidence_by_target,
                 *(candidate.target_id for candidate in fallback_candidates),
             )
         )
     )
     fallback_by_id = {candidate.target_id: candidate for candidate in fallback_candidates}
-    candidates = list(dict.fromkeys((direct_positive, evidence_positive)))
+    candidates = list(_known_positive_candidates(example))
     for target_id in negative_target_ids:
-        if target_id in path_evidence_by_target:
-            evidence_ids = tuple(path_evidence_by_target[target_id])
+        if target_id in evidence_path_by_target or target_id in path_evidence_by_target:
+            evidence_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *evidence_path_by_target.get(target_id, ()),
+                        *path_evidence_by_target.get(target_id, ()),
+                    )
+                )
+            )
         elif target_id in fallback_by_id:
             evidence_ids = fallback_by_id[target_id].evidence_ids
         else:
@@ -141,23 +190,60 @@ def build_hard_candidate_set(
         if candidate.target_id not in known_positives
     }
     direct_target_set = set(selected_target_ids)
+    evidence_target_set = set(evidence_path_by_target)
     path_target_set = set(path_evidence_by_target)
-    pool_counts = (
+    pool_counts = [
         ("direct_target_candidates", len(selected_target_ids)),
         ("evidence_candidates", len(evidence_negative_ids)),
-        ("path_target_candidates", len(path_evidence_by_target)),
-        ("fallback_target_candidates", len(fallback_candidates)),
-        ("direct_path_overlap", len(direct_target_set & path_target_set)),
-        ("base_negative_overlap", len(set(negative_target_ids) & base_negative_ids)),
-        ("merged_negative_targets", len(negative_target_ids)),
+    ]
+    if hard_evidence_target_ids:
+        pool_counts.extend(
+            [
+                (
+                    "evidence_target_candidates",
+                    sum(len(target_ids) for _, target_ids in evidence_target_ids_by_evidence),
+                ),
+                ("evidence_target_unique_targets", len(evidence_target_set)),
+                (
+                    "direct_evidence_target_overlap",
+                    len(direct_target_set & evidence_target_set),
+                ),
+                (
+                    "evidence_target_path_overlap",
+                    len(evidence_target_set & path_target_set),
+                ),
+            ]
+        )
+    pool_counts.extend(
+        [
+            ("path_target_candidates", len(path_evidence_by_target)),
+            ("fallback_target_candidates", len(fallback_candidates)),
+            ("direct_path_overlap", len(direct_target_set & path_target_set)),
+            (
+                "base_negative_overlap",
+                len(set(negative_target_ids) & base_negative_ids),
+            ),
+            ("merged_negative_targets", len(negative_target_ids)),
+        ]
     )
-    return HardCandidateSet(target_example, evidence_negative_ids, pool_counts)
+    return HardCandidateSet(
+        target_example,
+        evidence_negative_ids,
+        tuple(pool_counts),
+        tuple(
+            (
+                *selected_target_ids,
+                *(candidate.target_id for candidate in fallback_candidates),
+            )
+        ),
+        tuple(evidence_target_ids_by_evidence),
+    )
 
 
 def summarize_hard_candidate_sets(
     candidate_sets: Sequence[HardCandidateSet],
 ) -> dict[str, int | float]:
-    """Aggregate the three mining pools and their target-level deduplication."""
+    """Aggregate the mining pools and their target-level deduplication."""
 
     totals: dict[str, int] = {}
     for candidate_set in candidate_sets:
@@ -167,6 +253,7 @@ def summarize_hard_candidate_sets(
         totals.get(key, 0)
         for key in (
             "direct_target_candidates",
+            "evidence_target_candidates",
             "path_target_candidates",
             "fallback_target_candidates",
         )
@@ -196,15 +283,23 @@ def _edge_examples_for_candidate_set(
     target_example: TargetExample,
     store: FeatureStore,
     evidence_negative_ids: Sequence[str] = (),
+    direct_target_negative_ids: Sequence[str] = (),
+    evidence_target_negative_ids: Sequence[tuple[str, Sequence[str]]] = (),
 ) -> list[EdgeExample]:
     """Expand one mined target list into its directly supervised path edges."""
 
     evidence_positive = target_example.candidates[target_example.evidence_positive_index]
-    negative_target_ids = tuple(
+    known_positives = set(_known_positive_target_ids(target_example))
+    all_negative_target_ids = tuple(
         candidate.target_id
-        for index, candidate in enumerate(target_example.candidates)
-        if index != target_example.evidence_positive_index
+        for candidate in target_example.candidates
+        if candidate.target_id not in known_positives
     )
+    direct_negative_ids = tuple(direct_target_negative_ids) or all_negative_target_ids
+    evidence_target_map = {
+        evidence_id: tuple(target_ids)
+        for evidence_id, target_ids in evidence_target_negative_ids
+    }
     positive_evidence_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
     negative_evidence_by_type: dict[str, list[str]] = {}
     for evidence_id in evidence_negative_ids:
@@ -214,12 +309,26 @@ def _edge_examples_for_candidate_set(
     examples = [
         EdgeExample(
             query_id=target_example.query_id,
-            candidate_ids=tuple(candidate.target_id for candidate in target_example.candidates),
-            positive_index=target_example.direct_positive_index,
+            candidate_ids=(
+                target_example.candidates[
+                    target_example.direct_positive_index
+                ].target_id,
+                *(
+                    target_id
+                    for target_id in _known_positive_target_ids(target_example)
+                    if target_id
+                    != target_example.candidates[
+                        target_example.direct_positive_index
+                    ].target_id
+                ),
+                *direct_negative_ids,
+            ),
+            positive_index=0,
             dataset=target_example.dataset,
             split=target_example.split,
             source_type="table",
             destination_type="table",
+            positive_ids=_known_positive_target_ids(target_example),
         )
     ]
     for evidence_id in positive_evidence_ids:
@@ -235,19 +344,33 @@ def _edge_examples_for_candidate_set(
                     split=target_example.split,
                     source_type="table",
                     destination_type=evidence_type,
+                    positive_ids=(evidence_id,),
+                    confirmed_labels=(1, *([None] * len(negative_evidence_ids))),
                 )
             )
-        examples.append(
-            EdgeExample(
-                query_id=evidence_id,
-                candidate_ids=(evidence_positive.target_id, *negative_target_ids),
-                positive_index=0,
-                dataset=target_example.dataset,
-                split=target_example.split,
-                source_type=evidence_type,
-                destination_type="table",
-            )
+        evidence_target_negatives = evidence_target_map.get(
+            evidence_id, all_negative_target_ids
         )
+        if evidence_target_negatives:
+            examples.append(
+                EdgeExample(
+                    query_id=evidence_id,
+                    candidate_ids=(
+                        evidence_positive.target_id,
+                        *evidence_target_negatives,
+                    ),
+                    positive_index=0,
+                    dataset=target_example.dataset,
+                    split=target_example.split,
+                    source_type=evidence_type,
+                    destination_type="table",
+                    positive_ids=(evidence_positive.target_id,),
+                    confirmed_labels=(
+                        1,
+                        *([None] * len(evidence_target_negatives)),
+                    ),
+                )
+            )
     return examples
 
 
@@ -280,12 +403,18 @@ def _edge_record(example: EdgeExample) -> dict[str, Any]:
         "query_id": example.query_id,
         "source_type": example.source_type,
         "positive_id": example.candidate_ids[example.positive_index],
+        "positive_ids": list(
+            example.positive_ids
+            or (example.candidate_ids[example.positive_index],)
+        ),
         "candidate_ids": list(example.candidate_ids),
         "destination_type": example.destination_type,
         "dataset": example.dataset,
     }
     if example.split is not None:
         record["split"] = example.split
+    if example.confirmed_labels is not None:
+        record["confirmed_labels"] = list(example.confirmed_labels)
     return record
 
 
@@ -301,7 +430,11 @@ def hard_candidate_records(
         example = item.target_example
         target_records.append(_target_record(example))
         for edge in _edge_examples_for_candidate_set(
-            example, store, item.evidence_negative_ids
+            example,
+            store,
+            item.evidence_negative_ids,
+            item.direct_target_negative_ids,
+            item.evidence_target_negative_ids,
         ):
             edge_records.append(_edge_record(edge))
     return target_records, edge_records
@@ -314,6 +447,7 @@ def retrieve_hard_candidate_sets(
     hard_targets_per_query: int,
     hard_evidence_per_type: int,
     hard_paths_per_query: int,
+    hard_targets_per_positive_evidence: int = 0,
     direct_k: int,
     evidence_k: int,
     targets_per_evidence: int,
@@ -321,8 +455,12 @@ def retrieve_hard_candidate_sets(
 ) -> list[HardCandidateSet]:
     if hard_targets_per_query <= 0:
         raise ValueError("hard_targets_per_query must be positive")
-    if hard_evidence_per_type < 0 or hard_paths_per_query < 0:
-        raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
+    if min(
+        hard_evidence_per_type,
+        hard_paths_per_query,
+        hard_targets_per_positive_evidence,
+    ) < 0:
+        raise ValueError("Hard-evidence, E-T, and hard-path sizes must be non-negative")
     if min(direct_k, evidence_k, targets_per_evidence) < 0:
         raise ValueError("ANN search sizes must be non-negative")
 
@@ -338,6 +476,29 @@ def retrieve_hard_candidate_sets(
 
         evidence_positive = example.candidates[example.evidence_positive_index]
         positive_evidence_ids = set(evidence_positive.evidence_ids)
+        evidence_target_ids: dict[str, list[str]] = {}
+        if hard_targets_per_positive_evidence:
+            positive_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
+            positive_target_hits = indices.search_many(
+                positive_ids,
+                "table",
+                targets_per_evidence,
+            )
+            for evidence_id, hits in zip(
+                positive_ids, positive_target_hits, strict=True
+            ):
+                selected = []
+                for target_id, _score in hits:
+                    if (
+                        target_id == example.query_id
+                        or target_id in known_positives
+                        or target_id in selected
+                    ):
+                        continue
+                    selected.append(target_id)
+                    if len(selected) == hard_targets_per_positive_evidence:
+                        break
+                evidence_target_ids[evidence_id] = selected
         hard_evidence_ids = []
         hard_paths = []
         all_evidence_hits = []
@@ -380,6 +541,7 @@ def retrieve_hard_candidate_sets(
                 hard_evidence_ids,
                 hard_paths[:hard_paths_per_query],
                 hard_targets_per_query=hard_targets_per_query,
+                hard_evidence_target_ids=evidence_target_ids,
             )
         )
     return candidate_sets
@@ -395,9 +557,12 @@ def score_hard_candidate_sets(
     device: torch.device,
     batch_size: int,
     ensemble_alpha: float | None = None,
+    teacher_score_space: str = "raw_logit",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if ensemble_alpha is not None and teacher_score_space != "raw_logit":
+        raise ValueError("Teacher/raw ensembles require raw Teacher logits")
     teacher.eval()
     target_records = []
     edge_records = []
@@ -416,6 +581,8 @@ def score_hard_candidate_sets(
                 item.target_example,
                 store,
                 item.evidence_negative_ids,
+                item.direct_target_negative_ids,
+                item.evidence_target_negative_ids,
             )
             for item in mined_batch
         ]
@@ -427,9 +594,22 @@ def score_hard_candidate_sets(
                 batch, teacher, store, device, aggregator, ensemble_alpha
             )
             if ensemble_alpha is not None
-            else score_target_batch(teacher, batch, store, device, aggregator)
+            else score_target_batch(
+                teacher,
+                batch,
+                store,
+                device,
+                aggregator,
+                student_score_space=teacher_score_space,
+            )
         )
-        teacher_edges = score_edge_batch(teacher, edge_examples, store, device)
+        teacher_edges = score_edge_batch(
+            teacher,
+            edge_examples,
+            store,
+            device,
+            student_score_space=teacher_score_space,
+        )
         edge_scores = (
             _ensemble_list_scores(
                 _raw_edge_scores(edge_examples, store, device),
@@ -450,11 +630,16 @@ def score_hard_candidate_sets(
                 teacher_evidence_logits=teacher_targets.evidence.logits[
                     index, :target_count
                 ].cpu().tolist(),
+                teacher_score_config=aggregator.config(),
             )
             if ensemble_alpha is not None:
                 target_record.update(
                     teacher_logit_mode="ensemble",
                     teacher_ensemble_alpha=ensemble_alpha,
+                )
+            elif teacher_score_space != "raw_logit":
+                target_record["teacher_logit_mode"] = (
+                    f"teacher_{teacher_score_space}"
                 )
             target_records.append(target_record)
             for edge_example in item_edge_examples:
@@ -466,6 +651,10 @@ def score_hard_candidate_sets(
                 if ensemble_alpha is not None:
                     edge_record["teacher_logit_mode"] = "ensemble"
                     edge_record["teacher_ensemble_alpha"] = ensemble_alpha
+                elif teacher_score_space != "raw_logit":
+                    edge_record["teacher_logit_mode"] = (
+                        f"teacher_{teacher_score_space}"
+                    )
                 edge_records.append(edge_record)
                 edge_offset += 1
     return target_records, edge_records
@@ -482,11 +671,14 @@ def score_pending_hard_examples(
     device: torch.device,
     batch_size: int,
     ensemble_alpha: float | None = None,
+    teacher_score_space: str = "raw_logit",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Score persisted hard candidates without repeating ANN retrieval."""
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if ensemble_alpha is not None and teacher_score_space != "raw_logit":
+        raise ValueError("Teacher/raw ensembles require raw Teacher logits")
     teacher.eval()
 
     target_records = []
@@ -504,7 +696,14 @@ def score_pending_hard_examples(
                 batch, teacher, store, device, aggregator, ensemble_alpha
             )
             if ensemble_alpha is not None
-            else score_target_batch(teacher, batch, store, device, aggregator)
+            else score_target_batch(
+                teacher,
+                batch,
+                store,
+                device,
+                aggregator,
+                student_score_space=teacher_score_space,
+            )
         )
         for index, example in enumerate(batch):
             candidate_count = len(example.candidates)
@@ -516,12 +715,15 @@ def score_pending_hard_examples(
                 teacher_evidence_logits=scores.evidence.logits[
                     index, :candidate_count
                 ].cpu().tolist(),
+                teacher_score_config=aggregator.config(),
             )
             if ensemble_alpha is not None:
                 record.update(
                     teacher_logit_mode="ensemble",
                     teacher_ensemble_alpha=ensemble_alpha,
                 )
+            elif teacher_score_space != "raw_logit":
+                record["teacher_logit_mode"] = f"teacher_{teacher_score_space}"
             target_records.append(record)
 
     # One mined target produces roughly four directly supervised edge lists.
@@ -537,7 +739,13 @@ def score_pending_hard_examples(
         leave=False,
     ):
         batch = edge_examples[start : start + edge_batch_size]
-        teacher_scores = score_edge_batch(teacher, batch, store, device)
+        teacher_scores = score_edge_batch(
+            teacher,
+            batch,
+            store,
+            device,
+            student_score_space=teacher_score_space,
+        )
         scores = (
             _ensemble_list_scores(
                 _raw_edge_scores(batch, store, device),
@@ -556,6 +764,8 @@ def score_pending_hard_examples(
             if ensemble_alpha is not None:
                 record["teacher_logit_mode"] = "ensemble"
                 record["teacher_ensemble_alpha"] = ensemble_alpha
+            elif teacher_score_space != "raw_logit":
+                record["teacher_logit_mode"] = f"teacher_{teacher_score_space}"
             edge_records.append(record)
 
     return target_records, edge_records

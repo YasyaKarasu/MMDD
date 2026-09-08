@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from mmdd_stage1.checkpoints import load_path_aggregator, load_student
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.models import STUDENT_SCORE_SPACES
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
     checkpoint_fingerprint,
@@ -54,6 +55,16 @@ def run(args: argparse.Namespace) -> None:
         if args.evidence_power is not None
         else saved_aggregator.power
     )
+    path_combination = (
+        args.path_combination
+        if args.path_combination is not None
+        else saved_aggregator.path_combination
+    )
+    evidence_threshold = (
+        args.evidence_threshold
+        if args.evidence_threshold is not None
+        else saved_aggregator.threshold
+    )
     model.eval()
     store = FeatureStore.from_path(Path(args.features), cache_size=args.feature_cache_size)
     corpus_sha256 = (
@@ -66,6 +77,7 @@ def run(args: argparse.Namespace) -> None:
         device=device,
         checkpoint_sha256=checkpoint_fingerprint(checkpoint_path),
         corpus_sha256=corpus_sha256,
+        score_space=args.student_score_space,
     )
     results = retrieve_zero_one_hop(
         args.query_id,
@@ -82,6 +94,16 @@ def run(args: argparse.Namespace) -> None:
         evidence_top_k=evidence_top_k,
         evidence_temperature=evidence_temperature,
         evidence_power=evidence_power,
+        path_combination=path_combination,
+        evidence_threshold=evidence_threshold,
+        evidence_target_temperature=saved_aggregator.target_temperature,
+        row_support_model=saved_aggregator.row_support_model,
+        row_support_model_sha256=saved_aggregator.row_support_model_sha256,
+        row_support_top_l=saved_aggregator.row_support_top_l,
+        evidence_content_keys=saved_aggregator.evidence_content_keys,
+        evidence_content_keys_sha256=(
+            saved_aggregator.evidence_content_keys_sha256
+        ),
         rrf_k=args.rrf_k,
         fusion_mode=args.fusion_mode,
         direct_weight=args.direct_weight,
@@ -106,6 +128,21 @@ def run(args: argparse.Namespace) -> None:
                 "evidence_top_k": evidence_top_k,
                 "evidence_temperature": evidence_temperature,
                 "evidence_power": evidence_power,
+                "path_combination": path_combination,
+                "evidence_threshold": evidence_threshold,
+                "evidence_target_temperature": (
+                    saved_aggregator.target_temperature
+                ),
+                "row_support_model": saved_aggregator.row_support_model,
+                "row_support_model_sha256": (
+                    saved_aggregator.row_support_model_sha256
+                ),
+                "row_support_top_l": saved_aggregator.row_support_top_l,
+                "evidence_content_keys": saved_aggregator.evidence_content_keys,
+                "evidence_content_keys_sha256": (
+                    saved_aggregator.evidence_content_keys_sha256
+                ),
+                "student_score_space": args.student_score_space,
                 "target_fusion": args.fusion_mode,
                 "fusion_score_normalization": args.fusion_score_normalization,
                 "fusion_score_temperature": args.fusion_score_temperature,
@@ -150,6 +187,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=128)
+    parser.add_argument(
+        "--student-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        default="raw_logit",
+    )
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--gamma", type=int, default=4)
     parser.add_argument("--gamma-evidence", type=int, default=2)
@@ -177,6 +219,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument("--path-combination", choices=["sum", "min", "product"])
+    parser.add_argument("--evidence-threshold", type=float)
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument(
         "--fusion-mode",

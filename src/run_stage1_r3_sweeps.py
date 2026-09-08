@@ -12,7 +12,6 @@ from pathlib import Path
 
 import torch
 
-from evaluate_stage1_r3_baselines import _teacher_ensemble_metrics
 from mmdd_stage1.checkpoints import load_student, load_teacher
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
@@ -22,6 +21,7 @@ from mmdd_stage1.retrieval import (
     checkpoint_fingerprint,
 )
 from mmdd_stage1.selection import load_stage1_selection
+from mmdd_stage1.teacher_rerank import teacher_ensemble_metrics as _teacher_ensemble_metrics
 
 
 def _examples(paths: list[str]) -> list:

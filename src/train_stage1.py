@@ -27,10 +27,15 @@ from mmdd_stage1.features import FeatureStore
 from mmdd_stage1.models import (
     STUDENT_INITIALIZATIONS,
     STUDENT_RELATION_PARAMS,
+    STUDENT_SCORE_SPACES,
     StudentJoinabilityModel,
     TeacherJoinabilityModel,
 )
-from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
+from mmdd_stage1.objectives import (
+    PATH_AGGREGATIONS,
+    POSITIVE_LOSS_MODES,
+    PathAggregator,
+)
 from mmdd_stage1.pca import load_pca_projection
 from mmdd_stage1.protocol import validate_protocol_split
 from mmdd_stage1.retrieval import (
@@ -56,6 +61,7 @@ from mmdd_stage1.teacher_logits import (
 from mmdd_stage1.teacher_rerank import evaluate_teacher_reranking
 from mmdd_stage1.training import (
     checkpoint,
+    confirmed_edge_label_summary,
     student_projection_drift,
     student_relation_drift,
     train_student_edges,
@@ -287,6 +293,8 @@ def _initialize_student(
         freeze_projections=bool(args.freeze_projection),
         relation_param=args.relation_param,
         relation_rank=args.relation_rank,
+        confidence_transform=bool(args.student_confidence_transform),
+        confidence_epsilon=args.student_confidence_epsilon,
     ).to(device)
 
 
@@ -302,6 +310,8 @@ def _load_or_initialize_student(
         if args.freeze_projection is not None:
             student.set_projection_frozen(args.freeze_projection)
             student.reset_projection_anchors()
+        if args.student_confidence_transform is not None:
+            student.set_confidence_transform(args.student_confidence_transform)
         return student, "checkpoint"
     return (
         _initialize_student(args, embedding_dim=embedding_dim, device=device),
@@ -418,6 +428,13 @@ def _teacher_logit_cache_dir(args: argparse.Namespace) -> Path:
     return features.parent / f"{features.name}.teacher_logits"
 
 
+def _continuous_edge_teacher_logit_cache_dir(args: argparse.Namespace) -> Path:
+    configured = args.continuous_edge_teacher_logit_cache
+    if configured:
+        return Path(configured)
+    return _teacher_logit_cache_dir(args) / "continuous_edges"
+
+
 def _metadata(path: Path) -> dict[str, Any]:
     metadata_path = path.with_suffix(path.suffix + ".metadata.json")
     if not metadata_path.is_file():
@@ -434,6 +451,8 @@ def _validate_hard_provenance(
     teacher_checkpoint: Path,
     source_student_checkpoint: Path,
     aggregator: PathAggregator | None,
+    student_score_space: str = "raw_logit",
+    teacher_score_space: str = "raw_logit",
 ) -> int:
     teacher_sha256 = checkpoint_fingerprint(teacher_checkpoint)
     student_sha256 = checkpoint_fingerprint(source_student_checkpoint)
@@ -444,16 +463,51 @@ def _validate_hard_provenance(
             raise ValueError(f"{path}: hard-negative Teacher fingerprint does not match")
         if metadata.get("student_checkpoint_sha256") != student_sha256:
             raise ValueError(f"{path}: hard negatives were mined by a different Student checkpoint")
+        mining_config = metadata.get("mining_selection_config", {})
+        if not isinstance(mining_config, dict):
+            raise ValueError(f"{path}: mining_selection_config must be an object")
         if metadata.get("teacher_scoring") == "pending":
             raise ValueError(f"{path}: hard-negative Teacher scoring is still pending")
+        training_config = metadata.get("training_score_config")
+        if training_config is not None and not isinstance(training_config, dict):
+            raise ValueError(f"{path}: training_score_config must be an object")
+        score_config = training_config or metadata
+        scored_teacher_space = score_config.get(
+            "teacher_score_space",
+            metadata.get("teacher_score_space", "raw_logit"),
+        )
+        if scored_teacher_space != teacher_score_space:
+            raise ValueError(f"{path}: hard-negative Teacher score space does not match")
+        scored_student_space = score_config.get(
+            "student_score_space",
+            metadata.get("student_score_space", "raw_logit"),
+        )
+        if scored_student_space != student_score_space:
+            raise ValueError(f"{path}: hard-negative training Student score space does not match")
         if aggregator is not None and (
-            metadata.get("evidence_aggregation") != aggregator.evidence_aggregation
-            or int(metadata.get("evidence_top_k", 0)) != aggregator.top_k
-            or float(metadata.get("evidence_temperature", 1.0))
+            score_config.get("evidence_aggregation") != aggregator.evidence_aggregation
+            or int(score_config.get("evidence_top_k", 0)) != aggregator.top_k
+            or float(score_config.get("evidence_temperature", 1.0))
             != aggregator.temperature
-            or float(metadata.get("evidence_power", 2.0)) != aggregator.power
+            or float(score_config.get("evidence_power", 2.0)) != aggregator.power
+            or str(score_config.get("path_combination", "sum"))
+            != aggregator.path_combination
+            or float(score_config.get("evidence_threshold", 0.0))
+            != aggregator.threshold
+            or float(score_config.get("evidence_target_temperature", 1.0))
+            != aggregator.target_temperature
+            or score_config.get("row_support_model")
+            != aggregator.row_support_model
+            or score_config.get("row_support_model_sha256")
+            != aggregator.row_support_model_sha256
+            or int(score_config.get("row_support_top_l", 20))
+            != aggregator.row_support_top_l
+            or score_config.get("evidence_content_keys")
+            != aggregator.evidence_content_keys
+            or score_config.get("evidence_content_keys_sha256")
+            != aggregator.evidence_content_keys_sha256
         ):
-            raise ValueError(f"{path}: hard-negative path aggregation does not match")
+            raise ValueError(f"{path}: hard-negative training aggregation does not match")
         rounds.add(int(metadata.get("mining_round", -1)))
     if len(rounds) != 1 or next(iter(rounds)) < 1:
         raise ValueError("Hard-negative inputs must belong to one explicit mining round")
@@ -554,6 +608,45 @@ class _EpochController:
                     f"{len(missing)} additional dev objects"
                 )
 
+    def _retrieval_protocol(self) -> dict[str, Any]:
+        """Shared Student/raw dev-retrieval protocol for checkpoint gating."""
+
+        args = self.args
+        aggregator = self.aggregator
+        return {
+            "recall_ks": tuple(args.train_eval_ks or args.recall_ks),
+            "gamma": args.gamma,
+            "gamma_evidence": args.gamma_evidence,
+            "direct_k": args.direct_k,
+            "evidence_k": args.evidence_k,
+            "targets_per_evidence": args.targets_per_evidence,
+            "evidence_types": tuple(args.evidence_types),
+            "evidence_aggregation": aggregator.evidence_aggregation,
+            "evidence_top_k": aggregator.top_k,
+            "evidence_temperature": aggregator.temperature,
+            "evidence_power": aggregator.power,
+            "path_combination": aggregator.path_combination,
+            "evidence_threshold": aggregator.threshold,
+            "evidence_target_temperature": aggregator.target_temperature,
+            "row_support_model": aggregator.row_support_model,
+            "row_support_model_sha256": aggregator.row_support_model_sha256,
+            "row_support_top_l": aggregator.row_support_top_l,
+            "evidence_content_keys": aggregator.evidence_content_keys,
+            "evidence_content_keys_sha256": (
+                aggregator.evidence_content_keys_sha256
+            ),
+            "rrf_k": args.rrf_k,
+            "fusion_mode": args.fusion_mode,
+            "direct_weight": args.direct_weight,
+            "evidence_weight": args.evidence_weight,
+            "fusion_score_normalization": args.fusion_score_normalization,
+            "fusion_score_temperature": args.fusion_score_temperature,
+            "gated_evidence_min_paths": args.gated_evidence_min_paths,
+            "gated_evidence_quantile": args.gated_evidence_quantile,
+            "evidence_modality_weights": args.evidence_modality_weights,
+            "return_per_query": True,
+        }
+
     def __call__(
         self,
         epoch: int,
@@ -598,6 +691,7 @@ class _EpochController:
                 device=self.device,
                 checkpoint_sha256=candidate_sha256,
                 corpus_sha256=self.corpus_sha256,
+                score_space=self.args.student_score_space,
             )
             if self.raw_embedding_metrics is None:
                 raw_indices = load_or_build_raw_embedding_indices(
@@ -613,57 +707,13 @@ class _EpochController:
                 self.raw_embedding_metrics = evaluate_student_retrieval(
                     self.dev_examples,
                     raw_indices,
-                    recall_ks=tuple(
-                        self.args.train_eval_ks or self.args.recall_ks
-                    ),
-                    gamma=self.args.gamma,
-                    gamma_evidence=self.args.gamma_evidence,
-                    direct_k=self.args.direct_k,
-                    evidence_k=self.args.evidence_k,
-                    targets_per_evidence=self.args.targets_per_evidence,
-                    evidence_types=tuple(self.args.evidence_types),
-                    evidence_aggregation=self.aggregator.evidence_aggregation,
-                    evidence_top_k=self.aggregator.top_k,
-                    evidence_temperature=self.aggregator.temperature,
-                    evidence_power=self.aggregator.power,
-                    rrf_k=self.args.rrf_k,
-                    fusion_mode=self.args.fusion_mode,
-                    direct_weight=self.args.direct_weight,
-                    evidence_weight=self.args.evidence_weight,
-                    fusion_score_normalization=self.args.fusion_score_normalization,
-                    fusion_score_temperature=self.args.fusion_score_temperature,
-                    gated_evidence_min_paths=self.args.gated_evidence_min_paths,
-                    gated_evidence_quantile=self.args.gated_evidence_quantile,
-                    evidence_modality_weights=self.args.evidence_modality_weights,
-                    return_per_query=True,
+                    **self._retrieval_protocol(),
                 )
             retrieval_metrics = evaluate_student_retrieval(
                 self.dev_examples,
                 indices,
-                recall_ks=tuple(
-                    self.args.train_eval_ks or self.args.recall_ks
-                ),
-                gamma=self.args.gamma,
-                gamma_evidence=self.args.gamma_evidence,
-                direct_k=self.args.direct_k,
-                evidence_k=self.args.evidence_k,
-                targets_per_evidence=self.args.targets_per_evidence,
-                evidence_types=tuple(self.args.evidence_types),
-                evidence_aggregation=self.aggregator.evidence_aggregation,
-                evidence_top_k=self.aggregator.top_k,
-                evidence_temperature=self.aggregator.temperature,
-                evidence_power=self.aggregator.power,
-                rrf_k=self.args.rrf_k,
-                fusion_mode=self.args.fusion_mode,
-                direct_weight=self.args.direct_weight,
-                evidence_weight=self.args.evidence_weight,
-                fusion_score_normalization=self.args.fusion_score_normalization,
-                fusion_score_temperature=self.args.fusion_score_temperature,
-                gated_evidence_min_paths=self.args.gated_evidence_min_paths,
-                gated_evidence_quantile=self.args.gated_evidence_quantile,
-                evidence_modality_weights=self.args.evidence_modality_weights,
+                **self._retrieval_protocol(),
                 identity_baseline_metrics=self.raw_embedding_metrics,
-                return_per_query=True,
             )
             retrieval_metrics["raw_embedding"] = self.raw_embedding_metrics
             record["dev_retrieval"] = retrieval_metrics
@@ -799,6 +849,16 @@ def _data_paths(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[
     )
 
 
+def _input_provenance(values: list[str]) -> list[dict[str, str]]:
+    return [
+        {
+            "path": str(Path(value).resolve()),
+            "sha256": checkpoint_fingerprint(Path(value)),
+        }
+        for value in values
+    ]
+
+
 def _validate_teacher_rerank_interval(args: argparse.Namespace) -> None:
     if args.teacher_rerank_interval <= 0:
         raise ValueError("--teacher-rerank-interval must be positive")
@@ -819,7 +879,7 @@ def _validate_initialize_only(args: argparse.Namespace) -> None:
         )
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def _normalize_run_arguments(args: argparse.Namespace) -> None:
     _apply_argument_defaults(args)
     if args.kd_target_teacher_alpha is not None:
         if (
@@ -845,12 +905,65 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--feature-cache-size must be non-negative")
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("--epochs and --batch-size must be positive")
+    if (
+        args.max_optimizer_updates is not None
+        and args.max_optimizer_updates <= 0
+    ):
+        raise ValueError("--max-optimizer-updates must be positive")
+    if args.max_optimizer_updates is not None and args.stage != "student-path":
+        raise ValueError(
+            "--max-optimizer-updates is currently valid only for student-path"
+        )
     if args.teacher_logit_batch_size <= 0:
         raise ValueError("--teacher-logit-batch-size must be positive")
     if args.temperature <= 0:
         raise ValueError("--temperature must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
+    if args.edge_bce_weight < 0:
+        raise ValueError("--edge-bce-weight must be non-negative")
+    if args.continuous_edge_weight < 0:
+        raise ValueError("--continuous-edge-weight must be non-negative")
+    if (
+        args.continuous_edge_batch_size is not None
+        and args.continuous_edge_batch_size <= 0
+    ):
+        raise ValueError("--continuous-edge-batch-size must be positive")
+    continuous_edge_configured = bool(
+        args.continuous_edge_data
+        or args.continuous_edge_dev_data
+        or args.continuous_edge_teacher_checkpoint
+        or args.continuous_edge_teacher_logit_cache
+    )
+    if continuous_edge_configured and args.stage != "student-path":
+        raise ValueError(
+            "Continuous edge training options are only valid for student-path"
+        )
+    if args.continuous_edge_dev_data and not args.continuous_edge_data:
+        raise ValueError(
+            "--continuous-edge-dev-data requires --continuous-edge-data"
+        )
+    if args.continuous_edge_data and not args.continuous_edge_dev_data:
+        raise ValueError(
+            "--continuous-edge-dev-data is required with --continuous-edge-data"
+        )
+    if (
+        args.continuous_edge_data
+        and args.distillation_weight > 0
+        and not args.continuous_edge_teacher_checkpoint
+    ):
+        raise ValueError(
+            "--continuous-edge-teacher-checkpoint is required when continuous "
+            "edge KD is enabled"
+        )
+    if args.edge_bce_weight > 0 and not (
+        args.stage in {"teacher-edge", "student-edge"}
+        or (args.stage == "student-path" and args.continuous_edge_data)
+    ):
+        raise ValueError(
+            "--edge-bce-weight requires teacher-edge, student-edge, or "
+            "student-path with --continuous-edge-data"
+        )
     if args.distillation_datasets and args.stage != "student-path":
         raise ValueError("--distillation-datasets is only valid for student-path")
     if args.relation_loss_weights and args.stage != "student-path":
@@ -870,6 +983,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--relation-learning-rate must be non-negative")
     if args.relation_rank <= 0:
         raise ValueError("--relation-rank must be positive")
+    if not 0 < args.student_confidence_epsilon < 1:
+        raise ValueError("--student-confidence-epsilon must be between 0 and 1")
+    if not 0 < args.teacher_confidence_epsilon < 1:
+        raise ValueError("--teacher-confidence-epsilon must be between 0 and 1")
+    if (
+        args.evidence_target_temperature is not None
+        and args.evidence_target_temperature <= 0
+    ):
+        raise ValueError("--evidence-target-temperature must be positive")
+    if args.row_support_top_l is not None and args.row_support_top_l <= 0:
+        raise ValueError("--row-support-top-l must be positive")
+    if args.stage.startswith("teacher") and (
+        args.student_confidence_transform is not None
+        or args.student_score_space != "raw_logit"
+    ):
+        raise ValueError(
+            "Student confidence options are only valid for Student training"
+        )
+    if not args.stage.startswith("teacher") and args.teacher_confidence_transform is not None:
+        raise ValueError(
+            "--teacher-confidence-transform is only valid for Teacher training"
+        )
+    if args.edge_bce_weight > 0 and args.stage == "teacher-edge" and not bool(
+        args.teacher_confidence_transform
+    ):
+        raise ValueError(
+            "Teacher edge BCE requires --teacher-confidence-transform"
+        )
+    if args.teacher_ensemble_alpha is not None and args.teacher_score_space != "raw_logit":
+        raise ValueError(
+            "Teacher/raw ensemble targets currently require raw Teacher logits"
+        )
     if args.in_batch_max_negatives < 0:
         raise ValueError("--in-batch-max-negatives must be non-negative")
     if args.gamma <= 0 or args.gamma_evidence <= 0:
@@ -892,6 +1037,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--min-delta and --patience must be non-negative")
     if args.learning_rate <= 0 or args.hard_learning_rate <= 0:
         raise ValueError("Learning rates must be positive")
+    if args.hard_data and args.hard_learning_rate > args.learning_rate:
+        raise ValueError(
+            "--hard-learning-rate must not exceed --learning-rate"
+        )
     if args.min_dev_evidence_path_queries < 0:
         raise ValueError("--min-dev-evidence-path-queries must be non-negative")
     if not 0 <= args.min_dev_evidence_path_coverage <= 1:
@@ -926,16 +1075,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     validate_protocol_split("training", args.split)
     validate_protocol_split("dev_gate", args.dev_split)
 
-    base_paths, hard_paths, dev_paths = _data_paths(args)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = torch.device(
-        args.device
-        if args.device != "auto"
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    teacher_stage = args.stage.startswith("teacher")
+
+def _create_feature_store(
+    args: argparse.Namespace, teacher_stage: bool
+) -> tuple[FeatureStore, int, int, int, int | None]:
     total_cache_bytes = (
         int(args.feature_cache_gb * 2**30)
         if args.feature_cache_gb is not None
@@ -962,11 +1105,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cache_size=lru_cache_objects,
         cache_bytes=lru_cache_bytes,
     )
-    embedding_dim = store.embedding_dimension()
-    hidden_dim: int | None = None
+    return (
+        store,
+        store.embedding_dimension(),
+        hot_cache_objects,
+        lru_cache_objects,
+        hot_cache_bytes,
+    )
 
-    is_path = args.stage.endswith("path")
-    loader = _load_target_training_data if is_path else _load_edge_training_data
+
+def _load_training_examples(
+    args: argparse.Namespace,
+    base_paths: list[Path],
+    hard_paths: list[Path],
+    dev_paths: list[Path],
+) -> tuple[list[Any], list[Any], list[Any]]:
+    loader = (
+        _load_target_training_data
+        if args.stage.endswith("path")
+        else _load_edge_training_data
+    )
     examples = loader(base_paths, args.split)
     hard_examples = loader(hard_paths, args.split) if hard_paths else []
     dev_examples = loader(dev_paths, args.dev_split)
@@ -978,53 +1136,149 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "--distillation-datasets contains absent training datasets: "
             + ", ".join(sorted(unknown_distillation_datasets))
         )
-    hot_cache_plan = None
-    if teacher_stage and (hot_cache_objects or hot_cache_bytes):
-        access_weights = _feature_access_weights(
-            examples, args.dataset_sampling_alpha
-        )
-        _add_feature_accesses(access_weights, hard_examples)
-        _add_feature_accesses(access_weights, dev_examples)
-        hot_cache_plan = store.configure_hot_cache(
-            access_weights,
-            byte_budget=hot_cache_bytes,
-            object_budget=hot_cache_objects,
-            include_hidden=True,
-        )
+    return examples, hard_examples, dev_examples
 
-    aggregator: PathAggregator | None = None
-    if args.stage != "teacher-edge":
-        aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
-        saved_aggregator = (
-            load_path_aggregator(Path(aggregation_checkpoint))
-            if aggregation_checkpoint
-            else PathAggregator()
-        )
-        aggregator = PathAggregator(
-            args.evidence_aggregation or saved_aggregator.evidence_aggregation,
-            args.evidence_top_k
-            if args.evidence_top_k is not None
-            else saved_aggregator.top_k,
-            temperature=(
-                args.evidence_temperature
-                if args.evidence_temperature is not None
-                else saved_aggregator.temperature
-            ),
-            power=(
-                args.evidence_power
-                if args.evidence_power is not None
-                else saved_aggregator.power
-            ),
-        )
 
-    teacher: TeacherJoinabilityModel | None = None
-    student: StudentJoinabilityModel | None = None
+def _load_continuous_edge_examples(
+    args: argparse.Namespace,
+) -> tuple[list[EdgeExample], list[EdgeExample]]:
+    if not args.continuous_edge_data:
+        return [], []
+    return (
+        _load_edge_training_data(
+            [Path(value) for value in args.continuous_edge_data],
+            args.split,
+        ),
+        _load_edge_training_data(
+            [Path(value) for value in args.continuous_edge_dev_data],
+            args.dev_split,
+        ),
+    )
+
+
+def _plan_hot_cache(
+    args: argparse.Namespace,
+    store: FeatureStore,
+    examples: list[Any],
+    hard_examples: list[Any],
+    dev_examples: list[Any],
+    *,
+    hot_cache_bytes: int | None,
+    hot_cache_objects: int,
+) -> dict[str, Any] | None:
+    if not (hot_cache_objects or hot_cache_bytes):
+        return None
+    access_weights = _feature_access_weights(examples, args.dataset_sampling_alpha)
+    _add_feature_accesses(access_weights, hard_examples)
+    _add_feature_accesses(access_weights, dev_examples)
+    return store.configure_hot_cache(
+        access_weights,
+        byte_budget=hot_cache_bytes,
+        object_budget=hot_cache_objects,
+        include_hidden=True,
+    )
+
+
+def _resolve_aggregator(args: argparse.Namespace) -> PathAggregator | None:
+    if args.stage == "teacher-edge":
+        return None
+    aggregation_checkpoint = args.student_checkpoint or args.teacher_checkpoint
+    saved_aggregator = (
+        load_path_aggregator(Path(aggregation_checkpoint))
+        if aggregation_checkpoint
+        else PathAggregator()
+    )
+    row_support_model = (
+        args.row_support_model
+        if args.row_support_model is not None
+        else saved_aggregator.row_support_model
+    )
+    row_support_model_sha256 = (
+        saved_aggregator.row_support_model_sha256
+        if row_support_model == saved_aggregator.row_support_model
+        else None
+    )
+    evidence_content_keys = (
+        args.evidence_content_keys
+        if args.evidence_content_keys is not None
+        else saved_aggregator.evidence_content_keys
+    )
+    evidence_content_keys_sha256 = (
+        saved_aggregator.evidence_content_keys_sha256
+        if evidence_content_keys == saved_aggregator.evidence_content_keys
+        else None
+    )
+    return PathAggregator(
+        args.evidence_aggregation or saved_aggregator.evidence_aggregation,
+        args.evidence_top_k
+        if args.evidence_top_k is not None
+        else saved_aggregator.top_k,
+        temperature=(
+            args.evidence_temperature
+            if args.evidence_temperature is not None
+            else saved_aggregator.temperature
+        ),
+        power=(
+            args.evidence_power
+            if args.evidence_power is not None
+            else saved_aggregator.power
+        ),
+        path_combination=(
+            getattr(args, "path_combination", None)
+            if getattr(args, "path_combination", None) is not None
+            else saved_aggregator.path_combination
+        ),
+        threshold=(
+            getattr(args, "evidence_threshold", None)
+            if getattr(args, "evidence_threshold", None) is not None
+            else saved_aggregator.threshold
+        ),
+        target_temperature=(
+            args.evidence_target_temperature
+            if args.evidence_target_temperature is not None
+            else saved_aggregator.target_temperature
+        ),
+        row_support_model=row_support_model,
+        row_support_model_sha256=row_support_model_sha256,
+        row_support_top_l=(
+            args.row_support_top_l
+            if args.row_support_top_l is not None
+            else saved_aggregator.row_support_top_l
+        ),
+        evidence_content_keys=evidence_content_keys,
+        evidence_content_keys_sha256=evidence_content_keys_sha256,
+    )
+
+
+def _prepare_teacher_logits(
+    args: argparse.Namespace,
+    store: FeatureStore,
+    device: torch.device,
+    hard_paths: list[Path],
+    examples: list[Any],
+    hard_examples: list[Any],
+    dev_examples: list[Any],
+    aggregator: PathAggregator | None,
+    embedding_examples: list[Any],
+) -> tuple[
+    list[Any],
+    list[Any],
+    int | None,
+    int | None,
+    list[Path],
+    int,
+    bool,
+    int,
+]:
+    """Load or generate cached Teacher/ensemble logits for Student stages."""
+
+    is_path = args.stage.endswith("path")
+    hidden_dim: int | None = None
     mining_round = None
     teacher_cache_paths: list[Path] = []
     teacher_cache_hits = 0
     teacher_cache_generated = False
     preloaded_embeddings = 0
-    student_initialization_source: str | None = None
     if args.stage.startswith("student") and (
         args.distillation_weight > 0 or hard_examples
     ):
@@ -1058,12 +1312,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 teacher_checkpoint=teacher_path,
                 source_student_checkpoint=source_checkpoint,
                 aggregator=aggregator,
+                student_score_space=args.student_score_space,
+                teacher_score_space=args.teacher_score_space,
             )
             if not has_teacher_logits(
                 hard_examples,
                 teacher_sha256,
                 cache_aggregator,
                 args.teacher_ensemble_alpha,
+                args.teacher_score_space,
             ):
                 raise ValueError(
                     "Hard-negative data must contain matching cached Teacher/ensemble logits"
@@ -1076,6 +1333,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             teacher_sha256,
             cache_aggregator,
             args.teacher_ensemble_alpha,
+            args.teacher_score_space,
         )
         dev_examples, dev_cache_path, dev_cache_hit = load_teacher_logits(
             dev_examples,
@@ -1083,6 +1341,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             teacher_sha256,
             cache_aggregator,
             args.teacher_ensemble_alpha,
+            args.teacher_score_space,
         )
         teacher_cache_hits = int(train_cache_hit) + int(dev_cache_hit)
 
@@ -1091,12 +1350,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             teacher_sha256,
             cache_aggregator,
             args.teacher_ensemble_alpha,
+            args.teacher_score_space,
         )
         dev_logits_ready = has_teacher_logits(
             dev_examples,
             teacher_sha256,
             cache_aggregator,
             args.teacher_ensemble_alpha,
+            args.teacher_score_space,
         )
         if not train_logits_ready or not dev_logits_ready:
             teacher_cache_generated = True
@@ -1146,6 +1407,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         batch_size=args.teacher_logit_batch_size,
                         aggregator=cache_aggregator,
                         ensemble_alpha=args.teacher_ensemble_alpha,
+                        teacher_score_space=args.teacher_score_space,
                     )
                 if not dev_logits_ready:
                     dev_examples, dev_cache_path = score_and_cache_teacher_logits(
@@ -1158,6 +1420,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         batch_size=args.teacher_logit_batch_size,
                         aggregator=cache_aggregator,
                         ensemble_alpha=args.teacher_ensemble_alpha,
+                        teacher_score_space=args.teacher_score_space,
                     )
                 del frozen_teacher
                 if device.type == "cuda":
@@ -1166,20 +1429,143 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         if args.preload_embeddings:
             preloaded_embeddings = store.preload_embeddings(
-                _referenced_object_ids([*examples, *hard_examples, *dev_examples])
+                _referenced_object_ids(
+                    [
+                        *examples,
+                        *hard_examples,
+                        *dev_examples,
+                        *embedding_examples,
+                    ]
+                )
             )
     elif args.stage.startswith("student"):
         if args.preload_embeddings:
             preloaded_embeddings = store.preload_embeddings(
                 _referenced_object_ids(
-                    [*examples, *hard_examples, *dev_examples]
+                    [
+                        *examples,
+                        *hard_examples,
+                        *dev_examples,
+                        *embedding_examples,
+                    ]
                 )
             )
     else:
         hidden_dim = store.teacher_dimension()
         if hidden_dim is None:
             raise ValueError("Teacher training requires cached hidden_states")
+    return (
+        examples,
+        dev_examples,
+        hidden_dim,
+        mining_round,
+        teacher_cache_paths,
+        teacher_cache_hits,
+        teacher_cache_generated,
+        preloaded_embeddings,
+    )
 
+
+def _prepare_continuous_edge_teacher_logits(
+    args: argparse.Namespace,
+    store: FeatureStore,
+    device: torch.device,
+    examples: list[EdgeExample],
+    dev_examples: list[EdgeExample],
+) -> tuple[
+    list[EdgeExample],
+    list[EdgeExample],
+    list[Path],
+    int,
+    bool,
+    str | None,
+]:
+    """Attach logits from the independently trained edge Teacher."""
+
+    if not examples or args.distillation_weight == 0:
+        return examples, dev_examples, [], 0, False, None
+    teacher_path = _required_path(
+        args.continuous_edge_teacher_checkpoint,
+        "--continuous-edge-teacher-checkpoint",
+        args.stage,
+    )
+    teacher_sha256 = checkpoint_fingerprint(teacher_path)
+    cache_dir = _continuous_edge_teacher_logit_cache_dir(args)
+    examples, train_cache_path, train_cache_hit = load_teacher_logits(
+        examples,
+        cache_dir,
+        teacher_sha256,
+        None,
+        None,
+        args.teacher_score_space,
+    )
+    dev_examples, dev_cache_path, dev_cache_hit = load_teacher_logits(
+        dev_examples,
+        cache_dir,
+        teacher_sha256,
+        None,
+        None,
+        args.teacher_score_space,
+    )
+    train_ready = has_teacher_logits(
+        examples, teacher_sha256, None, None, args.teacher_score_space
+    )
+    dev_ready = has_teacher_logits(
+        dev_examples, teacher_sha256, None, None, args.teacher_score_space
+    )
+    generated = not train_ready or not dev_ready
+    if generated:
+        frozen_teacher = load_teacher(teacher_path, device)
+        _configure_teacher_compute(frozen_teacher, args.teacher_amp, device)
+        hidden_dim = store.teacher_dimension()
+        if hidden_dim is None:
+            raise ValueError(
+                "Continuous edge Teacher cache is incomplete and the feature "
+                "cache has no hidden_states"
+            )
+        if frozen_teacher.input_dim != hidden_dim:
+            raise ValueError(
+                "Continuous edge Teacher checkpoint input dimension does not "
+                "match the feature cache"
+            )
+        if not train_ready:
+            examples, train_cache_path = score_and_cache_teacher_logits(
+                examples,
+                frozen_teacher,
+                store,
+                cache_dir,
+                teacher_sha256,
+                device=device,
+                batch_size=args.teacher_logit_batch_size,
+                teacher_score_space=args.teacher_score_space,
+            )
+        if not dev_ready:
+            dev_examples, dev_cache_path = score_and_cache_teacher_logits(
+                dev_examples,
+                frozen_teacher,
+                store,
+                cache_dir,
+                teacher_sha256,
+                device=device,
+                batch_size=args.teacher_logit_batch_size,
+                teacher_score_space=args.teacher_score_space,
+            )
+        del frozen_teacher
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return (
+        examples,
+        dev_examples,
+        [train_cache_path, dev_cache_path],
+        int(train_cache_hit) + int(dev_cache_hit),
+        generated,
+        teacher_sha256,
+    )
+
+
+def _resolve_retrieval_paths(
+    args: argparse.Namespace,
+) -> tuple[Path | None, Path | None, Path | None, str]:
     corpus_path = None
     index_root = None
     raw_index_root = None
@@ -1211,6 +1597,165 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.raw_index_root
                 else Path(args.output).parent / "raw_embedding_index"
             )
+    return corpus_path, index_root, raw_index_root, primary_metric
+
+
+def _configure_teacher_optimizer(
+    teacher: TeacherJoinabilityModel,
+    args: argparse.Namespace,
+    *,
+    hidden_dim: int,
+    learning_rate: float,
+    device: torch.device,
+) -> torch.optim.AdamW:
+    if teacher.input_dim != hidden_dim:
+        raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
+    _configure_teacher_compute(teacher, args.teacher_amp, device)
+    return torch.optim.AdamW(
+        teacher.parameters(), lr=learning_rate, weight_decay=args.weight_decay
+    )
+
+
+def _prepare_student_training(
+    args: argparse.Namespace,
+    *,
+    embedding_dim: int,
+    learning_rate: float,
+    device: torch.device,
+) -> tuple[StudentJoinabilityModel, str, float, torch.optim.AdamW]:
+    student, student_initialization_source = _load_or_initialize_student(
+        args, embedding_dim=embedding_dim, device=device
+    )
+    if student.input_dim != embedding_dim:
+        raise ValueError("Student checkpoint input dimension does not match the feature cache")
+    relation_learning_rate = _student_relation_learning_rate(
+        student,
+        configured=args.relation_learning_rate,
+        projection_learning_rate=learning_rate,
+    )
+    optimizer = _student_optimizer(
+        student,
+        projection_learning_rate=learning_rate,
+        relation_learning_rate=relation_learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    return student, student_initialization_source, relation_learning_rate, optimizer
+
+
+def _stage2_evidence_gate(
+    best_metrics: dict[str, Any], args: argparse.Namespace
+) -> tuple[int, float, dict[str, float], bool]:
+    evidence_count = int(
+        best_metrics.get("positive_evidence_path_queries@10", 0)
+    )
+    evidence_coverage = float(
+        best_metrics.get("positive_evidence_path_coverage@10", 0.0)
+    )
+    evidence_coverage_by_dataset = {
+        dataset: float(metrics.get("positive_evidence_path_coverage@10", 0.0))
+        for dataset, metrics in best_metrics.get("by_dataset", {}).items()
+    }
+    stage2_allowed = (
+        args.stage == "student-path"
+        and evidence_count >= args.min_dev_evidence_path_queries
+        and evidence_coverage >= args.min_dev_evidence_path_coverage
+        and all(
+            coverage >= args.min_dev_evidence_path_coverage_by_dataset
+            for coverage in evidence_coverage_by_dataset.values()
+        )
+    )
+    return (
+        evidence_count,
+        evidence_coverage,
+        evidence_coverage_by_dataset,
+        stage2_allowed,
+    )
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    _normalize_run_arguments(args)
+    base_paths, hard_paths, dev_paths = _data_paths(args)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    device = torch.device(
+        args.device
+        if args.device != "auto"
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    teacher_stage = args.stage.startswith("teacher")
+    store, embedding_dim, hot_cache_objects, lru_cache_objects, hot_cache_bytes = (
+        _create_feature_store(args, teacher_stage)
+    )
+    examples, hard_examples, dev_examples = _load_training_examples(
+        args, base_paths, hard_paths, dev_paths
+    )
+    continuous_edge_examples, continuous_edge_dev_examples = (
+        _load_continuous_edge_examples(args)
+    )
+    if args.continuous_edge_data and not continuous_edge_examples:
+        raise ValueError("Continuous edge training data is empty")
+    if args.continuous_edge_dev_data and not continuous_edge_dev_examples:
+        raise ValueError("Continuous edge dev data is empty")
+    hot_cache_plan = _plan_hot_cache(
+        args,
+        store,
+        examples,
+        hard_examples,
+        dev_examples,
+        hot_cache_bytes=hot_cache_bytes,
+        hot_cache_objects=hot_cache_objects,
+    )
+    aggregator = _resolve_aggregator(args)
+    if (
+        aggregator is not None
+        and aggregator.evidence_aggregation == "greedy_row_support"
+        and (
+            not aggregator.row_support_models
+            or not aggregator.evidence_content_key_by_id
+        )
+    ):
+        raise ValueError(
+            "greedy_row_support requires --row-support-model and "
+            "--evidence-content-keys"
+        )
+    (
+        continuous_edge_examples,
+        continuous_edge_dev_examples,
+        continuous_edge_teacher_cache_paths,
+        continuous_edge_teacher_cache_hits,
+        continuous_edge_teacher_cache_generated,
+        continuous_edge_teacher_sha256,
+    ) = _prepare_continuous_edge_teacher_logits(
+        args,
+        store,
+        device,
+        continuous_edge_examples,
+        continuous_edge_dev_examples,
+    )
+    (
+        examples,
+        dev_examples,
+        hidden_dim,
+        mining_round,
+        teacher_cache_paths,
+        teacher_cache_hits,
+        teacher_cache_generated,
+        preloaded_embeddings,
+    ) = _prepare_teacher_logits(
+        args,
+        store,
+        device,
+        hard_paths,
+        examples,
+        hard_examples,
+        dev_examples,
+        aggregator,
+        [*continuous_edge_examples, *continuous_edge_dev_examples],
+    )
+    corpus_path, index_root, raw_index_root, primary_metric = (
+        _resolve_retrieval_paths(args)
+    )
 
     controller = _EpochController(
         output=Path(args.output),
@@ -1229,9 +1774,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     learning_rate = args.hard_learning_rate if hard_examples else args.learning_rate
     relation_learning_rate: float | None = None
-    if hard_examples and args.hard_learning_rate >= args.learning_rate:
+    if hard_examples and args.hard_learning_rate > args.learning_rate:
         raise ValueError(
-            "--hard-learning-rate must be lower than --learning-rate"
+            "--hard-learning-rate must not exceed --learning-rate"
         )
 
     common = {
@@ -1245,6 +1790,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "dev_examples": dev_examples,
         "epoch_callback": controller,
     }
+    student: StudentJoinabilityModel | None = None
+    student_initialization_source: str | None = None
     if args.stage == "teacher-edge":
         teacher = (
             load_teacher(
@@ -1266,15 +1813,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 table_tokens_per_group=_fresh_teacher_table_tokens_per_group(
                     args.teacher_table_tokens_per_group
                 ),
+                confidence_transform=bool(args.teacher_confidence_transform),
+                confidence_epsilon=args.teacher_confidence_epsilon,
             ).to(device)
         )
-        if teacher.input_dim != hidden_dim:
-            raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
-        _configure_teacher_compute(teacher, args.teacher_amp, device)
-        optimizer = torch.optim.AdamW(
-            teacher.parameters(), lr=learning_rate, weight_decay=args.weight_decay
+        if args.teacher_checkpoint and args.teacher_confidence_transform is not None:
+            teacher.set_confidence_transform(args.teacher_confidence_transform)
+        optimizer = _configure_teacher_optimizer(
+            teacher,
+            args,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+            device=device,
         )
-        history = train_teacher_edges(teacher, examples, store, optimizer, **common)
+        history = train_teacher_edges(
+            teacher,
+            examples,
+            store,
+            optimizer,
+            score_space=args.teacher_score_space,
+            edge_bce_weight=args.edge_bce_weight,
+            positive_loss_mode=args.positive_loss_mode,
+            **common,
+        )
     elif args.stage == "teacher-path":
         teacher_path = _required_path(
             args.teacher_checkpoint, "--teacher-checkpoint", args.stage
@@ -1284,14 +1845,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             device,
             table_tokens_per_group=args.teacher_table_tokens_per_group,
         )
-        if teacher.input_dim != hidden_dim:
-            raise ValueError("Teacher checkpoint input dimension does not match the feature cache")
-        _configure_teacher_compute(teacher, args.teacher_amp, device)
-        optimizer = torch.optim.AdamW(
-            teacher.parameters(), lr=learning_rate, weight_decay=args.weight_decay
+        if args.teacher_confidence_transform is not None:
+            teacher.set_confidence_transform(args.teacher_confidence_transform)
+        optimizer = _configure_teacher_optimizer(
+            teacher,
+            args,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+            device=device,
         )
         history = train_teacher_paths(
-            teacher, examples, store, optimizer, aggregator, **common
+            teacher,
+            examples,
+            store,
+            optimizer,
+            aggregator,
+            score_space=args.teacher_score_space,
+            positive_loss_mode=args.positive_loss_mode,
+            **common,
         )
     elif args.stage == "student-edge":
         if hard_examples and not args.student_checkpoint:
@@ -1305,21 +1876,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "Hard-negative Student edge training must start from the Student "
                 "checkpoint used for mining"
             )
-        student, student_initialization_source = _load_or_initialize_student(
-            args, embedding_dim=embedding_dim, device=device
-        )
-        if student.input_dim != embedding_dim:
-            raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        relation_learning_rate = _student_relation_learning_rate(
-            student,
-            configured=args.relation_learning_rate,
-            projection_learning_rate=learning_rate,
-        )
-        optimizer = _student_optimizer(
-            student,
-            projection_learning_rate=learning_rate,
-            relation_learning_rate=relation_learning_rate,
-            weight_decay=args.weight_decay,
+        student, student_initialization_source, relation_learning_rate, optimizer = (
+            _prepare_student_training(
+                args, embedding_dim=embedding_dim, learning_rate=learning_rate, device=device
+            )
         )
         history = train_student_edges(
             student,
@@ -1328,29 +1888,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             optimizer,
             temperature=args.temperature,
             distillation_weight=args.distillation_weight,
+            edge_bce_weight=args.edge_bce_weight,
             anchor_weight=args.anchor_weight,
             anchor_weight_evidence=args.anchor_weight_evidence,
             in_batch_negatives=args.in_batch_negatives,
             in_batch_max_negatives=args.in_batch_max_negatives,
             edge_type_oversample=args.edge_type_oversample,
+            student_score_space=args.student_score_space,
+            positive_loss_mode=args.positive_loss_mode,
             **common,
         )
     else:
-        student, student_initialization_source = _load_or_initialize_student(
-            args, embedding_dim=embedding_dim, device=device
-        )
-        if student.input_dim != embedding_dim:
-            raise ValueError("Student checkpoint input dimension does not match the feature cache")
-        relation_learning_rate = _student_relation_learning_rate(
-            student,
-            configured=args.relation_learning_rate,
-            projection_learning_rate=learning_rate,
-        )
-        optimizer = _student_optimizer(
-            student,
-            projection_learning_rate=learning_rate,
-            relation_learning_rate=relation_learning_rate,
-            weight_decay=args.weight_decay,
+        student, student_initialization_source, relation_learning_rate, optimizer = (
+            _prepare_student_training(
+                args, embedding_dim=embedding_dim, learning_rate=learning_rate, device=device
+            )
         )
         epoch_zero_record = None
         if args.eval_epoch_zero:
@@ -1383,10 +1935,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 in_batch_negatives=args.in_batch_negatives,
                 in_batch_max_negatives=args.in_batch_max_negatives,
                 relation_loss_weights=args.relation_loss_weights,
+                student_score_space=args.student_score_space,
+                positive_loss_mode=args.positive_loss_mode,
+                continuous_edge_examples=continuous_edge_examples,
+                continuous_edge_dev_examples=continuous_edge_dev_examples,
+                continuous_edge_weight=args.continuous_edge_weight,
+                continuous_edge_bce_weight=args.edge_bce_weight,
+                continuous_edge_batch_size=args.continuous_edge_batch_size,
+                max_optimizer_updates=args.max_optimizer_updates,
                 **common,
             )
         if epoch_zero_record is not None:
             history.insert(0, epoch_zero_record)
+
+    if (
+        history
+        and history[-1].get("optimizer_update_budget_exhausted")
+        and controller.stop_reason == "max_epochs"
+    ):
+        controller.stop_reason = (
+            f"optimizer_update_budget_{args.max_optimizer_updates}"
+        )
 
     controller.finalize_gate()
     controller.prune_indices()
@@ -1394,26 +1963,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     paths = controller.manager.paths
     assert controller.best_metrics is not None
     best_sha256 = checkpoint_fingerprint(paths["best"])
-    evidence_count = int(
-        controller.best_metrics.get("positive_evidence_path_queries@10", 0)
-    )
-    evidence_coverage = float(
-        controller.best_metrics.get("positive_evidence_path_coverage@10", 0.0)
-    )
-    evidence_coverage_by_dataset = {
-        dataset: float(metrics.get("positive_evidence_path_coverage@10", 0.0))
-        for dataset, metrics in controller.best_metrics.get(
-            "by_dataset", {}
-        ).items()
-    }
-    stage2_allowed = (
-        args.stage == "student-path"
-        and evidence_count >= args.min_dev_evidence_path_queries
-        and evidence_coverage >= args.min_dev_evidence_path_coverage
-        and all(
-            coverage >= args.min_dev_evidence_path_coverage_by_dataset
-            for coverage in evidence_coverage_by_dataset.values()
-        )
+    evidence_count, evidence_coverage, evidence_coverage_by_dataset, stage2_allowed = (
+        _stage2_evidence_gate(controller.best_metrics, args)
     )
     path_aggregation_metadata = (
         aggregator.config() if aggregator is not None else None
@@ -1435,6 +1986,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.teacher_rerank_batch_size,
         "interval": args.teacher_rerank_interval,
     }
+    continuous_edge_metadata = {
+        "enabled": bool(continuous_edge_examples),
+        "train_data": _input_provenance(args.continuous_edge_data),
+        "dev_data": _input_provenance(args.continuous_edge_dev_data),
+        "train_examples": len(continuous_edge_examples),
+        "dev_examples": len(continuous_edge_dev_examples),
+        "weight": args.continuous_edge_weight,
+        "bce_weight": args.edge_bce_weight,
+        "batch_size": args.continuous_edge_batch_size or args.batch_size,
+        "train_participation": (
+            confirmed_edge_label_summary(continuous_edge_examples)
+            if continuous_edge_examples
+            else None
+        ),
+        "dev_participation": (
+            confirmed_edge_label_summary(continuous_edge_dev_examples)
+            if continuous_edge_dev_examples
+            else None
+        ),
+        "teacher_checkpoint": (
+            str(Path(args.continuous_edge_teacher_checkpoint).resolve())
+            if args.continuous_edge_teacher_checkpoint
+            else None
+        ),
+        "teacher_checkpoint_sha256": continuous_edge_teacher_sha256,
+        "teacher_target": (
+            "teacher" if continuous_edge_teacher_sha256 is not None else None
+        ),
+        "teacher_cache_generated": continuous_edge_teacher_cache_generated,
+        "teacher_logit_cache_hits": continuous_edge_teacher_cache_hits,
+        "teacher_logit_caches": [
+            str(path.resolve()) for path in continuous_edge_teacher_cache_paths
+        ],
+    }
     history_payload = {
         "format_version": 1,
         "completed_stage": args.stage,
@@ -1448,6 +2033,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "learning_rate": learning_rate,
         "relation_learning_rate": relation_learning_rate,
         "anchor_weight": args.anchor_weight,
+        "edge_bce_weight": args.edge_bce_weight,
         "anchor_weight_evidence": (
             args.anchor_weight
             if args.anchor_weight_evidence is None
@@ -1462,11 +2048,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "in_batch_max_negatives": args.in_batch_max_negatives,
         "edge_type_oversample": args.edge_type_oversample,
         "relation_loss_weights": args.relation_loss_weights,
+        "student_score_space": args.student_score_space,
+        "teacher_score_space": args.teacher_score_space,
+        "positive_loss_mode": args.positive_loss_mode,
+        "teacher_confidence_transform": args.teacher_confidence_transform,
         "eval_epoch_zero": args.eval_epoch_zero,
         "initialize_only": args.initialize_only,
+        "max_optimizer_updates": args.max_optimizer_updates,
         "path_aggregation": path_aggregation_metadata,
         "fusion": fusion_metadata,
         "teacher_rerank_gate": teacher_rerank_gate_metadata,
+        "continuous_edge_training": continuous_edge_metadata,
         "teacher_amp": args.teacher_amp,
         "teacher_table_tokens_per_group": args.teacher_table_tokens_per_group,
         "feature_cache": {
@@ -1529,10 +2121,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "observed_coverage_by_dataset": evidence_coverage_by_dataset,
         },
         "stop_reason": controller.stop_reason,
+        "max_optimizer_updates": args.max_optimizer_updates,
         "path_aggregation": path_aggregation_metadata,
+        "student_score_space": args.student_score_space,
+        "teacher_score_space": args.teacher_score_space,
+        "positive_loss_mode": args.positive_loss_mode,
         "mining_round": mining_round,
         "fusion": fusion_metadata,
         "teacher_rerank_gate": teacher_rerank_gate_metadata,
+        "continuous_edge_training": continuous_edge_metadata,
     }
     if student is not None:
         history_payload["student_config"] = student.config()
@@ -1551,6 +2148,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_cache_generated": teacher_cache_generated,
         "teacher_logit_cache_hits": teacher_cache_hits,
         "preloaded_embeddings": preloaded_embeddings,
+        "continuous_edge_training": continuous_edge_metadata,
         "feature_cache": store.cache_info(),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -1584,6 +2182,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dev-split", default="dev", choices=["dev"])
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument(
+        "--max-optimizer-updates",
+        type=int,
+        help="Optional exact optimizer-step cap for student-path budget matching.",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -1628,6 +2231,29 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--teacher-logit-cache",
         help="Persistent base/dev Teacher-logit cache; defaults inside the feature cache.",
     )
+    parser.add_argument(
+        "--continuous-edge-data",
+        nargs="+",
+        default=[],
+        help="Train edge lists paired one-for-one with student-path batches.",
+    )
+    parser.add_argument(
+        "--continuous-edge-dev-data",
+        nargs="+",
+        default=[],
+        help="Fixed dev edge lists for the continuous local objective.",
+    )
+    parser.add_argument(
+        "--continuous-edge-teacher-checkpoint",
+        help="Independent edge Teacher checkpoint used for continuous edge KD.",
+    )
+    parser.add_argument(
+        "--continuous-edge-teacher-logit-cache",
+        help=(
+            "Persistent continuous-edge Teacher-logit cache; defaults below "
+            "the ordinary Teacher-logit cache."
+        ),
+    )
     parser.add_argument("--teacher-logit-batch-size", type=int, default=8)
     parser.add_argument(
         "--teacher-amp",
@@ -1642,6 +2268,24 @@ def _argument_parser() -> argparse.ArgumentParser:
             "Retain this many ordered pooled tokens per table schema/row group "
             "inside the Teacher. Fresh models default to 1; loaded checkpoints "
             "keep their saved value when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-confidence-transform",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable trainable positive-scale type-pair confidence logits in "
+            "Teacher training; loaded checkpoints keep their setting by default."
+        ),
+    )
+    parser.add_argument("--teacher-confidence-epsilon", type=float, default=1e-6)
+    parser.add_argument(
+        "--teacher-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        default="raw_logit",
+        help=(
+            "Teacher score space used by Teacher losses and Student KD caches."
         ),
     )
     parser.add_argument(
@@ -1716,6 +2360,31 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Freeze Student object projections; loaded checkpoints keep their setting by default.",
     )
+    parser.add_argument(
+        "--student-confidence-transform",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable trainable positive-scale type-pair affine confidence logits; "
+            "loaded checkpoints keep their setting by default."
+        ),
+    )
+    parser.add_argument("--student-confidence-epsilon", type=float, default=1e-6)
+    parser.add_argument(
+        "--student-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        default="raw_logit",
+        help="Student score consumed by edge/path losses and retrieval evaluation.",
+    )
+    parser.add_argument(
+        "--positive-loss-mode",
+        choices=sorted(POSITIVE_LOSS_MODES),
+        default="sum_probability",
+        help=(
+            "Multi-positive listwise objective: sum positive probability mass "
+            "or mean negative log probability across positives."
+        ),
+    )
     parser.add_argument("--anchor-weight", type=float, default=0.0)
     parser.add_argument(
         "--anchor-weight-evidence",
@@ -1759,6 +2428,17 @@ def _argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--distillation-weight", type=float, default=1.0)
+    parser.add_argument("--continuous-edge-weight", type=float, default=1.0)
+    parser.add_argument("--continuous-edge-batch-size", type=int)
+    parser.add_argument(
+        "--edge-bce-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for relation-macro BCE on explicitly confirmed edge labels; "
+            "unknown candidates are excluded and confidence logits are used."
+        ),
+    )
     parser.add_argument(
         "--kd-target-teacher-alpha",
         type=float,
@@ -1785,6 +2465,29 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument("--path-combination", choices=["sum", "min", "product"])
+    parser.add_argument("--evidence-threshold", type=float)
+    parser.add_argument(
+        "--row-support-model",
+        help="Frozen train-calibration isotonic model required by greedy_row_support.",
+    )
+    parser.add_argument(
+        "--row-support-top-l",
+        type=int,
+        help="Maximum quality-ranked evidence candidates considered by G5.",
+    )
+    parser.add_argument(
+        "--evidence-content-keys",
+        help="Exact-content key manifest required by formal G5 runs.",
+    )
+    parser.add_argument(
+        "--evidence-target-temperature",
+        type=float,
+        help=(
+            "Divide the aggregated evidence target score by this temperature "
+            "before target-level losses."
+        ),
+    )
     parser.add_argument(
         "--relation-loss-weight",
         dest="relation_loss_weights",

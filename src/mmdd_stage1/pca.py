@@ -106,7 +106,10 @@ def compute_pca_projection(
         center=True,
         niter=iterations,
     )
-    projection = components[:, :student_dim].T.contiguous().cpu()
+    orthonormal_components, _triangular = torch.linalg.qr(
+        components[:, :student_dim], mode="reduced"
+    )
+    projection = orthonormal_components.T.contiguous().cpu()
     retained_variance = singular_values[:student_dim].square().sum().cpu()
     total_variance = embeddings.float().var(dim=0, correction=1).sum()
     if total_variance <= 0:

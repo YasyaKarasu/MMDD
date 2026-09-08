@@ -17,7 +17,10 @@ import torch
 from mmdd_stage1.checkpoints import load_student
 from mmdd_stage1.data import TargetExample, load_target_examples
 from mmdd_stage1.features import FeatureStore
-from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
+from mmdd_stage1.objectives import (
+    RAW_EDGE_SCORE_PATH_AGGREGATIONS,
+    PathAggregator,
+)
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
     build_indices,
@@ -29,20 +32,20 @@ from mmdd_stage1.retrieval import (
 )
 from mmdd_stage1.selection import load_stage1_selection
 from mmdd_stage1.significance import paired_bootstrap_delta
-from run_stage1_r6_sweeps import (
-    RECALL_KS,
-    _append_values,
-    _finalize_records,
-    _path_pool,
-    _query_values,
+from mmdd_stage1.sweep_metrics import (
+    append_values as _append_values,
+    finalize_records as _finalize_records,
+    path_pool as _path_pool,
+    query_values as _query_values,
 )
+from run_stage1_r6_sweeps import RECALL_KS
 from run_stage1_r7_task_q import _lake_data
 
 R5_ANCHORS = {"entitables": 0.3774, "wdc": 0.6436}
 
 
 def aggregation_configs() -> list[dict[str, Any]]:
-    """Return the seven forms with a small allowed parameter grid."""
+    """Return every supported form with a small allowed parameter grid."""
 
     configs = [
         {"form": "logsumexp", "top_k": 4, "temperature": 1.0, "power": 2.0},
@@ -53,6 +56,16 @@ def aggregation_configs() -> list[dict[str, Any]]:
         for top_k in (2, 4):
             configs.append(
                 {"form": form, "top_k": top_k, "temperature": 1.0, "power": 2.0}
+            )
+    for form in ("logmeanexp", "topk_logmeanexp", "topk_logsumexp"):
+        for temperature in (0.1, 0.3, 1.0):
+            configs.append(
+                {
+                    "form": form,
+                    "top_k": 4,
+                    "temperature": temperature,
+                    "power": 2.0,
+                }
             )
     for temperature in (0.1, 0.3, 1.0):
         configs.append(
@@ -67,12 +80,18 @@ def aggregation_configs() -> list[dict[str, Any]]:
         configs.append(
             {"form": "power_mean", "top_k": 4, "temperature": 1.0, "power": power}
         )
-    if {config["form"] for config in configs} != PATH_AGGREGATIONS:
-        raise AssertionError("Task A must cover every PathAggregator form")
+    if {config["form"] for config in configs} != RAW_EDGE_SCORE_PATH_AGGREGATIONS:
+        raise AssertionError(
+            "Task A must cover every aggregation defined for raw edge scores"
+        )
     for config in configs:
         suffix = ""
         if config["form"] in {"topk_mean", "topk_sum"}:
             suffix = f"_k{config['top_k']}"
+        elif config["form"] in {"topk_logmeanexp", "topk_logsumexp"}:
+            suffix = f"_k{config['top_k']}_t{config['temperature']:g}"
+        elif config["form"] == "logmeanexp":
+            suffix = f"_t{config['temperature']:g}"
         elif config["form"] == "softmax_weighted_mean":
             suffix = f"_t{config['temperature']:g}"
         elif config["form"] == "power_mean":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -15,6 +16,7 @@ from .data import TargetExample
 from .evaluation import DEFAULT_RECALL_KS, retrieval_metric_values
 from .features import FeatureStore, ObjectFeatures
 from .models import TeacherJoinabilityModel
+from .retrieval import RawEmbeddingANNIndices, StudentANNIndices
 
 RECALL_KS = DEFAULT_RECALL_KS
 
@@ -366,3 +368,87 @@ def evaluate_teacher_reranking(
         "ensembles": ensembles,
     }
     return result
+
+
+def metric_bundle_from_per_k(
+    per_k: dict[int, dict[str, Any]], recall_ks: Sequence[int]
+) -> dict[str, Any]:
+    recall_ks = tuple(recall_ks)
+    max_k = max(recall_ks)
+    first = per_k[recall_ks[0]]
+    bundle: dict[str, Any] = {
+        "queries": first["queries"],
+        **{f"recall@{k}": per_k[k][f"recall@{k}"] for k in recall_ks},
+        f"mrr@{max_k}": per_k[max_k][f"mrr@{max_k}"],
+        "per_query": {
+            f"recall@{k}": per_k[k]["per_query"][f"recall@{k}"]
+            for k in recall_ks
+        },
+        "by_dataset": {},
+    }
+    for dataset in sorted(first["by_dataset"]):
+        bundle["by_dataset"][dataset] = {
+            "queries": first["by_dataset"][dataset]["queries"],
+            **{
+                f"recall@{k}": per_k[k]["by_dataset"][dataset][f"recall@{k}"]
+                for k in recall_ks
+            },
+            f"mrr@{max_k}": per_k[max_k]["by_dataset"][dataset][
+                f"mrr@{max_k}"
+            ],
+            "per_query": {
+                f"recall@{k}": per_k[k]["by_dataset"][dataset]["per_query"][
+                    f"recall@{k}"
+                ]
+                for k in recall_ks
+            },
+        }
+    return bundle
+
+
+def teacher_ensemble_metrics(
+    teacher: torch.nn.Module,
+    examples: Sequence[TargetExample],
+    indices: RawEmbeddingANNIndices | StudentANNIndices,
+    store: FeatureStore,
+    *,
+    recall_ks: Sequence[int],
+    gamma: int,
+    alpha: float,
+    device: torch.device,
+    batch_size: int,
+    score_cache: dict[tuple[str, str], float],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rerank a fresh gamma*k ANN pool at every requested k."""
+
+    query_ids = [example.query_id for example in examples]
+    per_k: dict[int, dict[str, Any]] = {}
+    retrieval_seconds = 0.0
+    rerank_seconds = 0.0
+    for k in recall_ks:
+        start = time.perf_counter()
+        hits = indices.search_many(query_ids, "table", gamma * k)
+        retrieval_seconds += time.perf_counter() - start
+        start = time.perf_counter()
+        result = evaluate_teacher_reranking(
+            teacher,
+            examples,
+            hits,
+            store,
+            device=device,
+            batch_size=batch_size,
+            ensemble_alphas=(alpha,),
+            recall_ks=(k,),
+            return_per_query=True,
+            score_cache=score_cache,
+        )
+        rerank_seconds += time.perf_counter() - start
+        per_k[k] = result["ensembles"][0]
+    total = retrieval_seconds + rerank_seconds
+    return metric_bundle_from_per_k(per_k, recall_ks), {
+        "ann_retrieval_seconds": retrieval_seconds,
+        "teacher_rerank_seconds": rerank_seconds,
+        "total_seconds": total,
+        "average_seconds_per_query_per_k": total / (len(examples) * len(recall_ks)),
+        "teacher_pair_score_cache_entries": len(score_cache),
+    }

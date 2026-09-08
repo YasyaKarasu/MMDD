@@ -13,10 +13,11 @@ import numpy as np
 import torch
 from mmdd_progress import progress
 
-from .artifacts import checkpoint_fingerprint
+from .artifacts import checkpoint_fingerprint as checkpoint_fingerprint
 from .features import OBJECT_TYPES, FeatureStore, normalize_object_type
-from .models import StudentANNModel
+from .models import STUDENT_SCORE_SPACES, StudentANNModel
 from .objectives import PathAggregator
+from .row_support import greedy_row_bundle, predict_row_support
 
 FUSION_MODES = (
     "rrf",
@@ -25,6 +26,27 @@ FUSION_MODES = (
     "normalized_score",
     "normalized_rrc",
 )
+
+
+def _load_persistent_index(
+    hnswlib: Any,
+    index_dir: Path,
+    record: dict[str, Any],
+    *,
+    dimension: int,
+    ef_search: int,
+) -> tuple[Any, list[str]]:
+    index = hnswlib.Index(space="ip", dim=dimension)
+    index.load_index(
+        str(index_dir / record["index_path"]),
+        max_elements=int(record["objects"]),
+    )
+    index.set_ef(ef_search)
+    ids_path = index_dir / record["ids_path"]
+    object_ids = json.loads(ids_path.read_text(encoding="utf-8"))
+    if len(object_ids) != int(record["objects"]):
+        raise ValueError(f"{ids_path}: object count does not match the manifest")
+    return index, object_ids
 
 
 def _validate_fusion_mode(fusion_mode: str) -> None:
@@ -264,6 +286,7 @@ class StudentANNIndices:
         checkpoint_sha256: str,
         corpus_sha256: str | None = None,
         destination_types: tuple[str, ...] | None = None,
+        score_space: str = "raw_logit",
     ) -> None:
         import hnswlib
 
@@ -297,6 +320,11 @@ class StudentANNIndices:
         self.store = store
         self.device = device
         self.relation_param = relation_param
+        if score_space not in STUDENT_SCORE_SPACES:
+            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
+        if score_space != "raw_logit" and not hasattr(model, "transform_edge_scores"):
+            raise ValueError("Confidence score spaces require a trainable Student model")
+        self.score_space = score_space
         self.indices = {}
         self.object_ids = {}
         self.ef_search = int(manifest["ef_search"])
@@ -310,12 +338,13 @@ class StudentANNIndices:
             destination_type = record.get("destination_type", record_key)
             if destination_type not in selected_types:
                 continue
-            index = hnswlib.Index(space="ip", dim=ann_dim)
-            index.load_index(str(index_dir / record["index_path"]), max_elements=int(record["objects"]))
-            index.set_ef(self.ef_search)
-            object_ids = json.loads((index_dir / record["ids_path"]).read_text(encoding="utf-8"))
-            if len(object_ids) != int(record["objects"]):
-                raise ValueError(f"{index_dir / record['ids_path']}: object count does not match the manifest")
+            index, object_ids = _load_persistent_index(
+                hnswlib,
+                index_dir,
+                record,
+                dimension=ann_dim,
+                ef_search=self.ef_search,
+            )
             self.indices[record_key] = index
             self.object_ids[record_key] = object_ids
 
@@ -386,12 +415,29 @@ class StudentANNIndices:
             for position, row_labels, row_distances in zip(
                 positions, labels, distances
             ):
+                raw_scores = [1.0 - float(distance) for distance in row_distances]
+                score_space = getattr(self, "score_space", "raw_logit")
+                if score_space == "raw_logit":
+                    output_scores = raw_scores
+                else:
+                    source_type = source_types[source_ids[position]]
+                    values = torch.tensor(
+                        raw_scores,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    output_scores = self.model.transform_edge_scores(
+                        values,
+                        source_type,
+                        destination_type,
+                        score_space,
+                    ).detach().cpu().tolist()
                 results[position] = [
                     (
                         self.object_ids[index_key][int(label)],
-                        1.0 - float(distance),
+                        float(score),
                     )
-                    for label, distance in zip(row_labels, row_distances)
+                    for label, score in zip(row_labels, output_scores)
                 ]
         return results
 
@@ -432,19 +478,13 @@ class RawEmbeddingANNIndices:
         for object_type, record in manifest["types"].items():
             if object_type not in selected_types:
                 continue
-            index = hnswlib.Index(space="ip", dim=self.embedding_dim)
-            index.load_index(
-                str(index_dir / record["index_path"]),
-                max_elements=int(record["objects"]),
+            index, object_ids = _load_persistent_index(
+                hnswlib,
+                index_dir,
+                record,
+                dimension=self.embedding_dim,
+                ef_search=self.ef_search,
             )
-            index.set_ef(self.ef_search)
-            object_ids = json.loads(
-                (index_dir / record["ids_path"]).read_text(encoding="utf-8")
-            )
-            if len(object_ids) != int(record["objects"]):
-                raise ValueError(
-                    f"{index_dir / record['ids_path']}: object count does not match the manifest"
-                )
             self.indices[object_type] = index
             self.object_ids[object_type] = object_ids
 
@@ -529,15 +569,17 @@ def load_or_build_raw_embedding_indices(
     )
 
 
-def _logsumexp(values: Iterable[float]) -> float:
+def _logsumexp(values: Iterable[float], temperature: float = 1.0) -> float:
     values = list(values)
     maximum = max(values)
-    return maximum + math.log(sum(math.exp(value - maximum) for value in values))
+    return maximum + temperature * math.log(
+        sum(math.exp((value - maximum) / temperature) for value in values)
+    )
 
 
 def _aggregate_path_channels(
     paths: list[dict[str, Any]], aggregator: PathAggregator
-) -> tuple[float | None, float | None]:
+) -> tuple[float | None, float | None, list[str] | None]:
     direct_score = next(
         (
             float(path["path_score"])
@@ -548,9 +590,20 @@ def _aggregate_path_channels(
     )
     evidence_scores = [float(path["path_score"]) for path in paths if path["kind"] == "evidence"]
     if not evidence_scores:
-        return direct_score, None
-    if aggregator.evidence_aggregation == "logsumexp":
-        evidence_score = _logsumexp(evidence_scores)
+        return direct_score, None, None
+    selected_evidence_ids = None
+    if aggregator.evidence_aggregation in {
+        "logmeanexp",
+        "logsumexp",
+        "topk_logmeanexp",
+        "topk_logsumexp",
+    }:
+        selected = evidence_scores
+        if aggregator.evidence_aggregation.startswith("topk_"):
+            selected = sorted(evidence_scores, reverse=True)[: aggregator.top_k]
+        evidence_score = _logsumexp(selected, aggregator.temperature)
+        if "logmeanexp" in aggregator.evidence_aggregation:
+            evidence_score -= aggregator.temperature * math.log(len(selected))
     elif aggregator.evidence_aggregation == "max":
         evidence_score = max(evidence_scores)
     elif aggregator.evidence_aggregation in {"topk_mean", "topk_sum"}:
@@ -573,11 +626,59 @@ def _aggregate_path_channels(
             sum((value - minimum) ** aggregator.power for value in evidence_scores)
             / len(evidence_scores)
         ) ** (1.0 / aggregator.power)
+    elif aggregator.evidence_aggregation == "fixed_power_mean":
+        selected = sorted(evidence_scores, reverse=True)[: aggregator.top_k]
+        strengths = [
+            min(
+                1.0,
+                max(
+                    0.0,
+                    (value - aggregator.threshold) / (1.0 - aggregator.threshold),
+                ),
+            )
+            for value in selected
+        ]
+        evidence_score = (
+            sum(value**aggregator.power for value in strengths) / aggregator.top_k
+        ) ** (1.0 / aggregator.power)
+    elif aggregator.evidence_aggregation == "greedy_row_support":
+        by_content: dict[str, dict[str, Any]] = {}
+        for path in paths:
+            if path["kind"] != "evidence":
+                continue
+            evidence_id = str(path["evidence_id"])
+            content_key = str(path.get("evidence_content_key", evidence_id))
+            candidate = {
+                "evidence_id": evidence_id,
+                "quality": float(path["path_score"]),
+                "path": path,
+            }
+            previous = by_content.get(content_key)
+            if previous is None or (
+                -float(candidate["quality"]), evidence_id
+            ) < (
+                -float(previous["quality"]), str(previous["evidence_id"])
+            ):
+                by_content[content_key] = candidate
+        candidates = sorted(
+            by_content.values(),
+            key=lambda value: (-float(value["quality"]), str(value["evidence_id"])),
+        )[: aggregator.row_support_top_l]
+        support = {
+            str(candidate["evidence_id"]): candidate["path"]["row_support"]
+            for candidate in candidates
+        }
+        selected_evidence_ids, evidence_score = greedy_row_bundle(
+            candidates,
+            row_support=support,
+            budget=aggregator.top_k,
+            threshold=aggregator.threshold,
+        )
     elif aggregator.evidence_aggregation == "comb_mnz":
         evidence_score = sum(evidence_scores) * len(evidence_scores)
     else:
         raise ValueError(f"Unknown evidence aggregation: {aggregator.evidence_aggregation}")
-    return direct_score, evidence_score
+    return direct_score, evidence_score, selected_evidence_ids
 
 
 
@@ -775,14 +876,29 @@ def fuse_ranked_channels(
 
 
 def _compact_result_paths(
-    paths: list[dict[str, Any]], *, evidence_limit: int
+    paths: list[dict[str, Any]],
+    *,
+    evidence_limit: int,
+    selected_evidence_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     compact = []
     if any(path["kind"] == "direct" for path in paths):
         compact.append({"kind": "direct"})
-    evidence_paths = [
-        path for path in paths if path["kind"] == "evidence"
-    ][:evidence_limit]
+    if selected_evidence_ids is None:
+        evidence_paths = [
+            path for path in paths if path["kind"] == "evidence"
+        ][:evidence_limit]
+    else:
+        evidence_by_id = {
+            str(path["evidence_id"]): path
+            for path in paths
+            if path["kind"] == "evidence"
+        }
+        evidence_paths = [
+            evidence_by_id[evidence_id]
+            for evidence_id in selected_evidence_ids[:evidence_limit]
+            if evidence_id in evidence_by_id
+        ]
     compact.extend(
         {
             "kind": "evidence",
@@ -810,6 +926,14 @@ def retrieve_zero_one_hop(
     evidence_top_k: int = 4,
     evidence_temperature: float = 1.0,
     evidence_power: float = 2.0,
+    path_combination: str = "sum",
+    evidence_threshold: float = 0.0,
+    evidence_target_temperature: float = 1.0,
+    row_support_model: str | Path | None = None,
+    row_support_model_sha256: str | None = None,
+    row_support_top_l: int = 20,
+    evidence_content_keys: str | Path | None = None,
+    evidence_content_keys_sha256: str | None = None,
     path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
@@ -846,6 +970,14 @@ def retrieve_zero_one_hop(
         evidence_top_k=evidence_top_k,
         evidence_temperature=evidence_temperature,
         evidence_power=evidence_power,
+        path_combination=path_combination,
+        evidence_threshold=evidence_threshold,
+        evidence_target_temperature=evidence_target_temperature,
+        row_support_model=row_support_model,
+        row_support_model_sha256=row_support_model_sha256,
+        row_support_top_l=row_support_top_l,
+        evidence_content_keys=evidence_content_keys,
+        evidence_content_keys_sha256=evidence_content_keys_sha256,
         path_edge_normalization=path_edge_normalization,
         rrf_k=rrf_k,
         fusion_mode=fusion_mode,
@@ -868,8 +1000,12 @@ def retrieve_zero_one_hop(
             result["evidence_score"] = detailed["evidence_score"]
         if result_index < path_result_k:
             result["paths"] = _compact_result_paths(
-                detailed["paths"], evidence_limit=retained_evidence
+                detailed["paths"],
+                evidence_limit=retained_evidence,
+                selected_evidence_ids=detailed.get("selected_evidence_ids"),
             )
+        if "selected_evidence_ids" in detailed:
+            result["selected_evidence_ids"] = detailed["selected_evidence_ids"]
         results.append(result)
     return results
 
@@ -953,18 +1089,46 @@ def rank_detailed_paths(
     paths_by_target = _normalize_path_edges(
         paths_by_target, path_edge_normalization
     )
+    for paths in paths_by_target.values():
+        for path in paths:
+            if path["kind"] != "evidence":
+                continue
+            if not {
+                "query_evidence_score",
+                "evidence_target_score",
+            } <= path.keys():
+                if aggregator.path_combination != "sum":
+                    raise ValueError(
+                        "Non-sum path combination requires both edge scores"
+                    )
+                continue
+            left = float(
+                path.get("normalized_query_evidence_score", path["query_evidence_score"])
+            )
+            right = float(
+                path.get("normalized_evidence_target_score", path["evidence_target_score"])
+            )
+            if aggregator.path_combination == "sum":
+                path["path_score"] = left + right
+            elif aggregator.path_combination == "min":
+                path["path_score"] = min(left, right)
+            else:
+                path["path_score"] = left * right
     results = []
     for target_id, paths in paths_by_target.items():
         paths.sort(key=lambda path: path["path_score"], reverse=True)
-        direct_score, evidence_score = _aggregate_path_channels(paths, aggregator)
-        results.append(
-            {
-                "target_id": target_id,
-                "direct_score": direct_score,
-                "evidence_score": evidence_score,
-                "paths": paths,
-            }
+        direct_score, evidence_score, selected_evidence_ids = (
+            _aggregate_path_channels(paths, aggregator)
         )
+        result = {
+            "target_id": target_id,
+            "direct_score": direct_score,
+            "evidence_score": evidence_score,
+            "paths": paths,
+        }
+        if selected_evidence_ids is not None:
+            result["selected_evidence_ids"] = selected_evidence_ids
+        results.append(result)
     direct = sorted(
         (result for result in results if result["direct_score"] is not None),
         key=lambda result: (
@@ -994,6 +1158,45 @@ def rank_detailed_paths(
     return {"fused": fused, "direct": direct, "evidence": evidence}
 
 
+def _annotate_row_support_paths(
+    query_ids: Sequence[str],
+    paths_by_query: Sequence[dict[str, list[dict[str, Any]]]],
+    indices: StudentANNIndices | RawEmbeddingANNIndices,
+    aggregator: PathAggregator,
+) -> None:
+    if aggregator.evidence_aggregation != "greedy_row_support":
+        return
+    if not aggregator.row_support_models:
+        raise ValueError("G5 retrieval requires a frozen row-support model")
+    for query_id, paths_by_target in zip(query_ids, paths_by_query):
+        query = indices.store.embedding_features(query_id)
+        if query.row_embeddings is None:
+            raise ValueError(f"{query_id}: G5 requires cached row embeddings")
+        annotations: dict[str, tuple[list[float], str]] = {}
+        for paths in paths_by_target.values():
+            for path in paths:
+                if path["kind"] != "evidence":
+                    continue
+                evidence_id = str(path["evidence_id"])
+                annotation = annotations.get(evidence_id)
+                if annotation is None:
+                    evidence = indices.store.embedding_features(evidence_id)
+                    try:
+                        model = aggregator.row_support_models[evidence.object_type]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"G5 has no row-support model for {evidence.object_type}"
+                        ) from exc
+                    annotation = (
+                        predict_row_support(
+                            query.row_embeddings, evidence.embedding, model
+                        ),
+                        aggregator.content_key(evidence_id, evidence.embedding),
+                    )
+                    annotations[evidence_id] = annotation
+                path["row_support"], path["evidence_content_key"] = annotation
+
+
 def retrieve_zero_one_hop_detailed_many(
     query_ids: Sequence[str],
     indices: StudentANNIndices | RawEmbeddingANNIndices,
@@ -1009,6 +1212,14 @@ def retrieve_zero_one_hop_detailed_many(
     evidence_top_k: int = 4,
     evidence_temperature: float = 1.0,
     evidence_power: float = 2.0,
+    path_combination: str = "sum",
+    evidence_threshold: float = 0.0,
+    evidence_target_temperature: float = 1.0,
+    row_support_model: str | Path | None = None,
+    row_support_model_sha256: str | None = None,
+    row_support_top_l: int = 20,
+    evidence_content_keys: str | Path | None = None,
+    evidence_content_keys_sha256: str | None = None,
     path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
@@ -1020,6 +1231,7 @@ def retrieve_zero_one_hop_detailed_many(
     gated_evidence_quantile: float = 0.75,
     evidence_modality_weights: dict[str, float] | None = None,
     query_batch_size: int = 32,
+    _aggregator: PathAggregator | None = None,
 ) -> list[dict[str, list[dict[str, Any]]]]:
     """Return full rankings for many queries with batched ANN searches."""
 
@@ -1059,6 +1271,20 @@ def retrieve_zero_one_hop_detailed_many(
         raise ValueError("gated_evidence_quantile must be in [0, 1]")
     if not query_ids:
         return []
+    aggregator = _aggregator or PathAggregator(
+        evidence_aggregation,
+        evidence_top_k,
+        temperature=evidence_temperature,
+        power=evidence_power,
+        path_combination=path_combination,
+        threshold=evidence_threshold,
+        target_temperature=evidence_target_temperature,
+        row_support_model=row_support_model,
+        row_support_model_sha256=row_support_model_sha256,
+        row_support_top_l=row_support_top_l,
+        evidence_content_keys=evidence_content_keys,
+        evidence_content_keys_sha256=evidence_content_keys_sha256,
+    )
     if len(query_ids) > query_batch_size:
         return [
             result
@@ -1077,6 +1303,14 @@ def retrieve_zero_one_hop_detailed_many(
                 evidence_top_k=evidence_top_k,
                 evidence_temperature=evidence_temperature,
                 evidence_power=evidence_power,
+                path_combination=path_combination,
+                evidence_threshold=evidence_threshold,
+                evidence_target_temperature=evidence_target_temperature,
+                row_support_model=row_support_model,
+                row_support_model_sha256=row_support_model_sha256,
+                row_support_top_l=row_support_top_l,
+                evidence_content_keys=evidence_content_keys,
+                evidence_content_keys_sha256=evidence_content_keys_sha256,
                 path_edge_normalization=path_edge_normalization,
                 rrf_k=rrf_k,
                 fusion_mode=fusion_mode,
@@ -1088,14 +1322,9 @@ def retrieve_zero_one_hop_detailed_many(
                 gated_evidence_quantile=gated_evidence_quantile,
                 evidence_modality_weights=evidence_modality_weights,
                 query_batch_size=query_batch_size,
+                _aggregator=aggregator,
             )
         ]
-    aggregator = PathAggregator(
-        evidence_aggregation,
-        evidence_top_k,
-        temperature=evidence_temperature,
-        power=evidence_power,
-    )
     paths_by_query = [defaultdict(list) for _query_id in query_ids]
     for paths_by_target, direct_hits in zip(
         paths_by_query, indices.search_many(list(query_ids), "table", direct_k)
@@ -1159,6 +1388,7 @@ def retrieve_zero_one_hop_detailed_many(
                     "path_score": query_evidence_score + evidence_target_score,
                 }
             )
+    _annotate_row_support_paths(query_ids, paths_by_query, indices, aggregator)
     return [
         rank_detailed_paths(
             paths_by_target,
@@ -1192,6 +1422,14 @@ def retrieve_zero_one_hop_detailed(
     evidence_top_k: int = 4,
     evidence_temperature: float = 1.0,
     evidence_power: float = 2.0,
+    path_combination: str = "sum",
+    evidence_threshold: float = 0.0,
+    evidence_target_temperature: float = 1.0,
+    row_support_model: str | Path | None = None,
+    row_support_model_sha256: str | None = None,
+    row_support_top_l: int = 20,
+    evidence_content_keys: str | Path | None = None,
+    evidence_content_keys_sha256: str | None = None,
     path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "rrf",
@@ -1219,6 +1457,14 @@ def retrieve_zero_one_hop_detailed(
         evidence_top_k=evidence_top_k,
         evidence_temperature=evidence_temperature,
         evidence_power=evidence_power,
+        path_combination=path_combination,
+        evidence_threshold=evidence_threshold,
+        evidence_target_temperature=evidence_target_temperature,
+        row_support_model=row_support_model,
+        row_support_model_sha256=row_support_model_sha256,
+        row_support_top_l=row_support_top_l,
+        evidence_content_keys=evidence_content_keys,
+        evidence_content_keys_sha256=evidence_content_keys_sha256,
         path_edge_normalization=path_edge_normalization,
         rrf_k=rrf_k,
         fusion_mode=fusion_mode,

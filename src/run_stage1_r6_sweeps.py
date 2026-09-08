@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import math
-import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +31,13 @@ from mmdd_stage1.retrieval import (
     retrieve_zero_one_hop_detailed_many,
 )
 from mmdd_stage1.selection import load_stage1_selection
-from mmdd_stage1.significance import paired_bootstrap_delta
+from mmdd_stage1.sweep_metrics import (
+    append_values as _append_values,
+    finalize_records as _finalize_records,
+    mean as _mean,
+    path_pool as _path_pool,
+    query_values as _query_values,
+)
 from mmdd_stage1.teacher_rerank import TeacherRerankedANNIndices
 
 RECALL_KS = DEFAULT_RECALL_KS
@@ -130,125 +135,6 @@ def _lake_inputs(root: Path, lake: str) -> LakeInputs:
 
 def _examples(path: Path) -> list[TargetExample]:
     return load_target_examples(path, split="dev", dataset_name=path.stem)
-
-
-def _path_pool(result: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
-    by_target = {}
-    for row in [*result["direct"], *result["evidence"]]:
-        by_target[str(row["target_id"])] = row["paths"]
-    return by_target
-
-
-def _positive_evidence(example: TargetExample) -> dict[str, set[str]]:
-    positives = set(example.positive_target_ids)
-    return {
-        candidate.target_id: set(candidate.evidence_ids)
-        for candidate in example.candidates
-        if candidate.target_id in positives and candidate.evidence_ids
-    }
-
-
-def _query_values(
-    result: dict[str, list[dict[str, Any]]], example: TargetExample, k: int
-) -> dict[str, float]:
-    positives = set(example.positive_target_ids)
-
-    def recall(channel: str) -> float:
-        ids = {str(row["target_id"]) for row in result[channel][:k]}
-        return len(ids & positives) / len(positives)
-
-    fused = result["fused"]
-    reciprocal_rank = next(
-        (
-            1.0 / rank
-            for rank, row in enumerate(fused[:k], 1)
-            if str(row["target_id"]) in positives
-        ),
-        0.0,
-    )
-    gold_evidence = _positive_evidence(example)
-    coverage = any(
-        str(row["target_id"]) in gold_evidence
-        and any(
-            path["kind"] == "evidence"
-            and str(path["evidence_id"]) in gold_evidence[str(row["target_id"])]
-            for path in row["paths"]
-        )
-        for row in fused[:10]
-    )
-    return {
-        "fused_recall": recall("fused"),
-        "direct_recall": recall("direct"),
-        "evidence_recall": recall("evidence"),
-        "reciprocal_rank": reciprocal_rank,
-        "coverage": float(coverage),
-    }
-
-
-def _append_values(
-    records: dict[str, dict[int, dict[str, list[float]]]],
-    config: str,
-    k: int,
-    values: dict[str, float],
-) -> None:
-    for name, value in values.items():
-        records[config][k][name].append(value)
-
-
-def _mean(values: list[float]) -> float:
-    return statistics.fmean(values)
-
-
-def _finalize_records(
-    records: dict[str, dict[int, dict[str, list[float]]]],
-    baseline: str,
-    *,
-    bootstrap_iterations: int,
-    bootstrap_seed: int,
-) -> dict[str, Any]:
-    output = {}
-    for config, by_k in records.items():
-        metrics: dict[str, Any] = {"queries": len(by_k[min(by_k)]["fused_recall"])}
-        for k, values in sorted(by_k.items()):
-            metrics[f"recall@{k}"] = _mean(values["fused_recall"])
-            metrics.setdefault("direct", {})[f"recall@{k}"] = _mean(
-                values["direct_recall"]
-            )
-            metrics.setdefault("evidence", {})[f"recall@{k}"] = _mean(
-                values["evidence_recall"]
-            )
-        max_k = max(by_k)
-        metrics[f"mrr@{max_k}"] = _mean(by_k[max_k]["reciprocal_rank"])
-        if 10 in by_k:
-            metrics["positive_evidence_path_coverage@10"] = _mean(
-                by_k[10]["coverage"]
-            )
-        metrics["per_query"] = {
-            "recall@10": by_k[10]["fused_recall"] if 10 in by_k else [],
-            f"mrr@{max_k}": by_k[max_k]["reciprocal_rank"],
-            "coverage@10": by_k[10]["coverage"] if 10 in by_k else [],
-        }
-        output[config] = {"metrics": metrics}
-
-    baseline_values = records[baseline]
-    for config, payload in output.items():
-        values = records[config]
-        deltas = {}
-        for name, k, field in (
-            ("recall@10", 10, "fused_recall"),
-            ("coverage@10", 10, "coverage"),
-            (f"mrr@{max(baseline_values)}", max(baseline_values), "reciprocal_rank"),
-        ):
-            if k not in values or k not in baseline_values:
-                continue
-            deltas[name] = paired_bootstrap_delta(
-                values[k][field],
-                baseline_values[k][field],
-                iterations=bootstrap_iterations,
-                seed=bootstrap_seed,
-            )
-        payload["delta_vs_baseline"] = deltas
-    return output
 
 
 def _fusion_configs() -> list[dict[str, Any]]:

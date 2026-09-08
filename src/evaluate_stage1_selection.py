@@ -14,6 +14,7 @@ from mmdd_stage1.checkpoints import load_path_aggregator, load_student
 from mmdd_stage1.data import load_target_examples
 from mmdd_stage1.evaluation import evaluate_student_retrieval
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.models import STUDENT_SCORE_SPACES
 from mmdd_stage1.objectives import PATH_AGGREGATIONS, PathAggregator
 from mmdd_stage1.retrieval import (
     StudentANNIndices,
@@ -65,6 +66,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     student = load_student(checkpoint_path, device)
     student.eval()
+    student_score_space = (
+        args.student_score_space
+        or selection.get("student_score_space", "raw_logit")
+    )
     indices = StudentANNIndices(
         student,
         store,
@@ -72,6 +77,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
         checkpoint_sha256=checkpoint_sha256,
         corpus_sha256=corpus_sha256,
+        score_space=student_score_space,
     )
     examples = _examples(args.dev_data)
     saved_aggregator = load_path_aggregator(checkpoint_path)
@@ -89,6 +95,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             getattr(args, "evidence_power", None)
             if getattr(args, "evidence_power", None) is not None
             else saved_aggregator.power
+        ),
+        path_combination=(
+            getattr(args, "path_combination", None)
+            if getattr(args, "path_combination", None) is not None
+            else saved_aggregator.path_combination
+        ),
+        threshold=(
+            getattr(args, "evidence_threshold", None)
+            if getattr(args, "evidence_threshold", None) is not None
+            else saved_aggregator.threshold
         ),
     )
     fusion_mode = getattr(args, "fusion_mode", "weighted_rrf")
@@ -119,6 +135,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         evidence_top_k=aggregator.top_k,
         evidence_temperature=aggregator.temperature,
         evidence_power=aggregator.power,
+        path_combination=aggregator.path_combination,
+        evidence_threshold=aggregator.threshold,
         fusion_mode=fusion_mode,
         direct_weight=direct_weight,
         evidence_weight=evidence_weight,
@@ -138,6 +156,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         evidence_top_k=aggregator.top_k,
         evidence_temperature=aggregator.temperature,
         evidence_power=aggregator.power,
+        path_combination=aggregator.path_combination,
+        evidence_threshold=aggregator.threshold,
         fusion_mode=fusion_mode,
         direct_weight=direct_weight,
         evidence_weight=evidence_weight,
@@ -152,12 +172,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_sha256": checkpoint_sha256,
         "best_epoch": selection["best_epoch"],
         "corpus_sha256": corpus_sha256,
-        "path_aggregation": {
-            "evidence_aggregation": aggregator.evidence_aggregation,
-            "evidence_top_k": aggregator.top_k,
-            "evidence_temperature": aggregator.temperature,
-            "evidence_power": aggregator.power,
-        },
+        "path_aggregation": aggregator.config(),
+        "student_score_space": student_score_space,
         "fusion": {
             "mode": fusion_mode,
             "direct_weight": direct_weight,
@@ -182,10 +198,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--feature-cache-size", type=int, default=60_000)
+    parser.add_argument("--student-score-space", choices=STUDENT_SCORE_SPACES)
     parser.add_argument("--evidence-aggregation", choices=sorted(PATH_AGGREGATIONS))
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument("--path-combination", choices=["sum", "min", "product"])
+    parser.add_argument("--evidence-threshold", type=float)
     parser.add_argument(
         "--fusion-mode",
         choices=["rrf", "weighted_rrf", "gated", "normalized_score", "normalized_rrc"],

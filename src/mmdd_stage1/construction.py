@@ -133,7 +133,6 @@ def _semantic_index(
 
 def _semantic_negative(
     query_text: str,
-    allowed: set[str],
     excluded: set[str],
     postings: dict[str, list[tuple[str, float]]],
     inverse_document_frequency: dict[str, float],
@@ -149,7 +148,7 @@ def _semantic_negative(
     scores: dict[str, float] = defaultdict(float)
     for token, value in weighted.items():
         for target_id, target_weight in postings[token]:
-            if target_id in allowed and target_id not in excluded:
+            if target_id not in excluded:
                 scores[target_id] += value / norm * target_weight
     return max(scores, key=scores.get) if scores else None
 
@@ -333,7 +332,6 @@ def build_stage1_training_artifacts(
     recovery_evidence = _recovery_evidence(queries, targets, assets, recoveries)
     asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
     target_ids = list(targets)
-    target_id_set = set(target_ids)
     structure_buckets: dict[tuple[int, int], list[str]] = defaultdict(list)
     for target_id, target in targets.items():
         structure_buckets[(len(target["columns"]), len(target["rows"]))].append(target_id)
@@ -386,7 +384,6 @@ def build_stage1_training_artifacts(
 
         semantic_id = _semantic_negative(
             "\n".join(query_objects[query_id]["table_parts"]),
-            target_id_set,
             excluded,
             postings,
             inverse_document_frequency,
@@ -447,19 +444,26 @@ def build_stage1_training_artifacts(
                 }
             )
 
-        direct_hard_ids = [
-            target_id
-            for target_id in evidence_positive_target_ids
-            if target_id not in direct_positive_target_ids
-        ]
-        direct_negative_ids = list(dict.fromkeys([*direct_hard_ids, *negative_ids]))
+        direct_ranking_positive_ids = positive_target_ids
+        direct_negative_ids = list(negative_ids)
         for positive_id in direct_positive_target_ids:
+            direct_candidate_ids = list(
+                dict.fromkeys(
+                    [
+                        positive_id,
+                        *direct_ranking_positive_ids,
+                        *direct_negative_ids,
+                    ]
+                )
+            )
             edge_lists.append(
                 {
                     "query_id": query_id,
                     "source_type": "table",
                     "positive_id": positive_id,
-                    "candidate_ids": [positive_id, *direct_negative_ids],
+                    "positive_ids": direct_ranking_positive_ids,
+                    "candidate_ids": direct_candidate_ids,
+                    "confirmed_labels": [None] * len(direct_candidate_ids),
                     "destination_type": "table",
                     "dataset": dataset_name,
                     "split": split,
@@ -510,7 +514,12 @@ def build_stage1_training_artifacts(
                     "query_id": query_id,
                     "source_type": "table",
                     "positive_id": positive_evidence_id,
+                    "positive_ids": [positive_evidence_id],
                     "candidate_ids": [positive_evidence_id, *negative_evidence_ids],
+                    "confirmed_labels": [
+                        1,
+                        *([None] * len(negative_evidence_ids)),
+                    ],
                     "destination_type": evidence_type,
                     "dataset": dataset_name,
                     "split": split,
@@ -542,7 +551,15 @@ def build_stage1_training_artifacts(
                         "query_id": evidence_id,
                         "source_type": asset_types[evidence_id],
                         "positive_id": positive_target_id,
+                        "positive_ids": [positive_target_id],
                         "candidate_ids": [positive_target_id, *evidence_target_negatives],
+                        "confirmed_labels": [
+                            1,
+                            *[
+                                0 if target_id == corrupted_id else None
+                                for target_id in evidence_target_negatives
+                            ],
+                        ],
                         "destination_type": "table",
                         "dataset": dataset_name,
                         "split": split,

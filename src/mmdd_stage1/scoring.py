@@ -14,6 +14,7 @@ from .data import EdgeExample, TargetExample
 from .features import FeatureStore, ObjectFeatures, normalize_object_type
 from .models import StudentJoinabilityModel, TeacherJoinabilityModel
 from .objectives import PathAggregator
+from .row_support import predict_row_support
 
 JoinabilityModel = TeacherJoinabilityModel | StudentJoinabilityModel
 
@@ -71,6 +72,7 @@ def _score_teacher_pairs(
     sources: Sequence[ObjectFeatures],
     destinations: Sequence[ObjectFeatures],
     compression_cache: dict[str, torch.Tensor] | None = None,
+    score_space: str = "raw_logit",
 ) -> torch.Tensor:
     """Score unique directed object pairs and gather repeated occurrences."""
 
@@ -89,6 +91,12 @@ def _score_teacher_pairs(
         unique_sources,
         unique_destinations,
         compression_cache=compression_cache,
+    )
+    scores = model.transform_pair_scores(
+        scores,
+        [features.object_type for features in unique_sources],
+        [features.object_type for features in unique_destinations],
+        score_space,
     )
     if len(unique_sources) == len(sources):
         return scores
@@ -135,6 +143,81 @@ def _target_positive_id_set(
     }
 
 
+def _edge_positive_id_set(example: EdgeExample) -> set[str]:
+    return set(example.positive_ids) or {
+        example.candidate_ids[example.positive_index]
+    }
+
+
+def edge_positive_mask(
+    examples: Sequence[EdgeExample],
+    width: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the complete positive mask for edge candidate lists."""
+
+    return _candidate_positive_mask(
+        [example.candidate_ids for example in examples],
+        [_edge_positive_id_set(example) for example in examples],
+        width,
+        device,
+    )
+
+
+def edge_confirmed_label_tensors(
+    examples: Sequence[EdgeExample],
+    width: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return aligned binary labels and a mask that excludes unknown candidates."""
+
+    label_rows = []
+    confirmed_rows = []
+    for example in examples:
+        labels = example.confirmed_labels
+        if labels is not None and len(labels) != len(example.candidate_ids):
+            raise ValueError("confirmed_labels must align with edge candidates")
+        labels = labels or (None,) * len(example.candidate_ids)
+        label_rows.append(
+            torch.tensor(
+                [0.0 if value is None else float(value) for value in labels],
+                dtype=torch.float32,
+                device=device,
+            )
+        )
+        confirmed_rows.append(
+            torch.tensor(
+                [value is not None for value in labels],
+                dtype=torch.bool,
+                device=device,
+            )
+        )
+    label_tensor = pad_sequence(
+        label_rows, batch_first=True, padding_value=0.0
+    )
+    confirmed_mask = pad_sequence(
+        confirmed_rows, batch_first=True, padding_value=False
+    )
+    if label_tensor.shape[0] != len(examples) or label_tensor.shape[1] > width:
+        raise ValueError(
+            "Confirmed-label width cannot exceed the scored candidate lists"
+        )
+    if label_tensor.shape[1] < width:
+        padding = width - label_tensor.shape[1]
+        label_tensor = torch.cat(
+            [label_tensor, label_tensor.new_zeros((len(examples), padding))],
+            dim=1,
+        )
+        confirmed_mask = torch.cat(
+            [
+                confirmed_mask,
+                confirmed_mask.new_zeros((len(examples), padding)),
+            ],
+            dim=1,
+        )
+    return label_tensor, confirmed_mask
+
+
 def target_positive_mask(
     examples: Sequence[TargetExample],
     width: int,
@@ -172,6 +255,8 @@ def score_edge_batch(
     examples: Sequence[EdgeExample],
     store: FeatureStore,
     device: torch.device,
+    *,
+    student_score_space: str = "raw_logit",
 ) -> ListScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
     hidden_dtype = (
@@ -226,14 +311,26 @@ def score_edge_batch(
             sources.append(query)
             destinations.append(destination)
     flat_scores = (
-        _score_teacher_pairs(model, sources, destinations)
+        _score_teacher_pairs(
+            model,
+            sources,
+            destinations,
+            score_space=student_score_space,
+        )
         if isinstance(model, TeacherJoinabilityModel)
-        else model.score_pairs(sources, destinations)
+        else model.score_pairs_in_space(
+            sources, destinations, student_score_space
+        )
     )
     rows = pad_sequence(list(flat_scores.split(lengths)), batch_first=True, padding_value=0.0)
     candidate_mask = _mask(lengths, rows.shape[1], device)
     positive_indices = torch.tensor([example.positive_index for example in examples], device=device)
-    return ListScores(rows, candidate_mask, positive_indices)
+    return ListScores(
+        rows,
+        candidate_mask,
+        positive_indices,
+        edge_positive_mask(examples, rows.shape[1], device),
+    )
 
 
 def _expanded_candidate_ids(
@@ -260,6 +357,7 @@ def _score_student_candidate_rows(
     positive_indices: Sequence[int],
     device: torch.device,
     positive_id_sets: Sequence[set[str]] | None = None,
+    student_score_space: str = "raw_logit",
 ) -> ListScores:
     parameter = next(student.parameters())
     score_rows: list[torch.Tensor | None] = [None] * len(query_features)
@@ -288,11 +386,12 @@ def _score_student_candidate_rows(
         candidate_embeddings = torch.stack(
             [candidate_features[object_id].embedding for object_id in pooled_ids]
         ).to(device=parameter.device, dtype=torch.float32)
-        score_matrix = student.score_embedding_matrix(
+        score_matrix = student.score_embedding_matrix_in_space(
             query_embeddings,
             source_type,
             candidate_embeddings,
             destination_type,
+            student_score_space,
         )
         column_by_id = {object_id: column for column, object_id in enumerate(pooled_ids)}
         for matrix_row, row_index in enumerate(row_indices):
@@ -330,6 +429,7 @@ def score_edge_batch_in_batch(
     *,
     max_negatives: int = 256,
     rng: random.Random | None = None,
+    student_score_space: str = "raw_logit",
 ) -> ListScores:
     """Score each edge list against same-type candidates pooled from the batch."""
 
@@ -374,13 +474,15 @@ def score_edge_batch_in_batch(
         key: list(dict.fromkeys(values)) for key, values in destination_pools.items()
     }
     candidate_rows = []
+    positive_id_sets = []
     for example, destination_type in zip(examples, destination_types):
-        positive_id = example.candidate_ids[example.positive_index]
+        positive_ids = _edge_positive_id_set(example)
+        positive_id_sets.append(positive_ids)
         candidate_rows.append(
             _expanded_candidate_ids(
                 example.candidate_ids,
                 destination_pools[destination_type],
-                {positive_id},
+                positive_ids,
                 max_negatives,
                 rng,
             )
@@ -392,6 +494,8 @@ def score_edge_batch_in_batch(
         cache,
         [example.positive_index for example in examples],
         device,
+        positive_id_sets,
+        student_score_space=student_score_space,
     )
 
 
@@ -416,6 +520,7 @@ def score_target_batch(
     device: torch.device,
     aggregator: PathAggregator,
     relation_loss_weights: dict[str, float] | None = None,
+    student_score_space: str = "raw_logit",
 ) -> TargetScores:
     include_hidden = isinstance(model, TeacherJoinabilityModel)
     hidden_dtype = (
@@ -433,6 +538,12 @@ def score_target_batch(
     evidence_lengths = []
     query_evidence_relation_keys = []
     evidence_target_relation_keys = []
+    use_row_support = aggregator.evidence_aggregation == "greedy_row_support"
+    flat_row_support: list[torch.Tensor] = []
+    flat_content_groups: list[int] = []
+    candidate_row_counts: list[int] = []
+    content_key_cache: dict[str, str] = {}
+    row_support_cache: dict[tuple[str, str], torch.Tensor] = {}
 
     for example in examples:
         query = _device_features(
@@ -443,6 +554,9 @@ def score_target_batch(
             include_hidden,
             hidden_dtype,
         )
+        raw_query = store.embedding_features(example.query_id) if use_row_support else None
+        if use_row_support and raw_query.row_embeddings is None:
+            raise ValueError(f"{example.query_id}: G5 requires cached row embeddings")
         for candidate in example.candidates:
             target = _device_features(
                 candidate.target_id,
@@ -455,7 +569,11 @@ def score_target_batch(
             direct_sources.append(query)
             direct_destinations.append(target)
             evidence_lengths.append(len(candidate.evidence_ids))
-            for evidence_id in candidate.evidence_ids:
+            candidate_row_counts.append(
+                0 if raw_query is None else int(raw_query.row_embeddings.shape[0])
+            )
+            content_groups: dict[str, int] = {}
+            for evidence_id in sorted(candidate.evidence_ids):
                 evidence = _device_features(
                     evidence_id,
                     store,
@@ -474,6 +592,40 @@ def score_target_batch(
                 evidence_target_relation_keys.append(
                     f"{evidence.object_type}_to_{target.object_type}"
                 )
+                if use_row_support:
+                    raw_evidence = store.embedding_features(evidence_id)
+                    try:
+                        support_model = aggregator.row_support_models[
+                            raw_evidence.object_type
+                        ]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"G5 has no row-support model for {raw_evidence.object_type}"
+                        ) from exc
+                    support_key = (example.query_id, evidence_id)
+                    support = row_support_cache.get(support_key)
+                    if support is None:
+                        assert raw_query is not None
+                        assert raw_query.row_embeddings is not None
+                        support = torch.tensor(
+                            predict_row_support(
+                                raw_query.row_embeddings,
+                                raw_evidence.embedding,
+                                support_model,
+                            ),
+                            dtype=torch.float32,
+                        )
+                        row_support_cache[support_key] = support
+                    flat_row_support.append(support)
+                    content_key = content_key_cache.get(evidence_id)
+                    if content_key is None:
+                        content_key = aggregator.content_key(
+                            evidence_id, raw_evidence.embedding
+                        )
+                        content_key_cache[evidence_id] = content_key
+                    flat_content_groups.append(
+                        content_groups.setdefault(content_key, len(content_groups))
+                    )
 
     if isinstance(model, TeacherJoinabilityModel):
         compression_cache: dict[str, torch.Tensor] = {}
@@ -482,6 +634,7 @@ def score_target_batch(
             direct_sources,
             direct_destinations,
             compression_cache,
+            student_score_space,
         )
         if evidence_sources:
             query_evidence_scores = _score_teacher_pairs(
@@ -489,21 +642,24 @@ def score_target_batch(
                 evidence_sources,
                 evidence_destinations,
                 compression_cache,
+                student_score_space,
             )
             evidence_target_edge_scores = _score_teacher_pairs(
                 model,
                 target_sources,
                 target_destinations,
                 compression_cache,
+                student_score_space,
             )
         else:
             query_evidence_scores = direct_scores.new_empty(0)
             evidence_target_edge_scores = direct_scores.new_empty(0)
     else:
         evidence_count = len(evidence_sources)
-        scores = model.score_pairs(
+        scores = model.score_pairs_in_space(
             [*direct_sources, *evidence_sources, *target_sources],
             [*direct_destinations, *evidence_destinations, *target_destinations],
+            student_score_space,
         )
         direct_scores, query_evidence_scores, evidence_target_edge_scores = (
             scores.split((len(direct_sources), evidence_count, evidence_count))
@@ -541,10 +697,49 @@ def score_target_batch(
     evidence_path_mask = _mask(
         evidence_lengths, query_evidence_rows.shape[1], device
     )
+    aggregation_kwargs = {}
+    if use_row_support:
+        max_paths = query_evidence_rows.shape[1]
+        max_rows = max(candidate_row_counts)
+        support_rows = []
+        content_group_rows = []
+        row_masks = []
+        offset = 0
+        for evidence_count, row_count in zip(
+            evidence_lengths, candidate_row_counts
+        ):
+            support = torch.zeros(
+                (max_paths, max_rows), dtype=torch.float32, device=device
+            )
+            groups = torch.full(
+                (max_paths,), -1, dtype=torch.long, device=device
+            )
+            if evidence_count:
+                values = torch.stack(
+                    flat_row_support[offset : offset + evidence_count]
+                ).to(device)
+                support[:evidence_count, :row_count] = values
+                groups[:evidence_count] = torch.tensor(
+                    flat_content_groups[offset : offset + evidence_count],
+                    dtype=torch.long,
+                    device=device,
+                )
+            support_rows.append(support)
+            content_group_rows.append(groups)
+            row_masks.append(
+                torch.arange(max_rows, device=device) < row_count
+            )
+            offset += evidence_count
+        aggregation_kwargs = {
+            "row_support": torch.stack(support_rows).unsqueeze(0),
+            "content_groups": torch.stack(content_group_rows).unsqueeze(0),
+            "row_mask": torch.stack(row_masks).unsqueeze(0),
+        }
     evidence_scores = aggregator(
         query_evidence_rows.unsqueeze(0),
         evidence_target_rows.unsqueeze(0),
         evidence_path_mask.unsqueeze(0),
+        **aggregation_kwargs,
     ).squeeze(0)
 
     candidate_lengths = [len(example.candidates) for example in examples]
@@ -611,6 +806,7 @@ def score_target_direct_batch_in_batch(
     *,
     max_negatives: int = 256,
     rng: random.Random | None = None,
+    student_score_space: str = "raw_logit",
 ) -> ListScores:
     """Expand direct target lists with other table candidates from the batch."""
 
@@ -661,4 +857,5 @@ def score_target_direct_batch_in_batch(
         [example.direct_positive_index for example in examples],
         device,
         positive_id_sets,
+        student_score_space,
     )

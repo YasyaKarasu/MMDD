@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +14,12 @@ from mmdd_stage1.checkpoints import load_student
 from mmdd_stage1.data import TargetExample, load_target_examples
 from mmdd_stage1.evaluation import DEFAULT_RECALL_KS
 from mmdd_stage1.features import FeatureStore
-from mmdd_stage1.objectives import PathAggregator
-from mmdd_stage1.retrieval import (
-    StudentANNIndices,
-    checkpoint_fingerprint,
-    rank_detailed_paths,
-    retrieve_zero_one_hop_detailed_many,
-)
+from mmdd_stage1.retrieval import StudentANNIndices, checkpoint_fingerprint
 from mmdd_stage1.selection import load_stage1_selection
 from mmdd_stage1.significance import paired_bootstrap_delta
-from run_stage1_r6_sweeps import (
-    _append_values,
-    _finalize_records,
-    _path_pool,
-    _query_values,
+from mmdd_stage1.sweep_metrics import (
+    evaluate_retrieval_configurations,
+    finalize_records as _finalize_records,
 )
 
 RECALL_KS = DEFAULT_RECALL_KS
@@ -179,57 +169,14 @@ def run(args: argparse.Namespace) -> None:
     )
     fusion_configs = _fusion_configs(args.lake)
     aggregation_configs = _aggregation_configs(args.lake)
-    records: dict[str, dict[int, dict[str, list[float]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
+    records, pool_hashes = evaluate_retrieval_configurations(
+        examples,
+        indices,
+        fusion_configs=fusion_configs,
+        aggregation_configs=aggregation_configs,
+        recall_ks=RECALL_KS,
+        query_batch_size=args.query_batch_size,
     )
-    pool_hashes = {k: hashlib.sha256() for k in RECALL_KS}
-    for k in RECALL_KS:
-        for start in range(0, len(examples), args.query_batch_size):
-            batch = examples[start : start + args.query_batch_size]
-            detailed = retrieve_zero_one_hop_detailed_many(
-                [example.query_id for example in batch],
-                indices,
-                k=k,
-                gamma=10,
-                gamma_evidence=2,
-                evidence_types=("text", "image"),
-                evidence_aggregation="logsumexp",
-                evidence_top_k=4,
-                fusion_mode="weighted_rrf",
-                direct_weight=1.0,
-                evidence_weight=0.05,
-                query_batch_size=args.query_batch_size,
-            )
-            for example, baseline in zip(batch, detailed):
-                paths = _path_pool(baseline)
-                pool_hashes[k].update(example.query_id.encode("utf-8"))
-                for target_id in sorted(paths):
-                    pool_hashes[k].update(b"\0")
-                    pool_hashes[k].update(target_id.encode("utf-8"))
-                for aggregation in aggregation_configs:
-                    for fusion in fusion_configs:
-                        name = f"{fusion['name']}__{aggregation['name']}"
-                        variant = rank_detailed_paths(
-                            paths,
-                            aggregator=PathAggregator(
-                                aggregation["aggregation"], 4
-                            ),
-                            path_edge_normalization=aggregation["normalization"],
-                            rrf_k=60,
-                            fusion_mode=fusion["mode"],
-                            direct_weight=1.0,
-                            evidence_weight=fusion["evidence_weight"],
-                            fusion_score_normalization=fusion["normalization"],
-                            fusion_score_temperature=1.0,
-                            gated_evidence_min_paths=2,
-                            gated_evidence_quantile=0.75,
-                        )
-                        _append_values(
-                            records,
-                            name,
-                            k,
-                            _query_values(variant, example, k),
-                        )
 
     baseline = "weighted_rrf_e0.05__logsumexp_edges_none"
     metrics = _finalize_records(
@@ -325,7 +272,6 @@ def run(args: argparse.Namespace) -> None:
         "metrics": metrics,
     }
     _write_json(output_dir / "metrics.json", payload)
-    selected = metrics[selected_name]["metrics"]
     lines = [
         f"# Stage-1 r7 Task Q: {args.lake}",
         "",

@@ -12,6 +12,7 @@ import torch
 from mmdd_stage1.checkpoints import load_path_aggregator, load_student, load_teacher
 from mmdd_stage1.data import load_edge_examples, load_target_examples
 from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.models import STUDENT_SCORE_SPACES
 from mmdd_stage1.mining import (
     hard_candidate_records,
     retrieve_hard_candidate_sets,
@@ -43,6 +44,32 @@ def _read_pending_metadata(path: Path) -> dict[str, Any]:
     return metadata
 
 
+def _mining_selection_config(metadata: dict[str, Any]) -> dict[str, Any]:
+    configured = metadata.get("mining_selection_config")
+    if configured is not None:
+        if not isinstance(configured, dict):
+            raise ValueError("mining_selection_config must be a JSON object")
+        return dict(configured)
+    return {
+        "student_score_space": metadata.get("student_score_space", "raw_logit"),
+        "evidence_aggregation": metadata.get(
+            "evidence_aggregation", "logsumexp"
+        ),
+        "evidence_top_k": int(metadata.get("evidence_top_k", 4)),
+        "evidence_temperature": float(
+            metadata.get("evidence_temperature", 1.0)
+        ),
+        "evidence_power": float(metadata.get("evidence_power", 2.0)),
+        "path_combination": metadata.get("path_combination", "sum"),
+        "evidence_threshold": float(
+            metadata.get("evidence_threshold", 0.0)
+        ),
+        "evidence_target_temperature": float(
+            metadata.get("evidence_target_temperature", 1.0)
+        ),
+    }
+
+
 def _validate_pending_metadata(
     target_path: Path,
     edge_path: Path,
@@ -54,12 +81,21 @@ def _validate_pending_metadata(
         raise ValueError("Pending target and edge metadata differ")
     if target_metadata.get("teacher_scoring") != "pending":
         raise ValueError("Pending hard negatives have already been Teacher-scored")
+    mining_config = _mining_selection_config(target_metadata)
     for key, value in expected.items():
         default = {
             "evidence_temperature": 1.0,
             "evidence_power": 2.0,
+            "path_combination": "sum",
+            "evidence_threshold": 0.0,
+            "student_score_space": "raw_logit",
+            "hard_targets_per_positive_evidence": 0,
         }.get(key)
-        actual = target_metadata.get(key, default)
+        actual = (
+            mining_config.get(key, default)
+            if key == "student_score_space"
+            else target_metadata.get(key, default)
+        )
         if actual != value:
             raise ValueError(
                 f"{target_path}: pending metadata {key!r} does not match this run"
@@ -69,6 +105,14 @@ def _validate_pending_metadata(
 
 def run(args: argparse.Namespace) -> None:
     teacher_ensemble_alpha = getattr(args, "teacher_ensemble_alpha", None)
+    teacher_score_space = getattr(args, "teacher_score_space", "raw_logit")
+    student_score_space = getattr(args, "student_score_space", "raw_logit")
+    training_student_score_space = getattr(
+        args, "training_student_score_space", None
+    ) or student_score_space
+    hard_targets_per_positive_evidence = getattr(
+        args, "hard_targets_per_positive_evidence", 0
+    )
     pending_target_value = getattr(args, "pending_target_lists", None)
     pending_edge_value = getattr(args, "pending_edge_lists", None)
     if bool(pending_target_value) != bool(pending_edge_value):
@@ -90,8 +134,19 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Teacher batch size must be positive")
     if teacher_ensemble_alpha is not None and not 0 <= teacher_ensemble_alpha <= 1:
         raise ValueError("--teacher-ensemble-alpha must be in [0, 1]")
-    if min(args.hard_evidence_per_type, args.hard_paths_per_query) < 0:
-        raise ValueError("Hard-evidence and hard-path sizes must be non-negative")
+    if teacher_ensemble_alpha is not None and teacher_score_space != "raw_logit":
+        raise ValueError("Teacher/raw ensembles require --teacher-score-space raw_logit")
+    if min(
+        args.hard_evidence_per_type,
+        hard_targets_per_positive_evidence,
+        args.hard_paths_per_query,
+    ) < 0:
+        raise ValueError("Hard-evidence, E-T, and hard-path sizes must be non-negative")
+    if (
+        getattr(args, "row_support_top_l", None) is not None
+        and args.row_support_top_l <= 0
+    ):
+        raise ValueError("--row-support-top-l must be positive")
     validate_protocol_split("mining", args.split)
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     split = args.split
@@ -123,6 +178,46 @@ def run(args: argparse.Namespace) -> None:
         if getattr(args, "evidence_power", None) is not None
         else saved_aggregator.power
     )
+    path_combination = (
+        getattr(args, "path_combination", None)
+        if getattr(args, "path_combination", None) is not None
+        else saved_aggregator.path_combination
+    )
+    evidence_threshold = (
+        getattr(args, "evidence_threshold", None)
+        if getattr(args, "evidence_threshold", None) is not None
+        else saved_aggregator.threshold
+    )
+    evidence_target_temperature = (
+        getattr(args, "evidence_target_temperature", None)
+        if getattr(args, "evidence_target_temperature", None) is not None
+        else saved_aggregator.target_temperature
+    )
+    row_support_model = (
+        getattr(args, "row_support_model", None)
+        if getattr(args, "row_support_model", None) is not None
+        else saved_aggregator.row_support_model
+    )
+    row_support_model_sha256 = (
+        saved_aggregator.row_support_model_sha256
+        if row_support_model == saved_aggregator.row_support_model
+        else None
+    )
+    row_support_top_l = (
+        getattr(args, "row_support_top_l", None)
+        if getattr(args, "row_support_top_l", None) is not None
+        else saved_aggregator.row_support_top_l
+    )
+    evidence_content_keys = (
+        getattr(args, "evidence_content_keys", None)
+        if getattr(args, "evidence_content_keys", None) is not None
+        else saved_aggregator.evidence_content_keys
+    )
+    evidence_content_keys_sha256 = (
+        saved_aggregator.evidence_content_keys_sha256
+        if evidence_content_keys == saved_aggregator.evidence_content_keys
+        else None
+    )
     student_sha256 = checkpoint_fingerprint(student_path)
     corpus_sha256 = checkpoint_fingerprint(Path(args.corpus))
     evidence_types = tuple(dict.fromkeys(args.evidence_types))
@@ -144,18 +239,17 @@ def run(args: argparse.Namespace) -> None:
                 "student_checkpoint_sha256": student_sha256,
                 "corpus_sha256": corpus_sha256,
                 "index_manifest_sha256": index_manifest_sha256,
-                "evidence_aggregation": evidence_aggregation,
-                "evidence_top_k": evidence_top_k,
-                "evidence_temperature": evidence_temperature,
-                "evidence_power": evidence_power,
+                "student_score_space": student_score_space,
                 "hard_targets_per_query": args.hard_targets_per_query,
                 "hard_evidence_per_type": args.hard_evidence_per_type,
+                "hard_targets_per_positive_evidence": (
+                    hard_targets_per_positive_evidence
+                ),
                 "hard_paths_per_query": args.hard_paths_per_query,
                 "direct_k": args.direct_k,
                 "evidence_k": args.evidence_k,
                 "targets_per_evidence": args.targets_per_evidence,
                 "evidence_types": list(evidence_types),
-                "teacher_ensemble_alpha": teacher_ensemble_alpha,
             },
         )
         pending_targets = load_target_examples(pending_target_path, split=split)
@@ -181,12 +275,16 @@ def run(args: argparse.Namespace) -> None:
             device=device,
             checkpoint_sha256=student_sha256,
             corpus_sha256=corpus_sha256,
+            score_space=student_score_space,
         )
         candidate_sets = retrieve_hard_candidate_sets(
             examples,
             indices,
             hard_targets_per_query=args.hard_targets_per_query,
             hard_evidence_per_type=args.hard_evidence_per_type,
+            hard_targets_per_positive_evidence=(
+                hard_targets_per_positive_evidence
+            ),
             hard_paths_per_query=args.hard_paths_per_query,
             direct_k=args.direct_k,
             evidence_k=args.evidence_k,
@@ -212,7 +310,26 @@ def run(args: argparse.Namespace) -> None:
             evidence_top_k,
             temperature=evidence_temperature,
             power=evidence_power,
+            path_combination=path_combination,
+            threshold=evidence_threshold,
+            target_temperature=evidence_target_temperature,
+            row_support_model=row_support_model,
+            row_support_model_sha256=row_support_model_sha256,
+            row_support_top_l=row_support_top_l,
+            evidence_content_keys=evidence_content_keys,
+            evidence_content_keys_sha256=evidence_content_keys_sha256,
         )
+        if (
+            aggregator.evidence_aggregation == "greedy_row_support"
+            and (
+                not aggregator.row_support_models
+                or not aggregator.evidence_content_key_by_id
+            )
+        ):
+            raise ValueError(
+                "greedy_row_support requires --row-support-model and "
+                "--evidence-content-keys"
+            )
         if use_pending:
             target_records, edge_records = score_pending_hard_examples(
                 pending_targets,
@@ -223,6 +340,7 @@ def run(args: argparse.Namespace) -> None:
                 device=device,
                 batch_size=args.teacher_batch_size,
                 ensemble_alpha=teacher_ensemble_alpha,
+                teacher_score_space=teacher_score_space,
             )
         else:
             target_records, edge_records = score_hard_candidate_sets(
@@ -233,6 +351,7 @@ def run(args: argparse.Namespace) -> None:
                 device=device,
                 batch_size=args.teacher_batch_size,
                 ensemble_alpha=teacher_ensemble_alpha,
+                teacher_score_space=teacher_score_space,
             )
     _write_jsonl(Path(args.output_target_lists), target_records)
     if args.output_edge_lists:
@@ -246,14 +365,21 @@ def run(args: argparse.Namespace) -> None:
         "evidence_top_k": evidence_top_k,
         "evidence_temperature": evidence_temperature,
         "evidence_power": evidence_power,
+        "path_combination": path_combination,
+        "evidence_threshold": evidence_threshold,
+        "student_score_space": student_score_space,
         "teacher_target_channels": ["direct", "evidence"],
         "hard_negative_mining": {
             "hard_evidence": "query_to_evidence_ann",
+            "hard_evidence_target": "positive_evidence_to_target_ann",
             "hard_target": "query_to_target_ann",
             "path_hard": "raw_query_evidence_target_path_score",
         },
         "hard_targets_per_query": args.hard_targets_per_query,
         "hard_evidence_per_type": args.hard_evidence_per_type,
+        "hard_targets_per_positive_evidence": (
+            hard_targets_per_positive_evidence
+        ),
         "hard_paths_per_query": args.hard_paths_per_query,
         "direct_k": args.direct_k,
         "evidence_k": args.evidence_k,
@@ -261,16 +387,27 @@ def run(args: argparse.Namespace) -> None:
         "evidence_types": list(evidence_types),
         "teacher_ensemble_alpha": teacher_ensemble_alpha,
     }
+    metadata.setdefault("mining_selection_config", _mining_selection_config(metadata))
     if teacher_sha256 is not None:
+        teacher_logit_mode = (
+            "ensemble"
+            if teacher_ensemble_alpha is not None
+            else "teacher"
+            if teacher_score_space == "raw_logit"
+            else f"teacher_{teacher_score_space}"
+        )
         metadata["teacher_checkpoint_sha256"] = teacher_sha256
         metadata["teacher_scoring"] = "complete"
-        metadata["teacher_target_logit_mode"] = (
-            "ensemble" if teacher_ensemble_alpha is not None else "teacher"
-        )
+        metadata["teacher_score_space"] = teacher_score_space
+        metadata["training_score_config"] = {
+            **aggregator.config(),
+            "teacher_score_space": teacher_score_space,
+            "student_score_space": training_student_score_space,
+            "teacher_ensemble_alpha": teacher_ensemble_alpha,
+        }
+        metadata["teacher_target_logit_mode"] = teacher_logit_mode
         metadata["teacher_target_ensemble_alpha"] = teacher_ensemble_alpha
-        metadata["teacher_edge_logit_mode"] = (
-            "ensemble" if teacher_ensemble_alpha is not None else "teacher"
-        )
+        metadata["teacher_edge_logit_mode"] = teacher_logit_mode
         metadata["teacher_edge_ensemble_alpha"] = teacher_ensemble_alpha
     else:
         metadata["teacher_scoring"] = "pending"
@@ -308,6 +445,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--teacher-checkpoint")
     parser.add_argument("--student-checkpoint", required=True)
+    parser.add_argument(
+        "--student-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        default="raw_logit",
+    )
+    parser.add_argument(
+        "--training-student-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        help=(
+            "Student score space that will consume the rescored candidate pool; "
+            "defaults to the mining Student score space."
+        ),
+    )
     parser.add_argument("--index-dir", required=True)
     parser.add_argument("--corpus", required=True, help="Full shared corpus used for the ANN index.")
     parser.add_argument("--target-lists", required=True, nargs="+")
@@ -327,6 +477,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-batch-size", type=int, default=4)
     parser.add_argument("--teacher-ensemble-alpha", type=float)
     parser.add_argument(
+        "--teacher-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        default="raw_logit",
+    )
+    parser.add_argument(
         "--mine-only",
         action="store_true",
         help=(
@@ -337,6 +492,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mining-round", type=int, default=1)
     parser.add_argument("--hard-targets-per-query", type=int, default=16)
     parser.add_argument("--hard-evidence-per-type", type=int, default=16)
+    parser.add_argument(
+        "--hard-targets-per-positive-evidence",
+        type=int,
+        default=0,
+        help="Independently mine this many E-to-target negatives per positive evidence.",
+    )
     parser.add_argument("--hard-paths-per-query", type=int, default=16)
     parser.add_argument("--direct-k", type=int, default=200)
     parser.add_argument("--evidence-k", type=int, default=100)
@@ -348,6 +509,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-temperature", type=float)
     parser.add_argument("--evidence-power", type=float)
+    parser.add_argument("--path-combination", choices=["sum", "min", "product"])
+    parser.add_argument("--evidence-threshold", type=float)
+    parser.add_argument("--evidence-target-temperature", type=float)
+    parser.add_argument("--row-support-model")
+    parser.add_argument("--row-support-top-l", type=int)
+    parser.add_argument("--evidence-content-keys")
     return parser.parse_args()
 
 

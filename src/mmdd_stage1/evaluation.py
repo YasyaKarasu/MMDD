@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from mmdd_progress import progress
@@ -89,7 +90,9 @@ def _retrieval_metrics(
     rankings: dict[str, dict[int, list[list[str]]]],
     positive_sets: Sequence[set[str]],
     positive_evidence_hits: dict[str, dict[int, list[bool]]],
+    valid_path_counts: dict[int, list[tuple[int, int]]],
     recall_ks: tuple[int, ...],
+    evidence_bundle_budget: int,
     *,
     return_per_query: bool = False,
 ) -> dict[str, Any]:
@@ -120,6 +123,13 @@ def _retrieval_metrics(
         return values
 
     primary_fused = fused_metrics("fused")
+    valid_path = {}
+    for k in recall_ks:
+        numerator = sum(valid_path_counts[k][index][0] for index in query_indices)
+        denominator = sum(valid_path_counts[k][index][1] for index in query_indices)
+        name = f"valid_path_recall@{k},{evidence_bundle_budget}"
+        valid_path[name] = numerator / denominator if denominator else 0.0
+        valid_path[f"supported_positive_pairs@{k},{evidence_bundle_budget}"] = denominator
     result: dict[str, Any] = {
         "queries": len(query_indices),
         **_channel_metrics(selected_rankings["fused"], selected_positives, recall_ks),
@@ -129,6 +139,7 @@ def _retrieval_metrics(
         "fused_e005": fused_metrics("fused_e005"),
         "positive_evidence_path_queries@10": primary_fused["positive_evidence_path_queries@10"],
         "positive_evidence_path_coverage@10": primary_fused["positive_evidence_path_coverage@10"],
+        **valid_path,
     }
     if return_per_query:
         result["per_query"] = {
@@ -159,6 +170,14 @@ def evaluate_student_retrieval(
     evidence_top_k: int = 4,
     evidence_temperature: float = 1.0,
     evidence_power: float = 2.0,
+    path_combination: str = "sum",
+    evidence_threshold: float = 0.0,
+    evidence_target_temperature: float = 1.0,
+    row_support_model: str | Path | None = None,
+    row_support_model_sha256: str | None = None,
+    row_support_top_l: int = 20,
+    evidence_content_keys: str | Path | None = None,
+    evidence_content_keys_sha256: str | None = None,
     path_edge_normalization: str = "none",
     rrf_k: int = 60,
     fusion_mode: str = "weighted_rrf",
@@ -193,6 +212,9 @@ def evaluate_student_retrieval(
         channel: {requested_k: [] for requested_k in retrieval_ks}
         for channel in ("fused", "fused_e0", "fused_e005")
     }
+    valid_path_counts: dict[int, list[tuple[int, int]]] = {
+        requested_k: [] for requested_k in retrieval_ks
+    }
 
     for requested_k in retrieval_ks:
         query_ids = [
@@ -218,6 +240,14 @@ def evaluate_student_retrieval(
             evidence_top_k=evidence_top_k,
             evidence_temperature=evidence_temperature,
             evidence_power=evidence_power,
+            path_combination=path_combination,
+            evidence_threshold=evidence_threshold,
+            evidence_target_temperature=evidence_target_temperature,
+            row_support_model=row_support_model,
+            row_support_model_sha256=row_support_model_sha256,
+            row_support_top_l=row_support_top_l,
+            evidence_content_keys=evidence_content_keys,
+            evidence_content_keys_sha256=evidence_content_keys_sha256,
             path_edge_normalization=path_edge_normalization,
             rrf_k=rrf_k,
             fusion_mode=fusion_mode,
@@ -253,6 +283,41 @@ def evaluate_student_retrieval(
                 for candidate in example.candidates
                 if candidate.target_id in positives and candidate.evidence_ids
             }
+            valid_numerator = 0
+            valid_denominator = len(positive_evidence)
+            fused_by_target = {
+                str(item["target_id"]): item for item in result["fused"][:requested_k]
+            }
+            for target_id, valid_evidence_ids in positive_evidence.items():
+                item = fused_by_target.get(target_id)
+                if item is None:
+                    continue
+                if "selected_evidence_ids" in item:
+                    selected_evidence_ids = set(
+                        str(value)
+                        for value in item["selected_evidence_ids"][:evidence_top_k]
+                    )
+                else:
+                    selected_paths = sorted(
+                        (
+                            path
+                            for path in item["paths"]
+                            if path["kind"] == "evidence"
+                        ),
+                        key=lambda path: (
+                            -float(path["path_score"]),
+                            str(path["evidence_id"]),
+                        ),
+                    )[:evidence_top_k]
+                    selected_evidence_ids = {
+                        str(path["evidence_id"]) for path in selected_paths
+                    }
+                valid_numerator += bool(
+                    selected_evidence_ids & valid_evidence_ids
+                )
+            valid_path_counts[requested_k].append(
+                (valid_numerator, valid_denominator)
+            )
             for channel in positive_evidence_hits:
                 positive_evidence_hits[channel][requested_k].append(
                     any(
@@ -268,13 +333,15 @@ def evaluate_student_retrieval(
 
     metrics = _retrieval_metrics(
         list(range(len(examples))), rankings, positive_sets,
-        positive_evidence_hits, recall_ks, return_per_query=return_per_query,
+        positive_evidence_hits, valid_path_counts, recall_ks,
+        evidence_top_k, return_per_query=return_per_query,
     )
     datasets = sorted({example.dataset for example in examples})
     metrics["by_dataset"] = {
         dataset: _retrieval_metrics(
             [index for index, example in enumerate(examples) if example.dataset == dataset],
-            rankings, positive_sets, positive_evidence_hits, recall_ks,
+            rankings, positive_sets, positive_evidence_hits, valid_path_counts,
+            recall_ks, evidence_top_k,
             return_per_query=return_per_query,
         )
         for dataset in datasets

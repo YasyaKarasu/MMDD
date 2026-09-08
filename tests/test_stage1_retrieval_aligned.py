@@ -120,10 +120,22 @@ def test_baseline_cli_accepts_reference_path_edge_normalization(monkeypatch):
             "output",
             "--path-edge-normalization",
             "zscore",
+            "--direct-k",
+            "100",
+            "--evidence-k",
+            "20",
+            "--targets-per-evidence",
+            "20",
         ],
     )
 
-    assert evaluate_stage1_r3_baselines.parse_args().path_edge_normalization == "zscore"
+    args = evaluate_stage1_r3_baselines.parse_args()
+    assert args.path_edge_normalization == "zscore"
+    assert (args.direct_k, args.evidence_k, args.targets_per_evidence) == (
+        100,
+        20,
+        20,
+    )
 
 
 def test_teacher_rerank_preflight_materializes_only_missing_objects(tmp_path):
@@ -222,6 +234,33 @@ def test_align_edge_record_keeps_handcrafted_quota_and_adds_raw_negatives():
         unavailable_ids={"raw_t1"},
     )
     assert without_bad["candidate_ids"] == ["positive", "hand1", "raw_t2", "raw_t3"]
+
+
+def test_align_edge_record_keeps_all_positives_and_marks_ann_additions_unknown():
+    record = {
+        "query_id": "q",
+        "source_type": "table",
+        "positive_id": "positive",
+        "positive_ids": ["positive", "also_positive"],
+        "candidate_ids": ["positive", "also_positive", "hand1"],
+        "confirmed_labels": [1, 1, 0],
+        "destination_type": "table",
+        "dataset": "data",
+        "split": "train",
+    }
+
+    aligned = align_edge_record(
+        record, StaticIndices(), list_width=4, handcrafted_negatives=1
+    )
+
+    assert aligned["candidate_ids"] == [
+        "positive",
+        "also_positive",
+        "hand1",
+        "raw_t1",
+    ]
+    assert aligned["positive_ids"] == ["positive", "also_positive"]
+    assert aligned["confirmed_labels"] == [1, 1, 0, None]
 
 
 def test_align_target_record_attaches_query_hard_evidence_to_raw_targets():

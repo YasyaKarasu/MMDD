@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 from mmdd_progress import progress
-from torch.nn.utils.rnn import pad_sequence
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from .data import (
     EdgeExample,
@@ -21,8 +22,7 @@ from .data import (
 from .features import FeatureStore
 from .models import TeacherJoinabilityModel
 from .objectives import PathAggregator
-from .scoring import score_edge_batch, score_target_batch
-from .scoring import ListScores, TargetScores
+from .scoring import ListScores, TargetScores, score_edge_batch, score_target_batch
 from .teacher_rerank import ensemble_scores
 
 TrainingExample = EdgeExample | TargetExample
@@ -34,10 +34,18 @@ FROZEN_COSINE_TARGET_SHA256 = hashlib.sha256(
 
 def _teacher_score_config(aggregator: PathAggregator) -> TeacherScoreConfig:
     return TeacherScoreConfig(
-        aggregator.evidence_aggregation,
-        aggregator.top_k,
-        aggregator.temperature,
-        aggregator.power,
+        evidence_aggregation=aggregator.evidence_aggregation,
+        evidence_top_k=aggregator.top_k,
+        evidence_temperature=aggregator.temperature,
+        evidence_power=aggregator.power,
+        path_combination=aggregator.path_combination,
+        evidence_threshold=aggregator.threshold,
+        evidence_target_temperature=aggregator.target_temperature,
+        row_support_model=aggregator.row_support_model,
+        row_support_model_sha256=aggregator.row_support_model_sha256,
+        row_support_top_l=aggregator.row_support_top_l,
+        evidence_content_keys=aggregator.evidence_content_keys,
+        evidence_content_keys_sha256=aggregator.evidence_content_keys_sha256,
     )
 
 
@@ -45,8 +53,30 @@ def _aggregation_cache_suffix(aggregator: PathAggregator) -> str:
     suffix = f"-{aggregator.evidence_aggregation}-k{aggregator.top_k}"
     if aggregator.evidence_aggregation == "softmax_weighted_mean":
         suffix += f"-t{aggregator.temperature:.12g}"
+    elif aggregator.evidence_aggregation in {
+        "logmeanexp",
+        "logsumexp",
+        "topk_logmeanexp",
+        "topk_logsumexp",
+    } and aggregator.temperature != 1.0:
+        suffix += f"-t{aggregator.temperature:.12g}"
     elif aggregator.evidence_aggregation == "power_mean":
         suffix += f"-p{aggregator.power:.12g}"
+    elif aggregator.evidence_aggregation == "fixed_power_mean":
+        suffix += f"-p{aggregator.power:.12g}-d{aggregator.threshold:.12g}"
+    elif aggregator.evidence_aggregation == "greedy_row_support":
+        row_support_fingerprint = aggregator.row_support_model_sha256 or "none"
+        content_fingerprint = aggregator.evidence_content_keys_sha256 or "none"
+        suffix += (
+            f"-l{aggregator.row_support_top_l}"
+            f"-d{aggregator.threshold:.12g}"
+            f"-rs{row_support_fingerprint[:12]}"
+            f"-ck{content_fingerprint[:12]}"
+        )
+    if aggregator.path_combination != "sum":
+        suffix += f"-c{aggregator.path_combination}"
+    if aggregator.target_temperature != 1.0:
+        suffix += f"-tt{aggregator.target_temperature:.12g}"
     return suffix
 
 
@@ -317,6 +347,7 @@ def _cache_path(
     teacher_sha256: str,
     aggregator: PathAggregator | None,
     ensemble_alpha: float | None,
+    teacher_score_space: str = "raw_logit",
 ) -> Path:
     kind = "edge" if isinstance(examples[0], EdgeExample) else "target"
     aggregation = (
@@ -329,7 +360,13 @@ def _cache_path(
         if ensemble_alpha is None
         else f"-ensemble-edge-v{ENSEMBLE_TARGET_VERSION}-a{ensemble_alpha:.12g}"
     )
-    name = f"{kind}{aggregation}{ensemble}-{examples_fingerprint(examples)}.pt"
+    score_space = (
+        "" if teacher_score_space == "raw_logit" else f"-{teacher_score_space}"
+    )
+    name = (
+        f"{kind}{aggregation}{score_space}{ensemble}-"
+        f"{examples_fingerprint(examples)}.pt"
+    )
     return cache_dir / teacher_sha256 / name
 
 
@@ -339,10 +376,19 @@ def _validate_ensemble_alpha(ensemble_alpha: float | None) -> None:
 
 
 def _logit_mode_matches(
-    example: TrainingExample, ensemble_alpha: float | None
+    example: TrainingExample,
+    ensemble_alpha: float | None,
+    teacher_score_space: str,
 ) -> bool:
     if ensemble_alpha is None:
-        return example.teacher_logit_mode in {None, "teacher"}
+        expected = (
+            "teacher"
+            if teacher_score_space == "raw_logit"
+            else f"teacher_{teacher_score_space}"
+        )
+        if expected == "teacher":
+            return example.teacher_logit_mode in {None, expected}
+        return example.teacher_logit_mode == expected
     return (
         example.teacher_logit_mode == "ensemble"
         and example.teacher_ensemble_alpha == ensemble_alpha
@@ -354,6 +400,7 @@ def has_teacher_logits(
     teacher_sha256: str | None = None,
     aggregator: PathAggregator | None = None,
     ensemble_alpha: float | None = None,
+    teacher_score_space: str = "raw_logit",
 ) -> bool:
     _validate_ensemble_alpha(ensemble_alpha)
     score_config = (
@@ -377,10 +424,61 @@ def has_teacher_logits(
                 teacher_sha256 is None
                 or example.teacher_checkpoint_sha256 == teacher_sha256
             )
-            and _logit_mode_matches(example, ensemble_alpha)
+            and _logit_mode_matches(
+                example, ensemble_alpha, teacher_score_space
+            )
         )
         for example in examples
     )
+
+
+def _replace_target_logits(
+    example: TargetExample,
+    direct_logits: torch.Tensor,
+    evidence_logits: torch.Tensor,
+    *,
+    aggregator: PathAggregator,
+    teacher_sha256: str,
+    logit_mode: str,
+    ensemble_alpha: float | None,
+) -> TargetExample:
+    count = len(example.candidates)
+    return replace(
+        example,
+        teacher_direct_logits=tuple(
+            float(value) for value in direct_logits[:count].cpu().tolist()
+        ),
+        teacher_evidence_logits=tuple(
+            float(value) for value in evidence_logits[:count].cpu().tolist()
+        ),
+        teacher_score_config=_teacher_score_config(aggregator),
+        teacher_checkpoint_sha256=teacher_sha256,
+        teacher_logit_mode=logit_mode,
+        teacher_ensemble_alpha=ensemble_alpha,
+    )
+
+
+def _target_logits_payload(
+    examples: Sequence[TargetExample], aggregator: PathAggregator
+) -> dict[str, Any]:
+    return {
+        **aggregator.config(),
+        "teacher_direct_logits": pad_sequence(
+            [torch.tensor(example.teacher_direct_logits) for example in examples],
+            batch_first=True,
+        ).float(),
+        "teacher_evidence_logits": pad_sequence(
+            [torch.tensor(example.teacher_evidence_logits) for example in examples],
+            batch_first=True,
+        ).float(),
+    }
+
+
+def _write_logits_cache(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def load_teacher_logits(
@@ -389,10 +487,16 @@ def load_teacher_logits(
     teacher_sha256: str,
     aggregator: PathAggregator | None = None,
     ensemble_alpha: float | None = None,
+    teacher_score_space: str = "raw_logit",
 ) -> tuple[list[TrainingExample], Path, bool]:
     _validate_ensemble_alpha(ensemble_alpha)
     path = _cache_path(
-        cache_dir, examples, teacher_sha256, aggregator, ensemble_alpha
+        cache_dir,
+        examples,
+        teacher_sha256,
+        aggregator,
+        ensemble_alpha,
+        teacher_score_space,
     )
     if not path.is_file():
         return list(examples), path, False
@@ -408,9 +512,17 @@ def load_teacher_logits(
         raise ValueError(f"{path}: Teacher logit cache metadata does not match")
     cached_mode = payload.get("teacher_logit_mode", "teacher")
     cached_alpha = payload.get("teacher_ensemble_alpha")
-    expected_mode = "ensemble" if ensemble_alpha is not None else "teacher"
+    expected_mode = (
+        "ensemble"
+        if ensemble_alpha is not None
+        else "teacher"
+        if teacher_score_space == "raw_logit"
+        else f"teacher_{teacher_score_space}"
+    )
     if cached_mode != expected_mode or cached_alpha != ensemble_alpha:
         raise ValueError(f"{path}: Teacher logit cache scoring mode does not match")
+    if payload.get("teacher_score_space", "raw_logit") != teacher_score_space:
+        raise ValueError(f"{path}: Teacher logit cache score space does not match")
     if (
         ensemble_alpha is not None
         and payload.get("ensemble_target_version") != ENSEMBLE_TARGET_VERSION
@@ -459,6 +571,21 @@ def load_teacher_logits(
             or float(payload.get("evidence_temperature", 1.0))
             != aggregator.temperature
             or float(payload.get("evidence_power", 2.0)) != aggregator.power
+            or str(payload.get("path_combination", "sum"))
+            != aggregator.path_combination
+            or float(payload.get("evidence_threshold", 0.0))
+            != aggregator.threshold
+            or float(payload.get("evidence_target_temperature", 1.0))
+            != aggregator.target_temperature
+            or payload.get("row_support_model") != aggregator.row_support_model
+            or payload.get("row_support_model_sha256")
+            != aggregator.row_support_model_sha256
+            or int(payload.get("row_support_top_l", 20))
+            != aggregator.row_support_top_l
+            or payload.get("evidence_content_keys")
+            != aggregator.evidence_content_keys
+            or payload.get("evidence_content_keys_sha256")
+            != aggregator.evidence_content_keys_sha256
             or any(
                 direct.shape[1] < len(example.candidates)
                 or evidence.shape[1] < len(example.candidates)
@@ -502,6 +629,7 @@ def score_and_cache_teacher_logits(
     batch_size: int,
     aggregator: PathAggregator | None = None,
     ensemble_alpha: float | None = None,
+    teacher_score_space: str = "raw_logit",
 ) -> tuple[list[TrainingExample], Path]:
     _validate_ensemble_alpha(ensemble_alpha)
     result = list(examples)
@@ -509,7 +637,11 @@ def score_and_cache_teacher_logits(
         index
         for index, example in enumerate(result)
         if not has_teacher_logits(
-            [example], teacher_sha256, aggregator, ensemble_alpha
+            [example],
+            teacher_sha256,
+            aggregator,
+            ensemble_alpha,
+            teacher_score_space,
         )
     ]
     teacher.eval()
@@ -524,7 +656,13 @@ def score_and_cache_teacher_logits(
         indices = missing[start : start + batch_size]
         batch = [result[index] for index in indices]
         if isinstance(batch[0], EdgeExample):
-            teacher_scores = score_edge_batch(teacher, batch, store, device)
+            teacher_scores = score_edge_batch(
+                teacher,
+                batch,
+                store,
+                device,
+                student_score_space=teacher_score_space,
+            )
             scores = (
                 _ensemble_list_scores(
                     _raw_edge_scores(batch, store, device),
@@ -546,7 +684,11 @@ def score_and_cache_teacher_logits(
                     teacher_logits=logits,
                     teacher_checkpoint_sha256=teacher_sha256,
                     teacher_logit_mode=(
-                        "ensemble" if ensemble_alpha is not None else "teacher"
+                        "ensemble"
+                        if ensemble_alpha is not None
+                        else "teacher"
+                        if teacher_score_space == "raw_logit"
+                        else f"teacher_{teacher_score_space}"
                     ),
                     teacher_ensemble_alpha=ensemble_alpha,
                 )
@@ -557,37 +699,55 @@ def score_and_cache_teacher_logits(
                     batch, teacher, store, device, aggregator, ensemble_alpha
                 )
                 if ensemble_alpha is not None
-                else score_target_batch(teacher, batch, store, device, aggregator)
+                else score_target_batch(
+                    teacher,
+                    batch,
+                    store,
+                    device,
+                    aggregator,
+                    student_score_space=teacher_score_space,
+                )
             )
             for row, index in enumerate(indices):
                 example = result[index]
                 assert isinstance(example, TargetExample)
-                count = len(example.candidates)
-                result[index] = replace(
+                result[index] = _replace_target_logits(
                     example,
-                    teacher_direct_logits=tuple(
-                        float(value)
-                        for value in scores.direct.logits[row, :count].cpu().tolist()
+                    scores.direct.logits[row],
+                    scores.evidence.logits[row],
+                    aggregator=aggregator,
+                    teacher_sha256=teacher_sha256,
+                    logit_mode=(
+                        "ensemble"
+                        if ensemble_alpha is not None
+                        else "teacher"
+                        if teacher_score_space == "raw_logit"
+                        else f"teacher_{teacher_score_space}"
                     ),
-                    teacher_evidence_logits=tuple(
-                        float(value)
-                        for value in scores.evidence.logits[row, :count].cpu().tolist()
-                    ),
-                    teacher_score_config=_teacher_score_config(aggregator),
-                    teacher_checkpoint_sha256=teacher_sha256,
-                    teacher_logit_mode=("ensemble" if ensemble_alpha is not None else "teacher"),
-                    teacher_ensemble_alpha=ensemble_alpha,
+                    ensemble_alpha=ensemble_alpha,
                 )
 
     path = _cache_path(
-        cache_dir, result, teacher_sha256, aggregator, ensemble_alpha
+        cache_dir,
+        result,
+        teacher_sha256,
+        aggregator,
+        ensemble_alpha,
+        teacher_score_space,
     )
     payload: dict[str, Any] = {
         "format_version": 1,
         "teacher_checkpoint_sha256": teacher_sha256,
         "examples_sha256": examples_fingerprint(result),
-        "teacher_logit_mode": "ensemble" if ensemble_alpha is not None else "teacher",
+        "teacher_logit_mode": (
+            "ensemble"
+            if ensemble_alpha is not None
+            else "teacher"
+            if teacher_score_space == "raw_logit"
+            else f"teacher_{teacher_score_space}"
+        ),
         "teacher_ensemble_alpha": ensemble_alpha,
+        "teacher_score_space": teacher_score_space,
     }
     if ensemble_alpha is not None:
         payload["ensemble_target_version"] = ENSEMBLE_TARGET_VERSION
@@ -598,22 +758,8 @@ def score_and_cache_teacher_logits(
         ).float()
     else:
         assert aggregator is not None
-        payload["evidence_aggregation"] = aggregator.evidence_aggregation
-        payload["evidence_top_k"] = aggregator.top_k
-        payload["evidence_temperature"] = aggregator.temperature
-        payload["evidence_power"] = aggregator.power
-        payload["teacher_direct_logits"] = pad_sequence(
-            [torch.tensor(example.teacher_direct_logits) for example in result],
-            batch_first=True,
-        ).float()
-        payload["teacher_evidence_logits"] = pad_sequence(
-            [torch.tensor(example.teacher_evidence_logits) for example in result],
-            batch_first=True,
-        ).float()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary)
-    temporary.replace(path)
+        payload.update(_target_logits_payload(result, aggregator))
+    _write_logits_cache(path, payload)
     return result, path
 
 
@@ -659,21 +805,14 @@ def score_and_cache_cosine_logits(
         )
         for row, index in enumerate(indices):
             example = result[index]
-            count = len(example.candidates)
-            result[index] = replace(
+            result[index] = _replace_target_logits(
                 example,
-                teacher_direct_logits=tuple(
-                    float(value)
-                    for value in scores.direct.logits[row, :count].cpu().tolist()
-                ),
-                teacher_evidence_logits=tuple(
-                    float(value)
-                    for value in scores.evidence.logits[row, :count].cpu().tolist()
-                ),
-                teacher_score_config=_teacher_score_config(aggregator),
-                teacher_checkpoint_sha256=FROZEN_COSINE_TARGET_SHA256,
-                teacher_logit_mode="ensemble",
-                teacher_ensemble_alpha=0.0,
+                scores.direct.logits[row],
+                scores.evidence.logits[row],
+                aggregator=aggregator,
+                teacher_sha256=FROZEN_COSINE_TARGET_SHA256,
+                logit_mode="ensemble",
+                ensemble_alpha=0.0,
             )
 
     path = _cache_path(
@@ -691,21 +830,7 @@ def score_and_cache_cosine_logits(
         "teacher_ensemble_alpha": 0.0,
         "ensemble_target_version": ENSEMBLE_TARGET_VERSION,
         "target_source": "frozen_embedding_cosine",
-        "evidence_aggregation": aggregator.evidence_aggregation,
-        "evidence_top_k": aggregator.top_k,
-        "evidence_temperature": aggregator.temperature,
-        "evidence_power": aggregator.power,
-        "teacher_direct_logits": pad_sequence(
-            [torch.tensor(example.teacher_direct_logits) for example in result],
-            batch_first=True,
-        ).float(),
-        "teacher_evidence_logits": pad_sequence(
-            [torch.tensor(example.teacher_evidence_logits) for example in result],
-            batch_first=True,
-        ).float(),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary)
-    temporary.replace(path)
+    payload.update(_target_logits_payload(result, aggregator))
+    _write_logits_cache(path, payload)
     return result, path

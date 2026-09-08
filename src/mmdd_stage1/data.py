@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from mmdd_progress import progress
 
 from .features import normalize_object_type
-from .objectives import PATH_AGGREGATIONS
+from .objectives import PATH_AGGREGATIONS, PATH_COMBINATIONS
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class EdgeExample:
     teacher_ensemble_alpha: float | None = None
     source_type: str | None = None
     destination_type: str | None = None
+    positive_ids: tuple[str, ...] = ()
+    confirmed_labels: tuple[int | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,14 @@ class TeacherScoreConfig:
     evidence_top_k: int
     evidence_temperature: float = 1.0
     evidence_power: float = 2.0
+    path_combination: str = "sum"
+    evidence_threshold: float = 0.0
+    evidence_target_temperature: float = 1.0
+    row_support_model: str | None = None
+    row_support_model_sha256: str | None = None
+    row_support_top_l: int = 20
+    evidence_content_keys: str | None = None
+    evidence_content_keys_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +135,97 @@ def _teacher_logits(
     if not all(math.isfinite(value) for value in logits):
         raise ValueError(f"{path}:{line_number}: {key} must be finite")
     return logits
+
+
+def _edge_positive_ids(
+    path: Path,
+    line_number: int,
+    record: dict[str, Any],
+    candidate_ids: list[str],
+    positive_index: int,
+) -> tuple[str, ...]:
+    values = record.get("positive_ids")
+    if values is None:
+        return (candidate_ids[positive_index],)
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{path}:{line_number}: positive_ids must be a non-empty list")
+    positive_ids = tuple(str(value) for value in values)
+    if len(set(positive_ids)) != len(positive_ids):
+        raise ValueError(f"{path}:{line_number}: positive_ids contains duplicates")
+    missing = set(positive_ids) - set(candidate_ids)
+    if missing:
+        raise ValueError(
+            f"{path}:{line_number}: positive_ids references missing candidates: "
+            + ", ".join(sorted(missing))
+        )
+    if candidate_ids[positive_index] not in positive_ids:
+        raise ValueError(
+            f"{path}:{line_number}: positive_ids omits the designated positive"
+        )
+    return positive_ids
+
+
+def _confirmed_edge_labels(
+    path: Path,
+    line_number: int,
+    record: dict[str, Any],
+    candidate_ids: list[str],
+) -> tuple[int | None, ...] | None:
+    values = record.get("confirmed_labels")
+    positive_values = record.get("confirmed_positive_ids")
+    negative_values = record.get("confirmed_negative_ids")
+    if values is not None and (positive_values is not None or negative_values is not None):
+        raise ValueError(
+            f"{path}:{line_number}: use confirmed_labels or confirmed positive/negative IDs, not both"
+        )
+    if values is not None:
+        if not isinstance(values, list) or len(values) != len(candidate_ids):
+            raise ValueError(
+                f"{path}:{line_number}: confirmed_labels must align with candidates"
+            )
+        labels = []
+        for value in values:
+            if value is None:
+                labels.append(None)
+            elif isinstance(value, (bool, int)) and int(value) in {0, 1}:
+                labels.append(int(value))
+            else:
+                raise ValueError(
+                    f"{path}:{line_number}: confirmed_labels entries must be 0, 1, or null"
+                )
+        return tuple(labels)
+    if positive_values is None and negative_values is None:
+        return None
+    if positive_values is not None and not isinstance(positive_values, list):
+        raise ValueError(
+            f"{path}:{line_number}: confirmed_positive_ids must be a list"
+        )
+    if negative_values is not None and not isinstance(negative_values, list):
+        raise ValueError(
+            f"{path}:{line_number}: confirmed_negative_ids must be a list"
+        )
+    confirmed_positive_ids = {str(value) for value in positive_values or []}
+    confirmed_negative_ids = {str(value) for value in negative_values or []}
+    overlap = confirmed_positive_ids & confirmed_negative_ids
+    if overlap:
+        raise ValueError(
+            f"{path}:{line_number}: confirmed positive and negative IDs overlap: "
+            + ", ".join(sorted(overlap))
+        )
+    missing = (confirmed_positive_ids | confirmed_negative_ids) - set(candidate_ids)
+    if missing:
+        raise ValueError(
+            f"{path}:{line_number}: confirmed labels reference missing candidates: "
+            + ", ".join(sorted(missing))
+        )
+    return tuple(
+        1
+        if candidate_id in confirmed_positive_ids
+        else 0
+        if candidate_id in confirmed_negative_ids
+        else None
+        for candidate_id in candidate_ids
+    )
 
 
 def _provenance_value(
@@ -220,6 +321,9 @@ def load_edge_examples(
         if len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError(f"{path}:{line_number}: candidate_ids contains duplicates")
         positive_index = _positive_index(path, line_number, record, candidate_ids, "positive_id")
+        positive_ids = _edge_positive_ids(
+            path, line_number, record, candidate_ids, positive_index
+        )
         examples.append(
             EdgeExample(
                 query_id,
@@ -259,6 +363,10 @@ def load_edge_examples(
                     normalize_object_type(str(record["destination_type"]))
                     if record.get("destination_type") is not None
                     else None
+                ),
+                positive_ids=positive_ids,
+                confirmed_labels=_confirmed_edge_labels(
+                    path, line_number, record, candidate_ids
                 ),
             )
         )
@@ -317,6 +425,8 @@ def load_target_examples(
             path, line_number, record, len(candidates), "teacher_evidence_logits"
         )
         raw_score_config = record.get("teacher_score_config")
+        if raw_score_config is None and metadata.get("training_score_config") is not None:
+            raw_score_config = metadata["training_score_config"]
         if raw_score_config is None and {
             "evidence_aggregation",
             "evidence_top_k",
@@ -326,6 +436,20 @@ def load_target_examples(
                 "evidence_top_k": metadata["evidence_top_k"],
                 "evidence_temperature": metadata.get("evidence_temperature", 1.0),
                 "evidence_power": metadata.get("evidence_power", 2.0),
+                "path_combination": metadata.get("path_combination", "sum"),
+                "evidence_threshold": metadata.get("evidence_threshold", 0.0),
+                "evidence_target_temperature": metadata.get(
+                    "evidence_target_temperature", 1.0
+                ),
+                "row_support_model": metadata.get("row_support_model"),
+                "row_support_model_sha256": metadata.get(
+                    "row_support_model_sha256"
+                ),
+                "row_support_top_l": metadata.get("row_support_top_l", 20),
+                "evidence_content_keys": metadata.get("evidence_content_keys"),
+                "evidence_content_keys_sha256": metadata.get(
+                    "evidence_content_keys_sha256"
+                ),
             }
         teacher_score_config = None
         if raw_score_config is not None:
@@ -338,6 +462,35 @@ def load_target_examples(
                     raw_score_config.get("evidence_temperature", 1.0)
                 ),
                 evidence_power=float(raw_score_config.get("evidence_power", 2.0)),
+                path_combination=str(raw_score_config.get("path_combination", "sum")),
+                evidence_threshold=float(
+                    raw_score_config.get("evidence_threshold", 0.0)
+                ),
+                evidence_target_temperature=float(
+                    raw_score_config.get("evidence_target_temperature", 1.0)
+                ),
+                row_support_model=(
+                    str(raw_score_config["row_support_model"])
+                    if raw_score_config.get("row_support_model") is not None
+                    else None
+                ),
+                row_support_model_sha256=(
+                    str(raw_score_config["row_support_model_sha256"])
+                    if raw_score_config.get("row_support_model_sha256") is not None
+                    else None
+                ),
+                row_support_top_l=int(raw_score_config.get("row_support_top_l", 20)),
+                evidence_content_keys=(
+                    str(raw_score_config["evidence_content_keys"])
+                    if raw_score_config.get("evidence_content_keys") is not None
+                    else None
+                ),
+                evidence_content_keys_sha256=(
+                    str(raw_score_config["evidence_content_keys_sha256"])
+                    if raw_score_config.get("evidence_content_keys_sha256")
+                    is not None
+                    else None
+                ),
             )
             if teacher_score_config.evidence_aggregation not in PATH_AGGREGATIONS:
                 raise ValueError(f"{path}:{line_number}: invalid Teacher evidence aggregation")
@@ -350,6 +503,34 @@ def load_target_examples(
             if teacher_score_config.evidence_power <= 0:
                 raise ValueError(
                     f"{path}:{line_number}: Teacher evidence_power must be positive"
+                )
+            if teacher_score_config.path_combination not in PATH_COMBINATIONS:
+                raise ValueError(f"{path}:{line_number}: invalid Teacher path combination")
+            if not 0 <= teacher_score_config.evidence_threshold < 1:
+                raise ValueError(
+                    f"{path}:{line_number}: Teacher evidence_threshold must be in [0, 1)"
+                )
+            if teacher_score_config.evidence_target_temperature <= 0:
+                raise ValueError(
+                    f"{path}:{line_number}: Teacher evidence_target_temperature "
+                    "must be positive"
+                )
+            if teacher_score_config.row_support_top_l <= 0:
+                raise ValueError(
+                    f"{path}:{line_number}: Teacher row_support_top_l must be positive"
+                )
+            if (
+                teacher_score_config.evidence_aggregation == "greedy_row_support"
+                and (
+                    teacher_score_config.row_support_model is None
+                    or teacher_score_config.row_support_model_sha256 is None
+                    or teacher_score_config.evidence_content_keys is None
+                    or teacher_score_config.evidence_content_keys_sha256 is None
+                )
+            ):
+                raise ValueError(
+                    f"{path}:{line_number}: G5 Teacher scores require row-support "
+                    "and exact-content provenance"
                 )
         examples.append(
             TargetExample(

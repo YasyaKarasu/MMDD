@@ -128,6 +128,31 @@ def test_training_validation_accepts_zero_relation_learning_rate(tmp_path):
         train_stage1.run(args)
 
 
+def test_hard_training_accepts_matching_base_learning_rate(tmp_path):
+    args = train_stage1._argument_parser().parse_args(
+        [
+            "student-path",
+            "--features",
+            str(tmp_path / "missing_features"),
+            "--base-data",
+            str(tmp_path / "missing_targets.jsonl"),
+            "--hard-data",
+            str(tmp_path / "missing_hard_targets.jsonl"),
+            "--dev-data",
+            str(tmp_path / "missing_targets.jsonl"),
+            "--output",
+            str(tmp_path / "student.pt"),
+            "--learning-rate",
+            "1e-6",
+            "--hard-learning-rate",
+            "1e-6",
+        ]
+    )
+
+    with pytest.raises(FileNotFoundError):
+        train_stage1.run(args)
+
+
 def test_paired_bootstrap_resamples_query_pairs_and_reports_ci():
     same = paired_bootstrap_delta([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], iterations=500, seed=7)
     assert same["mean"] == 0.0
@@ -439,8 +464,11 @@ def test_full_corpus_metrics_include_fused_direct_evidence_and_path_coverage():
     assert "mrr@100" not in metrics
     assert metrics["positive_evidence_path_queries@10"] == 1
     assert metrics["positive_evidence_path_coverage@10"] == 1.0
+    assert metrics["valid_path_recall@10,4"] == 1.0
+    assert metrics["supported_positive_pairs@10,4"] == 1
     assert metrics["by_dataset"]["EntiTables"]["queries"] == 1
     assert metrics["by_dataset"]["EntiTables"]["direct"]["recall@10"] == 1.0
+    assert metrics["by_dataset"]["EntiTables"]["valid_path_recall@10,4"] == 1.0
     assert metrics["fused_e0"]["positive_evidence_path_coverage@10"] == 1.0
     assert metrics["fused_e005"]["recall@10"] == 1.0
     assert metrics["evidence_identity_baseline"]["recall@10"] == 0.75

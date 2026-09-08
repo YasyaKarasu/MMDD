@@ -14,7 +14,7 @@ from run_stage1_pipeline_unification_tasks_b_to_e import (
     _select_task_b_aggregation,
     _task_c_decision,
 )
-from mmdd_stage1.objectives import PATH_AGGREGATIONS
+from mmdd_stage1.objectives import RAW_EDGE_SCORE_PATH_AGGREGATIONS
 
 
 def _records(values: dict[str, tuple[float, float, float]]):
@@ -27,7 +27,9 @@ def _records(values: dict[str, tuple[float, float, float]]):
 
 
 def test_task_a_covers_all_path_aggregation_forms() -> None:
-    assert {config["form"] for config in aggregation_configs()} == PATH_AGGREGATIONS
+    assert {
+        config["form"] for config in aggregation_configs()
+    } == RAW_EDGE_SCORE_PATH_AGGREGATIONS
 
 
 def test_parameter_selection_is_lake_local_within_one_form() -> None:

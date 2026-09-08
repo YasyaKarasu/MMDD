@@ -31,6 +31,7 @@ from cache_stage1_features import (
 from mmdd_stage1.checkpoints import (
     load_path_aggregator,
     load_student,
+    load_teacher,
 )
 from mmdd_stage1.data import (
     EdgeExample,
@@ -61,6 +62,7 @@ from mmdd_stage1.objectives import (
     listwise_cross_entropy,
     optional_listwise_cross_entropy,
     positive_indices_to_mask,
+    relation_macro_binary_cross_entropy_with_logits,
 )
 from mmdd_stage1.pca import compute_pca_projection, load_pca_projection
 from mmdd_stage1.retrieval import (
@@ -172,6 +174,54 @@ def teacher() -> TeacherJoinabilityModel:
     )
 
 
+def test_teacher_confidence_transform_checkpoint_round_trip(tmp_path):
+    model = TeacherJoinabilityModel(
+        input_dim=4,
+        model_dim=8,
+        num_heads=2,
+        num_layers=1,
+        text_latents=2,
+        image_latents=2,
+        dropout=0.0,
+        confidence_transform=True,
+    )
+    key = model.relation_key("table", "text")
+    with torch.no_grad():
+        model.confidence_alphas[key].fill_(0.7)
+        model.confidence_biases[key].fill_(-0.3)
+    path = tmp_path / "teacher.pt"
+    torch.save(checkpoint(model, "teacher-edge"), path)
+
+    loaded = load_teacher(path, torch.device("cpu"))
+
+    assert loaded.confidence_transform
+    assert loaded.config()["confidence_transform"] is True
+    torch.testing.assert_close(
+        loaded.transform_edge_scores(
+            torch.tensor([-1.0, 2.0]), "table", "text", "confidence_logit"
+        ),
+        model.transform_edge_scores(
+            torch.tensor([-1.0, 2.0]), "table", "text", "confidence_logit"
+        ),
+    )
+
+
+def test_legacy_teacher_checkpoint_loads_without_confidence_parameters(tmp_path):
+    model = teacher()
+    payload = checkpoint(model, "teacher-edge")
+    payload["config"].pop("confidence_transform")
+    payload["config"].pop("confidence_epsilon")
+    path = tmp_path / "legacy_teacher.pt"
+    torch.save(payload, path)
+
+    loaded = load_teacher(path, torch.device("cpu"))
+
+    assert not loaded.confidence_transform
+    assert loaded.transform_edge_scores(
+        torch.tensor([0.0]), "table", "text", "raw_logit"
+    ).item() == 0.0
+
+
 def test_structural_table_pool_returns_schema_and_row_tokens():
     hidden = torch.tensor([[1.0, 1.0], [3.0, 3.0], [6.0, 4.0]])
     groups = torch.tensor([0, 0, 1])
@@ -275,6 +325,56 @@ def test_student_score_is_exact_ann_inner_product():
 
     assert score.item() == pytest.approx(torch.dot(relation_query, index_vector).item())
     assert not torch.allclose(score, model.score_pairs([target], [query])[0])
+
+
+def test_student_confidence_transform_is_positive_monotonic_and_explicit():
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        confidence_transform=True,
+    )
+    key = model.relation_key("table", "image")
+    raw_scores = torch.tensor([-2.0, -0.5, 0.0, 1.5])
+    with torch.no_grad():
+        model.confidence_alphas[key].fill_(-1.2)
+        model.confidence_biases[key].fill_(0.4)
+
+    logits = model.transform_edge_scores(
+        raw_scores, "table", "image", "confidence_logit"
+    )
+    confidence = model.transform_edge_scores(
+        raw_scores, "table", "image", "confidence"
+    )
+
+    assert model.confidence_scale("table", "image").item() > 0
+    assert torch.equal(torch.argsort(raw_scores), torch.argsort(logits))
+    assert torch.equal(torch.argsort(raw_scores), torch.argsort(confidence))
+    torch.testing.assert_close(confidence, torch.sigmoid(logits))
+    torch.testing.assert_close(
+        model.transform_edge_scores(
+            raw_scores, "table", "image", "raw_logit"
+        ),
+        raw_scores,
+    )
+
+
+def test_disabled_student_confidence_transform_is_checkpoint_compatible_identity():
+    model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    raw_scores = torch.tensor([-1.0, 0.0, 2.0])
+
+    assert model.confidence_parameters() == []
+    torch.testing.assert_close(
+        model.transform_edge_scores(
+            raw_scores, "table", "text", "confidence_logit"
+        ),
+        raw_scores,
+    )
+    torch.testing.assert_close(
+        model.transform_edge_scores(
+            raw_scores, "table", "text", "confidence"
+        ),
+        torch.sigmoid(raw_scores),
+    )
 
 
 def test_lowrank_student_starts_at_identity_and_matches_explicit_residual():
@@ -387,6 +487,46 @@ def test_student_embedding_matrix_matches_inline_relation_formula(relation_param
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("relation_param", ["full", "lowrank"])
+def test_student_pair_scoring_matches_embedding_scoring_gradients(relation_param):
+    torch.manual_seed(23)
+    embedding_model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        relation_param=relation_param,
+        relation_rank=2,
+    )
+    pair_model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        relation_param=relation_param,
+        relation_rank=2,
+    )
+    pair_model.load_state_dict(embedding_model.state_dict())
+    source = feature("source", "table", 0.2)
+    destination = feature("destination", "image", 0.7)
+
+    embedding_score = embedding_model.score_embeddings(
+        source.embedding,
+        source.object_type,
+        destination.embedding,
+        destination.object_type,
+    )
+    pair_score = pair_model.score_pairs([source], [destination])[0]
+    embedding_score.backward()
+    pair_score.backward()
+
+    torch.testing.assert_close(pair_score, embedding_score)
+    for (embedding_name, embedding_parameter), (pair_name, pair_parameter) in zip(
+        embedding_model.named_parameters(), pair_model.named_parameters()
+    ):
+        assert pair_name == embedding_name
+        if embedding_parameter.grad is None:
+            assert pair_parameter.grad is None
+        else:
+            torch.testing.assert_close(pair_parameter.grad, embedding_parameter.grad)
 
 
 def test_lowrank_student_first_step_updates_the_zero_initialized_factor():
@@ -621,6 +761,168 @@ def test_student_in_batch_scoring_expands_lists_and_respects_maximum():
     assert unexpanded.candidate_mask.sum(dim=1).tolist() == [2, 2]
 
 
+def test_edge_scoring_preserves_all_ranking_positives():
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "p1": feature("p1", "table", 0.2),
+            "p2": feature("p2", "table", 0.3),
+            "n1": feature("n1", "table", 0.8),
+        }
+    )
+    example = EdgeExample(
+        "q",
+        ("p1", "p2", "n1"),
+        0,
+        positive_ids=("p1", "p2"),
+    )
+
+    scores = score_edge_batch(
+        StudentJoinabilityModel(4, 3),
+        [example],
+        store,
+        torch.device("cpu"),
+    )
+
+    assert scores.positive_mask.tolist() == [[True, True, False]]
+
+
+def test_relation_macro_edge_bce_excludes_unknown_candidates():
+    logits = torch.tensor(
+        [[0.0, 100.0, 0.0], [0.0, 0.0, -100.0]], requires_grad=True
+    )
+    labels = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    confirmed = torch.tensor(
+        [[True, False, True], [True, True, False]]
+    )
+
+    loss = relation_macro_binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        confirmed,
+        ["table_to_text", "table_to_image"],
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(torch.log(torch.tensor(2.0)).item())
+    assert logits.grad[0, 1].item() == 0.0
+    assert logits.grad[1, 2].item() == 0.0
+
+
+def test_teacher_edge_bce_excludes_unknowns_and_macro_averages_relations():
+    examples = [
+        EdgeExample(
+            "q1",
+            ("p1", "n1"),
+            0,
+            source_type="table",
+            destination_type="text",
+            confirmed_labels=(1, None),
+        ),
+        EdgeExample(
+            "q2",
+            ("p2", "n2"),
+            0,
+            source_type="table",
+            destination_type="text",
+            confirmed_labels=(0, None),
+        ),
+        EdgeExample(
+            "q3",
+            ("p3", "n3"),
+            0,
+            source_type="table",
+            destination_type="image",
+            confirmed_labels=(1, None),
+        ),
+    ]
+    candidate_mask = torch.ones((3, 2), dtype=torch.bool)
+    positive_indices = torch.zeros(3, dtype=torch.long)
+    positive_mask = torch.tensor([[True, False]] * 3)
+    ranking = ListScores(
+        torch.zeros((3, 2)), candidate_mask, positive_indices, positive_mask
+    )
+    confidence_logits = torch.tensor(
+        [[0.0, 100.0], [2.0, -100.0], [-2.0, 100.0]],
+        requires_grad=True,
+    )
+    confidence = ListScores(
+        confidence_logits, candidate_mask, positive_indices, positive_mask
+    )
+
+    losses = stage1_training._teacher_edge_losses(
+        examples, ranking, confidence, edge_bce_weight=1.0
+    )
+    losses["absolute_loss"].backward()
+
+    log_two = torch.log(torch.tensor(2.0))
+    positive_two = torch.nn.functional.softplus(torch.tensor(2.0))
+    expected = ((log_two + positive_two) / 2 + positive_two) / 2
+    assert losses["absolute_loss"].item() == pytest.approx(expected.item())
+    assert confidence_logits.grad[:, 1].tolist() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_edge_loader_preserves_positive_sets_and_ternary_confirmation(tmp_path):
+    path = tmp_path / "edges.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q",
+                "positive_id": "p1",
+                "positive_ids": ["p1", "p2"],
+                "candidate_ids": ["p1", "p2", "negative", "unknown"],
+                "confirmed_positive_ids": ["p1", "p2"],
+                "confirmed_negative_ids": ["negative"],
+                "source_type": "table",
+                "destination_type": "text",
+                "split": "train",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    example = load_edge_examples(path)[0]
+
+    assert example.positive_ids == ("p1", "p2")
+    assert example.confirmed_labels == (1, 1, 0, None)
+
+
+def test_student_edge_bce_uses_confirmed_labels_and_reports_participation():
+    store = feature_store()
+    student_model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        confidence_transform=True,
+    )
+    history = train_student_edges(
+        student_model,
+        [
+            EdgeExample(
+                "q",
+                ("positive", "negative"),
+                0,
+                source_type="table",
+                destination_type="table",
+                confirmed_labels=(1, 0),
+            )
+        ],
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.0,
+        edge_bce_weight=1.0,
+    )
+
+    assert history[0]["absolute_loss"] > 0
+    assert history[0]["confirmed_labels"]["positive"] == 1
+    assert history[0]["confirmed_labels"]["negative"] == 1
+
+
 def test_lowrank_in_batch_scoring_matches_pair_scoring_without_expansion():
     store = FeatureStore(
         {
@@ -742,6 +1044,25 @@ def test_lowrank_student_checkpoint_round_trips(tmp_path):
         torch.testing.assert_close(loaded.state_dict()[key], value)
 
 
+def test_student_confidence_transform_checkpoint_round_trips(tmp_path):
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        confidence_transform=True,
+    )
+    with torch.no_grad():
+        model.confidence_biases["table_to_text"].fill_(-0.7)
+    path = tmp_path / "student_confidence.pt"
+    torch.save(checkpoint(model, "student-edge"), path)
+
+    loaded = load_student(path, torch.device("cpu"))
+
+    assert loaded.config()["confidence_transform"] is True
+    assert loaded.config()["confidence_epsilon"] == pytest.approx(1e-6)
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[key], value)
+
+
 def test_pca_projection_finds_top_component_and_round_trips(tmp_path):
     embeddings = torch.tensor(
         [
@@ -793,6 +1114,39 @@ def test_pca_projection_finds_top_component_and_round_trips(tmp_path):
         load_pca_projection(spectrum_path, input_dim=3, student_dim=1),
         torch.tensor([[1.0, 0.0, 0.0]]),
     )
+
+
+def test_pca_projection_reorthogonalizes_lowrank_components(monkeypatch):
+    embeddings = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    def scaled_lowrank(values, *, q, center, niter):
+        assert q == 2
+        assert center
+        components = torch.tensor(
+            [
+                [0.9996, 0.0],
+                [0.0, 1.0004],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            device=values.device,
+        )
+        return (
+            torch.zeros((values.shape[0], q), device=values.device),
+            torch.tensor([2.0, 1.0], device=values.device),
+            components,
+        )
+
+    monkeypatch.setattr(torch, "pca_lowrank", scaled_lowrank)
+
+    projection, _mean, _explained = compute_pca_projection(
+        embeddings,
+        2,
+        device=torch.device("cpu"),
+        oversampling=0,
+    )
+
+    torch.testing.assert_close(projection @ projection.T, torch.eye(2))
 
 
 def test_identity_student_uses_raw_inner_product_for_every_type_pair():
@@ -928,6 +1282,36 @@ def test_listwise_cross_entropy_uses_all_positive_probability_mass():
     assert multi_positive < single_positive
 
 
+def test_listwise_cross_entropy_mean_log_probability_averages_positive_nll():
+    logits = torch.tensor([[2.0, 1.0, -1.0], [0.0, 0.5, 1.5]])
+    candidate_mask = torch.tensor(
+        [[True, True, True], [True, True, False]]
+    )
+    positive_indices = torch.tensor([0, 0])
+    positive_mask = torch.tensor(
+        [[True, True, False], [True, False, False]]
+    )
+
+    actual = listwise_cross_entropy(
+        logits,
+        positive_indices,
+        candidate_mask,
+        positive_mask,
+        positive_loss_mode="mean_log_probability",
+    )
+    log_probabilities = torch.log_softmax(
+        logits.masked_fill(~candidate_mask, -torch.inf), dim=-1
+    )
+    expected = torch.stack(
+        [
+            -log_probabilities[0, :2].mean(),
+            -log_probabilities[1, 0],
+        ]
+    ).mean()
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_optional_listwise_cross_entropy_skips_rows_without_a_negative():
     logits = torch.tensor([[2.0, 1.0]], requires_grad=True)
     candidate_mask = torch.ones_like(logits, dtype=torch.bool)
@@ -986,6 +1370,7 @@ def test_multi_positive_student_path_smoke_has_finite_losses():
         seed=13,
         temperature=1.0,
         distillation_weight=0.5,
+        positive_loss_mode="mean_log_probability",
         in_batch_negatives=True,
     )
 
@@ -1355,6 +1740,8 @@ def test_all_four_training_stages_run_on_synthetic_features():
     histories = [teacher_edge_history, teacher_path_history, student_edge_history, student_path_history]
     assert all(len(history) == 1 for history in histories)
     assert all(torch.isfinite(torch.tensor(history[0]["loss"])) for history in histories)
+    assert all(history[0]["optimizer_updates"] == 1 for history in histories)
+    assert all(history[0]["examples_seen"] == 1 for history in histories)
 
 
 def test_training_loss_refreshes_every_hundred_steps_and_at_epoch_end():
@@ -2652,6 +3039,66 @@ def test_student_ann_scores_and_zero_one_hop_retrieval(tmp_path):
     assert all({path["kind"] for path in result["paths"]} == {"direct", "evidence"} for result in results)
 
 
+def test_student_ann_confidence_rescores_without_changing_relation_order(tmp_path):
+    torch.manual_seed(17)
+    store = feature_store()
+    model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        confidence_transform=True,
+    )
+    with torch.no_grad():
+        model.confidence_alphas["table_to_table"].fill_(-0.5)
+        model.confidence_biases["table_to_table"].fill_(0.8)
+    ids_by_type = {
+        "table": ["positive", "negative"],
+        "text": ["evidence"],
+        "image": [],
+    }
+    build_indices(
+        model,
+        store,
+        ids_by_type,
+        tmp_path,
+        device=torch.device("cpu"),
+        checkpoint_sha256="synthetic-confidence",
+        batch_size=2,
+        m=8,
+        ef_construction=20,
+        ef_search=20,
+    )
+    raw_indices = StudentANNIndices(
+        model,
+        store,
+        tmp_path,
+        device=torch.device("cpu"),
+        checkpoint_sha256="synthetic-confidence",
+    )
+    confidence_indices = StudentANNIndices(
+        model,
+        store,
+        tmp_path,
+        device=torch.device("cpu"),
+        checkpoint_sha256="synthetic-confidence",
+        score_space="confidence",
+    )
+
+    raw_hits = raw_indices.search("q", "table", 2)
+    confidence_hits = confidence_indices.search("q", "table", 2)
+
+    assert [target_id for target_id, _score in confidence_hits] == [
+        target_id for target_id, _score in raw_hits
+    ]
+    expected = {
+        target_id: model.confidence_pairs(
+            [store.get("q")], [store.get(target_id)]
+        )[0].item()
+        for target_id in ("positive", "negative")
+    }
+    for target_id, score in confidence_hits:
+        assert score == pytest.approx(expected[target_id], abs=1e-5)
+
+
 def test_lowrank_student_ann_scores_are_exact(tmp_path, monkeypatch):
     torch.manual_seed(17)
     store = feature_store()
@@ -2751,6 +3198,26 @@ def test_raw_embedding_ann_uses_frozen_vectors_without_student_head(tmp_path):
     assert {target_id for target_id, _ in hits} == set(expected)
     for target_id, score in hits:
         assert score == pytest.approx(expected[target_id], abs=1e-5)
+
+
+def test_raw_embedding_ann_rejects_id_count_mismatch(tmp_path):
+    store = feature_store()
+    build_raw_embedding_indices(
+        store,
+        {"table": ["positive", "negative"], "text": [], "image": []},
+        tmp_path,
+        corpus_sha256="synthetic-corpus",
+    )
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    ids_path = tmp_path / manifest["types"]["table"]["ids_path"]
+    ids_path.write_text(json.dumps(["positive"]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="object count does not match the manifest"):
+        RawEmbeddingANNIndices(
+            store,
+            tmp_path,
+            corpus_sha256="synthetic-corpus",
+        )
 
 
 def test_ann_search_raises_ef_to_the_requested_k():
@@ -3026,7 +3493,13 @@ def test_online_retrieval_rrf_fuses_route_ranks_without_changing_route_scores():
 def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):
     path = tmp_path / "student.pt"
     aggregator = PathAggregator(
-        "softmax_weighted_mean", 2, temperature=0.3, power=3.0
+        "fixed_power_mean",
+        2,
+        temperature=0.3,
+        power=3.0,
+        path_combination="min",
+        threshold=0.25,
+        target_temperature=0.1,
     )
     torch.save(
         checkpoint(
@@ -3038,10 +3511,26 @@ def test_path_checkpoint_persists_online_aggregation_configuration(tmp_path):
     )
 
     loaded = load_path_aggregator(path)
-    assert loaded.evidence_aggregation == "softmax_weighted_mean"
+    assert loaded.evidence_aggregation == "fixed_power_mean"
     assert loaded.top_k == 2
     assert loaded.temperature == pytest.approx(0.3)
     assert loaded.power == pytest.approx(3.0)
+    assert loaded.path_combination == "min"
+    assert loaded.threshold == pytest.approx(0.25)
+    assert loaded.target_temperature == pytest.approx(0.1)
+
+
+def test_legacy_path_checkpoint_defaults_target_temperature_to_one(tmp_path):
+    path = tmp_path / "legacy_student.pt"
+    payload = checkpoint(
+        StudentJoinabilityModel(input_dim=4, student_dim=3),
+        "student-path",
+        PathAggregator(),
+    )
+    payload["path_aggregation"].pop("evidence_target_temperature")
+    torch.save(payload, path)
+
+    assert load_path_aggregator(path).target_temperature == 1.0
 
 
 def test_dataset_sampling_alpha_balances_or_preserves_natural_mass():
@@ -3166,12 +3655,145 @@ def test_student_path_distillation_reuses_separate_cached_teacher_logits():
     assert history[0]["evidence_distillation_loss"] > 0
 
 
+def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
+    monkeypatch,
+):
+    store = feature_store()
+    student_model = StudentJoinabilityModel(
+        input_dim=4,
+        student_dim=3,
+        confidence_transform=True,
+    )
+    path_examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            0,
+            0,
+            dataset=dataset,
+            teacher_direct_logits=(3.0, -2.0),
+            teacher_evidence_logits=(2.0, -1.0),
+        )
+        for dataset in ("paths_a", "paths_b")
+    ]
+    edge_examples = [
+        EdgeExample(
+            "q",
+            ("positive", "negative"),
+            0,
+            dataset="edges_a",
+            source_type="table",
+            destination_type="table",
+            confirmed_labels=(1, 0),
+            teacher_logits=(2.0, -1.0),
+        ),
+        EdgeExample(
+            "evidence",
+            ("positive", "negative", "q"),
+            0,
+            dataset="edges_b",
+            source_type="text",
+            destination_type="table",
+            confirmed_labels=(1, 0, None),
+            teacher_logits=(1.5, -0.5, -1.0),
+        ),
+    ]
+    anchor_calls = 0
+    original_anchor = stage1_training.student_anchor_loss
+
+    def counted_anchor(model):
+        nonlocal anchor_calls
+        anchor_calls += 1
+        return original_anchor(model)
+
+    monkeypatch.setattr(stage1_training, "student_anchor_loss", counted_anchor)
+
+    history = train_student_paths(
+        student_model,
+        path_examples,
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        PathAggregator(),
+        device=torch.device("cpu"),
+        epochs=1,
+        batch_size=2,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.3,
+        anchor_weight=0.1,
+        continuous_edge_examples=edge_examples,
+        continuous_edge_weight=1.0,
+        continuous_edge_bce_weight=1.0,
+        continuous_edge_batch_size=2,
+    )
+
+    record = history[0]
+    assert record["path_batches"] == 1
+    assert record["continuous_edge_batches"] == 1
+    assert record["optimizer_updates"] == 1
+    assert record["additional_optimizer_updates"] == 0
+    assert record["continuous_edge_examples_seen"] == 2
+    assert record["continuous_edge_participation"]["positive"] == 2
+    assert record["continuous_edge_participation"]["negative"] == 2
+    assert record["continuous_edge_participation"]["unknown"] == 1
+    assert set(record["continuous_edge_loss_by_relation"]) == {
+        "table_to_table",
+        "text_to_table",
+    }
+    assert anchor_calls == 1
+
+
+def test_student_path_optimizer_update_budget_truncates_the_last_epoch():
+    store = feature_store()
+    student_model = StudentJoinabilityModel(input_dim=4, student_dim=3)
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ("evidence",)),
+            ),
+            0,
+            0,
+            dataset=dataset,
+            teacher_direct_logits=(3.0, -2.0),
+            teacher_evidence_logits=(2.0, -1.0),
+        )
+        for dataset in ("a", "b")
+    ]
+
+    history = train_student_paths(
+        student_model,
+        examples,
+        store,
+        torch.optim.AdamW(student_model.parameters(), lr=1e-3),
+        PathAggregator(),
+        device=torch.device("cpu"),
+        epochs=3,
+        batch_size=1,
+        seed=13,
+        temperature=1.0,
+        distillation_weight=0.3,
+        max_optimizer_updates=1,
+    )
+
+    assert len(history) == 1
+    assert history[0]["optimizer_updates"] == 1
+    assert history[0]["cumulative_optimizer_updates"] == 1
+    assert history[0]["examples_seen"] == 1
+    assert history[0]["optimizer_update_budget_exhausted"]
+
+
 def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
     original = TargetExample(
         "q",
         (
             TargetCandidate("direct_positive", ()),
             TargetCandidate("evidence_positive", ("positive_evidence",)),
+            TargetCandidate("other_positive", ()),
             TargetCandidate("fallback", ()),
         ),
         direct_positive_index=0,
@@ -3197,18 +3819,43 @@ def test_hard_candidate_merge_excludes_gt_and_keeps_path_hard_evidence():
     assert [candidate.target_id for candidate in target_example.candidates] == [
         "direct_positive",
         "evidence_positive",
+        "other_positive",
         "hard_1",
         "hard_2",
     ]
     assert target_example.direct_positive_index == 0
     assert target_example.evidence_positive_index == 1
-    assert target_example.candidates[2:] == (
+    assert target_example.candidates[3:] == (
         TargetCandidate("hard_1", ("e1", "e2", "e3")),
         TargetCandidate("hard_2", ()),
     )
 
+    store = FeatureStore(
+        {
+            object_id: feature(object_id, object_type, 0.1)
+            for object_id, object_type in (
+                ("q", "table"),
+                ("direct_positive", "table"),
+                ("evidence_positive", "table"),
+                ("other_positive", "table"),
+                ("hard_1", "table"),
+                ("hard_2", "table"),
+                ("positive_evidence", "text"),
+            )
+        }
+    )
+    target_records, edge_records = hard_candidate_records([candidate_set], store)
+    assert [
+        candidate["target_id"] for candidate in target_records[0]["candidates"][:3]
+    ] == ["direct_positive", "evidence_positive", "other_positive"]
+    assert edge_records[0]["candidate_ids"][:3] == [
+        "direct_positive",
+        "evidence_positive",
+        "other_positive",
+    ]
 
-def test_hard_negative_refresh_mines_three_independent_candidate_pools():
+
+def test_hard_negative_refresh_mines_four_independent_candidate_pools():
     class StaticIndices(_BatchedSearchMixin):
         def search(self, source_id, destination_type, k):
             values = {
@@ -3249,6 +3896,7 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         StaticIndices(),
         hard_targets_per_query=1,
         hard_evidence_per_type=1,
+        hard_targets_per_positive_evidence=1,
         hard_paths_per_query=1,
         direct_k=2,
         evidence_k=3,
@@ -3260,6 +3908,7 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
         StaticIndices(),
         hard_targets_per_query=1,
         hard_evidence_per_type=1,
+        hard_targets_per_positive_evidence=1,
         hard_paths_per_query=1,
         direct_k=2,
         evidence_k=3,
@@ -3268,6 +3917,10 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
     )[0]
 
     assert mined.evidence_negative_ids == ("evidence_only",)
+    assert mined.direct_target_negative_ids == ("hard_target",)
+    assert mined.evidence_target_negative_ids == (
+        ("positive_evidence", ("path_target",)),
+    )
     assert duplicate_modality == mined
     assert mined.target_example.candidates == (
         TargetCandidate("direct_positive", ()),
@@ -3278,15 +3931,19 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
     assert summarize_hard_candidate_sets([mined]) == {
         "direct_target_candidates": 1,
         "evidence_candidates": 1,
+        "evidence_target_candidates": 1,
+        "evidence_target_unique_targets": 1,
+        "direct_evidence_target_overlap": 0,
+        "evidence_target_path_overlap": 1,
         "path_target_candidates": 1,
         "fallback_target_candidates": 0,
         "direct_path_overlap": 0,
         "base_negative_overlap": 0,
         "merged_negative_targets": 2,
         "queries": 1,
-        "raw_target_candidates": 2,
-        "target_candidates_removed_by_dedup": 0,
-        "target_pool_dedup_rate": 0.0,
+        "raw_target_candidates": 3,
+        "target_candidates_removed_by_dedup": 1,
+        "target_pool_dedup_rate": pytest.approx(1 / 3),
         "merged_targets_overlapping_base_rate": 0.0,
     }
 
@@ -3320,6 +3977,25 @@ def test_hard_negative_refresh_mines_three_independent_candidate_pools():
     assert query_evidence_edge["candidate_ids"] == [
         "positive_evidence",
         "evidence_only",
+    ]
+    direct_edge = next(
+        record
+        for record in edge_records
+        if record["source_type"] == "table" and record["destination_type"] == "table"
+    )
+    assert direct_edge["candidate_ids"] == [
+        "direct_positive",
+        "evidence_positive",
+        "hard_target",
+    ]
+    evidence_target_edge = next(
+        record
+        for record in edge_records
+        if record["source_type"] == "text" and record["destination_type"] == "table"
+    )
+    assert evidence_target_edge["candidate_ids"] == [
+        "evidence_positive",
+        "path_target",
     ]
 
 
@@ -3385,6 +4061,7 @@ def test_hard_negative_refresh_caches_teacher_target_and_edge_scores(tmp_path):
         "candidates",
         "teacher_direct_logits",
         "teacher_evidence_logits",
+        "teacher_score_config",
         "dataset",
         "split",
     }
@@ -3545,13 +4222,21 @@ def test_hard_negative_refresh_scores_pending_candidates_without_remining(
     torch.save(
         checkpoint(teacher_model, "teacher-path", PathAggregator()), teacher_path
     )
+    training_aggregator = PathAggregator(
+        "fixed_power_mean",
+        4,
+        power=2.0,
+        path_combination="min",
+        target_temperature=0.1,
+    )
     expected_targets, expected_edges = score_hard_candidate_sets(
         [candidate_set],
         teacher_model,
         store,
-        PathAggregator(),
+        training_aggregator,
         device=torch.device("cpu"),
         batch_size=1,
+        teacher_score_space="confidence",
     )
     corpus_path = tmp_path / "corpus.jsonl"
     corpus_path.write_text("{}\n", encoding="utf-8")
@@ -3620,6 +4305,8 @@ def test_hard_negative_refresh_scores_pending_candidates_without_remining(
             device="cpu",
             feature_cache_size=128,
             teacher_batch_size=1,
+            teacher_score_space="confidence",
+            training_student_score_space="confidence",
             mine_only=False,
             mining_round=1,
             hard_targets_per_query=1,
@@ -3629,8 +4316,13 @@ def test_hard_negative_refresh_scores_pending_candidates_without_remining(
             evidence_k=2,
             targets_per_evidence=2,
             evidence_types=["text"],
-            evidence_aggregation=None,
-            evidence_top_k=None,
+            evidence_aggregation="fixed_power_mean",
+            evidence_top_k=4,
+            evidence_temperature=1.0,
+            evidence_power=2.0,
+            path_combination="min",
+            evidence_threshold=0.0,
+            evidence_target_temperature=0.1,
         )
     )
 
@@ -3666,6 +4358,48 @@ def test_hard_negative_refresh_scores_pending_candidates_without_remining(
     assert output_metadata["teacher_checkpoint_sha256"] == checkpoint_fingerprint(
         teacher_path
     )
+    assert output_metadata["evidence_aggregation"] == "logsumexp"
+    assert output_metadata.get("path_combination", "sum") == "sum"
+    assert output_metadata["mining_selection_config"] == {
+        "student_score_space": "raw_logit",
+        "evidence_aggregation": "logsumexp",
+        "evidence_top_k": 4,
+        "evidence_temperature": 1.0,
+        "evidence_power": 2.0,
+        "path_combination": "sum",
+        "evidence_threshold": 0.0,
+        "evidence_target_temperature": 1.0,
+    }
+    assert output_metadata["training_score_config"] == {
+        **training_aggregator.config(),
+        "teacher_score_space": "confidence",
+        "student_score_space": "confidence",
+        "teacher_ensemble_alpha": None,
+    }
+    loaded_target = load_target_examples(output_targets)[0]
+    assert loaded_target.teacher_score_config.evidence_aggregation == (
+        "fixed_power_mean"
+    )
+    assert loaded_target.teacher_score_config.path_combination == "min"
+    assert loaded_target.teacher_score_config.evidence_target_temperature == 0.1
+    assert loaded_target.teacher_logit_mode == "teacher_confidence"
+    assert train_stage1._validate_hard_provenance(
+        [output_targets, output_edges],
+        teacher_checkpoint=teacher_path,
+        source_student_checkpoint=student_path,
+        aggregator=training_aggregator,
+        student_score_space="confidence",
+        teacher_score_space="confidence",
+    ) == 1
+    with pytest.raises(ValueError, match="training aggregation"):
+        train_stage1._validate_hard_provenance(
+            [output_targets],
+            teacher_checkpoint=teacher_path,
+            source_student_checkpoint=student_path,
+            aggregator=PathAggregator(),
+            student_score_space="confidence",
+            teacher_score_space="confidence",
+        )
 
 
 def test_hard_negative_refresh_rescores_cross_modal_edge_lists():
@@ -4170,6 +4904,60 @@ def test_pure_cosine_kd_cache_does_not_need_a_teacher(tmp_path):
     assert loaded[0].teacher_ensemble_alpha == 0.0
 
 
+def test_pure_cosine_kd_cache_pads_variable_candidate_counts(tmp_path):
+    store = FeatureStore(
+        {
+            "q": feature("q", "table", 0.1),
+            "positive": feature("positive", "table", 0.25),
+            "negative": feature("negative", "table", 0.9),
+            "evidence": feature("evidence", "text", 0.3),
+        }
+    )
+    examples = [
+        TargetExample(
+            "q",
+            (
+                TargetCandidate("positive", ("evidence",)),
+                TargetCandidate("negative", ()),
+            ),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        ),
+        TargetExample(
+            "q",
+            (TargetCandidate("positive", ("evidence",)),),
+            direct_positive_index=0,
+            evidence_positive_index=0,
+        ),
+    ]
+    aggregator = PathAggregator()
+
+    cached, path = score_and_cache_cosine_logits(
+        examples,
+        store,
+        tmp_path,
+        device=torch.device("cpu"),
+        batch_size=2,
+        aggregator=aggregator,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    loaded, _path, hit = load_teacher_logits(
+        examples,
+        tmp_path,
+        FROZEN_COSINE_TARGET_SHA256,
+        aggregator,
+        ensemble_alpha=0.0,
+    )
+
+    assert hit
+    assert payload["teacher_direct_logits"].shape == (2, 2)
+    assert payload["teacher_evidence_logits"].shape == (2, 2)
+    assert payload["target_source"] == "frozen_embedding_cosine"
+    assert loaded == cached
+    assert len(loaded[1].teacher_direct_logits) == 1
+    assert len(loaded[1].teacher_evidence_logits) == 1
+
+
 def test_kd_target_teacher_alpha_is_the_canonical_cli_name(monkeypatch):
     monkeypatch.setattr(
         sys,
@@ -4287,6 +5075,163 @@ def test_student_edge_entrypoint_reuses_ensemble_logits_without_teacher_hidden_t
     assert second["teacher_logit_cache_hits"] == 2
 
 
+def test_student_path_entrypoint_uses_independent_continuous_edge_teacher_cache(
+    tmp_path,
+):
+    features_path = tmp_path / "features.pt"
+    store = feature_store()
+    torch.save(
+        {
+            "objects": {
+                object_id: {
+                    "object_type": value.object_type,
+                    "embedding": value.embedding,
+                    "hidden_states": value.hidden_states,
+                    "token_groups": value.token_groups,
+                }
+                for object_id in store.object_ids()
+                for value in [store.get(object_id)]
+            }
+        },
+        features_path,
+    )
+    target_path = tmp_path / "targets.jsonl"
+    target_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "query_id": "q",
+                    "direct_positive_target_id": "positive",
+                    "evidence_positive_target_id": "positive",
+                    "candidates": [
+                        {
+                            "target_id": "positive",
+                            "evidence_ids": ["evidence"],
+                        },
+                        {
+                            "target_id": "negative",
+                            "evidence_ids": ["evidence"],
+                        },
+                    ],
+                    "dataset": "tiny",
+                    "split": split,
+                }
+            )
+            + "\n"
+            for split in ("train", "dev")
+        ),
+        encoding="utf-8",
+    )
+    edge_path = tmp_path / "edges.jsonl"
+    edge_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "query_id": "q",
+                    "positive_id": "positive",
+                    "candidate_ids": ["positive", "negative"],
+                    "confirmed_labels": [1, 0],
+                    "source_type": "table",
+                    "destination_type": "table",
+                    "dataset": "tiny_edges",
+                    "split": split,
+                }
+            )
+            + "\n"
+            for split in ("train", "dev")
+        ),
+        encoding="utf-8",
+    )
+    corpus_path = tmp_path / "corpus.jsonl"
+    corpus_path.write_text(
+        "".join(
+            json.dumps({"object_id": object_id}) + "\n"
+            for object_id in ("positive", "negative", "evidence")
+        ),
+        encoding="utf-8",
+    )
+    edge_teacher_path = tmp_path / "teacher_edge.pt"
+    path_teacher_path = tmp_path / "teacher_path.pt"
+    torch.save(checkpoint(teacher(), "teacher-edge"), edge_teacher_path)
+    torch.save(
+        checkpoint(teacher(), "teacher-path", PathAggregator()),
+        path_teacher_path,
+    )
+    path_cache = tmp_path / "path_teacher_logits"
+    edge_cache = tmp_path / "edge_teacher_logits"
+    output = tmp_path / "student_path.pt"
+    args = train_stage1._argument_parser().parse_args(
+        [
+            "student-path",
+            "--features",
+            str(features_path),
+            "--base-data",
+            str(target_path),
+            "--dev-data",
+            str(target_path),
+            "--corpus",
+            str(corpus_path),
+            "--teacher-checkpoint",
+            str(path_teacher_path),
+            "--teacher-logit-cache",
+            str(path_cache),
+            "--continuous-edge-data",
+            str(edge_path),
+            "--continuous-edge-dev-data",
+            str(edge_path),
+            "--continuous-edge-teacher-checkpoint",
+            str(edge_teacher_path),
+            "--continuous-edge-teacher-logit-cache",
+            str(edge_cache),
+            "--student-confidence-transform",
+            "--positive-loss-mode",
+            "mean_log_probability",
+            "--edge-bce-weight",
+            "1",
+            "--student-dim",
+            "3",
+            "--batch-size",
+            "1",
+            "--device",
+            "cpu",
+            "--initialize-only",
+            "--primary-metric",
+            "recall@1",
+            "--recall-ks",
+            "1",
+            "--output",
+            str(output),
+        ]
+    )
+
+    summary = train_stage1.run(args)
+    history = json.loads(
+        output.with_suffix(".pt.history.json").read_text(encoding="utf-8")
+    )
+    selection = json.loads(
+        output.with_suffix(".pt.selection.json").read_text(encoding="utf-8")
+    )
+    continuous = history["continuous_edge_training"]
+
+    assert summary["continuous_edge_training"]["enabled"]
+    assert continuous == selection["continuous_edge_training"]
+    assert continuous["train_examples"] == 1
+    assert continuous["dev_examples"] == 1
+    assert continuous["train_participation"]["positive"] == 1
+    assert continuous["train_participation"]["negative"] == 1
+    assert continuous["teacher_checkpoint_sha256"] == checkpoint_fingerprint(
+        edge_teacher_path
+    )
+    assert continuous["teacher_target"] == "teacher"
+    assert continuous["teacher_cache_generated"]
+    assert len(continuous["teacher_logit_caches"]) == 2
+    assert all(str(edge_cache.resolve()) in path for path in continuous["teacher_logit_caches"])
+    assert all(str(path_cache.resolve()) not in path for path in continuous["teacher_logit_caches"])
+    assert history["preloaded_embeddings"] == 4
+    assert history["positive_loss_mode"] == "mean_log_probability"
+    assert selection["positive_loss_mode"] == "mean_log_probability"
+
+
 def test_programmatic_training_args_use_cli_defaults():
     cli = train_stage1._argument_parser().parse_args(
         [
@@ -4323,6 +5268,27 @@ def test_feature_store_preloads_contiguous_training_embeddings():
         AssertionError("preloaded embedding fell back to the object file")
     )
     assert torch.equal(store.embedding_features("q").embedding, query)
+
+
+def test_feature_store_preload_preserves_query_row_embeddings():
+    row_embeddings = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    store = FeatureStore(
+        {
+            "q": ObjectFeatures(
+                "q",
+                "table",
+                torch.ones(4),
+                row_embeddings=row_embeddings,
+            )
+        }
+    )
+
+    store.preload_embeddings(["q"])
+
+    assert torch.equal(
+        store.embedding_features("q").row_embeddings,
+        row_embeddings,
+    )
 
 
 def test_retrieval_batches_all_evidence_to_target_queries():

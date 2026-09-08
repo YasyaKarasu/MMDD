@@ -5,30 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
-
-def _run(command: Sequence[str], log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    environment = dict(os.environ)
-    root = Path(__file__).resolve().parents[1]
-    environment["PYTHONPATH"] = str(root / "src")
-    environment["PYTHONUNBUFFERED"] = "1"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write("COMMAND " + " ".join(command) + "\n")
-        handle.flush()
-        subprocess.run(
-            list(command),
-            cwd=root,
-            env=environment,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            check=True,
-        )
+from mmdd_stage1.experiment_process import run_logged_subprocess
 
 
 def _lake_inputs(root: Path, lake: str) -> dict[str, Any]:
@@ -253,7 +234,7 @@ def run(args: argparse.Namespace) -> None:
             "--output",
             str(checkpoint),
         ]
-        _run(command, run_dir / "train.log")
+        run_logged_subprocess(command, run_dir / "train.log", root=root)
 
     evaluation = run_dir / "final_evaluation"
     metrics_path = evaluation / "metrics.json"
@@ -297,7 +278,7 @@ def run(args: argparse.Namespace) -> None:
             "--device",
             args.device,
         ]
-        _run(command, run_dir / "evaluation.log")
+        run_logged_subprocess(command, run_dir / "evaluation.log", root=root)
 
     _write_manifest(
         run_dir / "run_manifest.json",
