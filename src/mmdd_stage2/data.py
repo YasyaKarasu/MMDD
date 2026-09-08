@@ -213,7 +213,7 @@ def validate_retrieval_path_budget(
 
     metadata = record.get("path_aggregation", {})
     if not isinstance(metadata, dict):
-        return
+        raise ValueError("Retrieval path_aggregation must be an object")
     selected_results = record.get("results", [])[:max_targets]
     path_result_k = metadata.get("path_result_k")
     if path_result_k is not None and len(selected_results) > int(path_result_k):
@@ -223,7 +223,12 @@ def validate_retrieval_path_budget(
         )
     evidence_path_k = metadata.get("evidence_path_k")
     has_evidence_channel = any(
-        result.get("evidence_score") is not None for result in selected_results
+        result.get("evidence_score") is not None
+        or any(
+            isinstance(path, dict) and path.get("kind") == "evidence"
+            for path in (result.get("paths") or [])
+        )
+        for result in selected_results
     )
     if (
         has_evidence_channel
@@ -234,6 +239,31 @@ def validate_retrieval_path_budget(
             f"Stage 2 requests {top_k_evidence} evidence objects per target but retrieval "
             f"retained only {evidence_path_k}; regenerate with a larger --evidence-path-k"
         )
+    seen: set[str] = set()
+    for result in selected_results:
+        target_id = str(result["target_id"])
+        if target_id in seen:
+            raise ValueError(f"Duplicate Stage-1 target_id in input pool: {target_id}")
+        seen.add(target_id)
+        paths = result.get("paths")
+        if not isinstance(paths, list) or not paths:
+            raise ValueError(
+                f"{target_id}: missing path detail in the Stage-2 input pool; "
+                "provide retrieval with a larger --path-result-k covering all input targets"
+            )
+        for path in paths:
+            if not isinstance(path, dict) or path.get("kind") not in {"direct", "evidence"} or (
+                path["kind"] == "evidence" and not path.get("evidence_id")
+            ):
+                raise ValueError(f"{target_id}: invalid retrieval path detail")
+        for branch in ("direct", "evidence"):
+            if result.get(f"{branch}_score") is not None and not any(
+                path["kind"] == branch for path in paths
+            ):
+                raise ValueError(
+                    f"{target_id}: {branch}_score has no corresponding {branch} path detail; "
+                    "provide complete --path-result-k / --evidence-path-k detail"
+                )
 
 
 def column_name(table: dict[str, Any], column_index: int) -> str:
@@ -259,9 +289,11 @@ def row_values(table: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def column_values(table: dict[str, Any], column_index: int) -> list[str]:
+def column_values(
+    table: dict[str, Any], column_index: int, *, include_empty: bool = False
+) -> list[str]:
     values = [clean_text(get_cell(row, column_index).get("text")) for row in table["rows"]]
-    return [value for value in values if value]
+    return values if include_empty else [value for value in values if value]
 
 
 def serialize_table(

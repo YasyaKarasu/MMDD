@@ -24,12 +24,12 @@ from mmdd_stage2.verifier import build_evidence_bundles
 
 
 def run(args: argparse.Namespace) -> dict:
-    if args.max_targets <= 0:
-        raise ValueError("--max-targets must be positive")
-    if args.top_k_evidence < 0 or args.max_direct_targets < 0:
-        raise ValueError(
-            "--top-k-evidence and --max-direct-targets must be non-negative"
-        )
+    if args.input_candidate_budget <= 0:
+        raise ValueError("--input-candidate-budget must be positive")
+    if args.recovery_budget < 0:
+        raise ValueError("--recovery-budget must be non-negative")
+    if args.top_k_evidence <= 0:
+        raise ValueError("--top-k-evidence must be positive")
     validate_stage2_gate(
         Path(args.stage1_gate), [Path(args.retrieval_results)]
     )
@@ -41,12 +41,12 @@ def run(args: argparse.Namespace) -> dict:
     record = records[0]
     validate_retrieval_path_budget(
         record,
-        max_targets=args.max_targets,
+        max_targets=args.input_candidate_budget,
         top_k_evidence=args.top_k_evidence,
     )
-    results = record["results"][: args.max_targets]
+    results = record["results"][: args.input_candidate_budget]
     bundles = build_evidence_bundles(results, top_k_evidence=args.top_k_evidence)
-    direct_ids = direct_target_ids(results)[: args.max_direct_targets]
+    direct_ids = direct_target_ids(results)
     objects = load_stage2_objects(
         Path(args.dataset_root),
         str(record["query_id"]),
@@ -82,11 +82,13 @@ def run(args: argparse.Namespace) -> dict:
     )
     payload = verifier.verify(
         objects.query,
-        bundles,
+        results,
         objects.targets,
         objects.evidence,
-        direct_target_ids=direct_ids,
+        recovery_budget=args.recovery_budget,
+        top_k_evidence=args.top_k_evidence,
     ).to_dict()
+    payload["input_candidate_budget"] = args.input_candidate_budget
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
         output = Path(args.output)
@@ -97,7 +99,7 @@ def run(args: argparse.Namespace) -> dict:
     return payload
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--retrieval-results", required=True)
@@ -119,8 +121,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--focus-start-layer", type=int, default=14)
     parser.add_argument("--top-k-evidence", type=int, default=4)
-    parser.add_argument("--max-targets", type=int, default=10)
-    parser.add_argument("--max-direct-targets", type=int, default=5)
+    parser.add_argument(
+        "--input-candidate-budget", "--max-targets",
+        dest="input_candidate_budget", type=int, default=50,
+        help="N: unique Stage-1 input targets, all requiring path detail (default: 50). "
+        "--max-targets is a legacy alias for this input budget only.",
+    )
+    parser.add_argument(
+        "--recovery-budget", type=int, default=20,
+        help="M: unique evidence targets to recover after full-pool column scoring (default: 20). "
+        "Direct paths are all verified and do not consume this budget.",
+    )
     parser.add_argument("--max-text-evidence-tokens", type=int, default=1024)
     parser.add_argument("--text-overlap-tokens", type=int, default=128)
     parser.add_argument("--max-span-tokens", type=int, default=192)
@@ -130,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--similarity-batch-size", type=int, default=1024)
     parser.add_argument("--similarity-threshold", type=float, default=0.8)
     parser.add_argument("--min-row-coverage", type=float, default=0.6)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

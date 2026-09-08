@@ -327,7 +327,10 @@ def semantic_joinability(
             best_scores.append(1.0)
         else:
             best_scores.append(float(semantic_scores[query_index]))
-    coverage = sum(score >= similarity_threshold for score in best_scores) / len(best_scores)
+    coverage = sum(
+        bool(str(value).strip()) and score >= similarity_threshold
+        for value, score in zip(query_values, best_scores, strict=True)
+    ) / len(best_scores)
     return SemanticJoinability(
         joinable=coverage >= min_coverage,
         coverage=coverage,

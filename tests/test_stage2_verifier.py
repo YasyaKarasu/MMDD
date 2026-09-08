@@ -629,6 +629,17 @@ def _table(table_id, columns, rows, **extra):
     }
 
 
+def _retrieval_result(bundle, *, direct=False):
+    return {
+        "target_id": bundle.target_id,
+        "evidence_score": bundle.retrieval_score,
+        "paths": [
+            *([{"kind": "direct"}] if direct else []),
+            *({"kind": "evidence", "evidence_id": item} for item in bundle.evidence_ids),
+        ],
+    }
+
+
 def test_stage2_verifier_runs_column_selection_localization_generation_and_final_check():
     query = _table(
         "q1",
@@ -658,26 +669,27 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
         min_row_coverage=1.0,
     ).verify(
         query,
-        [bundle],
+        [_retrieval_result(bundle, direct=True)],
         {"t1": target},
         {
             "e1": {"asset_id": "e1", "asset_type": "text", "content": "Messi support"},
             "e2": {"asset_id": "e2", "asset_type": "text", "content": "Mbappe support"},
         },
-        direct_target_ids=["t1"],
     )
 
-    assert result.direct_candidates[0].target_id == "t1"
-    assert result.selection.column_name == "Club"
-    assert [row.value for row in result.rows] == ["Barcelona", "PSG"]
-    assert result.semantic_joinability.joinable
+    candidate = result.reranked_candidates[0]
+    recovered = candidate.evidence
+    assert candidate.direct.target_id == "t1"
+    assert recovered.selection.column_name == "Club"
+    assert [row.value for row in recovered.rows] == ["Barcelona", "PSG"]
+    assert recovered.semantic_joinability.joinable
     assert backend.localization_calls == [
         ({"Player": "Messi", "Country": "Argentina"}, "e1"),
         ({"Player": "Mbappe", "Country": "France"}, "e2"),
     ]
     assert backend.evidence_logit_calls == []
     assert backend.generation_calls == [("Messi", "e1"), ("Mbappe", "e2")]
-    assert result.rows[0].evidence == {
+    assert recovered.rows[0].evidence == {
         "evidence_id": "e1",
         "evidence_type": "text",
         "text_span": "Messi support",
@@ -703,16 +715,18 @@ def test_stage2_verifier_runs_column_selection_localization_generation_and_final
     ]
 
     payload = result.to_dict()
-    assert set(payload) == {"query_id", "direct_matches", "selection", "rows", "verification"}
-    assert payload["selection"] == {
+    assert payload["input_candidate_count"] == 1
+    assert payload["unattempted_candidates"] == []
+    serialized = payload["reranked_candidates"][0]
+    assert serialized["selection"] == {
         "target_id": "t1",
         "column_index": 1,
         "column_name": "Club",
     }
-    assert payload["rows"][0] == {
+    assert serialized["branches"]["evidence"]["rows"][0] == {
         "row_id": 0,
         "value": "Barcelona",
-        "evidence": result.rows[0].evidence,
+        "evidence": recovered.rows[0].evidence,
     }
     assert "augmented_query" not in payload
 
@@ -767,7 +781,7 @@ def test_stage2_skips_rows_without_assigned_evidence():
         evidence_router=FakeRouter({"e1": 0, "e2": 0}),
     ).verify(
         query,
-        [bundle],
+        [_retrieval_result(bundle)],
         {"t1": target},
         {
             "e1": {"asset_id": "e1", "asset_type": "text", "content": "first"},
@@ -783,8 +797,8 @@ def test_stage2_skips_rows_without_assigned_evidence():
         ({"Player": "Messi", "Country": "Argentina"}, "Club", ("e1", "e2"))
     ]
     assert backend.generation_calls == [("Messi", "e1")]
-    assert result.rows[1].value == ""
-    assert result.rows[1].evidence is None
+    assert result.reranked_candidates[0].evidence.rows[1].value == ""
+    assert result.reranked_candidates[0].evidence.rows[1].evidence is None
 
 
 def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
@@ -813,7 +827,7 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
         evidence_router=FakeRouter({"text": 0, "image": 0}),
     ).verify(
         query,
-        [bundle],
+        [_retrieval_result(bundle)],
         {"t1": target},
         {
             "text": {"asset_id": "text", "asset_type": "text", "content": "text support"},
@@ -825,9 +839,10 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
         ({"Player": "Messi", "Country": "Argentina"}, "Club", ("text", "image"))
     ]
     assert backend.generation_calls == [("Messi", "image")]
-    assert result.rows[0].evidence["evidence_id"] == "image"
-    assert result.rows[0].evidence["image_presence_probability"] == pytest.approx(0.01)
-    assert "text_span_relevance" not in result.rows[0].evidence
+    rows = result.reranked_candidates[0].evidence.rows
+    assert rows[0].evidence["evidence_id"] == "image"
+    assert rows[0].evidence["image_presence_probability"] == pytest.approx(0.01)
+    assert "text_span_relevance" not in rows[0].evidence
 
 
 def test_qwen_reader_places_all_evidence_in_one_forward():

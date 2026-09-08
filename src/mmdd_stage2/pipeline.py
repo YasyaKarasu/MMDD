@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
 from mmdd_progress import progress
 
 import torch
 
-from .data import column_name, column_values, row_values
+from .data import (
+    column_name,
+    column_values,
+    direct_target_ids,
+    row_values,
+    validate_retrieval_path_budget,
+)
 from .verifier import (
     CandidateColumnScorer,
     EvidenceBundle,
     SemanticJoinability,
+    build_evidence_bundles,
     joint_candidate_probabilities,
     semantic_joinability,
 )
@@ -63,6 +70,7 @@ class DirectVerification:
     target_id: str
     query_column: int
     target_column: int
+    semantic_joinability: SemanticJoinability
 
 
 @dataclass(frozen=True)
@@ -73,45 +81,116 @@ class RowPrediction:
 
 
 @dataclass(frozen=True)
-class Stage2Result:
-    query_id: str
-    direct_candidates: tuple[DirectVerification, ...]
-    selection: ColumnSelection | None
+class EvidenceVerification:
+    selection: ColumnSelection
     rows: tuple[RowPrediction, ...]
-    semantic_joinability: SemanticJoinability | None
+    semantic_joinability: SemanticJoinability
+
+
+@dataclass(frozen=True)
+class CandidateScores:
+    selection: ColumnSelection
+    column_indices: tuple[int, ...]
+    joint_probabilities: tuple[float, ...]
+    table_probability: float
+    recovery_priority: float
+
+
+def joinability_sort_key(
+    check: SemanticJoinability, stage1_rank: int = 0
+) -> tuple[float, float, int]:
+    return -check.coverage, -check.mean_similarity, stage1_rank
+
+
+@dataclass(frozen=True)
+class CandidateResult:
+    target_id: str
+    stage1_rank: int
+    stage1_score: float | None
+    table_prior: float | None
+    bundle: EvidenceBundle | None
+    scores: CandidateScores | None
+    selected_for_recovery: bool
+    direct: DirectVerification | None
+    evidence: EvidenceVerification | None
+    rerank_rank: int | None = None
+
+    @property
+    def final_branch(self) -> str | None:
+        branches = {
+            name: result
+            for name, result in (("direct", self.direct), ("evidence", self.evidence))
+            if result is not None
+        }
+        # An exact branch tie keeps direct; neither branch is normalized separately.
+        return min(
+            branches,
+            key=lambda name: joinability_sort_key(branches[name].semantic_joinability),
+            default=None,
+        )
+
+    @property
+    def semantic_joinability(self) -> SemanticJoinability | None:
+        branch = self.final_branch
+        result = self.direct if branch == "direct" else self.evidence
+        return result.semantic_joinability if result is not None else None
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"query_id": self.query_id}
-        if self.direct_candidates:
-            payload["direct_matches"] = [
-                {
-                    "target_id": candidate.target_id,
-                    "query_column": candidate.query_column,
-                    "target_column": candidate.target_column,
-                }
-                for candidate in self.direct_candidates
-            ]
-        if self.selection is not None:
-            payload["selection"] = {
-                "target_id": self.selection.target_id,
-                "column_index": self.selection.column_index,
-                "column_name": self.selection.column_name,
+        branches: dict[str, Any] = {}
+        if self.direct is not None:
+            branches["direct"] = {
+                "status": "verified",
+                "query_column": self.direct.query_column,
+                "target_column": self.direct.target_column,
+                "verification": asdict(self.direct.semantic_joinability),
             }
-        payload["rows"] = [
-            {
-                "row_id": row.row_id,
-                "value": row.value,
-                **({"evidence": row.evidence} if row.evidence is not None else {}),
+        if self.bundle is not None:
+            branches["evidence"] = {
+                "status": "verified" if self.evidence is not None else "not_attempted",
+                "not_attempted_reason": None if self.evidence is not None else "recovery_budget",
+                "evidence_ids": list(self.bundle.evidence_ids),
+                "verification": asdict(self.evidence.semantic_joinability) if self.evidence else None,
+                "rows": [asdict(row) for row in self.evidence.rows] if self.evidence else [],
             }
-            for row in self.rows
-        ]
-        if self.semantic_joinability is not None:
-            payload["verification"] = {
-                "joinable": self.semantic_joinability.joinable,
-                "coverage": self.semantic_joinability.coverage,
-                "mean_similarity": self.semantic_joinability.mean_similarity,
-            }
-        return payload
+        check = self.semantic_joinability
+        return {
+            "target_id": self.target_id,
+            "stage1_rank": self.stage1_rank,
+            "stage1_score": self.stage1_score,
+            "table_prior": self.table_prior,
+            "table_probability": self.scores.table_probability if self.scores else None,
+            "selection": asdict(self.scores.selection) if self.scores else None,
+            "joint_probabilities": [
+                {"column_index": column, "probability": probability}
+                for column, probability in zip(
+                    self.scores.column_indices, self.scores.joint_probabilities, strict=True
+                )
+            ] if self.scores else [],
+            "recovery_priority": self.scores.recovery_priority if self.scores else None,
+            "selected_for_recovery": self.selected_for_recovery,
+            "branches": branches,
+            "status": "verified" if check is not None else "not_attempted",
+            "final_branch": self.final_branch,
+            "verification": asdict(check) if check is not None else None,
+            "rerank_rank": self.rerank_rank,
+        }
+
+
+@dataclass(frozen=True)
+class Stage2Result:
+    query_id: str
+    recovery_budget: int
+    reranked_candidates: tuple[CandidateResult, ...]
+    unattempted_candidates: tuple[CandidateResult, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "input_candidate_count": len(self.reranked_candidates) + len(self.unattempted_candidates),
+            "recovery_budget": self.recovery_budget,
+            "reranked_candidates": [candidate.to_dict() for candidate in self.reranked_candidates],
+            "unattempted_candidates": [candidate.to_dict() for candidate in self.unattempted_candidates],
+        }
 
 
 class Stage2Backend(Protocol):
@@ -201,13 +280,18 @@ class Stage2Verifier:
             logits.append(self.scorer(open_states.to(device), close_states.to(device)))
         return logits
 
-    def select_column(
+    @torch.no_grad()
+    def score_candidates(
         self,
         query: dict[str, Any],
         bundles: Sequence[EvidenceBundle],
         targets: dict[str, dict[str, Any]],
         evidence: dict[str, dict[str, Any]],
-    ) -> ColumnSelection:
+    ) -> tuple[CandidateScores, ...]:
+        """Score the entire evidence pool before applying any recovery budget."""
+
+        if not bundles:
+            return ()
         logits = self.candidate_logits(query, bundles, targets, evidence)
         device = logits[0].device
         max_columns = max(values.shape[0] for values in logits)
@@ -222,15 +306,36 @@ class Stage2Verifier:
         joint = joint_candidate_probabilities(
             retrieval_scores, column_logits, column_mask
         )
-        flat_index = int(joint.reshape(-1).argmax())
-        target_index, column_position = divmod(flat_index, max_columns)
-        target = targets[bundles[target_index].target_id]
-        column_index = int(target["columns"][column_position]["column_index"])
-        return ColumnSelection(
-            target_id=bundles[target_index].target_id,
-            column_index=column_index,
-            column_name=column_name(target, column_index),
-        )
+        table_probabilities = retrieval_scores.softmax(dim=-1)
+        scored = []
+        for target_index, bundle in enumerate(bundles):
+            target = targets[bundle.target_id]
+            column_indices = tuple(int(column["column_index"]) for column in target["columns"])
+            probabilities = joint[target_index, : len(column_indices)]
+            column_position = int(probabilities.argmax())
+            column_index = column_indices[column_position]
+            scored.append(
+                CandidateScores(
+                    selection=ColumnSelection(
+                        bundle.target_id, column_index, column_name(target, column_index)
+                    ),
+                    column_indices=column_indices,
+                    joint_probabilities=tuple(probabilities.tolist()),
+                    table_probability=float(table_probabilities[target_index]),
+                    recovery_priority=float(probabilities[column_position]),
+                )
+            )
+        return tuple(scored)
+
+    def select_column(
+        self,
+        query: dict[str, Any],
+        bundles: Sequence[EvidenceBundle],
+        targets: dict[str, dict[str, Any]],
+        evidence: dict[str, dict[str, Any]],
+    ) -> ColumnSelection:
+        scores = self.score_candidates(query, bundles, targets, evidence)
+        return max(scores, key=lambda item: item.recovery_priority).selection
 
     def _semantic_check(self, query_values: Sequence[str], target_values: Sequence[str]) -> SemanticJoinability:
         embeddings = self.backend.embed_texts([*query_values, *target_values])
@@ -255,7 +360,7 @@ class Stage2Verifier:
         query_columns = [
             (
                 int(column["column_index"]),
-                column_values(query, int(column["column_index"])),
+                column_values(query, int(column["column_index"]), include_empty=True),
             )
             for column in query["columns"]
         ]
@@ -326,28 +431,95 @@ class Stage2Verifier:
             _, _, query_index, target_index, result = max(
                 candidates, key=lambda item: item[:2]
             )
-            if result.joinable:
-                verified.append(
-                    DirectVerification(target_id, query_index, target_index)
-                )
+            verified.append(
+                DirectVerification(target_id, query_index, target_index, result)
+            )
         return tuple(verified)
 
+    @torch.no_grad()
     def verify(
         self,
         query: dict[str, Any],
-        bundles: Sequence[EvidenceBundle],
+        retrieval_results: Sequence[dict[str, Any]],
         targets: dict[str, dict[str, Any]],
         evidence: dict[str, dict[str, Any]],
         *,
-        direct_target_ids: Sequence[str] = (),
+        recovery_budget: int = 20,
+        top_k_evidence: int = 4,
     ) -> Stage2Result:
-        query_id = str(query["table_id"])
-        direct = self.verify_direct(query, targets, direct_target_ids)
-        if not bundles:
-            return Stage2Result(query_id, direct, None, (), None)
+        """Rerank one complete Top-N path pool using direct and budgeted evidence checks."""
 
-        selection = self.select_column(query, bundles, targets, evidence)
-        selected_bundle = next(bundle for bundle in bundles if bundle.target_id == selection.target_id)
+        if recovery_budget < 0:
+            raise ValueError("recovery_budget must be non-negative")
+        if top_k_evidence <= 0:
+            raise ValueError("top_k_evidence must be positive")
+        validate_retrieval_path_budget(
+            {"results": retrieval_results},
+            max_targets=len(retrieval_results),
+            top_k_evidence=top_k_evidence,
+        )
+        bundles = build_evidence_bundles(retrieval_results, top_k_evidence=top_k_evidence)
+        scores = self.score_candidates(query, bundles, targets, evidence)
+        # Each table contributes exactly one maximum. Stable sorting preserves Stage-1 ties.
+        selected_ids = {
+            item.selection.target_id
+            for item in sorted(scores, key=lambda item: -item.recovery_priority)[:recovery_budget]
+        }
+        direct = {
+            result.target_id: result
+            for result in self.verify_direct(query, targets, direct_target_ids(retrieval_results))
+        }
+        recovered = {
+            bundle.target_id: self.recover_candidate(query, bundle, item.selection, targets, evidence)
+            for bundle, item in zip(bundles, scores, strict=True)
+            if bundle.target_id in selected_ids
+        }
+        bundle_by_id = {bundle.target_id: bundle for bundle in bundles}
+        score_by_id = {item.selection.target_id: item for item in scores}
+        candidates = []
+        for stage1_rank, result in enumerate(retrieval_results, 1):
+            target_id = str(result["target_id"])
+            bundle = bundle_by_id.get(target_id)
+            table_prior = bundle.retrieval_score if bundle else result.get("stage2_table_score")
+            candidates.append(
+                CandidateResult(
+                    target_id=target_id,
+                    stage1_rank=stage1_rank,
+                    stage1_score=float(result["score"]) if result.get("score") is not None else None,
+                    table_prior=float(table_prior) if table_prior is not None else None,
+                    bundle=bundle,
+                    scores=score_by_id.get(target_id),
+                    selected_for_recovery=target_id in selected_ids,
+                    direct=direct.get(target_id),
+                    evidence=recovered.get(target_id),
+                )
+            )
+        verified = sorted(
+            (candidate for candidate in candidates if candidate.semantic_joinability is not None),
+            key=lambda candidate: joinability_sort_key(candidate.semantic_joinability, candidate.stage1_rank),
+        )
+        return Stage2Result(
+            query_id=str(query["table_id"]),
+            recovery_budget=recovery_budget,
+            reranked_candidates=tuple(
+                replace(candidate, rerank_rank=rank) for rank, candidate in enumerate(verified, 1)
+            ),
+            unattempted_candidates=tuple(
+                candidate for candidate in candidates if candidate.semantic_joinability is None
+            ),
+        )
+
+    def recover_candidate(
+        self,
+        query: dict[str, Any],
+        selected_bundle: EvidenceBundle,
+        selection: ColumnSelection,
+        targets: dict[str, dict[str, Any]],
+        evidence: dict[str, dict[str, Any]],
+    ) -> EvidenceVerification:
+        """Recover one preselected bridge column without mutating the original query."""
+
+        query_id = str(query["table_id"])
         if self.evidence_router is None:
             raise ValueError("Stage-2 row filling requires an evidence router")
         assignment_by_evidence = self.evidence_router.assign(
@@ -423,4 +595,4 @@ class Stage2Verifier:
         generated_values = [prediction.value for prediction in predictions]
         target_values = column_values(targets[selection.target_id], selection.column_index)
         check = self._semantic_check(generated_values, target_values)
-        return Stage2Result(query_id, direct, selection, tuple(predictions), check)
+        return EvidenceVerification(selection, tuple(predictions), check)

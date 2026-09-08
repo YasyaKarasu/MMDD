@@ -409,8 +409,11 @@ advanced overrides. The first `k` target IDs/scores are returned unless
 `--result-k` overrides that serialization limit; only the first 10 targets
 retain a direct marker and the top four aggregated evidence paths.
 `--path-result-k` and `--evidence-path-k` control those two path-detail limits;
-they must be at least the corresponding Stage-2 `--max-targets` and
-`--top-k-evidence` values. Each target keeps only its final fusion `score`, a
+they must cover the Stage-2 **input** `--input-candidate-budget` (N, default 50)
+and `--top-k-evidence` values. The recovery budget M is not a path-detail limit.
+Returning 50 IDs with only 10 targets' paths is insufficient for N=50, even if
+M is smaller than 10. Stage 2 rejects this input before loading models; it does
+not automatically retrieve or export replacement data. Each target keeps only its final fusion `score`, a
 non-null `evidence_score` when available for Stage 2, and compact paths:
 `{"kind":"direct"}` or
 `{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
@@ -547,17 +550,38 @@ round selection has finished.
 ## Stage-2 verification
 
 Stage 2 is an executable RATA/FOCUS pipeline over canonical dataset artifacts
-and Stage-1 retrieval JSON. It first truncates the single global target list by
-its RRF `score` order. Inside that fixed candidate pool, it keeps
-`Q -> E -> T` paths for multimodal verification and checks direct `Q -> T`
-paths separately. The evidence branch uses the Stage-1 `evidence_score` for
-`softmax(r_T)`, but this does not create a second retrieval queue or change
-which targets passed the global cutoff. Repeated paths to one evidence object
-are aggregated with LogSumExp for evidence selection. For each candidate
-target, the query, target, and all selected top-k evidence objects are placed
-in one transformer input and produce one set of RATA boundary states.
-Retrieval JSON created before these channel scores were added must be
-regenerated.
+and Stage-1 retrieval JSON. `--input-candidate-budget` sets N (default 50): the
+first N unique targets in the Stage-1 result order. Duplicate target IDs and
+missing path detail are errors. `--recovery-budget` independently sets M
+(default 20, zero is allowed). `--max-targets` remains an alias for N only;
+`--max-direct-targets` has been removed.
+
+Inside this single Top-N pool, a `Q -> T` path creates a direct branch and a
+`Q -> E -> T` path creates an evidence branch. A target can have both. Branches
+depend only on retrieved paths, never on gold implicit/explicit labels, and
+path existence does not imply joinability. All direct candidates are verified
+against the original query; they neither consume M nor get truncated by it.
+
+For **every evidence candidate**, the query, target and top-k evidence objects
+are placed in one reader input and produce RATA boundary states for all target
+columns. Stage 2 reuses `joint_candidate_probabilities` to compute
+`P(T,c) = softmax(r_T) * softmax(g_T,c)` over the complete evidence pool.
+The table prior is exported `stage2_table_score` when present, otherwise
+`evidence_score`; the existing requirement for an evidence-channel score remains.
+Repeated evidence paths have already been aggregated by Stage 1, and bundles
+preserve its compact path order. No M cutoff is applied before reader scoring.
+
+Each table selects `c_T = argmax_c P(T,c)` and receives recovery priority
+`s_T = max_c P(T,c)`. The top M unique tables by this priority are recovered;
+ties preserve Stage-1 order (column ties preserve header order). Summing column
+probabilities would discard column information, and taking flattened top-M
+pairs would allow one table to consume multiple slots; neither is used.
+The full evidence pool still pays the column-selection reader cost. Only
+row routing, FOCUS localization, value generation and evidence-branch final
+verification are limited to M tables. Preselected columns are reused without
+another reader call. Each target has its own generated column, representing
+its augmented query `Q_T+`, without modifying the original query or another
+candidate's row values.
 
 The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
 `<|object_ref_end|>` tokens around every target header. Qwen is frozen; only
@@ -592,10 +616,11 @@ conda run -n MMDD python src/train_stage2.py \
   --output checkpoints/stage2_candidate.pt
 ```
 
-After the target column is fixed, each selected evidence object's original
+For each table admitted to recovery, after the target column is fixed, each selected evidence object's original
 Qwen embedding is compared with the cached query-row routing embeddings and
 assigned to exactly one row by cosine argmax. A row may receive zero or many
-evidence objects, but each evidence object runs through FOCUS at most once.
+evidence objects, but each evidence object runs through FOCUS at most once per
+recovered target (localization is target-attribute-specific).
 The routing embeddings contain only `Columns: ...` plus the current `Row: ...`
 for a query row, only `content` for text evidence, and only pixels for image
 evidence. No external table or asset metadata participates in routing.
@@ -617,10 +642,19 @@ candidate is used to generate the bridge value. Rows with one candidate skip
 the redundant reranker forward. Aggregated retrieval path scores determine the
 top-k evidence set but do not modify this final selection. Candidate order and
 labels remain fixed; no order rotation is applied. The generated column is
-accepted only when enough query rows semantically match values in the selected
-target column. The output keeps only the selected target/column,
-generated row values, compact evidence provenance, direct matches, and the
-final verification summary; it does not duplicate the full input table.
+marked joinable only when enough query rows match the selected target column.
+Both branches use the same exact/fuzzy-or-semantic matching rule, similarity
+threshold and minimum coverage. Empty values count in the denominator of all
+query rows and never count as matches. Direct verification chooses its best
+original query-column/target-column pair by coverage, then mean similarity.
+
+Verified targets are merged by `target_id` and sorted by coverage descending,
+mean similarity descending, then Stage-1 rank ascending. If both branches were
+verified, the better branch under the same rule supplies the final score;
+an exact tie keeps direct. Both branch results and all generated row evidence
+remain in the output. There is no branch-specific normalization, and `P(T,c)`
+is never a final joinability score. Verified failures remain in the reranked
+list; evidence-only targets outside M are separately marked not attempted.
 
 ```bash
 conda run -n MMDD python src/run_stage2.py \
@@ -630,14 +664,32 @@ conda run -n MMDD python src/run_stage2.py \
   --stage1-features cache/stage1_qwen8b \
   --scorer-checkpoint checkpoints/stage2_candidate.pt \
   --model-dir hf_models/Qwen3.5-9B \
+  --input-candidate-budget 50 --recovery-budget 20 \
   --output stage2_q1.json
 ```
 
-The result schema is intentionally compact:
+Output contains `input_candidate_budget`, the actual `input_candidate_count`,
+`recovery_budget`, `reranked_candidates`, and `unattempted_candidates`.
+Every candidate includes its `target_id`, 1-based `stage1_rank`, `stage1_score`,
+`table_prior` (raw r_T), `table_probability`, `selection`, per-column
+`joint_probabilities`, `recovery_priority`, and `selected_for_recovery`.
+Direct-only candidates without an exported table prior use null; their
+`stage1_score` is still retained and they do not participate in the evidence softmax.
+Each `branches.direct` / `branches.evidence` record retains its own
+`verification`; direct records identify the matched query and target columns,
+and evidence records retain `evidence_ids` plus row-aligned `rows` with values
+and compact localization provenance. Unrouted rows have empty values and null
+evidence. `final_branch`, `verification` and 1-based `rerank_rank` identify the
+merged result. Unattempted candidates have null final verification and rank,
+not fabricated zero scores; their evidence branch has status `not_attempted`
+and reason `recovery_budget`. Full input tables are not duplicated.
 
-```json
-{"query_id":"q1","selection":{"target_id":"t1","column_index":1,"column_name":"Club"},"rows":[{"row_id":0,"value":"Barcelona","evidence":{"evidence_id":"e1","evidence_type":"text","text_span":"Messi plays for Barcelona.","text_span_relevance":0.93}}],"verification":{"joinable":true,"coverage":1.0,"mean_similarity":0.91}}
-```
+`Stage2Verifier.verify(query, retrieval_results, targets, evidence, ...)` takes
+the already selected Top-N path records. `candidate_logits`, the candidate-head
+training interface, and Oracle loading/cache interfaces remain unchanged.
+This workflow change is covered by synthetic offline unit tests only, not
+training or model-inference experiments. Recall@1/3/5/7/9 evaluation, ablations,
+budget comparisons and effectiveness claims are outside this implementation.
 
 `mmdd_stage2/verifier.py` contains the paper-derived math,
 `mmdd_stage2/qwen.py` is the only model-specific boundary, and
