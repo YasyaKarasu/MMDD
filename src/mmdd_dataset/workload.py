@@ -99,16 +99,17 @@ def generate_query_views(
     for entity_col in entity_columns:
         add("entity_only", [entity_col])
 
-    all_columns = range(table["num_cols"])
-    random_projections = [
-        list(indices)
-        for width in range(2, min(4, table["num_cols"]) + 1)
-        for indices in combinations(all_columns, width)
-        if any(index in entity_columns for index in indices)
-    ]
-    rng.shuffle(random_projections)
-    for indices in random_projections:
-        add("random_projection", indices)
+    if len(plans) < max_views:
+        all_columns = range(table["num_cols"])
+        random_projections = [
+            list(indices)
+            for width in range(2, min(4, table["num_cols"]) + 1)
+            for indices in combinations(all_columns, width)
+            if any(index in entity_columns for index in indices)
+        ]
+        rng.shuffle(random_projections)
+        for indices in random_projections:
+            add("random_projection", indices)
 
     return [
         _query_view(table, indices, strategy, ordinal)

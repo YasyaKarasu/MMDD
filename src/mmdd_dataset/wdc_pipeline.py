@@ -1108,14 +1108,13 @@ def run_extract(
             sampled_shards[index],
             assets,
         )
-        writer = _new_shard(root, "model_tasks", index)
-        try:
-            for task in tasks:
-                writer.write(task)
-            add_stage_shard(root, manifest, writer.commit())
-        except BaseException:
-            writer.abort()
-            raise
+        _write_outcomes(
+            root,
+            manifest,
+            index=index,
+            artifact="model_tasks",
+            outcomes=tasks,
+        )
 
     completed_results = {
         _part_index(record["path"])
@@ -1145,14 +1144,13 @@ def run_extract(
         if pending:
             total_pending += pending
             continue
-        writer = _new_shard(root, "model_results", index)
-        try:
-            for result in results:
-                writer.write(result)
-            add_stage_shard(root, manifest, writer.commit())
-        except BaseException:
-            writer.abort()
-            raise
+        _write_outcomes(
+            root,
+            manifest,
+            index=index,
+            artifact="model_results",
+            outcomes=results,
+        )
         result_shards.set_postfix(tasks=len(tasks))
         if after_shard:
             after_shard(index)

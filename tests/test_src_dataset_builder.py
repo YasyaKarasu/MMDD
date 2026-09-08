@@ -5,10 +5,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import mmdd_dataset.workload as workload_module
+from build_image_attribute_dataset import build as build_image_attribute_dataset
+from build_table_dataset import main as table_pipeline_main
 from mmdd_dataset.extraction import (
     OpenAICompatibleExtractor,
     auto_check_recoveries,
@@ -24,8 +29,6 @@ from mmdd_dataset.pipeline import main as pipeline_main
 from mmdd_dataset.tables import prepare_entitables, prepare_wdc
 from mmdd_dataset.utils import sanitize_cell_text, write_jsonl
 from mmdd_dataset.workload import generate_query_views
-from build_image_attribute_dataset import build as build_image_attribute_dataset
-from build_table_dataset import main as table_pipeline_main
 
 
 def write_entitables(path: Path, table_count: int = 1, row_count: int = 5) -> None:
@@ -469,6 +472,25 @@ def test_table_workload_projects_reproducible_query_views(tmp_path: Path) -> Non
         set(splits[split]) == {"query_view_ids"}
         for split in ("train", "dev", "test")
     )
+
+
+def test_table_workload_skips_random_projections_when_deterministic_views_fill_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    write_entitables(input_dir / "tables.json")
+    prepared = prepare_entitables(input_dir)
+    monkeypatch.setattr(
+        workload_module,
+        "combinations",
+        lambda *_args, **_kwargs: pytest.fail("random projections were enumerated"),
+    )
+
+    views = generate_query_views(prepared.source_tables[0], max_views=1, seed=13)
+
+    assert len(views) == 1
+    assert views[0]["derivation_type"] != "random_projection"
 
 
 def test_extraction_masks_the_requested_attribute(tmp_path: Path) -> None:

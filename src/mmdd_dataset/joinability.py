@@ -339,14 +339,20 @@ def _qualified_columns(
         and profiles[column["column_index"]]["non_empty_ratio"]
         >= config.min_column_non_empty_ratio
     ]
+    valid_rows = [
+        int(row["row_id"])
+        for row in table["rows"]
+        if clean_text(get_cell(row, entity_col).get("wiki_title"))
+    ]
+    required = max(
+        config.min_recovered_rows,
+        math.ceil(
+            config.min_recovered_ratio * min(len(valid_rows), config.query_rows)
+        ),
+    )
     qualified: list[dict[str, Any]] = []
     for attribute_col in candidates:
         attribute_name = get_column_name(table, attribute_col)
-        valid_rows = [
-            int(row["row_id"])
-            for row in table["rows"]
-            if clean_text(get_cell(row, entity_col).get("wiki_title"))
-        ]
         recoveries: dict[int, list[dict[str, Any]]] = {}
         for row in table["rows"]:
             entity_cell = get_cell(row, entity_col)
@@ -364,13 +370,6 @@ def _qualified_columns(
             if matches:
                 recoveries[source_row_id] = matches
 
-        required = max(
-            config.min_recovered_rows,
-            math.ceil(
-                config.min_recovered_ratio
-                * min(len(valid_rows), config.query_rows)
-            ),
-        )
         if len(valid_rows) >= config.query_rows and len(recoveries) >= required:
             qualified.append(
                 {
@@ -676,31 +675,26 @@ def _build_joinability_for_table(
     qrels: list[dict[str, Any]] = []
     recoveries: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
+    artifacts = {
+        "query_tables": queries,
+        "data_lake_tables": targets,
+        "qrels": qrels,
+        "evidence_recoveries": recoveries,
+        "table_queryability_decisions": decisions,
+    }
 
     entity_col = _entity_column(table, config.query_rows)
     if entity_col is None:
         decisions.append(
             {"source_table_id": table["source_table_id"], "reason": "no_entity_column"}
         )
-        return {
-            "query_tables": queries,
-            "data_lake_tables": targets,
-            "qrels": qrels,
-            "evidence_recoveries": recoveries,
-            "table_queryability_decisions": decisions,
-        }
+        return artifacts
     qualified = _qualified_columns(table, entity_col, extraction_index, config)
     if not qualified:
         decisions.append(
             {"source_table_id": table["source_table_id"], "reason": "no_recoverable_column"}
         )
-        return {
-            "query_tables": queries,
-            "data_lake_tables": targets,
-            "qrels": qrels,
-            "evidence_recoveries": recoveries,
-            "table_queryability_decisions": decisions,
-        }
+        return artifacts
 
     layout = _implicit_context_layout(table, entity_col, qualified, config)
     if not layout:
@@ -719,13 +713,7 @@ def _build_joinability_for_table(
                 ],
             }
         )
-        return {
-            "query_tables": queries,
-            "data_lake_tables": targets,
-            "qrels": qrels,
-            "evidence_recoveries": recoveries,
-            "table_queryability_decisions": decisions,
-        }
+        return artifacts
 
     query_by_id: dict[str, dict[str, Any]] = {}
     qrel_keys: set[tuple[str, str, int]] = set()
@@ -781,13 +769,7 @@ def _build_joinability_for_table(
             ],
         }
     )
-    return {
-        "query_tables": queries,
-        "data_lake_tables": targets,
-        "qrels": qrels,
-        "evidence_recoveries": recoveries,
-        "table_queryability_decisions": decisions,
-    }
+    return artifacts
 
 
 def build_joinability_for_table(
