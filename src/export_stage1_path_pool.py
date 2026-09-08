@@ -141,7 +141,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 query_batch_size=args.query_batch_size,
             )
             for example, result in zip(batch, detailed):
-                positives = set(example.positive_target_ids)
+                positive_evidence = example.positive_evidence_by_target or {
+                    candidate.target_id: tuple(candidate.evidence_ids)
+                    for candidate in example.candidates
+                    if candidate.target_id in set(example.positive_target_ids)
+                    and candidate.evidence_ids
+                }
                 handle.write(
                     json.dumps(
                         {
@@ -150,11 +155,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "split": example.split,
                             "positive_target_ids": list(example.positive_target_ids),
                             "positive_evidence_by_target": {
-                                candidate.target_id: list(candidate.evidence_ids)
-                                for candidate in example.candidates
-                                if candidate.target_id in positives
-                                and candidate.evidence_ids
+                                target_id: list(evidence_ids)
+                                for target_id, evidence_ids in positive_evidence.items()
                             },
+                            "positive_evidence_rows_by_target": {
+                                target_id: {
+                                    evidence_id: list(row_ids)
+                                    for evidence_id, row_ids in evidence_rows.items()
+                                }
+                                for target_id, evidence_rows in (
+                                    example.positive_evidence_rows_by_target or {}
+                                ).items()
+                            },
+                            "query_row_count": example.query_row_count,
+                            "query_kind": example.query_kind,
                             "paths_by_target": _paths_by_target(result),
                         },
                         ensure_ascii=False,

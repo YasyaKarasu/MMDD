@@ -265,6 +265,7 @@ def build_stage1_training_artifacts(
     max_cell_chars: int = DEFAULT_MAX_CELL_CHARS,
     table_row_format: str = "values",
     seed: int = 13,
+    supervision_query_ids: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     if max_rows <= 0 or max_cell_chars <= 0:
         raise ValueError("max_rows and max_cell_chars must be positive")
@@ -276,6 +277,13 @@ def build_stage1_training_artifacts(
         str(record["table_id"]): record
         for record in _artifact_records(dataset_root, "query_tables")
     }
+    if supervision_query_ids is not None:
+        missing_queries = supervision_query_ids - set(queries)
+        if missing_queries:
+            raise ValueError(
+                "Supervision query IDs are missing from the dataset: "
+                + ", ".join(sorted(missing_queries)[:10])
+            )
     target_records = _resolve_target_references(
         dataset_root, _artifact_records(dataset_root, "data_lake_tables")
     )
@@ -284,10 +292,23 @@ def build_stage1_training_artifacts(
         for record in target_records
     }
     assets = _artifact_records(dataset_root, "bridge_assets")
-    qrels = _artifact_records(dataset_root, "qrels")
-    recoveries = _artifact_records(dataset_root, "evidence_recoveries", required=False)
+    qrels = [
+        record
+        for record in _artifact_records(dataset_root, "qrels")
+        if supervision_query_ids is None
+        or str(record["query_table_id"]) in supervision_query_ids
+    ]
+    recoveries = [
+        record
+        for record in _artifact_records(
+            dataset_root, "evidence_recoveries", required=False
+        )
+        if supervision_query_ids is None
+        or str(record["query_table_id"]) in supervision_query_ids
+    ]
 
     positives_by_query: dict[str, list[str]] = defaultdict(list)
+    qrel_reasons_by_query: dict[str, set[str]] = defaultdict(set)
     for qrel in qrels:
         if float(qrel.get("rel", 1)) <= 0:
             continue
@@ -297,6 +318,7 @@ def build_stage1_training_artifacts(
             raise KeyError(f"qrel references missing objects: {query_id} -> {target_id}")
         if target_id not in positives_by_query[query_id]:
             positives_by_query[query_id].append(target_id)
+        qrel_reasons_by_query[query_id].add(str(qrel.get("reason", "unknown")))
 
     query_objects = {
         query_id: _table_object(
@@ -330,6 +352,20 @@ def build_stage1_training_artifacts(
     postings, inverse_document_frequency = _semantic_index(target_text)
     evidence_by_target = _evidence_by_target(targets, assets, recoveries)
     recovery_evidence = _recovery_evidence(queries, targets, assets, recoveries)
+    recovery_rows: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+    for recovery in recoveries:
+        if (
+            recovery.get("query_table_id") is None
+            or recovery.get("query_row_id") is None
+        ):
+            continue
+        recovery_rows[
+            (
+                str(recovery["query_table_id"]),
+                str(recovery["target_table_id"]),
+                str(recovery.get("evidence", {}).get("asset_id", "")),
+            )
+        ].add(int(recovery["query_row_id"]))
     asset_types = {str(asset["asset_id"]): str(asset["asset_type"]) for asset in assets}
     target_ids = list(targets)
     structure_buckets: dict[tuple[int, int], list[str]] = defaultdict(list)
@@ -571,6 +607,31 @@ def build_stage1_training_artifacts(
                 "direct_positive_target_id": direct_positive_target_ids[0],
                 "evidence_positive_target_id": evidence_positive_target_ids[0],
                 "positive_target_ids": positive_target_ids,
+                "positive_evidence_by_target": {
+                    target_id: list(positive_evidence_by_target[target_id])
+                    for target_id in evidence_positive_target_ids
+                },
+                "positive_evidence_rows_by_target": {
+                    target_id: {
+                        evidence_id: sorted(
+                            recovery_rows.get(
+                                (query_id, target_id, evidence_id), set()
+                            )
+                        )
+                        for evidence_id in positive_evidence_by_target[target_id]
+                    }
+                    for target_id in evidence_positive_target_ids
+                },
+                "query_row_count": len(query.get("rows", ())),
+                "query_kind": (
+                    "implicit"
+                    if qrel_reasons_by_query[query_id]
+                    == {"model_recoverable_join_column"}
+                    else "explicit"
+                    if "model_recoverable_join_column"
+                    not in qrel_reasons_by_query[query_id]
+                    else "mixed"
+                ),
                 "candidates": candidates,
                 "dataset": dataset_name,
                 "split": split,

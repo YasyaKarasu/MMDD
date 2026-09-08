@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +17,7 @@ from .objectives import PathAggregator
 from .row_support import predict_row_support
 
 JoinabilityModel = TeacherJoinabilityModel | StudentJoinabilityModel
+EdgePositiveKey = tuple[str, str, str]
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,29 @@ def _edge_positive_id_set(example: EdgeExample) -> set[str]:
     return set(example.positive_ids) or {
         example.candidate_ids[example.positive_index]
     }
+
+
+def edge_positive_key(example: EdgeExample) -> EdgePositiveKey:
+    """Identify one directed edge neighborhood without crossing relation types."""
+
+    return (
+        example.query_id,
+        normalize_object_type(example.source_type) if example.source_type else "",
+        normalize_object_type(example.destination_type)
+        if example.destination_type
+        else "",
+    )
+
+
+def global_edge_positive_ids(
+    examples: Sequence[EdgeExample],
+) -> dict[EdgePositiveKey, frozenset[str]]:
+    """Collect every materialized positive neighbor for each training source."""
+
+    neighbors: dict[EdgePositiveKey, set[str]] = defaultdict(set)
+    for example in examples:
+        neighbors[edge_positive_key(example)].update(_edge_positive_id_set(example))
+    return {key: frozenset(values) for key, values in neighbors.items()}
 
 
 def edge_positive_mask(
@@ -430,6 +454,11 @@ def score_edge_batch_in_batch(
     max_negatives: int = 256,
     rng: random.Random | None = None,
     student_score_space: str = "raw_logit",
+    known_positive_ids: Mapping[EdgePositiveKey, Set[str]] | None = None,
+    use_global_positive_mask: bool = True,
+    sampling_seed: int | None = None,
+    sampling_context: str = "",
+    expansion_audit: dict[str, int] | None = None,
 ) -> ListScores:
     """Score each edge list against same-type candidates pooled from the batch."""
 
@@ -476,17 +505,66 @@ def score_edge_batch_in_batch(
     candidate_rows = []
     positive_id_sets = []
     for example, destination_type in zip(examples, destination_types):
-        positive_ids = _edge_positive_id_set(example)
-        positive_id_sets.append(positive_ids)
-        candidate_rows.append(
-            _expanded_candidate_ids(
-                example.candidate_ids,
-                destination_pools[destination_type],
-                positive_ids,
-                max_negatives,
-                rng,
+        local_positive_ids = _edge_positive_id_set(example)
+        all_positive_ids = set(
+            (known_positive_ids or {}).get(
+                edge_positive_key(example), local_positive_ids
             )
+        ) | local_positive_ids
+        pool_ids = destination_pools[destination_type]
+        extra_known_positives = (
+            set(pool_ids) - set(example.candidate_ids)
+        ) & all_positive_ids
+        positive_ids = (
+            all_positive_ids if use_global_positive_mask else local_positive_ids
         )
+        row_rng = rng
+        if sampling_seed is not None:
+            list_id = ":".join(
+                (
+                    example.query_id,
+                    example.source_type or "",
+                    example.destination_type or "",
+                    example.candidate_ids[example.positive_index],
+                )
+            )
+            row_rng = random.Random(
+                f"{sampling_seed}:{sampling_context}:{list_id}"
+            )
+        assert row_rng is not None
+        if expansion_audit is not None:
+            expansion_audit["lists"] = expansion_audit.get("lists", 0) + 1
+            expansion_audit["known_positive_candidates"] = (
+                expansion_audit.get("known_positive_candidates", 0)
+                + len(extra_known_positives)
+            )
+            expansion_audit["affected_lists"] = (
+                expansion_audit.get("affected_lists", 0)
+                + int(bool(extra_known_positives))
+            )
+            expansion_audit["known_positive_as_negative"] = (
+                expansion_audit.get("known_positive_as_negative", 0)
+                + (
+                    0
+                    if use_global_positive_mask
+                    else len(extra_known_positives)
+                )
+            )
+        positive_id_sets.append(positive_ids)
+        candidate_row = _expanded_candidate_ids(
+            example.candidate_ids,
+            pool_ids,
+            positive_ids,
+            max_negatives,
+            row_rng,
+        )
+        candidate_rows.append(candidate_row)
+        if expansion_audit is not None:
+            expansion_audit["added_negatives"] = (
+                expansion_audit.get("added_negatives", 0)
+                + len(candidate_row)
+                - len(example.candidate_ids)
+            )
     return _score_student_candidate_rows(
         student,
         queries,

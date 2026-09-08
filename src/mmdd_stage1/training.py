@@ -28,6 +28,7 @@ from .scoring import (
     TargetScores,
     edge_confirmed_label_tensors,
     edge_positive_mask,
+    global_edge_positive_ids,
     restrict_list_scores,
     score_edge_batch,
     score_edge_batch_in_batch,
@@ -510,6 +511,7 @@ def _student_edge_losses(
     supervised_scores: ListScores | None,
     confidence_scores: ListScores | None,
     *,
+    ranking_weight: float,
     temperature: float,
     distillation_weight: float,
     edge_bce_weight: float,
@@ -517,6 +519,8 @@ def _student_edge_losses(
     anchor_weight_evidence: float | None,
     positive_loss_mode: str = "sum_probability",
 ) -> dict[str, torch.Tensor]:
+    if ranking_weight < 0:
+        raise ValueError("ranking_weight must be non-negative")
     supervised = (
         _teacher_edge_loss(
             supervised_scores, positive_loss_mode=positive_loss_mode
@@ -555,12 +559,13 @@ def _student_edge_losses(
     )
     return {
         "loss": (
-            supervised
+            ranking_weight * supervised
             + distillation_weight * distillation
             + edge_bce_weight * absolute
             + weighted_anchor
         ),
         "supervised_loss": supervised,
+        "weighted_supervised_loss": ranking_weight * supervised,
         "distillation_loss": distillation,
         "absolute_loss": absolute,
         "anchor_loss": anchor,
@@ -574,6 +579,110 @@ def _edge_relation_key(example: EdgeExample) -> str:
     return StudentJoinabilityModel.relation_key(
         example.source_type, example.destination_type
     )
+
+
+def _recall_at_one(scores: ListScores) -> tuple[int, int]:
+    """Count lists whose highest-scoring candidate is one of the positives."""
+
+    positive_mask = scores.positive_mask
+    if positive_mask is None:
+        positive_mask = torch.zeros_like(scores.candidate_mask)
+        positive_mask.scatter_(1, scores.positive_indices.unsqueeze(1), True)
+    valid_rows = positive_mask.any(dim=1)
+    if not valid_rows.any():
+        return 0, 0
+    winners = scores.logits.masked_fill(~scores.candidate_mask, -torch.inf).argmax(dim=1)
+    hits = positive_mask.gather(1, winners.unsqueeze(1)).squeeze(1)
+    return int(hits[valid_rows].sum().item()), int(valid_rows.sum().item())
+
+
+@torch.no_grad()
+def _edge_list_metrics(
+    model: TeacherJoinabilityModel | StudentJoinabilityModel,
+    examples: Sequence[EdgeExample],
+    store: FeatureStore,
+    device: torch.device,
+    batch_size: int,
+    score_space: str,
+) -> dict[str, Any]:
+    """Evaluate list R@1 per directed relation and its equal-weight macro mean."""
+
+    model.eval()
+    counts: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev R@1", unit="batch", leave=False
+    ):
+        batch_scores = score_edge_batch(
+            model, batch, store, device, student_score_space=score_space
+        )
+        for relation in sorted({_edge_relation_key(example) for example in batch}):
+            row_mask = torch.tensor(
+                [_edge_relation_key(example) == relation for example in batch],
+                dtype=torch.bool,
+                device=device,
+            )
+            hits, lists = _recall_at_one(batch_scores.select(row_mask))
+            counts[relation][0] += hits
+            counts[relation][1] += lists
+    by_relation = {
+        relation: {
+            "hits@1": hits,
+            "lists": lists,
+            "recall@1": hits / lists if lists else 0.0,
+        }
+        for relation, (hits, lists) in sorted(counts.items())
+    }
+    recalls = [values["recall@1"] for values in by_relation.values()]
+    return {
+        "relations": len(by_relation),
+        "macro_recall@1": _mean(recalls),
+        "by_relation": by_relation,
+    }
+
+
+@torch.no_grad()
+def _target_list_metrics(
+    model: TeacherJoinabilityModel | StudentJoinabilityModel,
+    examples: Sequence[TargetExample],
+    store: FeatureStore,
+    aggregator: PathAggregator,
+    device: torch.device,
+    batch_size: int,
+    score_space: str,
+) -> dict[str, Any]:
+    """Evaluate direct and evidence target-list R@1 on fixed candidates."""
+
+    model.eval()
+    direct_hits = direct_lists = evidence_hits = evidence_lists = 0
+    for batch in progress(
+        _batches(examples, batch_size), desc="Dev target R@1", unit="batch", leave=False
+    ):
+        batch_scores = score_target_batch(
+            model,
+            batch,
+            store,
+            device,
+            aggregator,
+            student_score_space=score_space,
+        )
+        hits, lists = _recall_at_one(batch_scores.direct)
+        direct_hits += hits
+        direct_lists += lists
+        hits, lists = _recall_at_one(batch_scores.evidence)
+        evidence_hits += hits
+        evidence_lists += lists
+    return {
+        "direct": {
+            "hits@1": direct_hits,
+            "lists": direct_lists,
+            "recall@1": direct_hits / direct_lists if direct_lists else 0.0,
+        },
+        "evidence": {
+            "hits@1": evidence_hits,
+            "lists": evidence_lists,
+            "recall@1": evidence_hits / evidence_lists if evidence_lists else 0.0,
+        },
+    }
 
 
 def confirmed_edge_label_summary(
@@ -618,6 +727,7 @@ def _edge_losses_by_relation(
     supervised_scores: ListScores | None,
     confidence_scores: ListScores | None,
     *,
+    ranking_weight: float = 1.0,
     temperature: float,
     distillation_weight: float,
     edge_bce_weight: float,
@@ -652,6 +762,7 @@ def _edge_losses_by_relation(
                 if confidence_scores is not None
                 else None
             ),
+            ranking_weight=ranking_weight,
             temperature=temperature,
             distillation_weight=distillation_weight,
             edge_bce_weight=edge_bce_weight,
@@ -930,44 +1041,58 @@ def _student_edge_objective(
     in_batch_negatives: bool,
     in_batch_max_negatives: int,
     student_score_space: str,
+    ranking_weight: float,
+    ranking_score_space: str,
+    ranking_temperature: float,
+    use_global_positive_mask: bool,
     positive_loss_mode: str = "sum_probability",
 ) -> float:
     student.eval()
     losses = []
-    rng = random.Random(0)
-    for batch in progress(
+    known_positives = global_edge_positive_ids(examples)
+    for batch_index, batch in enumerate(progress(
         _batches(examples, batch_size), desc="Dev", unit="batch", leave=False
-    ):
+    )):
         teacher_scores = (
             _edge_teacher_scores(batch, device)
             if distillation_weight > 0
             else None
         )
         if in_batch_negatives:
-            expanded_scores = score_edge_batch_in_batch(
+            supervised_scores = score_edge_batch_in_batch(
                 student,
                 batch,
                 store,
                 device,
                 max_negatives=in_batch_max_negatives,
-                rng=rng,
-                student_score_space=student_score_space,
+                student_score_space=ranking_score_space,
+                known_positive_ids=known_positives,
+                use_global_positive_mask=use_global_positive_mask,
+                sampling_seed=0,
+                sampling_context=f"dev:{batch_index}",
             )
-            student_scores = restrict_list_scores(
-                expanded_scores,
-                [len(example.candidate_ids) for example in batch],
-                device,
-            )
-            supervised_scores = expanded_scores
         else:
-            student_scores = score_edge_batch(
+            supervised_scores = score_edge_batch(
                 student,
                 batch,
                 store,
                 device,
-                student_score_space=student_score_space,
+                student_score_space=ranking_score_space,
             )
-            supervised_scores = None
+        if ranking_temperature != 1.0:
+            supervised_scores = ListScores(
+                supervised_scores.logits / ranking_temperature,
+                supervised_scores.candidate_mask,
+                supervised_scores.positive_indices,
+                supervised_scores.positive_mask,
+            )
+        student_scores = score_edge_batch(
+            student,
+            batch,
+            store,
+            device,
+            student_score_space=student_score_space,
+        )
         confidence_scores = (
             score_edge_batch(
                 student,
@@ -986,6 +1111,7 @@ def _student_edge_objective(
             teacher_scores,
             supervised_scores,
             confidence_scores,
+            ranking_weight=ranking_weight,
             temperature=temperature,
             distillation_weight=distillation_weight,
             edge_bce_weight=edge_bce_weight,
@@ -1192,6 +1318,14 @@ def train_teacher_edges(
                 edge_bce_weight,
                 positive_loss_mode,
             )
+            values["dev_edge"] = _edge_list_metrics(
+                model,
+                dev_examples,
+                store,
+                device,
+                batch_size,
+                score_space,
+            )
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",
             **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
@@ -1287,6 +1421,15 @@ def train_teacher_paths(
                 score_space,
                 positive_loss_mode,
             )
+            values["dev_target_lists"] = _target_list_metrics(
+                model,
+                dev_examples,
+                store,
+                aggregator,
+                device,
+                batch_size,
+                score_space,
+            )
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",
             **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
@@ -1316,6 +1459,11 @@ def train_student_edges(
     in_batch_max_negatives: int = 256,
     edge_type_oversample: dict[str, int] | None = None,
     student_score_space: str = "raw_logit",
+    ranking_weight: float = 1.0,
+    ranking_score_space: str = "raw_logit",
+    ranking_temperature: float = 1.0,
+    use_global_positive_mask: bool = True,
+    max_optimizer_updates: int | None = None,
     positive_loss_mode: str = "sum_probability",
     dataset_sampling_alpha: float = 0.0,
     hard_examples: Sequence[EdgeExample] = (),
@@ -1323,12 +1471,18 @@ def train_student_edges(
     dev_examples: Sequence[EdgeExample] = (),
     epoch_callback: EpochCallback[StudentJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
-    if edge_bce_weight < 0:
-        raise ValueError("edge_bce_weight must be non-negative")
+    if min(edge_bce_weight, ranking_weight) < 0:
+        raise ValueError("edge_bce_weight and ranking_weight must be non-negative")
+    if ranking_temperature <= 0:
+        raise ValueError("ranking_temperature must be positive")
+    if max_optimizer_updates is not None and max_optimizer_updates <= 0:
+        raise ValueError("max_optimizer_updates must be positive")
     if edge_bce_weight > 0 and not student.confidence_transform:
         raise ValueError("Edge BCE requires the Student confidence transform")
     history = []
     rng = random.Random(seed)
+    known_positives = global_edge_positive_ids([*examples, *hard_examples])
+    optimizer_updates = 0
     epoch_bar = progress(range(epochs), desc="Student edge", unit="epoch")
     for epoch in epoch_bar:
         student.train()
@@ -1336,6 +1490,7 @@ def train_student_edges(
             (
                 "loss",
                 "supervised_loss",
+                "weighted_supervised_loss",
                 "distillation_loss",
                 "absolute_loss",
                 "anchor_loss",
@@ -1362,37 +1517,57 @@ def train_student_edges(
             unit="batch",
             leave=False,
         )
+        processed_examples: list[EdgeExample] = []
+        expansion_audit: dict[str, int] = {}
+        epoch_start_updates = optimizer_updates
         for step, batch in enumerate(batch_bar, 1):
+            if (
+                max_optimizer_updates is not None
+                and optimizer_updates >= max_optimizer_updates
+            ):
+                break
+            processed_examples.extend(batch)
             teacher_scores = (
                 _edge_teacher_scores(batch, device)
                 if distillation_weight > 0
                 else None
             )
             if in_batch_negatives:
-                expanded_scores = score_edge_batch_in_batch(
+                supervised_scores = score_edge_batch_in_batch(
                     student,
                     batch,
                     store,
                     device,
                     max_negatives=in_batch_max_negatives,
-                    rng=rng,
-                    student_score_space=student_score_space,
+                    student_score_space=ranking_score_space,
+                    known_positive_ids=known_positives,
+                    use_global_positive_mask=use_global_positive_mask,
+                    sampling_seed=seed,
+                    sampling_context=f"epoch={epoch}:step={step}",
+                    expansion_audit=expansion_audit,
                 )
-                student_scores = restrict_list_scores(
-                    expanded_scores,
-                    [len(example.candidate_ids) for example in batch],
-                    device,
-                )
-                supervised_scores = expanded_scores
             else:
-                student_scores = score_edge_batch(
+                supervised_scores = score_edge_batch(
                     student,
                     batch,
                     store,
                     device,
-                    student_score_space=student_score_space,
+                    student_score_space=ranking_score_space,
                 )
-                supervised_scores = None
+            if ranking_temperature != 1.0:
+                supervised_scores = ListScores(
+                    supervised_scores.logits / ranking_temperature,
+                    supervised_scores.candidate_mask,
+                    supervised_scores.positive_indices,
+                    supervised_scores.positive_mask,
+                )
+            student_scores = score_edge_batch(
+                student,
+                batch,
+                store,
+                device,
+                student_score_space=student_score_space,
+            )
             confidence_scores = (
                 score_edge_batch(
                     student,
@@ -1411,6 +1586,7 @@ def train_student_edges(
                 teacher_scores,
                 supervised_scores,
                 confidence_scores,
+                ranking_weight=ranking_weight,
                 temperature=temperature,
                 distillation_weight=distillation_weight,
                 edge_bce_weight=edge_bce_weight,
@@ -1419,22 +1595,34 @@ def train_student_edges(
                 positive_loss_mode=positive_loss_mode,
             )
             _optimize(objective["loss"], optimizer)
+            optimizer_updates += 1
             tracker.add(objective)
             if _loss_refresh_due(step, len(batches)):
                 tracker.flush()
                 batch_bar.set_postfix(loss=f"{tracker.mean('loss'):.4f}")
+        tracker.flush()
         train_loss = tracker.mean("loss")
         values = {
             "loss": train_loss,
             "train_loss": train_loss,
-            "optimizer_updates": len(batches),
-            "examples_seen": len(sampled),
+            "optimizer_updates": optimizer_updates - epoch_start_updates,
+            "optimizer_updates_total": optimizer_updates,
+            "optimizer_update_budget": max_optimizer_updates,
+            "optimizer_update_budget_exhausted": (
+                max_optimizer_updates is not None
+                and optimizer_updates >= max_optimizer_updates
+            ),
+            "examples_seen": len(processed_examples),
             "supervised_loss": tracker.mean("supervised_loss"),
+            "weighted_supervised_loss": tracker.mean(
+                "weighted_supervised_loss"
+            ),
             "distillation_loss": tracker.mean("distillation_loss"),
             "absolute_loss": tracker.mean("absolute_loss"),
             "confirmed_labels": confirmed_edge_label_summary(sampled),
             "anchor_loss": tracker.mean("anchor_loss"),
             "weighted_anchor_loss": tracker.mean("weighted_anchor_loss"),
+            "in_batch_expansion": expansion_audit,
         }
         if dev_examples:
             values["dev_loss"] = _student_edge_objective(
@@ -1451,14 +1639,30 @@ def train_student_edges(
                 in_batch_negatives,
                 in_batch_max_negatives,
                 student_score_space,
+                ranking_weight,
+                ranking_score_space,
+                ranking_temperature,
+                use_global_positive_mask,
                 positive_loss_mode,
+            )
+            values["dev_edge"] = _edge_list_metrics(
+                student,
+                dev_examples,
+                store,
+                device,
+                batch_size,
+                ranking_score_space,
             )
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",
             **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
         )
-        record = _epoch_record(epoch + 1, values, sampled, source_samples)
+        record = _epoch_record(
+            epoch + 1, values, processed_examples, source_samples
+        )
         if _finish_epoch(history, record, student, epoch_callback):
+            break
+        if values["optimizer_update_budget_exhausted"]:
             break
     return history
 
@@ -1481,6 +1685,7 @@ def train_student_paths(
     distillation_datasets: set[str] | None = None,
     in_batch_negatives: bool = False,
     in_batch_max_negatives: int = 256,
+    use_global_positive_mask: bool = True,
     relation_loss_weights: dict[str, float] | None = None,
     student_score_space: str = "raw_logit",
     positive_loss_mode: str = "sum_probability",
@@ -1511,6 +1716,9 @@ def train_student_paths(
     edge_batch_size = continuous_edge_batch_size or batch_size
     if edge_batch_size <= 0:
         raise ValueError("continuous_edge_batch_size must be positive")
+    continuous_known_positives = global_edge_positive_ids(
+        continuous_edge_examples
+    )
     if max_optimizer_updates is not None and max_optimizer_updates <= 0:
         raise ValueError("max_optimizer_updates must be positive")
     history = []
@@ -1655,6 +1863,8 @@ def train_student_paths(
                         max_negatives=in_batch_max_negatives,
                         rng=rng,
                         student_score_space=student_score_space,
+                        known_positive_ids=continuous_known_positives,
+                        use_global_positive_mask=use_global_positive_mask,
                     )
                     edge_student_scores = restrict_list_scores(
                         edge_expanded_scores,
@@ -1670,7 +1880,7 @@ def train_student_paths(
                         device,
                         student_score_space=student_score_space,
                     )
-                    edge_supervised_scores = None
+                    edge_supervised_scores = edge_student_scores
                 edge_confidence_scores = (
                     score_edge_batch(
                         student,
@@ -1689,6 +1899,7 @@ def train_student_paths(
                     edge_teacher_scores,
                     edge_supervised_scores,
                     edge_confidence_scores,
+                    ranking_weight=1.0,
                     temperature=temperature,
                     distillation_weight=distillation_weight,
                     edge_bce_weight=continuous_edge_bce_weight,
@@ -1705,6 +1916,7 @@ def train_student_paths(
                             edge_teacher_scores,
                             edge_supervised_scores,
                             edge_confidence_scores,
+                            ranking_weight=1.0,
                             temperature=temperature,
                             distillation_weight=distillation_weight,
                             edge_bce_weight=continuous_edge_bce_weight,
@@ -1822,6 +2034,10 @@ def train_student_paths(
                 in_batch_negatives,
                 in_batch_max_negatives,
                 student_score_space,
+                1.0,
+                student_score_space,
+                1.0,
+                use_global_positive_mask,
                 positive_loss_mode,
             )
             if "dev_loss" in values:

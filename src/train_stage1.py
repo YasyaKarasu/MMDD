@@ -47,6 +47,7 @@ from mmdd_stage1.retrieval import (
 )
 from mmdd_stage1.selection import (
     CheckpointManager,
+    MetricCriterion,
     MetricGate,
     metric_value,
 )
@@ -71,6 +72,17 @@ from mmdd_stage1.training import (
 )
 
 STAGES = ("teacher-edge", "teacher-path", "student-edge", "student-path")
+
+
+def _parse_selection_metric(value: str) -> MetricCriterion:
+    name, separator, direction = value.rpartition(":")
+    if not separator:
+        return MetricCriterion(value, True)
+    if direction not in {"max", "min"} or not name:
+        raise argparse.ArgumentTypeError(
+            "selection metrics must use METRIC, METRIC:max, or METRIC:min"
+        )
+    return MetricCriterion(name, direction == "max")
 
 
 def _parse_per_dataset_gate(
@@ -536,7 +548,12 @@ class _EpochController:
         self.stage = stage
         self.aggregator = aggregator
         self.manager = CheckpointManager(output)
-        self.gate = MetricGate(primary_metric, min_delta=min_delta, patience=patience)
+        self.gate = MetricGate(
+            primary_metric,
+            min_delta=min_delta,
+            patience=patience,
+            criteria=(args.selection_order or None),
+        )
         self.store = store
         self.device = device
         self.dev_examples = dev_examples
@@ -748,9 +765,18 @@ class _EpochController:
                 "raw_direct": rerank_metrics["raw_direct"],
                 "spearman": rerank_metrics["spearman"],
             }
+        elif self.stage in {"teacher-edge", "student-edge"}:
+            index_dir = None
+            gate_metrics = {
+                "dev_loss": record["dev_loss"],
+                "dev_edge": record["dev_edge"],
+            }
         else:
             index_dir = None
-            gate_metrics = {"dev_loss": record["dev_loss"]}
+            gate_metrics = {
+                "dev_loss": record["dev_loss"],
+                "dev_target_lists": record["dev_target_lists"],
+            }
 
         if epoch == 0:
             self.epoch_zero_fallback = (candidate, gate_metrics, index_dir)
@@ -798,6 +824,11 @@ class _EpochController:
             "bad_epochs": decision.bad_epochs,
             "eligible": True,
             "per_dataset": constraint_results,
+            "selection_reason": self.gate.last_reason,
+            "selection_values": {
+                criterion.name: metric_value(gate_metrics, criterion.name)
+                for criterion in (self.gate.criteria or [])
+            },
         }
         record["best_epoch_so_far"] = decision.best_epoch
         if decision.improved:
@@ -898,6 +929,10 @@ def _normalize_run_arguments(args: argparse.Namespace) -> None:
         args.relation_loss_weights = dict(args.relation_loss_weights)
     if args.batch_size is None:
         args.batch_size = 64 if args.stage.startswith("student") else 8
+    if args.edge_ranking_score_space is None:
+        args.edge_ranking_score_space = args.student_score_space
+    if args.selection_order:
+        args.primary_metric = args.selection_order[0].name
     args.feature_cache_size = _feature_cache_size(
         args.stage, args.feature_cache_size
     )
@@ -910,9 +945,12 @@ def _normalize_run_arguments(args: argparse.Namespace) -> None:
         and args.max_optimizer_updates <= 0
     ):
         raise ValueError("--max-optimizer-updates must be positive")
-    if args.max_optimizer_updates is not None and args.stage != "student-path":
+    if args.max_optimizer_updates is not None and args.stage not in {
+        "student-edge",
+        "student-path",
+    }:
         raise ValueError(
-            "--max-optimizer-updates is currently valid only for student-path"
+            "--max-optimizer-updates is valid only for Student stages"
         )
     if args.teacher_logit_batch_size <= 0:
         raise ValueError("--teacher-logit-batch-size must be positive")
@@ -920,6 +958,10 @@ def _normalize_run_arguments(args: argparse.Namespace) -> None:
         raise ValueError("--temperature must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
+    if args.edge_ranking_weight < 0:
+        raise ValueError("--edge-ranking-weight must be non-negative")
+    if args.edge_ranking_temperature <= 0:
+        raise ValueError("--edge-ranking-temperature must be positive")
     if args.edge_bce_weight < 0:
         raise ValueError("--edge-bce-weight must be non-negative")
     if args.continuous_edge_weight < 0:
@@ -1569,7 +1611,7 @@ def _resolve_retrieval_paths(
     corpus_path = None
     index_root = None
     raw_index_root = None
-    primary_metric = "dev_loss"
+    primary_metric = args.primary_metric if args.selection_order else "dev_loss"
     if args.stage == "student-path" or args.teacher_rerank:
         corpus_path = _required_path(args.corpus, "--corpus", args.stage)
         primary_metric = args.primary_metric
@@ -1895,6 +1937,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             in_batch_max_negatives=args.in_batch_max_negatives,
             edge_type_oversample=args.edge_type_oversample,
             student_score_space=args.student_score_space,
+            ranking_weight=args.edge_ranking_weight,
+            ranking_score_space=args.edge_ranking_score_space,
+            ranking_temperature=args.edge_ranking_temperature,
+            use_global_positive_mask=args.global_positive_mask,
+            max_optimizer_updates=args.max_optimizer_updates,
             positive_loss_mode=args.positive_loss_mode,
             **common,
         )
@@ -1934,6 +1981,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 in_batch_negatives=args.in_batch_negatives,
                 in_batch_max_negatives=args.in_batch_max_negatives,
+                use_global_positive_mask=args.global_positive_mask,
                 relation_loss_weights=args.relation_loss_weights,
                 student_score_space=args.student_score_space,
                 positive_loss_mode=args.positive_loss_mode,
@@ -2027,6 +2075,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "best_epoch": controller.gate.best_epoch,
         "best_metrics": controller.best_metrics,
         "primary_metric": controller.gate.primary_metric,
+        "selection_order": [
+            {"name": value.name, "maximize": value.maximize}
+            for value in args.selection_order
+        ],
         "min_delta": args.min_delta,
         "patience": args.patience,
         "stop_reason": controller.stop_reason,
@@ -2034,6 +2086,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "relation_learning_rate": relation_learning_rate,
         "anchor_weight": args.anchor_weight,
         "edge_bce_weight": args.edge_bce_weight,
+        "edge_ranking_weight": args.edge_ranking_weight,
+        "edge_ranking_score_space": args.edge_ranking_score_space,
+        "edge_ranking_temperature": args.edge_ranking_temperature,
         "anchor_weight_evidence": (
             args.anchor_weight
             if args.anchor_weight_evidence is None
@@ -2046,6 +2101,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "gate_unsatisfied": controller.gate_unsatisfied,
         "in_batch_negatives": args.in_batch_negatives,
         "in_batch_max_negatives": args.in_batch_max_negatives,
+        "global_positive_mask": args.global_positive_mask,
         "edge_type_oversample": args.edge_type_oversample,
         "relation_loss_weights": args.relation_loss_weights,
         "student_score_space": args.student_score_space,
@@ -2086,6 +2142,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "completed_stage": args.stage,
         "selection_split": "dev",
         "primary_metric": controller.gate.primary_metric,
+        "selection_order": [
+            {"name": value.name, "maximize": value.maximize}
+            for value in args.selection_order
+        ],
         "per_dataset_gate": args.per_dataset_gate,
         "gate_unsatisfied": controller.gate_unsatisfied,
         "best_epoch": controller.gate.best_epoch,
@@ -2124,6 +2184,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_optimizer_updates": args.max_optimizer_updates,
         "path_aggregation": path_aggregation_metadata,
         "student_score_space": args.student_score_space,
+        "edge_ranking": {
+            "weight": args.edge_ranking_weight,
+            "score_space": args.edge_ranking_score_space,
+            "temperature": args.edge_ranking_temperature,
+            "global_positive_mask": args.global_positive_mask,
+        },
         "teacher_score_space": args.teacher_score_space,
         "positive_loss_mode": args.positive_loss_mode,
         "mining_round": mining_round,
@@ -2316,6 +2382,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-sampling-alpha", type=float, default=0.0)
 
     parser.add_argument("--primary-metric", default="recall@10")
+    parser.add_argument(
+        "--selection-order",
+        type=_parse_selection_metric,
+        action="append",
+        default=[],
+        metavar="METRIC[:max|min]",
+        help="Lexicographic dev checkpoint metrics in declared order.",
+    )
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-dev-evidence-path-queries", type=int, default=1)
@@ -2405,6 +2479,15 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--in-batch-max-negatives", type=int, default=256)
     parser.add_argument(
+        "--global-positive-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude every materialized same-source positive from in-batch "
+            "negative expansion. Disable only for historical diagnostics."
+        ),
+    )
+    parser.add_argument(
         "--edge-type-oversample",
         nargs="*",
         type=_parse_edge_oversample,
@@ -2427,6 +2510,21 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--edge-ranking-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--edge-ranking-score-space",
+        choices=STUDENT_SCORE_SPACES,
+        help=(
+            "Student score used only by supervised edge ranking; defaults to "
+            "--student-score-space for backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--edge-ranking-temperature",
+        type=float,
+        default=1.0,
+        help="Divide supervised edge-ranking scores by this temperature.",
+    )
     parser.add_argument("--distillation-weight", type=float, default=1.0)
     parser.add_argument("--continuous-edge-weight", type=float, default=1.0)
     parser.add_argument("--continuous-edge-batch-size", type=int)

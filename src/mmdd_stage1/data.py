@@ -68,6 +68,12 @@ class TargetExample:
     teacher_checkpoint_sha256: str | None = None
     teacher_logit_mode: str | None = None
     teacher_ensemble_alpha: float | None = None
+    positive_evidence_by_target: dict[str, tuple[str, ...]] | None = None
+    positive_evidence_rows_by_target: (
+        dict[str, dict[str, tuple[int, ...]]] | None
+    ) = None
+    query_row_count: int | None = None
+    query_kind: str | None = None
 
 
 def _records(path: Path, split: str | None) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -532,6 +538,41 @@ def load_target_examples(
                     f"{path}:{line_number}: G5 Teacher scores require row-support "
                     "and exact-content provenance"
                 )
+        raw_positive_evidence = record.get("positive_evidence_by_target")
+        positive_evidence_by_target = None
+        if raw_positive_evidence is not None:
+            if not isinstance(raw_positive_evidence, dict):
+                raise ValueError(
+                    f"{path}:{line_number}: positive_evidence_by_target must be an object"
+                )
+            positive_evidence_by_target = {
+                str(target_id): tuple(str(value) for value in evidence_ids)
+                for target_id, evidence_ids in raw_positive_evidence.items()
+            }
+        raw_evidence_rows = record.get("positive_evidence_rows_by_target")
+        positive_evidence_rows_by_target = None
+        if raw_evidence_rows is not None:
+            if not isinstance(raw_evidence_rows, dict):
+                raise ValueError(
+                    f"{path}:{line_number}: positive_evidence_rows_by_target "
+                    "must be an object"
+                )
+            positive_evidence_rows_by_target = {
+                str(target_id): {
+                    str(evidence_id): tuple(int(value) for value in row_ids)
+                    for evidence_id, row_ids in evidence_rows.items()
+                }
+                for target_id, evidence_rows in raw_evidence_rows.items()
+            }
+        query_row_count = (
+            int(record["query_row_count"])
+            if record.get("query_row_count") is not None
+            else None
+        )
+        if query_row_count is not None and query_row_count <= 0:
+            raise ValueError(
+                f"{path}:{line_number}: query_row_count must be positive"
+            )
         examples.append(
             TargetExample(
                 query_id,
@@ -565,6 +606,16 @@ def load_target_examples(
                     "teacher_ensemble_alpha",
                     "teacher_target_ensemble_alpha",
                     fallback_on_falsy=False,
+                ),
+                positive_evidence_by_target=positive_evidence_by_target,
+                positive_evidence_rows_by_target=(
+                    positive_evidence_rows_by_target
+                ),
+                query_row_count=query_row_count,
+                query_kind=(
+                    str(record["query_kind"])
+                    if record.get("query_kind") is not None
+                    else None
                 ),
             )
         )

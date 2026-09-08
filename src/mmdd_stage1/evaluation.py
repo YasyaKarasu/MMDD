@@ -154,6 +154,122 @@ def _retrieval_metrics(
     return result
 
 
+def evidence_funnel_metrics(
+    examples: Sequence[TargetExample],
+    detailed_results: Sequence[dict[str, list[dict[str, Any]]]],
+    *,
+    evidence_bundle_budget: int,
+) -> dict[str, Any]:
+    """Measure evidence arrival and retention before final target admission."""
+
+    pair_rows = []
+    for example, result in zip(examples, detailed_results):
+        if example.query_kind not in {None, "implicit"}:
+            continue
+        positive_evidence = example.positive_evidence_by_target or {
+            candidate.target_id: candidate.evidence_ids
+            for candidate in example.candidates
+            if candidate.target_id in set(example.positive_target_ids)
+            and candidate.evidence_ids
+        }
+        rows_by_target = example.positive_evidence_rows_by_target or {}
+        evidence_by_target = {
+            str(row["target_id"]): row for row in result["evidence"]
+        }
+        all_query_evidence = {
+            str(path["evidence_id"])
+            for row in result["evidence"]
+            for path in row["paths"]
+            if path["kind"] == "evidence"
+        }
+        for target_id, valid_values in positive_evidence.items():
+            valid_evidence = set(valid_values)
+            target = evidence_by_target.get(str(target_id))
+            target_paths = (
+                [path for path in target["paths"] if path["kind"] == "evidence"]
+                if target is not None
+                else []
+            )
+            pool_evidence = {
+                str(path["evidence_id"]) for path in target_paths
+            }
+            if target is not None and "selected_evidence_ids" in target:
+                selected = [
+                    str(value)
+                    for value in target["selected_evidence_ids"][
+                        :evidence_bundle_budget
+                    ]
+                ]
+            else:
+                selected = [
+                    str(path["evidence_id"])
+                    for path in sorted(
+                        target_paths,
+                        key=lambda path: (
+                            -float(path["path_score"]),
+                            str(path["evidence_id"]),
+                        ),
+                    )[:evidence_bundle_budget]
+                ]
+            valid_selected = valid_evidence & set(selected)
+            supported_rows = set()
+            for evidence_id in valid_selected:
+                supported_rows.update(
+                    rows_by_target.get(str(target_id), {}).get(evidence_id, ())
+                )
+            row_denominator = example.query_row_count or 0
+            pair_rows.append(
+                {
+                    "query_id": example.query_id,
+                    "target_id": str(target_id),
+                    "valid_pool": int(bool(valid_evidence & pool_evidence)),
+                    "valid_b": int(bool(valid_selected)),
+                    "row_b_numerator": len(supported_rows),
+                    "row_b_denominator": row_denominator,
+                    "q_to_e": int(bool(valid_evidence & all_query_evidence)),
+                    "e_to_t_given_q_to_e": int(
+                        bool(valid_evidence & pool_evidence)
+                    ),
+                }
+            )
+    pair_count = len(pair_rows)
+    q_to_e_count = sum(row["q_to_e"] for row in pair_rows)
+    return {
+        "implicit_positive_pairs": pair_count,
+        "valid_pool_count": sum(row["valid_pool"] for row in pair_rows),
+        "valid_pool": (
+            sum(row["valid_pool"] for row in pair_rows) / pair_count
+            if pair_count
+            else 0.0
+        ),
+        "valid_b_count": sum(row["valid_b"] for row in pair_rows),
+        "valid_b": (
+            sum(row["valid_b"] for row in pair_rows) / pair_count
+            if pair_count
+            else 0.0
+        ),
+        "row_b": (
+            sum(
+                row["row_b_numerator"] / row["row_b_denominator"]
+                if row["row_b_denominator"]
+                else 0.0
+                for row in pair_rows
+            )
+            / pair_count
+            if pair_count
+            else 0.0
+        ),
+        "q_to_e_pair_recall": q_to_e_count / pair_count if pair_count else 0.0,
+        "e_to_t_pair_recall_given_q_to_e": (
+            sum(row["e_to_t_given_q_to_e"] for row in pair_rows)
+            / q_to_e_count
+            if q_to_e_count
+            else 0.0
+        ),
+        "per_pair": pair_rows,
+    }
+
+
 def evaluate_student_retrieval(
     examples: Sequence[TargetExample],
     indices: StudentANNIndices | RawEmbeddingANNIndices,
@@ -215,6 +331,9 @@ def evaluate_student_retrieval(
     valid_path_counts: dict[int, list[tuple[int, int]]] = {
         requested_k: [] for requested_k in retrieval_ks
     }
+    detailed_results_by_k: dict[
+        int, list[dict[str, list[dict[str, Any]]]]
+    ] = {}
 
     for requested_k in retrieval_ks:
         query_ids = [
@@ -259,6 +378,7 @@ def evaluate_student_retrieval(
             gated_evidence_quantile=gated_evidence_quantile,
             evidence_modality_weights=evidence_modality_weights,
         )
+        detailed_results_by_k[requested_k] = results
         for example, result in zip(
             examples,
             results,
@@ -335,6 +455,11 @@ def evaluate_student_retrieval(
         list(range(len(examples))), rankings, positive_sets,
         positive_evidence_hits, valid_path_counts, recall_ks,
         evidence_top_k, return_per_query=return_per_query,
+    )
+    metrics["evidence_funnel"] = evidence_funnel_metrics(
+        examples,
+        detailed_results_by_k[10],
+        evidence_bundle_budget=evidence_top_k,
     )
     datasets = sorted({example.dataset for example in examples})
     metrics["by_dataset"] = {

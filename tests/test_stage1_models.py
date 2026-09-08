@@ -3725,6 +3725,7 @@ def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
         distillation_weight=0.3,
         anchor_weight=0.1,
         continuous_edge_examples=edge_examples,
+        continuous_edge_dev_examples=edge_examples,
         continuous_edge_weight=1.0,
         continuous_edge_bce_weight=1.0,
         continuous_edge_batch_size=2,
@@ -3739,6 +3740,7 @@ def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
     assert record["continuous_edge_participation"]["positive"] == 2
     assert record["continuous_edge_participation"]["negative"] == 2
     assert record["continuous_edge_participation"]["unknown"] == 1
+    assert record["dev_continuous_edge_loss"] > 0
     assert set(record["continuous_edge_loss_by_relation"]) == {
         "table_to_table",
         "text_to_table",

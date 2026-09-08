@@ -13,7 +13,7 @@ import torch
 from .artifacts import checkpoint_fingerprint, write_json
 
 
-def metric_value(metrics: dict[str, Any], name: str) -> float:
+def _metric_raw_value(metrics: dict[str, Any], name: str) -> int | float:
     value: Any = metrics
     for part in name.split("."):
         if not isinstance(value, dict) or part not in value:
@@ -21,7 +21,112 @@ def metric_value(metrics: dict[str, Any], name: str) -> float:
         value = value[part]
     if not isinstance(value, (int, float)):
         raise ValueError(f"Primary metric {name!r} is not numeric")
+    return value
+
+
+def metric_value(metrics: dict[str, Any], name: str) -> float:
+    value = _metric_raw_value(metrics, name)
     return float(value)
+
+
+@dataclass(frozen=True)
+class MetricCriterion:
+    name: str
+    maximize: bool = True
+
+
+def compare_metric_vectors(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    criteria: list[MetricCriterion],
+    *,
+    tolerance: float = 1e-12,
+) -> tuple[int, str]:
+    """Compare metric dictionaries in declared lexicographic order."""
+
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+    for criterion in criteria:
+        left_value = _metric_raw_value(left, criterion.name)
+        right_value = _metric_raw_value(right, criterion.name)
+        tied = (
+            left_value == right_value
+            if isinstance(left_value, int) and isinstance(right_value, int)
+            else abs(left_value - right_value) <= tolerance
+        )
+        if tied:
+            continue
+        left_better = left_value > right_value
+        if not criterion.maximize:
+            left_better = not left_better
+        direction = "higher" if criterion.maximize else "lower"
+        reason = (
+            f"{criterion.name}: {left_value!r} vs {right_value!r}; "
+            f"{direction} is preferred"
+        )
+        return (1 if left_better else -1), reason
+    return 0, "all declared metrics tied"
+
+
+def select_lexicographic(
+    candidates: list[dict[str, Any]],
+    criteria: list[MetricCriterion],
+    *,
+    metrics_key: str = "metrics",
+    step_key: str = "step",
+    id_key: str | None = None,
+    tolerance: float = 1e-12,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select by metrics, then earlier step, then an optional stable ID."""
+
+    if not candidates:
+        raise ValueError("Cannot select from an empty candidate list")
+    if not criteria:
+        raise ValueError("At least one metric criterion is required")
+    best = candidates[0]
+    decisions = []
+    for candidate in candidates[1:]:
+        candidate_step = int(candidate[step_key])
+        comparison, reason = compare_metric_vectors(
+            candidate[metrics_key],
+            best[metrics_key],
+            criteria,
+            tolerance=tolerance,
+        )
+        if comparison == 0:
+            best_step = int(best[step_key])
+            if candidate_step != best_step:
+                comparison = 1 if candidate_step < best_step else -1
+                reason = (
+                    f"{step_key}: {candidate_step} vs {best_step}; earlier is preferred"
+                )
+            elif id_key is not None:
+                candidate_id = str(candidate[id_key])
+                best_id = str(best[id_key])
+                if candidate_id != best_id:
+                    comparison = 1 if candidate_id < best_id else -1
+                    reason = (
+                        f"{id_key}: {candidate_id!r} vs {best_id!r}; "
+                        "lexically smaller is preferred"
+                    )
+        decisions.append(
+            {
+                "candidate": candidate.get(id_key) if id_key else candidate_step,
+                "incumbent": best.get(id_key) if id_key else int(best[step_key]),
+                "comparison": comparison,
+                "reason": reason,
+            }
+        )
+        if comparison > 0:
+            best = candidate
+    return best, {
+        "criteria": [
+            {"name": value.name, "maximize": value.maximize}
+            for value in criteria
+        ],
+        "tolerance": tolerance,
+        "decisions": decisions,
+    }
 
 
 @dataclass(frozen=True)
@@ -42,6 +147,8 @@ class MetricGate:
         min_delta: float = 0.0,
         patience: int = 3,
         maximize: bool | None = None,
+        criteria: list[MetricCriterion] | None = None,
+        tolerance: float = 1e-12,
     ) -> None:
         if min_delta < 0 or patience < 0:
             raise ValueError("min_delta and patience must be non-negative")
@@ -51,18 +158,41 @@ class MetricGate:
         self.maximize = (
             not primary_metric.endswith("loss") if maximize is None else maximize
         )
+        self.criteria = criteria
+        self.tolerance = tolerance
         self.best_epoch = 0
         self.best_value: float | None = None
+        self.best_metrics: dict[str, Any] | None = None
         self.bad_epochs = 0
+        self.last_reason = "first candidate"
 
     def observe(self, epoch: int, metrics: dict[str, Any]) -> GateDecision:
         value = metric_value(metrics, self.primary_metric)
         improved = self.best_value is None
         if self.best_value is not None:
-            change = value - self.best_value if self.maximize else self.best_value - value
-            improved = change > 0 and change >= self.min_delta
+            if self.criteria is not None:
+                assert self.best_metrics is not None
+                comparison, self.last_reason = compare_metric_vectors(
+                    metrics,
+                    self.best_metrics,
+                    self.criteria,
+                    tolerance=self.tolerance,
+                )
+                improved = comparison > 0
+            else:
+                change = (
+                    value - self.best_value
+                    if self.maximize
+                    else self.best_value - value
+                )
+                improved = change > 0 and change >= self.min_delta
+                self.last_reason = (
+                    f"{self.primary_metric}: change={change!r}, "
+                    f"min_delta={self.min_delta!r}"
+                )
         if improved:
             self.best_value = value
+            self.best_metrics = metrics
             self.best_epoch = epoch
             self.bad_epochs = 0
         else:
