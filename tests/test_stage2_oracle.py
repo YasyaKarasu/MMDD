@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,14 @@ from mmdd_stage2.reader_cache import (
     build_reader_cache,
     load_reader_cache,
     train_cached_scorer,
+)
+from mmdd_stage2.r12_column import (
+    R12ColumnExample,
+    build_r12_reader_cache,
+    evaluate_r12_scores,
+    load_r12_reader_cache,
+    score_r12_records,
+    train_r12_candidate_scorer,
 )
 from mmdd_stage2.verifier import EvidenceBundle
 from run_stage2_round1 import _round1_conclusion
@@ -383,6 +392,137 @@ def test_reader_cache_allows_multiple_gold_targets_for_one_query(tmp_path):
         ("q1", "t1"),
         ("q1", "t2"),
     ]
+
+
+def test_r12_reader_cache_physically_permutes_columns_and_adds_rejection_controls(
+    tmp_path,
+):
+    examples = [
+        R12ColumnExample(
+            dataset="lake",
+            dataset_root=str(tmp_path / "dataset"),
+            protocol_split="train_fit",
+            query_id=query_id,
+            target_id=target_id,
+            source_table_id=source_id,
+            gold_source_column=gold,
+            gold_local_column=gold,
+            evidence_ids=(evidence_id,),
+            evidence_modalities=("text",),
+        )
+        for query_id, target_id, source_id, evidence_id, gold in (
+            ("q1", "t1", "s1", "e1", 1),
+            ("q2", "t2", "s2", "e2", 0),
+        )
+    ]
+    objects = Stage2ObjectIndex(
+        {"q1": {"table_id": "q1"}, "q2": {"table_id": "q2"}},
+        {
+            target_id: {
+                "table_id": target_id,
+                "columns": [
+                    {"column_index": 0, "column_name": "left"},
+                    {"column_index": 1, "column_name": "right"},
+                ],
+            }
+            for target_id in ("t1", "t2")
+        },
+        {
+            "e1": {"asset_id": "e1", "asset_type": "text"},
+            "e2": {"asset_id": "e2", "asset_type": "text"},
+        },
+    )
+
+    class Backend(_FrozenBackend):
+        def __init__(self):
+            super().__init__()
+            self.presented = []
+
+        def reader_states(self, query, target, _evidence):
+            indices = [int(column["column_index"]) for column in target["columns"]]
+            self.presented.append((query["table_id"], target["table_id"], indices))
+            values = torch.tensor(indices, dtype=torch.float32).unsqueeze(1).repeat(1, 3)
+            return values, values + 1
+
+    backend = Backend()
+    cache_dir = tmp_path / "r12_cache"
+    manifest = build_r12_reader_cache(
+        backend,
+        examples,
+        objects,
+        cache_dir,
+        model_path=tmp_path / "model",
+        model_dtype="fp32",
+        top_k_evidence=4,
+        column_permutation_seed=13,
+        shard_size=2,
+    )
+    records, _fingerprint = load_r12_reader_cache([cache_dir])
+
+    assert manifest["record_count"] == 6
+    assert Counter(record["example_type"] for record in records) == {
+        "positive": 2,
+        "wrong_target": 2,
+        "no_available_column": 2,
+    }
+    for record in records:
+        if record["example_type"] == "positive":
+            assert record["candidate_column_indices"][record["gold_column_position"]] == record[
+                "gold_column_index"
+            ]
+        elif record["example_type"] == "no_available_column":
+            assert record["gold_column_index"] not in record["candidate_column_indices"]
+    assert len(backend.presented) == 6
+    assert sum(len(indices) == 1 for _, _, indices in backend.presented) == 2
+
+
+def test_r12_cached_scorer_learns_column_selection_and_control_rejection(tmp_path):
+    def record(example_type, values, gold=None):
+        return {
+            "dataset": "lake",
+            "protocol_split": "train_fit",
+            "query_id": f"q-{example_type}-{values}",
+            "gold_target_id": "gold",
+            "presented_target_id": "shown",
+            "source_table_id": "source",
+            "example_type": example_type,
+            "gold_column_position": gold,
+            "gold_column_index": gold,
+            "candidate_column_indices": tuple(range(len(values))),
+            "candidate_column_count": len(values),
+            "evidence_ids": ("e",),
+            "evidence_modalities": ("text",),
+            "open_states": torch.tensor(values, dtype=torch.float32).unsqueeze(1),
+            "close_states": torch.zeros(len(values), 1),
+        }
+
+    base = [
+        record("positive", [-2.0, 2.0], 1),
+        record("positive", [2.0, -2.0], 0),
+        record("wrong_target", [-2.0, -2.0]),
+        record("no_available_column", [-2.0]),
+    ]
+    train = base * 8
+    scorer, summary = train_r12_candidate_scorer(
+        train,
+        base,
+        hidden_dim=1,
+        seed=13,
+        epochs=10,
+        learning_rate=0.1,
+        weight_decay=0.0,
+        output_dir=tmp_path / "scorer",
+        checkpoint_metadata={"model_dir": str(tmp_path / "model")},
+    )
+    metrics = evaluate_r12_scores(
+        score_r12_records(scorer, base),
+        threshold=summary["rejection_threshold"],
+    )
+
+    assert summary["head_parameters_updated"] is True
+    assert metrics["macro_decision_accuracy"] == pytest.approx(1.0)
+    assert metrics["by_example_type"]["positive"]["column_accuracy_without_rejection"] == 1.0
+    assert metrics["control_false_accept_rate"] == 0.0
 
 
 def test_cached_scorer_selects_earlier_tied_nonfinal_epoch(tmp_path, monkeypatch):

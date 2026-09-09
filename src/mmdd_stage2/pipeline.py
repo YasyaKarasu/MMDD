@@ -14,6 +14,7 @@ from .data import (
     column_name,
     column_values,
     direct_target_ids,
+    permute_table_columns,
     row_values,
     validate_retrieval_path_budget,
 )
@@ -94,6 +95,8 @@ class CandidateScores:
     joint_probabilities: tuple[float, ...]
     table_probability: float
     recovery_priority: float
+    accepted: bool = True
+    acceptance_probability: float | None = None
 
 
 def joinability_sort_key(
@@ -145,9 +148,15 @@ class CandidateResult:
                 "verification": asdict(self.direct.semantic_joinability),
             }
         if self.bundle is not None:
+            if self.evidence is not None:
+                not_attempted_reason = None
+            elif self.scores is not None and not self.scores.accepted:
+                not_attempted_reason = "column_rejected"
+            else:
+                not_attempted_reason = "recovery_budget"
             branches["evidence"] = {
                 "status": "verified" if self.evidence is not None else "not_attempted",
-                "not_attempted_reason": None if self.evidence is not None else "recovery_budget",
+                "not_attempted_reason": not_attempted_reason,
                 "evidence_ids": list(self.bundle.evidence_ids),
                 "verification": asdict(self.evidence.semantic_joinability) if self.evidence else None,
                 "rows": [asdict(row) for row in self.evidence.rows] if self.evidence else [],
@@ -167,6 +176,10 @@ class CandidateResult:
                 )
             ] if self.scores else [],
             "recovery_priority": self.scores.recovery_priority if self.scores else None,
+            "column_accepted": self.scores.accepted if self.scores else None,
+            "column_acceptance_probability": (
+                self.scores.acceptance_probability if self.scores else None
+            ),
             "selected_for_recovery": self.selected_for_recovery,
             "branches": branches,
             "status": "verified" if check is not None else "not_attempted",
@@ -250,17 +263,28 @@ class Stage2Verifier:
         similarity_threshold: float = 0.8,
         min_row_coverage: float = 0.6,
         similarity_batch_size: int = 1024,
+        column_permutation_seed: int | None = None,
+        column_rejection_threshold: float | None = None,
     ) -> None:
         if scorer.weight.in_features != backend.hidden_dim * 2:
             raise ValueError("Candidate scorer and Stage-2 backend dimensions disagree")
         if similarity_batch_size <= 0:
             raise ValueError("similarity_batch_size must be positive")
+        if column_rejection_threshold is not None and not 0.0 <= column_rejection_threshold <= 1.0:
+            raise ValueError("column_rejection_threshold must be between zero and one")
         self.backend = backend
         self.scorer = scorer
         self.evidence_router = evidence_router
         self.similarity_threshold = similarity_threshold
         self.min_row_coverage = min_row_coverage
         self.similarity_batch_size = similarity_batch_size
+        self.column_permutation_seed = column_permutation_seed
+        self.column_rejection_threshold = column_rejection_threshold
+
+    def _reader_target(self, target: dict[str, Any]) -> dict[str, Any]:
+        if self.column_permutation_seed is None:
+            return target
+        return permute_table_columns(target, seed=self.column_permutation_seed)
 
     def candidate_logits(
         self,
@@ -272,7 +296,7 @@ class Stage2Verifier:
         device = self.scorer.weight.weight.device
         logits = []
         for bundle in bundles:
-            target = targets[bundle.target_id]
+            target = self._reader_target(targets[bundle.target_id])
             selected_evidence = [evidence[evidence_id] for evidence_id in bundle.evidence_ids]
             open_states, close_states = self.backend.reader_states(query, target, selected_evidence)
             if open_states.shape[0] != len(target["columns"]):
@@ -309,11 +333,16 @@ class Stage2Verifier:
         table_probabilities = retrieval_scores.softmax(dim=-1)
         scored = []
         for target_index, bundle in enumerate(bundles):
-            target = targets[bundle.target_id]
+            target = self._reader_target(targets[bundle.target_id])
             column_indices = tuple(int(column["column_index"]) for column in target["columns"])
             probabilities = joint[target_index, : len(column_indices)]
             column_position = int(probabilities.argmax())
             column_index = column_indices[column_position]
+            acceptance_probability = float(torch.sigmoid(logits[target_index].max()))
+            accepted = (
+                self.column_rejection_threshold is None
+                or acceptance_probability >= self.column_rejection_threshold
+            )
             scored.append(
                 CandidateScores(
                     selection=ColumnSelection(
@@ -323,6 +352,8 @@ class Stage2Verifier:
                     joint_probabilities=tuple(probabilities.tolist()),
                     table_probability=float(table_probabilities[target_index]),
                     recovery_priority=float(probabilities[column_position]),
+                    accepted=accepted,
+                    acceptance_probability=acceptance_probability,
                 )
             )
         return tuple(scored)
@@ -463,7 +494,10 @@ class Stage2Verifier:
         # Each table contributes exactly one maximum. Stable sorting preserves Stage-1 ties.
         selected_ids = {
             item.selection.target_id
-            for item in sorted(scores, key=lambda item: -item.recovery_priority)[:recovery_budget]
+            for item in sorted(
+                (item for item in scores if item.accepted),
+                key=lambda item: -item.recovery_priority,
+            )[:recovery_budget]
         }
         direct = {
             result.target_id: result

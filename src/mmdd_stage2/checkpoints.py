@@ -42,3 +42,13 @@ def load_candidate_scorer(
     scorer = CandidateColumnScorer(int(payload["hidden_dim"])).to(device)
     scorer.load_state_dict(payload["state_dict"])
     return scorer
+
+
+def load_candidate_scorer_metadata(path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if payload.get("format_version") != 1:
+        raise ValueError(f"{path}: unsupported Stage-2 checkpoint")
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{path}: invalid Stage-2 checkpoint metadata")
+    return metadata

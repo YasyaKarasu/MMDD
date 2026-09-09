@@ -845,6 +845,43 @@ def test_stage2_uses_joint_logits_instead_of_cross_modal_localization_scores():
     assert "text_span_relevance" not in rows[0].evidence
 
 
+def test_stage2_column_permutation_and_rejection_are_optional_protocol_controls():
+    query = _table("q1", ["Player"], [["Messi"]])
+    target = _table("t1", ["Country", "Club"], [["Argentina", "Barcelona"]])
+    bundle = EvidenceBundle("t1", 1.0, ("e1",))
+
+    class PermutationBackend(FakeBackend):
+        def reader_states(self, query, target, evidence):
+            del query, evidence
+            self.presented_columns = [
+                int(column["column_index"]) for column in target["columns"]
+            ]
+            return torch.full((2, 2), -4.0), torch.zeros(2, 2)
+
+    scorer = CandidateColumnScorer(2)
+    with torch.no_grad():
+        scorer.weight.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+        scorer.weight.bias.zero_()
+    backend = PermutationBackend()
+    verifier = Stage2Verifier(
+        backend,
+        scorer,
+        column_permutation_seed=13,
+        column_rejection_threshold=0.5,
+    )
+
+    scores = verifier.score_candidates(
+        query,
+        (bundle,),
+        {"t1": target},
+        {"e1": {"asset_id": "e1", "asset_type": "text", "content": "support"}},
+    )
+
+    assert scores[0].column_indices == tuple(backend.presented_columns)
+    assert scores[0].accepted is False
+    assert scores[0].acceptance_probability == pytest.approx(torch.sigmoid(torch.tensor(-4.0)).item())
+
+
 def test_qwen_reader_places_all_evidence_in_one_forward():
     backend = QwenStage2Backend.__new__(QwenStage2Backend)
     backend.marker_ids = {"<|object_ref_start|>": 10, "<|object_ref_end|>": 11}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -278,6 +279,26 @@ def local_column_index(table: dict[str, Any], source_column_index: int) -> int:
         if int(column.get("source_column_index", column["column_index"])) == source_column_index:
             return int(column["column_index"])
     raise KeyError(f"Table has no source column {source_column_index}")
+
+
+def permute_table_columns(
+    table: dict[str, Any], *, seed: int, excluded_column_indices: Sequence[int] = ()
+) -> dict[str, Any]:
+    """Return a shallow table copy with a fixed, label-independent column order."""
+
+    excluded = {int(value) for value in excluded_column_indices}
+    table_id = str(table["table_id"])
+    columns = [
+        column
+        for column in table["columns"]
+        if int(column["column_index"]) not in excluded
+    ]
+    columns.sort(
+        key=lambda column: hashlib.sha256(
+            f"{seed}\0{table_id}\0{int(column['column_index'])}".encode("utf-8")
+        ).digest()
+    )
+    return {**table, "columns": columns}
 
 
 def row_values(table: dict[str, Any], row: dict[str, Any]) -> dict[str, str]:
