@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 import math
 
@@ -26,6 +26,7 @@ STUDENT_INITIALIZATIONS = (
 STUDENT_RELATION_PARAMS = ("full", "lowrank")
 STUDENT_SCORE_SPACES = ("raw_logit", "confidence_logit", "confidence")
 STUDENT_PROJECTION_MODES = ("shared", "split")
+STUDENT_PROJECTION_ADAPTERS = ("none", "linear", "gelu")
 TABLE_ROLES = ("query", "target")
 
 
@@ -562,6 +563,9 @@ class StudentJoinabilityModel(nn.Module):
         confidence_transform: bool = False,
         confidence_epsilon: float = 1e-6,
         projection_mode: str = "shared",
+        projection_adapter: str = "none",
+        projection_hidden_dim: int = 256,
+        projection_scales: Mapping[str, float] | None = None,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or student_dim <= 0:
@@ -584,6 +588,12 @@ class StudentJoinabilityModel(nn.Module):
             raise ValueError(
                 f"projection_mode must be one of {STUDENT_PROJECTION_MODES}"
             )
+        if projection_adapter not in STUDENT_PROJECTION_ADAPTERS:
+            raise ValueError(
+                f"projection_adapter must be one of {STUDENT_PROJECTION_ADAPTERS}"
+            )
+        if projection_hidden_dim <= 0:
+            raise ValueError("projection_hidden_dim must be positive")
         if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
             raise ValueError(
                 f"{initialization} initialization requires student_dim == input_dim"
@@ -619,6 +629,8 @@ class StudentJoinabilityModel(nn.Module):
         self.confidence_transform = False
         self.confidence_epsilon = float(confidence_epsilon)
         self.projection_mode = projection_mode
+        self.projection_adapter = projection_adapter
+        self.projection_hidden_dim = int(projection_hidden_dim)
         projection_keys = (
             ("table_query", "table_target", "text", "image")
             if projection_mode == "split"
@@ -627,6 +639,28 @@ class StudentJoinabilityModel(nn.Module):
         self.projections = nn.ModuleDict(
             {key: nn.Linear(input_dim, student_dim, bias=False) for key in projection_keys}
         )
+        scales = dict(projection_scales or {})
+        unknown_scale_keys = set(scales) - set(projection_keys)
+        if unknown_scale_keys:
+            raise ValueError(
+                f"Unknown projection scale keys: {sorted(unknown_scale_keys)}"
+            )
+        self.projection_scales = {
+            key: float(scales.get(key, 1.0)) for key in projection_keys
+        }
+        if any(not math.isfinite(value) or value <= 0 for value in self.projection_scales.values()):
+            raise ValueError("projection scales must be finite and positive")
+        self.projection_residual_inputs = nn.ModuleDict()
+        self.projection_residual_outputs = nn.ModuleDict()
+        if projection_adapter != "none":
+            for key in projection_keys:
+                self.projection_residual_inputs[key] = nn.Linear(
+                    input_dim, self.projection_hidden_dim, bias=False
+                )
+                self.projection_residual_outputs[key] = nn.Linear(
+                    self.projection_hidden_dim, student_dim, bias=False
+                )
+                nn.init.zeros_(self.projection_residual_outputs[key].weight)
 
         if initialization in {"identity", "identity_noise"}:
             with torch.no_grad():
@@ -709,6 +743,9 @@ class StudentJoinabilityModel(nn.Module):
             "confidence_transform": self.confidence_transform,
             "confidence_epsilon": self.confidence_epsilon,
             "projection_mode": self.projection_mode,
+            "projection_adapter": self.projection_adapter,
+            "projection_hidden_dim": self.projection_hidden_dim,
+            "projection_scales": dict(self.projection_scales),
         }
 
     @property
@@ -745,6 +782,15 @@ class StudentJoinabilityModel(nn.Module):
             ]
         )
         return [*relation_parameters, *self.confidence_parameters()]
+
+    def projection_parameters(self) -> list[nn.Parameter]:
+        """Return base and optional residual projection parameters."""
+
+        return [
+            *self.projections.parameters(),
+            *self.projection_residual_inputs.parameters(),
+            *self.projection_residual_outputs.parameters(),
+        ]
 
     def confidence_parameters(self) -> list[nn.Parameter]:
         """Return the optional monotonic type-pair calibration parameters."""
@@ -840,6 +886,10 @@ class StudentJoinabilityModel(nn.Module):
         self.freeze_projections = bool(frozen)
         for projection in self.projections.values():
             projection.weight.requires_grad_(not self.freeze_projections)
+        for projection in self.projection_residual_inputs.values():
+            projection.weight.requires_grad_(not self.freeze_projections)
+        for projection in self.projection_residual_outputs.values():
+            projection.weight.requires_grad_(not self.freeze_projections)
 
     @torch.no_grad()
     def reset_projection_anchors(self) -> None:
@@ -858,7 +908,15 @@ class StudentJoinabilityModel(nn.Module):
         *,
         role: str | None = None,
     ) -> torch.Tensor:
-        return self.projections[self.projection_key(object_type, role)](embedding)
+        key = self.projection_key(object_type, role)
+        projected = self.projections[key](embedding)
+        if self.projection_adapter == "none":
+            return projected
+        hidden = self.projection_residual_inputs[key](embedding)
+        hidden = hidden / self.projection_scales[key]
+        if self.projection_adapter == "gelu":
+            hidden = F.gelu(hidden)
+        return projected + self.projection_residual_outputs[key](hidden)
 
     def _score_projected_pairs(
         self,
@@ -1080,7 +1138,15 @@ class StudentJoinabilityModel(nn.Module):
             embeddings = torch.stack(
                 [by_id[object_id].embedding for object_id in object_ids]
             ).to(device=parameter.device, dtype=torch.float32)
-            vectors = self.projections[projection_key](embeddings)
+            vectors = self.project(
+                embeddings,
+                "table" if projection_key.startswith("table_") else projection_key,
+                role=(
+                    projection_key.removeprefix("table_")
+                    if projection_key.startswith("table_")
+                    else None
+                ),
+            )
             projected.update(
                 ((projection_key, object_id), vectors[row])
                 for row, object_id in enumerate(object_ids)
@@ -1280,6 +1346,44 @@ def split_table_projection(
         split.reset_projection_anchors()
     split.projection_reference_origin = shared.projection_reference_origin
     return split
+
+
+def add_projection_residual(
+    shared: StudentJoinabilityModel,
+    adapter: str,
+    *,
+    hidden_dim: int = 256,
+    scales: Mapping[str, float] | None = None,
+) -> StudentJoinabilityModel:
+    """Add a zero-output residual projection without changing step-0 scores."""
+
+    if shared.projection_adapter != "none":
+        raise ValueError("Projection residual migration requires a linear base Student")
+    if adapter not in {"linear", "gelu"}:
+        raise ValueError("Residual adapter must be linear or gelu")
+    config = shared.config()
+    config.update(
+        projection_adapter=adapter,
+        projection_hidden_dim=hidden_dim,
+        projection_scales=dict(scales or {}),
+    )
+    if config["initialization"] == "pca":
+        config["initialization_basis"] = (
+            shared.initial_projection_weights[0].detach().cpu()
+        )
+    migrated = StudentJoinabilityModel(**config).to(next(shared.parameters()).device)
+    missing, unexpected = migrated.load_state_dict(shared.state_dict(), strict=False)
+    expected_missing = {
+        f"projection_residual_{side}.{key}.weight"
+        for side in ("inputs", "outputs")
+        for key in migrated.projection_keys
+    }
+    if set(missing) != expected_missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected residual migration keys: missing={missing}, unexpected={unexpected}"
+        )
+    migrated.projection_reference_origin = shared.projection_reference_origin
+    return migrated
 
 
 class IdentityStudentJoinabilityModel(nn.Module):

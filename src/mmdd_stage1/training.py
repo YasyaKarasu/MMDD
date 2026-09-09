@@ -520,7 +520,14 @@ def student_gradient_norms(student: StudentJoinabilityModel) -> dict[str, float 
     return {
         name: float(parameter.grad.detach().norm().cpu()) if parameter.grad is not None else None
         for name, parameter in student.named_parameters()
-        if name.startswith(("projections.", "relations.", "relation_as.", "relation_bs."))
+        if name.startswith((
+            "projections.",
+            "projection_residual_inputs.",
+            "projection_residual_outputs.",
+            "relations.",
+            "relation_as.",
+            "relation_bs.",
+        ))
     }
 
 
@@ -912,7 +919,10 @@ def _student_path_losses(
     anchor_weight_evidence: float | None,
     distillation_rows: torch.Tensor | None,
     positive_loss_mode: str = "sum_probability",
+    evidence_loss_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
+    if evidence_loss_weight < 0:
+        raise ValueError("evidence_loss_weight must be non-negative")
     supervised, direct_supervised, evidence_supervised = _path_supervised_losses(
         student_scores,
         positive_loss_mode=positive_loss_mode,
@@ -939,8 +949,10 @@ def _student_path_losses(
     anchor, weighted_anchor = _anchor_losses(
         student, anchor_weight, anchor_weight_evidence
     )
+    direct_loss = direct_supervised + distillation_weight * direct_distillation
+    evidence_loss = evidence_supervised + distillation_weight * evidence_distillation
     return {
-        "loss": supervised + distillation_weight * distillation + weighted_anchor,
+        "loss": direct_loss + evidence_loss_weight * evidence_loss + weighted_anchor,
         "supervised_loss": supervised,
         "distillation_loss": distillation,
         "direct_supervised_loss": direct_supervised,
