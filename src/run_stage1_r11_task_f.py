@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +22,7 @@ from mmdd_stage1.row_support import load_evidence_content_keys
 from mmdd_stage1.selection import load_stage1_selection
 from run_stage1_r11_task_e import (
     INTERVENTIONS,
+    _row_strengths,
     empty_intervention_stats,
     finalize_intervention_stats,
     intervene_paths,
@@ -34,6 +38,11 @@ FUSION_IDS = (
     "f3_union_rrf_equal",
     "f4_lambda_0.25",
     "f4_lambda_0.5",
+    "f5_reserved_half",
+)
+R12_FUSION_IDS = (
+    "f1_union_direct",
+    "f3_union_rrf_equal",
     "f5_reserved_half",
 )
 
@@ -59,7 +68,9 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def _scale(values: Sequence[float]) -> dict[str, float | int]:
+def _scale(values: Sequence[float]) -> dict[str, float | int] | None:
+    if not values:
+        return None
     q10 = _percentile(values, 0.1)
     q50 = _percentile(values, 0.5)
     q90 = _percentile(values, 0.9)
@@ -185,15 +196,38 @@ def _target_channels(
             "evidence_score": evidence_score,
             "selected_evidence_ids": selected,
             "paths": paths,
+            "original_direct_member": any(
+                path.get("kind") == "direct"
+                for path in record["paths_by_target"][target_id]
+            ),
         }
-        if any(path.get("kind") == "direct" for path in paths):
-            direct.append(row)
+        if selected:
+            missing = [
+                evidence_id
+                for evidence_id in selected
+                if evidence_id not in support_cache
+            ]
+            support_cache.update(_row_strengths(query_id, missing, store))
+            row["routed_rows"] = {
+                evidence_id: max(
+                    range(len(support_cache[evidence_id])),
+                    key=lambda index: (support_cache[evidence_id][index], -index),
+                )
+                for evidence_id in selected
+            }
+        else:
+            row["routed_rows"] = {}
+        direct.append(row)
         if evidence_score is not None:
             evidence.append(row)
     direct.sort(key=lambda row: (-float(row["direct_score"]), str(row["target_id"])))
     evidence.sort(
         key=lambda row: (-float(row["evidence_score"]), str(row["target_id"]))
     )
+    for rank, row in enumerate(direct, 1):
+        row["direct_rank"] = rank
+    for rank, row in enumerate(evidence, 1):
+        row["evidence_rank"] = rank
     return direct, evidence
 
 
@@ -214,9 +248,11 @@ def _linear_fusion(
     evidence: Sequence[dict[str, Any]],
     *,
     direct_scale: dict[str, float | int],
-    evidence_scale: dict[str, float | int],
+    evidence_scale: dict[str, float | int] | None,
     evidence_weight: float,
 ) -> list[dict[str, Any]]:
+    if evidence and evidence_scale is None:
+        raise ValueError("Evidence is present but cal-fit has no evidence scale")
     evidence_by_target = {
         str(row["target_id"]): float(row["evidence_score"]) for row in evidence
     }
@@ -307,6 +343,7 @@ def _empty() -> dict[str, Any]:
         "multi_row_2": {k: 0 for k in RECALL_KS},
         "multi_row_3": {k: 0 for k in RECALL_KS},
         "valid_discovery": {k: 0 for k in RECALL_KS},
+        "actual_routed_support": {k: [] for k in RECALL_KS},
         "positive_rescued_vs_f1": {k: 0 for k in RECALL_KS},
         "positive_displaced_vs_f1": {k: 0 for k in RECALL_KS},
         "implicit_positive_pairs": 0,
@@ -317,9 +354,9 @@ def _empty() -> dict[str, Any]:
 
 def _selected_valid_rows(
     record: dict[str, Any], target: dict[str, Any] | None, target_id: str
-) -> tuple[set[str], set[int]]:
+) -> tuple[set[str], set[int], set[int]]:
     if target is None:
-        return set(), set()
+        return set(), set(), set()
     selected = {str(value) for value in target.get("selected_evidence_ids", [])}
     expected = {
         str(value)
@@ -335,7 +372,13 @@ def _selected_valid_rows(
             for evidence_id in valid
         )
     )
-    return valid, rows
+    routed = {
+        int(target.get("routed_rows", {}).get(evidence_id))
+        for evidence_id in valid
+        if target.get("routed_rows", {}).get(evidence_id)
+        in {int(row) for row in rows_by_evidence.get(evidence_id, [])}
+    }
+    return valid, rows, routed
 
 
 def _accumulate(
@@ -374,10 +417,11 @@ def _accumulate(
         valid_count = 0
         discovery_count = 0
         row_values = []
+        routed_values = []
         multi2 = 0
         multi3 = 0
         for target_id in implicit_targets:
-            valid, rows = _selected_valid_rows(
+            valid, rows, routed = _selected_valid_rows(
                 record, by_target.get(target_id), target_id
             )
             valid_count += int(bool(valid))
@@ -385,17 +429,51 @@ def _accumulate(
                 target_id not in raw_d100 and target_id in top and bool(valid)
             )
             row_values.append(len(rows) / row_count if row_count else 0.0)
+            routed_values.append(len(routed) / row_count if row_count else 0.0)
             multi2 += int(len(rows) >= 2)
             multi3 += int(len(rows) >= 3)
         metrics["valid_path"][k] += valid_count
         metrics["valid_discovery"][k] += discovery_count
         metrics["row_support"][k].extend(row_values)
+        metrics["actual_routed_support"][k].extend(routed_values)
         metrics["multi_row_2"][k] += multi2
         metrics["multi_row_3"][k] += multi3
         per_query[f"recall@{k}"] = recall
         per_query[f"valid_path_count@{k},4"] = valid_count
         per_query[f"valid_discovery_count@{k},4"] = discovery_count
         per_query[f"row_support_sum@{k},4"] = sum(row_values)
+        per_query[f"actual_routed_support_sum@{k},4"] = sum(routed_values)
+        if k == 10:
+            per_query["raw_d100_positive_ids"] = sorted(positives & raw_d100)
+            per_query["final_top10"] = []
+            for rank, row in enumerate(ranking[:10], 1):
+                target_id = str(row["target_id"])
+                valid, supported_rows, routed_rows = _selected_valid_rows(
+                    record, row, target_id
+                )
+                per_query["final_top10"].append(
+                    {
+                        "target_id": target_id,
+                        "final_rank": rank,
+                        "positive": target_id in positives,
+                        "raw_d100_member": target_id in raw_d100,
+                        "model_d100_member": bool(
+                            row.get("original_direct_member", False)
+                        ),
+                        "direct_rank": row.get("direct_rank"),
+                        "evidence_rank": row.get("evidence_rank"),
+                        "selected_evidence_ids": row.get("selected_evidence_ids", []),
+                        "valid_selected_evidence_ids": sorted(valid),
+                        "correct_attribute_supported_rows": sorted(supported_rows),
+                        "actual_correctly_routed_rows": sorted(routed_rows),
+                    }
+                )
+            per_query["rescued_positive_ids_vs_f1@10"] = sorted(
+                (top - f1_top) & positives
+            )
+            per_query["displaced_positive_ids_vs_f1@10"] = sorted(
+                (f1_top - top) & positives
+            )
     metrics["per_query"].append(per_query)
 
 
@@ -431,6 +509,9 @@ def _finalize(metrics: dict[str, Any]) -> dict[str, Any]:
             metrics["valid_path"][k] / denominator if denominator else 0.0
         )
         result[f"row_support@{k},4"] = _mean(metrics["row_support"][k])
+        result[f"actual_routed_support@{k},4"] = _mean(
+            metrics["actual_routed_support"][k]
+        )
         result[f"multi_row_2@{k},4"] = (
             metrics["multi_row_2"][k] / denominator if denominator else 0.0
         )
@@ -501,43 +582,72 @@ def _calibration_scales(
     return {"direct": _scale(direct_values), "evidence": _scale(evidence_values)}
 
 
-def _quality_selection(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _quality_selection(
+    results: dict[str, dict[str, Any]],
+    *,
+    fusion_ids: Sequence[str] = FUSION_IDS,
+    require_explicit: bool = False,
+) -> dict[str, Any]:
     baseline = results["f1_union_direct"]
     eligible = []
-    for name in FUSION_IDS:
-        if name in {"f0_d100_direct", "f1_union_direct", "f2_d100_rrf_e005"}:
+    for name in fusion_ids:
+        if not require_explicit and name in {
+            "f0_d100_direct", "f1_union_direct", "f2_d100_rrf_e005"
+        }:
             continue
         row = results[name]
         overall_drop = baseline["recall@10"] - row["recall@10"]
         implicit_drop = baseline["implicit_recall@10"] - row["implicit_recall@10"]
-        if overall_drop <= 0.02 + 1e-12 and implicit_drop <= 0.02 + 1e-12:
+        explicit_drop = baseline["explicit_recall@10"] - row["explicit_recall@10"]
+        if (
+            overall_drop <= 0.02 + 1e-12
+            and implicit_drop <= 0.02 + 1e-12
+            and (not require_explicit or explicit_drop <= 0.02 + 1e-12)
+        ):
             eligible.append(name)
-    selected = (
-        min(
-            eligible,
-            key=lambda name: (
-                -results[name]["row_support@10,4"],
-                -results[name]["multi_row_2@10,4"],
-                -results[name]["valid_path@10,4"],
-                -results[name]["recall@10"],
-                name,
-            ),
+    if require_explicit:
+        comparison_order = [
+            "actual_routed_support@10,4",
+            "valid_path@10,4",
+            "valid_discovery_count@10,4",
+            "recall@10",
+            "lower_measured_cost",
+            "config_id",
+        ]
+        selection_key = lambda name: (
+            -results[name]["actual_routed_support@10,4"],
+            -results[name]["valid_path@10,4"],
+            -results[name]["valid_discovery_count@10,4"],
+            -results[name]["recall@10"],
+            name,
         )
-        if eligible
-        else None
-    )
-    return {
-        "quality_tolerance_absolute": 0.02,
-        "eligible": eligible,
-        "selected": selected,
-        "comparison_order": [
+    else:
+        comparison_order = [
             "row_support@10,4",
             "multi_row_2@10,4",
             "valid_path@10,4",
             "recall@10",
             "lower_measured_cost",
             "config_id",
+        ]
+        selection_key = lambda name: (
+            -results[name]["row_support@10,4"],
+            -results[name]["multi_row_2@10,4"],
+            -results[name]["valid_path@10,4"],
+            -results[name]["recall@10"],
+            name,
+        )
+    selected = min(eligible, key=selection_key) if eligible else None
+    return {
+        "quality_tolerance_absolute": 0.02,
+        "quality_dimensions": [
+            "recall@10",
+            "implicit_recall@10",
+            *( ["explicit_recall@10"] if require_explicit else [] ),
         ],
+        "eligible": eligible,
+        "selected": selected,
+        "comparison_order": comparison_order,
     }
 
 
@@ -547,13 +657,19 @@ def _selection_result(
     evaluation_role: str,
     frozen_selection: str | None,
     frozen_selection_source: Path | None,
+    fusion_ids: Sequence[str] = FUSION_IDS,
+    require_explicit: bool = False,
 ) -> dict[str, Any]:
     if evaluation_role == "dev":
         if frozen_selection is None and frozen_selection_source is None:
             return {
                 "selection_scope": "dev",
                 "reselected": True,
-                **_quality_selection(results),
+                **_quality_selection(
+                    results,
+                    fusion_ids=fusion_ids,
+                    require_explicit=require_explicit,
+                ),
             }
         selection_scope = "dev_fixed_intervention"
     else:
@@ -583,22 +699,29 @@ def _selection_result(
 
 
 def _markdown(payload: dict[str, Any]) -> str:
+    description = (
+        "F1, F3, and F5 score the same D/E union with one direct recomputation. "
+        "The R12 quality gate constrains overall, implicit, and explicit R@10."
+        if payload["protocol"] == "r12"
+        else "F1/F3/F4/F5 score every target in the D/E union with the same direct "
+        "function. F4 scales are frozen on cal-fit. F5 is allocated independently "
+        "for each K."
+    )
     lines = [
-        f"# R11 Task F: {payload['system']}",
+        f"# {payload['protocol'].upper()} Task E fusion: {payload['system']}",
         "",
-        "F1/F3/F4/F5 score every target in the D/E union with the same direct ",
-        "function. F4 scales are frozen on cal-fit. F5 is allocated independently ",
-        "for each K.",
+        description,
         "",
-        "| Rule | R@10 | Implicit R@10 | ValidPath | RowSupport | MultiRow2 | ValidDiscovery | Rescued | Displaced |",
+        "| Rule | R@10 | Implicit R@10 | Explicit R@10 | ValidPath | RoutedSupport | ValidDiscovery | Rescued | Displaced |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for name in FUSION_IDS:
+    for name in payload["fusion_ids"]:
         row = payload["results"][name]
         lines.append(
             f"| `{name}` | {row['recall@10']:.2%} | "
-            f"{row['implicit_recall@10']:.2%} | {row['valid_path@10,4']:.2%} | "
-            f"{row['row_support@10,4']:.2%} | {row['multi_row_2@10,4']:.2%} | "
+            f"{row['implicit_recall@10']:.2%} | {row['explicit_recall@10']:.2%} | "
+            f"{row['valid_path@10,4']:.2%} | "
+            f"{row['actual_routed_support@10,4']:.2%} | "
             f"{row['valid_discovery_count@10,4']} | "
             f"{row['positive_rescued_vs_f1@10']} | "
             f"{row['positive_displaced_vs_f1@10']} |"
@@ -615,6 +738,7 @@ def _markdown(payload: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.monotonic()
     dev_pool = Path(args.dev_pool).resolve()
     cal_pool = Path(args.cal_fit_pool).resolve()
     raw_reference = Path(args.raw_reference_pool).resolve()
@@ -658,27 +782,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.device != "auto"
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
+    protocol = getattr(args, "protocol", "r11")
+    fusion_ids = R12_FUSION_IDS if protocol == "r12" else FUSION_IDS
     scorer = DirectScorer(dev_metadata, store, device)
     intervention_stats = empty_intervention_stats()
-    scales = _calibration_scales(
-        cal_pool,
-        retention=args.retention,
-        scorer=scorer,
-        store=store,
-        content_keys=content_keys,
-        top_l=args.top_l,
-        evidence_budget=args.evidence_budget,
-        pair_batch_size=args.pair_batch_size,
-        intervention=args.intervention,
-        intervention_stats=intervention_stats,
+    scales = (
+        _calibration_scales(
+            cal_pool,
+            retention=args.retention,
+            scorer=scorer,
+            store=store,
+            content_keys=content_keys,
+            top_l=args.top_l,
+            evidence_budget=args.evidence_budget,
+            pair_batch_size=args.pair_batch_size,
+            intervention=args.intervention,
+            intervention_stats=intervention_stats,
+        )
+        if protocol == "r11"
+        else None
     )
     raw_d100 = _raw_d100_by_query(raw_reference)
-    metrics = {name: _empty() for name in FUSION_IDS}
+    metrics = {name: _empty() for name in fusion_ids}
     lambda_zero_exact = True
     f2_discovery_boundary = True
     records = 0
     with dev_pool.open(encoding="utf-8") as handle:
-        for line in progress(handle, desc="Evaluate R11 Task F", unit="query"):
+        for line in progress(handle, desc=f"Evaluate {protocol.upper()} Task E", unit="query"):
             record = json.loads(line)
             query_id = str(record["query_id"])
             direct, evidence = _target_channels(
@@ -694,50 +824,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 intervention_stats=intervention_stats,
             )
             union = _union_direct(direct, evidence)
+            d100 = [row for row in direct if row["original_direct_member"]]
             f1 = [{**row, "score": float(row["direct_score"])} for row in union]
-            lambda_zero = _linear_fusion(
-                union,
-                evidence,
-                direct_scale=scales["direct"],
-                evidence_scale=scales["evidence"],
-                evidence_weight=0.0,
-            )
-            lambda_zero_exact &= [row["target_id"] for row in f1] == [
-                row["target_id"] for row in lambda_zero
-            ]
             configurations = {
-                "f0_d100_direct": [
-                    {**row, "score": float(row["direct_score"])} for row in direct
-                ],
                 "f1_union_direct": f1,
-                "f2_d100_rrf_e005": fuse_ranked_channels(
-                    list(direct),
-                    list(evidence),
-                    rrf_k=60,
-                    fusion_mode="weighted_rrf",
-                    direct_weight=1.0,
-                    evidence_weight=0.05,
-                ),
                 "f3_union_rrf_equal": fuse_ranked_channels(
                     list(union), list(evidence), rrf_k=60, fusion_mode="rrf"
                 ),
-                "f4_lambda_0.25": _linear_fusion(
-                    union,
-                    evidence,
-                    direct_scale=scales["direct"],
-                    evidence_scale=scales["evidence"],
-                    evidence_weight=0.25,
-                ),
-                "f4_lambda_0.5": _linear_fusion(
-                    union,
-                    evidence,
-                    direct_scale=scales["direct"],
-                    evidence_scale=scales["evidence"],
-                    evidence_weight=0.5,
-                ),
             }
+            if protocol == "r11":
+                lambda_zero = _linear_fusion(
+                    union,
+                    evidence,
+                    direct_scale=scales["direct"],
+                    evidence_scale=scales["evidence"],
+                    evidence_weight=0.0,
+                )
+                lambda_zero_exact &= [row["target_id"] for row in f1] == [
+                    row["target_id"] for row in lambda_zero
+                ]
+                configurations.update({
+                    "f0_d100_direct": [
+                        {**row, "score": float(row["direct_score"])} for row in d100
+                    ],
+                    "f2_d100_rrf_e005": fuse_ranked_channels(
+                        list(d100), list(evidence), rrf_k=60,
+                        fusion_mode="weighted_rrf", direct_weight=1.0,
+                        evidence_weight=0.05,
+                    ),
+                    "f4_lambda_0.25": _linear_fusion(
+                        union, evidence, direct_scale=scales["direct"],
+                        evidence_scale=scales["evidence"], evidence_weight=0.25,
+                    ),
+                    "f4_lambda_0.5": _linear_fusion(
+                        union, evidence, direct_scale=scales["direct"],
+                        evidence_scale=scales["evidence"], evidence_weight=0.5,
+                    ),
+                })
             f1_by_k = {k: f1 for k in RECALL_KS}
-            for name in FUSION_IDS:
+            for name in fusion_ids:
                 rankings = (
                     {k: reserved_channel_fusion(union, evidence, k=k) for k in RECALL_KS}
                     if name == "f5_reserved_half"
@@ -753,13 +878,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             records += 1
 
     results = {name: _finalize(values) for name, values in metrics.items()}
-    f2_discovery_boundary = all(
-        results["f2_d100_rrf_e005"][f"valid_discovery_count@{k},4"] == 0
-        for k in RECALL_KS
+    f2_discovery_boundary = (
+        all(
+            results["f2_d100_rrf_e005"][f"valid_discovery_count@{k},4"] == 0
+            for k in RECALL_KS
+        )
+        if protocol == "r11"
+        else None
     )
     payload = {
         "format_version": 1,
-        "experiment": "R11 Task F union-direct fusion",
+        "experiment": f"{protocol.upper()} Task E union-direct fusion",
+        "protocol": protocol,
+        "fusion_ids": list(fusion_ids),
         "system": dev_metadata["system"],
         "evaluation_role": args.evaluation_role,
         "retention": args.retention,
@@ -786,12 +917,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.frozen_selection_source is not None
                 else None
             ),
+            fusion_ids=fusion_ids,
+            require_explicit=protocol == "r12",
         ),
         "cost": {
-            "cal_fit_and_dev_union_direct_pair_scores_recomputed": True,
+            "cal_fit_and_dev_union_direct_pair_scores_recomputed": protocol == "r11",
+            "direct_score_scope": (
+                "cal-fit and dev D/E unions"
+                if protocol == "r11"
+                else "dev D/E union; R12 rules require no fitted score scale"
+            ),
             "union_direct_pair_scores": scorer.scored_pairs,
             "ann_calls_during_fusion": 0,
             "reader_calls": 0,
+            "elapsed_seconds_before_artifact_writes": time.monotonic() - started,
+            "timing_scope": "one runner pass through loading, retention, and fusion",
         },
     }
     output_dir = Path(args.output_dir)
@@ -802,10 +942,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             handle.write(
                 json.dumps(
                     {
-                        "query_id": results[FUSION_IDS[0]]["per_query"][index]["query_id"],
+                        "query_id": results[fusion_ids[0]]["per_query"][index]["query_id"],
                         "systems": {
                             name: results[name]["per_query"][index]
-                            for name in FUSION_IDS
+                            for name in fusion_ids
                         },
                     },
                     ensure_ascii=False,
@@ -817,7 +957,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dev-pool", required=True)
     parser.add_argument("--cal-fit-pool", required=True)
@@ -827,7 +967,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--retention",
-        choices=("e0_top_quality", "e1_content_dedup", "e2_row_coverage"),
+        choices=(
+            "e0_top_quality",
+            "e1_content_dedup",
+            "e2_row_coverage",
+            "d0_content_dedup",
+            "d1_soft_row_coverage",
+            "d2_unique_argmax",
+        ),
         required=True,
     )
     parser.add_argument("--top-l", type=int, default=20)
@@ -845,7 +992,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--frozen-selection", choices=FUSION_IDS)
     parser.add_argument("--frozen-selection-source")
-    args = parser.parse_args()
+    parser.add_argument("--protocol", choices=("r11", "r12"), default="r11")
+    parser.add_argument("--runs-jsonl", type=Path)
+    args = parser.parse_args(argv)
     if min(
         args.top_l,
         args.evidence_budget,
@@ -856,5 +1005,31 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    args = parse_args(argv)
+    payload = run(args)
+    if args.runs_jsonl is not None:
+        args.runs_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with args.runs_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "task": payload["experiment"],
+                        "status": "complete",
+                        "command": [sys.executable, *sys.argv],
+                        "output": str(
+                            (Path(args.output_dir) / "metrics.json").resolve()
+                        ),
+                        "elapsed_seconds": time.monotonic() - started,
+                        "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return payload
+
+
 if __name__ == "__main__":
-    run(parse_args())
+    main()

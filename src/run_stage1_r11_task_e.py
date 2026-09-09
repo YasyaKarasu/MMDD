@@ -7,7 +7,10 @@ import argparse
 import json
 import math
 import statistics
+import sys
+import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -23,6 +26,11 @@ from mmdd_stage1.row_support import (
 
 
 STRATEGIES = ("e0_top_quality", "e1_content_dedup", "e2_row_coverage")
+R12_STRATEGIES = (
+    "d0_content_dedup",
+    "d1_soft_row_coverage",
+    "d2_unique_argmax",
+)
 INTERVENTIONS = ("original_mixed", "remove_image", "duplicate_same_row")
 
 
@@ -208,10 +216,12 @@ def select_evidence(
     support_cache: dict[str, list[float]],
 ) -> tuple[list[str], float | None]:
     candidates = _evidence_paths(paths)
-    if strategy != "e0_top_quality":
+    if strategy not in {"e0_top_quality"}:
         candidates = _deduplicate(candidates, content_keys)
     candidates = candidates[:top_l]
-    if strategy != "e2_row_coverage":
+    if not candidates:
+        return [], None
+    if strategy in {"e0_top_quality", "e1_content_dedup", "d0_content_dedup"}:
         selected = [str(path["evidence_id"]) for path in candidates[:budget]]
         scores = [float(path["path_score"]) for path in candidates[:budget]]
         evidence_score = (
@@ -227,6 +237,36 @@ def select_evidence(
         if str(path["evidence_id"]) not in support_cache
     ]
     support_cache.update(_row_strengths(query_id, missing, store))
+    if strategy == "d2_unique_argmax":
+        representatives: dict[int, dict[str, Any]] = {}
+        for path in candidates:
+            evidence_id = str(path["evidence_id"])
+            strengths = support_cache[evidence_id]
+            row = max(
+                range(len(strengths)),
+                key=lambda index: (strengths[index], -index),
+            )
+            previous = representatives.get(row)
+            if previous is None or (
+                -float(path["path_score"]), evidence_id
+            ) < (
+                -float(previous["path_score"]), str(previous["evidence_id"])
+            ):
+                representatives[row] = path
+        selected_paths = sorted(
+            representatives.values(),
+            key=lambda path: (-float(path["path_score"]), str(path["evidence_id"])),
+        )[:budget]
+        selected = [str(path["evidence_id"]) for path in selected_paths]
+        row_count = len(next(iter(support_cache.values())))
+        score = sum(
+            _sigmoid(float(path["path_score"]))
+            * max(support_cache[str(path["evidence_id"])])
+            for path in selected_paths
+        ) / row_count
+        return selected, score
+    if strategy not in {"e2_row_coverage", "d1_soft_row_coverage"}:
+        raise ValueError(f"Unknown evidence retention strategy: {strategy}")
     greedy_candidates = [
         {
             "evidence_id": str(path["evidence_id"]),
@@ -243,7 +283,7 @@ def select_evidence(
         budget=budget,
         threshold=0.0,
     )
-    return selected, coverage_strength
+    return selected, coverage_strength if selected else None
 
 
 def _empty() -> dict[str, Any]:
@@ -258,8 +298,33 @@ def _empty() -> dict[str, Any]:
         "selected_by_modality": Counter(),
         "valid_selected_by_modality": Counter(),
         "selected_evidence_count": 0,
+        "actual_routed_row_values": [],
+        "matching_upper_row_values": [],
+        "routing_checked": 0,
+        "routing_errors": 0,
         "per_pair": [],
     }
+
+
+def _matching_upper(
+    selected: Sequence[str], rows_by_evidence: dict[str, set[int]]
+) -> set[int]:
+    matched_evidence: dict[int, str] = {}
+
+    def assign(evidence_id: str, seen: set[int]) -> bool:
+        for row in sorted(rows_by_evidence.get(evidence_id, set())):
+            if row in seen:
+                continue
+            seen.add(row)
+            previous = matched_evidence.get(row)
+            if previous is None or assign(previous, seen):
+                matched_evidence[row] = evidence_id
+                return True
+        return False
+
+    for evidence_id in selected:
+        assign(evidence_id, set())
+    return set(matched_evidence)
 
 
 def _accumulate(
@@ -268,6 +333,7 @@ def _accumulate(
     target_id: str,
     selected: Sequence[str],
     evidence_type: dict[str, str],
+    routed_rows: dict[str, int] | None = None,
 ) -> None:
     expected = {
         str(value)
@@ -301,6 +367,27 @@ def _accumulate(
     values["multi_row_3_count"] += int(len(supported_rows) >= 3)
     values["supported_row_count_distribution"][len(supported_rows)] += 1
     values["selected_evidence_count"] += len(selected)
+    routed_supported_rows = set()
+    routing_checked = 0
+    routing_errors = 0
+    if routed_rows is not None:
+        for evidence_id in valid_selected:
+            supported = rows_by_evidence.get(evidence_id, set())
+            if not supported:
+                continue
+            routing_checked += 1
+            routed = routed_rows[evidence_id]
+            if routed in supported:
+                routed_supported_rows.add(routed)
+            else:
+                routing_errors += 1
+        matching_rows = _matching_upper(sorted(valid_selected), rows_by_evidence)
+        values["actual_routed_row_values"].append(
+            len(routed_supported_rows) / row_count
+        )
+        values["matching_upper_row_values"].append(len(matching_rows) / row_count)
+        values["routing_checked"] += routing_checked
+        values["routing_errors"] += routing_errors
     values["selected_by_modality"].update(
         evidence_type.get(evidence_id, "unknown") for evidence_id in selected
     )
@@ -322,6 +409,15 @@ def _accumulate(
             "recoverable_row": recoverable,
             "multi_row_2": int(len(supported_rows) >= 2),
             "multi_row_3": int(len(supported_rows) >= 3),
+            "actual_routed_supported_rows": sorted(routed_supported_rows),
+            "actual_routed_row_b": len(routed_supported_rows) / row_count,
+            "matching_upper_row_b": (
+                len(_matching_upper(sorted(valid_selected), rows_by_evidence)) / row_count
+                if routed_rows is not None
+                else None
+            ),
+            "routing_checked": routing_checked,
+            "routing_errors": routing_errors,
         }
     )
 
@@ -349,6 +445,23 @@ def _finalize(values: dict[str, Any]) -> dict[str, Any]:
         "mean_selected_evidence": (
             values["selected_evidence_count"] / denominator if denominator else 0.0
         ),
+        "actual_routed_row_b": (
+            statistics.fmean(values["actual_routed_row_values"])
+            if values["actual_routed_row_values"]
+            else None
+        ),
+        "matching_upper_row_b": (
+            statistics.fmean(values["matching_upper_row_values"])
+            if values["matching_upper_row_values"]
+            else None
+        ),
+        "routing_checked": values["routing_checked"],
+        "routing_errors": values["routing_errors"],
+        "routing_error_rate": (
+            values["routing_errors"] / values["routing_checked"]
+            if values["routing_checked"]
+            else None
+        ),
         "selected_by_modality": dict(sorted(values["selected_by_modality"].items())),
         "valid_selected_by_modality": dict(
             sorted(values["valid_selected_by_modality"].items())
@@ -359,7 +472,7 @@ def _finalize(values: dict[str, Any]) -> dict[str, Any]:
 
 def _markdown(payload: dict[str, Any]) -> str:
     lines = [
-        f"# R11 Task E: {payload['system']}",
+        f"# {payload['protocol'].upper()} evidence retention: {payload['system']}",
         "",
         "All strategies use the same fixed L=20 path pool and B=4. E2 uses an ",
         "unlabeled monotonic transform of row-evidence cosine as localization ",
@@ -368,7 +481,7 @@ def _markdown(payload: dict[str, Any]) -> str:
         "| Strategy | ValidB | RowB | RecoverableRow | MultiRow2 | MultiRow3 | Mean selected |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for name in STRATEGIES:
+    for name in payload["strategies"]:
         row = payload["results"][name]
         lines.append(
             f"| `{name}` | {row['valid_b']:.2%} "
@@ -389,6 +502,7 @@ def _markdown(payload: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.monotonic()
     pool = Path(args.path_pool).resolve()
     metadata_path = pool.with_suffix(pool.suffix + ".metadata.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -412,7 +526,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     store = FeatureStore.from_path(
         Path(args.features), cache_size=args.feature_cache_size
     )
-    metrics = {name: _empty() for name in STRATEGIES}
+    protocol = getattr(args, "protocol", "r11")
+    strategies = R12_STRATEGIES if protocol == "r12" else STRATEGIES
+    metrics = {name: _empty() for name in strategies}
     intervention_stats = empty_intervention_stats()
     duplicate_paths = 0
     evidence_paths = 0
@@ -445,7 +561,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if str(record.get("query_kind")) == "implicit":
                 for target_id in record.get("positive_evidence_by_target", {}):
                     paths = intervened_paths.get(str(target_id), [])
-                    for strategy in STRATEGIES:
+                    for strategy in strategies:
                         selected, _score = select_evidence(
                             strategy,
                             paths,
@@ -456,19 +572,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             budget=args.evidence_budget,
                             support_cache=support_cache,
                         )
+                        routed_rows = {} if protocol == "r12" else None
+                        if protocol == "r12" and selected:
+                            missing = [
+                                evidence_id
+                                for evidence_id in selected
+                                if evidence_id not in support_cache
+                            ]
+                            support_cache.update(
+                                _row_strengths(str(record["query_id"]), missing, store)
+                            )
+                            routed_rows = {
+                                evidence_id: max(
+                                    range(len(support_cache[evidence_id])),
+                                    key=lambda index: (
+                                        support_cache[evidence_id][index],
+                                        -index,
+                                    ),
+                                )
+                                for evidence_id in selected
+                            }
                         _accumulate(
                             metrics[strategy],
                             record,
                             str(target_id),
                             selected,
                             evidence_type,
+                            routed_rows,
                         )
             records += 1
 
     results = {name: _finalize(values) for name, values in metrics.items()}
     payload = {
         "format_version": 1,
-        "experiment": "R11 Task E fixed-pool evidence retention",
+        "experiment": f"{protocol.upper()} fixed-pool evidence retention",
+        "protocol": protocol,
+        "strategies": list(strategies),
         "system": metadata["system"],
         "split": metadata["split"],
         "path_pool": str(pool),
@@ -491,10 +630,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "unlabeled strength clamp((raw row-evidence cosine + 1) / 2, 0, 1); "
             "not a calibrated probability"
         ),
+        "label_scope": (
+            "Historical recovery annotations only; independent R12 attribute review pending"
+            if protocol == "r12"
+            else "R11 recovery annotations"
+        ),
         "quality_policy": "sigmoid(raw fixed two-hop path score); monotonic strength",
         "content_duplicate_paths": duplicate_paths,
         "evidence_paths": evidence_paths,
         "results": results,
+        "cost": {
+            "elapsed_seconds_before_artifact_writes": time.monotonic() - started,
+            "timing_scope": "one runner pass through loading and retention metrics",
+        },
     }
     output_dir = Path(args.output_dir)
     _write_json(output_dir / "metrics.json", payload)
@@ -505,16 +653,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 (row["query_id"], row["target_id"]): row
                 for row in results[name]["per_pair"]
             }
-            for name in STRATEGIES
+            for name in strategies
         }
-        for key in sorted(by_key[STRATEGIES[0]]):
+        for key in sorted(by_key[strategies[0]]):
             handle.write(
                 json.dumps(
                     {
                         "query_id": key[0],
                         "target_id": key[1],
                         "strategies": {
-                            name: by_key[name][key] for name in STRATEGIES
+                            name: by_key[name][key] for name in strategies
                         },
                     },
                     ensure_ascii=False,
@@ -526,7 +674,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path-pool", required=True)
     parser.add_argument("--features", required=True)
@@ -535,14 +683,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-l", type=int, default=20)
     parser.add_argument("--evidence-budget", type=int, default=4)
     parser.add_argument("--feature-cache-size", type=int, default=60_000)
+    parser.add_argument("--protocol", choices=("r11", "r12"), default="r11")
     parser.add_argument(
         "--intervention", choices=INTERVENTIONS, default="original_mixed"
     )
-    args = parser.parse_args()
+    parser.add_argument("--runs-jsonl", type=Path)
+    args = parser.parse_args(argv)
     if min(args.top_l, args.evidence_budget, args.feature_cache_size) <= 0:
         parser.error("Budgets and cache size must be positive")
     return args
 
 
+def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    args = parse_args(argv)
+    payload = run(args)
+    if args.runs_jsonl is not None:
+        args.runs_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with args.runs_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "task": payload["experiment"],
+                        "status": "complete",
+                        "command": [sys.executable, *sys.argv],
+                        "output": str(
+                            (Path(args.output_dir) / "metrics.json").resolve()
+                        ),
+                        "elapsed_seconds": time.monotonic() - started,
+                        "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return payload
+
+
 if __name__ == "__main__":
-    run(parse_args())
+    main()

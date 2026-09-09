@@ -48,8 +48,21 @@ def load_student(path: Path, device: torch.device) -> StudentJoinabilityModel:
         placeholder[:, :student_dim] = torch.eye(student_dim)
         config["initialization_basis"] = placeholder
     model = StudentJoinabilityModel(**config)
-    model.load_state_dict(payload["state_dict"])
-    model.reset_projection_anchors()
+    state = dict(payload["state_dict"])
+    if "initial_projection_weights" not in state:
+        # Historical checkpoints remain usable for inference, not anchored training.
+        state["initial_projection_weights"] = torch.full_like(
+            model.initial_projection_weights, float("nan")
+        )
+        state["stage_initial_projection_weights"] = torch.stack(
+            [state[f"projections.{kind}.weight"] for kind in model.projections]
+        )
+        model.projection_reference_origin = "legacy_missing"
+    else:
+        model.projection_reference_origin = payload.get(
+            "projection_references", {}
+        ).get("origin", "checkpoint")
+    model.load_state_dict(state)
     return model.to(device)
 
 

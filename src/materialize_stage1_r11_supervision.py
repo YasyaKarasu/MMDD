@@ -189,6 +189,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
     }
     query_sets = {name: set(values) for name, values in buckets.items()}
+    query_source = {
+        str(row["table_id"]): str(row["source_table_id"])
+        for row in iter_dataset_artifact(dataset_root, "query_tables")
+    }
+    source_sets = {
+        name: {query_source[value] for value in values}
+        for name, values in query_sets.items()
+    }
     for left, left_values in query_sets.items():
         for right, right_values in query_sets.items():
             if left >= right:
@@ -198,6 +206,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(
                     f"R11 supervision buckets overlap: {left}/{right}: "
                     f"{sorted(overlap)[:10]}"
+                )
+            source_overlap = source_sets[left] & source_sets[right]
+            if source_overlap:
+                raise ValueError(
+                    f"Supervision source groups overlap: {left}/{right}: "
+                    f"{sorted(source_overlap)[:10]}"
                 )
 
     outputs: dict[str, Any] = {}
@@ -258,8 +272,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "supervision_policy": (
             "qrels and recoveries are filtered to each query bucket before "
-            "positive, corruption, and Teacher candidate lists are built"
+            "positive, corruption, and Teacher candidate lists are built; "
+            "corrupted E-to-T targets are ranking-only unknowns, not confirmed negatives"
         ),
+        "source_group_overlap_checked": True,
+        "source_group_counts": {name: len(values) for name, values in source_sets.items()},
         "calibration": {
             "policy": (
                 "seeded shuffle of sorted train-calibration source groups; "

@@ -25,6 +25,8 @@ STUDENT_INITIALIZATIONS = (
 )
 STUDENT_RELATION_PARAMS = ("full", "lowrank")
 STUDENT_SCORE_SPACES = ("raw_logit", "confidence_logit", "confidence")
+STUDENT_PROJECTION_MODES = ("shared", "split")
+TABLE_ROLES = ("query", "target")
 
 
 def structural_table_pool_with_groups(
@@ -559,6 +561,7 @@ class StudentJoinabilityModel(nn.Module):
         relation_rank: int = 16,
         confidence_transform: bool = False,
         confidence_epsilon: float = 1e-6,
+        projection_mode: str = "shared",
     ) -> None:
         super().__init__()
         if input_dim <= 0 or student_dim <= 0:
@@ -577,6 +580,10 @@ class StudentJoinabilityModel(nn.Module):
             raise ValueError("relation_rank must be positive")
         if not 0 < confidence_epsilon < 1:
             raise ValueError("confidence_epsilon must be between 0 and 1")
+        if projection_mode not in STUDENT_PROJECTION_MODES:
+            raise ValueError(
+                f"projection_mode must be one of {STUDENT_PROJECTION_MODES}"
+            )
         if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
             raise ValueError(
                 f"{initialization} initialization requires student_dim == input_dim"
@@ -611,8 +618,14 @@ class StudentJoinabilityModel(nn.Module):
         self.relation_rank = relation_rank
         self.confidence_transform = False
         self.confidence_epsilon = float(confidence_epsilon)
+        self.projection_mode = projection_mode
+        projection_keys = (
+            ("table_query", "table_target", "text", "image")
+            if projection_mode == "split"
+            else OBJECT_TYPES
+        )
         self.projections = nn.ModuleDict(
-            {object_type: nn.Linear(input_dim, student_dim, bias=False) for object_type in OBJECT_TYPES}
+            {key: nn.Linear(input_dim, student_dim, bias=False) for key in projection_keys}
         )
 
         if initialization in {"identity", "identity_noise"}:
@@ -640,10 +653,15 @@ class StudentJoinabilityModel(nn.Module):
         self.register_buffer(
             "initial_projection_weights",
             torch.stack(
-                [self.projections[object_type].weight.detach().clone() for object_type in OBJECT_TYPES]
+                [self.projections[key].weight.detach().clone() for key in self.projection_keys]
             ),
-            persistent=False,
+            persistent=True,
         )
+        self.register_buffer(
+            "stage_initial_projection_weights",
+            self.initial_projection_weights.detach().clone(),
+        )
+        self.projection_reference_origin = "initialization"
         self.set_projection_frozen(self.freeze_projections)
 
         self.relations = nn.ParameterDict()
@@ -690,7 +708,22 @@ class StudentJoinabilityModel(nn.Module):
             "relation_rank": self.relation_rank,
             "confidence_transform": self.confidence_transform,
             "confidence_epsilon": self.confidence_epsilon,
+            "projection_mode": self.projection_mode,
         }
+
+    @property
+    def projection_keys(self) -> tuple[str, ...]:
+        return tuple(self.projections.keys())
+
+    def projection_key(self, object_type: str, role: str | None = None) -> str:
+        """Resolve an object projection from its runtime endpoint role."""
+
+        object_type = normalize_object_type(object_type)
+        if object_type != "table" or self.projection_mode == "shared":
+            return object_type
+        if role not in TABLE_ROLES:
+            raise ValueError("Split table projection requires role='query' or 'target'")
+        return f"table_{role}"
 
     @property
     def ann_dim(self) -> int:
@@ -810,16 +843,22 @@ class StudentJoinabilityModel(nn.Module):
 
     @torch.no_grad()
     def reset_projection_anchors(self) -> None:
-        """Anchor projection regularization to the model's current starting point."""
+        """Record a stage boundary without changing the full-chain reference."""
 
-        self.initial_projection_weights.copy_(
+        self.stage_initial_projection_weights.copy_(
             torch.stack(
-                [self.projections[object_type].weight for object_type in OBJECT_TYPES]
+                [self.projections[key].weight for key in self.projection_keys]
             )
         )
 
-    def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
-        return self.projections[normalize_object_type(object_type)](embedding)
+    def project(
+        self,
+        embedding: torch.Tensor,
+        object_type: str,
+        *,
+        role: str | None = None,
+    ) -> torch.Tensor:
+        return self.projections[self.projection_key(object_type, role)](embedding)
 
     def _score_projected_pairs(
         self,
@@ -844,9 +883,20 @@ class StudentJoinabilityModel(nn.Module):
         source_type: str,
         destination_embedding: torch.Tensor,
         destination_type: str,
+        *,
+        source_role: str | None = None,
+        destination_role: str | None = None,
     ) -> torch.Tensor:
-        source = self.project(source_embedding, source_type)
-        destination = self.project(destination_embedding, destination_type)
+        source = self.project(
+            source_embedding,
+            source_type,
+            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
+        )
+        destination = self.project(
+            destination_embedding,
+            destination_type,
+            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
+        )
         key = self.relation_key(source_type, destination_type)
         return self._score_projected_pairs(source, destination, key)
 
@@ -906,11 +956,22 @@ class StudentJoinabilityModel(nn.Module):
         source_type: str,
         destination_embeddings: torch.Tensor,
         destination_type: str,
+        *,
+        source_role: str | None = None,
+        destination_role: str | None = None,
     ) -> torch.Tensor:
         """Score every source/destination pair in two embedding batches."""
 
-        sources = self.project(source_embeddings, source_type)
-        destinations = self.project(destination_embeddings, destination_type)
+        sources = self.project(
+            source_embeddings,
+            source_type,
+            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
+        )
+        destinations = self.project(
+            destination_embeddings,
+            destination_type,
+            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
+        )
         key = self.relation_key(source_type, destination_type)
         if self.relation_param == "full":
             return sources @ self.relations[key] @ destinations.T
@@ -1000,20 +1061,28 @@ class StudentJoinabilityModel(nn.Module):
             return parameter.new_empty(0)
 
         projected: dict[tuple[str, str], torch.Tensor] = {}
-        features_by_type: dict[str, dict[str, ObjectFeatures]] = defaultdict(dict)
-        for features in (*sources, *destinations):
-            features_by_type[features.object_type].setdefault(
-                features.object_id, features
+        features_by_projection: dict[str, dict[str, ObjectFeatures]] = defaultdict(dict)
+        for features in sources:
+            key = self.projection_key(
+                features.object_type,
+                "query" if features.object_type == "table" else None,
             )
+            features_by_projection[key].setdefault(features.object_id, features)
+        for features in destinations:
+            key = self.projection_key(
+                features.object_type,
+                "target" if features.object_type == "table" else None,
+            )
+            features_by_projection[key].setdefault(features.object_id, features)
 
-        for object_type, by_id in features_by_type.items():
+        for projection_key, by_id in features_by_projection.items():
             object_ids = list(by_id)
             embeddings = torch.stack(
                 [by_id[object_id].embedding for object_id in object_ids]
             ).to(device=parameter.device, dtype=torch.float32)
-            vectors = self.project(embeddings, object_type)
+            vectors = self.projections[projection_key](embeddings)
             projected.update(
-                ((object_type, object_id), vectors[row])
+                ((projection_key, object_id), vectors[row])
                 for row, object_id in enumerate(object_ids)
             )
 
@@ -1025,13 +1094,13 @@ class StudentJoinabilityModel(nn.Module):
         for (source_type, destination_type), pair_indices in pair_groups.items():
             source_vectors = torch.stack(
                 [
-                    projected[(source_type, sources[index].object_id)]
+                    projected[(self.projection_key(source_type, "query" if source_type == "table" else None), sources[index].object_id)]
                     for index in pair_indices
                 ]
             )
             destination_vectors = torch.stack(
                 [
-                    projected[(destination_type, destinations[index].object_id)]
+                    projected[(self.projection_key(destination_type, "target" if destination_type == "table" else None), destinations[index].object_id)]
                     for index in pair_indices
                 ]
             )
@@ -1114,8 +1183,14 @@ class StudentJoinabilityModel(nn.Module):
         source_embedding: torch.Tensor,
         source_type: str,
         destination_type: str,
+        *,
+        source_role: str | None = None,
     ) -> torch.Tensor:
-        source = self.project(source_embedding, source_type)
+        source = self.project(
+            source_embedding,
+            source_type,
+            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
+        )
         key = self.relation_key(source_type, destination_type)
         if self.relation_param == "full":
             return source @ self.relations[key]
@@ -1126,8 +1201,14 @@ class StudentJoinabilityModel(nn.Module):
         destination_embedding: torch.Tensor,
         destination_type: str,
         source_type: str | None = None,
+        *,
+        destination_role: str | None = None,
     ) -> torch.Tensor:
-        destination = self.project(destination_embedding, destination_type)
+        destination = self.project(
+            destination_embedding,
+            destination_type,
+            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
+        )
         if self.relation_param == "full":
             return destination
         if source_type is None:
@@ -1136,6 +1217,69 @@ class StudentJoinabilityModel(nn.Module):
         return torch.cat(
             [destination, destination @ self.relation_bs[key]], dim=-1
         )
+
+
+def split_table_projection(
+    shared: StudentJoinabilityModel,
+) -> StudentJoinabilityModel:
+    """Create a step-0-equivalent Q/T table split from a shared Student."""
+
+    if shared.projection_mode != "shared":
+        raise ValueError("Only a shared Student can be migrated to split table roles")
+    table_index = shared.projection_keys.index("table")
+    basis = shared.initial_projection_weights[table_index].detach().cpu()
+    if not bool(torch.isfinite(basis).all()):
+        raise ValueError("Role migration requires the persisted PCA reference")
+    split = StudentJoinabilityModel(
+        shared.input_dim,
+        shared.student_dim,
+        initialization="pca",
+        initialization_basis=basis,
+        freeze_projections=shared.freeze_projections,
+        relation_param=shared.relation_param,
+        relation_rank=shared.relation_rank,
+        confidence_transform=shared.confidence_transform,
+        confidence_epsilon=shared.confidence_epsilon,
+        projection_mode="split",
+    )
+    split = split.to(next(shared.parameters()).device)
+    with torch.no_grad():
+        table = shared.projections["table"].weight
+        split.projections["table_query"].weight.copy_(table)
+        split.projections["table_target"].weight.copy_(table)
+        for object_type in ("text", "image"):
+            split.projections[object_type].weight.copy_(
+                shared.projections[object_type].weight
+            )
+        for name, parameter in shared.relations.items():
+            split.relations[name].copy_(parameter)
+        for name, parameter in shared.relation_as.items():
+            split.relation_as[name].copy_(parameter)
+        for name, parameter in shared.relation_bs.items():
+            split.relation_bs[name].copy_(parameter)
+        for name, parameter in shared.confidence_alphas.items():
+            split.confidence_alphas[name].copy_(parameter)
+        for name, parameter in shared.confidence_biases.items():
+            split.confidence_biases[name].copy_(parameter)
+        shared_initial = {
+            key: value
+            for key, value in zip(
+                shared.projection_keys, shared.initial_projection_weights
+            )
+        }
+        split.initial_projection_weights.copy_(
+            torch.stack(
+                [
+                    shared_initial["table"],
+                    shared_initial["table"],
+                    shared_initial["text"],
+                    shared_initial["image"],
+                ]
+            )
+        )
+        split.reset_projection_anchors()
+    split.projection_reference_origin = shared.projection_reference_origin
+    return split
 
 
 class IdentityStudentJoinabilityModel(nn.Module):

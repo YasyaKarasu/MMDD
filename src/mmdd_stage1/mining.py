@@ -465,67 +465,98 @@ def retrieve_hard_candidate_sets(
         raise ValueError("ANN search sizes must be non-negative")
 
     candidate_sets = []
-    for example in progress(
-        examples, desc="Mine hard negatives", unit="query", leave=False
+    query_batch_size = 16
+    starts = range(0, len(examples), query_batch_size)
+    for start in progress(
+        starts, desc="Mine hard negatives", unit="batch", leave=False
     ):
-        known_positives = set(_known_positive_target_ids(example))
+        batch = examples[start : start + query_batch_size]
+        query_ids = [example.query_id for example in batch]
+        known_positives = [set(_known_positive_target_ids(example)) for example in batch]
+        hard_target_hits = indices.search_many(query_ids, "table", direct_k)
         hard_target_ids = [
-            target_id
-            for target_id, _score in indices.search(example.query_id, "table", direct_k)
+            [target_id for target_id, _score in hits]
+            for hits in hard_target_hits
         ]
 
-        evidence_positive = example.candidates[example.evidence_positive_index]
-        positive_evidence_ids = set(evidence_positive.evidence_ids)
-        evidence_target_ids: dict[str, list[str]] = {}
+        evidence_positives = [
+            example.candidates[example.evidence_positive_index]
+            for example in batch
+        ]
+        positive_evidence_ids = [
+            set(candidate.evidence_ids) for candidate in evidence_positives
+        ]
+        evidence_target_ids: list[dict[str, list[str]]] = [
+            {} for _example in batch
+        ]
         if hard_targets_per_positive_evidence:
-            positive_ids = tuple(dict.fromkeys(evidence_positive.evidence_ids))
+            positive_requests = [
+                (example_index, evidence_id)
+                for example_index, candidate in enumerate(evidence_positives)
+                for evidence_id in dict.fromkeys(candidate.evidence_ids)
+            ]
             positive_target_hits = indices.search_many(
-                positive_ids,
+                [evidence_id for _example_index, evidence_id in positive_requests],
                 "table",
                 targets_per_evidence,
             )
-            for evidence_id, hits in zip(
-                positive_ids, positive_target_hits, strict=True
+            for (example_index, evidence_id), hits in zip(
+                positive_requests, positive_target_hits, strict=True
             ):
                 selected = []
                 for target_id, _score in hits:
                     if (
-                        target_id == example.query_id
-                        or target_id in known_positives
+                        target_id == batch[example_index].query_id
+                        or target_id in known_positives[example_index]
                         or target_id in selected
                     ):
                         continue
                     selected.append(target_id)
                     if len(selected) == hard_targets_per_positive_evidence:
                         break
-                evidence_target_ids[evidence_id] = selected
-        hard_evidence_ids = []
-        hard_paths = []
-        all_evidence_hits = []
-        for evidence_type in dict.fromkeys(evidence_types):
-            evidence_hits = indices.search(example.query_id, evidence_type, evidence_k)
-            evidence_negatives_for_type = 0
-            for evidence_id, query_evidence_score in evidence_hits:
-                all_evidence_hits.append((evidence_id, query_evidence_score))
-                if (
-                    evidence_id not in positive_evidence_ids
-                    and evidence_negatives_for_type < hard_evidence_per_type
-                ):
-                    hard_evidence_ids.append(evidence_id)
-                    evidence_negatives_for_type += 1
+                evidence_target_ids[example_index][evidence_id] = selected
 
-        target_hits = indices.search_many(
-            [evidence_id for evidence_id, _score in all_evidence_hits],
+        hard_evidence_ids: list[list[str]] = [[] for _example in batch]
+        all_evidence_hits: list[list[tuple[str, float]]] = [
+            [] for _example in batch
+        ]
+        for evidence_type in dict.fromkeys(evidence_types):
+            evidence_hits = indices.search_many(query_ids, evidence_type, evidence_k)
+            for example_index, hits in enumerate(evidence_hits):
+                evidence_negatives_for_type = 0
+                for evidence_id, query_evidence_score in hits:
+                    all_evidence_hits[example_index].append(
+                        (evidence_id, query_evidence_score)
+                    )
+                    if (
+                        evidence_id not in positive_evidence_ids[example_index]
+                        and evidence_negatives_for_type < hard_evidence_per_type
+                    ):
+                        hard_evidence_ids[example_index].append(evidence_id)
+                        evidence_negatives_for_type += 1
+
+        path_requests = [
+            (example_index, evidence_id, query_evidence_score)
+            for example_index, hits in enumerate(all_evidence_hits)
+            for evidence_id, query_evidence_score in hits
+        ]
+        path_target_hits = indices.search_many(
+            [evidence_id for _example_index, evidence_id, _score in path_requests],
             "table",
             targets_per_evidence,
         )
-        for (evidence_id, query_evidence_score), evidence_targets in zip(
-            all_evidence_hits, target_hits
+        hard_paths: list[list[HardPath]] = [[] for _example in batch]
+        for request, evidence_targets in zip(
+            path_requests, path_target_hits, strict=True
         ):
+            example_index, evidence_id, query_evidence_score = request
             for target_id, evidence_target_score in evidence_targets:
-                if target_id == example.query_id or target_id in known_positives:
+                if (
+                    target_id == batch[example_index].query_id
+                    or target_id in known_positives[example_index]
+                ):
                     continue
-                hard_paths.append(
+                hard_paths[example_index].append(
                     HardPath(
                         evidence_id,
                         target_id,
@@ -533,17 +564,23 @@ def retrieve_hard_candidate_sets(
                     )
                 )
 
-        hard_paths.sort(key=lambda path: (-path.score, path.target_id, path.evidence_id))
-        candidate_sets.append(
-            build_hard_candidate_set(
-                example,
-                hard_target_ids,
-                hard_evidence_ids,
-                hard_paths[:hard_paths_per_query],
-                hard_targets_per_query=hard_targets_per_query,
-                hard_evidence_target_ids=evidence_target_ids,
+        for example_index, example in enumerate(batch):
+            hard_paths[example_index].sort(
+                key=lambda path: (-path.score, path.target_id, path.evidence_id)
             )
-        )
+            candidate_sets.append(
+                build_hard_candidate_set(
+                    example,
+                    hard_target_ids[example_index],
+                    hard_evidence_ids[example_index],
+                    hard_paths[example_index][:hard_paths_per_query],
+                    hard_targets_per_query=hard_targets_per_query,
+                    hard_evidence_target_ids=evidence_target_ids[example_index],
+                )
+            )
+        clear_query_cache = getattr(indices, "clear_query_cache", None)
+        if clear_query_cache is not None:
+            clear_query_cache()
     return candidate_sets
 
 

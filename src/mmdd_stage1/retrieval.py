@@ -92,6 +92,7 @@ def build_indices(
     m: int = 32,
     ef_construction: int = 200,
     ef_search: int = 100,
+    num_threads: int | None = None,
 ) -> dict[str, Any]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -134,6 +135,8 @@ def build_indices(
             if not object_ids:
                 continue
             index = hnswlib.Index(space="ip", dim=ann_dim)
+            if num_threads is not None:
+                index.set_num_threads(num_threads)
             index.init_index(max_elements=len(object_ids), ef_construction=ef_construction, M=m)
             starts = range(0, len(object_ids), batch_size)
             for start in progress(
@@ -184,6 +187,8 @@ def build_indices(
         "ann_dim": ann_dim,
         "relation_param": relation_param,
         "relation_rank": getattr(model, "relation_rank", None),
+        "projection_mode": getattr(model, "projection_mode", "shared"),
+        "table_destination_role": "target",
         "student_checkpoint_sha256": checkpoint_sha256,
         "corpus_sha256": corpus_sha256,
         "hnsw_m": m,
@@ -296,6 +301,12 @@ class StudentANNIndices:
             raise ValueError(f"{manifest_path}: unsupported ANN index format")
         if manifest.get("student_dim") != model.student_dim:
             raise ValueError(f"{manifest_path}: Student dimension does not match the checkpoint")
+        if manifest.get("projection_mode", "shared") != getattr(
+            model, "projection_mode", "shared"
+        ):
+            raise ValueError(
+                f"{manifest_path}: projection mode does not match the checkpoint"
+            )
         relation_param = getattr(model, "relation_param", "full")
         ann_dim = int(getattr(model, "ann_dim", model.student_dim))
         if manifest.get("relation_param", "full") != relation_param:
@@ -328,7 +339,7 @@ class StudentANNIndices:
         self.indices = {}
         self.object_ids = {}
         self.ef_search = int(manifest["ef_search"])
-        self._relation_queries: dict[tuple[str, str], np.ndarray] = {}
+        self._relation_queries: dict[tuple[str, str, str], np.ndarray] = {}
         selected_types = (
             set(OBJECT_TYPES)
             if destination_types is None
@@ -352,6 +363,9 @@ class StudentANNIndices:
     def search(self, source_id: str, destination_type: str, k: int) -> list[tuple[str, float]]:
         return self.search_many([source_id], destination_type, k)[0]
 
+    def clear_query_cache(self) -> None:
+        self._relation_queries.clear()
+
     @torch.no_grad()
     def search_many(
         self, source_ids: list[str], destination_type: str, k: int
@@ -367,20 +381,34 @@ class StudentANNIndices:
         for source_id in dict.fromkeys(source_ids):
             source = self.store.embedding_features(source_id)
             source_types[source_id] = source.object_type
-            key = (source_id, destination_type)
+            source_role = "query" if source.object_type == "table" else "evidence"
+            key = (source_id, source_role, destination_type)
             if key not in self._relation_queries:
                 missing_by_type[source.object_type].append(source)
         for source_type, features in missing_by_type.items():
             embeddings = torch.stack([value.embedding for value in features]).to(
                 device=self.device, dtype=torch.float32
             )
-            queries = self.model.relation_query(
-                embeddings, source_type, destination_type
+            queries = (
+                self.model.relation_query(
+                    embeddings,
+                    source_type,
+                    destination_type,
+                    source_role="query" if source_type == "table" else None,
+                )
+                if hasattr(self.model, "projection_mode")
+                else self.model.relation_query(
+                    embeddings, source_type, destination_type
+                )
             )
             arrays = queries.detach().cpu().numpy().astype("float32")
             for features_value, array in zip(features, arrays):
                 self._relation_queries[
-                    (features_value.object_id, destination_type)
+                    (
+                        features_value.object_id,
+                        "query" if source_type == "table" else "evidence",
+                        destination_type,
+                    )
                 ] = array
 
         positions_by_index: dict[str, list[int]] = defaultdict(list)
@@ -403,7 +431,11 @@ class StudentANNIndices:
             query_array = np.stack(
                 [
                     self._relation_queries[
-                        (source_ids[position], destination_type)
+                        (
+                            source_ids[position],
+                            "query" if source_types[source_ids[position]] == "table" else "evidence",
+                            destination_type,
+                        )
                     ]
                     for position in positions
                 ]

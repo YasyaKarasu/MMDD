@@ -414,13 +414,23 @@ def student_anchor_loss(student: StudentJoinabilityModel) -> torch.Tensor:
     )
     if student.freeze_projections:
         return relation_anchor
-    projection_anchor = sum(
-        (student.projections[object_type].weight - initial).square().sum()
+    if not bool(torch.isfinite(student.initial_projection_weights).all()):
+        raise ValueError("Checkpoint has no full-chain projection reference")
+    terms = {
+        key: (student.projections[key].weight - initial).square().sum()
         / (student.input_dim * student.student_dim)
-        for object_type, initial in zip(
-            OBJECT_TYPES, student.initial_projection_weights
+        for key, initial in zip(
+            student.projection_keys, student.initial_projection_weights
         )
-    )
+    }
+    if student.projection_mode == "split":
+        projection_anchor = (
+            0.5 * (terms["table_query"] + terms["table_target"])
+            + terms["text"]
+            + terms["image"]
+        )
+    else:
+        projection_anchor = sum(terms.values())
     return relation_anchor + projection_anchor
 
 
@@ -455,22 +465,63 @@ def student_relation_drift(
 
 def student_projection_drift(
     student: StudentJoinabilityModel,
-) -> dict[str, float]:
+    *,
+    reference: str = "pca",
+) -> dict[str, float | None]:
     """Measure normalized projection drift from the initialization basis."""
 
     normalizer = math.sqrt(student.input_dim * student.student_dim)
+    if reference not in {"pca", "stage_start"}:
+        raise ValueError("Projection reference must be pca or stage_start")
+    anchors = (
+        student.initial_projection_weights
+        if reference == "pca"
+        else student.stage_initial_projection_weights
+    )
     with torch.no_grad():
         return {
-            object_type: float(
+            key: float(
                 torch.linalg.vector_norm(
-                    student.projections[object_type].weight - initial
+                    student.projections[key].weight - initial
                 ).cpu()
                 / normalizer
-            )
-            for object_type, initial in zip(
-                OBJECT_TYPES, student.initial_projection_weights
+            ) if bool(torch.isfinite(initial).all()) else None
+            for key, initial in zip(
+                student.projection_keys, anchors
             )
         }
+
+
+def student_projection_references(student: StudentJoinabilityModel) -> dict[str, Any]:
+    """Fingerprint the two persisted references without conflating their roles."""
+
+    import hashlib
+
+    result: dict[str, Any] = {
+        "origin": student.projection_reference_origin,
+        "regularizer_reference": "P_PCA",
+        "relation_reference": "identity",
+    }
+    for name, tensor in (
+        ("P_PCA", student.initial_projection_weights),
+        ("P_stage_start", student.stage_initial_projection_weights),
+    ):
+        values = tensor.detach().cpu().contiguous()
+        available = bool(torch.isfinite(values).all())
+        result[name] = {
+            "available": available,
+            "sha256": hashlib.sha256(values.numpy().tobytes()).hexdigest()
+            if available else None,
+        }
+    return result
+
+
+def student_gradient_norms(student: StudentJoinabilityModel) -> dict[str, float | None]:
+    return {
+        name: float(parameter.grad.detach().norm().cpu()) if parameter.grad is not None else None
+        for name, parameter in student.named_parameters()
+        if name.startswith(("projections.", "relations.", "relation_as.", "relation_bs."))
+    }
 
 
 def _student_relation_keys(student: StudentJoinabilityModel) -> list[str]:
@@ -1470,6 +1521,9 @@ def train_student_edges(
     hard_fraction: float = 0.5,
     dev_examples: Sequence[EdgeExample] = (),
     epoch_callback: EpochCallback[StudentJoinabilityModel] | None = None,
+    eval_epoch_zero: bool = False,
+    checkpoint_steps: Sequence[int] = (),
+    step_callback: EpochCallback[StudentJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     if min(edge_bce_weight, ranking_weight) < 0:
         raise ValueError("edge_bce_weight and ranking_weight must be non-negative")
@@ -1483,6 +1537,26 @@ def train_student_edges(
     rng = random.Random(seed)
     known_positives = global_edge_positive_ids([*examples, *hard_examples])
     optimizer_updates = 0
+    def evaluate(record: dict[str, Any]) -> None:
+        if not dev_examples:
+            return
+        record["dev_loss"] = _student_edge_objective(
+            student, dev_examples, store, device, batch_size, temperature,
+            distillation_weight, edge_bce_weight, anchor_weight,
+            anchor_weight_evidence, in_batch_negatives, in_batch_max_negatives,
+            student_score_space, ranking_weight, ranking_score_space,
+            ranking_temperature, use_global_positive_mask, positive_loss_mode,
+        )
+        record["dev_edge"] = _edge_list_metrics(
+            student, dev_examples, store, device, batch_size, ranking_score_space,
+        )
+
+    if eval_epoch_zero:
+        record = {"epoch": 0, "training_state": "initial", "optimizer_updates_total": 0,
+                  "dataset_samples": {}, "source_samples": {"base": 0, "hard": 0}}
+        evaluate(record)
+        if _finish_epoch(history, record, student, epoch_callback):
+            return history
     epoch_bar = progress(range(epochs), desc="Student edge", unit="epoch")
     for epoch in epoch_bar:
         student.train()
@@ -1597,6 +1671,14 @@ def train_student_edges(
             _optimize(objective["loss"], optimizer)
             optimizer_updates += 1
             tracker.add(objective)
+            if optimizer_updates in checkpoint_steps and step_callback is not None:
+                step_record = {"epoch": epoch + 1, "optimizer_updates_total": optimizer_updates,
+                               "loss": float(objective["loss"].detach()),
+                               "in_batch_expansion": dict(expansion_audit)}
+                evaluate(step_record)
+                if step_callback(optimizer_updates, student, step_record):
+                    raise RuntimeError("Step callbacks must not silently truncate the registered update budget")
+                student.train()
             if _loss_refresh_due(step, len(batches)):
                 tracker.flush()
                 batch_bar.set_postfix(loss=f"{tracker.mean('loss'):.4f}")
@@ -1624,35 +1706,7 @@ def train_student_edges(
             "weighted_anchor_loss": tracker.mean("weighted_anchor_loss"),
             "in_batch_expansion": expansion_audit,
         }
-        if dev_examples:
-            values["dev_loss"] = _student_edge_objective(
-                student,
-                dev_examples,
-                store,
-                device,
-                batch_size,
-                temperature,
-                distillation_weight,
-                edge_bce_weight,
-                anchor_weight,
-                anchor_weight_evidence,
-                in_batch_negatives,
-                in_batch_max_negatives,
-                student_score_space,
-                ranking_weight,
-                ranking_score_space,
-                ranking_temperature,
-                use_global_positive_mask,
-                positive_loss_mode,
-            )
-            values["dev_edge"] = _edge_list_metrics(
-                student,
-                dev_examples,
-                store,
-                device,
-                batch_size,
-                ranking_score_space,
-            )
+        evaluate(values)
         epoch_bar.set_postfix(
             train=f"{train_loss:.4f}",
             **({"dev": f"{values['dev_loss']:.4f}"} if "dev_loss" in values else {}),
@@ -1694,17 +1748,23 @@ def train_student_paths(
     continuous_edge_weight: float = 1.0,
     continuous_edge_bce_weight: float = 0.0,
     continuous_edge_batch_size: int | None = None,
+    continuous_edge_ranking_score_space: str | None = None,
+    continuous_edge_ranking_temperature: float = 1.0,
     max_optimizer_updates: int | None = None,
     dataset_sampling_alpha: float = 0.0,
     hard_examples: Sequence[TargetExample] = (),
     hard_fraction: float = 0.5,
     dev_examples: Sequence[TargetExample] = (),
     epoch_callback: EpochCallback[StudentJoinabilityModel] | None = None,
+    checkpoint_steps: Sequence[int] = (),
+    step_callback: EpochCallback[StudentJoinabilityModel] | None = None,
 ) -> list[dict[str, Any]]:
     if continuous_edge_weight < 0:
         raise ValueError("continuous_edge_weight must be non-negative")
     if continuous_edge_bce_weight < 0:
         raise ValueError("continuous_edge_bce_weight must be non-negative")
+    if continuous_edge_ranking_temperature <= 0:
+        raise ValueError("continuous_edge_ranking_temperature must be positive")
     if continuous_edge_bce_weight > 0 and not student.confidence_transform:
         raise ValueError(
             "Continuous edge BCE requires the Student confidence transform"
@@ -1714,6 +1774,9 @@ def train_student_paths(
             "Continuous edge dev data requires continuous edge training data"
         )
     edge_batch_size = continuous_edge_batch_size or batch_size
+    edge_ranking_score_space = (
+        continuous_edge_ranking_score_space or student_score_space
+    )
     if edge_batch_size <= 0:
         raise ValueError("continuous_edge_batch_size must be positive")
     continuous_known_positives = global_edge_positive_ids(
@@ -1723,6 +1786,7 @@ def train_student_paths(
         raise ValueError("max_optimizer_updates must be positive")
     history = []
     rng = random.Random(seed)
+    continuous_edge_rng = random.Random(f"{seed}:continuous_edge")
     optimizer_updates = 0
     _validate_cached_path_aggregation(
         [*examples, *hard_examples, *dev_examples], aggregator
@@ -1780,10 +1844,10 @@ def train_student_paths(
             edge_sampled = _sample_balanced_count(
                 continuous_edge_examples,
                 len(batches) * edge_batch_size,
-                rng,
+                continuous_edge_rng,
                 dataset_sampling_alpha,
             )
-            rng.shuffle(edge_sampled)
+            continuous_edge_rng.shuffle(edge_sampled)
             edge_batches = _batches(edge_sampled, edge_batch_size)
             if len(edge_batches) != len(batches):
                 raise RuntimeError(
@@ -1855,6 +1919,9 @@ def train_student_paths(
                     else None
                 )
                 if in_batch_negatives:
+                    edge_sampling_context = (
+                        f"path_epoch={epoch}:step={step}:continuous_edge"
+                    )
                     edge_expanded_scores = score_edge_batch_in_batch(
                         student,
                         edge_batch,
@@ -1865,13 +1932,30 @@ def train_student_paths(
                         student_score_space=student_score_space,
                         known_positive_ids=continuous_known_positives,
                         use_global_positive_mask=use_global_positive_mask,
+                        sampling_seed=seed,
+                        sampling_context=edge_sampling_context,
                     )
                     edge_student_scores = restrict_list_scores(
                         edge_expanded_scores,
                         [len(example.candidate_ids) for example in edge_batch],
                         device,
                     )
-                    edge_supervised_scores = edge_expanded_scores
+                    edge_supervised_scores = (
+                        edge_expanded_scores
+                        if edge_ranking_score_space == student_score_space
+                        else score_edge_batch_in_batch(
+                            student,
+                            edge_batch,
+                            store,
+                            device,
+                            max_negatives=in_batch_max_negatives,
+                            student_score_space=edge_ranking_score_space,
+                            known_positive_ids=continuous_known_positives,
+                            use_global_positive_mask=use_global_positive_mask,
+                            sampling_seed=seed,
+                            sampling_context=edge_sampling_context,
+                        )
+                    )
                 else:
                     edge_student_scores = score_edge_batch(
                         student,
@@ -1880,7 +1964,26 @@ def train_student_paths(
                         device,
                         student_score_space=student_score_space,
                     )
-                    edge_supervised_scores = edge_student_scores
+                    edge_supervised_scores = (
+                        edge_student_scores
+                        if edge_ranking_score_space == student_score_space
+                        else score_edge_batch(
+                            student,
+                            edge_batch,
+                            store,
+                            device,
+                            student_score_space=edge_ranking_score_space,
+                        )
+                    )
+                if continuous_edge_ranking_temperature != 1.0:
+                    edge_supervised_scores = ListScores(
+                        edge_supervised_scores.logits
+                        / continuous_edge_ranking_temperature,
+                        edge_supervised_scores.candidate_mask,
+                        edge_supervised_scores.positive_indices,
+                        edge_supervised_scores.positive_mask,
+                        edge_supervised_scores.candidate_ids,
+                    )
                 edge_confidence_scores = (
                     score_edge_batch(
                         student,
@@ -1944,12 +2047,18 @@ def train_student_paths(
                     }
                 )
             _optimize(total_loss, optimizer)
+            optimizer_updates += 1
             tracker.add(tracked_objective)
+            if optimizer_updates in checkpoint_steps and step_callback is not None:
+                step_record = {"epoch": epoch + 1, "optimizer_updates_total": optimizer_updates,
+                               "loss": float(total_loss.detach())}
+                if step_callback(optimizer_updates, student, step_record):
+                    raise RuntimeError("Step callbacks must not silently truncate the registered update budget")
+                student.train()
             if _loss_refresh_due(step, len(batches)):
                 tracker.flush()
                 edge_relation_tracker.flush()
                 batch_bar.set_postfix(loss=f"{tracker.mean('loss'):.4f}")
-        optimizer_updates += len(batches)
         train_loss = tracker.mean("loss")
         values = {
             "loss": train_loss,
@@ -2035,8 +2144,8 @@ def train_student_paths(
                 in_batch_max_negatives,
                 student_score_space,
                 1.0,
-                student_score_space,
-                1.0,
+                edge_ranking_score_space,
+                continuous_edge_ranking_temperature,
                 use_global_positive_mask,
                 positive_loss_mode,
             )
@@ -2072,4 +2181,6 @@ def checkpoint(
     }
     if aggregator is not None:
         payload["path_aggregation"] = aggregator.config()
+    if isinstance(model, StudentJoinabilityModel):
+        payload["projection_references"] = student_projection_references(model)
     return payload

@@ -64,6 +64,8 @@ from mmdd_stage1.training import (
     checkpoint,
     confirmed_edge_label_summary,
     student_projection_drift,
+    student_projection_references,
+    student_gradient_norms,
     student_relation_drift,
     train_student_edges,
     train_student_paths,
@@ -321,6 +323,14 @@ def _load_or_initialize_student(
         student = load_student(Path(args.student_checkpoint), device)
         if args.freeze_projection is not None:
             student.set_projection_frozen(args.freeze_projection)
+        if not args.initialize_only and not bool(
+            torch.isfinite(student.initial_projection_weights).all()
+        ):
+            raise ValueError(
+                "Historical checkpoint lacks P_PCA; use it for --initialize-only "
+                "or start a fresh R12 training chain"
+            )
+        if not args.initialize_only:
             student.reset_projection_anchors()
         if args.student_confidence_transform is not None:
             student.set_confidence_transform(args.student_confidence_transform)
@@ -557,6 +567,12 @@ class _EpochController:
         self.store = store
         self.device = device
         self.dev_examples = dev_examples
+        self.retrieval_enabled = stage == "student-path" or bool(args.retrieval_dev_data)
+        self.retrieval_examples = (
+            [example for value in args.retrieval_dev_data
+             for example in load_target_examples(Path(value), split=args.dev_split)]
+            if args.retrieval_dev_data else dev_examples
+        )
         self.corpus_path = corpus_path
         self.index_root = index_root
         self.raw_index_root = raw_index_root
@@ -672,6 +688,11 @@ class _EpochController:
     ) -> bool:
         if isinstance(model, StudentJoinabilityModel):
             record["projection_drift"] = student_projection_drift(model)
+            record["projection_stage_start_drift"] = student_projection_drift(
+                model, reference="stage_start"
+            )
+            record["projection_references"] = student_projection_references(model)
+            record["gradient_norms"] = student_gradient_norms(model)
             record["relation_drift"] = student_relation_drift(model)
         candidate = self.manager.save_candidate(
             epoch, checkpoint(model, self.stage, self.aggregator)
@@ -680,7 +701,7 @@ class _EpochController:
         record["candidate_checkpoint"] = str(candidate.resolve())
         record["candidate_checkpoint_sha256"] = candidate_sha256
 
-        if self.stage == "student-path":
+        if self.retrieval_enabled:
             assert isinstance(model, StudentJoinabilityModel)
             assert self.index_root is not None
             assert self.raw_index_root is not None
@@ -722,12 +743,12 @@ class _EpochController:
                     ef_search=self.args.ef_search,
                 )
                 self.raw_embedding_metrics = evaluate_student_retrieval(
-                    self.dev_examples,
+                    self.retrieval_examples,
                     raw_indices,
                     **self._retrieval_protocol(),
                 )
             retrieval_metrics = evaluate_student_retrieval(
-                self.dev_examples,
+                self.retrieval_examples,
                 indices,
                 **self._retrieval_protocol(),
                 identity_baseline_metrics=self.raw_embedding_metrics,
@@ -737,6 +758,8 @@ class _EpochController:
             gate_metrics = dict(retrieval_metrics)
             if "dev_loss" in record:
                 gate_metrics["dev_loss"] = record["dev_loss"]
+            if "dev_edge" in record:
+                gate_metrics["dev_edge"] = record["dev_edge"]
         elif self.stage == "teacher-path" and self.args.teacher_rerank:
             assert isinstance(model, TeacherJoinabilityModel)
             index_dir = None
@@ -813,7 +836,7 @@ class _EpochController:
                 self.stop_reason = (
                     f"early_stopping_patience_{self.gate.patience}"
                 )
-            if self.stage == "student-path":
+            if self.retrieval_enabled:
                 self.prune_indices()
             return should_stop
         decision = self.gate.observe(epoch, gate_metrics)
@@ -835,7 +858,7 @@ class _EpochController:
             self.manager.update_best(candidate)
             self.best_metrics = gate_metrics
             self.best_index = index_dir
-        if self.stage == "student-path":
+        if self.retrieval_enabled:
             self.prune_indices()
         if decision.should_stop:
             self.stop_reason = f"early_stopping_patience_{self.gate.patience}"
@@ -853,6 +876,24 @@ class _EpochController:
         self.gate.best_epoch = 0
         self.gate.best_value = metric_value(metrics, self.gate.primary_metric)
         self.gate_unsatisfied = True
+
+    def save_step(
+        self, step: int, model: StudentJoinabilityModel, record: dict[str, Any]
+    ) -> bool:
+        folder = self.manager.paths["best"].with_suffix(".steps")
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"step_{step:06d}.pt"
+        torch.save(checkpoint(model, self.stage, self.aggregator), path)
+        record.update({
+            "checkpoint": str(path.resolve()), "checkpoint_sha256": checkpoint_fingerprint(path),
+            "projection_drift": student_projection_drift(model),
+            "projection_stage_start_drift": student_projection_drift(model, reference="stage_start"),
+            "projection_references": student_projection_references(model),
+            "gradient_norms": student_gradient_norms(model),
+            "relation_drift": student_relation_drift(model),
+        })
+        write_json(path.with_suffix(".json"), record)
+        return False
 
     def prune_indices(self) -> None:
         epoch_zero_index = (
@@ -912,6 +953,10 @@ def _validate_initialize_only(args: argparse.Namespace) -> None:
 
 def _normalize_run_arguments(args: argparse.Namespace) -> None:
     _apply_argument_defaults(args)
+    if args.retrieval_dev_data and args.stage != "student-edge":
+        raise ValueError("--retrieval-dev-data is the Student edge lake-evaluation input")
+    if any(step < 0 for step in args.checkpoint_steps):
+        raise ValueError("--checkpoint-steps must be nonnegative")
     if args.kd_target_teacher_alpha is not None:
         if (
             args.teacher_ensemble_alpha is not None
@@ -966,6 +1011,10 @@ def _normalize_run_arguments(args: argparse.Namespace) -> None:
         raise ValueError("--edge-bce-weight must be non-negative")
     if args.continuous_edge_weight < 0:
         raise ValueError("--continuous-edge-weight must be non-negative")
+    if args.continuous_edge_ranking_temperature <= 0:
+        raise ValueError(
+            "--continuous-edge-ranking-temperature must be positive"
+        )
     if (
         args.continuous_edge_batch_size is not None
         and args.continuous_edge_batch_size <= 0
@@ -1612,7 +1661,7 @@ def _resolve_retrieval_paths(
     index_root = None
     raw_index_root = None
     primary_metric = args.primary_metric if args.selection_order else "dev_loss"
-    if args.stage == "student-path" or args.teacher_rerank:
+    if args.stage == "student-path" or args.retrieval_dev_data or args.teacher_rerank:
         corpus_path = _required_path(args.corpus, "--corpus", args.stage)
         primary_metric = args.primary_metric
         if args.teacher_rerank and args.stage != "student-path":
@@ -1622,7 +1671,7 @@ def _resolve_retrieval_paths(
                     f"--primary-metric {primary_metric!r} is not available in teacher-rerank mode. "
                     f"Use one of: dev_loss, teacher_rerank.<metric>, raw_direct.<metric>, spearman"
                 )
-        if args.stage == "student-path":
+        if args.stage == "student-path" or args.retrieval_dev_data:
             index_root = (
                 Path(args.index_root)
                 if args.index_root
@@ -1923,6 +1972,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args, embedding_dim=embedding_dim, learning_rate=learning_rate, device=device
             )
         )
+        if 0 in args.checkpoint_steps:
+            controller.save_step(0, student, {"epoch": 0, "optimizer_updates_total": 0})
         history = train_student_edges(
             student,
             examples,
@@ -1943,6 +1994,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             use_global_positive_mask=args.global_positive_mask,
             max_optimizer_updates=args.max_optimizer_updates,
             positive_loss_mode=args.positive_loss_mode,
+            eval_epoch_zero=args.eval_epoch_zero,
+            checkpoint_steps=args.checkpoint_steps,
+            step_callback=controller.save_step,
             **common,
         )
     else:
@@ -1952,6 +2006,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
         epoch_zero_record = None
+        if 0 in args.checkpoint_steps:
+            controller.save_step(0, student, {"epoch": 0, "optimizer_updates_total": 0})
         if args.eval_epoch_zero:
             epoch_zero_record = {
                 "epoch": 0,
@@ -1990,7 +2046,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 continuous_edge_weight=args.continuous_edge_weight,
                 continuous_edge_bce_weight=args.edge_bce_weight,
                 continuous_edge_batch_size=args.continuous_edge_batch_size,
+                continuous_edge_ranking_score_space=(
+                    args.continuous_edge_ranking_score_space
+                ),
+                continuous_edge_ranking_temperature=(
+                    args.continuous_edge_ranking_temperature
+                ),
                 max_optimizer_updates=args.max_optimizer_updates,
+                checkpoint_steps=args.checkpoint_steps,
+                step_callback=controller.save_step,
                 **common,
             )
         if epoch_zero_record is not None:
@@ -2043,6 +2107,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "weight": args.continuous_edge_weight,
         "bce_weight": args.edge_bce_weight,
         "batch_size": args.continuous_edge_batch_size or args.batch_size,
+        "ranking_score_space": (
+            args.continuous_edge_ranking_score_space
+            or args.student_score_space
+        ),
+        "ranking_temperature": args.continuous_edge_ranking_temperature,
         "train_participation": (
             confirmed_edge_label_summary(continuous_edge_examples)
             if continuous_edge_examples
@@ -2498,8 +2567,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--eval-epoch-zero",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Evaluate and gate the initial student-path checkpoint before optimization.",
+        help="Evaluate and gate the initial Student edge/path checkpoint before optimization.",
     )
+    parser.add_argument("--retrieval-dev-data", nargs="+", default=[],
+                        help="Target lists for Student-edge full-lake gating, using the path-stage evaluator.")
+    parser.add_argument("--checkpoint-steps", nargs="+", type=int, default=[],
+                        help="Persist Student checkpoints at these actual optimizer update counts.")
     parser.add_argument(
         "--initialize-only",
         action="store_true",
@@ -2528,6 +2601,15 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distillation-weight", type=float, default=1.0)
     parser.add_argument("--continuous-edge-weight", type=float, default=1.0)
     parser.add_argument("--continuous-edge-batch-size", type=int)
+    parser.add_argument(
+        "--continuous-edge-ranking-score-space",
+        choices=STUDENT_SCORE_SPACES,
+    )
+    parser.add_argument(
+        "--continuous-edge-ranking-temperature",
+        type=float,
+        default=1.0,
+    )
     parser.add_argument(
         "--edge-bce-weight",
         type=float,

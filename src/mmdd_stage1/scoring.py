@@ -26,6 +26,7 @@ class ListScores:
     candidate_mask: torch.Tensor
     positive_indices: torch.Tensor
     positive_mask: torch.Tensor | None = None
+    candidate_ids: tuple[tuple[str, ...], ...] | None = None
 
     def select(self, row_mask: torch.Tensor) -> ListScores:
         """Return the selected batch rows for every score field."""
@@ -39,6 +40,13 @@ class ListScores:
                 if self.positive_mask is None
                 else self.positive_mask[row_mask]
             ),
+            candidate_ids=(
+                None if self.candidate_ids is None else tuple(
+                    ids for ids, selected in zip(
+                        self.candidate_ids, row_mask.detach().cpu().tolist()
+                    ) if selected
+                )
+            ),
         )
 
 
@@ -46,6 +54,7 @@ class ListScores:
 class TargetScores:
     direct: ListScores
     evidence: ListScores
+    path_logits: tuple[tuple[torch.Tensor, ...], ...] | None = None
 
 
 def _device_features(
@@ -442,6 +451,7 @@ def _score_student_candidate_rows(
         _mask(lengths, logits.shape[1], device),
         torch.tensor(positive_indices, device=device),
         positive_mask,
+        tuple(tuple(row) for row in candidate_rows),
     )
 
 
@@ -542,14 +552,6 @@ def score_edge_batch_in_batch(
                 expansion_audit.get("affected_lists", 0)
                 + int(bool(extra_known_positives))
             )
-            expansion_audit["known_positive_as_negative"] = (
-                expansion_audit.get("known_positive_as_negative", 0)
-                + (
-                    0
-                    if use_global_positive_mask
-                    else len(extra_known_positives)
-                )
-            )
         positive_id_sets.append(positive_ids)
         candidate_row = _expanded_candidate_ids(
             example.candidate_ids,
@@ -565,7 +567,7 @@ def score_edge_batch_in_batch(
                 + len(candidate_row)
                 - len(example.candidate_ids)
             )
-    return _score_student_candidate_rows(
+    scores = _score_student_candidate_rows(
         student,
         queries,
         candidate_rows,
@@ -575,6 +577,22 @@ def score_edge_batch_in_batch(
         positive_id_sets,
         student_score_space=student_score_space,
     )
+    if expansion_audit is not None:
+        errors = 0
+        for index, (example, row) in enumerate(zip(examples, candidate_rows)):
+            known = set((known_positive_ids or {}).get(
+                edge_positive_key(example), _edge_positive_id_set(example)
+            ))
+            errors += sum(
+                candidate_id in known
+                and bool(scores.candidate_mask[index, column])
+                and not bool(scores.positive_mask[index, column])
+                for column, candidate_id in enumerate(row)
+            )
+        expansion_audit["known_positive_as_negative"] = (
+            expansion_audit.get("known_positive_as_negative", 0) + errors
+        )
+    return scores
 
 
 def restrict_list_scores(
@@ -820,6 +838,19 @@ def score_target_batch(
         **aggregation_kwargs,
     ).squeeze(0)
 
+    raw_path_rows = query_evidence_rows + evidence_target_rows
+    path_logits = []
+    candidate_offset = 0
+    for example in examples:
+        example_rows = []
+        for candidate in example.candidates:
+            evidence_count = evidence_lengths[candidate_offset]
+            example_rows.append(
+                raw_path_rows[candidate_offset, :evidence_count]
+            )
+            candidate_offset += 1
+        path_logits.append(tuple(example_rows))
+
     candidate_lengths = [len(example.candidates) for example in examples]
     direct_rows = pad_sequence(
         list(direct_scores.split(candidate_lengths)), batch_first=True, padding_value=0.0
@@ -873,6 +904,7 @@ def score_target_batch(
             evidence_positive_indices,
             evidence_positive_mask,
         ),
+        path_logits=tuple(path_logits),
     )
 
 

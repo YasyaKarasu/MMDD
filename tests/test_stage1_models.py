@@ -3710,6 +3710,55 @@ def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
         return original_anchor(model)
 
     monkeypatch.setattr(stage1_training, "student_anchor_loss", counted_anchor)
+    original_edge_losses = stage1_training._student_edge_losses
+    original_in_batch_scores = stage1_training.score_edge_batch_in_batch
+    checked_ranking_scores = 0
+    in_batch_calls = []
+
+    def capture_in_batch_scores(*args, **kwargs):
+        scores = original_in_batch_scores(*args, **kwargs)
+        in_batch_calls.append((kwargs["student_score_space"], scores.candidate_ids))
+        return scores
+
+    monkeypatch.setattr(
+        stage1_training, "score_edge_batch_in_batch", capture_in_batch_scores
+    )
+
+    def check_edge_ranking_scores(
+        model,
+        examples,
+        student_scores,
+        teacher_scores,
+        supervised_scores,
+        confidence_scores,
+        **kwargs,
+    ):
+        nonlocal checked_ranking_scores
+        for row, example in enumerate(examples):
+            valid = student_scores.candidate_mask[row]
+            expected = model.transform_edge_scores(
+                student_scores.logits[row, valid],
+                example.source_type,
+                example.destination_type,
+                "confidence",
+            ) / 0.1
+            assert torch.allclose(
+                supervised_scores.logits[row, : valid.shape[0]][valid], expected
+            )
+        checked_ranking_scores += 1
+        return original_edge_losses(
+            model,
+            examples,
+            student_scores,
+            teacher_scores,
+            supervised_scores,
+            confidence_scores,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        stage1_training, "_student_edge_losses", check_edge_ranking_scores
+    )
 
     history = train_student_paths(
         student_model,
@@ -3724,11 +3773,15 @@ def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
         temperature=1.0,
         distillation_weight=0.3,
         anchor_weight=0.1,
+        in_batch_negatives=True,
+        in_batch_max_negatives=3,
         continuous_edge_examples=edge_examples,
         continuous_edge_dev_examples=edge_examples,
         continuous_edge_weight=1.0,
         continuous_edge_bce_weight=1.0,
         continuous_edge_batch_size=2,
+        continuous_edge_ranking_score_space="confidence",
+        continuous_edge_ranking_temperature=0.1,
     )
 
     record = history[0]
@@ -3746,6 +3799,10 @@ def test_student_path_pairs_continuous_edges_without_extra_optimizer_updates(
         "text_to_table",
     }
     assert anchor_calls == 1
+    assert checked_ranking_scores > 0
+    assert in_batch_calls[0][0] == "raw_logit"
+    assert in_batch_calls[1][0] == "confidence"
+    assert in_batch_calls[0][1] == in_batch_calls[1][1]
 
 
 def test_student_path_optimizer_update_budget_truncates_the_last_epoch():
@@ -5185,6 +5242,10 @@ def test_student_path_entrypoint_uses_independent_continuous_edge_teacher_cache(
             str(edge_teacher_path),
             "--continuous-edge-teacher-logit-cache",
             str(edge_cache),
+            "--continuous-edge-ranking-score-space",
+            "confidence",
+            "--continuous-edge-ranking-temperature",
+            "0.1",
             "--student-confidence-transform",
             "--positive-loss-mode",
             "mean_log_probability",
@@ -5226,6 +5287,8 @@ def test_student_path_entrypoint_uses_independent_continuous_edge_teacher_cache(
     )
     assert continuous["teacher_target"] == "teacher"
     assert continuous["teacher_cache_generated"]
+    assert continuous["ranking_score_space"] == "confidence"
+    assert continuous["ranking_temperature"] == 0.1
     assert len(continuous["teacher_logit_caches"]) == 2
     assert all(str(edge_cache.resolve()) in path for path in continuous["teacher_logit_caches"])
     assert all(str(path_cache.resolve()) not in path for path in continuous["teacher_logit_caches"])

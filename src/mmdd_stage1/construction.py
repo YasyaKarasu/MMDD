@@ -591,11 +591,9 @@ def build_stage1_training_artifacts(
                         "candidate_ids": [positive_target_id, *evidence_target_negatives],
                         "confirmed_labels": [
                             1,
-                            *[
-                                0 if target_id == corrupted_id else None
-                                for target_id in evidence_target_negatives
-                            ],
+                            *([None] * len(evidence_target_negatives)),
                         ],
+                        "negative_policy": "ranking_only_unconfirmed_targets",
                         "destination_type": "table",
                         "dataset": dataset_name,
                         "split": split,

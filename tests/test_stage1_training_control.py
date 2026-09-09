@@ -291,6 +291,7 @@ def test_teacher_rerank_interval_saves_but_does_not_gate_skipped_epoch(
 ):
     controller = object.__new__(train_stage1._EpochController)
     controller.stage = "teacher-path"
+    controller.retrieval_enabled = False
     controller.aggregator = PathAggregator("logsumexp", 4)
     controller.manager = CheckpointManager(tmp_path / "teacher.pt")
     controller.gate = MetricGate("teacher_rerank.recall@10", patience=3)

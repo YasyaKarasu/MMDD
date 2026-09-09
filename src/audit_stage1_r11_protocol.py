@@ -11,8 +11,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from mmdd_stage1.data import EdgeExample, load_edge_examples
-from mmdd_stage1.scoring import edge_positive_key, global_edge_positive_ids
+from mmdd_stage1.features import FeatureStore, ObjectFeatures
+from mmdd_stage1.models import StudentJoinabilityModel
+from mmdd_stage1.scoring import (
+    edge_positive_key, global_edge_positive_ids, score_edge_batch_in_batch,
+)
 from mmdd_stage1.training import sample_mixed_epoch
 
 
@@ -61,55 +67,45 @@ def _expansion_epoch(
             dataset_sampling_alpha=0.0,
         )
     known = global_edge_positive_ids(examples)
-    audit = Counter()
+    audit = Counter({
+        "legacy_known_positive_as_negative": 0,
+        "fixed_known_positive_as_negative": 0,
+    })
+    model = StudentJoinabilityModel(1, 1, initialization="identity")
     for start in range(0, len(sampled), batch_size):
         batch = sampled[start : start + batch_size]
         step = start // batch_size + 1
-        pools: dict[str, list[str]] = defaultdict(list)
+        types: dict[str, str] = {}
         for example in batch:
-            pools[example.destination_type or ""].extend(example.candidate_ids)
-        pools = {
-            key: list(dict.fromkeys(values)) for key, values in pools.items()
-        }
-        for example in batch:
-            local = set(example.positive_ids) or {
-                example.candidate_ids[example.positive_index]
-            }
-            complete = set(known[edge_positive_key(example)])
-            extra = (
-                set(pools[example.destination_type or ""])
-                - set(example.candidate_ids)
-            ) & complete
-            legacy_candidates = [
-                value
-                for value in pools[example.destination_type or ""]
-                if value not in set(example.candidate_ids) | local
-            ]
-            if len(legacy_candidates) > cap:
-                list_id = ":".join(
-                    (
-                        example.query_id,
-                        example.source_type or "",
-                        example.destination_type or "",
-                        example.candidate_ids[example.positive_index],
-                    )
+            types[example.query_id] = str(example.source_type)
+            types.update((value, str(example.destination_type))
+                         for value in example.candidate_ids)
+        # Values do not affect expansion/masks; use real IDs with scalar features.
+        store = FeatureStore({
+            value: ObjectFeatures(value, kind, torch.zeros(1))
+            for value, kind in types.items()
+        })
+        audit["lists"] += len(batch)
+        for label, global_mask in (("legacy", False), ("fixed", True)):
+            with torch.inference_mode():
+                scores = score_edge_batch_in_batch(
+                    model, batch, store, torch.device("cpu"),
+                    max_negatives=cap, known_positive_ids=known,
+                    use_global_positive_mask=global_mask,
+                    sampling_seed=seed,
+                    sampling_context=f"epoch={epoch}:step={step}",
                 )
-                list_rng = random.Random(
-                    f"{seed}:epoch={epoch}:step={step}:{list_id}"
+            for index, (example, candidates) in enumerate(
+                zip(batch, scores.candidate_ids)
+            ):
+                errors = sum(
+                    candidate in known[edge_positive_key(example)]
+                    and bool(scores.candidate_mask[index, column])
+                    and not bool(scores.positive_mask[index, column])
+                    for column, candidate in enumerate(candidates)
                 )
-                indices = set(
-                    list_rng.sample(range(len(legacy_candidates)), cap)
-                )
-                legacy_candidates = [
-                    value
-                    for index, value in enumerate(legacy_candidates)
-                    if index in indices
-                ]
-            selected_errors = set(legacy_candidates) & extra
-            audit["lists"] += 1
-            audit["legacy_known_positive_as_negative"] += len(selected_errors)
-            audit["affected_lists"] += int(bool(selected_errors))
-            audit["fixed_known_positive_as_negative"] += 0
+                audit[f"{label}_known_positive_as_negative"] += errors
+                audit[f"{label}_affected_lists"] += int(bool(errors))
     return dict(audit)
 
 
