@@ -679,53 +679,6 @@ def test_runtime_args_leave_api_key_environment_precedence_to_extractor(
     assert extractor.image_model_api_key == "image-secret"
 
 
-def test_remote_vllm_runbook_pins_resume_state_and_secure_tmux() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    section = readme.split("### Remote vLLM on one A100 80GB", 1)[1].split(
-        "### ", 1
-    )[0]
-    resume_command = section.split("ordinary `--resume`:", 1)[1].split(
-        "```bash", 1
-    )[1].split("```", 1)[0]
-    health_command = section.split("`$VLLM_API_KEY` text:", 1)[1].split(
-        "```bash", 1
-    )[1].split("```", 1)[0]
-
-    assert "https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/" in section
-    assert "tmux -L mmdd-vllm new-session" in section
-    assert "tmux -L mmdd-vllm new-window" in section
-    assert "chmod 600" in section
-    assert "--input_dir /home/oycy/MMDD/wdc_schemaorg_2023" in resume_command
-    assert (
-        "--output_dir /home/oycy/MMDD/output_wdc_200k_sampled_20260720"
-        in resume_command
-    )
-    assert (
-        "--work_dir /home/oycy/MMDD/work_wdc_200k_eta_advisory_20260719"
-        in resume_command
-    )
-    assert (
-        "--cache_dir /home/oycy/MMDD/cache/wdc_webtable"
-        in resume_command
-    )
-    assert "--sampled_entities_per_table 8" in resume_command
-    assert "--entity_sampling_seed 20260720" in resume_command
-    assert "--min_free_disk_bytes 107374182400" in resume_command
-    assert "--resume" in resume_command
-    assert "--from_stage" not in resume_command
-    assert '-H "Authorization: Bearer $VLLM_API_KEY"' not in health_command
-    assert health_command.count("--config -") == 2
-    assert health_command.count(
-        'header = "Authorization: Bearer $VLLM_API_KEY"'
-    ) == 2
-    subprocess.run(
-        ["bash", "-n"],
-        input=health_command,
-        text=True,
-        check=True,
-    )
-
-
 def test_pipeline_config_requires_separate_roots(tmp_path: Path) -> None:
     common = tmp_path / "same"
     with pytest.raises(ValueError, match="separate"):

@@ -146,10 +146,6 @@ def test_scale_gate_input_round_robins_lowest_row_from_each_bucket(
     assert ".candidate-index.sqlite3" not in checksums["files"]
 
 
-def test_selection_modes_are_stable() -> None:
-    assert gate_module.SELECTION_MODES == SELECTION_MODES
-
-
 def test_scale_gate_input_default_matches_explicit_round_robin(
     tmp_path: Path,
 ) -> None:

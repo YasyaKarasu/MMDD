@@ -3294,8 +3294,17 @@ def test_image_finish_fence_failure_preserves_root_error_and_resumes(
         assert connection.execute(
             "SELECT status, COUNT(*) FROM jobs GROUP BY status"
         ).fetchall() == [("retryable", 1)]
-    if failure_mode == "sqlite":
-        with sqlite3.connect(outcomes_path) as connection:
+    with sqlite3.connect(outcomes_path) as connection:
+        if failure_mode == "guard":
+            # Cleanup also hits the guard; simulate expiry of its leftover URL
+            # lease so recovery does not wait for the real 38-second timeout.
+            cursor = connection.execute(
+                "UPDATE image_url_claims SET lease_until = 0 "
+                "WHERE policy_fingerprint = ? AND url_key = ? AND status = 'leased'",
+                (fingerprint, url_key),
+            )
+            assert cursor.rowcount == 1
+        else:
             connection.execute("DROP TRIGGER fail_image_transport_finish")
 
     resumed_transport = FakeImageTransport(tmp_path, {image_url: "unique"})
@@ -3700,9 +3709,11 @@ class TrackingTerminalTransport:
 def test_image_scheduler_releases_host_state_for_many_unique_hosts(
     tmp_path: Path,
 ) -> None:
+    claim_buffer = 32
+    # Three buffers exercise host-state reclamation across repeated refills.
     urls = [
         f"https://h{index}.test/image.png"
-        for index in range(2_000)
+        for index in range(3 * claim_buffer)
     ]
     unique_path = tmp_path / "unique.jsonl"
     unique_jobs = write_unique_jobs(unique_path, urls)
@@ -3721,12 +3732,12 @@ def test_image_scheduler_releases_host_state_for_many_unique_hosts(
         policy,
         outcomes_path=tmp_path / "outcomes.sqlite3",
         image_dir=tmp_path / "content",
-        claim_buffer=32,
+        claim_buffer=claim_buffer,
     )
 
-    assert fetched.maximum_claimed <= 32
+    assert fetched.maximum_claimed <= claim_buffer
     assert fetched.maximum_inflight <= 8
-    assert fetched.maximum_host_states <= 32
+    assert fetched.maximum_host_states <= claim_buffer
     assert transport.calls == len(urls)
 
 

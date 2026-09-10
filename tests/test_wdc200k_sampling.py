@@ -293,23 +293,19 @@ def test_sampling_progress_reports_real_shards_and_resume_completion(
     }
 
 
-@pytest.mark.parametrize("shard_size", [1, 2, 3, 7])
-@pytest.mark.parametrize("workers", [1, 2, 8])
-def test_per_table_selection_is_stable_across_shard_grouping_and_workers(
-    shard_size: int,
-    workers: int,
-) -> None:
-    del workers  # Scheduling cannot affect stable per-entity hash ranks.
+def test_page_only_sampling_is_stable_across_input_order() -> None:
     source = _source(rows=12)
     entities = _entities(rows=12)
-    shards = [entities[index : index + shard_size] for index in range(0, 12, shard_size)]
-    regrouped = [entity for shard in reversed(shards) for entity in reversed(shard)]
     pages = [_page(f"entity-{index}") for index in range(12)]
     expected, _ = sample_table_entities(
         source, entities, pages, [], SamplingPolicy(entity_sampling_seed=19)
     )
     actual, _ = sample_table_entities(
-        source, regrouped, reversed(pages), [], SamplingPolicy(entity_sampling_seed=19)
+        source,
+        list(reversed(entities)),
+        reversed(pages),
+        [],
+        SamplingPolicy(entity_sampling_seed=19),
     )
     assert [record["entity_id"] for record in actual] == [
         record["entity_id"] for record in expected

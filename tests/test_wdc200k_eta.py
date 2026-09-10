@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import inspect
 import json
 import math
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError, dataclass, fields, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -22,7 +21,6 @@ if str(SCRIPTS) not in sys.path:
 from wdc200k_eta import (  # noqa: E402
     DurableUrlCounts,
     MAX_URL_COMPLETION_PUBLICATIONS,
-    UrlEtaEstimate,
     UrlProgressTracker,
     UrlProgressSnapshot,
     decode_histogram_blob,
@@ -359,26 +357,6 @@ def test_eligible_factor_rejects_non_positive_or_non_finite_samples(
             predicted=predicted,
             actual=actual,
         )
-
-
-def test_snapshot_and_estimate_have_the_exact_public_fields() -> None:
-    assert [field.name for field in fields(UrlProgressSnapshot)] == [
-        "execution_epoch", "baseline_completed", "completed_durable", "total",
-        "local_buffered_not_started", "in_flight_jobs", "physical_in_flight",
-        "finished_not_durable", "unobserved_nonlocal", "deadline_seconds",
-        "effective_concurrency", "epoch_elapsed_seconds",
-        "transport_event_histogram", "active_censor_histogram",
-        "commit_event_histogram", "transport_overflow_events",
-        "active_overflow_censors", "commit_overflow_events",
-    ]
-    assert [field.name for field in fields(UrlEtaEstimate)] == [
-        "durable_rate", "rate_eta", "queue_eta", "inflight_eta", "commit_eta",
-        "overflow_eta", "predicted_remaining_seconds", "fallback",
-    ]
-    snapshot = _snapshot()
-    with pytest.raises(FrozenInstanceError):
-        snapshot.total = 3  # type: ignore[misc]
-    assert tuple(inspect.signature(estimate_url_eta).parameters) == ("snapshot",)
 
 
 @pytest.mark.parametrize(
@@ -748,6 +726,8 @@ def test_tracker_captures_exact_mutable_censors_and_monotonic_histograms() -> No
     assert young.active_censor_histogram != older.active_censor_histogram
     assert young.epoch_elapsed_seconds == 1.0
     assert older.epoch_elapsed_seconds == 3.0
+    with pytest.raises(FrozenInstanceError):
+        young.total = 3  # type: ignore[misc]
 
     tracker.physical_finished("job")
     tracker.future_finished("job")

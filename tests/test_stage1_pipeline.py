@@ -1832,6 +1832,7 @@ def test_download_image_singleflight_shares_one_network_attempt(tmp_path):
 )
 def test_download_image_coordinates_retryable_and_terminal_http_responses(
     tmp_path,
+    monkeypatch,
     responses,
     expected_calls,
     expect_success,
@@ -1839,11 +1840,14 @@ def test_download_image_coordinates_retryable_and_terminal_http_responses(
     client = make_wikipedia_client(tmp_path, max_retries=1)
     session = SequenceImageSession(responses)
     client.session = session
+    retry_delays = []
+    monkeypatch.setattr(client.media_downloader, "_sleep", retry_delays.append)
 
     record = client.download_image(jpeg_info("Retry.jpg"), "asset_retry")
 
     assert (record is not None) is expect_success
     assert session.calls == expected_calls
+    assert retry_delays == ([5.0] if responses[0].status_code == 503 else [])
     assert not list((tmp_path / "images").glob("*.tmp"))
 
 

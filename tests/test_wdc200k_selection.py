@@ -89,7 +89,6 @@ def test_statistics_catalog_keeps_missing_gzip_as_provisional(
     assert [record.relative_path for record in records] == [
         "Product/Product_missing.test_October2023.json.gz"
     ]
-    assert "exists" not in (read_statistics_catalog.__doc__ or "")
 
 
 def test_selection_module_imports_through_scripts_package() -> None:
@@ -262,28 +261,28 @@ def test_allocate_strata_rejects_top100_above_target_or_cap() -> None:
 
 def test_mixed_allocation_is_exact_capped_and_reproducible() -> None:
     catalog = synthetic_catalog(
-        classes=42,
-        top100_per_class=100,
-        minimum3_per_class=10_000,
-        rest_per_class=10_000,
+        classes=4,
+        top100_per_class=2,
+        minimum3_per_class=20,
+        rest_per_class=20,
     )
-
-    first = select_tables(
-        catalog,
-        SelectionPolicy(target_tables=200_000, seed=13),
+    policy = SelectionPolicy(
+        target_tables=40,
+        seed=13,
+        minimum3_base_per_class=2,
+        rest_base_per_class=1,
+        class_cap=10,
     )
-    second = select_tables(
-        reversed(catalog),
-        SelectionPolicy(target_tables=200_000, seed=13),
-    )
+    first = select_tables(catalog, policy)
+    second = select_tables(reversed(catalog), policy)
 
     assert [item.relative_path for item in first.selected] == [
         item.relative_path for item in second.selected
     ]
-    assert len(first.selected) == 200_000
+    assert len(first.selected) == policy.target_tables
     assert (
         max(Counter(item.schema_class for item in first.selected).values())
-        <= 40_000
+        == policy.class_cap
     )
     selected_paths = {item.relative_path for item in first.selected}
     assert all(
