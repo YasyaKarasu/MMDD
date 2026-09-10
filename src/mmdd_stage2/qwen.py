@@ -173,8 +173,6 @@ class QwenStage2Backend:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Read the query table, selected evidence objects, and target table together."""
 
-        if not evidence:
-            raise ValueError("Candidate-column reading requires at least one evidence object")
         def reader_content(max_image_pixels: int | None) -> list[dict[str, Any]]:
             content: list[dict[str, Any]] = [
                 {
@@ -196,7 +194,7 @@ class QwenStage2Backend:
                     ),
                 }
             ]
-            text_limit = max(1, 12000 // len(evidence))
+            text_limit = max(1, 12000 // max(1, len(evidence)))
             for index, item in enumerate(evidence, 1):
                 label = f"\nEvidence {index} ({escape_marker_literals(item['asset_id'])}):"
                 if item.get("asset_type") == "image":
