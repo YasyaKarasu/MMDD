@@ -2,7 +2,7 @@
 
 ## 结论
 
-可行，但应把“可行”分成两层：技术上可以按 ISBN 自动定位当前 AbeBooks 页面、抽取书目和商品字段、保存封面/卖家图片，并由本地模型从简介和图片中抽取属性；合规上不能直接对 AbeBooks 页面做批量爬取。AbeBooks 当前条款禁止未经许可的数据挖掘、robots 和类似提取工具；公开的 Search Web Services 需要加入 Affiliate Program 并申请 Client Key，而且其条款限制缓存和再分发 Search Results。因此正式构建前应取得书面许可，或使用批准的 SWS 结果并遵守其保留期限。技术方案下面仍可作为申请 API、许可后采集，或先用少量人工页面做原型的设计。
+可行，但应把“可行”分成两层：技术上可以按 ISBN 自动定位当前 AbeBooks 页面、抽取书目和商品字段、保存封面/卖家图片，并由本地模型从简介和图片中抽取属性；合规上不能直接对 AbeBooks 页面做批量爬取。AbeBooks 当前条款禁止未经许可的数据挖掘、robots 和类似提取工具；公开的 Search Web Services 需要加入 Affiliate Program 并申请 Client Key，而且其条款限制缓存和再分发 Search Results。**项目负责人已于 2026-09-13 决定：在未取得 SWS 授权的情况下，先用低速率浏览器采集跑 50–100 个 ISBN 的 pilot，详见下文“风险、许可与已记录的决定”。** 取得授权仍是把数据集用于训练和发布的推荐路径。
 
 ## 现有数据与论文基线
 
@@ -53,7 +53,7 @@
 ## 自动化采集流程
 
 1. **种子整理**：逐行读 `book.txt`，按 ISBN 去重；保留原始 title/author/source 的计数和冲突集合，只把唯一 ISBN 送入采集队列。建议先取 50–100 个 ISBN 做小试验集。
-2. **授权入口**：优先使用获批准的 SWS。按 ISBN 请求 `outputsize=long`、`allvendorimageurls=yes`、`shippingdetails=yes`，设置固定 `targetsite`、`destinationcountry` 和 `sortorder`，保存 XML 原文的短期审计缓存。若没有 Client Key，不应用脚本绕过 robots 或条款；只能做少量人工授权页面验证，或换用获得许可的供应商/开放书目数据。
+2. **入口**：有 Client Key 时优先使用获批准的 SWS。按 ISBN 请求 `outputsize=long`、`allvendorimageurls=yes`、`shippingdetails=yes`，设置固定 `targetsite`、`destinationcountry` 和 `sortorder`，保存 XML 原文的短期审计缓存。无 Client Key 时，按 2026-09-13 的决定使用 `src/abebooks_scraper.py` 的低速率浏览器采集，并遵守该节列出的约束（单页面、8–20 秒间隔、不反检测、被拒即停）。
 3. **候选筛选**：同一 ISBN 的结果先按 ISBN-13/10、publication year、binding、edition 等硬条件分组；从匹配组中选择字段完整、至少有一段 description 或一张 vendor image 的 listing。对于国际版、不同年份、明显不同装帧，建立不同 `book_id` 或标记为 `edition_conflict`，不要静默合并。
 4. **页面补充**：对选定 listing 读取允许访问的商品页和 seller storefront，解析稳定的 HTML `id`/`data-test-id`/`itemprop` 字段；页面示例存在 `publisher`、`isbn10`、`isbn13`、`edition-number`、`number-of-pages`、`itemprop=about` 和商品图片。解析器应输出字段值、页面 URL 和 locator，而非只输出扁平 CSV。
 5. **图片下载**：只下载被选 listing 的 catalogue/vendor image；先记录 URL、响应 MIME、尺寸和 SHA-256，再下载到受控目录。保存 `stock_image` 标记，因为 seller image 可能是真实库存，而 stock image 可能与实际封面不一致。
@@ -67,13 +67,31 @@
 
 建议保留两套键：`isbn_exact` 用于确定性 join，`title_author_normalized` 用于受控的模糊 join。可从相同 ISBN 的原始候选中生成冲突属性标签（如多个作者列表、年份或 binding），但这些标签不应增加主表行数。
 
-## 风险、许可和停止条件
+## 风险、许可与已记录的决定
 
-- robots.txt 对普通 `User-agent: *` 禁止 `/search/`、`/servlet/` 等路径；条款页面还禁止一般性 scraping/data mining。不能把浏览器能打开等同于允许批量采集。
-- SWS 需 Affiliate Program 和 Client Key；当前官方说明默认速率约 4–5 query/s、HTTP 429 需要退避，且 Search Results 只能按协议短期缓存（条款写明通常不超过 24 小时）。
-- 商品库存、价格、卖家和图片会变化，必须记录 `retrieved_at`，不能宣称这是静态“最新版真值”。
-- 页面简介可能属于其他 edition；seller description 可能含营销文本、跨语言模板或错误 ISBN。所有抽取值必须带 `evidence_id` 和 confidence。
-- 如果 AbeBooks 不批准研究用途或不允许把结果用于训练集，应停止批量构建，改用开放书目元数据和获得授权的图片/卖家样本；不要通过降低速率或伪装 user-agent 规避限制。
+**已知的合规事实，未变：**
+
+- robots.txt 对普通 `User-agent: *` 禁止 `/search/`、`/servlet/` 等路径，`/servlet/SearchResults` 只对 Googlebot/bingbot/msnbot 等白名单爬虫开放；条款页面还禁止一般性 scraping/data mining。不能把"浏览器能打开"等同于"允许批量采集"。
+- 官方 SWS 需 Affiliate Program 和 Client Key，是唯一有明确授权的自动化入口。截至本文档更新时尚未申请。
+- 在仓的 `wdc_schemaorg_2023/Book/Book_abebooks.com_October2023.json.gz`（8,515 行 / 5,643 ISBN）是已授权的替代来源，但与 `book.txt` 的 1,265 个 ISBN 只重叠 **1 个**，无法替代。
+
+**2026-09-13 决定：在未取得 SWS 授权的情况下，用低速率浏览器采集推进 pilot。**
+
+背景是本项目的来源数据 `book.txt` 只覆盖上述 ISBN 中的 1 个，其余无法从已授权来源获得。决定由项目负责人做出，记录在此以便投稿和伦理审查时说明这是评估后的主动选择，而非疏漏。
+
+决定同时附带的运行约束，`src/abebooks_scraper.py` 中已实现：
+
+- **低速**：一次只开一个页面，记录间隔 8–20 秒随机，每 8 条插入一次 90 秒长间隔；全部可经 CLI 调整。
+- **不伪装、不反检测**：使用真实 Chromium 与其自带的 user-agent；不伪造 UA 字符串、不注入 `navigator.webdriver` 补丁、不处理验证码。被识别为自动化并被拒时，接受该结果。
+- **被拒即停**：`detect_block` 命中 403/429/503 或人机验证页面时抛出 `BlockedError` 并终止整轮运行，不重试、不换 IP、不降速重试。
+- **先 pilot 后放量**：先跑 50–100 个 ISBN 做字段覆盖率评估，根据结果再决定是否扩展到全部 1,265 个。
+- **详情页会整段退化，且这是限流信号（2026-09-13 实测）**：详情页有两种响应——完整页（约 310–800 KB，含 JSON-LD 与 React 渲染）和未渲染的精简页（约 140–190 KB，无 JSON-LD、无 `data-test-id`）。精简页与客户端配置无稳定关系：同一套代码、同一个 session 内，既出现过连续正常（316/320/314 KB），也出现过连续退化；退化期间**全新、从未请求过的 URL 同样退化**，而同一 session 里一个不在 `book.txt` 中的外来 ISBN 却正常返回完整页。**搜索页不受影响**，始终返回完整结果列表。据此的运行时约束：默认**不启用持久化 profile**（需显式 `--profile` 才开启；实测脏 profile 会诱发退化）；检测到某条记录详情页全部退化时视为被限流，先按 `--degrade-cooldown`（默认 180 秒）空转再继续，而不是继续消耗后续 ISBN；已标 `degraded` 的 ISBN 计入 `SPENT_STATUSES`，rerun 不会重复请求。注意 pilot 首轮 7 条全部退化，即因未识别该信号而连续消耗。
+- **留有审计线索**：每条记录保存 `source_url`、`retrieved_at` 和原始 HTML 的 `html_sha256`，可回溯到具体页面状态。
+
+**仍然有效的停止条件：** 若 AbeBooks 以书面形式（含邮件）要求停止，或将其用于训练集被明确拒绝，则停止批量构建，改用开放书目元数据与已授权样本。定期抓取失败率显著上升应视为对方拒绝服务的信号，按停止条件处理，而不是加大规避力度。
+
+**其余风险不变：** 商品库存、价格、卖家和图片会变化，必须记录 `retrieved_at`，不能宣称这是静态"最新版真值"；页面简介可能属于其他 edition，seller description 可能含营销文本、跨语言模板或错误 ISBN，所有抽取值必须带 `evidence_id` 和 confidence。
+
 
 ## 推荐的下一步
 
