@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import shutil
 import sqlite3
 import sys
@@ -340,7 +341,31 @@ class StructuralStageBarrier:
         object.__setattr__(self, "final_selection", final_selection)
 
 
-def _connect(path: Path, *, timeout: float = 30.0) -> sqlite3.Connection:
+def _begin_immediate_with_retry(
+    connection: sqlite3.Connection,
+    *,
+    max_attempts: int = 10,
+    base_delay: float = 1.0,
+) -> None:
+    _BEGIN = "BEGIN IMMEDIATE"
+    for attempt in range(max_attempts):
+        try:
+            connection.execute(_BEGIN)
+            return
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc):
+                raise
+            if attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** min(attempt, 4)) + random.random() * 0.5
+            logging.warning(
+                "BEGIN IMMEDIATE locked (attempt %d/%d), retrying in %.1fs",
+                attempt + 1, max_attempts, delay,
+            )
+            time.sleep(delay)
+
+
+def _connect(path: Path, *, timeout: float = 120.0) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=timeout)
     connection.row_factory = sqlite3.Row
     return connection
@@ -457,7 +482,7 @@ def _initialize_tables(
     connection = _connect(path)
     try:
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS model_jobsets (
@@ -803,7 +828,7 @@ def enqueue_model_tasks(
     }
     now = time.time()
     with _connect(store.path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         for modality in ("text", "image"):
             connection.execute(
                 """
@@ -964,7 +989,7 @@ def enqueue_model_tasks(
             membership_digests[modality] = digest.hexdigest()
 
         with _connect(store.path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             frozen: dict[str, bool] = {}
             for modality in ("text", "image"):
                 jobset_row = connection.execute(
@@ -1590,7 +1615,7 @@ def _fenced_commit_cached_model_records(
     # writer and then failing with ``database is locked``.
     with _MODEL_BATCH_WRITE_LOCK:
         with _connect(database_path, timeout=120.0) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             rows_by_id: dict[str, sqlite3.Row] = {}
             for start in range(
                 0, len(payload_valid), _CACHE_LOOKUP_BATCH_SIZE
@@ -1696,7 +1721,7 @@ def _fenced_commit_cached_model_records(
 
     with _MODEL_BATCH_WRITE_LOCK:
         with _connect(database_path, timeout=120.0) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             finalized = finish_rows(connection, valid)
             if finalized:
                 if write_tracker is not None:
@@ -1715,7 +1740,7 @@ def _repair_durable_results(
 ) -> int:
     repaired = 0
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         for modality in ("text", "image"):
             rows = connection.execute(
                 """
@@ -1864,7 +1889,7 @@ def _reclaim_orphaned_local_leases(
         write_tracker.before_write(4096 * len(orphaned))
     reclaimed = 0
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         for status, owner in orphaned:
             pending_status = (
                 "review_pending" if status == "review_leased" else "retryable"
@@ -1914,7 +1939,7 @@ def _extend_leases(
 ) -> set[str]:
     renewed: set[str] = set()
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         now = time.time()
         for job in jobs:
             cursor = connection.execute(
@@ -2038,7 +2063,7 @@ def _fenced_commit_model_record(
             8192 + 4 * len(encoded.encode("utf-8"))
         )
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         row = connection.execute(
             """
             SELECT kind, payload_json, status, owner, lease_id,
@@ -2104,7 +2129,7 @@ def _fenced_commit_model_record(
     if heartbeat.is_lost(str(job.job_id)):
         return False
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         finish_time = time.time()
         cursor = connection.execute(
             """
@@ -2191,7 +2216,7 @@ def _fenced_retry_model_job(
 ) -> bool:
     encoded = _canonical_json(record)
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         now = time.time()
         row = connection.execute(
             """
@@ -2266,7 +2291,7 @@ def _fenced_defer_remote_review(
             4096 + 2 * len(encoded.encode("utf-8"))
         )
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         cursor = connection.execute(
             """
             UPDATE jobs
@@ -2313,7 +2338,7 @@ def _fenced_retry_remote_review(
             4096 + 2 * len(encoded.encode("utf-8"))
         )
     with _connect(database_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+        _begin_immediate_with_retry(connection)
         cursor = connection.execute(
             """
             UPDATE jobs

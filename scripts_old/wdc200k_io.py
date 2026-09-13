@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import json
 import os
+import random
 import sqlite3
 import sys
 import tempfile
@@ -378,6 +379,31 @@ class Job:
     lease_id: str | None
 
 
+def _begin_immediate_with_retry(
+    connection: sqlite3.Connection,
+    max_attempts: int = 8,
+    base_delay: float = 0.5,
+) -> None:
+    _BEGIN = "BEGIN IMMEDIATE"
+    for attempt in range(max_attempts):
+        try:
+            connection.execute(_BEGIN)
+            return
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc):
+                raise
+            if attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** min(attempt, 4)) + random.random() * 0.5
+            logging.getLogger(__name__).warning(
+                "BEGIN IMMEDIATE locked (attempt %d/%d), retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+
 class SqliteJobStore:
     """Persistent SQLite-backed leases and terminal outcomes."""
 
@@ -399,7 +425,7 @@ class SqliteJobStore:
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -436,7 +462,7 @@ class SqliteJobStore:
             connection.close()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
+        connection = sqlite3.connect(self.path, timeout=120.0)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -487,7 +513,7 @@ class SqliteJobStore:
         lease_expires = now + lease_seconds
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             status_placeholders = ",".join("?" for _ in pending_statuses)
             rows = connection.execute(
                 f"""
@@ -562,7 +588,7 @@ class SqliteJobStore:
         now = time.time()
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate_with_retry(connection)
             count = int(
                 connection.execute(
                     """
