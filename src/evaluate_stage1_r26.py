@@ -55,7 +55,7 @@ def summarize(rows: list[dict]) -> dict:
 
 
 @torch.inference_mode()
-def evaluate(generator_id: str, device_name: str, index_threads: int = 4) -> dict:
+def evaluate(generator_id: str, device_name: str, index_threads: int = 4, *, legacy_diagnostics: bool = True) -> dict:
     torch.set_num_threads(4)
     device = torch.device(device_name)
     if not torch.cuda.is_available():
@@ -77,6 +77,8 @@ def evaluate(generator_id: str, device_name: str, index_threads: int = 4) -> dic
                  "code_sha256": {name: sha256(ROOT / "src" / name) for name in (
                      "evaluate_stage1_r26.py", "mmdd_stage1/r26_metrics.py", "mmdd_stage1/retrieval.py",
                      "run_stage1_r11_task_e.py", "mmdd_stage1/row_support.py", "mmdd_stage1/models.py")}}
+    if not legacy_diagnostics:
+        signature["legacy_diagnostics"] = False
     destination = OUT / "rankings" / generator_id
     destination.mkdir(parents=True, exist_ok=True)
     receipt_path = destination / "RETRIEVAL_RECEIPT.json"
@@ -168,13 +170,20 @@ def evaluate(generator_id: str, device_name: str, index_threads: int = 4) -> dic
             qt_rank = sorted(union, key=lambda t: (-qt[t], t))
             exact = [table_ids[j] for j in positions[i]]
             m = exact[:len(union)]
-            fusion = fuse_channels(direct, evidence)
-            # Natural LSE uses actual path logits, not D1 coverage strengths.
-            natural_scores = fused_lse(qt, retrieved["evidence"])
+            if legacy_diagnostics:
+                fusion = fuse_channels(direct, evidence)
+                natural_scores = fused_lse(qt, retrieved["evidence"])
+            else:
+                from run_stage1_r27_scores import equal_rank
+                equal, equal_scores = equal_rank(d, e)
+                fusion = {"rankings": {"Equal": equal}, "scores": {"Equal": equal_scores}}
+                natural_scores = None
             truth = set(meta["positive_target_ids"])
             rankings = {"D100_ANN": d, "D100_EXACT": exact[:100], "U": qt_rank, "M_EXACT": m,
-                        "QT_OVER_U": qt_rank, "E_ONLY": e, "PATH_FUSED_LSE": sorted(union, key=lambda t: (-natural_scores[t], t)),
+                        "QT_OVER_U": qt_rank, "E_ONLY": e,
                         **fusion["rankings"]}
+            if legacy_diagnostics:
+                rankings["PATH_FUSED_LSE"] = sorted(union, key=lambda t: (-natural_scores[t], t))
             output_rows.append({**meta, "generator_id": generator_id, "parameter_sha": signature["parameter_sha256"],
                 "index_id": stable_sha(signature), "retrieval_protocol_id": stable_sha(protocol),
                 "candidate_pool_id": stable_sha({"q": meta["query_id"], "D": d, "E": e}), "rankings": rankings,

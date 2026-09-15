@@ -31,7 +31,7 @@ def metrics(rows: list[dict]) -> dict:
 
 
 @torch.inference_mode()
-def run(generators: list[str], device_name: str, benchmark_queries: int) -> dict:
+def run(generators: list[str], device_name: str, benchmark_queries: int, *, cache_name: str = "T0_pairs.sqlite") -> dict:
     torch.set_num_threads(4)
     device = torch.device(device_name)
     checkpoint = ROOT / "work/stage1_optimization_r22_20260911/fresh_lineage/T1-B/seed13/checkpoints/step_010536.pt"
@@ -48,7 +48,7 @@ def run(generators: list[str], device_name: str, benchmark_queries: int) -> dict
     namespace = stable_sha(identity)
     _json(directory / "CACHE_IDENTITY.json", {**identity, "namespace": namespace,
           "pair_key": ["namespace", "query_id", "target_id", "actual_query_feature_sha", "actual_target_feature_sha"]})
-    cache = TeacherPairCache(directory / "T0_pairs.sqlite", namespace, teacher, store, device)
+    cache = TeacherPairCache(directory / cache_name, namespace, teacher, store, device)
     initialization_seconds = time.monotonic()-started
     completed = []
     for generator in generators:
