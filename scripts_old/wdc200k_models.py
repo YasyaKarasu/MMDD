@@ -112,6 +112,20 @@ _ADAPTER_WORK_QUEUE_FACTOR = 2
 _ADAPTER_CHECKPOINT_SOURCE_SHARDS = 32
 
 
+def _json_dumps(value: Any, **kwargs: Any) -> str:
+    """Serialize JSON and escape lone surrogates only when necessary."""
+    ensure_ascii = bool(kwargs.setdefault("ensure_ascii", False))
+    encoded = json.dumps(value, **kwargs)
+    if ensure_ascii:
+        return encoded
+    try:
+        encoded.encode("utf-8")
+    except UnicodeEncodeError:
+        kwargs["ensure_ascii"] = True
+        return json.dumps(value, **kwargs)
+    return encoded
+
+
 @dataclass(frozen=True)
 class ModelJobInfo:
     job_id: str
@@ -372,7 +386,7 @@ def _connect(path: Path, *, timeout: float = 120.0) -> sqlite3.Connection:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
+    return _json_dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
@@ -454,12 +468,13 @@ def _atomic_json(
     try:
         with temporary.open("w", encoding="utf-8") as raw_handle:
             handle = GuardedTextWriter(raw_handle, tracker)
-            json.dump(
-                payload,
-                handle,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+            handle.write(
+                _json_dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
             )
             handle.write("\n")
             raw_handle.flush()
@@ -4457,9 +4472,7 @@ class _AdapterTempJsonlWriter:
         self.records = 0
 
     def write(self, record: dict[str, Any]) -> None:
-        encoded = (
-            json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
-        )
+        encoded = _json_dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
         self.tracker.before_write(len(encoded))
         self.handle.write(encoded)
         self.digest.update(encoded)

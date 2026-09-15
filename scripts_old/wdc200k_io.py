@@ -50,6 +50,27 @@ class CompletedShard:
 PreWriteGuard = Callable[[Path, int], None]
 
 
+def _json_dumps(value: Any, **kwargs: Any) -> str:
+    """Serialize JSON while tolerating lone UTF-16 surrogate code points.
+
+    Some upstream pages and model responses contain escaped surrogate code
+    points.  ``ensure_ascii=False`` preserves normal Unicode, but attempting
+    to encode such a string as UTF-8 raises ``UnicodeEncodeError``.  Fall
+    back to ASCII escapes only for those records so existing fingerprints and
+    human-readable Unicode remain unchanged in the common case.
+    """
+    ensure_ascii = bool(kwargs.setdefault("ensure_ascii", False))
+    encoded = json.dumps(value, **kwargs)
+    if ensure_ascii:
+        return encoded
+    try:
+        encoded.encode("utf-8")
+    except UnicodeEncodeError:
+        kwargs["ensure_ascii"] = True
+        return json.dumps(value, **kwargs)
+    return encoded
+
+
 def _guard_write(
     guard: PreWriteGuard | None,
     path: Path,
@@ -184,7 +205,7 @@ class AtomicJsonlShard:
     def write(self, record: dict[str, Any]) -> None:
         if self._handle.closed:
             raise RuntimeError("cannot write to a closed shard")
-        encoded = json.dumps(record, ensure_ascii=False) + "\n"
+        encoded = _json_dumps(record, ensure_ascii=False) + "\n"
         self.write_text(encoded)
         self._records += 1
 
@@ -349,12 +370,13 @@ class StageManifest:
         try:
             with temporary_path.open("w", encoding="utf-8") as raw_handle:
                 handle = GuardedTextWriter(raw_handle, tracker)
-                json.dump(
-                    payload,
-                    handle,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
+                handle.write(
+                    _json_dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
                 )
                 handle.write("\n")
                 raw_handle.flush()
@@ -476,7 +498,7 @@ class SqliteJobStore:
 
     def enqueue(self, kind: str, job_id: str, payload: dict[str, Any]) -> None:
         now = time.time()
-        encoded_payload = json.dumps(payload, ensure_ascii=False)
+        encoded_payload = _json_dumps(payload, ensure_ascii=False)
         self._write_tracker.before_write(
             4096 + 2 * len(encoded_payload.encode("utf-8"))
         )
@@ -639,7 +661,7 @@ class SqliteJobStore:
         encoded_result = (
             None
             if result is None
-            else json.dumps(result, ensure_ascii=False)
+            else _json_dumps(result, ensure_ascii=False)
         )
         self._write_tracker.before_write(
             4096
@@ -707,7 +729,7 @@ class SqliteJobStore:
 
 def _external_key(key: Any) -> str:
     try:
-        return json.dumps(
+        return _json_dumps(
             key,
             ensure_ascii=False,
             sort_keys=True,

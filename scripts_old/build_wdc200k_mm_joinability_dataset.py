@@ -140,6 +140,20 @@ STAGES = (
 )
 
 
+def _json_dumps(value: Any, **kwargs: Any) -> str:
+    """Serialize JSON, escaping only otherwise-invalid lone surrogates."""
+    ensure_ascii = bool(kwargs.setdefault("ensure_ascii", False))
+    encoded = json.dumps(value, **kwargs)
+    if ensure_ascii:
+        return encoded
+    try:
+        encoded.encode("utf-8")
+    except UnicodeEncodeError:
+        kwargs["ensure_ascii"] = True
+        return json.dumps(value, **kwargs)
+    return encoded
+
+
 class DiskSpaceInsufficientError(RuntimeError):
     """Raised before a stage could violate the configured disk reserve."""
 
@@ -2313,12 +2327,13 @@ def _atomic_json(
     try:
         with temporary.open("w", encoding="utf-8") as raw_handle:
             handle = GuardedTextWriter(raw_handle, tracker)
-            json.dump(
-                payload,
-                handle,
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
+            handle.write(
+                _json_dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
             )
             handle.write("\n")
             raw_handle.flush()
@@ -2597,7 +2612,7 @@ def _read_only_job_scope(path: Path, kind: str) -> dict[str, Any]:
         ):
             records += 1
             digest.update(
-                json.dumps(
+                _json_dumps(
                     list(row),
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -2720,7 +2735,7 @@ def _read_only_transport_attempt_summary(
                 terminal_replays += int(baseline == "terminal")
                 unfinished += int(not finished)
             digest.update(
-                json.dumps(
+                _json_dumps(
                     values,
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -4488,7 +4503,7 @@ def _structural_exact_counts(
         connection.execute("DELETE FROM page_urls")
         for result in results:
             for record in _iter_jsonl(result.page_refs):
-                encoded = json.dumps(record, ensure_ascii=False)
+                encoded = _json_dumps(record, ensure_ascii=False)
                 write_tracker.before_write(
                     4096 + 2 * len(encoded.encode("utf-8"))
                 )
@@ -7209,7 +7224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr, flush=True)
         return 2
     print(
-        json.dumps(
+        _json_dumps(
             {
                 "status": result.status,
                 "stage": result.stage,

@@ -48,6 +48,33 @@ def test_atomic_shard_is_visible_only_after_commit(tmp_path: Path) -> None:
     assert validate_completed_shard(record, root=tmp_path)
 
 
+def test_json_writes_escape_lone_surrogates(tmp_path: Path) -> None:
+    shard = AtomicJsonlShard(tmp_path / "part-00000.jsonl")
+    shard.write({"bad": "\ud800", "normal": "中文"})
+    shard.commit()
+
+    text = shard.path.read_text(encoding="utf-8")
+    assert json.loads(text) == {"bad": "\ud800", "normal": "中文"}
+    assert "\\ud800" in text
+
+    store = SqliteJobStore(tmp_path / "jobs.sqlite3")
+    store.enqueue("model", "job", {"bad": "\ud800"})
+    job = store.claim("model", limit=1, owner="worker")[0]
+    store.finish(
+        "job",
+        status="success",
+        result={"bad": "\ud800"},
+        owner="worker",
+        lease_id=job.lease_id,
+    )
+    with sqlite3.connect(store.path) as connection:
+        payload_json, result_json = connection.execute(
+            "SELECT payload_json, result_json FROM jobs WHERE job_id = 'job'"
+        ).fetchone()
+    assert json.loads(payload_json) == {"bad": "\ud800"}
+    assert json.loads(result_json) == {"bad": "\ud800"}
+
+
 def test_atomic_shard_guard_runs_before_open_write_and_commit(
     tmp_path: Path,
 ) -> None:

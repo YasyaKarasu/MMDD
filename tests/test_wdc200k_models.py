@@ -41,6 +41,15 @@ from wdc200k_models import (
 )
 
 
+def test_canonical_json_escapes_lone_surrogates_without_changing_unicode() -> None:
+    encoded = models._canonical_json({"bad": "\ud800", "normal": "中文"})
+
+    assert encoded.encode("utf-8")
+    assert json.loads(encoded) == {"bad": "\ud800", "normal": "中文"}
+    assert "\\ud800" in encoded
+    assert "中文" in models._canonical_json({"normal": "中文"})
+
+
 def model_args(
     *,
     text_model_name: str = "text-v1",
