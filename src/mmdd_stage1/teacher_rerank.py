@@ -161,9 +161,18 @@ def _teacher_scores(
     device: torch.device,
     batch_size: int,
     score_cache: dict[tuple[str, str], float] | None = None,
+    compression_cache: Any | None = None,
 ) -> list[float]:
     query = _device_features(teacher, store, query_id, device)
-    compression_cache: dict[str, torch.Tensor] = {}
+    # R19 Global Teacher caches carry checkpoint ownership metadata; a plain
+    # dict is valid for the newer TeacherJoinabilityModel but rejected by the
+    # historical R19 checkpoint loader.
+    if compression_cache is None:
+        compression_cache = (
+            teacher.new_compression_cache()
+            if hasattr(teacher, "new_compression_cache")
+            else {}
+        )
     computed_scores: dict[str, float] = {}
     missing_ids = [
         candidate_id

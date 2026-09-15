@@ -154,6 +154,8 @@ def _target_positive_id_set(
 
 
 def _edge_positive_id_set(example: EdgeExample) -> set[str]:
+    if not example.positive_ids and example.positive_index < 0:
+        return set()
     return set(example.positive_ids) or {
         example.candidate_ids[example.positive_index]
     }
@@ -724,7 +726,14 @@ def score_target_batch(
                     )
 
     if isinstance(model, TeacherJoinabilityModel):
-        compression_cache: dict[str, torch.Tensor] = {}
+        # R19 Teacher compression caches are owner-tagged by checkpoint.
+        # A plain dict bypasses that identity contract and fails as soon as
+        # the global Teacher representation is scored on a new target pool.
+        compression_cache: dict[str, torch.Tensor] = (
+            model.new_compression_cache()
+            if hasattr(model, "new_compression_cache")
+            else {}
+        )
         direct_scores = _score_teacher_pairs(
             model,
             direct_sources,

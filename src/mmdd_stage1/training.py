@@ -586,16 +586,24 @@ def _student_edge_losses(
         if supervised_scores is not None
         else student_scores.logits.new_zeros(())
     )
-    distillation = (
-        distillation_kl(
-            student_scores.logits,
-            teacher_scores.logits,
-            student_scores.candidate_mask,
-            temperature,
-        )
-        if teacher_scores is not None
-        else student_scores.logits.new_zeros(())
-    )
+    if teacher_scores is None:
+        distillation = student_scores.logits.new_zeros(())
+    else:
+        # Teacher targets may be present only for a relation subset (for
+        # example TT rows in the fresh-lineage runner).  Intersect the masks
+        # and remove rows with no valid Teacher candidates before softmax;
+        # passing an all-False row to distillation_kl would produce NaNs.
+        kd_mask = student_scores.candidate_mask & teacher_scores.candidate_mask
+        usable = kd_mask.any(dim=-1)
+        if usable.any().item():
+            distillation = distillation_kl(
+                student_scores.logits[usable],
+                teacher_scores.logits[usable],
+                kd_mask[usable],
+                temperature,
+            )
+        else:
+            distillation = student_scores.logits.new_zeros(())
     absolute = student_scores.logits.new_zeros(())
     if edge_bce_weight > 0:
         if confidence_scores is None:

@@ -23,7 +23,7 @@ from mmdd_stage1.scoring import _expanded_candidate_ids, edge_positive_key, glob
 from mmdd_stage1.training import sample_mixed_epoch
 
 
-def materialize_batch(batch, known, ann_hits, seed, epoch, step, cap=256):
+def materialize_batch(batch, known, ann_hits, seed, epoch, step, cap=256, *, enforce_positive_closure=False):
     pools = defaultdict(list)
     for row in batch:
         pools[row.destination_type].extend(row.candidate_ids)
@@ -35,6 +35,16 @@ def materialize_batch(batch, known, ann_hits, seed, epoch, step, cap=256):
                              row.candidate_ids[row.positive_index]))
         rng = random.Random(f"{seed}:epoch={epoch}:step={step}:{identity}")
         base = _expanded_candidate_ids(row.candidate_ids, pools[row.destination_type], positives, cap, rng)
+        if enforce_positive_closure:
+            # R25 requires every train-known positive for this ordered
+            # relation to survive materialization.  Historical R12 schedules
+            # predated this explicit closure and are left unchanged by the
+            # default flag.
+            missing = sorted(positives - set(base))
+            base = [*missing, *base]
+            if len(base) > cap:
+                negatives = [value for value in base if value not in positives]
+                base = [*sorted(positives), *negatives[: max(0, cap - len(positives))]]
         local_positives = [value for value in base if value in positives]
         negatives = [value for value in base if value not in positives]
         quota = len(negatives) // 2
