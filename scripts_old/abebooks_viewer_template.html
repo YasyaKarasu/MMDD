@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AbeBooks 四张表</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --panel:#fff; --ink:#141a21; --muted:#69737f; --line:#d8dee6;
+    --soft:#eef1f5; --accent:#1f6feb; --accent-soft:#e7effd; --null:#aab3bf;
+    --green:#0b7a46; --amber:#8a5a00; --red:#b42318; --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#12161b; --panel:#191e25; --ink:#e6eaf0; --muted:#98a3b1; --line:#2b333d;
+           --soft:#212832; --accent:#5a9bff; --accent-soft:#1b2a41; --null:#5d6874;
+           --green:#4ec38a; --amber:#d8a13a; --red:#f2726a; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       -webkit-text-size-adjust:100%}
+  a{color:var(--accent)}
+  code,.mono{font-family:var(--mono);font-size:.92em}
+  .wrap{padding:0 16px 64px;max-width:100%}
+
+  header.top{display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between;align-items:flex-end;
+             padding:18px 16px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header.top h1{margin:0;font-size:19px;font-weight:650;letter-spacing:.2px}
+  header.top .sub{margin:4px 0 0;color:var(--muted);font-size:12.5px}
+  header.top .meta{color:var(--muted);font-size:12px;text-align:right;line-height:1.7}
+  header.top .meta b{color:var(--ink);font-weight:600}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px;padding:14px 0 4px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:11px 13px;min-width:0}
+  .card h3{margin:0 0 8px;font-size:11.5px;font-weight:650;color:var(--muted);
+           text-transform:uppercase;letter-spacing:.7px;display:flex;justify-content:space-between;gap:8px}
+  .card h3 span{font-weight:500;text-transform:none;letter-spacing:0}
+  .kv{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:1.5px 0}
+  .kv .k{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .kv .v{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+  .bar{height:4px;border-radius:2px;background:var(--soft);margin-top:5px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--accent);border-radius:2px}
+  .card.big .v{font-size:21px;font-weight:680}
+  .note{color:var(--muted);font-size:12.5px;margin:0}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
+  .chip{background:var(--soft);border-radius:5px;padding:1.5px 6px;font-family:var(--mono);font-size:11.5px}
+
+  nav.tabs{display:flex;gap:2px;overflow-x:auto;padding:16px 0 0;border-bottom:1px solid var(--line);
+           position:sticky;top:0;background:var(--bg);z-index:20;scrollbar-width:thin}
+  nav.tabs button{appearance:none;border:0;background:none;color:var(--muted);cursor:pointer;
+                  font:inherit;font-size:13.5px;font-weight:550;padding:8px 13px;border-bottom:2px solid transparent;
+                  white-space:nowrap;display:flex;gap:7px;align-items:center}
+  nav.tabs button:hover{color:var(--ink)}
+  nav.tabs button[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
+  nav.tabs .n{background:var(--soft);border-radius:20px;padding:0 7px;font-size:11.5px;
+              font-variant-numeric:tabular-nums;font-weight:600;color:var(--muted)}
+  nav.tabs button[aria-selected=true] .n{background:var(--accent-soft);color:var(--accent)}
+
+  .toolbar{display:flex;flex-wrap:wrap;gap:9px;align-items:center;padding:12px 0}
+  .toolbar input[type=search],.toolbar select{font:inherit;font-size:13px;color:var(--ink);background:var(--panel);
+       border:1px solid var(--line);border-radius:7px;padding:6px 10px}
+  .toolbar input[type=search]{min-width:min(360px,100%);flex:1 1 240px}
+  .toolbar input[type=search]:focus,.toolbar select:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+  .toolbar label.chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer;
+                     background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:6px 10px}
+  .toolbar label.chk input{margin:0}
+  details.picker{position:relative}
+  details.picker>summary{list-style:none;cursor:pointer;font-size:13px;color:var(--muted);background:var(--panel);
+       border:1px solid var(--line);border-radius:7px;padding:6px 10px;user-select:none}
+  details.picker>summary::-webkit-details-marker{display:none}
+  details.picker[open]>summary{border-color:var(--accent);color:var(--accent)}
+  details.picker .pop{position:absolute;z-index:30;top:calc(100% + 5px);left:0;width:330px;max-height:60vh;overflow:auto;
+       background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px;
+       box-shadow:0 10px 28px rgba(0,0,0,.16)}
+  .pop .actions{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+  .pop .actions button{font:inherit;font-size:12px;background:var(--soft);border:0;border-radius:6px;
+       padding:4px 9px;cursor:pointer;color:var(--ink)}
+  .pop .actions button:hover{background:var(--accent-soft);color:var(--accent)}
+  .pop label{display:flex;gap:8px;align-items:center;padding:3.5px 5px;border-radius:6px;cursor:pointer;font-size:13px}
+  .pop label:hover{background:var(--soft)}
+  .pop label .cn{flex:1;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pop label .cv{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .count{color:var(--muted);font-size:12.5px;margin-left:auto;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  .tablewrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:auto;
+             max-height:calc(100vh - 190px)}
+  table{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-content;min-width:100%}
+  thead th{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--line);
+           text-align:left;padding:0;white-space:nowrap;vertical-align:bottom}
+  thead th button{appearance:none;border:0;background:none;font:inherit;color:var(--ink);cursor:pointer;
+       padding:8px 10px 6px;text-align:left;width:100%;display:block;font-weight:600}
+  thead th button:hover{background:var(--soft)}
+  thead th .cn{font-family:var(--mono);font-size:11.5px;letter-spacing:-.2px}
+  thead th .dir{color:var(--accent);font-size:10px;margin-left:3px}
+  thead th .cov{display:block;font-weight:500;font-size:10.5px;color:var(--muted);margin-top:1px;
+                font-variant-numeric:tabular-nums}
+  thead th .cov i{display:inline-block;height:3px;border-radius:2px;background:var(--accent);vertical-align:middle;
+                  margin-right:4px;max-width:34px}
+  thead th .cov.zero i{background:var(--null)}
+  tbody td{border-bottom:1px solid var(--line);padding:5px 10px;vertical-align:top;
+           max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  tbody tr{cursor:pointer}
+  tbody tr:hover td{background:var(--soft)}
+  tbody tr.open td{background:var(--accent-soft)}
+  tbody tr:last-child td{border-bottom:0}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  td.nul{color:var(--null);font-style:italic}
+  td .exp{color:var(--muted)}
+  .jump{background:var(--accent-soft);color:var(--accent);border:0;border-radius:5px;cursor:pointer;
+        font:inherit;font-family:var(--mono);font-size:11.5px;padding:1px 6px;max-width:100%;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+  .jump:hover{background:var(--accent);color:#fff}
+  .tag{display:inline-block;background:var(--soft);border-radius:5px;padding:1px 6px;font-size:11.5px;
+       font-family:var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+
+  .pager{display:flex;gap:8px;align-items:center;justify-content:center;padding:14px 0;flex-wrap:wrap}
+  .pager button{font:inherit;font-size:13px;background:var(--panel);border:1px solid var(--line);border-radius:7px;
+       padding:5px 12px;cursor:pointer;color:var(--ink)}
+  .pager button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .pager button:disabled{opacity:.38;cursor:default}
+  .pager .at{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+  .empty{padding:44px 16px;text-align:center;color:var(--muted)}
+  .warn{background:#fff6e5;border:1px solid #f0cf94;color:var(--amber);border-radius:8px;
+        padding:9px 12px;font-size:13px;margin:10px 0}
+  @media (prefers-color-scheme:dark){.warn{background:#2b2313;border-color:#5a4a20}}
+
+  aside.drawer{position:fixed;top:0;right:0;height:100%;width:min(620px,100%);background:var(--panel);
+       border-left:1px solid var(--line);z-index:50;transform:translateX(102%);transition:transform .18s ease;
+       display:flex;flex-direction:column;box-shadow:-10px 0 34px rgba(0,0,0,.14)}
+  aside.drawer.open{transform:none}
+  aside.drawer .dh{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
+       padding:14px 16px;border-bottom:1px solid var(--line)}
+  aside.drawer .dh h2{margin:0;font-size:15px;font-weight:650}
+  aside.drawer .dh p{margin:3px 0 0;color:var(--muted);font-size:12px;font-family:var(--mono)}
+  aside.drawer .dh button{font:inherit;font-size:20px;line-height:1;background:none;border:0;cursor:pointer;
+       color:var(--muted);padding:0 4px}
+  aside.drawer .db{overflow:auto;padding:6px 16px 40px}
+  .field{padding:8px 0;border-bottom:1px solid var(--line)}
+  .field:last-child{border-bottom:0}
+  .field .fk{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:2px}
+  .field .fk b{font-family:var(--mono);font-size:12px;font-weight:600}
+  .field .fk .fb{display:flex;gap:5px}
+  .field .fk button{font:inherit;font-size:11px;background:var(--soft);border:0;border-radius:5px;
+       padding:1.5px 7px;cursor:pointer;color:var(--muted)}
+  .field .fk button:hover{background:var(--accent-soft);color:var(--accent)}
+  .field .fv{font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}
+  .field .fv.null{color:var(--null);font-style:italic}
+  .rel{display:flex;flex-wrap:wrap;gap:6px;padding:4px 0 12px}
+  .rel button{font:inherit;font-size:12px;background:var(--soft);border:0;border-radius:6px;padding:4px 9px;
+       cursor:pointer;color:var(--ink)}
+  .rel button:hover{background:var(--accent-soft);color:var(--accent)}
+  .rel h4{width:100%;margin:0 0 2px;font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div>
+    <h1>AbeBooks 四张表</h1>
+    <p class="sub" id="subtitle"></p>
+  </div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<div class="wrap">
+  <div class="stats" id="stats"></div>
+  <nav class="tabs" id="tabs"></nav>
+  <div class="toolbar">
+    <input type="search" id="q" placeholder="搜索：所有列子串匹配（/ 聚焦，Esc 清空）" autocomplete="off">
+    <details class="picker" id="picker"><summary>列</summary><div class="pop" id="collist"></div></details>
+    <label class="chk"><input type="checkbox" id="hideempty"> 隐藏全空列</label>
+    <select id="size">
+      <option value="25">25 / 页</option>
+      <option value="50" selected>50 / 页</option>
+      <option value="100">100 / 页</option>
+      <option value="250">250 / 页</option>
+      <option value="1000">1000 / 页</option>
+      <option value="0">全部</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+  <div id="notice"></div>
+  <div class="tablewrap"><table id="tbl"></table></div>
+  <div class="pager" id="pager"></div>
+</div>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="dh">
+    <div><h2 id="dt"></h2><p id="ds"></p></div>
+    <button id="dclose" title="关闭 (Esc)">&times;</button>
+  </div>
+  <div class="db" id="dbody"></div>
+</aside>
+
+<script id="payload" type="application/json">__PAYLOAD__</script>
+<script>
+(function(){
+"use strict";
+
+var P = JSON.parse(document.getElementById("payload").textContent);
+var TABLES = P.tables;
+var JUMPABLE = {
+  book_id:"book_edition", seller_id:"seller", listing_id:"book_listing",
+  evidence_id:"evidence_asset", representative_listing_id:"book_listing",
+  detail_listing_id:"book_listing"
+};
+var BY_NAME = {};
+TABLES.forEach(function(t){ BY_NAME[t.name] = t; });
+var MAIN_TABLES = 4;   /* the rest are the single-file extras, shown as their own tabs */
+
+var state = { ti:0, q:"", sortCol:null, sortDir:1, page:0, size:50,
+              hidden:{}, hideEmpty:false, sel:null };
+
+var $ = function(id){ return document.getElementById(id); };
+
+function esc(s){
+  return String(s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+  });
+}
+function isNull(v){ return v === null || v === undefined || v === ""; }
+function disp(v){
+  if(v === null || v === undefined) return "";
+  if(Array.isArray(v)) return v.join(", ");
+  if(typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+function numeric(v){
+  if(typeof v === "number") return v;
+  var s = String(v).trim();
+  if(!s) return NaN;
+  if(!/^[-+]?[\d,]*\.?\d+([eE][-+]?\d+)?$/.test(s)) return NaN;
+  var n = Number(s.replace(/,/g,""));
+  return isNaN(n) ? NaN : n;
+}
+function fmt(n){
+  var s = String(n);
+  if(!/^\d{4,}$/.test(s)) return s;
+  return s.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
+function trunc(s, n){
+  s = disp(s);
+  if(s.length <= n) return s;
+  return s.slice(0, n);
+}
+function table(){ return TABLES[state.ti]; }
+function colIndex(t, name){ return t.columns.indexOf(name); }
+
+/* ---------- coverage ---------- */
+function coverage(t){
+  if(t._cov) return t._cov;
+  var n = t.rows.length;
+  t._cov = t.columns.map(function(_, c){
+    var k = 0;
+    for(var i=0;i<t.rows.length;i++) if(!isNull(t.rows[i][c])) k++;
+    return n ? k/n : 0;
+  });
+  return t._cov;
+}
+function hiddenFor(t){
+  if(!state.hidden[t.name]) state.hidden[t.name] = {};
+  return state.hidden[t.name];
+}
+function visibleCols(t){
+  var cov = coverage(t), hid = hiddenFor(t);
+  var out = [];
+  for(var c=0;c<t.columns.length;c++){
+    if(hid[t.columns[c]]) continue;
+    if(state.hideEmpty && cov[c] === 0) continue;
+    out.push(c);
+  }
+  return out;
+}
+
+/* ---------- filtering / sorting ---------- */
+function filtered(){
+  var t = table();
+  var q = state.q.trim().toLowerCase();
+  if(!q) return t._all || (t._all = t.rows.map(function(_, i){ return i; }));
+  var hits = [];
+  for(var i=0;i<t.rows.length;i++){
+    var row = t.rows[i];
+    for(var c=0;c<row.length;c++){
+      if(isNull(row[c])) continue;
+      if(disp(row[c]).toLowerCase().indexOf(q) >= 0){ hits.push(i); break; }
+    }
+  }
+  return hits;
+}
+function sorted(idx){
+  var c = state.sortCol;
+  if(c === null) return idx;
+  var t = table(), dir = state.sortDir;
+  var arr = idx.slice();
+  arr.sort(function(a, b){
+    var va = t.rows[a][c], vb = t.rows[b][c];
+    var na = isNull(va), nb = isNull(vb);
+    if(na && nb) return a - b;
+    if(na) return 1;          /* null 永远排在最后，与方向无关 */
+    if(nb) return -1;
+    var x = numeric(va), y = numeric(vb), r;
+    if(!isNaN(x) && !isNaN(y)) r = x - y;
+    else r = disp(va).localeCompare(disp(vb), "zh-Hans-CN");
+    return (r * dir) || (a - b);
+  });
+  return arr;
+}
+
+/* ---------- cell rendering ---------- */
+function cellHTML(t, c, row){
+  var v = row[c];
+  if(isNull(v)) return { cls:"nul", html:"NULL", text:"" };
+  var name = t.columns[c];
+  var s = disp(v);
+
+  if(JUMPABLE[name] && BY_NAME[JUMPABLE[name]]){
+    return { cls:"", html:'<button class="jump" data-jump="' + esc(name) + '" data-val="' + esc(s) +
+             '" title="在 ' + esc(JUMPABLE[name]) + ' 中筛选">' + esc(trunc(s, 34)) + "</button>", text:s };
+  }
+  if(/^https?:\/\//.test(s)){
+    return { cls:"", html:'<a href="' + esc(s) + '" target="_blank" rel="noopener noreferrer">' +
+             esc(trunc(s, 52)) + "</a>", text:s };
+  }
+  if(/^[0-9a-f]{32,64}$/.test(s)){
+    return { cls:"", html:'<span class="mono" title="' + esc(s) + '">' + esc(s.slice(0, 12)) + "&hellip;</span>", text:s };
+  }
+  var n = numeric(v);
+  var numCls = (!isNaN(n) && typeof v !== "string" || !isNaN(n)) ? " num" : "";
+  var shown = trunc(s, 150);
+  var extra = s.length > 150 ? '<span class="exp"> &hellip;+' + (s.length - 150) + "</span>" : "";
+  return { cls:numCls, html:esc(shown) + extra, text:s };
+}
+
+/* ---------- render ---------- */
+function renderStats(){
+  var s = P.stats || {}, cards = [];
+  function card(title, right, body){
+    cards.push('<div class="card"><h3>' + esc(title) + (right ? "<span>" + esc(right) + "</span>" : "") +
+               "</h3>" + body + "</div>");
+  }
+  function kv(k, v){ return '<div class="kv"><span class="k">' + esc(k) + '</span><span class="v">' + fmt(v) + "</span></div>"; }
+  function bars(obj, total){
+    var keys = Object.keys(obj).sort(function(a,b){ return obj[b] - obj[a]; });
+    return keys.map(function(k){
+      var pct = total ? Math.round(obj[k] / total * 100) : 0;
+      return '<div class="kv"><span class="k">' + esc(k) + '</span><span class="v">' + fmt(obj[k]) +
+             " <span style='color:var(--muted);font-weight:500'>" + pct + "%</span></span></div>" +
+             '<div class="bar"><i style="width:' + pct + '%"></i></div>';
+    }).join("");
+  }
+
+  card("表规模", "", TABLES.map(function(t){ return kv(t.name, t.rows.length); }).join(""));
+  if(s.status_counts) card("采集状态", Object.values(s.status_counts).reduce(function(a,b){return a+b;},0) + " 条记录",
+                           bars(s.status_counts, Object.values(s.status_counts).reduce(function(a,b){return a+b;},0)));
+  if(s.selected_reasons) card("selected_reason", "253 行", bars(s.selected_reasons, 253));
+  if(s.image_kinds) card("image_kind", "代表卡片", bars(s.image_kinds, 253));
+  if(s.detail_match_methods) card("detail_match_method", "Stage A", bars(s.detail_match_methods, 253));
+  if(s.detail_listing_ambiguous !== undefined)
+    card("歧义 / 截断", "", kv("detail_listing_ambiguous", s.detail_listing_ambiguous) +
+         kv("cards_truncated", s.cards_truncated) + kv("superseded_records", s.superseded_records) +
+         kv("distinct_isbns", s.distinct_isbns));
+  if(s.anomalies) card("anomalies", s.anomalies.length ? "需注意" : "无",
+                       s.anomalies.length ? s.anomalies.map(function(a){ return kv(disp(a), ""); }).join("")
+                                          : '<p class="note">构建未记录任何异常</p>');
+  if(s.seed) card("种子覆盖", "", kv("种子 ISBN", s.seed.isbns) + kv("已查询", s.seed.queried) +
+                   kv("覆盖率", (s.seed.coverage*100).toFixed(2) + "%") +
+                   kv("不在种子内", (s.seed.records_not_in_seed||[]).length));
+  if(s.unresolved_isbns && s.unresolved_isbns.length)
+    card("unresolved ISBN", s.unresolved_isbns.length + " 个",
+         '<div class="chips">' + s.unresolved_isbns.map(function(i){ return '<span class="chip">' + esc(i) + "</span>"; }).join("") + "</div>");
+  if(s.no_listings_isbns && s.no_listings_isbns.length)
+    card("no_listings ISBN", s.no_listings_isbns.length + " 个",
+         '<div class="chips">' + s.no_listings_isbns.slice(0, 24).map(function(i){ return '<span class="chip">' + esc(i) + "</span>"; }).join("") +
+         (s.no_listings_isbns.length > 24 ? '<span class="chip">+' + (s.no_listings_isbns.length - 24) + "</span>" : "") + "</div>");
+  if(s.evidence_asset_types) card("evidence asset_type", "2,305 行", bars(s.evidence_asset_types, 2305));
+
+  $("stats").innerHTML = cards.join("");
+}
+
+function renderTabs(){
+  $("tabs").innerHTML = TABLES.map(function(t, i){
+    return '<button role="tab" aria-selected="' + (i === state.ti) + '" data-ti="' + i + '">' +
+           esc(t.name) + '<span class="n">' + fmt(t.rows.length) + "</span></button>";
+  }).join("");
+}
+
+function renderColPicker(){
+  var t = table(), cov = coverage(t), hid = hiddenFor(t);
+  var items = t.columns.map(function(name, c){
+    return '<label><input type="checkbox" data-col="' + c + '"' + (hid[name] ? "" : " checked") +
+           '><span class="cn">' + esc(name) + '</span><span class="cv">' + Math.round(cov[c]*100) + "%</span></label>";
+  }).join("");
+  $("collist").innerHTML =
+    '<div class="actions"><button data-act="all">全选</button><button data-act="none">全不选</button>' +
+    '<button data-act="nonempty">仅非空</button></div>' + items;
+}
+
+function renderTable(){
+  var t = table();
+  var idx = sorted(filtered());
+  var cols = visibleCols(t);
+  var cov = coverage(t);
+
+  var size = state.size || idx.length || 1;
+  var pages = Math.max(1, Math.ceil(idx.length / size));
+  if(state.page >= pages) state.page = pages - 1;
+  if(state.page < 0) state.page = 0;
+  var start = state.size ? state.page * size : 0;
+  var slice = state.size ? idx.slice(start, start + size) : idx;
+
+  var head = '<thead><tr>' + cols.map(function(c){
+    var dir = state.sortCol === c ? (state.sortDir > 0 ? " ▲" : " ▼") : "";
+    var pct = Math.round(cov[c] * 100);
+    return '<th><button data-sort="' + c + '"><span class="cn">' + esc(t.columns[c]) + '</span>' +
+           '<span class="dir">' + dir + '</span><span class="cov' + (pct === 0 ? " zero" : "") +
+           '"><i style="width:' + Math.round(cov[c]*34) + 'px"></i>' + pct + "%</span></button></th>";
+  }).join("") + "</tr></thead>";
+
+  var body = slice.map(function(ri){
+    var row = t.rows[ri];
+    var tds = cols.map(function(c){
+      var cell = cellHTML(t, c, row);
+      return '<td class="' + cell.cls.trim() + '" title="' + esc(trunc(cell.text || "NULL", 400)) + '">' + cell.html + "</td>";
+    }).join("");
+    return '<tr data-row="' + ri + '"' + (state.sel === ri ? ' class="open"' : "") + ">" + tds + "</tr>";
+  }).join("");
+
+  $("tbl").innerHTML = head + "<tbody>" + body + "</tbody>";
+  if(!slice.length){
+    $("tbl").innerHTML = head + '<tbody><tr><td colspan="' + cols.length + '"><div class="empty">' +
+      (state.q ? "没有匹配「" + esc(state.q) + "」的行" : "该表为空") + "</div></td></tr></tbody>";
+  }
+
+  var from = slice.length ? start + 1 : 0, to = start + slice.length;
+  $("count").textContent = "显示 " + fmt(from) + "–" + fmt(to) + " / " + fmt(t.rows.length) +
+    (idx.length !== t.rows.length ? "（筛出 " + fmt(idx.length) + "）" : "") +
+    "  ·  " + cols.length + "/" + t.columns.length + " 列";
+
+  renderPager(pages, idx.length);
+  var total = 0; for(var c=0;c<t.columns.length;c++) total += cov[c];
+  $("notice").innerHTML = (state.size === 0 && idx.length > 4000)
+    ? '<div class="warn">已渲染全部 ' + fmt(idx.length) + " 行，会明显变慢。改小每页行数可恢复流畅。</div>" : "";
+}
+
+function renderPager(pages, n){
+  if(state.size === 0 || pages <= 1){
+    $("pager").innerHTML = state.size === 0 ? '<span class="at">共 ' + fmt(n) + " 行</span>" : "";
+    return;
+  }
+  $("pager").innerHTML =
+    '<button data-p="0"' + (state.page === 0 ? " disabled" : "") + ">首页</button>" +
+    '<button data-p="' + (state.page - 1) + '"' + (state.page === 0 ? " disabled" : "") + ">上一页</button>" +
+    '<span class="at">第 ' + (state.page + 1) + " / " + pages + " 页</span>" +
+    '<button data-p="' + (state.page + 1) + '"' + (state.page >= pages - 1 ? " disabled" : "") + ">下一页</button>" +
+    '<button data-p="' + (pages - 1) + '"' + (state.page >= pages - 1 ? " disabled" : "") + ">末页</button>";
+}
+
+function render(){ renderTabs(); renderColPicker(); renderTable(); syncHash(); }
+
+/* ---------- drawer ---------- */
+function related(t, row){
+  var out = [];
+  var keys = ["book_id","seller_id","listing_id","evidence_id"];
+  keys.forEach(function(k){
+    var ci = colIndex(t, k);
+    if(ci < 0 || isNull(row[ci])) return;
+    var v = row[ci];
+    TABLES.forEach(function(other){
+      if(other === t) return;
+      var oi = colIndex(other, k);
+      if(oi < 0) return;
+      var n = 0;
+      for(var i=0;i<other.rows.length;i++) if(other.rows[i][oi] === v) n++;
+      if(n) out.push({ table:other.name, col:k, value:v, n:n });
+    });
+  });
+  return out;
+}
+
+function openDrawer(ri){
+  var t = table(), row = t.rows[ri];
+  state.sel = ri;
+  var title = row[colIndex(t, "book_id")] || row[colIndex(t, "seller_id")] ||
+              row[colIndex(t, "listing_id")] || row[colIndex(t, "evidence_id")] || ("第 " + (ri + 1) + " 行");
+  $("dt").textContent = disp(title);
+  $("ds").textContent = t.name + "  ·  第 " + (ri + 1) + " / " + t.rows.length + " 行";
+
+  var rel = related(t, row);
+  var html = "";
+  if(rel.length){
+    html += '<div class="rel"><h4>关联行</h4>' + rel.map(function(r){
+      return '<button data-jump2="' + esc(r.table) + '" data-val="' + esc(r.value) + '">' +
+             esc(r.table) + " · " + esc(r.col) + " → " + fmt(r.n) + " 行</button>";
+    }).join("") + "</div>";
+  }
+  html += t.columns.map(function(name, c){
+    var v = row[c];
+    var body = isNull(v) ? '<span class="null">NULL</span>'
+                         : "<span>" + esc(Array.isArray(v) ? v.join("\n") : disp(v)) + "</span>";
+    return '<div class="field"><div class="fk"><b>' + esc(name) + "</b><span class=\"fb\">" +
+           (isNull(v) ? "" : '<button data-copy="' + c + '">复制</button>' +
+                             '<button data-jump2="' + esc(t.name) + '" data-col="' + esc(name) + '" data-val="' + esc(disp(v)) + '">筛选此值</button>') +
+           '</span></div><div class="fv' + (isNull(v) ? " null" : "") + '">' + body + "</div></div>";
+  }).join("");
+  $("dbody").innerHTML = html;
+  $("drawer").classList.add("open");
+  $("drawer").setAttribute("aria-hidden", "false");
+  renderTable();
+}
+function closeDrawer(){
+  state.sel = null;
+  $("drawer").classList.remove("open");
+  $("drawer").setAttribute("aria-hidden", "true");
+  renderTable();
+}
+
+/* ---------- navigation ---------- */
+function gotoTable(name, q){
+  var i = TABLES.findIndex(function(t){ return t.name === name; });
+  if(i < 0) return false;
+  state.ti = i; state.page = 0; state.sortCol = null; state.sel = null;
+  if(q !== undefined && q !== null){ state.q = q; $("q").value = q; }
+  closeDrawerSoft();
+  render();
+  return true;
+}
+function closeDrawerSoft(){
+  state.sel = null;
+  $("drawer").classList.remove("open");
+  $("drawer").setAttribute("aria-hidden", "true");
+}
+
+/* ---------- deep link ---------- */
+var hashLock = false;
+function syncHash(){
+  if(hashLock) return;
+  var parts = ["t=" + encodeURIComponent(table().name)];
+  if(state.q) parts.push("q=" + encodeURIComponent(state.q));
+  if(state.sortCol !== null) parts.push("c=" + encodeURIComponent(table().columns[state.sortCol]),
+                                       "d=" + (state.sortDir > 0 ? "a" : "d"));
+  if(state.page) parts.push("p=" + (state.page + 1));
+  if(state.size !== 50) parts.push("s=" + state.size);
+  var h = "#" + parts.join("&");
+  hashLock = true;
+  history.replaceState(null, "", h);
+  hashLock = false;
+}
+function readHash(){
+  var h = location.hash.replace(/^#/, "");
+  if(!h) return;
+  var o = {};
+  h.split("&").forEach(function(p){
+    var i = p.indexOf("="); if(i < 0) return;
+    o[decodeURIComponent(p.slice(0, i))] = decodeURIComponent(p.slice(i + 1));
+  });
+  if(o.t){
+    var i = TABLES.findIndex(function(t){ return t.name === o.t; });
+    if(i >= 0) state.ti = i;
+  }
+  if(o.q){ state.q = o.q; $("q").value = o.q; }
+  var t = table();
+  if(o.c){ var c = colIndex(t, o.c); if(c >= 0){ state.sortCol = c; state.sortDir = o.d === "d" ? -1 : 1; } }
+  if(o.p) state.page = Math.max(0, parseInt(o.p, 10) - 1);
+  if(o.s){ state.size = parseInt(o.s, 10); $("size").value = String(state.size); }
+}
+
+/* ---------- events ---------- */
+$("tabs").addEventListener("click", function(e){
+  var b = e.target.closest("button[data-ti]"); if(!b) return;
+  closeDrawerSoft();
+  state.ti = +b.dataset.ti; state.page = 0; state.sortCol = null;
+  render();
+});
+$("tbl").addEventListener("click", function(e){
+  var jump = e.target.closest("[data-jump]");
+  if(jump){ gotoTable(JUMPABLE[jump.dataset.jump], jump.dataset.val); return; }
+  var th = e.target.closest("th button[data-sort]");
+  if(th){
+    var c = +th.dataset.sort;
+    if(state.sortCol === c) state.sortDir = -state.sortDir;
+    else { state.sortCol = c; state.sortDir = 1; }
+    state.page = 0; renderTable(); syncHash(); return;
+  }
+  var tr = e.target.closest("tr[data-row]");
+  if(tr) openDrawer(+tr.dataset.row);
+});
+$("pager").addEventListener("click", function(e){
+  var b = e.target.closest("button[data-p]"); if(!b) return;
+  state.page = +b.dataset.p; renderTable(); syncHash();
+  document.querySelector(".tablewrap").scrollTop = 0;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+$("q").addEventListener("input", function(e){
+  state.q = e.target.value; state.page = 0; renderTable(); syncHash();
+});
+$("size").addEventListener("change", function(e){
+  state.size = parseInt(e.target.value, 10); state.page = 0; renderTable(); syncHash();
+});
+$("hideempty").addEventListener("change", function(e){
+  state.hideEmpty = e.target.checked; renderColPicker(); renderTable();
+});
+$("collist").addEventListener("change", function(e){
+  var cb = e.target.closest("input[data-col]"); if(!cb) return;
+  var t = table(), name = t.columns[+cb.dataset.col];
+  hiddenFor(t)[name] = !cb.checked;
+  renderTable();
+});
+$("collist").addEventListener("click", function(e){
+  var b = e.target.closest("button[data-act]"); if(!b) return;
+  var t = table(), hid = hiddenFor(t), cov = coverage(t);
+  if(b.dataset.act === "all") t.columns.forEach(function(n){ delete hid[n]; });
+  else if(b.dataset.act === "none") t.columns.forEach(function(n){ hid[n] = true; });
+  else t.columns.forEach(function(n, c){ if(cov[c] === 0) hid[n] = true; else delete hid[n]; });
+  renderColPicker(); renderTable();
+});
+$("dbody").addEventListener("click", function(e){
+  var j = e.target.closest("button[data-jump2]");
+  if(j){
+    var val = j.dataset.val;
+    if(j.dataset.col){
+      /* 按某一列精确筛选：只用该列的子串，仍走全表搜索 */
+      gotoTable(j.dataset.jump2, val);
+    } else {
+      gotoTable(j.dataset.jump2, val);
+    }
+    return;
+  }
+  var cp = e.target.closest("button[data-copy]");
+  if(cp){
+    var t = table(), row = t.rows[state.sel], name = t.columns[+cp.dataset.copy];
+    var v = disp(row[+cp.dataset.copy]);
+    if(navigator.clipboard) navigator.clipboard.writeText(v);
+    cp.textContent = "已复制";
+    setTimeout(function(){ cp.textContent = "复制"; }, 900);
+  }
+});
+$("dclose").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", function(e){
+  if(e.key === "Escape"){
+    if($("drawer").classList.contains("open")) closeDrawer();
+    else if(state.q){ state.q = ""; $("q").value = ""; state.page = 0; renderTable(); syncHash(); }
+    else $("picker").open = false;
+  }
+  if(e.key === "/" && document.activeElement !== $("q")){
+    e.preventDefault(); $("q").focus(); $("q").select();
+  }
+});
+window.addEventListener("hashchange", function(){
+  if(hashLock) return;
+  readHash(); render();
+});
+
+/* ---------- boot ---------- */
+(function boot(){
+  var inp = P.input || {};
+  var extra = TABLES.length - MAIN_TABLES;
+  $("subtitle").textContent = "四张主表（book_edition / seller / book_listing / evidence_asset）" +
+    (extra > 0 ? " + " + extra + " 张附表" : "") + "，每行可展开字段全文与关联行。";
+  var bits = [];
+  if(inp.path) bits.push("输入 <b>" + esc(inp.path) + "</b>（" + fmt(inp.records) + " 条记录）");
+  if(inp.sha256) bits.push("sha256 <b>" + esc(inp.sha256.slice(0, 16)) + "&hellip;</b>");
+  if(P.generated_at) bits.push("生成于 <b>" + esc(P.generated_at) + "</b>");
+  $("meta").innerHTML = bits.join("<br>");
+  readHash();
+  renderStats();
+  render();
+})();
+})();
+</script>
+</body>
+</html>

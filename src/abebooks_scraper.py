@@ -39,10 +39,17 @@ DETAIL_READY = "[data-test-id='listing-title']"
 # How many distinct listings to try before giving a book up as degraded.
 DETAIL_ATTEMPTS = 3
 
-# Statuses whose source URL has been spent: AbeBooks serves the full page on a
-# URL's first hit only, so re-requesting one returns an unhydrated page. Reruns
-# must skip these rather than burn requests on pages that cannot come back.
-SPENT_STATUSES = ("ok", "degraded")
+# Statuses where asking again cannot change the answer, so a rerun must skip
+# them: "ok" already has the data, and a search with no listings on AbeBooks
+# will still have none.
+#
+# "degraded" is deliberately NOT here. It was, on the theory that an unhydrated
+# page is a sticky per-URL property. That theory is wrong: on 2026-09-13 three
+# detail URLs came back unhydrated at 14:02:26 and all three served the full
+# page again by 14:15, untouched. Degradation is a transient site-side state, so
+# marking those ISBNs spent threw away books for a condition that had already
+# cleared. "error" and "blocked" are retryable for the same reason.
+SPENT_STATUSES = ("ok", "no_listings")
 
 # Phrases AbeBooks serves instead of a page when it stops answering a client.
 BLOCK_MARKERS = (
@@ -220,6 +227,12 @@ def parse_book_page(html: str, url: str) -> dict:
     isbn_text = field(soup, "listing-isbn-link") or ""
     isbn10, _, isbn13 = (part.strip() for part in isbn_text.partition("/"))
 
+    # The bibliographic block describes this copy, so prefer it over the
+    # JSON-LD, which describes the edition in general.
+    biblio = {key: field(soup, f"bibliographic-details-{key}")
+              for key in ("edition", "binding", "language", "publisher", "publishyear",
+                          "condition", "dustjacket", "dimensions", "itemweight", "series")}
+
     publisher_text = field(soup, "listing-publisher") or ""
     published = re.match(r"Published by (?P<publisher>.+?), (?P<year>\d{4})\s*$", publisher_text)
     if published:
@@ -228,6 +241,8 @@ def parse_book_page(html: str, url: str) -> dict:
         raw_publisher = book.get("publisher")
         publisher = raw_publisher.get("name") if isinstance(raw_publisher, dict) else raw_publisher
         year = book.get("datePublished")
+    publisher = biblio["publisher"] or publisher
+    year = biblio["publishyear"] or year
 
     rating_text = field(soup, "goodreads-rating") or ""
     rating_match = re.match(r"(?P<value>[0-9.]+)\s+(?P<count>\d+)", rating_text)
@@ -237,6 +252,14 @@ def parse_book_page(html: str, url: str) -> dict:
     binding = (book.get("bookFormat") or "").removeprefix("https://schema.org/") or None
     attributes = [item.get_text(strip=True) for item in soup.select("[data-test-id='listing-attributes'] li")]
 
+    # Columns for the plan's seller/book_listing tables that only the detail
+    # page carries. Each is left None when the seller did not supply it.
+    shipping_price, shipping_currency = parse_price(field(soup, "buybox-item-shipping-price"))
+    inventory = field(soup, "vendor-listing-id") or ""
+    address = [part.strip() for part in (field(soup, "sf-address-line") or "").split(",") if part.strip()]
+    city, region, country = address[:3] if len(address) >= 3 else (None, None, None)
+    image_label = (field(soup, "listing-image-type-label") or "").strip().lower()
+
     return {
         "source_url": url,
         "title": field(soup, "listing-title") or book.get("name"),
@@ -245,17 +268,38 @@ def parse_book_page(html: str, url: str) -> dict:
         "isbn13": isbn13 or book.get("isbn"),
         "publisher": publisher,
         "publication_year": year,
-        "language": language or book.get("inLanguage"),
-        "binding": binding,
-        "condition": ", ".join(attributes) or None,
+        "language": biblio["language"] or language or book.get("inLanguage"),
+        "binding": biblio["binding"] or binding,
+        "edition_number": biblio["edition"],
+        "series": biblio["series"],
+        "dust_jacket": biblio["dustjacket"],
+        "dimensions": biblio["dimensions"],
+        "item_weight": biblio["itemweight"],
+        "condition": biblio["condition"] or ", ".join(attributes) or None,
         "catalogue_image_url": book.get("image"),
+        "stock_image": image_label.startswith("stock") if image_label else None,
         "synopsis_text": ld_of_type(blocks, "Product").get("description"),
+        # about-description is the seller's blurb about themselves, not an
+        # author bio; the bio lives in the "About this title" section, so the
+        # two are read from different nodes on purpose.
+        "about_author_text": field(soup, "about-the-title"),
+        "vendor_description": field(soup, "description-text"),
         "goodreads_rating": rating.get("value"),
         "goodreads_rating_count": rating.get("count"),
-        "seller_name": store.get("name"),
+        "seller_name": store.get("name") or field(soup, "sf-name"),
         "seller_url": store.get("url"),
         "seller_since": (field(soup, "sf-seller-since") or "").removeprefix("AbeBooks seller since ").strip() or None,
         "seller_description": store.get("description"),
+        "seller_location": field(soup, "sf-address-line"),
+        "seller_city": city,
+        "seller_region": region,
+        "seller_country": country,
+        "seller_rating": field(soup, "star-rating"),
+        "seller_terms": field(soup, "policy-sales-terms-text"),
+        "shipping_terms": field(soup, "policy-shipping-terms-text"),
+        "shipping_price": shipping_price,
+        "shipping_currency": shipping_currency,
+        "seller_inventory_no": inventory.removeprefix("Seller Inventory #").strip() or None,
     }
 
 
@@ -375,11 +419,13 @@ def fetched_isbns(output: Path) -> set[str]:
 
 
 def collect(isbns: list[str], output: Path, pace: Pace, session: BrowserSession,
-            html_dir: Path, detailed: bool, degrade_cooldown: float = 0.0) -> dict:
+            html_dir: Path, detailed: bool, degrade_cooldown: float = 0.0,
+            max_consecutive_degraded: int = 3) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     done = fetched_isbns(output)
     stats = {"requested": len(isbns), "already_done": len(done), "ok": 0, "degraded": 0,
-             "blocked": 0, "errors": 0}
+             "no_listings": 0, "blocked": 0, "errors": 0, "stopped_early": False}
+    consecutive_degraded = 0
 
     with output.open("a", encoding="utf-8") as fh:
         for index, isbn in enumerate(isbns):
@@ -411,6 +457,18 @@ def collect(isbns: list[str], output: Path, pace: Pace, session: BrowserSession,
 
             record["html_path"], record["html_sha256"] = snapshot(html, html_dir, isbn)
 
+            if detailed and not record["search"]["listings"]:
+                # AbeBooks has nothing for this ISBN, so there is no detail page
+                # to open. Kept apart from "ok" so it does not dilute per-field
+                # coverage, and spent so a rerun does not ask again.
+                record.update(status="no_listings")
+                stats["no_listings"] += 1
+                consecutive_degraded = 0
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                print(f"[{index + 1}/{len(isbns)}] {isbn} no listings on AbeBooks")
+                continue
+
             if detailed and record["search"]["listings"]:
                 try:
                     for attempt, listing in enumerate(record["search"]["listings"][:DETAIL_ATTEMPTS]):
@@ -419,11 +477,19 @@ def collect(isbns: list[str], output: Path, pace: Pace, session: BrowserSession,
                         detail_url = listing["listing_url"]
                         detail_html, _ = session.fetch(detail_url, wait_for=DETAIL_READY)
                         book = parse_book_page(detail_html, detail_url)
-                        # An unhydrated detail page means the site is throttling
-                        # us, not that this listing is bad -- re-hitting the same
-                        # URL stays degraded for hours. Try a different listing,
-                        # and if they are all degraded back off in the caller.
+                        # An unhydrated detail page means the site is serving the
+                        # lightweight variant; it says nothing about this listing.
+                        # The state is transient (see SPENT_STATUSES), so try a
+                        # different listing, and if they are all unhydrated back
+                        # off in the caller. Keep one sample so the episode can be
+                        # audited afterwards -- without it there is nothing to
+                        # compare against when the same URL works later.
                         if book_is_empty(book):
+                            if "degraded_html_path" not in record:
+                                record["degraded_url"] = detail_url
+                                (record["degraded_html_path"],
+                                 record["degraded_html_sha256"]) = snapshot(
+                                    detail_html, html_dir, f"{isbn}_degraded")
                             continue
                         record["book"] = book
                         record["book_html_path"], record["book_html_sha256"] = snapshot(
@@ -433,14 +499,24 @@ def collect(isbns: list[str], output: Path, pace: Pace, session: BrowserSession,
                     else:
                         record.update(status="degraded")
                         stats["degraded"] += 1
+                        consecutive_degraded += 1
                         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                         fh.flush()
                         print(f"[{index + 1}/{len(isbns)}] {isbn} all {DETAIL_ATTEMPTS} detail "
-                              f"listings came back degraded; cooling down {degrade_cooldown:.0f}s")
-                        # Degradation is a throttle signal that also hits URLs we
-                        # have never requested, so ploughing on just burns more
-                        # ISBNs. Sit out the cooldown and let the next one have a
-                        # clean shot.
+                              f"listings came back degraded "
+                              f"({consecutive_degraded}/{max_consecutive_degraded} in a row)")
+                        # Degradation arrives in clusters and also hits URLs we
+                        # have never requested, so a run of them means the site
+                        # has stopped hydrating detail pages for now. Continuing
+                        # would just mark more records degraded, so stop and let
+                        # the operator decide. Nothing is lost permanently: a
+                        # rerun retries every degraded ISBN.
+                        if consecutive_degraded >= max_consecutive_degraded:
+                            stats["stopped_early"] = True
+                            print(f"STOP: {consecutive_degraded} consecutive degraded records -- "
+                                  f"AbeBooks is throttling. {len(isbns) - index - 1} ISBNs left "
+                                  f"untouched; wait for the throttle to clear, then rerun.")
+                            return stats
                         if degrade_cooldown > 0:
                             time.sleep(degrade_cooldown)
                         continue
@@ -456,6 +532,7 @@ def collect(isbns: list[str], output: Path, pace: Pace, session: BrowserSession,
 
             record["status"] = "ok"
             stats["ok"] += 1
+            consecutive_degraded = 0
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             fh.flush()
             print(f"[{index + 1}/{len(isbns)}] {isbn} ok ({record['search']['listing_count']} listings)")
@@ -482,6 +559,9 @@ def main() -> None:
                         "a dirty profile makes AbeBooks serve unhydrated detail pages")
     p.add_argument("--degrade-cooldown", type=float, default=180.0,
                    help="seconds to idle after a record whose detail pages all came back degraded")
+    p.add_argument("--max-consecutive-degraded", type=int, default=3,
+                   help="abort the run after this many degraded records in a row; each one spends "
+                        "an ISBN, so continuing through a throttle only destroys data")
     p.add_argument("--no-detailed", dest="detailed", action="store_false", default=True,
                    help="collect search results only, skip the detail page")
     p.add_argument("--timeout", type=float, default=45_000, help="per-page timeout in ms")
@@ -497,7 +577,7 @@ def main() -> None:
 
     with BrowserSession(proxy, args.headless, args.timeout, args.user_data_dir) as session:
         stats = collect(isbns, args.output, pace, session, args.html_dir, args.detailed,
-                        args.degrade_cooldown)
+                        args.degrade_cooldown, args.max_consecutive_degraded)
     print(json.dumps(stats, indent=2))
 
 

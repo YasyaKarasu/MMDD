@@ -8,6 +8,7 @@ import pytest
 from src.abebooks_scraper import (
     Pace,
     book_is_empty,
+    collect,
     detect_block,
     fetched_isbns,
     parse_book_page,
@@ -229,6 +230,65 @@ def test_parse_book_page_survives_a_bare_page():
     assert parsed["seller_name"] is None
 
 
+BIBLIO_HTML = """
+<html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Book","name":"Compilers",
+ "publisher":{"@type":"Organization","name":"Addison Wesley"},"datePublished":"2005",
+ "bookFormat":"https://schema.org/Paperback","inLanguage":"English"}
+</script>
+</head><body>
+<h1 data-test-id="listing-title">Compilers</h1>
+<div data-test-id="bibliographic-details-edition">First Edition.</div>
+<div data-test-id="bibliographic-details-binding">Hardcover</div>
+<div data-test-id="bibliographic-details-publishyear">1985</div>
+<div data-test-id="bibliographic-details-publisher">Addison-Wesley</div>
+<div data-test-id="bibliographic-details-language">English</div>
+<div data-test-id="description-text">The item might be beaten up but readable.</div>
+<div data-test-id="about-description">We are an independent online bookseller.</div>
+<div data-test-id="about-the-title">Christine Hofmeister is a project manager.</div>
+<div data-test-id="bibliographic-details-dustjacket">Yes</div>
+<span data-test-id="vendor-listing-id">Seller Inventory # RWARE0000058606</span>
+<span data-test-id="buybox-item-shipping-price">US$ 6.00 shipping</span>
+<span data-test-id="sf-address-line">Tokyo, TKY, Japan</span>
+<span data-test-id="star-rating">2-star seller</span>
+<span data-test-id="listing-image-type-label">Stock Image</span>
+</body></html>
+"""
+
+
+def test_parse_book_page_prefers_the_bibliographic_block():
+    parsed = parse_book_page(BIBLIO_HTML, "https://www.abebooks.com/x/1/bd")
+    # the block describes this copy; the JSON-LD only describes the edition
+    assert parsed["edition_number"] == "First Edition."
+    assert parsed["binding"] == "Hardcover"
+    assert parsed["publication_year"] == "1985"
+    assert parsed["publisher"] == "Addison-Wesley"
+    assert parsed["vendor_description"] == "The item might be beaten up but readable."
+    assert parsed["dust_jacket"] == "Yes"
+
+
+def test_parse_book_page_reads_the_seller_and_shipping_columns():
+    parsed = parse_book_page(BIBLIO_HTML, "https://www.abebooks.com/x/1/bd")
+    assert parsed["seller_inventory_no"] == "RWARE0000058606"
+    assert parsed["shipping_price"] == 6.0
+    assert parsed["shipping_currency"] == "USD"
+    assert parsed["seller_location"] == "Tokyo, TKY, Japan"
+    assert parsed["seller_city"] == "Tokyo"
+    assert parsed["seller_region"] == "TKY"
+    assert parsed["seller_country"] == "Japan"
+    assert parsed["seller_rating"] == "2-star seller"
+    assert parsed["stock_image"] is True
+
+
+def test_parse_book_page_does_not_mistake_the_seller_blurb_for_an_author_bio():
+    parsed = parse_book_page(BIBLIO_HTML, "https://www.abebooks.com/x/1/bd")
+    # the bio comes from "About this title", never from the seller's own blurb
+    assert parsed["about_author_text"] == "Christine Hofmeister is a project manager."
+    assert "independent online bookseller" not in parsed["about_author_text"]
+    assert "independent online bookseller" not in (parsed["synopsis_text"] or "")
+
+
 def test_book_is_empty_flags_an_unhydrated_page():
     bare = parse_book_page("<html><title>Art of Computer Programming</title></html>", "https://x/y")
     assert book_is_empty(bare) is True
@@ -240,7 +300,7 @@ def test_book_is_empty_flags_an_unhydrated_page():
 # resume
 # --------------------------------------------------------------------------- #
 
-def test_fetched_isbns_marks_ok_and_degraded_as_spent(tmp_path: Path):
+def test_fetched_isbns_spends_only_what_a_rerun_cannot_improve(tmp_path: Path):
     out = tmp_path / "out.jsonl"
     out.write_text(
         "\n".join(
@@ -250,12 +310,15 @@ def test_fetched_isbns_marks_ok_and_degraded_as_spent(tmp_path: Path):
                 {"isbn": "2", "status": "error"},
                 {"isbn": "3", "status": "blocked"},
                 {"isbn": "4", "status": "degraded"},
+                {"isbn": "5", "status": "no_listings"},
             ]
         ),
         encoding="utf-8",
     )
-    # degraded URLs are spent too: re-requesting one only returns an unhydrated page
-    assert fetched_isbns(out) == {"1", "4"}
+    # only "ok" and "no_listings" are final. A degraded page is a transient
+    # site-side state -- the same URLs served full pages minutes later -- so
+    # those ISBNs must stay queued or the dataset loses books for nothing.
+    assert fetched_isbns(out) == {"1", "5"}
 
 
 def test_fetched_isbns_missing_file_is_empty(tmp_path: Path):
@@ -266,3 +329,58 @@ def test_fetched_isbns_ignores_truncated_lines(tmp_path: Path):
     out = tmp_path / "out.jsonl"
     out.write_text('{"isbn": "1", "status": "ok"}\n{"isbn": "2", "stat', encoding="utf-8")
     assert fetched_isbns(out) == {"1"}
+
+
+# --------------------------------------------------------------------------- #
+# degrade circuit-breaker
+# --------------------------------------------------------------------------- #
+
+class _ThrottledSession:
+    """Serves a normal search page but never a hydrated detail page."""
+
+    def __init__(self, search_html: str, detail_html: str):
+        self.search_html = search_html
+        self.detail_html = detail_html
+
+    def fetch(self, url: str, wait_for: str | None = None):
+        return (self.search_html if "SearchResults" in url else self.detail_html, 200)
+
+
+def test_collect_stops_once_degradation_comes_in_a_run(tmp_path: Path):
+    out = tmp_path / "out.jsonl"
+    pace = Pace(min_delay=0, max_delay=0, break_every=0, rng=random.Random(0))
+    session = _ThrottledSession(SEARCH_HTML, "<html><title>unhydrated</title></html>")
+
+    stats = collect(["1", "2", "3", "4", "5"], out, pace, session, tmp_path / "html", True,
+                    degrade_cooldown=0, max_consecutive_degraded=2)
+
+    assert stats["stopped_early"] is True
+    assert stats["degraded"] == 2
+    # the last three were never requested, so they stay available -- and so do
+    # the two degraded ones, whose pages may hydrate on a later attempt
+    assert fetched_isbns(out) == set()
+    # one unhydrated sample is kept, so the episode can be audited later against
+    # the same URL once it works again
+    assert (tmp_path / "html" / "1_degraded.html").exists()
+
+
+def test_collect_keeps_going_when_degradation_is_isolated(tmp_path: Path):
+    class _Flaky(_ThrottledSession):
+        def __init__(self):
+            super().__init__(SEARCH_HTML, "<html><title>unhydrated</title></html>")
+            self.calls = 0
+
+        def fetch(self, url: str, wait_for: str | None = None):
+            if "SearchResults" in url:
+                return (SEARCH_HTML, 200)
+            self.calls += 1
+            # every record's second listing hydrates, so nothing runs
+            return ("<html><h1 data-test-id='listing-title'>Art</h1>"
+                    "<div data-test-id='listing-isbn-link'>0201853949 / 9780201853940</div></html>", 200)
+
+    out = tmp_path / "out.jsonl"
+    pace = Pace(min_delay=0, max_delay=0, break_every=0, rng=random.Random(0))
+    stats = collect(["1", "2", "3"], out, pace, _Flaky(), tmp_path / "html", True,
+                    degrade_cooldown=0, max_consecutive_degraded=2)
+    assert stats["stopped_early"] is False
+    assert stats["ok"] == 3
