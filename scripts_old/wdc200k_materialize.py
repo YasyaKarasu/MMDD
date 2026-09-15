@@ -395,12 +395,22 @@ class _CachedQueryAutoCheckExtractor:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
+    encoded = json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    try:
+        encoded.encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return encoded
 
 
 _INLINE_JSON_MAX_UTF8_BYTES = 4 * 1024 * 1024

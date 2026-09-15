@@ -99,6 +99,17 @@ class _MemoryCache:
         self.transient_items[key] = dict(record)
 
 
+def test_canonical_json_escapes_lone_surrogates_without_changing_unicode() -> None:
+    encoded = materializer._canonical_json(
+        {"bad": "\ud800", "normal": "中文"}
+    )
+
+    assert encoded.encode("utf-8")
+    assert json.loads(encoded) == {"bad": "\ud800", "normal": "中文"}
+    assert "\\ud800" in encoded
+    assert "中文" in materializer._canonical_json({"normal": "中文"})
+
+
 def test_materialize_schema_initialization_commit_uses_live_guard(
     tmp_path: Path,
 ) -> None:
