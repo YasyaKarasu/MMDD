@@ -322,12 +322,15 @@ def serialize_table(
     *,
     mark_candidates: bool = False,
     max_rows: int = 12,
+    reader_layout_version: str = "header_markers_v0",
 ) -> str:
+    if reader_layout_version not in {"header_markers_v0", "tail_candidates_v1"}:
+        raise ValueError(f"Unknown reader layout: {reader_layout_version}")
     lines = []
     headers = []
     for column in table["columns"]:
         name = escape_marker_literals(column.get("column_name"))
-        if mark_candidates:
+        if mark_candidates and reader_layout_version == "header_markers_v0":
             name = f"{CANDIDATE_OPEN}{name}{CANDIDATE_CLOSE}"
         headers.append(name)
     lines.append("Columns: " + " | ".join(headers))
@@ -337,6 +340,11 @@ def serialize_table(
             for column in table["columns"]
         ]
         lines.append("Row: " + " | ".join(values))
+    if mark_candidates and reader_layout_version == "tail_candidates_v1":
+        lines.append("Candidate columns:")
+        for position, column in enumerate(table["columns"]):
+            name = escape_marker_literals(column.get("column_name"))
+            lines.append(f"{CANDIDATE_OPEN}Candidate {position + 1}: {name}{CANDIDATE_CLOSE}")
     return "\n".join(lines)
 
 

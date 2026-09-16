@@ -266,8 +266,10 @@ class Stage2Verifier:
         column_permutation_seed: int | None = None,
         column_rejection_threshold: float | None = None,
     ) -> None:
-        if scorer.weight.in_features != backend.hidden_dim * 2:
+        if scorer.input_dim != backend.hidden_dim * 2:
             raise ValueError("Candidate scorer and Stage-2 backend dimensions disagree")
+        if getattr(scorer, "reader_layout_version", "header_markers_v0") != getattr(backend, "reader_layout_version", "header_markers_v0"):
+            raise ValueError("Candidate scorer and Stage-2 backend reader layouts disagree")
         if similarity_batch_size <= 0:
             raise ValueError("similarity_batch_size must be positive")
         if column_rejection_threshold is not None and not 0.0 <= column_rejection_threshold <= 1.0:
@@ -293,7 +295,7 @@ class Stage2Verifier:
         targets: dict[str, dict[str, Any]],
         evidence: dict[str, dict[str, Any]],
     ) -> list[torch.Tensor]:
-        device = self.scorer.weight.weight.device
+        device = next(self.scorer.parameters()).device
         logits = []
         for bundle in bundles:
             target = self._reader_target(targets[bundle.target_id])

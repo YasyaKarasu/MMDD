@@ -71,9 +71,19 @@ def build_evidence_bundles(
 class CandidateColumnScorer(nn.Module):
     """RATA reader head over each candidate column's boundary states."""
 
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(self, hidden_dim: int, *, head_type: str = "linear") -> None:
         super().__init__()
-        self.weight = nn.Linear(hidden_dim * 2, 1)
+        self.hidden_dim = hidden_dim
+        self.input_dim = hidden_dim * 2
+        self.head_type = head_type
+        if head_type == "linear":
+            self.weight = nn.Linear(self.input_dim, 1)
+        elif head_type == "mlp":
+            self.weight = nn.Sequential(
+                nn.Linear(self.input_dim, 256), nn.GELU(), nn.Dropout(0.1), nn.Linear(256, 1)
+            )
+        else:
+            raise ValueError(f"Unknown column head: {head_type}")
 
     def forward(self, open_states: torch.Tensor, close_states: torch.Tensor) -> torch.Tensor:
         if open_states.shape != close_states.shape:

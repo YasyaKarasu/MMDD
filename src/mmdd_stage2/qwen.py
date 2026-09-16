@@ -56,6 +56,9 @@ class QwenStage2Backend:
         embedding_batch_size: int = 64,
         max_embedding_tokens: int = 128,
         reader_oom_image_max_pixels: int = 1024 * 1024,
+        reader_layout_version: str = "header_markers_v0",
+        reader_anonymize_evidence: bool = False,
+        reader_image_max_pixels: int | None = None,
     ) -> None:
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
@@ -94,6 +97,9 @@ class QwenStage2Backend:
         self.max_embedding_tokens = max_embedding_tokens
         self.reader_oom_image_max_pixels = reader_oom_image_max_pixels
         self.last_reader_image_policy = "processor_default"
+        self.reader_layout_version = reader_layout_version
+        self.reader_anonymize_evidence = reader_anonymize_evidence
+        self.reader_image_max_pixels = reader_image_max_pixels
         tokenizer = self.processor.tokenizer
         self.marker_ids = {
             marker: tokenizer.convert_tokens_to_ids(marker)
@@ -107,6 +113,11 @@ class QwenStage2Backend:
             )
         }
         self.image_token_id = int(self.model.config.image_token_id)
+        if (len(set(self.marker_ids.values())) != len(self.marker_ids)
+                or tokenizer.unk_token_id in self.marker_ids.values()
+                or any(tokenizer.encode(marker, add_special_tokens=False) != [token_id]
+                       for marker, token_id in self.marker_ids.items())):
+            raise ValueError("Reader markers must be unique single known tokenizer tokens")
 
     def _inputs(self, content: list[dict[str, Any]], *, generation_prompt: bool) -> dict[str, torch.Tensor]:
         inputs = self.processor.apply_chat_template(
@@ -197,6 +208,8 @@ class QwenStage2Backend:
             text_limit = max(1, 12000 // max(1, len(evidence)))
             for index, item in enumerate(evidence, 1):
                 label = f"\nEvidence {index} ({escape_marker_literals(item['asset_id'])}):"
+                if getattr(self, "reader_anonymize_evidence", False):
+                    label = f"\nEvidence {index}:"
                 if item.get("asset_type") == "image":
                     content.extend(
                         [
@@ -217,7 +230,7 @@ class QwenStage2Backend:
                     "type": "text",
                     "text": (
                     "\nEND RETRIEVED EVIDENCE\n\nBEGIN CANDIDATE TARGET TABLE\n"
-                    f"{serialize_table(target, mark_candidates=True)}\n"
+                    f"{serialize_table(target, mark_candidates=True, reader_layout_version=getattr(self, 'reader_layout_version', 'header_markers_v0'))}\n"
                     "END CANDIDATE TARGET TABLE"
                     ),
                 }
@@ -225,10 +238,15 @@ class QwenStage2Backend:
             return content
 
         self.last_reader_image_policy = "processor_default"
-        inputs = self._inputs(reader_content(None), generation_prompt=False)
+        fixed_pixels = getattr(self, "reader_image_max_pixels", None)
+        if fixed_pixels is not None:
+            self.last_reader_image_policy = f"first_frame_rgb_max_pixels_{fixed_pixels}"
+        inputs = self._inputs(reader_content(fixed_pixels), generation_prompt=False)
         try:
             outputs = self.model.model(**inputs, use_cache=False, return_dict=True)
         except torch.OutOfMemoryError:
+            if fixed_pixels is not None:
+                raise
             del inputs
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -245,6 +263,9 @@ class QwenStage2Backend:
         close_positions = (input_ids == self.marker_ids[CANDIDATE_CLOSE]).nonzero().flatten()
         if open_positions.numel() != len(target["columns"]) or close_positions.numel() != len(target["columns"]):
             raise ValueError("Candidate marker count changed during Qwen preprocessing")
+        if not torch.all(open_positions < close_positions) or not torch.all(close_positions[:-1] < open_positions[1:]):
+            raise ValueError("Candidate marker pairs are out of order")
+        self.last_reader_token_count = int(input_ids.numel())
         hidden = outputs.last_hidden_state[0]
         return hidden[open_positions].float().cpu(), hidden[close_positions].float().cpu()
 

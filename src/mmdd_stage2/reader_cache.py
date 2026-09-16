@@ -330,7 +330,7 @@ def evaluate_scorer(
     include_predictions: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     scorer.eval()
-    device = scorer.weight.weight.device
+    device = next(scorer.parameters()).device
     results = []
     for record in records:
         logits = scorer(
@@ -338,8 +338,9 @@ def evaluate_scorer(
         ).float().cpu()
         probabilities = torch.softmax(logits, dim=0)
         gold = int(record["gold_column_position"])
-        predicted = int(logits.argmax())
-        rank = int((logits > logits[gold]).sum()) + 1
+        order = sorted(range(len(logits)), key=lambda index: (-float(logits[index]), index))
+        predicted = order[0]
+        rank = order.index(gold) + 1
         candidate_indices = [int(value) for value in record["candidate_column_indices"]]
         results.append(
             {
