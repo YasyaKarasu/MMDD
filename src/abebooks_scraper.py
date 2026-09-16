@@ -327,11 +327,12 @@ class BrowserSession:
     """A single Chromium instance reused across the whole run."""
 
     def __init__(self, proxy: dict[str, str] | None, headless: bool, timeout_ms: float,
-                 user_data_dir: Path | str | None):
+                 user_data_dir: Path | str | None, user_agent: str | None = None):
         self.proxy = proxy
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.user_data_dir = Path(user_data_dir) if user_data_dir is not None else None
+        self.user_agent = user_agent
         self._pw = None
         self._context: BrowserContext | None = None
 
@@ -340,6 +341,12 @@ class BrowserSession:
         # channel="chromium" selects the full browser build; without it Playwright
         # reaches for the separate chrome-headless-shell download.
         launch = {"headless": self.headless, "proxy": self.proxy, "channel": "chromium"}
+        context: dict[str, object] = {"locale": "en-US", "timezone_id": "America/New_York"}
+        if self.user_agent:
+            # This overrides the User-Agent header and nothing else. The browser
+            # still sends sec-ch-ua* client hints describing its real version, so
+            # an old UA string ends up contradicted by its own request headers.
+            context["user_agent"] = self.user_agent
         if self.user_data_dir is not None:
             # Off by default. Carrying cookies between runs does NOT make the
             # site treat us as a returning visitor -- it makes it serve the
@@ -347,12 +354,10 @@ class BrowserSession:
             # this when debugging something that genuinely needs stored state.
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
             self._context = self._pw.chromium.launch_persistent_context(
-                str(self.user_data_dir), locale="en-US", timezone_id="America/New_York", **launch
+                str(self.user_data_dir), **context, **launch
             )
         else:
-            self._context = self._pw.chromium.launch(**launch).new_context(
-                locale="en-US", timezone_id="America/New_York"
-            )
+            self._context = self._pw.chromium.launch(**launch).new_context(**context)
         self._context.set_default_timeout(self.timeout_ms)
         return self
 
@@ -557,6 +562,14 @@ def main() -> None:
     p.add_argument("--profile", dest="user_data_dir", type=Path, default=None,
                    help="reuse a persistent browser profile at this path; off by default because "
                         "a dirty profile makes AbeBooks serve unhydrated detail pages")
+    p.add_argument("--user-agent", default=None,
+                   help="override the browser's User-Agent string; unset by default, and unset is "
+                        "the only configuration that has been observed to work. This overrides the "
+                        "header only: the browser keeps sending sec-ch-ua* client hints for its "
+                        "real version, so a stale UA ends up contradicted by its own request "
+                        "headers. A 2026-09-16 attempt to blame the UA was inconclusive -- both "
+                        "runs began on the same unfinished record, so the comparison isolated "
+                        "nothing")
     p.add_argument("--degrade-cooldown", type=float, default=180.0,
                    help="seconds to idle after a record whose detail pages all came back degraded")
     p.add_argument("--max-consecutive-degraded", type=int, default=3,
@@ -575,7 +588,8 @@ def main() -> None:
     print(f"{len(isbns)} ISBNs queued; proxy={proxy or 'direct'}; "
           f"pace={args.min_delay}-{args.max_delay}s, break {args.break_seconds}s every {args.break_every}")
 
-    with BrowserSession(proxy, args.headless, args.timeout, args.user_data_dir) as session:
+    with BrowserSession(proxy, args.headless, args.timeout, args.user_data_dir,
+                        args.user_agent) as session:
         stats = collect(isbns, args.output, pace, session, args.html_dir, args.detailed,
                         args.degrade_cooldown, args.max_consecutive_degraded)
     print(json.dumps(stats, indent=2))
