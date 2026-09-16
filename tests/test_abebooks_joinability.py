@@ -458,7 +458,7 @@ def _strip_ids(record: dict[str, Any], ids: dict[str, str]) -> dict[str, Any]:
 def test_emitted_records_match_the_shared_materialize_join(lake: dict[str, Any]) -> None:
     """The pin that keeps the port from drifting away from the original.
 
-    ``materialize_join`` here is a port rather than a call because six things
+    ``materialize_join`` here is a port rather than a call because five things
     have to differ, and each is asserted below rather than assumed.  Everything
     else -- the column projections, the row selections, the target fan-out, the
     qrel and recovery contents -- must stay byte-identical, so both
@@ -527,14 +527,14 @@ def test_emitted_records_match_the_shared_materialize_join(lake: dict[str, Any])
         row["cells"].pop()
     assert ours_query["rows"] == ref_query["rows"]
 
-    # Divergence 3: the split on a target table.  The EntiTables artifacts carry
-    # one and the shared builder omits the key entirely; nothing reads it, and a
-    # target is a data-lake object rather than a split member.
+    # A target is a data-lake object rather than a split member, so neither side
+    # carries a split.  Asserted rather than assumed so the port cannot quietly
+    # reintroduce one.
     for ours_item, ref_item in zip(ours_targets, ref_targets):
         assert "split" not in ref_item
-        assert ours_item.pop("split") == "train"
+        assert "split" not in ours_item
 
-    # Divergences 4 and 5: query_entity names a real column instead of a wiki
+    # Divergences 3 and 4: query_entity names a real column instead of a wiki
     # title, and evidence names the asset family.  Both are additive facts about
     # this data source that the shared record has nowhere to put.
     stripped = []
@@ -559,7 +559,7 @@ def test_emitted_records_match_the_shared_materialize_join(lake: dict[str, Any])
     for ours_item, ref_item in stripped:
         assert normalize(ours_item) == normalize(ref_item)
 
-    # Divergence 6, and the pin: the query, the qrels and the targets are equal
+    # Divergence 5, and the pin: the query, the qrels and the targets are equal
     # field for field once the ids are aligned.
     assert normalize(ours_query) == normalize(ref_query)
     assert [normalize(item) for item in ours_qrels] == [normalize(item) for item in ref_qrels]
@@ -604,6 +604,32 @@ def test_the_manifest_lists_every_artifact_construction_reads(
         assert record["records"] == len(_read_jsonl(root / record["path"])), artifact
     assert manifest["query_construction"]["join_shape"] == "attribute"
     assert manifest["query_construction"]["image_local_path_policy"] == "absolute"
+
+
+def test_the_split_summary_declares_a_query_only_shared_lake(
+        lake: dict[str, Any], tmp_path: Path) -> None:
+    """Train/dev/test scope the queries; the lake is one shared corpus.
+
+    ``construction.py`` retrieves over every lake table for every query, so a
+    builder that partitioned the lake would disagree with Stage 1 while still
+    looking correct.
+    """
+    run(lake, tmp_path)
+    root = tmp_path / "out"
+    manifest = json.loads((root / "dataset_manifest.json").read_text(encoding="utf-8"))
+    splits = json.loads((root / "splits.json").read_text(encoding="utf-8"))
+    query_tables = _read_jsonl(root / "query_tables.jsonl")
+    lake_tables = _read_jsonl(root / "data_lake_tables.jsonl")
+    assert manifest["split_schema_version"] == "query-only-shared-data-lake-v1"
+    assert splits["split_policy"] == "query_only"
+    assert splits["data_lake_scope"] == "shared"
+    assert "data_lake_table_ids" not in splits
+    assert splits["data_lake_artifact"] == "data_lake_tables"
+    assert splits["data_lake_table_count"] == len(lake_tables)
+    assert sum(splits["query_table_counts"].values()) == len(query_tables)
+    assert all("split" not in record for record in lake_tables)
+    assert all(record["split"] in {"train", "dev", "test"}
+               for record in query_tables)
 
 
 def test_tables_that_yield_no_query_are_still_lake_candidates(

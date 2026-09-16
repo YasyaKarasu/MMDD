@@ -71,7 +71,6 @@ from wdc200k_structural import (
 )
 from stage1_io import (
     iter_manifest_records,
-    load_split_map,
     resolve_source_table_reference,
 )
 from stage1_io import stable_hash
@@ -1929,7 +1928,7 @@ def test_empty_assets_keep_source_reference_in_raw_data_lake_table(
     legacy_record = join_builder.table_record(
         table_id="dl_raw_source-1",
         role="raw_data_lake_table",
-        split="test",
+        split=None,
         source_table=actual.source_table,
         column_indices=columns,
         rows=legacy_rows,
@@ -1939,10 +1938,13 @@ def test_empty_assets_keep_source_reference_in_raw_data_lake_table(
             "reason": "no_column_met_recovered_value_ratio",
         },
     )
-    assert resolve_source_table_reference(
+    assert "split" not in actual.data_lake_tables[0]
+    expanded = resolve_source_table_reference(
         actual.data_lake_tables[0],
         actual.source_table,
-    ) == legacy_record
+    )
+    # stage1_io is a retired consumer and still injects an empty split key.
+    assert {key: value for key, value in expanded.items() if key != "split"} == legacy_record
     assert actual.decision["reason"] == "no_column_met_recovered_value_ratio"
 
 
@@ -2443,7 +2445,9 @@ def test_full_materialization_writes_current_canonical_layout_and_resumes(
     assert list(
         iter_manifest_records(output_root, "source_tables", log_every=0)
     ) == [_source_table()]
-    assert load_split_map(output_root) == {"source-1": "test"}
+    assert json.loads(
+        (output_root / "splits.json").read_text(encoding="utf-8")
+    )["split_policy"] == "query_only"
     assert "rows" not in data_lake_records[0]
     assert data_lake_records[0]["source_table_ref"] == {
         "artifact": "source_tables",
@@ -2627,7 +2631,9 @@ def test_real_task3_expand_through_task7_is_readable(
         column["column_name"]
         for column in source_records[0]["columns"]
     }
-    assert load_split_map(output_root)
+    assert json.loads(
+        (output_root / "splits.json").read_text(encoding="utf-8")
+    )["query_table_counts"]
 
 
 def test_cross_run_task5_and_task6_substitution_is_rejected(

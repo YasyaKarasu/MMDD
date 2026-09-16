@@ -4193,6 +4193,34 @@ def test_table_record_defaults_dataset_provenance_builder(source_overrides):
     assert record["provenance"]["builder"] == "build_mm_joinability_dataset.py"
 
 
+@pytest.mark.parametrize(
+    ("role", "split", "expected_split"),
+    [
+        ("query", "train", "train"),
+        ("target_data_lake_table", None, None),
+        ("raw_data_lake_table", None, None),
+    ],
+)
+def test_table_record_scopes_split_to_queries_only(
+    role: str,
+    split: str | None,
+    expected_split: str | None,
+) -> None:
+    record = joinability_dataset.table_record(
+        table_id="table_1",
+        role=role,
+        split=split,
+        source_table={"source_table_id": "source_1", "columns": []},
+        column_indices=[],
+        rows=[],
+        source_row_indices=[],
+        extra={},
+    )
+
+    assert record.get("split") == expected_split
+    assert ("split" in record) == (expected_split is not None)
+
+
 def test_old_cache_key_is_preserved_when_disabling_thinking():
     base = dict(
         asset_id="asset_1",

@@ -59,6 +59,7 @@ from mmdd_dataset.joinability import (
     BuildConfig,
 )
 from mmdd_dataset.utils import (
+    SPLIT_SCHEMA_VERSION,
     clean_text,
     get_cell,
     read_jsonl,
@@ -508,14 +509,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     artifacts["source_tables"] = _source_tables(tables, assets)
     if args.raw_data_lake_refs:
         artifacts["data_lake_tables"] = _with_raw_refs(
-            tables, artifacts["data_lake_tables"], split_of
+            tables, artifacts["data_lake_tables"]
         )
 
+    query_table_counts = {"train": 0, "dev": 0, "test": 0}
     for query in artifacts["query_tables"]:
-        splits[query["split"]]["query_table_ids"].append(query["table_id"])
-    splits["data_lake_table_ids"] = sorted(
-        target["table_id"] for target in artifacts["data_lake_tables"]
-    )
+        query_table_counts[str(query["split"])] += 1
+    splits["query_table_counts"] = query_table_counts
+    splits["data_lake_table_count"] = len(artifacts["data_lake_tables"])
+    splits["data_lake_artifact"] = "data_lake_tables"
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -541,15 +543,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "copy_channels": sorted(f"{family}->{name}" for family, name in channels),
         "auto_check": "skipped" if args.no_auto_check else "local",
         "raw_data_lake_refs": bool(args.raw_data_lake_refs),
-        "queries_by_split": {
-            split: len(payload["query_table_ids"]) for split, payload in splits.items()
-            if isinstance(payload, dict) and "query_table_ids" in payload
-        },
+        "queries_by_split": dict(query_table_counts),
     }
     write_json(out_dir / "splits.json", splits)
     write_json(out_dir / "stats.json", stats)
     write_json(out_dir / "dataset_manifest.json", {
         "format": "mmdd_joinability_research_v2",
+        "split_schema_version": SPLIT_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "source_lake": str(args.lake_dir),
         "query_construction": {
@@ -616,7 +616,6 @@ def _source_tables(tables: list[dict[str, Any]], assets: list[dict[str, Any]]) -
 def _with_raw_refs(
     tables: list[dict[str, Any]],
     targets: list[dict[str, Any]],
-    split_of: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Add every lake table as a lightweight data-lake candidate.
 
@@ -632,7 +631,6 @@ def _with_raw_refs(
             "object_id": "dl_raw_" + stable_hash("raw", table["source_table_id"]),
             "object_type": "table",
             "role": "raw_data_lake_table",
-            "split": split_of[table["source_table_id"]],
             "source_table_id": table["source_table_id"],
             "source_table_ref": {"artifact": "source_tables",
                                  "source_table_id": table["source_table_id"]},

@@ -3025,8 +3025,8 @@ def build_dataset(
             flush_every,
         )
 
-    splits = join_builder.source_splits(source_split_records, args)
-    source_to_split = join_builder.split_map(splits)
+    splits, source_to_split = join_builder.source_splits(source_split_records, args)
+    query_table_counts = {"train": 0, "dev": 0, "test": 0}
     assets = join_builder.load_assets(bridge_assets_writer.paths())
     model_cache_path = cache_dir / "model_attribute_extractions.jsonl"
     cache = join_builder.ExtractionCache(
@@ -3258,7 +3258,6 @@ def build_dataset(
                     and bool(candidates)
                 )
                 decision["source_table_id"] = source_table_id
-                decision["split"] = split
                 if deferred_candidate:
                     for candidate in candidates:
                         candidate_id = join_builder.clean_text(
@@ -3278,11 +3277,10 @@ def build_dataset(
                 for record in query_tables:
                     write_jsonl_record(query_handle, record)
                     query_table_count += 1
-                    splits[split]["query_table_ids"].append(record["table_id"])
+                    query_table_counts[split] += 1
                 for record in ([] if deferred_candidate else data_lake_tables):
                     write_jsonl_record(data_lake_handle, record)
                     data_lake_table_count += 1
-                    splits[split]["data_lake_table_ids"].append(record["table_id"])
                 qrels.extend(table_qrels)
                 if (query_table_count + data_lake_table_count) % flush_every == 0:
                     query_handle.flush()
@@ -3330,14 +3328,9 @@ def build_dataset(
                         selected_by_source.get(source_table_id, [])
                     )
                     if not selected_candidate_ids:
-                        record = join_builder.raw_data_lake_record(
-                            source_table, split
-                        )
+                        record = join_builder.raw_data_lake_record(source_table)
                         write_jsonl_record(data_lake_handle, record)
                         data_lake_table_count += 1
-                        splits[split]["data_lake_table_ids"].append(
-                            record["table_id"]
-                        )
                         continue
                     seen_candidates.update(
                         explicit_candidate_source_ids[candidate_id]
@@ -3389,7 +3382,6 @@ def build_dataset(
                         **original_decision,
                         **explicit_decisions[0],
                         "source_table_id": source_table_id,
-                        "split": split,
                         "qualified_columns": [
                             qualified
                             for item in explicit_decisions
@@ -3407,15 +3399,10 @@ def build_dataset(
                         write_jsonl_record(query_handle, record)
                         query_table_count += 1
                         explicit_join_query_table_count += 1
-                        splits[split]["query_table_ids"].append(
-                            record["table_id"]
-                        )
+                        query_table_counts[split] += 1
                     for record in explicit_targets:
                         write_jsonl_record(data_lake_handle, record)
                         data_lake_table_count += 1
-                        splits[split]["data_lake_table_ids"].append(
-                            record["table_id"]
-                        )
                     qrels.extend(explicit_qrels)
                 if seen_candidates != set(candidate_source_ids):
                     raise ValueError(
@@ -3431,17 +3418,15 @@ def build_dataset(
         if progress is not None:
             progress.close()
 
-    for split in ("train", "dev", "test"):
-        splits[split]["query_table_ids"] = sorted(splits[split]["query_table_ids"])
-        splits[split]["data_lake_table_ids"] = sorted(
-            splits[split]["data_lake_table_ids"]
-        )
     join_builder.validate_implicit_query_uniqueness(
         qrels,
         expected_query_count=implicit_query_table_count,
     )
     qrels_count = write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
+    splits["query_table_counts"] = query_table_counts
+    splits["data_lake_table_count"] = data_lake_table_count
+    splits["data_lake_artifact"] = "data_lake_tables"
     write_json(output_dir / "splits.json", splits)
 
     stats = {
@@ -3572,7 +3557,10 @@ def build_dataset(
             if model_error_file.is_relative_to(output_dir)
             else str(model_error_file),
         },
+        "split_schema_version": "query-only-shared-data-lake-v1",
         "query_construction": {
+            "split_policy": "query_only",
+            "data_lake_scope": "shared",
             "query_rows_per_table": args.query_rows_per_table,
             "query_row_selection": "recovery_balanced_disjoint_train_views",
             "max_train_query_row_views_per_join": (

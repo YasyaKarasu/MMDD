@@ -2552,6 +2552,8 @@ def _parameter_payload(
     return {
         "seed": int(args.seed),
         "split_by": str(args.split_by),
+        "split_policy": "query_only",
+        "data_lake_scope": "shared",
         "train_ratio": float(args.train_ratio),
         "dev_ratio": float(args.dev_ratio),
         "test_ratio": float(args.test_ratio),
@@ -4816,7 +4818,6 @@ def _materialize_balance_work_item(
     explicit_decision = {
         **explicit_decisions[0],
         "source_table_id": item.source_table_id,
-        "split": item.split,
         "qualified_columns": [
             qualified
             for decision in explicit_decisions
@@ -5192,7 +5193,6 @@ def _store_table_unit(
         decision = {
             **materialized.decision,
             "source_table_id": source_table_id,
-            "split": split,
         }
         artifact_records: dict[str, Iterable[dict[str, Any]]] = {
             "source_tables": [
@@ -7383,85 +7383,44 @@ def _write_splits(
     try:
         with temporary.open("w", encoding="utf-8") as raw_handle:
             handle = GuardedTextWriter(raw_handle, tracker)
-            handle.write("{")
-            first_split = True
+            split_counts = {"train": 0, "dev": 0, "test": 0}
             with _connect(database_path) as connection:
-                for split in ("train", "dev", "test"):
-                    if not first_split:
-                        handle.write(",")
-                    first_split = False
-                    handle.write(json.dumps(split))
-                    handle.write(":{")
-                    for index, (name, query, parameters) in enumerate(
-                        (
-                            (
-                                "source_table_ids",
-                                """
-                                SELECT source_table_id AS value
-                                FROM source_catalog WHERE split = ?
-                                ORDER BY source_table_id
-                                """,
-                                (split,),
-                            ),
-                            (
-                                "query_table_ids",
-                                """
-                                SELECT record_id AS value
-                                FROM materialized_records
-                                WHERE artifact = 'query_tables'
-                                  AND json_extract(
-                                      record_json, '$.split'
-                                  ) = ?
-                                ORDER BY record_id
-                                """,
-                                (split,),
-                            ),
-                            (
-                                "data_lake_table_ids",
-                                """
-                                SELECT record_id AS value
-                                FROM materialized_records
-                                WHERE artifact = 'data_lake_tables'
-                                  AND json_extract(
-                                      record_json, '$.split'
-                                  ) = ?
-                                ORDER BY record_id
-                                """,
-                                (split,),
-                            ),
-                        )
-                    ):
-                        if index:
-                            handle.write(",")
-                        handle.write(json.dumps(name))
-                        handle.write(":[")
-                        first = True
-                        for row in connection.execute(query, parameters):
-                            if not first:
-                                handle.write(",")
-                            first = False
-                            handle.write(
-                                json.dumps(str(row["value"]))
-                            )
-                        handle.write("]")
-                    handle.write("}")
-            handle.write(',"split_key":')
+                for row in connection.execute(
+                    """
+                    SELECT json_extract(record_json, '$.split') AS split,
+                           COUNT(*) AS records
+                    FROM materialized_records
+                    WHERE artifact = 'query_tables'
+                    GROUP BY split
+                    """
+                ):
+                    split_counts[str(row["split"])] = int(row["records"])
+                data_lake_table_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) AS records
+                        FROM materialized_records
+                        WHERE artifact = 'data_lake_tables'
+                        """
+                    ).fetchone()["records"]
+                )
             handle.write(
                 json.dumps(
-                    "page_title_or_source_table_id"
-                    if args.split_by == "page_title"
-                    else "source_table_id"
+                    {
+                        "split_key": (
+                            "page_title_or_source_table_id"
+                            if args.split_by == "page_title"
+                            else "source_table_id"
+                        ),
+                        "split_policy": "query_only",
+                        "data_lake_scope": "shared",
+                        "query_table_counts": split_counts,
+                        "data_lake_table_count": data_lake_table_count,
+                        "data_lake_artifact": "data_lake_tables",
+                    }
                 )
             )
-            handle.write(',"note":')
-            handle.write(
-                json.dumps(
-                    "source-level split; data_lake contains generated "
-                    "targets for queryable tables and source-table "
-                    "references for rejected tables"
-                )
-            )
-            handle.write("}\n")
+            handle.write("\n")
             raw_handle.flush()
             os.fsync(raw_handle.fileno())
         digest = _sha256_path(temporary)
@@ -8218,6 +8177,7 @@ def _finalize_dataset(
                 "model_attribute_errors.jsonl"
             ),
         },
+        "split_schema_version": "query-only-shared-data-lake-v1",
         "published_single_files": {
             name: {
                 **_completed_payload(shard),

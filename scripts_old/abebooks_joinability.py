@@ -631,7 +631,7 @@ def materialize_join(
             table,
             table_id=target_id,
             role="target_data_lake_table",
-            split=split,
+            split=None,
             column_indices=target_columns,
             rows=target_rows,
             source_row_ids=target_source_rows,

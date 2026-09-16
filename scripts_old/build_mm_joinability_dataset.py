@@ -6776,28 +6776,21 @@ def source_splits(source_records: list[dict[str, str]], args: argparse.Namespace
         "dev": keys[train_n : train_n + dev_n],
         "test": keys[train_n + dev_n :],
     }
-    splits: dict[str, Any] = {}
+    source_to_split: dict[str, str] = {}
     for split, selected in split_keys.items():
-        splits[split] = {
-            "source_table_ids": sorted({source_id for key in selected for source_id in groups[key]}),
-            "query_table_ids": [],
-            "data_lake_table_ids": [],
-        }
-    splits["split_key"] = "page_title_or_source_table_id" if args.split_by == "page_title" else "source_table_id"
-    splits["note"] = (
-        "source-level split; data_lake contains generated targets for "
-        "queryable tables and source-table references for rejected tables"
-    )
-    return splits
-
-
-def split_map(splits: dict[str, Any]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for split, payload in splits.items():
-        if isinstance(payload, dict):
-            for source_id in payload.get("source_table_ids", []):
-                result[source_id] = split
-    return result
+        for key in selected:
+            for source_id in groups[key]:
+                source_to_split[source_id] = split
+    splits: dict[str, Any] = {
+        "split_key": (
+            "page_title_or_source_table_id"
+            if args.split_by == "page_title"
+            else "source_table_id"
+        ),
+        "split_policy": "query_only",
+        "data_lake_scope": "shared",
+    }
+    return splits, source_to_split
 
 
 def choose_entity_column(
@@ -7054,19 +7047,18 @@ def table_record(
     *,
     table_id: str,
     role: str,
-    split: str,
+    split: str | None,
     source_table: dict[str, Any],
     column_indices: list[int],
     rows: list[dict[str, Any]],
     source_row_indices: list[int],
     extra: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    record = {
         "table_id": table_id,
         "object_id": table_id,
         "object_type": "table",
         "role": role,
-        "split": split,
         "source_table_id": source_table["source_table_id"],
         "page_title": clean_text(source_table.get("page_title")),
         "caption": clean_text(source_table.get("caption")),
@@ -7081,9 +7073,12 @@ def table_record(
         },
         **extra,
     }
+    if split is not None:
+        record["split"] = split
+    return record
 
 
-def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, Any]:
+def raw_data_lake_record(source_table: dict[str, Any]) -> dict[str, Any]:
     source_table_id = clean_text(source_table.get("source_table_id"))
     if not source_table_id:
         raise ValueError("source table is missing source_table_id")
@@ -7093,7 +7088,6 @@ def raw_data_lake_record(source_table: dict[str, Any], split: str) -> dict[str, 
         "object_id": table_id,
         "object_type": "table",
         "role": "raw_data_lake_table",
-        "split": split,
         "source_table_id": source_table_id,
         "source_table_ref": {
             "artifact": "source_tables",
@@ -7791,7 +7785,7 @@ def _materialize_explicit_join_candidate(
         target_table = table_record(
             table_id=target_table_id,
             role="target_data_lake_table",
-            split=split,
+            split=None,
             source_table=source_table,
             column_indices=target_cols,
             rows=target_rows,
@@ -8204,7 +8198,7 @@ def rejected_table_join_records(
         if explicit_candidates:
             return (
                 [],
-                [raw_data_lake_record(source_table, split)],
+                [raw_data_lake_record(source_table)],
                 [],
                 {
                     **decision,
@@ -8214,9 +8208,9 @@ def rejected_table_join_records(
                     "explicit_join_candidate": explicit_candidates[0],
                 },
             )
-        return [], [raw_data_lake_record(source_table, split)], [], decision
+        return [], [raw_data_lake_record(source_table)], [], decision
     if mode == "disabled":
-        return [], [raw_data_lake_record(source_table, split)], [], decision
+        return [], [raw_data_lake_record(source_table)], [], decision
     explicit_records = build_explicit_join_fallback_records(
         source_table=source_table,
         split=split,
@@ -8229,7 +8223,7 @@ def rejected_table_join_records(
     )
     if explicit_records is not None:
         return explicit_records
-    return [], [raw_data_lake_record(source_table, split)], [], decision
+    return [], [raw_data_lake_record(source_table)], [], decision
 
 
 def select_best_qualified_column(qualified_cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10822,7 +10816,7 @@ def _build_table_join_records_once(
                 table_record(
                     table_id=str(target_materialization["target_table_id"]),
                     role="target_data_lake_table",
-                    split=split,
+                    split=None,
                     source_table=source_table,
                     column_indices=list(target_materialization["target_cols"]),
                     rows=target_materialization["target_rows"],
@@ -11473,8 +11467,8 @@ def _build_dataset(
             flush_every,
         )
 
-    splits = source_splits(source_split_records, args)
-    source_to_split = split_map(splits)
+    splits, source_to_split = source_splits(source_split_records, args)
+    query_table_counts = {"train": 0, "dev": 0, "test": 0}
     if getattr(args, "model_progress", True):
         planned_keys = estimate_model_analysis_keys(
             source_paths=source_writer.paths(),
@@ -11658,7 +11652,6 @@ def _build_dataset(
                     and bool(candidates)
                 )
                 decision["source_table_id"] = source_table_id
-                decision["split"] = split
                 if deferred_candidate:
                     for candidate in candidates:
                         candidate_id = clean_text(candidate.get("candidate_id"))
@@ -11681,11 +11674,10 @@ def _build_dataset(
                 for record in query_tables:
                     write_jsonl_record(query_handle, record)
                     query_table_count += 1
-                    splits[split]["query_table_ids"].append(record["table_id"])
+                    query_table_counts[split] += 1
                 for record in ([] if deferred_candidate else data_lake_tables):
                     write_jsonl_record(data_lake_handle, record)
                     data_lake_table_count += 1
-                    splits[split]["data_lake_table_ids"].append(record["table_id"])
                 qrels.extend(table_qrels)
                 if (query_table_count + data_lake_table_count) % flush_every == 0:
                     query_handle.flush()
@@ -11736,12 +11728,9 @@ def _build_dataset(
                         selected_by_source.get(source_table_id, [])
                     )
                     if not selected_candidate_ids:
-                        record = raw_data_lake_record(source_table, split)
+                        record = raw_data_lake_record(source_table)
                         write_jsonl_record(data_lake_handle, record)
                         data_lake_table_count += 1
-                        splits[split]["data_lake_table_ids"].append(
-                            record["table_id"]
-                        )
                         continue
                     decision_index = explicit_candidate_decision_indices[
                         selected_candidate_ids[0]
@@ -11787,7 +11776,6 @@ def _build_dataset(
                         **original_decision,
                         **explicit_decisions[0],
                         "source_table_id": source_table_id,
-                        "split": split,
                         "qualified_columns": [
                             qualified
                             for item in explicit_decisions
@@ -11805,15 +11793,10 @@ def _build_dataset(
                         write_jsonl_record(query_handle, record)
                         query_table_count += 1
                         explicit_join_query_table_count += 1
-                        splits[split]["query_table_ids"].append(
-                            record["table_id"]
-                        )
+                        query_table_counts[split] += 1
                     for record in explicit_targets:
                         write_jsonl_record(data_lake_handle, record)
                         data_lake_table_count += 1
-                        splits[split]["data_lake_table_ids"].append(
-                            record["table_id"]
-                        )
                     qrels.extend(explicit_qrels)
                 if explicit_join_query_table_count != implicit_query_table_count:
                     raise ValueError(
@@ -11825,16 +11808,15 @@ def _build_dataset(
         if progress is not None:
             progress.close()
 
-    for split in ("train", "dev", "test"):
-        splits[split]["query_table_ids"] = sorted(splits[split]["query_table_ids"])
-        splits[split]["data_lake_table_ids"] = sorted(splits[split]["data_lake_table_ids"])
-
     validate_implicit_query_uniqueness(
         qrels,
         expected_query_count=implicit_query_table_count,
     )
     qrels_count = write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", table_decisions)
+    splits["query_table_counts"] = query_table_counts
+    splits["data_lake_table_count"] = data_lake_table_count
+    splits["data_lake_artifact"] = "data_lake_tables"
     write_json(output_dir / "splits.json", splits)
 
     replacement_selection = {
@@ -11960,7 +11942,10 @@ def _build_dataset(
             "stats": "stats.json",
             "table_queryability_decisions": "table_queryability_decisions.jsonl",
         },
+        "split_schema_version": "query-only-shared-data-lake-v1",
         "query_construction": {
+            "split_policy": "query_only",
+            "data_lake_scope": "shared",
             "query_rows_per_table": args.query_rows_per_table,
             "query_row_selection": "recovery_balanced_disjoint_train_views",
             "max_train_query_row_views_per_join": args.max_train_query_row_views_per_join,

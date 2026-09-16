@@ -2400,13 +2400,28 @@ def test_build_dataset_materializes_only_settled_replacement_tables(
 
     assert [row["source_table_id"] for row in source_rows] == ["t2", "t1"]
     assert {row["source_table_id"] for row in decisions} == {"t1", "t2"}
+    # The split scopes queries; a source-table decision is not a split member.
+    assert all("split" not in row for row in decisions)
     assert {row["asset_id"] for row in bridge_assets} == {"asset-t1", "asset-t2"}
     assert all(row.get("source_table_id") != "t0" for row in qrels)
-    assert all(
-        "t0" not in payload.get("source_table_ids", [])
-        for payload in splits.values()
-        if isinstance(payload, dict)
+    query_rows = list(
+        builder.iter_jsonl_records(sorted((output_dir / "query_tables").glob("*.jsonl")))
     )
+    assert splits["split_policy"] == "query_only"
+    assert splits["data_lake_scope"] == "shared"
+    assert splits["data_lake_artifact"] == "data_lake_tables"
+    assert sum(splits["query_table_counts"].values()) == len(query_rows)
+    assert "data_lake_table_ids" not in splits
+    lake_rows = list(
+        builder.iter_jsonl_records(
+            sorted((output_dir / "data_lake_tables").glob("*.jsonl"))
+        )
+    )
+    assert splits["data_lake_table_count"] == len(lake_rows)
+    assert all("split" not in row for row in lake_rows)
+    # Query records here come from the stubbed build_table_join_records, so the
+    # query-side split key is asserted against table_record itself in
+    # test_mm_joinability_extraction.py.
     assert manifest["artifacts"]["source_tables"]["total_records"] == len(source_rows)
     assert sum(
         shard["records"]
