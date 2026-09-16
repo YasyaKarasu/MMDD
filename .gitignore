@@ -39,6 +39,11 @@ output_*/
 output_stage1_logic/
 output_medium/
 
+# Packaged experiment deliveries and source archives
+# (multi-hundred-MB tarballs produced by the package_* runners; regenerable)
+/deliveries/
+/packages/
+
 # Local input datasets and downloaded assets
 /references/
 /data/
