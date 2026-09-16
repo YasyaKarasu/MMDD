@@ -500,6 +500,17 @@ def score_teacher_pairs(
     }
 
 
+def _teacher_pair_job_counts(execution: dict[str, Any]) -> dict[str, int]:
+    return {
+        "teacher_pair_scores_consumed": (
+            int(execution.get("required_pairs", 0))
+            if execution["status"] == "complete"
+            else 0
+        ),
+        "teacher_pair_scores_computed_this_run": int(execution.get("new_pairs", 0)),
+    }
+
+
 def _source_label(target: str, direct: set[str], evidence: set[str]) -> str:
     if target in direct and target in evidence:
         return "both"
@@ -1793,7 +1804,7 @@ def run(phase: str, device_name: str) -> dict[str, Any]:
                 if (FINAL_TEACHER_FEATURES / "BACKFILL_RECEIPT.json").is_file()
                 else 0
             ),
-            "teacher_pair_scoring": teacher_execution.get("new_pairs", 0),
+            **_teacher_pair_job_counts(teacher_execution),
         },
         "elapsed_seconds": time.monotonic() - started,
     }

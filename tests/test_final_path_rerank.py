@@ -5,6 +5,7 @@ import math
 import pytest
 
 from evaluate_final_path_rerank import (
+    _teacher_pair_job_counts,
     logsumexp,
     rank_scores,
     source_bootstrap,
@@ -37,3 +38,16 @@ def test_source_bootstrap_reports_paired_wins_losses_and_ties() -> None:
     assert result["wins"] == result["losses"] == result["ties"] == 1
     assert result["queries"] == 3
     assert result["source_groups"] == 2
+
+
+def test_teacher_execution_distinguishes_consumed_and_new_scores() -> None:
+    execution = {
+        "status": "complete",
+        "required_pairs": 12,
+        "cached_pairs": 12,
+        "new_pairs": 0,
+    }
+    assert _teacher_pair_job_counts(execution) == {
+        "teacher_pair_scores_consumed": 12,
+        "teacher_pair_scores_computed_this_run": 0,
+    }
