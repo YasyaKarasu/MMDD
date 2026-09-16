@@ -1,0 +1,75 @@
+#!/usr/bin/env python
+"""Run the contracted R2 column-only experiments without modifying R1 artifacts."""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--r1', type=Path)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--model-dir', type=Path)
+    parser.add_argument('--jobs', type=Path)
+    parser.add_argument('--shard', type=int, default=0)
+    parser.add_argument('--shards', type=int, default=2)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--kind', choices=['flat', 'separate', 'test', 'prior-test'], default='flat')
+    parser.add_argument('--arm', choices=['OO_CONTROL', 'FLAT_MIX', 'PRIOR', 'PVR_BUNDLE', 'PVR_SEPARATE', 'PVR_SUPPORT'])
+    parser.add_argument('--seed', type=int, choices=[13,29], default=13)
+    parser.add_argument('phase', choices=['audit', 'prepare-a', 'reader', 'evaluate-a', 'natural-train',
+                                         'prepare-jobs', 'train', 'freeze-shortlists', 'audit-support',
+                                         'lock-selection', 'formal-test', 'analyze', 'cost', 'report', 'audit-reader-inputs', 'freeze-runtime'])
+    args = parser.parse_args()
+    root = args.root.resolve()
+    r1 = args.r1 or root / 'work/S2-COL-R1'
+    output = args.output or root / 'work/S2_COL_R2'
+    model_dir = args.model_dir or root / 'hf_models/Qwen3.5-9B'
+    if args.phase == 'audit':
+        from mmdd_stage2.column_r2_audit import audit_and_replay
+        audit_and_replay(root, r1, output, model_dir)
+    elif args.phase == 'prepare-a':
+        from mmdd_stage2.column_r2_cache import prepare_phase_a
+        prepare_phase_a(r1, output)
+    elif args.phase == 'reader':
+        from mmdd_stage2.column_r2_cache import reader_worker
+        reader_worker(r1, output, model_dir, args.jobs, args.shard, args.shards, args.device)
+    elif args.phase == 'evaluate-a':
+        from mmdd_stage2.column_r2_phase_a import evaluate_phase_a
+        evaluate_phase_a(r1, output)
+    elif args.phase == 'natural-train':
+        from mmdd_stage2.column_r2_natural import build_natural_train
+        build_natural_train(root, r1, output)
+    elif args.phase == 'prepare-jobs':
+        from mmdd_stage2.column_r2_training import prepare_jobs
+        prepare_jobs(r1, output, args.kind)
+    elif args.phase == 'train':
+        from mmdd_stage2.column_r2_training import train_arm
+        train_arm(r1, output, args.arm, args.seed)
+    elif args.phase == 'freeze-shortlists':
+        from mmdd_stage2.column_r2_training import freeze_shortlists
+        freeze_shortlists(r1, output)
+    elif args.phase == 'audit-support':
+        from mmdd_stage2.column_r2_support import audit_support
+        audit_support(r1, output)
+    elif args.phase in {'lock-selection', 'formal-test', 'analyze'}:
+        from mmdd_stage2.column_r2_evaluation import lock_selection, formal_test, analyze
+        {'lock-selection': lock_selection, 'formal-test': formal_test, 'analyze': analyze}[args.phase](r1, output)
+    elif args.phase == 'cost':
+        from mmdd_stage2.column_r2_cost import audit_cost
+        audit_cost(r1, output)
+    elif args.phase == 'report':
+        from mmdd_stage2.column_r2_report import build_report
+        build_report(r1, output)
+    elif args.phase == 'audit-reader-inputs':
+        from mmdd_stage2.column_r2_audit import audit_reader_inputs
+        audit_reader_inputs(r1, output)
+    elif args.phase == 'freeze-runtime':
+        from mmdd_stage2.column_r2_runtime import freeze_runtime
+        freeze_runtime(root, r1, output)
+
+
+if __name__ == '__main__':
+    main()
