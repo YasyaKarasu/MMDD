@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Migrate a legacy WDC output to query-only splits with a shared data lake."""
+"""Migrate a legacy dataset output to query-only splits with a shared data lake."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from mmdd_dataset.utils import SPLIT_SCHEMA_VERSION
 from mmdd_progress import progress
 
 SPLITS = ("train", "dev", "test")
-SPLIT_SCHEMA_VERSION = "query-only-shared-data-lake-v1"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -43,14 +43,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _metadata(path: Path, *, relative_path: str, records: int) -> dict[str, Any]:
-    return {
-        "path": relative_path,
-        "records": records,
-        "bytes": path.stat().st_size,
-        "sha256": _sha256(path),
-        "mtime_ns": path.stat().st_mtime_ns,
-    }
+def _metadata(
+    path: Path, *, relative_path: str, records: int, checksums: bool
+) -> dict[str, Any]:
+    """Describe a written file, matching the detail level the manifest already uses.
+
+    Older manifests list shards as path and record count only. Adding checksums to
+    them would switch on the verification branch in
+    ``mmdd_dataset.wdc_runtime.iter_dataset_artifact`` and re-hash every artifact on
+    each read, so the caller decides based on the manifest it is migrating.
+    """
+    metadata = {"path": relative_path, "records": records}
+    if checksums:
+        metadata |= {
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+    return metadata
 
 
 def _temporary(path: Path) -> Path:
@@ -105,7 +115,7 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
     splits_path = root / "splits.json"
     manifest = _read_json(manifest_path)
     old_splits = _read_json(splits_path)
-    if manifest.get("complete") is not True:
+    if "complete" in manifest and manifest["complete"] is not True:
         raise ValueError("dataset manifest is not complete")
 
     query_splits: dict[str, str] = {}
@@ -146,6 +156,7 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
     target_ids: set[str] = set()
     target_split_fields = 0
     target_artifact = manifest["artifacts"]["data_lake_tables"]
+    checksums = "sha256" in target_artifact["shards"][0]
     target_paths = _artifact_paths(root, manifest, "data_lake_tables")
     target_shards = zip(target_artifact["shards"], target_paths)
     for shard, source in progress(
@@ -180,7 +191,12 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
             (
                 source,
                 temporary,
-                _metadata(temporary, relative_path=str(shard["path"]), records=records),
+                _metadata(
+                    temporary,
+                    relative_path=str(shard["path"]),
+                    records=records,
+                    checksums=checksums,
+                ),
             )
         )
 
@@ -223,24 +239,6 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
         decisions_path, decisions_temporary
     )
 
-    assignments_dir = root / "split_assignments"
-    assignments_dir.mkdir(exist_ok=True)
-    assignments_path = assignments_dir / "part-00000.jsonl"
-    assignments_temporary = _temporary(assignments_path)
-    with assignments_temporary.open("w", encoding="utf-8") as handle:
-        for query_id in sorted(query_splits):
-            record = {
-                "object_id": query_id,
-                "object_type": "query_table",
-                "source_table_id": query_sources[query_id],
-                "split": query_splits[query_id],
-            }
-            handle.write(
-                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-            )
-        handle.flush()
-        os.fsync(handle.fileno())
-
     split_key = str(old_splits.get("split_key", "source_table_id"))
     new_splits = {
         "split_key": split_key,
@@ -248,7 +246,6 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
         "data_lake_scope": "shared",
         "query_table_counts": query_counts,
         "data_lake_table_count": len(target_ids),
-        "assignments_artifact": "split_assignments",
         "data_lake_artifact": "data_lake_tables",
     }
     splits_temporary = _temporary(splits_path)
@@ -259,24 +256,15 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
         shard.update(metadata)
     target_artifact["total_records"] = len(target_ids)
 
-    assignment_metadata = _metadata(
-        assignments_temporary,
-        relative_path="split_assignments/part-00000.jsonl",
-        records=len(query_splits),
+    published = manifest.setdefault("published_single_files", {})
+    published["splits.json"] = _metadata(
+        splits_temporary, relative_path="splits.json", records=1, checksums=checksums
     )
-    manifest["artifacts"]["split_assignments"] = {
-        "directory": "split_assignments",
-        "total_records": len(query_splits),
-        "max_records_per_shard": int(manifest.get("records_per_shard", 10000)),
-        "shards": [assignment_metadata],
-    }
-    manifest["published_single_files"]["splits.json"] = _metadata(
-        splits_temporary, relative_path="splits.json", records=1
-    )
-    manifest["published_single_files"][decisions_path.name] = _metadata(
+    published[decisions_path.name] = _metadata(
         decisions_temporary,
         relative_path=decisions_path.name,
         records=decision_records,
+        checksums=checksums,
     )
     construction = manifest.setdefault("query_construction", {})
     construction["split_policy"] = "query_only"
@@ -292,7 +280,6 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
     for source, temporary, _ in target_replacements:
         os.replace(temporary, source)
     os.replace(decisions_temporary, decisions_path)
-    os.replace(assignments_temporary, assignments_path)
     os.replace(splits_temporary, splits_path)
     os.replace(manifest_temporary, manifest_path)
 
@@ -303,7 +290,6 @@ def migrate_dataset(root: Path) -> dict[str, Any]:
         "data_lake_table_count": len(target_ids),
         "data_lake_split_fields_removed": target_split_fields,
         "decision_split_fields_removed": decision_split_fields,
-        "split_assignment_count": len(query_splits),
     }
 
 
