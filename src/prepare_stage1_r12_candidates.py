@@ -66,6 +66,70 @@ def materialize_batch(batch, known, ann_hits, seed, epoch, step, cap=256, *, enf
     return arms
 
 
+def apply_positive_closure(
+    base_rows: list[dict],
+    known: dict,
+    *,
+    cap: int = 256,
+) -> tuple[list[dict], dict[str, int]]:
+    """Insert train-known positives into an already materialized base list.
+
+    This is deliberately a second operation, rather than another call to
+    :func:`materialize_batch`.  B2/B3 bridge comparisons must consume the
+    *same* base lists: enabling closure may add positives and evict only the
+    tail of the existing negatives, but it must not resample or rerun ANN.
+    The returned rows keep the original negative order and update labels and
+    provenance fields without treating absent positives as negatives.
+    """
+
+    if cap <= 0:
+        raise ValueError("cap must be positive")
+    changed = 0
+    inserted = 0
+    evicted = 0
+    output: list[dict] = []
+    for row in base_rows:
+        key = (row["query_id"], row["source_type"], row["destination_type"])
+        positives = set(known.get(key, ()))
+        ids = list(dict.fromkeys(row["candidate_ids"]))
+        missing = sorted(positives - set(ids))
+        if missing:
+            changed += 1
+            inserted += len(missing)
+            # Prefix insertion is deterministic and leaves every pre-existing
+            # candidate in its original relative order until cap enforcement.
+            ids = [*missing, *ids]
+        if len(ids) > cap:
+            kept = ids[:cap]
+            evicted += len(ids) - len(kept)
+            ids = kept
+        values = dict(row)
+        values["candidate_ids"] = ids
+        values["positive_ids"] = [value for value in ids if value in positives]
+        values["confirmed_labels"] = [
+            label for value, label in zip(row["candidate_ids"], row.get("confirmed_labels", []))
+            if value in ids
+        ]
+        # The old labels may not cover inserted candidates.  Keep positional
+        # semantics explicit: inserted known positives have no assumed label.
+        labels = dict(zip(row["candidate_ids"], row.get("confirmed_labels", [])))
+        values["confirmed_labels"] = [labels.get(value) for value in ids]
+        # Preserve raw-ANN provenance from the shared base materialization.
+        # Closure changes the label mask, not how the negative candidates were
+        # mined; zeroing these fields would make the receipt misleading.
+        values["raw_ann_negative_quota"] = row.get("raw_ann_negative_quota", 0)
+        values["raw_ann_negatives_used"] = row.get("raw_ann_negatives_used", 0)
+        values["closure_inserted_positive_ids"] = missing
+        values["closure_evicted_negative_count"] = max(0, len(row["candidate_ids"]) + len(missing) - len(ids))
+        output.append(values)
+    return output, {
+        "lists": len(base_rows),
+        "lists_modified": changed,
+        "positives_inserted": inserted,
+        "negatives_evicted": evicted,
+    }
+
+
 def run(args):
     started = time.monotonic()
     torch.set_num_threads(2)
