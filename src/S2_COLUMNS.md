@@ -47,3 +47,15 @@ PYTHONPATH=/home/oycy/MMDD/src conda run -n MMDD python -m pytest \
 ```
 
 合成测试通过不代表实际 9B 训练完成。以 `RUN_RECEIPTS`、checkpoint hashes、逐 epoch visits、独立标签与完整预测重新计算的指标为证。缺失输出保留分母；无自然检索产物的测试轨不能用于推断证据噪声效应。`RESULTS` 必须保留未执行状态。
+
+完整运行退出成功后，独立核验并生成最终报告：
+
+```bash
+cd /tmp
+export PYTHONPATH=/home/oycy/MMDD/src
+conda run -n MMDD python /home/oycy/MMDD/src/audit_stage2_column_execution.py --output /home/oycy/MMDD/work/S2-COL-R1
+conda run -n MMDD python /home/oycy/MMDD/src/plot_stage2_column_trajectories.py --output /home/oycy/MMDD/work/S2-COL-R1
+conda run -n MMDD python /home/oycy/MMDD/src/finalize_stage2_columns.py --output /home/oycy/MMDD/work/S2-COL-R1
+```
+
+`audit_stage2_column_support.py` 只读取既有 recovery 标注，记录选定 E 的已知行覆盖与未截断正文保留率，不生成新的属性值。最终报告还需要冻结的 24 个 dev 案例审阅记录 `DEV_REVIEW_NOTES.json`；不把自动列名匹配当作外部人工裁决。`finalize_stage2_columns.py` 重算固定模型输入扰动的成对差分与 source-cluster 置信区间，并输出分桶、成本、案例及交付哈希清单。
