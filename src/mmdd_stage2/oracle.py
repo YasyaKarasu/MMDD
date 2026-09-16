@@ -276,9 +276,7 @@ def load_oracle_column_data(
                 continue
             if query_id not in queries or target_id not in targets:
                 continue
-            if str(queries[query_id].get("split", split)) != split or str(
-                targets[target_id].get("split", split)
-            ) != split:
+            if str(queries[query_id].get("split", split)) != split:
                 missing["split_mismatch"].append(f"{query_id}->{target_id}")
                 continue
             all_evidence_ids = sorted(

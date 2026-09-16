@@ -19,7 +19,7 @@
 | `data_lake_tables/` | 候选 target 表 | 必需 |
 | `source_tables/` | 展开轻量的 raw data-lake 引用 | 必需 |
 | `qrels.jsonl` | query-target 正例与相关度 | 必需 |
-| `splits.json` | train/dev/test 的 ID 列表 | 必需 |
+| `splits.json` | query 切分摘要与共享湖契约 | 必需 |
 
 训练或评测多模态 evidence 路径时，另外读取：
 
@@ -242,7 +242,6 @@ query table 的通用字段如下：
 | 字段 | 含义 |
 | --- | --- |
 | `table_id` | candidate 主键，也是 qrel 的 `target_table_id` |
-| `split` | candidate 所属 split |
 | `columns`、`rows` | target 的可见内容 |
 | `join_col`、`join_col_name` | join 列在 source table 中的位置和名称 |
 | `queryable_source_table` | 当前为 `true` |
@@ -264,7 +263,6 @@ set(query.source_row_indices) ⊆ set(target.source_row_indices)
 {
   "table_id": "dl_raw_st_example",
   "role": "raw_data_lake_table",
-  "split": "test",
   "source_table_id": "st_example",
   "source_table_ref": {
     "artifact": "source_tables",
@@ -306,7 +304,7 @@ set(query.source_row_indices) ⊆ set(target.source_row_indices)
 
 - `target_table_id` 与 `data_lake_table_id` 当前相同；新代码应优先使用
   `target_table_id`，读取旧数据时可回退到 `data_lake_table_id`。
-- `rel = 3` 表示强相关正例。训练负例不是以 `rel = 0` 写入，而是从同 split
+- `rel = 3` 表示强相关正例。训练负例不是以 `rel = 0` 写入，而是从共享的完整
   candidate corpus 中动态采样。
 - `reason` 当前主要有 `model_recoverable_join_column` 和
   `explicit_visible_join_column`。
@@ -379,27 +377,42 @@ recovery 当作正路径，但应按 `query_table_id`、`query_row_id` 和 `asse
 
 ## 9. `splits.json` 与无泄漏划分
 
-`splits.json` 的顶层键为 `train`、`dev`、`test`，每个 split 包含：
+**切分只作用在 query 上。train/dev/test 共享同一片完整的数据湖。**
+
+`splits.json` 是一份摘要，不再是 ID 清单：
 
 ```json
 {
-  "source_table_ids": [],
-  "query_table_ids": [],
-  "data_lake_table_ids": []
+  "split_key": "page_title_or_source_table_id",
+  "split_policy": "query_only",
+  "data_lake_scope": "shared",
+  "query_table_counts": {"train": 12630, "dev": 1198, "test": 1166},
+  "data_lake_table_count": 22886,
+  "data_lake_artifact": "data_lake_tables"
 }
 ```
+
+逐条的 query 归属**只有一个来源**：`query_tables[*].split`。
 
 推荐的数据选择方式：
 
 | 阶段 | Query | Candidate corpus | Ground truth |
 | --- | --- | --- | --- |
-| 训练 | `split == train` 的 query | train data-lake IDs | train qrels |
-| 验证 | `split == dev` 的 query | dev data-lake IDs | dev qrels |
-| 测试 | `split == test` 的 query | test data-lake IDs | test qrels |
+| 训练 | `split == train` 的 query | 完整 `data_lake_tables` | train qrels |
+| 验证 | `split == dev` 的 query | 完整 `data_lake_tables` | dev qrels |
+| 测试 | `split == test` 的 query | 完整 `data_lake_tables` | test qrels |
 
-必须以 source table 为泄漏边界。同一个 `source_table_id` 的 query、target、row views
-和 evidence 不得跨 split。对 train 中同一 `chain_id` 的多个 `row_view_index`，可以
-作为数据增强使用，但验证/测试只应出现 canonical `row_view_index = 0`。
+**test 的 query 会检索到由 train 来源表生成的湖表，这是预期行为，不是泄漏。** 泄漏边界在
+query 侧：同一个 `source_table_id` 派生的 query 不跨 split，因此模型在测试时从未见过该
+query 的监督信号。湖是被检索的对象，不是监督信号。
+
+对 train 中同一 `chain_id` 的多个 `row_view_index`，可以作为数据增强使用，但验证/测试
+只应出现 canonical `row_view_index = 0`。
+
+> **旧格式提示。** `split_policy` 字段不存在的数据集是旧格式：`splits.json` 顶层为
+> `train`/`dev`/`test`，各含一份互不相交的 `data_lake_table_ids`，且湖表记录带 `split`
+> 字段。判据：`manifest["split_schema_version"] == "query-only-shared-data-lake-v1"`。
+> 迁移见 `docs/entitables_shared_lake_format.md`。
 
 ## 10. 推荐的训练样本构造
 
@@ -414,7 +427,7 @@ recovery 当作正路径，但应按 `query_table_id`、`query_row_id` 和 `asse
 构造步骤：
 
 1. 以 `qrels.jsonl` 生成正例 pair。
-2. 从相同 split 的 `data_lake_table_ids` 中采样负例。
+2. 从完整的 `data_lake_tables` 中采样负例，不按 split 过滤。
 3. 排除该 query 的所有 qrel target；同时建议排除同一 `source_table_id` 的其他投影，
    以减少伪负例。
 4. query 与 candidate 都只序列化可见的列名和 cell `text`；文本资产只序列化
@@ -446,7 +459,7 @@ query-to-table retriever，不应把正例 evidence 或 recovered value 拼入 q
 
 ## 11. 推荐评测协议
 
-对 dev/test 的每个 query，在相同 split 的完整 candidate corpus 上排序，并至少报告：
+对 dev/test 的每个 query，在完整的共享 candidate corpus 上排序，并至少报告：
 
 - Recall@K；
 - MRR；
@@ -482,9 +495,11 @@ query-to-table retriever，不应把正例 evidence 或 recovered value 拼入 q
 
 - manifest 列出的所有 shard 都存在，记录数与 manifest 相符；
 - `table_id`、`source_table_id`、`asset_id`、`recovery_id` 在各自主表中唯一；
-- 每条 qrel 的 query 和 target 均存在，且三者 split 一致；
+- 每条 qrel 的 query 和 target 均存在，且 qrel 的 `split` 与其 query 的 `split` 一致
+  （target 没有 `split`，不参与该校验）；
 - 每个 implicit query 恰好有一个 qrel；
-- qrel 的 target 出现在对应 split 的 `data_lake_table_ids` 中；
+- qrel 的 target 出现在 `data_lake_tables` 中；
+- 湖表记录一律不含 `split` 字段；
 - raw data-lake 引用能够解析到同 ID 的 source table；
 - query 的 source rows 是同 chain target source rows 的子集；
 - implicit join attribute 不出现在 query 可见列中；

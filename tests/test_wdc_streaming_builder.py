@@ -408,6 +408,7 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     manifest = json.loads(manifest_text)
     assert manifest["complete"] is True
     assert manifest["format"] == "mmdd_joinability_sharded_v3"
+    assert manifest["split_schema_version"] == "query-only-shared-data-lake-v1"
     assert str(config.work_dir) not in manifest_text
     assert all(
         not Path(shard["path"]).is_absolute()
@@ -422,9 +423,6 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     data_lake_tables = list(
         iter_dataset_artifact(config.output_dir, "data_lake_tables")
     )
-    split_assignments = list(
-        iter_dataset_artifact(config.output_dir, "split_assignments")
-    )
     splits = json.loads((config.output_dir / "splits.json").read_text(encoding="utf-8"))
     decisions = list(
         iter_dataset_artifact(config.output_dir, "table_queryability_decisions")
@@ -437,8 +435,7 @@ def test_final_dataset_is_self_contained_after_work_directory_is_renamed(
     assert len(source_tables) == len(decisions) == 2
     assert len(query_tables) == 2
     assert all("split" not in target for target in data_lake_tables)
-    assert len(split_assignments) == len(query_tables)
-    assert {record["object_type"] for record in split_assignments} == {"query_table"}
+    assert not (config.output_dir / "split_assignments").exists()
     assert splits["split_policy"] == "query_only"
     assert splits["data_lake_scope"] == "shared"
     assert sum(splits["query_table_counts"].values()) == len(query_tables)

@@ -116,7 +116,7 @@ def audit_data(roots: list[Path], output: Path, retrieval_paths: list[Path]) -> 
                 if len(split_set) != 1 or not split_set <= {'train', 'dev', 'test'}:
                     raise ValueError('conflicting_split')
                 split = next(iter(split_set))
-                if query.get('split') != split or target.get('split') != split:
+                if query.get('split') != split:
                     raise ValueError('object_split_mismatch')
                 if query.get('query_kind', 'implicit') != 'implicit':
                     raise ValueError('reason_query_kind_mismatch')

@@ -94,6 +94,12 @@ def get_column_name(table: dict[str, Any], column_index: int) -> str:
     return clean_text(table["columns"][column_index]["column_name"])
 
 
+#: Manifest marker for the query-only shared-data-lake schema. A dataset manifest
+#: carrying this value assigns train/dev/test to queries only and never partitions
+#: the data lake; see ``docs/entitables_shared_lake_format.md``.
+SPLIT_SCHEMA_VERSION = "query-only-shared-data-lake-v1"
+
+
 def source_splits(
     tables: list[dict[str, Any]],
     *,
@@ -116,14 +122,11 @@ def source_splits(
     }
 
     split_of: dict[str, str] = {}
-    splits: dict[str, Any] = {}
     for split, selected_source_ids in split_keys.items():
-        selected_source_ids.sort()
-        splits[split] = {
-            "query_table_ids": [],
-        }
         split_of.update({source_id: split for source_id in selected_source_ids})
-    splits["split_key"] = "source_table_id"
-    splits["split_policy"] = "query_only"
-    splits["data_lake_scope"] = "shared"
+    splits: dict[str, Any] = {
+        "split_key": "source_table_id",
+        "split_policy": "query_only",
+        "data_lake_scope": "shared",
+    }
     return splits, split_of

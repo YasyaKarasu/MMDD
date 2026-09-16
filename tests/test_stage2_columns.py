@@ -9,7 +9,9 @@ from mmdd_stage2.data import CANDIDATE_OPEN, CANDIDATE_CLOSE, serialize_table, p
 from mmdd_stage2.verifier import CandidateColumnScorer
 from mmdd_stage2.checkpoints import save_candidate_scorer, load_candidate_scorer
 from mmdd_stage2.column_metrics import prediction, evaluate, column_order
-from mmdd_stage2.column_data import visible_table, natural_evidence, digest
+from mmdd_stage2.column_data import (
+    visible_table, natural_evidence, digest, audit_data, read_jsonl, write_json, write_jsonl,
+)
 from mmdd_stage2.column_cache import load_features, condition_input
 from mmdd_stage2.column_training import column_loss
 
@@ -229,3 +231,58 @@ def test_cache_identical_visible_pairs_keep_identity_and_manifest_is_immutable(t
     assert len({r['input_hash'] for r in records}) == 2
     assert build_features(tmp_path, tmp_path/'fake_model', **kwargs) == path
     assert file_hash(path) == original_hash and backend.calls == 2
+
+
+def _shared_lake_root(root: Path, *, query_split: str = 'train') -> Path:
+    """A dataset root in the query-only shared-lake layout: the lake table carries no split."""
+    artifacts = {'query_tables': 'query_tables/part.jsonl',
+                 'data_lake_tables': 'data_lake_tables/part.jsonl',
+                 'bridge_assets': 'bridge_assets/part.jsonl',
+                 'evidence_recoveries': 'evidence_recoveries/part.jsonl'}
+    root.mkdir(parents=True)
+    write_json(root/'dataset_manifest.json',
+               {'single_files': {'qrels': 'qrels.jsonl'},
+                'artifacts': {name: {'path': path} for name, path in artifacts.items()}})
+    write_jsonl(root/'qrels.jsonl', [{'query_table_id': 'q1', 'target_table_id': 't1',
+                                      'split': 'train', 'reason': 'model_recoverable_join_column',
+                                      'source_table_id': 'st1', 'chain_id': 'chain1',
+                                      'join_attribute': {'source_column_index': 7}}])
+    write_jsonl(root/artifacts['query_tables'],
+                [{'table_id': 'q1', 'split': query_split,
+                  'columns': [{'column_index': 0, 'source_column_index': 0, 'column_name': 'entity'}],
+                  'rows': []}])
+    write_jsonl(root/artifacts['data_lake_tables'],
+                [{'table_id': 't1',
+                  'columns': [{'column_index': 2, 'source_column_index': 9, 'column_name': 'other'},
+                              {'column_index': 5, 'source_column_index': 7, 'column_name': 'gold'}],
+                  'rows': []}])
+    write_jsonl(root/artifacts['bridge_assets'],
+                [{'asset_id': 'text_a', 'asset_type': 'text', 'content': 'a'}])
+    write_jsonl(root/artifacts['evidence_recoveries'],
+                [{'query_table_id': 'q1', 'target_table_id': 't1', 'split': 'train',
+                  'evidence': {'asset_id': 'text_a', 'asset_type': 'text'}}])
+    return root
+
+
+def test_audit_data_populates_pairs_when_lake_records_carry_no_split(tmp_path):
+    root = _shared_lake_root(tmp_path/'entitables_lake')
+    output = tmp_path/'audit'
+    audit = audit_data([root], output, [])
+
+    assert audit['excluded_before_population_lock'] == []
+    assert audit['split_counts'] == {'train': 1}
+    assert audit['population_locked']
+    population = read_jsonl(output/'COLUMN_POPULATION.train.jsonl')
+    assert len(population) == 1
+    assert population[0]['gold_column_indices'] == [5]
+    assert population[0]['gold_source_column_indices'] == [7]
+    assert population[0]['split'] == 'train'
+    assert len(read_jsonl(output/'COLUMN_INPUTS.train.jsonl')) == 1
+
+
+def test_audit_data_still_rejects_a_query_whose_split_differs_from_its_qrel(tmp_path):
+    root = _shared_lake_root(tmp_path/'entitables_lake', query_split='dev')
+    audit = audit_data([root], tmp_path/'audit', [])
+
+    assert [r['reason'] for r in audit['excluded_before_population_lock']] == ['object_split_mismatch']
+    assert audit['split_counts'] == {}

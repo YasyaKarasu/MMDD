@@ -48,16 +48,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         ratios=(args.train_ratio, args.dev_ratio, args.test_ratio),
         seed=args.seed,
     )
-    for split in ("train", "dev", "test"):
-        splits[split]["query_view_ids"] = [
-            view["query_view_id"]
-            for view in views
-            if split_of[view["source_table_id"]] == split
-        ]
-        splits[split].pop("query_table_ids")
-    splits["data_lake_source_table_ids"] = sorted(
-        table["source_table_id"] for table in prepared.source_tables
-    )
+    query_view_counts = {"train": 0, "dev": 0, "test": 0}
+    for view in views:
+        query_view_counts[split_of[view["source_table_id"]]] += 1
+    splits["query_view_counts"] = query_view_counts
+    splits["data_lake_source_table_count"] = len(prepared.source_tables)
+    splits["data_lake_artifact"] = "source_tables"
 
     failures: list[dict[str, str]] = []
     assets: list[dict[str, Any]] = []

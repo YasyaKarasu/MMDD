@@ -18,7 +18,13 @@ from .joinability import (
     table_asset_links,
 )
 from .tables import prepare_entitables, prepare_wdc
-from .utils import read_jsonl, source_splits, write_json, write_jsonl
+from .utils import (
+    SPLIT_SCHEMA_VERSION,
+    read_jsonl,
+    source_splits,
+    write_json,
+    write_jsonl,
+)
 
 ARTIFACTS = (
     "source_tables",
@@ -162,11 +168,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
 
+    query_table_counts = {"train": 0, "dev": 0, "test": 0}
     for query in artifacts["query_tables"]:
-        splits[query["split"]]["query_table_ids"].append(query["table_id"])
-    splits["data_lake_table_ids"] = sorted(
-        target["table_id"] for target in artifacts["data_lake_tables"]
-    )
+        query_table_counts[str(query["split"])] += 1
+    splits["query_table_counts"] = query_table_counts
+    splits["data_lake_table_count"] = len(artifacts["data_lake_tables"])
+    splits["data_lake_artifact"] = "data_lake_tables"
 
     counts = {
         artifact: write_jsonl(output_dir / f"{artifact}.jsonl", artifacts[artifact])
@@ -185,6 +192,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         output_dir / "dataset_manifest.json",
         {
             "format": "mmdd_joinability_research_v2",
+            "split_schema_version": SPLIT_SCHEMA_VERSION,
             "query_construction": {
                 "policy_version": JOINABILITY_POLICY_VERSION,
                 "context_attr_limit_policy": "compatibility_flags_ignored",

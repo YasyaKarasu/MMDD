@@ -881,9 +881,9 @@ Compatibility changes from the old WDC builder are intentional:
   chains, or absolute upstream paths;
 - every potentially large artifact, including `qrels` and decisions, is a
   sharded directory rather than a large single JSONL file;
-- `splits.json` is a small query-split summary, while detailed query assignments
-  live in the sharded `split_assignments` artifact; `data_lake_tables` is the
-  single shared corpus and is never assigned to train/dev/test.
+- `splits.json` is a small query-split summary; per-query assignments live on
+  `query_tables[*].split`, which is their single source. `data_lake_tables` is
+  the single shared corpus and is never assigned to train/dev/test.
 
 Only files listed in `dataset_manifest.json` are authoritative. The helper
 `mmdd_dataset.wdc_runtime.iter_dataset_artifact()` resolves them relative to

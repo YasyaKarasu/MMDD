@@ -465,13 +465,9 @@ def test_table_workload_projects_reproducible_query_views(tmp_path: Path) -> Non
     assert manifest["artifacts"]["query_views"]["records"] == 4
     assert splits["split_policy"] == "query_only"
     assert splits["data_lake_scope"] == "shared"
-    assert splits["data_lake_source_table_ids"] == [
-        prepared.source_tables[0]["source_table_id"]
-    ]
-    assert all(
-        set(splits[split]) == {"query_view_ids"}
-        for split in ("train", "dev", "test")
-    )
+    assert splits["data_lake_source_table_count"] == 1
+    assert splits["data_lake_artifact"] == "source_tables"
+    assert sum(splits["query_view_counts"].values()) == 4
 
 
 def test_table_workload_skips_random_projections_when_deterministic_views_fill_limit(
@@ -848,16 +844,15 @@ def test_offline_cli_pipeline_is_self_contained(tmp_path: Path) -> None:
     )
     assert exit_code == 0
     assert manifest["format"] == "mmdd_joinability_research_v2"
+    assert manifest["split_schema_version"] == "query-only-shared-data-lake-v1"
     assert manifest["artifacts"]["query_tables"]["records"] == 1
     assert manifest["artifacts"]["qrels"]["records"] == 1
     assert all("split" not in target for target in targets)
     assert splits["split_policy"] == "query_only"
     assert splits["data_lake_scope"] == "shared"
-    assert splits["data_lake_table_ids"] == [target["table_id"] for target in targets]
-    assert sum(
-        len(splits[split]["query_table_ids"])
-        for split in ("train", "dev", "test")
-    ) == 1
+    assert splits["data_lake_table_count"] == len(targets)
+    assert splits["data_lake_artifact"] == "data_lake_tables"
+    assert sum(splits["query_table_counts"].values()) == 1
 
 
 def test_image_attribute_builder_copies_selected_images(tmp_path: Path) -> None:

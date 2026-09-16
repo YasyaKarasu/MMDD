@@ -20,6 +20,7 @@ from .joinability import (
     table_asset_links,
 )
 from .utils import (
+    SPLIT_SCHEMA_VERSION,
     clean_text,
     get_cell,
     get_column_name,
@@ -63,7 +64,6 @@ FINAL_ARTIFACTS = (
     "qrels",
     "evidence_recoveries",
     "table_queryability_decisions",
-    "split_assignments",
 )
 
 
@@ -1293,15 +1293,6 @@ def _materialize_one_shard(
             ):
                 for record in built[artifact]:
                     writers[artifact].write(record)
-            for query in built["query_tables"]:
-                writers["split_assignments"].write(
-                    {
-                        "object_id": query["table_id"],
-                        "object_type": "query_table",
-                        "source_table_id": source_table_id,
-                        "split": split,
-                    }
-                )
         return [writers[artifact].commit() for artifact in FINAL_ARTIFACTS]
     except BaseException:
         for writer in writers.values():
@@ -1335,6 +1326,7 @@ def _final_manifest(
         }
     return {
         "format": "mmdd_joinability_sharded_v3",
+        "split_schema_version": SPLIT_SCHEMA_VERSION,
         "source": "wdc_schemaorg_tables",
         "input_fingerprint": input_fingerprint,
         "build": {
@@ -1457,9 +1449,9 @@ def run_materialize(
         for artifact in FINAL_ARTIFACTS
     }
     split_counts = {"train": 0, "dev": 0, "test": 0}
-    for record in _artifact_records(manifest, "split_assignments"):
-        for assignment in iter_jsonl(config.output_dir / record["path"]):
-            split_counts[str(assignment["split"])] += 1
+    for record in _artifact_records(manifest, "query_tables"):
+        for query in iter_jsonl(config.output_dir / record["path"]):
+            split_counts[str(query["split"])] += 1
     atomic_write_json(config.output_dir / "stats.json", stats)
     atomic_write_json(
         config.output_dir / "splits.json",
@@ -1469,7 +1461,6 @@ def run_materialize(
             "data_lake_scope": "shared",
             "query_table_counts": split_counts,
             "data_lake_table_count": stats["data_lake_tables"],
-            "assignments_artifact": "split_assignments",
             "data_lake_artifact": "data_lake_tables",
         },
     )
