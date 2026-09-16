@@ -22,7 +22,7 @@ def plot(output: Path) -> None:
             history = json.loads(path.read_text())
             epochs = [r['epoch'] for r in history]
             for axis, field, label in zip(axes, ('loss', 'MRR', 'grad_norm_mean'),
-                                           ('Train set-mass CE', 'Dev query-macro MRR', 'Gradient norm before clipping'), strict=True):
+                                           ('Train mean per-pair set-mass CE', 'Dev query-macro MRR', 'Gradient norm before clipping'), strict=True):
                 values = [r['dev_query_macro'][field] if field == 'MRR' else r[field] for r in history]
                 axis.plot(epochs, values, color=colors[arm], linestyle='-' if seed == 13 else '--',
                           label=f'{arm}, seed {seed}', linewidth=1.5)

@@ -59,3 +59,5 @@ conda run -n MMDD python /home/oycy/MMDD/src/finalize_stage2_columns.py --output
 ```
 
 `audit_stage2_column_support.py` 只读取既有 recovery 标注，记录选定 E 的已知行覆盖与未截断正文保留率，不生成新的属性值。最终报告还需要冻结的 24 个 dev 案例审阅记录 `DEV_REVIEW_NOTES.json`；不把自动列名匹配当作外部人工裁决。`finalize_stage2_columns.py` 重算固定模型输入扰动的成对差分与 source-cluster 置信区间，并输出分桶、成本、案例及交付哈希清单。
+
+本机 MMDD 环境未安装 matplotlib；实际绘图依赖隔离在 `/tmp/mmdd_s2_plot_deps`（matplotlib 3.9.4），绘图命令额外设置 `MPLCONFIGDIR=/tmp/mmdd_s2_mpl PYTHONPATH=/tmp/mmdd_s2_plot_deps:/home/oycy/MMDD/src`。这一路径不用于 reader、训练或评测，详见运行目录的 `PLOTTING_ENVIRONMENT.json`。

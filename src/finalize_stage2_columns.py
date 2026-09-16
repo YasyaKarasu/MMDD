@@ -6,7 +6,6 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from statistics import mean
 from typing import Any
 
 import numpy as np
@@ -54,12 +53,15 @@ def finalize(output: Path) -> None:
     diagnostics = read('DIAGNOSTIC_SELECTION.json')
     selected = diagnostics['arm']
     evaluated: dict[tuple, tuple] = {}
+    predicted: dict[tuple, dict] = {}
 
     def scores(arm: str, seed: int, split: str, condition: str, view: int = 0) -> tuple:
         key = (arm, seed, split, condition, view)
         if key not in evaluated:
             path = output/'PREDICTIONS'/arm/str(seed)/f'{split}.{condition}.view{view}.jsonl.gz'
-            evaluated[key] = evaluate(population[split], read_jsonl(path))
+            outputs = read_jsonl(path)
+            predicted[key] = {pair_key(r): r for r in outputs}
+            evaluated[key] = evaluate(population[split], outputs)
         return evaluated[key]
 
     input_effects, perturbations, conditional_c50 = [], [], []
@@ -113,9 +115,9 @@ def finalize(output: Path) -> None:
     review = ['# 固定 dev 案例审阅', '',
               '24 个 Q–T 按预测前冻结的 hash 顺序选取，包含成功与失败；不挑选 test 错例。',
               'Codex 对正文、表头/行值及六张整图进行了辅助定性审阅，未经外部人工裁决。严格发布标签未修改。',
-              'O-O 正文截取预算与模型相同；图片审阅见 DEV_REVIEW_IMAGES.jpg。能读出线索不等于所有行均获支持。', '',
-              '| query / target | 严格正确列 | C0 O-O rank 13/29 | C1 O-O rank 13/29 | C2 O-O rank 13/29 | 选定模型 O-R rank 13/29 | 审阅 |',
-              '|---|---|---|---|---|---|---|']
+              '定性审阅检查正文段首、相关事实与可见整图，不构成全部截断正文的独立支持验证；图片见 DEV_REVIEW_IMAGES.jpg。能读出线索不等于所有行均获支持。', '',
+              '| query / target | 严格正确列 | C0 O-O rank 13/29 | C1 O-O rank 13/29 | C2 O-O rank 13/29 | 选定模型 O-R rank 13/29 | 选定模型 Top1 O-O；O-R（13/29） | 审阅 |',
+              '|---|---|---|---|---|---|---|---|']
     review_rows = []
     for query, target in keys:
         p = labels[(query, target)]
@@ -128,8 +130,16 @@ def finalize(output: Path) -> None:
                      for a,c in [('C0','O-O'), ('C1','O-O'), ('C2','O-O'), (selected,'O-R')]]
         gold = ', '.join(f'{c}:{names[c]}' for c in p['gold_column_indices'])
         note = note_index[(query,target)]
-        review.append(f'| {query}<br>{target} | {gold} | ' + ' | '.join(rank_text) + f' | {note} |')
-        review_rows.append({'query_id': query, 'target_id': target, 'gold': gold, 'ranks': ranks, 'note': note})
+        top_names = {}
+        for condition in ('O-O','O-R'):
+            top_names[condition] = []
+            for seed in (13,29):
+                record = predicted[(selected, seed, 'dev', condition, 0)][pair_key(p)]
+                top_names[condition].append(names[record['ranking'][0]] if record['status'] == 'ok' else 'FAIL')
+        tops = '; '.join(' / '.join(top_names[c]) for c in ('O-O','O-R'))
+        review.append(f'| {query}<br>{target} | {gold} | ' + ' | '.join(rank_text) + f' | {tops} | {note} |')
+        review_rows.append({'query_id': query, 'target_id': target, 'gold': gold, 'ranks': ranks,
+                            'selected_model_top1': top_names, 'note': note})
     review += ['', '标注歧义仅作为后续独立审计建议；不自动把同名/同值列视为同一属性，也不回改本轮模型选择。',
                '若 rank>3 在这 24 个预先固定样本中未出现，报告未覆盖，不能用事后挑样补成有代表性的错误率。']
     (output/'ERROR_CASES.md').write_text('\n'.join(review)+'\n')
@@ -137,7 +147,10 @@ def finalize(output: Path) -> None:
 
     result['execution_validation'] = validation
     result['supplemental_evaluation'] = 'SUPPLEMENTAL_EVALUATION.json'
-    for stage in ('NoE_ShuffledE_value_order_diagnostics', 'C50_input_compatibility', 'fixed_dev_case_review', 'trajectory_export'):
+    interpretation_path = output/'SCIENTIFIC_INTERPRETATION.md'
+    result['scientific_interpretation'] = str(interpretation_path) if interpretation_path.is_file() else None
+    for stage in ('NoE_ShuffledE_value_order_diagnostics', 'C50_input_compatibility', 'fixed_dev_case_review',
+                  'trajectory_export', 'independent_execution_audit', 'published_support_annotation_audit'):
         result['stage_status'][stage] = dict(planned=True, implemented=True, executed=True, evaluated=True)
     for name in ('TRAJECTORIES.csv', 'TRAJECTORIES.png', 'TRAJECTORIES.pdf'):
         if not (output/name).is_file():
@@ -156,6 +169,7 @@ def finalize(output: Path) -> None:
               'EXECUTION_VALIDATION.json 独立重建访问顺序、optimizer steps 和 dev 选择；核验 checkpoint 文件与参数 hash，及 C0/C1 初值一致。',
               '每条正式臂完成 20 × 7029 = 140580 次基础样本 visits；头部训练用 CPU，冻结 9B 特征仅在本机 GPU 1 RTX 4090 上生成。',
               '每 epoch 的 loss/dev MRR/梯度曲线见 TRAJECTORIES.png、PDF 与 CSV。缓存峰值显存、大小、延迟及失败明细见 SUPPLEMENTAL_EVALUATION.json/cache_costs。', '',
+              '曲线中的训练 CE 是成功处理样本的未加权 pair 均值；实际反向传播按湖等权、湖内 query 等权加权。分模态沿用冻结人口的正 E 模态，O-R 实际证据可能改变或为空。', '',
               '## 主指标分母、机会基线与列预算', '',
               '| split | queries / pairs | Random@1/2/3/5 | 平均列预算@1/2/3/5 | 候选占比@1/2/3/5 |',
               '|---|---|---|---|---|']
@@ -215,11 +229,17 @@ def finalize(output: Path) -> None:
               'explicit 的缺失属性指标为 N/A：它属于可见列直接连接，未与 implicit 缺失属性混算。',
               'C3 未执行：本轮按用户优先范围完成 P0/C0/C1/C2；自然 E train artifact 未建立。raw-Qwen 表级历史引用保留，未重跑他人负责的 baseline。',
               '实际硬件为经用户修正授权的本机 RTX 4090 GPU 1；不是 A100 实验。']
+    if interpretation_path.is_file():
+        lines += ['', interpretation_path.read_text()]
     (output/'RESULTS.zh-CN.md').write_text('\n'.join(lines)+'\n')
     required = ['INPUT_MANIFEST.json','DATA_AUDIT.json','MODEL_SELECTION.json','UNIT_TEST_RESULTS.json',
                 'PER_QUERY_DIFFERENCES.jsonl','ERROR_CASES.md','RESULTS.zh-CN.md','RESULTS.json',
                 'EXECUTION_VALIDATION.json','SUPPLEMENTAL_EVALUATION.json','TRAJECTORIES.csv',
+                'EXECUTION_COMPLETION.json','PAIRED_BOOTSTRAP.json','EVIDENCE_SUPPORT_AUDIT.json',
+                'TRAJECTORIES.png','TRAJECTORIES.pdf',
                 *[f'COLUMN_POPULATION.{s}.jsonl' for s in ('train','dev','test')]]
+    if interpretation_path.is_file():
+        required.append(interpretation_path.name)
     write_json(output/'DELIVERY_MANIFEST.json', {'scope':'P0 + C0/C1/C2 on available EntiTables lake',
         'files': {name: file_hash(output/name) for name in required}, 'states': result['stage_status'],
         'execution_evidence':'EXECUTION_VALIDATION.json + original receipts/visits/checkpoints + recomputed predictions',
