@@ -63,7 +63,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if existing is not None:
             expected = teacher_dir / Path(str(existing["teacher_feature_path"])).name
             if (
-                existing.get("object_type") != "text"
+                existing.get("object_type") != str(row["object_type"])
                 or existing.get("source_fingerprint") != source_fingerprint
                 or not expected.is_file()
             ):
