@@ -1,0 +1,28 @@
+{
+  "note": "Analytic resource estimates; no real lake inference or GPU latency benchmark performed.",
+  "teacher_parameters": 8417281,
+  "student_parameters": 7554048,
+  "weights_fp32_mib_teacher": 32.109378814697266,
+  "weights_fp32_mib_student": 28.81640625,
+  "feature_rows": [
+    {
+      "total_objects": 20000,
+      "bytes": 1638400000,
+      "gib": 1.52587890625,
+      "student_keys_f32_gib": 0.0762939453125
+    },
+    {
+      "total_objects": 200000,
+      "bytes": 16384000000,
+      "gib": 15.2587890625,
+      "student_keys_f32_gib": 0.762939453125
+    },
+    {
+      "total_objects": 600000,
+      "bytes": 49152000000,
+      "gib": 45.7763671875,
+      "student_keys_f32_gib": 2.288818359375
+    }
+  ],
+  "torch_test_version": "2.10.0+cpu"
+}

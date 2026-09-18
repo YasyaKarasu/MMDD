@@ -1,0 +1,220 @@
+{
+  "protocol_id": "MMDD_S1_CLEAN_R1_20260917_v1.0",
+  "seed": 13,
+  "stage2_enabled": false,
+  "paths": {
+    "repo_root": ".",
+    "dataset_root": "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9",
+    "qwen_model_env": "MMDD_QWEN_MODEL_DIR",
+    "output_root": "work/s1_clean_r1_20260917",
+    "frozen_feature_roots": []
+  },
+  "fresh": {
+    "parent_checkpoint": null,
+    "historical_train_lists": [],
+    "historical_rankings": [],
+    "historical_teacher_logits": [],
+    "historical_pca": null,
+    "allow_verified_frozen_qwen_feature_reuse": true,
+    "resume_same_run_only": true
+  },
+  "data": {
+    "primary_lake": "entitables20k",
+    "preserve_original_splits": true,
+    "train_split": "train",
+    "dev_split": "dev",
+    "test_split": "test",
+    "explicit_reason": "explicit_visible_join_column",
+    "implicit_reason": "model_recoverable_join_column",
+    "unknown_reason": "error",
+    "unjudged_policy": "contrastive_only_not_binary_gt",
+    "source_fallback_for_witness": false,
+    "seed": 13
+  },
+  "cache": {
+    "global_dimension": 4096,
+    "global_dtype": "float32",
+    "summary_slots": 8,
+    "summary_dtype": "float16",
+    "prompt_version": "role_modality_v2_object_only",
+    "table_max_rows": 12,
+    "table_max_cell_chars": 1024,
+    "table_row_format": "values",
+    "part_token_limit": 512,
+    "text_token_limit": 7168,
+    "max_length": 8192,
+    "image_max_pixels": 524288,
+    "qwen_dtype": "bfloat16",
+    "persist_full_hidden_states": false,
+    "persist_kv": false,
+    "persist_row_embeddings": false,
+    "shard_objects": 4096,
+    "cpu_lru_objects": 1024,
+    "max_feature_gib": 60,
+    "max_workspace_gib": 100,
+    "min_free_disk_gib": 200
+  },
+  "student": {
+    "input_dim": 4096,
+    "dimension": 1024,
+    "interaction_rank": 64,
+    "object_slots": 9,
+    "slot_kind_count": 11,
+    "normalization_epsilon": 1e-06,
+    "score_temperature": 0.07,
+    "pooling": "shared_single_query_attention",
+    "target_bias": false,
+    "arms": [
+      "SUP",
+      "KD"
+    ],
+    "epochs": 6,
+    "lr": 0.0002,
+    "effective_query_batch": 16,
+    "mining_refresh": "every_epoch_after_first",
+    "mining_generator": "own_previous_epoch_last",
+    "kd_temperature": 2.0,
+    "kd_weight": 1.0,
+    "kd_bundle_to_query_only": false
+  },
+  "teacher": {
+    "input_dim": 4096,
+    "dimension": 512,
+    "heads": 8,
+    "ffn_dimension": 1024,
+    "layers": 3,
+    "dropout": 0.1,
+    "norm_first": true,
+    "activation": "gelu",
+    "normalization_epsilon": 1e-06,
+    "slot_kind_count": 11,
+    "tasks": [
+      "P",
+      "J"
+    ],
+    "readout": "single_shared_linear",
+    "attention_pattern": [
+      "object_local",
+      "global",
+      "global"
+    ],
+    "global_sequence_position_embedding": false,
+    "epochs": 6,
+    "base_epochs": [
+      1,
+      2
+    ],
+    "bundle_epochs": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "hard_refresh_after_epoch": 2,
+    "lr": 0.0001,
+    "effective_query_batch": 4,
+    "calibration_weight": 0.2,
+    "singleton_witnesses_per_query_epoch": 1,
+    "bundle_view_rule": "(epoch + uint64_sha_Bview_query) mod 2; even natural, odd witness_augmented"
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "no_decay": [
+      "bias",
+      "layer_norm",
+      "embedding",
+      "pool_query",
+      "rel"
+    ],
+    "clip_grad_norm": 1.0,
+    "warmup_fraction": 0.05,
+    "schedule": "cosine",
+    "end_lr_fraction": 0.1,
+    "amp_dtype": "bfloat16",
+    "loss_dtype": "float32",
+    "weights_dtype": "float32"
+  },
+  "sampling": {
+    "hard_negative_count": 16,
+    "uniform_negative_count": 15,
+    "preserve_all_task_positives": true,
+    "exclude_other_known_target_positives_for_C": true,
+    "hard_pool_top_n": 128,
+    "negative_list_reorder": "sha256",
+    "witness_cycle": "stable_per_query_order_cyclic_by_epoch",
+    "share_uniform_rng_across_student_arms": true,
+    "share_query_order_across_student_arms": true
+  },
+  "retrieval": {
+    "direct_k": 100,
+    "evidence_per_modality": 10,
+    "second_hop_k": 20,
+    "candidate_budget": 100,
+    "handoff_budget": 50,
+    "primary_k": 10,
+    "evidence_order": "interleave_text_image",
+    "evidence_target_merge": "round_robin_one_new_target_per_stream",
+    "admission": "round_robin_D100_RE",
+    "final_score": "teacher_J_Q_T_full_natural_BQ",
+    "path_lse": false,
+    "rrf": false,
+    "teacher_target_chunk": 8,
+    "exact_query_batch": 64,
+    "exact_corpus_chunk": 4096
+  },
+  "ann": {
+    "library": "hnswlib",
+    "space": "ip",
+    "M": 32,
+    "ef_construction": 200,
+    "ef_search": 256,
+    "random_seed": 13,
+    "construction_threads": 1,
+    "query_threads": 1,
+    "index_input_dtype": "float32",
+    "unit_keys": true
+  },
+  "evaluation": {
+    "metric": "query_macro_recall",
+    "ks": [
+      10,
+      20,
+      50
+    ],
+    "select_by": [
+      "overall_R10",
+      "implicit_R10",
+      "overall_R20",
+      "earlier_epoch"
+    ],
+    "report_views": [
+      "overall",
+      "implicit",
+      "explicit"
+    ],
+    "ann_and_exact": true,
+    "bootstrap_unit": "source_group_with_multiplicity_then_query_macro",
+    "bootstrap_repetitions": 10000,
+    "bootstrap_seed": 13,
+    "dev_health_queries": 128,
+    "formal_methods": [
+      "RAW-D",
+      "RAW-2H",
+      "RAW+T",
+      "SUP+T",
+      "KD+T"
+    ],
+    "main_method": "KD+T",
+    "primary_comparisons": [
+      "KD+T - RAW+T",
+      "KD+T - SUP+T"
+    ],
+    "single_training_seed": true
+  }
+}
