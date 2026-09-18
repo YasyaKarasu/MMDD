@@ -47,10 +47,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy
+from PIL import Image
+
 # Running this file directly puts ``scripts_old`` on ``sys.path``, not ``src``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mmdd_dataset.utils import clean_text, read_jsonl, sanitize_cell_text, write_json, write_jsonl
+
+#: Every seller of one book shows the same cover artwork, so "are these the same
+#: picture?" cannot be answered by looking at the artwork -- it has to be
+#: answered by looking at the *image*.  A content hash misses the re-encodes:
+#: one seller uploads the cover at 287x300 and another at 288x300, and the two
+#: share nothing but the pixels.  Measured against the 2529 downloaded covers, a
+#: 64x64 RGB comparison that tolerates a small translation separates them
+#: cleanly -- lookalikes sit at or below 5, while everything from ~20 up is a
+#: *photograph of the physical copy* set against the flat artwork, which is the
+#: evidence that reads condition and binding, so folding those would destroy
+#: the very signal the image channel exists to carry.
+IMAGE_GRID = 64
+IMAGE_SHIFT = 4
+IMAGE_DUPLICATE_MAX_DISTANCE = 5.0
 
 #: AbeBooks appends ``<isbn><AB|B><MMDDYY> "About the title" may belong to
 #: another edition of this title.`` to bios.  It is both a leak (the ISBN, in
@@ -353,6 +370,130 @@ def bridge_assets(evidence: list[dict], images: dict[str, dict], key_of: dict[st
     return assets
 
 
+def _duplicate_key(asset: dict) -> tuple | None:
+    """Identity of an asset's payload, or None when it must never be folded.
+
+    An image whose download failed carries no sha, so every such asset would
+    share the key ``(None)`` -- keep them all rather than collapse unrelated
+    failures into one row.
+    """
+    if asset["asset_type"] == "image":
+        sha = asset.get("sha256")
+        return ("image", asset["row_id"], sha) if sha else None
+    return ("text", asset["row_id"], asset["source"], asset["content"])
+
+
+def _thumbnail(path: Path) -> Any | None:
+    """A ``IMAGE_GRID`` square RGB thumbnail, or None if the file is unreadable."""
+    try:
+        with Image.open(path) as handle:
+            resized = handle.convert("RGB").resize((IMAGE_GRID, IMAGE_GRID), Image.LANCZOS)
+    except (OSError, ValueError):
+        return None
+    return numpy.asarray(resized, dtype=numpy.float32)
+
+
+def _image_distance(left: Any, right: Any) -> float:
+    """Mean absolute RGB difference, minimised over small translations.
+
+    The shift search is what makes a re-encode comparable at all: two uploads
+    of one photograph are rarely cropped to the same box, and a one-pixel
+    offset on a 64x64 grid swamps the difference between "the same photo" and
+    "a different photo".  The border is excluded from the comparison so the
+    pixels rolled in at the edge cannot pass themselves off as content.
+    """
+    inner = (slice(IMAGE_SHIFT, IMAGE_GRID - IMAGE_SHIFT),
+             slice(IMAGE_SHIFT, IMAGE_GRID - IMAGE_SHIFT))
+    best = float("inf")
+    for dy in range(-IMAGE_SHIFT, IMAGE_SHIFT + 1):
+        for dx in range(-IMAGE_SHIFT, IMAGE_SHIFT + 1):
+            moved = numpy.roll(numpy.roll(right, dy, axis=0), dx, axis=1)
+            distance = float(numpy.abs(left[inner] - moved[inner]).mean())
+            if distance < best:
+                best = distance
+    return best
+
+
+def _lookalike_ids(images: list[tuple[dict, Any]], max_distance: float) -> set[str]:
+    """Asset ids to drop: all but one per single-linkage cluster of lookalikes."""
+    parent = list(range(len(images)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(images)):
+        for j in range(i + 1, len(images)):
+            if _image_distance(images[i][1], images[j][1]) <= max_distance:
+                left, right = find(i), find(j)
+                if left != right:
+                    parent[max(left, right)] = min(left, right)
+
+    clusters: dict[int, list[dict]] = {}
+    for index, (asset, _) in enumerate(images):
+        clusters.setdefault(find(index), []).append(asset)
+    dropped: set[str] = set()
+    for members in clusters.values():
+        survivors = sorted(members, key=lambda asset: asset["asset_id"])
+        dropped.update(asset["asset_id"] for asset in survivors[1:])
+    return dropped
+
+
+def dedupe_assets(assets: list[dict], image_root: Path | str | None = None,
+                  max_distance: float = IMAGE_DUPLICATE_MAX_DISTANCE) -> list[dict]:
+    """Drop repeated evidence within a row, keeping the lowest asset_id.
+
+    A book's detail page carries one panel per listing, so the same vendor
+    blurb and the same cover photograph arrive once per listing. Identical
+    evidence recovers nothing a second time, it only multiplies the extraction
+    budget, and counting it as several independent recoveries would flatter
+    the recovery gate. Keeping the lowest asset_id makes the survivor
+    deterministic across rebuilds.
+
+    Text folds on exact content, which is the whole of it -- a blurb is either
+    byte-identical to its sibling or it says something else. Images need the
+    pixel comparison as well, because the same photograph reaches the lake
+    re-encoded at a different size under half a dozen listing urls; pass
+    ``image_root`` to resolve ``local_path`` against and those fold too. An
+    image whose file is missing is never folded: without the pixels there is
+    no evidence the two are the same picture, and guessing would be worse
+    than keeping the extra row.
+    """
+    positions: dict[tuple, int] = {}
+    kept: list[dict] = []
+    for asset in assets:
+        key = _duplicate_key(asset)
+        if key is None:
+            kept.append(asset)
+            continue
+        at = positions.get(key)
+        if at is None:
+            positions[key] = len(kept)
+            kept.append(asset)
+        elif asset["asset_id"] < kept[at]["asset_id"]:
+            kept[at] = asset
+
+    if image_root is None or max_distance <= 0:
+        return kept
+
+    by_row: dict[str, list[tuple[dict, Any]]] = {}
+    for asset in kept:
+        local = asset.get("local_path")
+        if asset["asset_type"] != "image" or not local:
+            continue
+        thumbnail = _thumbnail(Path(image_root) / local)
+        if thumbnail is not None:
+            by_row.setdefault(asset["row_id"], []).append((asset, thumbnail))
+
+    dropped: set[str] = set()
+    for group in by_row.values():
+        if len(group) > 1:
+            dropped |= _lookalike_ids(group, max_distance)
+    return [asset for asset in kept if asset["asset_id"] not in dropped]
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
@@ -382,8 +523,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     key_of = {row["_source_key"]: row["_row_id"] for row in books}
     seller_key_of = {row["_source_key"]: row["_row_id"] for row in seller_records}
     seller_of_listing = {row["listing_id"]: row["seller_id"] for row in listings}
-    assets = bridge_assets(evidence, images, key_of, seller_of_listing, seller_key_of,
-                           args.max_cell_chars)
+    raw_assets = bridge_assets(evidence, images, key_of, seller_of_listing, seller_key_of,
+                               args.max_cell_chars)
+    exact = dedupe_assets(raw_assets)
+    assets = dedupe_assets(raw_assets, args.image_root, args.image_max_distance)
+    assets_dropped = len(raw_assets) - len(assets)
 
     write_jsonl(out_dir / "source_tables.jsonl", tables)
     write_jsonl(out_dir / "bridge_assets.jsonl", assets)
@@ -416,6 +560,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "columns": {"book": tables[0]["num_cols"], "seller": tables[-1]["num_cols"]},
         "bridge_assets": by_type,
         "bridge_assets_by_family": by_family,
+        "bridge_assets_before_dedupe": len(raw_assets),
+        "bridge_assets_deduped": assets_dropped,
+        "image_lookalikes_merged": len(exact) - len(assets),
         "text_assets_without_source_column": text_without_source_column,
         "assets_by_row_source": {
             name: sum(1 for asset in assets
@@ -451,6 +598,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     print(f"  book {stats['columns']['book']} cols, seller {stats['columns']['seller']} cols")
     print(f"  bridge assets {by_type}  images resolved {stats['images_resolved']}/"
           f"{stats['images_resolved'] + stats['images_missing']}")
+    print(f"  dropped {assets_dropped} duplicate assets "
+          f"({len(raw_assets)} -> {len(assets)}; one per (row, payload))")
+    print(f"    of which {len(exact) - len(assets)} were re-encoded covers of a "
+          f"picture already in the row")
     print(f"  {out_dir / 'source_tables.jsonl'}")
     return stats
 
@@ -468,6 +619,14 @@ def parser() -> argparse.ArgumentParser:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument("--data-dir", default="output/abebooks_dataset")
     result.add_argument("--image-manifest", default="output/abebooks_images/image_manifest.jsonl")
+    result.add_argument("--image-root", default=".",
+                        help="root the manifest's relative local_path values resolve "
+                             "against, for the lookalike-cover comparison")
+    result.add_argument("--image-max-distance", type=float,
+                        default=IMAGE_DUPLICATE_MAX_DISTANCE,
+                        help="fold two covers in one row when their thumbnails differ "
+                             "by less than this; 0 disables the pixel comparison and "
+                             "leaves only the exact-content fold")
     result.add_argument("--output-dir", default="output/abebooks_lake")
     result.add_argument("--target-tables", type=int, default=60,
                         help="how many tables to split the lake into, in total")

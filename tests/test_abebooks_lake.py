@@ -9,14 +9,15 @@ string matching instead of by evidence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from build_abebooks_lake import (BOOK_EDITION_COLUMNS, BOOK_LISTING_COLUMNS,
-                                 SELLER_COLUMNS, _strip_boilerplate, build, chunk, parser,
-                                 piece_counts)
+                                 SELLER_COLUMNS, _strip_boilerplate, build, chunk,
+                                 dedupe_assets, parser, piece_counts)
 from mmdd_dataset.workload import generate_query_views
 
 ISBN = "9780201616477"
@@ -297,3 +298,168 @@ def test_rebuilding_is_deterministic(dataset: Path, tmp_path: Path) -> None:
     first = (tmp_path / "lake" / "source_tables.jsonl").read_text(encoding="utf-8")
     run(dataset, tmp_path)
     assert (tmp_path / "lake" / "source_tables.jsonl").read_text(encoding="utf-8") == first
+
+
+def text_asset(asset_id: str, **overrides) -> dict:
+    asset = {"asset_id": asset_id, "asset_type": "text", "source": "abebooks_description",
+             "source_column": "vendor_description", "row_id": "bk_0001",
+             "content": "Unread book in perfect condition."}
+    asset.update(overrides)
+    return asset
+
+
+def image_asset(asset_id: str, sha256: str | None, **overrides) -> dict:
+    asset = {"asset_id": asset_id, "asset_type": "image", "source": "abebooks_seller_cover",
+             "source_column": None, "row_id": "bk_0001", "content": None, "sha256": sha256}
+    asset.update(overrides)
+    return asset
+
+
+def test_a_blurb_repeated_in_a_row_folds_to_its_lowest_asset_id() -> None:
+    kept = dedupe_assets([text_asset("ev:b"), text_asset("ev:a"),
+                          text_asset("ev:c", content="Different blurb.")])
+    assert [asset["asset_id"] for asset in kept] == ["ev:a", "ev:c"]
+
+
+def test_one_stock_photo_under_two_urls_folds_to_one_asset() -> None:
+    """Two listings, one image file: the downloader gave both URLs one sha."""
+    kept = dedupe_assets([image_asset("ev:b", "same"), image_asset("ev:a", "same")])
+    assert [asset["asset_id"] for asset in kept] == ["ev:a"]
+
+
+def test_covers_that_never_downloaded_are_each_kept() -> None:
+    """No sha means no evidence they are the same picture -- never fold on None."""
+    kept = dedupe_assets([image_asset("ev:a", None), image_asset("ev:b", None)])
+    assert len(kept) == 2
+
+
+def test_one_payload_under_two_rows_stays_two_assets() -> None:
+    kept = dedupe_assets([text_asset("ev:a"), text_asset("ev:b", row_id="bk_0002")])
+    assert len(kept) == 2
+
+
+def test_the_same_text_reaching_a_row_under_two_families_stays_two_assets() -> None:
+    """Folding those would hide the containment channel the plan has to detect."""
+    kept = dedupe_assets([text_asset("ev:a"),
+                          text_asset("ev:b", source="abebooks_synopsis",
+                                     source_column="synopsis_text")])
+    assert len(kept) == 2
+
+
+def test_the_lake_folds_repeats_and_reports_how_many(dataset: Path, tmp_path: Path) -> None:
+    """A detail page carries one panel per listing, so evidence arrives repeated."""
+    with (dataset / "evidence_asset.jsonl").open("a", encoding="utf-8") as handle:
+        for record in (
+            {"evidence_id": "ev:img2", "book_id": f"isbn13:{ISBN}",
+             "asset_type": "seller_cover",
+             "uri": "https://pictures.abebooks.com/inventory/999.jpg"},
+            {"evidence_id": "ev:txt2", "book_id": f"isbn13:{ISBN}", "asset_type": "about_author",
+             "record_isbn": ISBN,
+             "extracted_text": f"Evi Nemeth writes books. {ISBN}AB06262002 {BOILERPLATE}"},
+        ):
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    manifest = tmp_path / "images.jsonl"
+    write_jsonl(manifest, [
+        {"url": "https://pictures.abebooks.com/inventory/31595123263.jpg", "status": "ok",
+         "local_path": "output/images/cover.jpg", "relative_path": "images/cover.jpg",
+         "sha256": "a" * 64, "mime_type": "image/jpeg", "width": 287, "height": 300},
+        # A second listing showing the very same photograph.
+        {"url": "https://pictures.abebooks.com/inventory/999.jpg", "status": "ok",
+         "local_path": "output/images/cover.jpg", "relative_path": "images/cover.jpg",
+         "sha256": "a" * 64, "mime_type": "image/jpeg", "width": 287, "height": 300},
+    ])
+    args = parser().parse_args(["--data-dir", str(dataset), "--output-dir", str(tmp_path / "lake"),
+                                "--image-manifest", str(manifest)])
+    stats = build(args)
+
+    assets = [json.loads(line) for line in
+              (tmp_path / "lake" / "bridge_assets.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert stats["bridge_assets_before_dedupe"] == 5
+    assert stats["bridge_assets_deduped"] == 2
+    assert sorted(asset["asset_id"] for asset in assets) == ["ev:img", "ev:policy", "ev:txt"]
+
+
+def cover(path: Path, size: tuple[int, int], box: tuple[int, int, int, int],
+          tint: tuple[int, int, int] = (0, 0, 0)) -> str:
+    """Write a flat-colour cover with one filled rectangle, and return its sha."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", size, (240, 235, 225))
+    ImageDraw.Draw(image).rectangle(box, fill=tint)
+    image.save(path, format="JPEG", quality=90)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def lookalikes(tmp_path: Path, files: dict[str, tuple[int, int, int, int, tuple[int, int, int]]]):
+    """Build one row's worth of image assets plus the files they point at."""
+    (tmp_path / "images").mkdir(exist_ok=True)
+    assets, manifest = [], []
+    for asset_id, (size, box, tint) in files.items():
+        name = f"{asset_id.replace(':', '_')}.jpg"
+        sha = cover(tmp_path / "images" / name, size, box, tint)
+        assets.append(image_asset(asset_id, sha, local_path=f"images/{name}"))
+        manifest.append({"url": f"https://example.invalid/{name}", "status": "ok",
+                         "local_path": f"images/{name}", "sha256": sha})
+    return assets, manifest
+
+
+def test_a_reencoded_cover_folds_even_though_its_bytes_differ(tmp_path: Path) -> None:
+    """One seller uploads the cover at 287x300, another at 288x300."""
+    assets, _ = lookalikes(tmp_path, {
+        "ev:a": ((287, 300), (20, 40, 200, 240), (30, 60, 140)),
+        "ev:b": ((288, 300), (20, 40, 200, 240), (30, 60, 140)),
+    })
+    kept = dedupe_assets(assets, image_root=tmp_path)
+    assert [asset["asset_id"] for asset in kept] == ["ev:a"]
+
+
+def test_a_photograph_of_the_book_is_kept_against_its_flat_cover(tmp_path: Path) -> None:
+    """A seller's photo of the actual copy is the evidence that reads condition."""
+    assets, _ = lookalikes(tmp_path, {
+        "ev:flat": ((287, 300), (20, 40, 200, 240), (30, 60, 140)),
+        # The same artwork, but photographed askew on a dark background.
+        "ev:photo": ((300, 300), (60, 90, 180, 250), (20, 45, 105)),
+    })
+    kept = dedupe_assets(assets, image_root=tmp_path)
+    assert sorted(asset["asset_id"] for asset in kept) == ["ev:flat", "ev:photo"]
+
+
+def test_an_unreadable_cover_is_never_folded_away(tmp_path: Path) -> None:
+    assets = [image_asset("ev:a", "a" * 64, local_path="images/gone.jpg"),
+              image_asset("ev:b", "b" * 64, local_path="images/gone.jpg")]
+    kept = dedupe_assets(assets, image_root=tmp_path)
+    assert len(kept) == 2
+
+
+def test_lookalike_folding_is_off_by_default_and_by_zero(tmp_path: Path) -> None:
+    assets, _ = lookalikes(tmp_path, {
+        "ev:a": ((287, 300), (20, 40, 200, 240), (30, 60, 140)),
+        "ev:b": ((288, 300), (20, 40, 200, 240), (30, 60, 140)),
+    })
+    assert len(dedupe_assets(assets)) == 2
+    assert len(dedupe_assets(assets, image_root=tmp_path, max_distance=0)) == 2
+
+
+def test_the_lake_folds_a_reencoded_cover_and_says_so(dataset: Path, tmp_path: Path) -> None:
+    with (dataset / "evidence_asset.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(
+            {"evidence_id": "ev:img2", "book_id": f"isbn13:{ISBN}",
+             "asset_type": "seller_cover",
+             "uri": "https://pictures.abebooks.com/inventory/999.jpg"},
+            ensure_ascii=False) + "\n")
+    lookalikes(tmp_path, {
+        "ev:img": ((287, 300), (20, 40, 200, 240), (30, 60, 140)),
+        "ev:img2": ((288, 300), (20, 40, 200, 240), (30, 60, 140)),
+    })
+    write_jsonl(tmp_path / "images.jsonl", [
+        {"url": "https://pictures.abebooks.com/inventory/31595123263.jpg", "status": "ok",
+         "local_path": "images/ev_img.jpg", "sha256": "a" * 64},
+        {"url": "https://pictures.abebooks.com/inventory/999.jpg", "status": "ok",
+         "local_path": "images/ev_img2.jpg", "sha256": "b" * 64},
+    ])
+    args = parser().parse_args(["--data-dir", str(dataset), "--output-dir", str(tmp_path / "lake"),
+                                "--image-manifest", str(tmp_path / "images.jsonl"),
+                                "--image-root", str(tmp_path)])
+    stats = build(args)
+    assert stats["image_lookalikes_merged"] == 1
