@@ -44,10 +44,12 @@ import base64
 import json
 import mimetypes
 import sys
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # Running this file directly puts ``scripts_old`` on ``sys.path``, not ``src``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -155,11 +157,7 @@ class AbeBooksExtractor(OpenAICompatibleExtractor):
             ]
         response = self.session.post(
             self.url,
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": 0,
-            },
+            json=self.request_body(content),
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -182,15 +180,19 @@ class AbeBooksExtractor(OpenAICompatibleExtractor):
 
 
 def build_extractors(args: argparse.Namespace) -> dict[str, Any]:
-    def make(base_url: str | None, model: str | None, key_env: str) -> Any:
+    def make(base_url: str | None, model: str | None, key_env: str,
+             max_tokens: int) -> Any:
         if not base_url or not model:
             return None
         return AbeBooksExtractor(base_url, model, api_key_env=key_env,
-                                 timeout=args.model_timeout)
+                                 timeout=args.model_timeout,
+                                 max_tokens=max_tokens)
 
     return {
-        "text": make(args.text_model_base_url, args.text_model_name, args.text_api_key_env),
-        "image": make(args.image_model_base_url, args.image_model_name, args.image_api_key_env),
+        "text": make(args.text_model_base_url, args.text_model_name,
+                     args.text_api_key_env, args.text_model_max_tokens),
+        "image": make(args.image_model_base_url, args.image_model_name,
+                      args.image_api_key_env, args.image_model_max_tokens),
     }
 
 
@@ -294,7 +296,22 @@ def run_extraction(
     asset_by_id: dict[str, dict[str, Any]],
     extractors: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    on_record: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
+    """Run every pending task, handing each finished record to ``on_record``.
+
+    ``on_record`` exists for the full run: 119,729 calls is over five hours of
+    wall clock, and a cache that is only written when the pass *ends* throws all
+    of it away if anything dies at hour five.  ``bounded_map`` already yields a
+    batch at a time, so the callback is called as the work completes and a
+    restart resumes from the cache instead of from zero.
+
+    Text and image run as two streams with separate worker budgets rather than
+    one flat pool.  The endpoint's budget is per modality -- 104 text, 32 image,
+    128 total -- and a flat pool sized for the total sends every task it holds at
+    the image budget's expense the moment the tail of the pass is image-only.
+    """
     def one(task: dict[str, Any]) -> dict[str, Any]:
         record = {
             "extraction_id": task["extraction_id"],
@@ -310,7 +327,13 @@ def run_extraction(
         }
         extractor = extractors.get(task["asset_type"])
         if extractor is None:
-            return record
+            # Run the other modality first and this task is not merely unsolved,
+            # it is *unasked*.  Returning the empty record anyway would append it
+            # to --extraction-cache, where the next run reads it back as a
+            # completed extraction and skips the task forever -- so the image
+            # pilot would silently do nothing after the text pilot.  Report it as
+            # attempted (None) and let the caller drop it.
+            return None
         table = tables_by_id[task["source_table_id"]]
         row = row_index[(task["source_table_id"], task["source_row_id"])]
         result = extractor.extract(
@@ -320,7 +343,50 @@ def run_extraction(
         )
         return {**record, **result}
 
-    return list(bounded_map(one, tasks, workers=args.model_workers))
+    produced: list[dict[str, Any]] = []
+    lock = threading.Lock()
+
+    def drain(asset_type: str, workers: int) -> list[dict[str, Any]]:
+        batch = [task for task in tasks if task["asset_type"] == asset_type]
+        if not batch:
+            return []
+        collected: list[dict[str, Any]] = []
+        for record in progress(
+            bounded_map(one, batch, workers=workers),
+            total=len(batch), desc=f"Extract {asset_type}", unit="call",
+        ):
+            if record is None:
+                continue
+            collected.append(record)
+            # Written on completion, not at the end: the cache has to survive a
+            # crash five hours in.  Locked because both streams share the handle
+            # and a line has to land whole.
+            with lock:
+                if on_record is not None:
+                    on_record(record)
+        return collected
+
+    budgets = [("text", args.text_model_workers), ("image", args.image_model_workers)]
+    active = [stream for stream in budgets if any(t["asset_type"] == stream[0]
+                                                 for t in tasks)]
+    if not active:
+        return produced
+    if len(active) == 1:
+        produced = drain(*active[0])
+    else:
+        with ThreadPoolExecutor(max_workers=len(active)) as pool:
+            futures = [pool.submit(drain, *stream) for stream in active]
+            for future in futures:
+                produced.extend(future.result())
+    # Canonical order, not completion order.  The index keeps *every* extraction
+    # for a (row, attribute) key in list order, and that order reaches the
+    # emitted recoveries, so two streams finishing at different moments would
+    # otherwise hand back a different dataset per run.
+    produced.sort(key=lambda record: (
+        record["source_table_id"], record["source_row_id"],
+        record["attribute_name"], record["asset_id"],
+    ))
+    return produced
 
 
 def load_cached(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -456,15 +522,29 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             f"{len(pending)} extraction tasks pending but no model endpoint is "
             "configured; pass --text-model-base-url/--text-model-name (and the "
             "image pair), or --plan-only to just report")
-    produced = list(progress(
-        run_extraction(pending, tables_by_id, row_index, asset_by_id, extractors, args),
-        total=len(pending), desc="Extract attributes", unit="call"))
+    # Append as the work completes rather than at the end of the pass: only the
+    # records that were actually produced are written (a task whose extractor is
+    # missing returns None and is never cached), and a crash an hour in keeps the
+    # hour.
+    cache_handle = None
     if args.extraction_cache:
         cache_path = Path(args.extraction_cache)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with cache_path.open("a", encoding="utf-8") as handle:
-            for record in produced:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        cache_handle = cache_path.open("a", encoding="utf-8")
+
+    def append_to_cache(record: dict[str, Any]) -> None:
+        assert cache_handle is not None
+        cache_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        cache_handle.flush()
+
+    try:
+        produced = run_extraction(pending, tables_by_id, row_index, asset_by_id,
+                                  extractors, args,
+                                  on_record=append_to_cache if cache_handle else None)
+    finally:
+        if cache_handle is not None:
+            cache_handle.close()
+    skipped_no_extractor = len(pending) - len(produced)
 
     extractions = [*cached.values(), *produced]
     index = extraction_index(extractions, channels=channels)
@@ -536,9 +616,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_columns": dict(sorted(hidden.items())),
         "tasks_planned": len(tasks),
         "tasks_cached": len(cached),
+        "tasks_skipped_no_extractor": skipped_no_extractor,
         "extractions_used": len(extractions),
         "extractions_empty": sum(1 for record in extractions if not record.get("value")),
-        "extractor_calls": len(pending),
+        "extractor_calls": len(pending) - skipped_no_extractor,
         "images_dropped_missing_file": len(dropped_images),
         "copy_channels": sorted(f"{family}->{name}" for family, name in channels),
         "auto_check": "skipped" if args.no_auto_check else "local",
@@ -571,6 +652,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "min_implicit_context_columns": MIN_IMPLICIT_CONTEXT_COLUMNS,
             "cell_text_policy": "clean_and_truncate_1024",
         },
+        # The resolved model config lives here on purpose: probing a pipeline
+        # weeks later, the run's own command line is usually gone (scrollback
+        # buffer, shell history), and the gates cannot be reinterpreted without
+        # knowing which endpoint and which decoding settings produced the
+        # extractions.
+        "model": {
+            "text": _model_record(args, args.text_model_base_url, args.text_model_name,
+                                  args.text_model_max_tokens),
+            "image": _model_record(args, args.image_model_base_url, args.image_model_name,
+                                   args.image_model_max_tokens),
+            "prompt_version": PROMPT_VERSION,
+            "thinking_policy": "enable_thinking=false_on_every_call",
+            "workers": {"text": args.text_model_workers,
+                        "image": args.image_model_workers},
+            "timeout_seconds": args.model_timeout,
+        },
         "artifact_references": (
             {"data_lake_tables": {"field": "source_table_ref",
                                   "target_artifact": "source_tables",
@@ -588,6 +685,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         ),
     })
     return stats
+
+
+def _model_record(args: argparse.Namespace, base_url: str | None, model: str | None,
+                  max_tokens: int) -> dict[str, Any]:
+    if not base_url or not model:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "base_url": base_url,
+        "model": model,
+        "max_tokens": max_tokens,
+    }
 
 
 def _count_by(records: Iterable[dict[str, Any]], field: str) -> dict[str, int]:
@@ -692,8 +801,21 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--image-model-base-url")
     result.add_argument("--image-model-name")
     result.add_argument("--image-api-key-env", default="VLLM_API_KEY")
-    result.add_argument("--model-workers", type=int, default=8)
+    result.add_argument(
+        "--text-model-workers", type=int,
+        default=104,
+        help="in-flight text requests; default is the budget the endpoint "
+             "declares in configs/model_endpoints.qwen35.wdc.remote_gpu0_only.json")
+    result.add_argument(
+        "--image-model-workers", type=int,
+        default=32,
+        help="in-flight image requests; text and image are budgeted separately "
+             "because the vision encoder is the scarcer of the two")
     result.add_argument("--model-timeout", type=float, default=120.0)
+    # Output is one small JSON object; the caps only matter as a guard against a
+    # runaway generation, and they mirror the EntiTables builder's (1024/384).
+    result.add_argument("--text-model-max-tokens", type=int, default=1024)
+    result.add_argument("--image-model-max-tokens", type=int, default=384)
     result.add_argument("--no-auto-check", action="store_true",
                         help="skip the local attribute-extraction check; recovery "
                              "counts are then unverified and the manifest says so")

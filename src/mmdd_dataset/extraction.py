@@ -35,14 +35,41 @@ class OpenAICompatibleExtractor:
         *,
         api_key_env: str = "VLLM_API_KEY",
         timeout: float = 120,
+        max_tokens: int | None = None,
+        enable_thinking: bool = False,
     ) -> None:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.timeout = timeout
+        self.max_tokens = max_tokens
+        self.enable_thinking = enable_thinking
         self.session = requests.Session()
         api_key = os.environ.get(api_key_env)
         if api_key:
             self.session.headers["Authorization"] = f"Bearer {api_key}"
+
+    def request_body(self, content: str | list[dict[str, Any]]) -> dict[str, Any]:
+        """The request body, shared by this class and its subclasses.
+
+        ``chat_template_kwargs`` is deliberately unconditional, for the same
+        reason the EntiTables builder sends it unconditionally: the Qwen
+        endpoints serve reasoning models whose default path prepends a
+        ``Thinking Process:`` trace.  That trace restates the prompt, including
+        its ``{"value": ..., "evidence": ...}`` template, so a client that scans
+        for the first ``{`` reads the placeholder back as the extracted value --
+        a non-empty string that is never caught as a failure and never matches a
+        real cell.  The direct-answer path is the only one whose output is
+        parseable, on text and image calls alike.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+        }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
+        return payload
 
     def extract(
         self,
@@ -75,11 +102,7 @@ class OpenAICompatibleExtractor:
             ]
         response = self.session.post(
             self.url,
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": 0,
-            },
+            json=self.request_body(content),
             timeout=self.timeout,
         )
         response.raise_for_status()

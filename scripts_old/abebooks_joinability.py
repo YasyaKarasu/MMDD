@@ -22,7 +22,7 @@ from the shared materializer, all marked ``ABEBOOKS DIVERGENCE`` below:
    ``wiki_title``;
 3. ``query_columns`` depends on the join shape -- see :data:`JOIN_SHAPES`.
 
-Two correctness guards have no counterpart in the shared module, because the
+Three correctness guards have no counterpart in the shared module, because the
 corpus never needed them:
 
 ``copy_channels``
@@ -42,6 +42,20 @@ corpus never needed them:
     description, and ``synopsis_text`` and ``vendor_description`` share text for
     244/249 rows.  Any query context column that contains the hidden column's
     value is moved to the target side.
+
+``evidence_is_already_visible``
+    The channels close the *self* pair and the containment pairs, but not this:
+    an asset can be asked about a **different** hidden column and answer it out
+    of the visible row.  ``seller_policy`` text is the row's ``terms_of_sale``
+    verbatim, so asking it for ``city`` ("Pella") reads the query's own visible
+    cell -- the join is solvable without the target table.  Measured on the
+    pilot: 17 of 24 recoveries did this (8/8 ``seller_policy``, 4/4
+    ``abebooks_description``); the clean ones were ``abebooks_synopsis`` assets
+    whose ``synopsis_text`` the query did not display.  Since every seller text
+    asset is a copy of a visible policy column, this makes a seller query
+    structurally unreachable -- not merely unlikely, which is what the plan had
+    guessed.  Images carry no ``source_column`` and are unaffected, so the image
+    channel is the only one this pipeline can honestly measure.
 """
 
 from __future__ import annotations
@@ -51,7 +65,7 @@ import random
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 # Running this file directly puts ``scripts_old`` on ``sys.path``, not ``src``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -544,6 +558,36 @@ def select_query_rows(
 # materialisation
 # --------------------------------------------------------------------------
 
+def evidence_is_already_visible(
+    table: dict[str, Any],
+    query_column_indices: Sequence[int],
+    asset: dict[str, Any],
+) -> bool:
+    """Whether this asset only repeats a column the query already displays.
+
+    Copy channels stop an asset being asked about its *own* source column, but
+    not about a different hidden one.  A ``seller_policy`` asset is, by the
+    lake's construction, the same row's ``terms_of_sale`` text; when the query
+    displays ``terms_of_sale``, asking that asset for ``city`` recovers nothing
+    -- the answer is already in the row the model was handed, so the join is
+    solvable without ever looking at the target table.
+
+    Measured on the pilot: 17 of 24 recoveries were exactly this (8/8
+    ``seller_policy``, 4/4 ``abebooks_description``, and the ``about_author``
+    ones).  The clean ones were ``abebooks_synopsis`` assets whose
+    ``synopsis_text`` the query did not display.
+
+    Images carry no ``source_column`` and are never a copy of a text cell, which
+    is why the image channel is the one this pipeline can actually measure.
+    """
+    source_column = asset.get("source_column")
+    if not source_column:
+        return False
+    return source_column in {
+        get_column_name(table, index) for index in query_column_indices
+    }
+
+
 def materialize_join(
     table: dict[str, Any],
     split: str,
@@ -557,6 +601,7 @@ def materialize_join(
     target_additional: list[int],
     *,
     join_shape: str = "attribute",
+    self_leak: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]],
            list[dict[str, Any]]]:
     """One query plus 1..k physical targets for a single join family.
@@ -595,9 +640,35 @@ def materialize_join(
     query_fingerprint = _visible_query_fingerprint(table, query_columns, query_rows)
     query_id = f"query_{stable_hash(source_table_id, query_fingerprint)}"
     query_row_by_source = {row["source_row_id"]: row["row_id"] for row in query_rows}
+
+    def usable_extractions(source_row_id: str) -> list[dict[str, Any]]:
+        """The recoveries for this row that the query does not already show."""
+        return [
+            extraction
+            for extraction in candidate["recoveries"].get(source_row_id, [])
+            if not evidence_is_already_visible(
+                table, query_columns, assets_by_id.get(extraction["asset_id"], {})
+            )
+        ]
+
     recovered_selected = sum(
-        source_row_id in candidate["recoveries"] for source_row_id in retained_query_rows
+        1 for source_row_id in retained_query_rows if usable_extractions(source_row_id)
     )
+    if recovered_selected < candidate["required_recovered_rows"]:
+        # Every recovery that survived was read off a column the query displays,
+        # so the hidden column is not hidden.  Emitting this query would claim a
+        # recoverability the model never demonstrated.  Record which hidden
+        # column was dropped and which displayed column it kept being read out
+        # of, so the audit says why rather than just that.
+        if self_leak is not None:
+            read_out_of = self_leak.setdefault(member_names[members[0]], set())
+            for source_row_id in retained_query_rows:
+                for extraction in candidate["recoveries"].get(source_row_id, []):
+                    asset = assets_by_id.get(extraction["asset_id"]) or {}
+                    source_column = clean_text(asset.get("source_column"))
+                    if source_column:
+                        read_out_of.add(source_column)
+        return None, [], [], []
 
     targets: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
@@ -665,7 +736,7 @@ def materialize_join(
         target_row_by_source = {row["source_row_id"]: row["row_id"] for row in target_rows}
         seen: set[str] = set()
         for source_row_id in retained_query_rows:
-            for extraction in candidate["recoveries"].get(source_row_id, []):
+            for extraction in usable_extractions(source_row_id):
                 member_value = sanitize_cell_text(
                     get_cell(source_rows_by_id[source_row_id], member).get("text")
                 )
@@ -792,6 +863,7 @@ def build_joinability_for_table(
     moved: list[str] = []
     dropped: list[str] = []
     emitted: list[dict[str, Any]] = []
+    self_leak: dict[str, set[str]] = {}
     query_by_id: dict[str, dict[str, Any]] = {}
     qrel_keys: set[tuple[str, str, int]] = set()
     for candidate, members, group_key, query_additional, target_additional in variants:
@@ -823,6 +895,7 @@ def build_joinability_for_table(
         query, family_targets, family_qrels, family_recoveries = materialize_join(
             table, split, entity_col, candidate, members, group_key, assets_by_id,
             config, guarded_query, guarded_target, join_shape=join_shape,
+            self_leak=self_leak,
         )
         if not family_targets:
             continue
@@ -852,7 +925,15 @@ def build_joinability_for_table(
         recoveries.extend(family_recoveries)
 
     if not queries:
-        return (decision("target_too_small", rejected=rejected), [], [], [], [])
+        reason = "evidence_is_a_visible_copy" if self_leak else "target_too_small"
+        return (
+            decision(reason, rejected=rejected,
+                     dropped_as_visible_copy=sorted(
+                         (hidden, sorted(sources))
+                         for hidden, sources in self_leak.items()
+                     )),
+            [], [], [], [],
+        )
     return (
         decision(
             "queryable",

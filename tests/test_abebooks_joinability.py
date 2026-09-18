@@ -12,6 +12,7 @@ follows is aimed at that.
 from __future__ import annotations
 
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -421,6 +422,77 @@ def test_every_recovery_points_at_an_asset_that_reaches_the_row(
         assert recovery["recovered_attribute"]["hidden_in_query"] is True
 
 
+def test_no_recovery_reads_a_column_the_query_already_shows(
+        lake: dict[str, Any], tmp_path: Path) -> None:
+    """The pilot's headline defect, as an invariant.
+
+    A text asset is a copy of the column it was scraped from, so an asset can be
+    asked about a *different* hidden column and answer it out of the visible row
+    (``seller_policy`` -> ``city``, read off the displayed ``terms_of_sale``).
+    Measured on the real pilot: 17 of 24 recoveries did this.  Whatever survives
+    must come from evidence the query does not display.
+    """
+    run(lake, tmp_path)
+    queries = {q["table_id"]: q
+               for q in _read_jsonl(tmp_path / "out" / "query_tables.jsonl")}
+    assets = {a["asset_id"]: a for a in lake["assets"]}
+    checked = 0
+    for recovery in _read_jsonl(tmp_path / "out" / "evidence_recoveries.jsonl"):
+        query = queries[recovery["query_table_id"]]
+        asset = assets[recovery["evidence"]["asset_id"]]
+        if not asset["source_column"]:
+            continue  # an image displays nothing; it is always independent
+        shown = {c["column_name"] for c in query["columns"]}
+        assert asset["source_column"] not in shown, (
+            f"{recovery['evidence']['asset_family']} recovered "
+            f"{recovery['recovered_attribute']['column_name']} out of "
+            f"{asset['source_column']}, which the query displays"
+        )
+        checked += 1
+    assert checked, "no text-derived recovery survived to check"
+
+
+def test_evidence_that_is_a_visible_copy_is_flagged_rather_than_used(
+        lake: dict[str, Any], tmp_path: Path) -> None:
+    from abebooks_joinability import evidence_is_already_visible
+
+    table = lake["table"]
+    visible = [TITLE, VENDOR]          # the query shows title and vendor_description
+    description = {"asset_type": "text", "source_column": "vendor_description"}
+    cover = {"asset_type": "image", "source_column": None}
+    assert evidence_is_already_visible(table, visible, description) is True
+    assert evidence_is_already_visible(table, [TITLE], description) is False
+    assert evidence_is_already_visible(table, visible, cover) is False
+
+
+def test_a_table_dropped_as_a_visible_copy_says_which_column_it_copied(
+        lake: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fail-closed drop has to be auditable, not merely counted.
+
+    The reason code says a table was dropped; a reader still has to be able to
+    see which hidden column could not be hidden and which displayed column its
+    evidence kept being read out of.  ``dropped_as_visible_copy`` carries both --
+    it is named for the hidden column, because that is what was lost.
+    """
+    monkeypatch.setattr(algo, "evidence_is_already_visible", lambda *a, **k: True)
+    run(lake, tmp_path)
+    decisions = _read_jsonl(tmp_path / "out" / "table_queryability_decisions.jsonl")
+    dropped = [record for record in decisions
+               if record["reason"] == "evidence_is_a_visible_copy"]
+    assert dropped, "forcing the rule on flagged no table at all"
+    flagged = dict(dropped[0]["dropped_as_visible_copy"])
+    assert flagged, "the flagged table names no dropped column"
+    for hidden, sources in flagged.items():
+        assert hidden in COLUMNS, hidden
+        # Empty is legitimate: a recovery with no source column is an image, and
+        # the image is not what the query displays.  What must never happen is a
+        # source that is not a column of this table.
+        assert set(sources) <= set(COLUMNS), sources
+    assert any(sources for _, sources in flagged.items()), (
+        "no dropped column recorded where its evidence came from"
+    )
+
+
 def test_extraction_cache_reuses_a_pilot_run(lake: dict[str, Any], tmp_path: Path) -> None:
     """The pilot's cache has to be reusable, or step 3 of the plan pays twice.
 
@@ -436,6 +508,103 @@ def test_extraction_cache_reuses_a_pilot_run(lake: dict[str, Any], tmp_path: Pat
     assert second_stats["extractor_calls"] == 0
     assert second_stats["tasks_cached"] == second_stats["tasks_planned"] > 0
     assert second.calls < first.calls
+
+
+def test_extractions_survive_a_crash_partway_through_the_pass(
+    lake: dict[str, Any], tmp_path: Path
+) -> None:
+    """The full run is 119,729 calls: the cache cannot wait for the last one.
+
+    A cache written only when the pass finishes throws away every hour that came
+    before the crash, and the pass is over five hours long.  What has to hold is
+    that the records already produced are on disk *and* are reused on the retry.
+    """
+    cache = tmp_path / "cache" / "abe.jsonl"
+
+    class Exploding(Oracle):
+        def extract(self, **kwargs: Any) -> dict[str, str]:
+            if self.calls >= 20:
+                raise RuntimeError("endpoint died")
+            return super().extract(**kwargs)
+
+    with pytest.raises(RuntimeError, match="endpoint died"):
+        run(lake, tmp_path / "one", "--extraction-cache", str(cache),
+            extractor=Exploding(lake["table"]))
+
+    written = _read_jsonl(cache)
+    assert written, "a crash mid-pass left the cache empty"
+    assert all(record["extraction_id"] for record in written)
+
+    retry, _ = run(lake, tmp_path / "two", "--extractions-jsonl", str(cache))
+    assert 0 < retry["tasks_cached"] < retry["tasks_planned"], (
+        "the retry did not pick the partial cache up, or the crash cached "
+        "everything after all"
+    )
+
+
+def test_a_text_only_run_does_not_cache_its_image_tasks(
+    lake: dict[str, Any], tmp_path: Path
+) -> None:
+    """Otherwise the text pilot silently cancels the image pilot.
+
+    With no image extractor configured the image tasks are unasked, not
+    unanswered.  Writing them to the shared cache as empty values makes the next
+    run -- which passes the image endpoint and reuses the cache -- read them back
+    as completed and skip every one of them.
+    """
+    cache = tmp_path / "cache" / "abe.jsonl"
+    oracle = Oracle(lake["table"])
+    original = builder.build_extractors
+    builder.build_extractors = lambda _args: {"text": oracle, "image": None}
+    try:
+        args = builder.parser().parse_args([
+            "--lake-dir", str(lake["dir"]), "--output-dir", str(tmp_path / "one"),
+            "--limit-tables", "1", "--extraction-cache", str(cache)])
+        text_stats = builder.build(args)
+    finally:
+        builder.build_extractors = original
+
+    assert text_stats["tasks_skipped_no_extractor"] > 0
+    cached = _read_jsonl(cache)
+    assert cached, "the text run extracted nothing"
+    assert all(record["asset_type"] == "text" for record in cached)
+
+    image_pass, _ = run(lake, tmp_path / "two", "--extractions-jsonl", str(cache))
+    # The text pass is reused; the image tasks are still pending, which is the
+    # whole point of sharing the cache between the two pilot runs.
+    assert 0 < image_pass["tasks_cached"] < image_pass["tasks_planned"]
+
+
+def test_extraction_results_come_back_in_a_canonical_order(
+    lake: dict[str, Any], tmp_path: Path
+) -> None:
+    """Two streams finish at different moments; the dataset must not notice.
+
+    The extraction index keeps *every* record for a (row, attribute) key in list
+    order, and that order reaches the emitted recoveries.  A merge in completion
+    order therefore makes the artifacts depend on thread scheduling.  This was
+    not theoretical: the reproducibility test above only failed when another
+    test happened to run first and change the timing.
+    """
+    table = lake["table"]
+    table_id = table["source_table_id"]
+    tasks = algo.extraction_tasks(table, lake["by_row"], TITLE, config())
+    args = builder.parser().parse_args(["--lake-dir", str(lake["dir"])])
+    shuffled = list(tasks)
+    random.Random(7).shuffle(shuffled)
+
+    records = builder.run_extraction(
+        shuffled,
+        {table_id: table},
+        {(table_id, row["row_id"]): row for row in table["rows"]},
+        {asset["asset_id"]: asset for asset in lake["assets"]},
+        {"text": Oracle(table), "image": Oracle(table)},
+        args,
+    )
+    assert len(records) == len(tasks)
+    order = [(record["source_table_id"], record["source_row_id"],
+              record["attribute_name"], record["asset_id"]) for record in records]
+    assert order == sorted(order), "extraction order follows completion, not the data"
 
 
 def test_the_run_is_reproducible(lake: dict[str, Any], tmp_path: Path) -> None:
