@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AbeBooks 数据集浏览器</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <strong>AbeBooks 数据集浏览器</strong>
+    <span class="dim" id="origin"></span>
+  </div>
+  <div class="picker">
+    <select id="group"></select>
+    <select id="table"></select>
+  </div>
+</header>
+
+<div class="toolbar">
+  <input id="q" type="search" placeholder="全表筛选…（任意列包含即命中）" autocomplete="off">
+  <label class="dim">每页
+    <select id="size">
+      <option>50</option><option selected>100</option><option>250</option>
+      <option>1000</option><option value="0">全部</option>
+    </select>
+  </label>
+  <label class="dim"><input type="checkbox" id="thumbs" checked> 图片缩略图</label>
+  <span class="spacer"></span>
+  <span class="dim" id="count"></span>
+</div>
+
+<main id="wrap">
+  <table id="grid"><thead></thead><tbody></tbody></table>
+  <div id="empty" hidden>没有匹配的行</div>
+</main>
+
+<footer class="pager">
+  <button id="first">« 首页</button>
+  <button id="prev">‹ 上一页</button>
+  <span id="pageinfo" class="dim"></span>
+  <button id="next">下一页 ›</button>
+  <button id="last">末页 »</button>
+  <span class="spacer"></span>
+  <span class="dim" id="status"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
