@@ -1,0 +1,26 @@
+{
+  "protocol": "MMDD-QCPATH-R1 v1.0",
+  "date": "2026-09-19",
+  "document_sections": 20,
+  "requirement_ids": 43,
+  "reference_cpu_tests_passed": 37,
+  "reference_cpu_tests_failed": 0,
+  "local_torch_version": "2.10.0+cpu",
+  "validation": {
+    "json_parse": true,
+    "key_constants_match_spec": true,
+    "requirement_ids_match_checklist": true,
+    "markdown_fences_and_math_delimiters_balanced": true,
+    "sequential_sections_0_to_19": true
+  },
+  "not_executed": [
+    "real_dataset_label_rebuild",
+    "production_MMDD_integration_tests",
+    "Qwen_or_T0_or_B13_real_forward",
+    "full_lake_ANN_evaluation",
+    "A_or_B_GPU_training",
+    "fresh_rebuild",
+    "distillation"
+  ],
+  "implementation_status": "mathematical_reference_only_not_repository_training_pipeline"
+}

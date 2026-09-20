@@ -1,0 +1,231 @@
+{
+  "protocol_id": "MMDD-QCPATH-R1",
+  "version": "1.0",
+  "date": "2026-09-19",
+  "status": "PLANNED_NOT_EXECUTED",
+  "lineage_kind": "local_feasibility_with_historical_parents",
+  "fresh_claim_allowed": false,
+  "max_formal_training_jobs": 8,
+  "authoritative_spec": "EXPERIMENT_SPEC.zh-CN.md",
+  "execution_order": [
+    "resolve_and_test",
+    "A_seed13",
+    "gate_A13",
+    "B_seed13",
+    "gate_B13",
+    "A_seed29",
+    "gate_A29",
+    "B_seed29",
+    "gate_B29",
+    "report_and_stop"
+  ],
+  "out_of_scope": {
+    "kd_training": true,
+    "full_fresh_training": true,
+    "stage2": true,
+    "qwen_forward_or_finetuning": true,
+    "new_200k_training": true,
+    "hyperparameter_search": true,
+    "extra_seeds_or_epochs": true
+  },
+  "resources": {
+    "gpu_family": "A100",
+    "new_directory_max_gib": 100,
+    "minimum_free_disk_gib": 200,
+    "upgrade_core_libraries": false,
+    "copy_existing_full_features": false
+  },
+  "retrieval": {
+    "direct_k": 100,
+    "first_hop_text_k": 20,
+    "first_hop_image_k": 20,
+    "targets_per_evidence": 20,
+    "teacher_candidate_budget": 100,
+    "production_evidence_and_equal": "resolve_and_lock_original_functions_no_redefinition",
+    "static_target_index": true,
+    "new_target_index_per_arm": false,
+    "strict_excludes_both_ann_and_exact_direct100": true,
+    "matched_direct_M": "one_arm_per_query_M_equals_own_union_size"
+  },
+  "A": {
+    "arms": [
+      "EONLY",
+      "QE"
+    ],
+    "first_seed": 13,
+    "replication_seed": 29,
+    "base_role": "historical_QCET_INPUT_LOCK_R27_B13_exact_replay_final",
+    "original_parameters_frozen": true,
+    "target_vectors_frozen": true,
+    "train_pairs": "rebuild_from_raw_train_query_specific_annotations",
+    "label_P": "verified_current_q_e_targets",
+    "label_I": "(all_train_query_positives_union_all_train_evidence_positives)_minus_P",
+    "denominator": "all_legal_targets_except_I",
+    "adapter_hidden_dim": 256,
+    "activation": "GELU",
+    "bias": true,
+    "adapter_dropout": 0.0,
+    "output_weight_and_bias_init": "zero",
+    "rho": 0.5,
+    "eps_norm": 1e-12,
+    "clipping_factor_detached": false,
+    "post_addition_normalization": false,
+    "score_space": "raw_inner_product",
+    "logit_temperature": 1.0,
+    "loss": "logsumexp(P_union_N)-logsumexp(P)",
+    "item_weight": "N_pair/(N_query*m_query)",
+    "logical_batch_reduction": "sum(item_weight*item_loss)/actual_logical_batch_size",
+    "epochs": 3,
+    "endpoint": "epoch3",
+    "best_epoch_selection": false,
+    "logical_batch_size": 128,
+    "microbatch_size": 32,
+    "drop_last": false,
+    "optimizer": "AdamW",
+    "lr": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_eps": 1e-08,
+    "weight_decay": 0.01,
+    "gradient_clip_norm": 1.0,
+    "scheduler": null,
+    "precision": "float32",
+    "autocast": false,
+    "tf32": false,
+    "kd_weight": 0.0,
+    "other_loss_weights": 0.0,
+    "safety": {
+      "et_r10_max_drop": 0.05,
+      "probe_top1_max_concentration": 0.25
+    },
+    "gate": {
+      "et_vs_base_min_gain": 0.01,
+      "et_vs_eonly_min_gain": 0.005,
+      "u_implicit_min_gain": 0.005,
+      "u_overall_min_delta": -0.0025,
+      "u_explicit_min_delta": -0.005,
+      "c100_overall_min_delta": -0.005
+    }
+  },
+  "B": {
+    "arms": [
+      "QT_CONT",
+      "QET_PATH"
+    ],
+    "parent_sha256": "ab0e3c3f85f006d2fdc4ba5194a0021680ab8fa1341441cb8eb003410ded68cc",
+    "parent_identity": "R22_T1-B_seed13_step010536",
+    "base_model_kind": "R19GlobalResidualTeacher_compatible_QET_extension",
+    "model_dim": 512,
+    "global_dim": 512,
+    "num_layers": 3,
+    "num_heads": 8,
+    "ffn_dim": 2048,
+    "dropout": 0.1,
+    "shared_transformer_count": 1,
+    "shared_scoring_head_count": 1,
+    "head": "preserve_parent_512_512_1_GELU_dropout",
+    "preserve_global_QT_representation_branch": true,
+    "external_QT_scalar_fallback": false,
+    "e_block": "parent_gE_then_parent_compressed_CE",
+    "empty_e_input": "exact_original_parent_QT_sequence",
+    "zero_hop_slot": "one_per_candidate_without_GT_routing",
+    "aggregation": "logsumexp(f0, f_e_plus_log_multiplicity)",
+    "aggregation_temperature": 1.0,
+    "normalize_path_count": false,
+    "max_train_queries_per_class": 2048,
+    "train_subset_sampling_seed": 20260919,
+    "train_targets": "AQE13_natural_C100_union_all_train_known_positives",
+    "train_views": [
+      "natural",
+      "same_one_witness_added_to_every_candidate"
+    ],
+    "label_P": "Dq_union_targets_with_verified_witness_visible_in_view",
+    "label_I": "Gq_minus_view_P",
+    "label_N": "train_candidates_minus_Gq",
+    "support_margin": 1.0,
+    "support_weight": 0.2,
+    "qt_support_reuse_same_forward_scalar": true,
+    "epochs": 2,
+    "endpoint": "epoch2",
+    "best_epoch_selection": false,
+    "logical_batch_size": 8,
+    "query_microbatch_size": 1,
+    "path_microbatch_size": 8,
+    "preflight_path_microbatch_options": [
+      8,
+      4,
+      2,
+      1
+    ],
+    "optimizer": "AdamW",
+    "lr": 5e-05,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_eps": 1e-08,
+    "weight_decay": 0.01,
+    "gradient_clip_norm": 1.0,
+    "scheduler": null,
+    "precision": "float32",
+    "autocast": false,
+    "tf32": false,
+    "kd_weight": 0.0,
+    "training_pool_for_seed29": "same_seed13_generated_train_pack",
+    "safety": {
+      "epoch1_max_overall_r10_drop_vs_frozen_T0": 0.1
+    },
+    "gate": {
+      "overall_min_delta_vs_strong_QT": -0.005,
+      "implicit_min_delta_vs_strong_QT": 0.0,
+      "strict_min_gain_vs_strong_QT": 0.01,
+      "real_minus_swap_overall_min_gain": 0.005
+    }
+  },
+  "statistics": {
+    "primary_final_metric": "query_macro_Recall@10",
+    "required_slices": [
+      "overall",
+      "implicit",
+      "explicit"
+    ],
+    "bootstrap_unit": "source_group",
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260919,
+    "confidence_interval": 0.95,
+    "wl_tie_epsilon": 1e-12,
+    "test_evaluation_authorized": false,
+    "decision_numeric_epsilon": 1e-12
+  },
+  "unresolved_inputs_policy": "runtime_resolve_exact_roles_before_training_no_substitution",
+  "implementation_restart_max": 1,
+  "determinism": {
+    "algorithm_policy": "strict_or_block",
+    "model_seed": [
+      13,
+      29
+    ],
+    "namespace_hash": "sha256_first_8_bytes_big_endian",
+    "data_rng": "local_random.Random",
+    "B_subset_namespace": "QCPATH-R1|B-subset|20260919|{class}",
+    "B_candidates_namespace": "QCPATH-R1|B-candidates|20260919|{query_id}",
+    "B_order_namespace": "QCPATH-R1|B-order|{model_seed}|{epoch}",
+    "B_anchor_namespace": "QCPATH-R1|B-anchor|20260919|{query_id}",
+    "B_anchor_rule": "sorted_unique_e_t_pairs[(seed_offset+epoch-1)%count]"
+  },
+  "latency": {
+    "query_selection": "first_128_canonical_dev_ids",
+    "warmup_queries": 16,
+    "metrics": [
+      "p50",
+      "p95",
+      "mean"
+    ],
+    "cuda_synchronize_at_query_boundaries": true,
+    "reranking_inputs": "same_candidate_path_budget_warm_frozen_features",
+    "stage1_metric_excludes_qwen_encoding": true,
+    "tuning_from_latency_panel": false
+  }
+}
