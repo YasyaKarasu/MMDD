@@ -1,0 +1,48 @@
+{
+  "data_lake": {
+    "total_after": 193454,
+    "total_before": 209602
+  },
+  "dataset_dir": "output_wdc_webtable_200000_qwen35_local_autocheck_v9",
+  "lists_dir": "MMDD_PAGEURL_RELOCATION_20260920/lists",
+  "qrels": {
+    "pairs_lost": 18310,
+    "pairs_total": 79277
+  },
+  "queries": {
+    "by_split": {
+      "dev": {
+        "kept": 9461,
+        "orphaned": 1256,
+        "total": 10717
+      },
+      "test": {
+        "kept": 4406,
+        "orphaned": 2129,
+        "total": 6535
+      },
+      "train": {
+        "kept": 40410,
+        "orphaned": 12741,
+        "total": 53151
+      }
+    },
+    "orphaned": 16126,
+    "partial": 318,
+    "rerun_autocheck": 22038,
+    "reuse_autocheck": 31816,
+    "surviving": 54277,
+    "total": 70403
+  },
+  "targets": {
+    "drop": 16148,
+    "drop_reasons": {
+      "join column is page_url": 7559,
+      "would be left with <=1 column": 8589
+    },
+    "kept": 54819,
+    "strip": 22396,
+    "total": 70967,
+    "untouched": 32423
+  }
+}
