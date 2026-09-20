@@ -96,3 +96,5 @@ book.txt
 # Local experiment review, plan and audit bundles
 /mmdd_r*/
 /mmdd_s2_*/
+/mmdd_s1_audit_*.tar.gz
+/_codex_*_transcript.txt
