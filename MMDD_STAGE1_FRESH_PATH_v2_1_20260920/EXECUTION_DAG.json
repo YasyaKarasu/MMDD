@@ -1,0 +1,208 @@
+{
+  "protocol": "2.1",
+  "max_jobs_per_seed": 13,
+  "max_seeds": 2,
+  "notes": "All task parents are in the same fresh run and model seed. data_dependencies require sealed receipts. DAG governs readiness, not update order within each job.",
+  "data_producers": {
+    "edge_refresh": "T_EDGE",
+    "common_target_graph": "T_EDGE",
+    "qt_only_KD_lists": "T_QT"
+  },
+  "stages": [
+    {
+      "stage": "T_EDGE",
+      "weight_parents": [],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P0",
+        "P1",
+        "raw_edge_lists"
+      ],
+      "epochs": 2,
+      "single_gpu": true,
+      "priority": 0
+    },
+    {
+      "stage": "T_PATH",
+      "weight_parents": [
+        "T_EDGE"
+      ],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "edge_refresh",
+        "common_target_graph"
+      ],
+      "epochs": 2,
+      "single_gpu": true,
+      "priority": 1
+    },
+    {
+      "stage": "T_QT",
+      "weight_parents": [
+        "T_EDGE"
+      ],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "edge_refresh",
+        "common_target_graph"
+      ],
+      "epochs": 2,
+      "single_gpu": true,
+      "priority": 2
+    },
+    {
+      "stage": "S_SUP_C1",
+      "weight_parents": [],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "PCA",
+        "edge_refresh"
+      ],
+      "epochs": 1,
+      "single_gpu": true,
+      "priority": 3
+    },
+    {
+      "stage": "S_KD_C1",
+      "weight_parents": [],
+      "read_only_model_dependencies": [
+        "T_PATH"
+      ],
+      "data_dependencies": [
+        "P1",
+        "PCA",
+        "edge_refresh"
+      ],
+      "epochs": 1,
+      "single_gpu": true,
+      "priority": 4
+    },
+    {
+      "stage": "S_SUP_QE_C2",
+      "weight_parents": [
+        "S_SUP_C1"
+      ],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "common_target_graph",
+        "conditional_lists"
+      ],
+      "epochs": 3,
+      "single_gpu": true,
+      "priority": 5
+    },
+    {
+      "stage": "S_KD_QE_C2",
+      "weight_parents": [
+        "S_KD_C1"
+      ],
+      "read_only_model_dependencies": [
+        "T_PATH"
+      ],
+      "data_dependencies": [
+        "P1",
+        "common_target_graph",
+        "conditional_lists"
+      ],
+      "epochs": 3,
+      "single_gpu": true,
+      "priority": 6
+    },
+    {
+      "stage": "S_KD_EONLY_C2",
+      "weight_parents": [
+        "S_KD_C1"
+      ],
+      "read_only_model_dependencies": [
+        "T_PATH"
+      ],
+      "data_dependencies": [
+        "P1",
+        "common_target_graph",
+        "conditional_lists"
+      ],
+      "epochs": 3,
+      "single_gpu": true,
+      "priority": 7
+    },
+    {
+      "stage": "S_KD_NATIVE_C2",
+      "weight_parents": [
+        "S_KD_C1"
+      ],
+      "read_only_model_dependencies": [
+        "T_QT"
+      ],
+      "data_dependencies": [
+        "P1",
+        "common_target_graph"
+      ],
+      "epochs": 1,
+      "single_gpu": true,
+      "priority": 8
+    },
+    {
+      "stage": "S_QT_SUP_C1",
+      "weight_parents": [],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "PCA",
+        "raw_QT_only_lists"
+      ],
+      "epochs": 1,
+      "single_gpu": true,
+      "priority": 9
+    },
+    {
+      "stage": "S_QT_KD_C1",
+      "weight_parents": [],
+      "read_only_model_dependencies": [
+        "T_QT"
+      ],
+      "data_dependencies": [
+        "P1",
+        "PCA",
+        "raw_QT_only_lists"
+      ],
+      "epochs": 1,
+      "single_gpu": true,
+      "priority": 10
+    },
+    {
+      "stage": "S_QT_SUP_C2",
+      "weight_parents": [
+        "S_QT_SUP_C1"
+      ],
+      "read_only_model_dependencies": [],
+      "data_dependencies": [
+        "P1",
+        "PCA",
+        "original_train_G"
+      ],
+      "epochs": 3,
+      "single_gpu": true,
+      "priority": 11
+    },
+    {
+      "stage": "S_QT_KD_C2",
+      "weight_parents": [
+        "S_QT_KD_C1"
+      ],
+      "read_only_model_dependencies": [
+        "T_QT"
+      ],
+      "data_dependencies": [
+        "P1",
+        "qt_only_KD_lists"
+      ],
+      "epochs": 3,
+      "single_gpu": true,
+      "priority": 12
+    }
+  ]
+}

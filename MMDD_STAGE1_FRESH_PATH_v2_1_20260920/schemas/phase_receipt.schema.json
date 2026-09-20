@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FRESH-PATH phase receipt",
+  "type": "object",
+  "required": [
+    "run_id",
+    "protocol_hash",
+    "root_hash",
+    "stage",
+    "model_seed",
+    "parent_artifact_ids",
+    "status",
+    "planned_epochs",
+    "executed_epochs",
+    "optimizer_steps",
+    "active_queries",
+    "source_hash",
+    "checkpoint",
+    "physical_gpu_uuid",
+    "logical_device",
+    "concurrent_job_ids",
+    "training_recipe_hash"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "protocol_hash": {
+      "type": "string"
+    },
+    "root_hash": {
+      "type": "string"
+    },
+    "stage": {
+      "enum": [
+        "T_EDGE",
+        "T_PATH",
+        "T_QT",
+        "S_SUP_C1",
+        "S_KD_C1",
+        "S_SUP_QE_C2",
+        "S_KD_QE_C2",
+        "S_KD_EONLY_C2",
+        "S_KD_NATIVE_C2",
+        "S_QT_SUP_C1",
+        "S_QT_KD_C1",
+        "S_QT_SUP_C2",
+        "S_QT_KD_C2"
+      ]
+    },
+    "model_seed": {
+      "enum": [
+        13,
+        29
+      ]
+    },
+    "parent_artifact_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "enum": [
+        "planned",
+        "implemented",
+        "executed",
+        "evaluated",
+        "blocked",
+        "invalid"
+      ]
+    },
+    "planned_epochs": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "executed_epochs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "optimizer_steps": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "active_queries": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_hash": {
+      "type": "string"
+    },
+    "checkpoint": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "physical_gpu_uuid": {
+      "type": "string"
+    },
+    "logical_device": {
+      "type": "string"
+    },
+    "concurrent_job_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "training_recipe_hash": {
+      "type": "string"
+    }
+  }
+}

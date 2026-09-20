@@ -1,0 +1,12 @@
+{
+  "prompt_version": "role_modality_v2_object_only",
+  "source": "uploaded src/cache_stage1_features.py",
+  "source_sha256": "1e2a8fa2b1280a873dd72e7ad579d3e3a16cebc66803a5c0335f700722231ba2",
+  "instructions": {
+    "query/table": "Represent this query table for directed multimodal joinability retrieval. Emphasize its visible entity and key columns, row values, and schema that identify what each row is about, so compatible target tables and bridge evidence can be found. Do not infer missing attributes or relationships not present in the table.",
+    "query_row/table": "Represent this single query row together with its table schema for assigning relevant multimodal evidence to that row. Emphasize the row's entity identity, key values, and qualifiers present in the cells. Do not infer missing attributes.",
+    "target/table": "Represent this candidate target table for directed joinability retrieval. Emphasize the entities and join-key values it covers, its schema and cell values, and the factual attributes it can provide to a compatible query table. Preserve distinctions between columns and do not assume a relationship to any particular query.",
+    "evidence/text": "Represent this text as independent bridge evidence for directed multimodal joinability retrieval. Emphasize explicitly stated entities, aliases, attributes, values, and relations that can connect a query-table row to a compatible target table. Do not assume a relationship to any particular table or add facts not expressed in the text.",
+    "evidence/image": "Represent this image as independent bridge evidence for directed multimodal joinability retrieval. Emphasize visually grounded entities, objects, scenes, text, attributes, and relations that can connect a query-table row to a compatible target table. Do not infer identities or facts that are not visible in the image."
+  }
+}

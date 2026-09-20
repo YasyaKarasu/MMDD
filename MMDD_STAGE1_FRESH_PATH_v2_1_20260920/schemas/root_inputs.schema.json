@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FRESH-PATH root roles",
+  "type": "object",
+  "required": [
+    "run_id",
+    "dataset_root",
+    "raw_splits",
+    "raw_train_GT",
+    "raw_dev_GT",
+    "raw_test_GT_location",
+    "public_backbone",
+    "code",
+    "protocol"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "dataset_root": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "raw_splits": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "raw_train_GT": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "raw_dev_GT": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "raw_test_GT_location": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "public_backbone": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "code": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind",
+        "fingerprint"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "raw_dataset",
+            "public_backbone",
+            "source_code",
+            "protocol"
+          ]
+        },
+        "fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "pure_caches": {
+      "type": "array"
+    },
+    "encoder_contract": {
+      "type": "object"
+    }
+  },
+  "not": {
+    "anyOf": [
+      {
+        "required": [
+          "student_base"
+        ]
+      },
+      {
+        "required": [
+          "teacher_parent"
+        ]
+      },
+      {
+        "required": [
+          "historical_PCA"
+        ]
+      },
+      {
+        "required": [
+          "old_train_fit"
+        ]
+      },
+      {
+        "required": [
+          "old_hard32"
+        ]
+      }
+    ]
+  }
+}
