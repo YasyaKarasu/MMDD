@@ -1,0 +1,232 @@
+{
+  "scope": "Synthetic probes of uploaded source, no real weights trained.",
+  "B_packet": [
+    {
+      "epoch": 3,
+      "view": "witness_augmented",
+      "actual_context": [
+        "et00"
+      ],
+      "expected_context_with_raw_qrank_count": 20,
+      "before_override": [
+        "tpos"
+      ],
+      "after_override": [
+        "tpos"
+      ],
+      "before_loss": 3.465735912322998,
+      "after_loss": 3.465735912322998,
+      "positive_gradient_actual": -0.96875
+    },
+    {
+      "epoch": 4,
+      "view": "natural",
+      "actual_context": [],
+      "expected_context_with_raw_qrank_count": 20,
+      "before_override": [],
+      "after_override": "MISSING",
+      "before_loss": null,
+      "after_loss": 3.465735912322998,
+      "positive_gradient_actual": -0.96875
+    },
+    {
+      "epoch": 5,
+      "view": "witness_augmented",
+      "actual_context": [
+        "et00"
+      ],
+      "expected_context_with_raw_qrank_count": 20,
+      "before_override": [
+        "tpos"
+      ],
+      "after_override": [
+        "tpos"
+      ],
+      "before_loss": 3.465735912322998,
+      "after_loss": 3.465735912322998,
+      "positive_gradient_actual": -0.96875
+    },
+    {
+      "epoch": 6,
+      "view": "natural",
+      "actual_context": [],
+      "expected_context_with_raw_qrank_count": 20,
+      "before_override": [],
+      "after_override": "MISSING",
+      "before_loss": null,
+      "after_loss": 3.465735912322998,
+      "positive_gradient_actual": -0.96875
+    }
+  ],
+  "rank_interleave": {
+    "input_interleaved": [
+      "text0",
+      "image0",
+      "text1",
+      "image1"
+    ],
+    "after_hard_pool": [
+      "image0",
+      "image1",
+      "text0",
+      "text1"
+    ]
+  },
+  "hard_refresh": {
+    "result": {
+      "refreshed": {
+        "D": 1,
+        "E_text": 1,
+        "E_image": 1,
+        "anchor": 0
+      }
+    },
+    "calls": [
+      {
+        "queries": [
+          "query_probe"
+        ],
+        "candidates": [
+          [
+            "t00",
+            "t01",
+            "t02",
+            "t03",
+            "t04",
+            "t05",
+            "t06",
+            "t07",
+            "t08",
+            "t09",
+            "t10",
+            "t11",
+            "t12",
+            "t13",
+            "t14",
+            "t15",
+            "t16",
+            "t17",
+            "t18",
+            "t19"
+          ]
+        ],
+        "contexts": null,
+        "mode": 0
+      },
+      {
+        "queries": [
+          "query_probe"
+        ],
+        "candidates": [
+          [
+            "et00",
+            "et01",
+            "et02",
+            "et03",
+            "et04",
+            "et05",
+            "et06",
+            "et07",
+            "et08",
+            "et09",
+            "et10",
+            "et11",
+            "et12",
+            "et13",
+            "et14",
+            "et15",
+            "et16",
+            "et17",
+            "et18",
+            "et19"
+          ]
+        ],
+        "contexts": null,
+        "mode": 0
+      },
+      {
+        "queries": [
+          "query_probe"
+        ],
+        "candidates": [
+          [
+            "ei00",
+            "ei01",
+            "ei02",
+            "ei03",
+            "ei04",
+            "ei05",
+            "ei06",
+            "ei07",
+            "ei08",
+            "ei09",
+            "ei10",
+            "ei11",
+            "ei12",
+            "ei13",
+            "ei14",
+            "ei15",
+            "ei16",
+            "ei17",
+            "ei18",
+            "ei19"
+          ]
+        ],
+        "contexts": null,
+        "mode": 0
+      }
+    ],
+    "C_anchor_rank_after": {
+      "et00": [
+        [
+          "special_E_target",
+          1.0
+        ]
+      ]
+    },
+    "D_pool_before": [
+      "t00",
+      "t01",
+      "t02",
+      "t03",
+      "t04",
+      "t05",
+      "t06",
+      "t07",
+      "t08",
+      "t09",
+      "t10",
+      "t11",
+      "t12",
+      "t13",
+      "t14",
+      "t15",
+      "t16",
+      "t17",
+      "t18",
+      "t19"
+    ],
+    "D_pool_seen": [
+      "t00",
+      "t01",
+      "t02",
+      "t03",
+      "t04",
+      "t05",
+      "t06",
+      "t07",
+      "t08",
+      "t09",
+      "t10",
+      "t11",
+      "t12",
+      "t13",
+      "t14",
+      "t15",
+      "t16",
+      "t17",
+      "t18",
+      "t19"
+    ]
+  }
+}

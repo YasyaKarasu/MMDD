@@ -79,7 +79,12 @@ class MakeList:
         self.corpus_universe = corpus_universe
         # A caller that builds lists repeatedly (once per packet per query) passes
         # the byte-ordered index in, so it is derived once instead of per call.
-        self._corpus: dict[str, SamplingCorpus] = dict(corpus_index or {})
+        # Keep the caller's cache by reference.  Copying this tiny mapping per
+        # packet also prevented a lazily built corpus from being shared with the
+        # next packet, even though ``PacketBuilder`` deliberately owns one cache.
+        self._corpus: dict[str, SamplingCorpus] = (
+            corpus_index if corpus_index is not None else {}
+        )
 
     def corpus(self, destination: str) -> SamplingCorpus:
         cached = self._corpus.get(destination)
@@ -97,7 +102,13 @@ class MakeList:
         """HardRank is真实score降序/ID升序; no random perturbation is added."""
         if not hard_rank:
             return []
-        ordered = sorted(hard_rank, key=lambda item: (-float(item[1]), item[0]))
+        # A raw modality-interleaved list is already a ranking stream.  Keep its
+        # order while filtering it; lists re-scored by one common scorer use the
+        # deterministic score/ID order instead (spec 7.3).
+        if getattr(hard_rank, "preserve_order", False):
+            ordered = list(hard_rank)
+        else:
+            ordered = sorted(hard_rank, key=lambda item: (-float(item[1]), item[0]))
         out: list[str] = []
         seen: set[str] = set()
         for value, _ in ordered:
@@ -131,9 +142,6 @@ class MakeList:
         positive_set = set(positive_ids)
         blocked = frozenset(set(excluded) | positive_set)
         universe_set = self._universe_set(destination)
-        namespace = sampling_namespace(
-            self.phase, self.sampling_arm, packet, epoch, query_id, anchor, PURPOSE_RANDOM
-        )
 
         # One exact SHA-ordered head of the legal pool serves every hard list this
         # key can produce: hard-fill and the uniform draw use the same namespace, so
@@ -152,28 +160,32 @@ class MakeList:
         ]
         hard = pool[:hard_count]
         provenance = {value: "hard_negative" for value in hard}
+        if legal_count < hard_count + uniform_count:
+            raise HashPoolExhausted(f"{packet}/{query_id}: insufficient legal remainder")
 
         # Whatever the hard ranking cannot supply is filled from the same
         # SHA-ordered draw that supplies the uniform competitors, so a short hard
-        # pool lengthens that draw rather than shortening the list.
+        # pool lengthens that draw rather than shortening the list.  One prefix
+        # of length hard+uniform is sufficient: removing h selected hard IDs
+        # still leaves the first (hard+uniform-h) legal hashed IDs.  This avoids
+        # scanning and hashing the whole corpus twice on short hard pools.
         if len(hard) < hard_count:
-            fill = stable_order_topk(
-                (), namespace, hard_count - len(hard),
-                blocked=blocked | frozenset(hard), corpus=corpus,
+            prefix = stable_order_topk(
+                (), namespace, hard_count + uniform_count,
+                blocked=blocked, corpus=corpus,
             )
+            hard_set = frozenset(hard)
+            hashed = [value for value in prefix if value not in hard_set]
+            fill_count = hard_count - len(hard)
+            fill = hashed[:fill_count]
             hard = hard + fill
             for value in fill:
                 provenance[value] = "hard_pool_exhausted_hash_fill"
-
-        uniform = stable_order_topk(
-            (), namespace, uniform_count,
-            blocked=blocked | frozenset(hard), corpus=corpus,
-        )
-        if len(hard) + len(uniform) < min(hard_count + uniform_count, legal_count):
-            raise HashPoolExhausted(
-                f"{packet}/{query_id}: the legal pool holds {legal_count} objects, "
-                f"fewer than the {hard_count + uniform_count} required competitors; "
-                "the destination corpus cannot supply the pre-registered list size"
+            uniform = hashed[len(fill) : len(fill) + uniform_count]
+        else:
+            uniform = stable_order_topk(
+                (), namespace, uniform_count,
+                blocked=blocked | frozenset(hard), corpus=corpus,
             )
         for value in uniform:
             provenance[value] = "uniform_negative"
@@ -188,14 +200,12 @@ class MakeList:
             provenance=provenance,
         )
 
-    def _universe_set(self, destination: str) -> set[str]:
-        cached = getattr(self, "_universe_cache", None)
-        if cached is None:
-            cached = {}
-            self._universe_cache = cached
-        if destination not in cached:
-            cached[destination] = set(self.corpus_universe[destination])
-        return cached[destination]
+    def _universe_set(self, destination: str) -> frozenset[str]:
+        # ``SamplingCorpus`` already owns the immutable membership set used by
+        # legal-count and hash sampling.  Reusing it avoids constructing a
+        # second set for every MakeList instance while preserving membership
+        # semantics exactly.
+        return self.corpus(destination).members
 
 
 class HashPoolExhausted(RuntimeError):
@@ -320,3 +330,16 @@ def _legacy_build(self, *, packet, epoch, query_id, anchor, destination, positiv
     whole = stable_order(list(positive_ids) + negatives, namespace)
     return NegativeList(positive_ids=positive_ids, negative_ids=negatives,
                         ordered_ids=whole, provenance=provenance)
+
+
+class RankSequence(list[tuple[str, float]]):
+    """A ranked stream whose order is part of its meaning.
+
+    ``MakeList`` must not score-sort a stream that was deliberately assembled by
+    modality alternation or by a raw second-hop arrival order.  A list rescored
+    by one model remains an ordinary list and is sorted by ``(-score, id)``.
+    """
+
+    def __init__(self, values: Iterable[tuple[str, float]] = (), *, preserve_order: bool = True):
+        super().__init__(values)
+        self.preserve_order = bool(preserve_order)

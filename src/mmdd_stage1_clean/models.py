@@ -318,19 +318,19 @@ def project_corpus_keys(
     device: torch.device | str,
     block: int = 4096,
 ) -> np.ndarray:
-    """Per-path unit index keys for the whole corpus (spec Eq. (13)/(14) key side).
+    """Return one raw, unit object key per destination object.
 
-    ``path="D"`` applies A_D, ``path="E"`` applies A_E, and ``path="C"`` produces
-    the target-index keys, which Eq. (14) leaves *unconditioned* -- the E vector
-    changes only the query, never the target key or the target index.
+    Relation transforms belong exclusively to the query side.  ``path`` remains
+    in the API to make call sites explicit, but all three indexes store ``nu_x``.
     """
     student.eval()
     out = np.zeros((len(object_ids), student.d), dtype=np.float32)
-    linear = {"D": student.direct, "E": student.evidence, "C": student.base_e}[path]
+    if path not in {"D", "E", "C"}:
+        raise ConfigError(f"unknown Student index path: {path}")
     for start in range(0, len(object_ids), block):
         chunk = list(object_ids[start : start + block])
         vector = student_object_keys(student, bank, chunk, device)
-        out[start : start + block] = reference.unit(linear(vector)).cpu().numpy()
+        out[start : start + block] = reference.unit(vector).cpu().numpy()
     return out
 
 

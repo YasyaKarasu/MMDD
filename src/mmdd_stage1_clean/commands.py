@@ -493,6 +493,12 @@ def cmd_build_objects(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
         "train_queries": len(gt["per_split"]["train"]["population"]),
         "dev_queries": len(gt["per_split"]["dev"]["population"]),
         "test_queries": len(gt["per_split"]["test"]["population"]),
+        "query_row_statistics": data.query_row_statistics(
+            lake,
+            int(cache_config["table_max_rows"]),
+            int(cache_config["table_max_cell_chars"]),
+            str(cache_config["table_row_format"]),
+        ),
     }
     write_json(output_root / "objects" / "SUMMARY.json", summary)
     log_line(
@@ -744,7 +750,46 @@ def cmd_raw_retrieve(args, spec, spec_dir, cwd, output_root, receipt) -> dict[st
     )
     log_line(f"raw-retrieve {split}: evidence ranking done ({time.time() - started:.0f}s)")
 
+    out_dir = output_root / "raw_retrieval" / split
+    out_dir.mkdir(parents=True, exist_ok=True)
     anchor_ids: list[str] = []
+    evidence_target_records: list[dict[str, Any]] = []
+    # The Teacher refresh needs the natural second-hop lists for the raw QE
+    # candidates, rather than a list made only from GT witnesses.  Compute and
+    # persist those lists while the frozen z bank is resident.
+    if split == "train":
+        per_modality = int(retrieval["evidence_per_modality"])
+        natural_evidence_ids: set[str] = set()
+        for row_index, query_id in enumerate(query_ids):
+            natural_evidence_ids.update(retrieve.interleave_text_image(
+                [text_ids[i] for i in t_order[row_index]],
+                [image_ids[i] for i in i_order[row_index]],
+                per_modality,
+                per_modality * 2,
+            ))
+        # E->T uses only the evidence vector, so one evidence object has the
+        # same ranking in every query bundle.  Store each distinct ranking once
+        # rather than repeating it for every (query, evidence) occurrence.
+        natural_evidence = byte_order(natural_evidence_ids)
+        evidence_z = z[[position[evidence_id] for evidence_id in natural_evidence]]
+        e_order, e_score = retrieve.exact_topk(
+            # One-row blocks preserve the float32 score bytes produced by the
+            # original per-evidence calls; only duplicate calls are removed.
+            evidence_z, target_z, second_hop_pool, query_batch=1, corpus_chunk=cc
+        )
+        for evidence_index, evidence_id in enumerate(natural_evidence):
+            evidence_target_records.append(
+                {
+                    "evidence_id": evidence_id,
+                    "target_ids": [target_ids[i] for i in e_order[evidence_index]],
+                    "target_scores": [float(v) for v in e_score[evidence_index]],
+                }
+            )
+        write_jsonl(out_dir / "evidence_target_rankings.jsonl", evidence_target_records)
+        log_line(
+            f"raw-retrieve {split}: natural evidence second hop done "
+            f"({len(evidence_target_records)} lists)"
+        )
     if split == "train":
         # Every canonical witness is a possible C-packet anchor (spec 7.1), so its
         # own z_E -> T ranking is precomputed here rather than during training.
@@ -765,8 +810,6 @@ def cmd_raw_retrieve(args, spec, spec_dir, cwd, output_root, receipt) -> dict[st
         a_order = np.zeros((0, 0), dtype=np.int64)
         a_score = np.zeros((0, 0), dtype=np.float32)
 
-    out_dir = output_root / "raw_retrieval" / split
-    out_dir.mkdir(parents=True, exist_ok=True)
     records = []
     for row_index, query_id in enumerate(query_ids):
         records.append(
@@ -800,6 +843,7 @@ def cmd_raw_retrieve(args, spec, spec_dir, cwd, output_root, receipt) -> dict[st
         "evidence_pool": evidence_pool,
         "second_hop_pool": second_hop_pool,
         "anchor_count": len(anchor_ids),
+        "natural_evidence_target_lists": len(evidence_target_records),
         "corpus_sizes": {
             "target": len(target_ids),
             "text": len(text_ids),
@@ -954,6 +998,21 @@ def _load_rank_tables(
     return tables, anchor_rank
 
 
+def _load_raw_evidence_target_rankings(
+    output_root: Path, split: str, retrieval: dict[str, Any]
+) -> dict[str, list[tuple[str, float]]]:
+    path = output_root / "raw_retrieval" / split / "evidence_target_rankings.jsonl"
+    if not path.is_file():
+        return {}
+    second_hop = int(retrieval.get("train_second_hop_pool", 128))
+    return {
+        str(row["evidence_id"]): list(
+            zip(row["target_ids"][:second_hop], row["target_scores"][:second_hop])
+        )
+        for row in read_jsonl(path)
+    }
+
+
 def _load_bank_objects(output_root: Path, resolved: dict[str, Any]):
     corpora = _load_corpus(output_root)
     (z, summary, mask), object_ids, _fingerprint = _load_bank(output_root, resolved, corpora)
@@ -980,10 +1039,18 @@ def _freeze(module: torch.nn.Module) -> None:
 
 
 def _model_hash(module: torch.nn.Module) -> str:
-    return stable_digest(
-        {name: [float(v) for v in tensor.detach().float().flatten()[:8]] for name, tensor in module.state_dict().items()},
-        len(list(module.state_dict())),
-    )
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name, tensor in module.state_dict().items():
+        value = tensor.detach().cpu().contiguous().numpy()
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(repr(tuple(value.shape)).encode("ascii"))
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _save_checkpoint(path: Path, **payload: Any) -> None:
@@ -1005,6 +1072,10 @@ def cmd_train_teacher(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
     bank, corpora = _load_bank_objects(output_root, resolved)
     builder = _make_builder(output_root, corpora)
     rank_tables, anchor_rank = _load_rank_tables(output_root, "train", resolved["retrieval"])
+    raw_query_rankings = _load_rankings(output_root, "train")
+    raw_evidence_target_rankings = _load_raw_evidence_target_rankings(
+        output_root, "train", resolved["retrieval"]
+    )
     teacher_dir = output_root / "teacher"
     teacher_dir.mkdir(parents=True, exist_ok=True)
     set_seed(int(resolved["seed"]))
@@ -1014,6 +1085,8 @@ def cmd_train_teacher(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
         builder=builder,
         rank_tables=rank_tables,
         anchor_rank=anchor_rank,
+        raw_query_rankings=raw_query_rankings,
+        raw_evidence_target_rankings=raw_evidence_target_rankings,
         output_dir=teacher_dir,
         device=args.device,
         limit_queries=args.limit_queries,
@@ -1025,7 +1098,10 @@ def cmd_train_teacher(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
     _save_checkpoint(
         teacher_dir / "last.pt",
         model=trainer.teacher.state_dict(),
+        optimizer=trainer.optimizer.state_dict(),
         epoch=trainer.epochs,
+        global_step=result["steps"],
+        rng_state=train._rng_state(),
         steps=result["steps"],
         history=result["epochs"],
         protocol=resolved["protocol_id"],
@@ -1087,6 +1163,80 @@ def _teacher_dev_ranker(
     return ranker
 
 
+def build_fixed_candidates(
+    *,
+    bank: models.ObjectBank,
+    target_ids: Sequence[str],
+    retrieval: dict[str, Any],
+    records: Sequence[dict[str, Any]],
+    population: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rebuild the *corrected* raw candidate set for one split.
+
+    NEXT_STEPS_DEEPSEEK.md task 2.  ``D100`` is the raw exact top-``direct_k``;
+    ``B_Q`` is the raw natural bundle; every unique evidence in ``B_Q`` gets one
+    query-independent exact ``Top20`` E->T list computed on the frozen z; ``R_E``
+    is their round-robin merge; ``U`` is ``D100`` plus ``R_E``; ``C100`` is the
+    round-robin admission of ``D100`` and ``R_E`` capped at ``candidate_budget``.
+    Nothing here reads a label or the GT: the witness targets are carried for
+    diagnostics only and never enter a candidate list.
+    """
+    direct_k = int(retrieval["direct_k"])
+    per_modality = int(retrieval["evidence_per_modality"])
+    second_hop_k = int(retrieval["second_hop_k"])
+    budget = int(retrieval["candidate_budget"])
+    chunk = int(retrieval["exact_corpus_chunk"])
+
+    position = bank.position
+    target_z = evaluate._unit(bank.z[[position[o] for o in target_ids]])
+    evidence_lists: dict[str, list[str]] = {}
+
+    def evidence_targets(evidence_id: str) -> list[str]:
+        cached = evidence_lists.get(evidence_id)
+        if cached is None:
+            order, _ = retrieve.exact_topk(
+                evaluate._unit(bank.z[position[evidence_id]][None, :]),
+                target_z,
+                second_hop_k,
+                query_batch=1,
+                corpus_chunk=chunk,
+            )
+            cached = [target_ids[i] for i in order[0]]
+            evidence_lists[evidence_id] = cached
+        return cached
+
+    out: list[dict[str, Any]] = []
+    for row in records:
+        query_id = str(row["query_id"])
+        meta = population.get(query_id)
+        if meta is None:
+            continue
+        d_q = list(dict.fromkeys(row["target_ids"][:direct_k]))
+        b_q = retrieve.interleave_text_image(
+            row["text_ids"][:per_modality], row["image_ids"][:per_modality],
+            per_modality, per_modality * 2,
+        )
+        lists = {value: evidence_targets(value) for value in b_q}
+        r_e = retrieve.round_robin(list(lists.values())) if lists else []
+        union = list(dict.fromkeys(list(d_q) + r_e))
+        c_q = retrieve.round_robin([d_q, r_e], budget) if r_e else list(d_q[:budget])
+        out.append(
+            {
+                "query_id": query_id,
+                "D100": d_q,
+                "B_Q": b_q,
+                "L_E": lists,
+                "R_E": r_e,
+                "U": union,
+                "C100": c_q,
+                "direct_target_ids": meta["direct_target_ids"],
+                "implicit_target_ids": meta["implicit_target_ids"],
+                "positive_target_ids": meta["positive_target_ids"],
+            }
+        )
+    return out
+
+
 def cmd_freeze_teacher(args, spec, spec_dir, cwd, output_root, receipt) -> dict[str, Any]:
     """Spec 8.3: choose the best epoch on dev by the pre-registered key."""
     resolved = _resolved_or_raise(output_root)
@@ -1098,31 +1248,16 @@ def cmd_freeze_teacher(args, spec, spec_dir, cwd, output_root, receipt) -> dict[
     )
     if not dev_records:
         raise ConfigError("dev raw retrieval is missing; run raw-retrieve --split dev")
-    # Dev candidates are the RAW Qwen C100/B20, fixed before any training.
+    # Dev candidates are the raw Qwen C100/B20, fixed before any training.
     retrieval = resolved["retrieval"]
-    bank, _corpora = _load_bank_objects(output_root, resolved)
-    per_modality = int(retrieval["evidence_per_modality"])
-    fixed: list[dict[str, Any]] = []
-    for row in dev_records:
-        query_id = str(row["query_id"])
-        meta = population.get(query_id)
-        if meta is None:
-            continue
-        direct = row["target_ids"][: int(retrieval["direct_k"])]
-        bundle = retrieve.interleave_text_image(
-            row["text_ids"][:per_modality], row["image_ids"][:per_modality],
-            per_modality, per_modality * 2,
-        )
-        fixed.append(
-            {
-                "query_id": query_id,
-                "C100": direct,
-                "B_Q": bundle,
-                "direct_target_ids": meta["direct_target_ids"],
-                "implicit_target_ids": meta["implicit_target_ids"],
-                "positive_target_ids": meta["positive_target_ids"],
-            }
-        )
+    bank, corpora = _load_bank_objects(output_root, resolved)
+    fixed = build_fixed_candidates(
+        bank=bank,
+        target_ids=corpora["target"],
+        retrieval=retrieval,
+        records=dev_records,
+        population=population,
+    )
     cache = evaluate.TeacherLogitCache(output_root / "teacher_logits.sqlite")
     candidates: list[dict[str, Any]] = []
     for epoch in range(1, epochs + 1):
@@ -1348,6 +1483,7 @@ def cmd_train_student(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
         resolved=resolved, bank=bank, builder=builder, rank_tables=rank_tables,
         anchor_rank=anchor_rank, output_dir=student_dir, arm=arm, init_state=init_state,
         device=args.device, limit_queries=args.limit_queries, max_epochs=args.max_epochs,
+        prefetch_workers=getattr(args, "prefetch_workers", 1),
     )
     _save_checkpoint(student_dir / "init.pt", model=trainer.student.state_dict(), arm=arm)
 
@@ -1365,6 +1501,8 @@ def cmd_train_student(args, spec, spec_dir, cwd, output_root, receipt) -> dict[s
     )
     _save_checkpoint(
         student_dir / "last.pt", model=trainer.student.state_dict(), arm=arm,
+        optimizer=trainer.optimizer.state_dict(), global_step=result["steps"],
+        rng_state=train._rng_state(),
         epochs=trainer.epochs, history=trainer.history, protocol=resolved["protocol_id"],
     )
     write_jsonl(student_dir / "training.jsonl", trainer.history)
@@ -2402,7 +2540,7 @@ def run_split(
             outputs = (
                 engine.pipeline_both(query_id)
                 if run_exact
-                else {"ann": engine.pipeline(query_id, use_ann=True)}
+                else engine.pipeline(query_id, use_ann=True)
             )
         result = outputs.get("ann") or outputs["exact"]
         exact_result = outputs.get("exact")

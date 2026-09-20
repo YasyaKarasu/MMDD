@@ -129,6 +129,41 @@ def serialize_table_parts(
     return parts
 
 
+def query_row_statistics(
+    lake: "RawLake", max_rows: int, max_cell_chars: int,
+    row_format: str = "values",
+) -> dict[str, Any]:
+    """Report query-only row retention before any cache reuse decision.
+
+    Query rows are recorded independently from target-table truncation.  The
+    returned block boundaries describe the seven summary groups used by the
+    compact cache, so a replay can tell whether it is reusing compatible query
+    input rather than treating a global ``table_max_rows`` value as evidence.
+    """
+    result: dict[str, Any] = {}
+    for query_id in sorted(lake.query_tables, key=lambda value: value.encode("utf-8")):
+        table = lake.query_tables[query_id]
+        raw = len(table.get("rows", []))
+        retained = min(raw, int(max_rows))
+        # This is the legacy serialization count.  A caller that elects the
+        # query-all-rows repair can set retained=raw and still use the same
+        # explicit block metadata.
+        boundaries = []
+        groups = max(1, min(7, retained)) if retained else 0
+        for index in range(groups):
+            boundaries.append([index * retained // groups, (index + 1) * retained // groups])
+        result[query_id] = {
+            "raw_rows": raw,
+            "serialized_rows": retained,
+            "independent_row_slots": groups,
+            "row_block_boundaries": boundaries,
+            "truncated": raw > retained,
+            "max_cell_chars": int(max_cell_chars),
+            "row_format": row_format,
+        }
+    return result
+
+
 def resolve_table_references(
     records: list[dict[str, Any]],
     sources: dict[str, dict[str, Any]],

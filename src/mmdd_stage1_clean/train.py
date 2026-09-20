@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sqlite3
 import time
 from pathlib import Path
@@ -42,6 +43,7 @@ from .sampling import (
     select_witness_anchor,
     support_positive_set,
     use_natural_bundle,
+    RankSequence,
 )
 from .util import SamplingCorpus, log_line, stable_digest, write_json, write_jsonl
 
@@ -112,6 +114,23 @@ class PacketBuilder:
         # packet: encoding and sorting a few hundred thousand ids costs far more
         # than the sampling it feeds.
         self._corpora: dict[str, SamplingCorpus] = {}
+        # ``state`` is on the inner loop of both trainers.  The population is
+        # immutable after GT loading, so retain its original first-row
+        # semantics in an index instead of scanning the whole split per packet.
+        self._population = {
+            split: list(value["population"])
+            for split, value in gt.items()
+        }
+        self._population_source = {
+            split: value["population"]
+            for split, value in gt.items()
+        }
+        self._state_index: dict[str, dict[Any, dict[str, Any]]] = {}
+        for split, rows in self._population.items():
+            index: dict[Any, dict[str, Any]] = {}
+            for row in rows:
+                index.setdefault(row["query_id"], row)
+            self._state_index[split] = index
 
     def preload_corpora(self, corpora: dict[str, "SamplingCorpus"]) -> None:
         """Adopt pre-built corpus indexes, so a worker does not rebuild them."""
@@ -129,15 +148,26 @@ class PacketBuilder:
 
     # -- per-query supervision state ---------------------------------------
 
+    def _ensure_population_index(self, split: str) -> None:
+        """Refresh the O(1) lookup only if a caller replaced a split list."""
+        current = self.gt[split]["population"]
+        if self._population_source.get(split) is current:
+            return
+        rows = list(current)
+        index: dict[Any, dict[str, Any]] = {}
+        for row in rows:
+            index.setdefault(row["query_id"], row)
+        self._population[split] = rows
+        self._population_source[split] = current
+        self._state_index[split] = index
+
     def state(self, split: str, query_id: str) -> dict[str, Any] | None:
-        population = self.gt[split]["population"]
-        for row in population:
-            if row["query_id"] == query_id:
-                return row
-        return None
+        self._ensure_population_index(split)
+        return self._state_index.get(split, {}).get(query_id)
 
     def population(self, split: str) -> list[dict[str, Any]]:
-        return list(self.gt[split]["population"])
+        self._ensure_population_index(split)
+        return list(self._population[split])
 
     def positive_sets(self, row: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
         return (
@@ -171,14 +201,23 @@ class PacketBuilder:
         phase: str,
         sampling_arm: str,
         q_rank: dict[str, Any] | None,
-        anchor_rank: dict[str, list[tuple[str, float]]],
+        anchor_rank: dict[Any, list[tuple[str, float]]],
         rank_tables: dict[str, RankTable],
         per_modality: int,
         include_bundle: bool,
     ) -> dict[str, Any]:
         query_id = row["query_id"]
+        if include_bundle and q_rank is None:
+            raise ConfigError(
+                f"{query_id}: include_bundle=True requires this run's raw query ranking; "
+                "an omitted ranking is not the same as a legal empty ranking"
+            )
         direct, implicit, all_positive = self.positive_sets(row)
         witnesses = self.witnesses(row)
+        witness_ids = sorted(
+            {value for values in witnesses.values() for value in values},
+            key=lambda value: value.encode("utf-8"),
+        )
         make = MakeList(
             phase=phase, sampling_arm=sampling_arm, corpus_universe=self.corpora,
             corpus_index=self._corpora,
@@ -195,6 +234,7 @@ class PacketBuilder:
                 "provenance": packet["list"].provenance_counts(),
                 "mode": packet["mode"],
                 "context_size": len(packet["context"]) if packet.get("context") else 0,
+                "context_ids": list(packet.get("context", [])),
             }
 
         # --- D packet: potential retrieval over all targets
@@ -210,47 +250,59 @@ class PacketBuilder:
         )
         add(D_PACKET, {
             "list": d_list,
+            "packet_type": D_PACKET,
             "mode": "P",
             "candidates": d_list.ordered_ids,
             "context": [],
+            "excluded_ids": [],
         })
 
         # --- E packet: potential retrieval over all canonical evidence
-        e_hard = merge_modality_ranks(
-            rank_tables["E_text"].get(query_id),
-            rank_tables["E_image"].get(query_id),
-            self.hard_pool_top_n,
-        )
+        if epoch <= 2:
+            e_hard = merge_modality_ranks(
+                rank_tables["E_text"].get(query_id),
+                rank_tables["E_image"].get(query_id),
+                self.hard_pool_top_n,
+            )
+        else:
+            # After refresh both modality streams carry scores from the same
+            # Teacher P(Q,E) scorer, so normalize their union by that scorer.
+            e_hard = _scored_union(
+                rank_tables["E_text"].get(query_id),
+                rank_tables["E_image"].get(query_id),
+                self.hard_pool_top_n,
+            )
         e_list = make.build(
             packet=E_PACKET,
             epoch=epoch,
             query_id=query_id,
             anchor=None,
             destination="evidence",
-            positives=self.witness_union(row),
+            positives=witness_ids,
             excluded=[],
             hard_rank=e_hard,
         )
         add(E_PACKET, {
             "list": e_list,
+            "packet_type": E_PACKET,
             "mode": "P",
             "candidates": e_list.ordered_ids,
             "context": [],
+            "excluded_ids": [],
         })
 
         # --- C packet: one witness anchor per epoch
-        anchor = select_witness_anchor(self.witness_union(row), query_id, epoch)
+        anchor = select_witness_anchor(witness_ids, query_id, epoch)
         diagnostics["witness_anchor"] = anchor
         if anchor is not None:
             c_positives = support_positive_set(
                 direct=direct, implicit=implicit, witnesses=witnesses, context={anchor}
             )
             c_excluded = all_positive - c_positives
-            c_hard = merge_modality_ranks(
-                anchor_rank.get(anchor, []),
-                rank_tables["D"].get(query_id),
-                self.hard_pool_top_n,
-            )
+            # Before the first refresh C uses the natural raw E->T stream.  It
+            # must retain that stream order; after refresh the (q,e)-specific
+            # list has been scored by the same J scorer and may be score-sorted.
+            c_hard = _anchor_rank(anchor_rank, query_id, anchor)
             c_list = make.build(
                 packet=C_PACKET,
                 epoch=epoch,
@@ -263,16 +315,16 @@ class PacketBuilder:
             )
             add(C_PACKET, {
                 "list": c_list,
+                "packet_type": C_PACKET,
                 "mode": "J",
                 "candidates": c_list.ordered_ids,
                 "context": [anchor],
+                "excluded_ids": sorted(c_excluded),
             })
 
         # --- B packet: same target list ids as D, context varies by epoch
         if include_bundle:
-            natural = self.natural_bundle(q_rank or {}, per_modality) if q_rank else []
-            if q_rank is None:
-                natural = []
+            natural = self.natural_bundle(q_rank, per_modality)
             if use_natural_bundle(epoch, query_id) or anchor is None:
                 bundle = list(natural)
                 view = "natural"
@@ -285,6 +337,7 @@ class PacketBuilder:
             b_excluded = all_positive - b_positives
             add(B_PACKET, {
                 "list": d_list,
+                "packet_type": B_PACKET,
                 "mode": "J",
                 "candidates": d_list.ordered_ids,
                 "context": bundle,
@@ -324,7 +377,47 @@ def merge_modality_ranks(
                     out.append((value, score))
         if len(out) >= limit:
             break
+    return RankSequence(out[:limit], preserve_order=True)
+
+
+def merge_rank_sequences(
+    left: Sequence[tuple[str, float]],
+    right: Sequence[tuple[str, float]],
+    limit: int,
+) -> list[tuple[str, float]]:
+    """Merge candidate sources for a common scorer, preserving no old score order."""
+    out: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for value, score in list(left) + list(right):
+        if value not in seen:
+            seen.add(value)
+            out.append((value, score))
     return out[:limit]
+
+
+def _scored_union(
+    left: Sequence[tuple[str, float]], right: Sequence[tuple[str, float]], limit: int
+) -> list[tuple[str, float]]:
+    by_id: dict[str, float] = {}
+    for value, score in list(left) + list(right):
+        by_id.setdefault(value, float(score))
+    return sorted(by_id.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
+def _anchor_rank(
+    anchor_rank: dict[Any, list[tuple[str, float]]], query_id: str, anchor: str
+) -> list[tuple[str, float]]:
+    """Read refreshed ranks keyed by (query,evidence), with raw compatibility."""
+    scoped = anchor_rank.get((query_id, anchor))
+    if scoped is not None:
+        # Refreshed C ranks were produced by one J scorer and are already in
+        # deterministic score/ID order.
+        return scoped
+    value = anchor_rank.get(anchor, [])
+    if getattr(value, "preserve_order", False):
+        return value
+    # Raw ET streams are arrival/interleaving ranks; make that type explicit.
+    return RankSequence(value, preserve_order=True)
 
 
 class PackedTeacher:
@@ -486,7 +579,9 @@ class TeacherTrainer:
         bank: ObjectBank,
         builder: PacketBuilder,
         rank_tables: dict[str, RankTable],
-        anchor_rank: dict[str, list[tuple[str, float]]],
+        anchor_rank: dict[Any, list[tuple[str, float]]],
+        raw_query_rankings: dict[str, dict[str, Any]] | None = None,
+        raw_evidence_target_rankings: dict[str, list[tuple[str, float]]] | None = None,
         output_dir: Path,
         device: str,
         limit_queries: int | None = None,
@@ -498,6 +593,8 @@ class TeacherTrainer:
         self.builder = builder
         self.rank_tables = rank_tables
         self.anchor_rank = anchor_rank
+        self.raw_query_rankings = raw_query_rankings
+        self.raw_evidence_target_rankings = raw_evidence_target_rankings or {}
         self.output_dir = Path(output_dir)
         self.device = device
         self.prefetch_workers = max(1, int(prefetch_workers))
@@ -517,6 +614,19 @@ class TeacherTrainer:
         self.queries = [row["query_id"] for row in builder.population("train")]
         if limit_queries:
             self.queries = self.queries[: int(limit_queries)]
+        if self.raw_query_rankings is None:
+            # Small in-memory callers from the reference suite may not have a
+            # raw-retrieval artifact.  Production commands always pass the
+            # explicit per-query raw mapping; this fallback is only a fixture
+            # convenience and never turns a supplied missing entry into [] in
+            # the production path.
+            self.raw_query_rankings = {
+                query_id: {
+                    "text_ids": [v for v, _ in rank_tables["E_text"].get(query_id)],
+                    "image_ids": [v for v, _ in rank_tables["E_image"].get(query_id)],
+                }
+                for query_id in self.queries
+            }
         if max_epochs:
             self.epochs = min(self.epochs, int(max_epochs))
         self.total_steps = self.epochs * max(1, math.ceil(len(self.queries) / self.effective_batch))
@@ -543,7 +653,7 @@ class TeacherTrainer:
                     epoch=epoch,
                     phase="teacher",
                     sampling_arm="T",
-                    q_rank=None,
+                    q_rank=self.raw_query_rankings.get(query_id),
                     anchor_rank=self.anchor_rank,
                     rank_tables=self.rank_tables,
                     per_modality=self.per_modality,
@@ -629,7 +739,7 @@ class TeacherTrainer:
                     epoch=epoch,
                     phase="teacher",
                     sampling_arm="T",
-                    q_rank=None,
+                    q_rank=self.raw_query_rankings.get(query_id),
                     per_modality=self.per_modality,
                     include_bundle=include_bundle,
                 )
@@ -665,6 +775,7 @@ class TeacherTrainer:
                     if any(name in r["terms"] for r in losses)
                 },
                 "skip_counts": _count_skips(pending_diag),
+                "bundle": _bundle_diagnostics(pending_diag),
                 "step": step,
                 "elapsed_seconds": time.time() - started,
             }
@@ -677,7 +788,8 @@ class TeacherTrainer:
             # Keep a per-epoch checkpoint so the pre-registered dev selection can
             # be applied to every candidate epoch, not only the last one.
             torch.save(
-                {"model": self.teacher.state_dict(), "epoch": epoch, "arm": "T"},
+                {"model": self.teacher.state_dict(), "optimizer": self.optimizer.state_dict(),
+                 "epoch": epoch, "global_step": step, "rng_state": _rng_state(), "arm": "T"},
                 self.output_dir / f"epoch_{epoch:02d}.pt",
             )
             if epoch == self.refresh_after:
@@ -715,16 +827,24 @@ class TeacherTrainer:
         """Spec 8.3: one in-run refresh after epoch 2, using the current Teacher."""
         started = time.time()
         self.teacher.eval()
-        refreshed: dict[str, dict[str, list[tuple[str, float]]]] = {
+        refreshed: dict[str, dict[Any, list[tuple[str, float]]]] = {
             "D": {}, "E_text": {}, "E_image": {}, "anchor": {}
         }
         with torch.no_grad():
             for row in self.builder.population("train"):
                 query_id = row["query_id"]
-                pool_targets = _dedupe(
-                    self.rank_tables["D"].ids(query_id)
-                    + [v for v, _ in self.anchor_hard_pool(query_id)]
-                )
+                witness_ids = self.builder.witness_union(row)
+                raw = self.raw_query_rankings.get(query_id, {})
+                raw_qt = list(zip(raw.get("target_ids", [])[:128], raw.get("target_scores", [])[:128]))
+                raw_re = []
+                for evidence_id in retrieve_interleave(
+                    raw.get("text_ids", [])[: self.per_modality],
+                    raw.get("image_ids", [])[: self.per_modality],
+                    self.per_modality,
+                    self.builder.bundle_limit,
+                ):
+                    raw_re.extend(self.raw_evidence_target_rankings.get(evidence_id, [])[:128])
+                pool_targets = _dedupe([v for v, _ in raw_qt] + [v for v, _ in raw_re])
                 if pool_targets:
                     scores = torch.cat(
                         self.batch.score(
@@ -732,36 +852,75 @@ class TeacherTrainer:
                             chunk=self.chunk,
                         )
                     )
-                    refreshed["D"][query_id] = _ranked(pool_targets, scores)
-                pool_text = self.rank_tables["E_text"].ids(query_id)
-                pool_image = self.rank_tables["E_image"].ids(query_id)
+                    refreshed["D"][query_id] = _ranked(pool_targets, scores, exclude=set(row["positive_target_ids"]))
+                pool_text = _dedupe(raw.get("text_ids", [])[:128])
+                pool_image = _dedupe(raw.get("image_ids", [])[:128])
                 if pool_text:
                     scores = torch.cat(
                         self.batch.score(self.teacher, [query_id], [pool_text], None, MODE_P,
                                          chunk=self.chunk)
                     )
-                    refreshed["E_text"][query_id] = _ranked(pool_text, scores)
+                    refreshed["E_text"][query_id] = _ranked(
+                        pool_text, scores, exclude=set(witness_ids)
+                    )
                 if pool_image:
                     scores = torch.cat(
                         self.batch.score(self.teacher, [query_id], [pool_image], None, MODE_P,
                                          chunk=self.chunk)
                     )
-                    refreshed["E_image"][query_id] = _ranked(pool_image, scores)
+                    refreshed["E_image"][query_id] = _ranked(
+                        pool_image, scores, exclude=set(witness_ids)
+                    )
+                # Refresh the C hard list per (Q,E), because J(Q,T;{E}) is
+                # query-conditioned.  The pool is natural raw ET128 ∪ QT128.
+                for anchor in witness_ids:
+                    raw_anchor_rank = self.raw_evidence_target_rankings.get(
+                        anchor, self.anchor_rank.get(anchor, [])
+                    )
+                    c_pool = _dedupe(
+                        [v for v, _ in raw_anchor_rank[:128]]
+                        + [v for v, _ in raw_qt]
+                    )
+                    if not c_pool:
+                        continue
+                    scores = torch.cat(
+                        self.batch.score(
+                            self.teacher, [query_id], [c_pool], [[anchor]], MODE_J,
+                            chunk=self.chunk,
+                        )
+                    )
+                    refreshed["anchor"][(query_id, anchor)] = _ranked(
+                        c_pool, scores, exclude=set(row["positive_target_ids"])
+                    )
         payload = {
             key: RankTable(value).to_rows() for key, value in refreshed.items()
+            if key != "anchor"
         }
+        payload["anchor"] = [
+            {"key": [key[0], key[1]], "ranked_ids": [v for v, _ in ranked],
+             "scores": [s for _, s in ranked]}
+            for key, ranked in sorted(refreshed["anchor"].items())
+        ]
         write_jsonl(self.output_dir / "mining_epoch2" / "refreshed_ranks.jsonl", (
             {"table": table, **row} for table, rows in payload.items() for row in rows
         ))
         self.rank_tables["D"] = RankTable(refreshed["D"])
         self.rank_tables["E_text"] = RankTable(refreshed["E_text"])
         self.rank_tables["E_image"] = RankTable(refreshed["E_image"])
+        self.anchor_rank.update(refreshed["anchor"])
         write_json(
             self.output_dir / "mining_epoch2" / "meta.json",
             {
                 "refreshed_queries": {k: len(v) for k, v in refreshed.items()},
                 "elapsed_seconds": time.time() - started,
-                "source": "current in-run Teacher, mode=P",
+                "source": "current in-run Teacher; D/E=P and C=J(Q,T;{E})",
+                "scoring_calls": {
+                    "D": sum(1 for row in self.builder.population("train") if refreshed["D"].get(row["query_id"])),
+                    "E_text": sum(1 for row in self.builder.population("train") if refreshed["E_text"].get(row["query_id"])),
+                    "E_image": sum(1 for row in self.builder.population("train") if refreshed["E_image"].get(row["query_id"])),
+                    "C": len(refreshed["anchor"]),
+                },
+                "teacher_hash": _module_hash(self.teacher),
             },
         )
         log_line(f"teacher: refreshed hard ranks after epoch 2 ({time.time() - started:.0f}s)")
@@ -782,10 +941,40 @@ def _dedupe(values: Iterable[str]) -> list[str]:
     return out
 
 
-def _ranked(ids: Sequence[str], scores: torch.Tensor) -> list[tuple[str, float]]:
-    pairs = [(value, float(score)) for value, score in zip(ids, scores)]
+def _ranked(
+    ids: Sequence[str], scores: torch.Tensor, *, exclude: set[str] | None = None
+) -> list[tuple[str, float]]:
+    exclude = exclude or set()
+    pairs = [(value, float(score)) for value, score in zip(ids, scores) if value not in exclude]
     pairs.sort(key=lambda item: (-item[1], item[0]))
     return pairs
+
+
+def _module_hash(module: torch.nn.Module) -> str:
+    """Hash every state_dict byte, including values beyond a short preview."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name, tensor in module.state_dict().items():
+        encoded = name.encode("utf-8")
+        value = tensor.detach().cpu().contiguous().numpy()
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(repr(tuple(value.shape)).encode("ascii"))
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
 
 
 def _count_skips(results: Sequence[dict[str, Any]]) -> dict[str, int]:
@@ -794,6 +983,36 @@ def _count_skips(results: Sequence[dict[str, Any]]) -> dict[str, int]:
         for reason in result.get("skipped", []):
             counts[reason] = counts.get(reason, 0) + 1
     return counts
+
+
+def _bundle_diagnostics(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Export the actual natural/augmented B contract, not only its mean size."""
+    histogram: dict[str, int] = {str(i): 0 for i in range(21)}
+    views: dict[str, int] = {}
+    summaries: list[dict[str, Any]] = []
+    for result in results:
+        packet = result.get("diagnostics", {}).get("packets", {}).get(B_PACKET)
+        if packet is None:
+            continue
+        size = int(packet.get("context_size", 0))
+        histogram[str(size)] = histogram.get(str(size), 0) + 1
+        view = str(packet.get("view") or "unknown")
+        views[view] = views.get(view, 0) + 1
+        # packet diagnostics are deliberately IDs only; this makes the audit
+        # reproducible without copying raw evidence content into every epoch log.
+        summaries.append({
+            "query_id": result.get("query_id"),
+            "view": view,
+            "context_size": size,
+            "context_ids": packet.get("context_ids", []),
+            "positive_ids": packet.get("positive_ids", []),
+        })
+    return {
+        "length_histogram": histogram,
+        "view_counts": views,
+        "count": sum(views.values()),
+        "id_summaries": summaries,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -892,28 +1111,24 @@ class StudentTrainer:
         target_ids = list(corpora["target"])
         text_ids = list(corpora["evidence_text"])
         image_ids = list(corpora["evidence_image"])
-        base_tensor = torch.from_numpy(base)
-
-        def project(ids: list[str], linear: torch.nn.Module) -> np.ndarray:
-            vectors = base_tensor[[index[o] for o in ids]]
-            return reference.unit(vectors @ linear.weight.detach().cpu().T).numpy()
+        target_index = np.asarray([index[o] for o in target_ids], dtype=np.int64)
+        target_base = base[target_index]
+        text_index = np.asarray([index[o] for o in text_ids], dtype=np.int64)
+        image_index = np.asarray([index[o] for o in image_ids], dtype=np.int64)
 
         return {
             "target_ids": target_ids,
             "text_ids": text_ids,
             "image_ids": image_ids,
             "target_position": index,
-            # C path: the target index key is base_e(nu_T); Eq. (14) conditions only
-            # the query vector, never the target key or the target index.
-            "target_keys_C": torch.from_numpy(
-                reference.unit(
-                    base_tensor[[index[o] for o in target_ids]]
-                    @ self.student.base_e.weight.detach().cpu().T
-                ).numpy()
-            ).to(self.device),
-            "D_keys": project(target_ids, self.student.direct),
-            "E_text_keys": project(text_ids, self.student.evidence),
-            "E_image_keys": project(image_ids, self.student.evidence),
+            # Every destination index stores the unprojected object key nu_x.
+            # Relation transforms apply only on the query side (Eq. 13–15).
+            # C mining performs exact NumPy search below, so retain this bank on
+            # CPU instead of uploading it only to download it again immediately.
+            "target_keys_C": target_base,
+            "D_keys": target_base,
+            "E_text_keys": base[text_index],
+            "E_image_keys": base[image_index],
         }
 
     # -- one query ---------------------------------------------------------
@@ -975,7 +1190,7 @@ class StudentTrainer:
                 skipped.append(f"{name}:empty_positive_or_negative")
                 diagnostics["packets"][name] = {**entry, "skipped": True}
                 continue
-            terms.append(term)
+            packet_loss = term
             entry["rank_loss"] = float(term.detach())
             if self.arm == "KD":
                 teacher_scores = kd_scores.get(name)
@@ -993,7 +1208,11 @@ class StudentTrainer:
                     kd = reference.kd_loss(
                         scores, teacher_scores, valid_mask, self.kd_temperature
                     )
-                terms.append(kd * self.kd_weight)
+                # One term per valid packet: rank_loss + lambda*KD.  Appending
+                # the two parts separately and then taking one mean over all
+                # parts would divide the protocol loss by an extra factor of two
+                # without changing the SUP arm (which has no KD part).
+                packet_loss = term + kd * self.kd_weight
                 probability = torch.softmax(
                     teacher_scores[valid_mask].detach().float() / self.kd_temperature, 0
                 )
@@ -1002,6 +1221,7 @@ class StudentTrainer:
                     -(probability * probability.clamp_min(1e-12).log()).sum()
                 )
                 entry["kd_valid"] = int(valid_mask.sum())
+            terms.append(packet_loss)
             diagnostics["packets"][name] = entry
         if not terms:
             return {"query_id": query_id, "loss": None, "skipped": skipped, "diagnostics": diagnostics}
@@ -1027,19 +1247,24 @@ class StudentTrainer:
             objects = objects + [packet["context"][0]]
         cache, valid, modality, kind = self.bank.keys(objects, self.device)
         vectors = self.student.encode(cache, valid, modality, kind)
-        if packet["context"]:
+        packet_type = packet.get("packet_type")
+        if packet_type == C_PACKET or packet["context"]:
+            if len(packet["context"]) != 1:
+                raise ConfigError("C packet must carry exactly one evidence anchor")
             query_vector = self.student.query_next(vectors[0], vectors[-1])
-        elif packet["mode"] == "P":
+        elif packet_type == D_PACKET:
             query_vector = self.student.query_direct(vectors[0])
-        else:
+        elif packet_type == E_PACKET:
             query_vector = self.student.query_evidence(vectors[0])
-        candidate_keys = self.student.base_e(vectors[1 : 1 + len(candidates)])
+        else:
+            raise ConfigError(f"unknown Student packet type: {packet_type!r}")
+        candidate_keys = vectors[1 : 1 + len(candidates)]
         return self.student.logits(query_vector, candidate_keys)
 
     # -- mining refresh ----------------------------------------------------
 
     def refresh_mining(self, epoch: int, keys: dict[str, Any]) -> dict[str, Any]:
-        """Spec 9.2: exact top-128 mining with the previous epoch's *last* model."""
+        """Exact full-lake D/E/C mining with the previous epoch's last model."""
         started = time.time()
         refreshed: dict[str, dict[str, list[tuple[str, float]]]] = {
             "D": {}, "E_text": {}, "E_image": {}, "anchor": {}
@@ -1048,9 +1273,15 @@ class StudentTrainer:
         target_ids = keys["target_ids"]
         text_ids = keys["text_ids"]
         image_ids = keys["image_ids"]
+        target_key_payload = keys["target_keys_C"]
+        if torch.is_tensor(target_key_payload):
+            target_keys_c = target_key_payload.detach().cpu().numpy()
+        else:
+            target_keys_c = np.asarray(target_key_payload)
         rows = self.builder.population("train")
         query_ids = [row["query_id"] for row in rows]
         base = self._base_vectors(query_ids)
+        base_by_query = {query_id: base[i] for i, query_id in enumerate(query_ids)}
         with self.timing.stage("mining_project_queries"), torch.no_grad():
             d_queries = torch.from_numpy(
                 _unit_np(base @ self.student.direct.weight.detach().cpu().numpy().T)
@@ -1059,16 +1290,50 @@ class StudentTrainer:
                 _unit_np(base @ self.student.evidence.weight.detach().cpu().numpy().T)
             ).numpy()
         with self.timing.stage("mining_exact_topk"):
-            d_scores = d_queries @ keys["D_keys"].T
-            text_scores = e_queries @ keys["E_text_keys"].T
-            image_scores = e_queries @ keys["E_image_keys"].T
+            d_scores = d_queries @ np.asarray(keys["D_keys"]).T
+            text_scores = e_queries @ np.asarray(keys["E_text_keys"]).T
+            image_scores = e_queries @ np.asarray(keys["E_image_keys"]).T
         for i, row in enumerate(rows):
             query_id = row["query_id"]
             positives = set(row["positive_target_ids"])
             refreshed["D"][query_id] = _top_pairs(target_ids, d_scores[i], 128, positives)
-            refreshed["E_text"][query_id] = _top_pairs(text_ids, text_scores[i], 128, set())
-            refreshed["E_image"][query_id] = _top_pairs(image_ids, image_scores[i], 128, set())
-        payload = {key: RankTable(value).to_rows() for key, value in refreshed.items()}
+            witness_ids = self.builder.witness_union(row)
+            witness_set = set(witness_ids)
+            refreshed["E_text"][query_id] = _top_pairs(text_ids, text_scores[i], 128, witness_set)
+            refreshed["E_image"][query_id] = _top_pairs(image_ids, image_scores[i], 128, witness_set)
+            # C is a separate conditional exact search for the anchor that will
+            # be used in the next epoch.  Its key side is raw nu_T.
+            next_anchor = select_witness_anchor(
+                witness_ids, query_id, epoch
+            )
+            if next_anchor is not None:
+                with torch.no_grad():
+                    e_cache, e_valid, e_modality, e_kind = self.bank.keys(
+                        [next_anchor], self.device
+                    )
+                    e_vector = self.student.encode(
+                        e_cache, e_valid, e_modality, e_kind
+                    )[0].cpu()
+                    q_vector = torch.from_numpy(base_by_query[query_id]).to(self.device)
+                    c_query = self.student.query_next(
+                        q_vector[None, :], e_vector.to(self.device)[None, :]
+                    )[0].cpu().numpy()
+                # The target key matrix is read-only here.  Copying it once per
+                # query turns C refresh into an avoidable O(Q*T*D) memory-copy
+                # loop, especially for large target lakes.
+                c_scores = target_keys_c @ c_query
+                refreshed["anchor"][(query_id, next_anchor)] = _top_pairs(
+                    target_ids, c_scores, 128, positives
+                )
+        payload = {
+            key: RankTable(value).to_rows()
+            for key, value in refreshed.items() if key != "anchor"
+        }
+        payload["anchor"] = [
+            {"key": [key[0], key[1]], "ranked_ids": [v for v, _ in ranked],
+             "scores": [s for _, s in ranked]}
+            for key, ranked in sorted(refreshed["anchor"].items())
+        ]
         out_dir = self.output_dir / f"lists_epoch{epoch:02d}"
         write_jsonl(
             out_dir / "refreshed_ranks.jsonl",
@@ -1077,6 +1342,7 @@ class StudentTrainer:
         self.rank_tables["D"] = RankTable(refreshed["D"])
         self.rank_tables["E_text"] = RankTable(refreshed["E_text"])
         self.rank_tables["E_image"] = RankTable(refreshed["E_image"])
+        self.anchor_rank.update(refreshed["anchor"])
         meta = {
             "epoch": epoch,
             "generator": f"{self.arm} epoch {epoch - 1} last parameters",
@@ -1085,6 +1351,7 @@ class StudentTrainer:
                 "target": len(target_ids), "text": len(text_ids), "image": len(image_ids)
             },
             "note": "hard-negative ids only; no loss is computed against these keys",
+            "c_refresh_count": len(refreshed["anchor"]),
         }
         write_json(out_dir / "meta.json", meta)
         log_line(f"{self.arm}: refreshed mining for epoch {epoch} ({time.time() - started:.0f}s)")
@@ -1119,7 +1386,6 @@ class StudentTrainer:
         step = 0
         chunk = int(self.resolved["retrieval"]["teacher_target_chunk"])
         for epoch in range(1, self.epochs + 1):
-            keys = self.key_index()
             order = stable_order(self.queries, query_order_namespace("S", epoch))
             self.student.train()
             self.student.requires_grad_(True)
@@ -1191,9 +1457,15 @@ class StudentTrainer:
             # Keep the per-epoch checkpoint: dev selection needs every candidate
             # epoch, and next-epoch mining is driven by *last*, never by best.
             torch.save(
-                {"model": self.student.state_dict(), "epoch": epoch, "arm": self.arm},
+                {"model": self.student.state_dict(), "optimizer": self.optimizer.state_dict(),
+                 "epoch": epoch, "global_step": step, "rng_state": _rng_state(),
+                 "arm": self.arm},
                 self.output_dir / f"epoch_{epoch:02d}.pt",
             )
+            # The dev ranking and next mining snapshot are generated from the
+            # same epoch-last parameters.  Reusing the epoch-start bank pairs
+            # old keys with new queries and changes the mining protocol.
+            keys = self.key_index()
             if dev_ranker is not None:
                 evaluation = dev_ranker(self.student, keys)
                 record["dev"] = evaluation
@@ -1347,8 +1619,11 @@ def _dedupe(values: Iterable[str]) -> list[str]:
     return out
 
 
-def _ranked(ids: Sequence[str], scores: torch.Tensor) -> list[tuple[str, float]]:
-    pairs = [(value, float(score)) for value, score in zip(ids, scores)]
+def _ranked(
+    ids: Sequence[str], scores: torch.Tensor, *, exclude: set[str] | None = None
+) -> list[tuple[str, float]]:
+    exclude = exclude or set()
+    pairs = [(value, float(score)) for value, score in zip(ids, scores) if value not in exclude]
     pairs.sort(key=lambda item: (-item[1], item[0]))
     return pairs
 
@@ -1503,10 +1778,15 @@ def _compact_packets(built: dict[str, Any]) -> dict[str, Any]:
             "ordered_ids": list(negative_list.ordered_ids),
             "provenance": dict(negative_list.provenance),
             "mode": packet["mode"],
+            "packet_type": packet.get("packet_type", name),
             "candidates": list(packet["candidates"]),
             "context": list(packet["context"]),
             "view": packet.get("view"),
-            "positive_ids_override": packet.get("positive_ids"),
+            # ``[]`` is a meaningful explicit empty support set.  Keep a
+            # presence bit rather than using truthiness during expansion.
+            "has_positive_ids_override": "positive_ids" in packet,
+            "positive_ids_override": list(packet["positive_ids"]) if "positive_ids" in packet else None,
+            "excluded_ids": list(packet.get("excluded_ids", [])),
         }
     return {"packets": packets, "diagnostics": built["diagnostics"]}
 
@@ -1522,11 +1802,14 @@ def _expand_packets(compact: dict[str, Any]) -> dict[str, Any]:
                 provenance=data["provenance"],
             ),
             "mode": data["mode"],
+            "packet_type": data.get("packet_type", name),
             "candidates": data["candidates"],
             "context": data["context"],
             **({"view": data["view"]} if data.get("view") else {}),
-            **({"positive_ids": data["positive_ids_override"]}
-               if data.get("positive_ids_override") else {}),
+            **({"positive_ids": data.get("positive_ids_override")}
+               if data.get("has_positive_ids_override", data.get("positive_ids_override") is not None)
+               else {}),
+            "excluded_ids": data.get("excluded_ids", []),
         }
     return {"packets": packets, "diagnostics": compact["diagnostics"]}
 

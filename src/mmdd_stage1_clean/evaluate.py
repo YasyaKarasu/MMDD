@@ -415,21 +415,34 @@ class RawEngine:
     ) -> dict[str, Any]:
         from .retrieve import retrieve_query
 
-        vector = self._z(bank, query_id)
+        per = int(self.retrieval["evidence_per_modality"])
         outputs: dict[str, Any] = {}
         for label, use_ann in (paths if paths is not None else (("ann", True), ("exact", False))):
             if use_ann and not self.ann_enabled:
                 continue
             rankers = self._rankers(use_ann)
+            query_vector = self._z(bank, query_id)
+            # Each retriever path first derives its own natural bundle from the
+            # frozen query vector.  The second hop must condition on the z of the
+            # bundle entry that is actually at that position -- reusing the query
+            # vector here would silently collapse RAW-2H into ``Top20_T(z_Q)``.
+            b_q = interleave_text_image(
+                rankers["text"](query_vector, per),
+                rankers["image"](query_vector, per),
+                per,
+                per * 2,
+            )
+            evidence_z = {value: self._z(bank, value) for value in b_q}
             outputs[label] = retrieve_query(
                 query_id=query_id,
                 rank_target=rankers["target"],
                 rank_text=rankers["text"],
                 rank_image=rankers["image"],
-                condition=lambda position: vector,
-                u_D=vector,
-                u_E=vector,
+                condition=lambda position: evidence_z[b_q[position]],
+                u_D=query_vector,
+                u_E=query_vector,
                 retrieval=self.retrieval,
+                bundle=b_q,
             )
         return outputs
 

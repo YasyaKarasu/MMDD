@@ -1,0 +1,49 @@
+{
+  "D": {
+    "actual_logits": [
+      19.157257080078125,
+      -13.985186576843262
+    ],
+    "specified_logits": [
+      9.578628540039062,
+      -6.992593288421631
+    ],
+    "max_error": 9.578628540039062,
+    "evidence_weight_grad_is_none": true,
+    "direct_weight_grad_is_none": false,
+    "base_e_weight_grad_is_none": false
+  },
+  "E": {
+    "actual_logits": [
+      -20.272525787353516,
+      13.89968204498291
+    ],
+    "specified_logits": [
+      11.887930870056152,
+      -7.68264627456665
+    ],
+    "max_error": 32.160457611083984,
+    "evidence_weight_grad_is_none": true,
+    "direct_weight_grad_is_none": false,
+    "base_e_weight_grad_is_none": false
+  },
+  "C": {
+    "actual_logits": [
+      -11.883238792419434,
+      1.9672287702560425
+    ],
+    "specified_logits": [
+      -5.941619396209717,
+      0.9836143851280212
+    ],
+    "max_error": 5.941619396209717,
+    "evidence_weight_grad_is_none": true,
+    "direct_weight_grad_is_none": true,
+    "base_e_weight_grad_is_none": false
+  },
+  "mining_keys": {
+    "D_max_error_to_nuT": 0.4240179657936096,
+    "E_max_error_to_nuE": 1.3577985763549805,
+    "note": "C uses 2I in this probe; normalization hides its extra map. Actual source applies base_e to every candidate."
+  }
+}

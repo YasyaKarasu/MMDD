@@ -1,0 +1,19 @@
+test_duplicates_and_unicode (__main__.ExactSamplingTests.test_duplicates_and_unicode) ... ok
+test_empty_and_all_excluded (__main__.ExactSamplingTests.test_empty_and_all_excluded) ... ok
+test_exclusion (__main__.ExactSamplingTests.test_exclusion) ... ok
+test_full_digest_and_tie_break (__main__.ExactSamplingTests.test_full_digest_and_tie_break) ... ok
+test_global_rng_not_consumed (__main__.ExactSamplingTests.test_global_rng_not_consumed) ... ok
+test_hard_counts_zero_to_sixteen (__main__.ExactSamplingTests.test_hard_counts_zero_to_sixteen) ... ok
+test_invalid_and_repeated_hard_ids (__main__.ExactSamplingTests.test_invalid_and_repeated_hard_ids) ... ok
+test_literal_reference (__main__.ExactSamplingTests.test_literal_reference) ... ok
+test_mismatched_corpus_rejected (__main__.ExactSamplingTests.test_mismatched_corpus_rejected) ... ok
+test_namespace_sensitive_no_mixed_epoch_cache (__main__.ExactSamplingTests.test_namespace_sensitive_no_mixed_epoch_cache) ... ok
+test_parallel_order_equals_serial (__main__.ExactSamplingTests.test_parallel_order_equals_serial) ... ok
+test_prefix_identity_exhaustive_small_subsets (__main__.ExactSamplingTests.test_prefix_identity_exhaustive_small_subsets) ... ok
+test_reuse_prefix_two_arms_and_final_order (__main__.ExactSamplingTests.test_reuse_prefix_two_arms_and_final_order) ... ok
+test_small_legal_corpus (__main__.ExactSamplingTests.test_small_legal_corpus) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.961s
+
+OK

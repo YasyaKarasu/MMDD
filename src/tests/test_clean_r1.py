@@ -403,6 +403,51 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(sorted(packet.ordered_ids), sorted(packet.positive_ids + packet.negative_ids))
         self.assertEqual(packet.provenance_counts()["hard_negative"], 2)
 
+    def test_single_hash_scan_matches_legacy_sampling(self):
+        def outcome(builder, method, kwargs):
+            try:
+                result = method(**kwargs)
+            except sampling.HashPoolExhausted:
+                return sampling.HashPoolExhausted
+            return (
+                result.positive_ids,
+                result.negative_ids,
+                result.ordered_ids,
+                result.provenance,
+            )
+
+        for corpus_size in (8, 30, 33, 35, 100):
+            corpus = [f"id_{i:03d}" for i in range(corpus_size)]
+            for hard_size in range(17):
+                ranked = [
+                    (f"id_{i:03d}", 1.0 - i / 100)
+                    for i in range(hard_size)
+                ]
+                # Exercise filtering and deduplication in both score-sorted and
+                # explicitly ordered ranking streams.
+                ranked += [("id_000", -1.0), ("missing", 2.0)]
+                for hard_rank in (ranked, sampling.RankSequence(ranked)):
+                    builder = sampling.MakeList(
+                        phase="T",
+                        sampling_arm="T",
+                        corpus_universe={"target": corpus},
+                    )
+                    kwargs = {
+                        "packet": sampling.D_PACKET,
+                        "epoch": 3,
+                        "query_id": "q",
+                        "anchor": None,
+                        "destination": "target",
+                        "positives": ["id_000"],
+                        "excluded": ["id_001"],
+                        "hard_rank": hard_rank,
+                    }
+                    self.assertEqual(
+                        outcome(builder, builder.build, kwargs),
+                        outcome(builder, builder.build_legacy, kwargs),
+                        (corpus_size, hard_size, type(hard_rank).__name__),
+                    )
+
     def test_rank_loss_does_not_include_unjudged(self):
         scores = torch.tensor([2.0, 1.0, 0.0, -5.0], requires_grad=True)
         positive = torch.tensor([True, False, False, False])
@@ -764,9 +809,13 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertGreater(result["steps"], 0)
 
     def test_teacher_packets_have_positives_and_negatives(self):
+        raw_ranking = {
+            "text_ids": [f"text_{i:03d}" for i in range(40)],
+            "image_ids": [f"image_{i:03d}" for i in range(40)],
+        }
         built = self.builder.build(
             split="train", row=self.gt["train"]["population"][0], epoch=3,
-            phase="teacher", sampling_arm="T", q_rank=None, anchor_rank={},
+            phase="teacher", sampling_arm="T", q_rank=raw_ranking, anchor_rank={},
             rank_tables=self._rank_tables(), per_modality=10, include_bundle=True,
         )
         for name in ("D", "E", "C", "B"):
@@ -828,17 +877,22 @@ class TrainingLoopTests(unittest.TestCase):
             for name, p in trainer.student.named_parameters()
             if p.grad is not None
         }
-        # The conditional (E-conditioned) path must receive gradient, not only the
-        # shared pooling: this is the specific failure the spec warns about.
+        # Every query-side relation path must move: D uses direct, E uses evidence,
+        # and C uses the evidence-conditioned low-rank interaction plus base_e.
         for name in ("base_e.weight", "out_factor.weight", "q_factor.weight",
-                     "e_factor.weight", "pool_query", "project.weight"):
+                     "e_factor.weight", "direct.weight", "evidence.weight",
+                     "pool_query", "project.weight"):
             self.assertIn(name, gradients, name)
             self.assertGreater(gradients[name], 0.0, name)
-        # direct.weight is used by the D packet in the same query, so it must move
-        # too; evidence.weight is the retrieval-only path and is not in these
-        # packets, so it is expected to stay untouched here.
-        self.assertGreater(gradients["direct.weight"], 0.0)
-        self.assertNotIn("evidence.weight", gradients)
+
+        # Candidate keys are raw nu_x.  On an isolated E packet, base_e therefore
+        # cannot receive candidate-side gradient; only the E query transform does.
+        trainer.student.zero_grad(set_to_none=True)
+        e_packet = prepared["built"]["packets"]["E"]
+        e_scores = trainer.score_packet("query_000", e_packet)
+        e_scores.sum().backward()
+        self.assertIsNone(trainer.student.base_e.weight.grad)
+        self.assertGreater(float(trainer.student.evidence.weight.grad.abs().sum()), 0.0)
 
     def test_student_epoch_runs_for_both_arms(self):
         for arm in ("SUP", "KD"):
@@ -895,6 +949,129 @@ class TrainingLoopTests(unittest.TestCase):
             keys["D_keys"] = np.zeros_like(keys["D_keys"])
         meta = trainer.refresh_mining(2, keys)
         self.assertEqual(meta["generator"], "SUP epoch 1 last parameters")
+
+
+    # -- NEXT_STEPS task 6: KD total-loss reduction ------------------------
+
+    def _kd_trainer_and_prepared(self):
+        trainer = train.StudentTrainer(
+            resolved=self.resolved, bank=self.bank, builder=self.builder,
+            rank_tables=self._rank_tables(), anchor_rank={},
+            output_dir=Path("/tmp/_smoke_kd_reduction"), arm="KD",
+            init_state=build_student(self.resolved["student"]).state_dict(),
+            device=self.device,
+        )
+        return trainer, trainer.prepare_query("query_000", 2, None)
+
+    @staticmethod
+    def _packet_logits(packet, seed):
+        generator = torch.Generator().manual_seed(seed)
+        return torch.randn(len(packet["candidates"]), generator=generator)
+
+    @staticmethod
+    def _valid_mask(scores, packet):
+        mask = torch.zeros_like(scores, dtype=torch.bool)
+        index = {v: i for i, v in enumerate(packet["list"].ordered_ids)}
+        for value in packet["list"].positive_ids:
+            mask[index[value]] = True
+        for value in packet["list"].negative_ids:
+            mask[index[value]] = True
+        return mask
+
+    def _protocol_terms(self, logits, packets):
+        """The spec reduction: one (rank + lambda*KD) term per valid packet."""
+        terms = []
+        for name in ("D", "E", "C"):
+            packet = packets.get(name)
+            if packet is None:
+                continue
+            scores = logits[name]
+            rank = train.teacher_rank_term(scores, packet)
+            if rank is None:
+                continue
+            kd = reference.kd_loss(scores, scores, self._valid_mask(scores, packet), 2.0)
+            terms.append(rank + kd * 1.0)
+        return terms
+
+    def test_kd_total_loss_is_the_per_packet_mean(self):
+        trainer, prepared = self._kd_trainer_and_prepared()
+        packets = prepared["built"]["packets"]
+        logits = {
+            name: self._packet_logits(packets[name], 200 + i)
+            for i, name in enumerate(("D", "E", "C"))
+            if name in packets
+        }
+        by_type = {packets[name]["packet_type"]: logits[name] for name in logits}
+        trainer.score_packet = lambda query_id, packet: by_type[packet["packet_type"]]
+        result = trainer.finalize_query(prepared, dict(logits))
+        self.assertIsNotNone(result["loss"])
+        protocol = torch.stack(self._protocol_terms(logits, packets)).mean()
+        torch.testing.assert_close(result["loss"], protocol, atol=0.0, rtol=0.0)
+        if len(logits) > 1:
+            # The pre-fix reducer appended rank and KD separately and averaged
+            # over 2m parts, i.e. it divided the protocol loss by two.
+            doubled = []
+            for name in ("D", "E", "C"):
+                packet = packets.get(name)
+                if packet is None:
+                    continue
+                scores = logits[name]
+                rank = train.teacher_rank_term(scores, packet)
+                if rank is None:
+                    continue
+                kd = reference.kd_loss(
+                    scores, scores, self._valid_mask(scores, packet), 2.0
+                )
+                doubled.extend([rank, kd * 1.0])
+            self.assertNotAlmostEqual(
+                float(result["loss"]), float(torch.stack(doubled).mean()), places=6
+            )
+
+    def test_kd_single_packet_reduction_matches_the_formula(self):
+        trainer, prepared = self._kd_trainer_and_prepared()
+        d_packet = prepared["built"]["packets"]["D"]
+        packets = {"D": d_packet}
+        prepared["built"]["packets"] = packets
+        logits = {"D": self._packet_logits(d_packet, 7)}
+        by_type = {d_packet["packet_type"]: logits["D"]}
+        trainer.score_packet = lambda query_id, packet: by_type[packet["packet_type"]]
+        result = trainer.finalize_query(prepared, dict(logits))
+        protocol = torch.stack(self._protocol_terms(logits, packets)).mean()
+        torch.testing.assert_close(result["loss"], protocol, atol=0.0, rtol=0.0)
+        # With a single packet the protocol loss is exactly rank + KD; the old
+        # reduction still averaged the two parts and returned half of it.
+        doubled = []
+        rank = train.teacher_rank_term(logits["D"], d_packet)
+        doubled.extend(
+            [
+                rank,
+                reference.kd_loss(
+                    logits["D"], logits["D"], self._valid_mask(logits["D"], d_packet), 2.0
+                )
+                * 1.0,
+            ]
+        )
+        self.assertAlmostEqual(
+            float(torch.stack(doubled).mean()),
+            float(result["loss"]) / 2.0,
+            places=6,
+        )
+
+    def test_kd_skipped_packet_leaves_the_denominator(self):
+        trainer, prepared = self._kd_trainer_and_prepared()
+        packets = prepared["built"]["packets"]
+        packets["E"]["list"].negative_ids = []
+        logits = {
+            name: self._packet_logits(packets[name], 300 + i)
+            for i, name in enumerate(("D", "E", "C"))
+            if name in packets
+        }
+        by_type = {packets[name]["packet_type"]: logits[name] for name in logits}
+        trainer.score_packet = lambda query_id, packet: by_type[packet["packet_type"]]
+        result = trainer.finalize_query(prepared, dict(logits))
+        self.assertIn("E:empty_positive_or_negative", result["skipped"])
+        protocol = torch.stack(self._protocol_terms(logits, packets)).mean()
+        torch.testing.assert_close(result["loss"], protocol, atol=0.0, rtol=0.0)
 
 
 class RetrievalPipelineTests(unittest.TestCase):
@@ -1513,3 +1690,108 @@ class SinglePathPipelineTests(unittest.TestCase):
         stages = engine.timing.summarise()
         self.assertIn("candidate_admission:path=ann", stages)
         self.assertNotIn("candidate_admission:path=exact", stages)
+
+
+# ==========================================================================
+# NEXT_STEPS_DEEPSEEK.md task 2 — the two repaired evaluation entrypoints
+# ==========================================================================
+
+
+class EvaluationEntrypointFixTests(unittest.TestCase):
+    """A hand-built two-dimensional bank where Q and E point at different targets.
+
+    Q = (1, 0) admits ``target_direct``; the only evidence E = (0, 1) admits
+    ``target_bridge``.  The runtime ``RawEngine`` must run the second hop on the
+    evidence, and the freeze entry must admit the evidence-only target.
+    """
+
+    def setUp(self):
+        self.retrieval = {
+            "direct_k": 1,
+            "evidence_per_modality": 1,
+            "second_hop_k": 1,
+            "candidate_budget": 100,
+            "exact_corpus_chunk": 4096,
+        }
+        self.corpora = {
+            "query": ["query_q"],
+            "target": ["target_direct", "target_bridge"],
+            "evidence_text": ["text_e"],
+            "evidence_image": [],
+        }
+        self.corpora["evidence"] = (
+            self.corpora["evidence_text"] + self.corpora["evidence_image"]
+        )
+        self.corpora["all"] = (
+            self.corpora["query"] + self.corpora["target"] + self.corpora["evidence"]
+        )
+        vectors = {
+            "query_q": [1.0, 0.0],
+            "target_direct": [1.0, 0.0],
+            "target_bridge": [0.0, 1.0],
+            "text_e": [0.0, 1.0],
+        }
+        ids = self.corpora["all"]
+        z = np.array([vectors[o] for o in ids], dtype=np.float32)
+        summary = np.zeros((len(ids), 8, 2), dtype=np.float16)
+        mask = np.ones((len(ids), 9), dtype=np.uint8)
+        modality_id = np.zeros(len(ids), dtype=np.int64)
+        kind_ids = np.stack(
+            [np.array(cache_module.TABLE_KINDS, dtype=np.int64)] * len(ids)
+        )
+        for i, object_id in enumerate(ids):
+            if object_id.startswith("text_"):
+                modality_id[i] = 1
+                kind_ids[i] = np.array(cache_module.TEXT_KINDS)
+        self.bank = ObjectBank(ids, modality_id, kind_ids, z, summary, mask)
+
+    def test_raw_engine_conditions_the_second_hop_on_the_evidence(self):
+        raw = evaluate.RawEngine(
+            bank=self.bank, corpora=self.corpora, retrieval=self.retrieval,
+            ann={}, seed=13, device="cpu", build_ann=False,
+        )
+        output = raw.pipeline_both(
+            self.bank, "query_q", paths=(("exact", False),)
+        )["exact"]
+        self.assertEqual(output["D100"], ["target_direct"])
+        self.assertEqual(output["B_Q"], ["text_e"])
+        # The evidence's own nearest target, not the query's.
+        self.assertEqual(output["L_E"]["text_e"], ["target_bridge"])
+        self.assertNotEqual(output["L_E"]["text_e"], output["D100"])
+        # The evidence-only target enters the union and the admission set.
+        self.assertIn("target_bridge", output["U"])
+        self.assertEqual(output["C100"], ["target_direct", "target_bridge"])
+
+    def test_freeze_candidate_builder_is_round_robin_not_d100(self):
+        records = [
+            {
+                "query_id": "query_q",
+                "target_ids": ["target_direct", "target_bridge"],
+                "text_ids": ["text_e"],
+                "image_ids": [],
+            }
+        ]
+        population = {
+            "query_q": {
+                "direct_target_ids": ["target_direct"],
+                "implicit_target_ids": ["target_bridge"],
+                "positive_target_ids": ["target_direct", "target_bridge"],
+            }
+        }
+        fixed = commands.build_fixed_candidates(
+            bank=self.bank, target_ids=self.corpora["target"],
+            retrieval=self.retrieval, records=records, population=population,
+        )
+        self.assertEqual(len(fixed), 1)
+        record = fixed[0]
+        self.assertEqual(record["D100"], ["target_direct"])
+        self.assertEqual(record["L_E"]["text_e"], ["target_bridge"])
+        self.assertEqual(record["R_E"], ["target_bridge"])
+        self.assertEqual(record["U"], ["target_direct", "target_bridge"])
+        expected = reference.round_robin([record["D100"], record["R_E"]], 100)
+        self.assertEqual(record["C100"], expected)
+        self.assertEqual(record["C100"], ["target_direct", "target_bridge"])
+        # "same length as D100" or "same as R_E" would not be sufficient checks.
+        self.assertNotEqual(record["C100"], record["D100"])
+        self.assertNotEqual(record["C100"], record["R_E"])
+        self.assertIn("target_bridge", record["C100"])
