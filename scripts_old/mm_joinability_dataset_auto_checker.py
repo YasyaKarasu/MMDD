@@ -1363,6 +1363,14 @@ def _summary(
     }
 
 
+def _reviewer_concurrency_ceiling(reviewer: Any, default: int) -> int:
+    """How many calls this reviewer can usefully have in flight."""
+    if reviewer is None:
+        return default
+    from_pool = int(getattr(reviewer, "max_parallelism", 0) or 0)
+    return max(default, from_pool)
+
+
 def run_auto_check(
     config: AutoCheckConfig,
     reviewer: BatchExtractor,
@@ -1373,19 +1381,27 @@ def run_auto_check(
         raise ValueError("sample_rate must be within (0, 1]")
     if config.workers <= 0:
         raise ValueError("workers must be positive")
+    # A single endpoint gets the fixed ceiling; a profile pool owns one adaptive
+    # controller per provider, so its ceiling is the pool's own budget.  Capping
+    # a twelve-provider pool at the single-endpoint number would throw away the
+    # routing it exists for.
+    luna_ceiling = _reviewer_concurrency_ceiling(
+        luna_reviewer, MAX_SECONDARY_OPENAI_CONCURRENCY
+    )
+    terra_ceiling = _reviewer_concurrency_ceiling(
+        terra_reviewer, MAX_SECONDARY_OPENAI_CONCURRENCY
+    )
     if luna_reviewer is not None and not (
-        1 <= config.secondary_workers <= MAX_SECONDARY_OPENAI_CONCURRENCY
+        1 <= config.secondary_workers <= luna_ceiling
     ):
         raise ValueError(
-            "secondary_workers must be between 1 and "
-            f"{MAX_SECONDARY_OPENAI_CONCURRENCY}"
+            f"secondary_workers must be between 1 and {luna_ceiling}"
         )
     if terra_reviewer is not None and not (
-        1 <= config.terra_workers <= MAX_SECONDARY_OPENAI_CONCURRENCY
+        1 <= config.terra_workers <= terra_ceiling
     ):
         raise ValueError(
-            "terra_workers must be between 1 and "
-            f"{MAX_SECONDARY_OPENAI_CONCURRENCY}"
+            f"terra_workers must be between 1 and {terra_ceiling}"
         )
     if terra_reviewer is not None and luna_reviewer is None:
         raise ValueError("terra_reviewer requires luna_reviewer")
@@ -1408,18 +1424,29 @@ def run_auto_check(
     dataset.max_rows = 100
     dataset.max_paths = 1000
     dataset.max_asset_chars = config.max_asset_chars
-    dataset.validate_implicit_query_uniqueness()
-    population_ids = dataset.implicit_query_ids()
+    every_implicit = dataset.implicit_query_ids()
+    population_ids = dataset.auditable_implicit_query_ids()
+    # A query carrying several targets is several joins behind one visible
+    # query; it stays in the dataset and out of this audit, and the number left
+    # out is part of the summary rather than a silent narrowing.
+    multi_target = len(every_implicit) - len(population_ids)
+    if multi_target:
+        LOG.warning(
+            "Leaving %s multi-target implicit queries out of the audit "
+            "(the checker audits one attribute/target pair per query)",
+            f"{multi_target:,}",
+        )
     selected_ids = sampled_query_ids(
         population_ids,
         config.sample_rate,
         config.seed,
     )
     LOG.info(
-        "Selected %s/%s implicit queries (%.2f%%)",
+        "Selected %s/%s implicit queries (%.2f%%); %s multi-target excluded",
         f"{len(selected_ids):,}",
         f"{len(population_ids):,}",
         config.sample_rate * 100.0,
+        f"{multi_target:,}",
     )
 
     cache = AutoReviewCache(config.cache_path)
@@ -1602,6 +1629,23 @@ def _preload_openai_environment(arguments: Sequence[str]) -> None:
     parsed, _unknown = parser.parse_known_args(list(arguments))
     if parsed.provider != "openai" and parsed.no_secondary_openai:
         return
+    # The JSON profile config supersedes the legacy dotenv: it is what declares
+    # the reviewers the cascade routes across, and loading the dotenv first only
+    # risks reading a stale file for a key the profiles already carry.
+    api_config_path = Path(
+        getattr(parsed, "auto_check_api_config_file", "")
+        or join_builder.DEFAULT_AUTO_CHECK_API_CONFIG_FILE
+    )
+    if api_config_path.exists():
+        from openai_attribute_extractor import load_openai_auto_check_api_config
+
+        load_openai_auto_check_api_config(
+            api_config_path,
+            default_max_concurrency=(
+                join_builder.DEFAULT_AUTO_CHECK_PROFILE_MAX_CONCURRENCY
+            ),
+        )
+        return
     environment_path = (
         Path(parsed.openai_env_file)
         if parsed.openai_env_file
@@ -1609,6 +1653,14 @@ def _preload_openai_environment(arguments: Sequence[str]) -> None:
     )
     if parsed.openai_env_file or environment_path.exists():
         load_openai_environment_file(environment_path)
+
+
+def api_config_in_play(args: argparse.Namespace) -> bool:
+    """Whether the JSON profile config is what supplies the reviewers."""
+    configured = clean_text(getattr(args, "auto_check_api_config_file", ""))
+    return bool(
+        configured or Path(join_builder.DEFAULT_AUTO_CHECK_API_CONFIG_FILE).exists()
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1738,6 +1790,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=MAX_SECONDARY_OPENAI_CONCURRENCY,
         help="Terra adjudication concurrency; must be between 1 and 5.",
     )
+    # The same auto-check group the EntiTables builder uses.  When
+    # ``--auto_check_api_config_file`` (default ``.auto_check_apis.json``)
+    # declares profiles, the cascade runs through the builder's reviewer *pools*
+    # -- one adaptive concurrency controller per profile, initial review spread
+    # across every profile that offers one -- instead of a single endpoint.
+    join_builder.add_model_auto_check_arguments(parser)
     return parser.parse_args(arguments)
 
 
@@ -1959,16 +2017,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             args,
             usage_journal_path=primary_usage_path,
         )
-        luna_reviewer = prepare_cascade_openai_reviewer(
-            args,
-            role="luna",
-            usage_journal_path=luna_usage_path,
-        )
-        terra_reviewer = prepare_cascade_openai_reviewer(
-            args,
-            role="terra",
-            usage_journal_path=terra_usage_path,
-        )
+        # With profile pools the reviewers are not single endpoints: each
+        # profile owns an adaptive controller and the initial stage is spread
+        # across every profile that offers one, so the stage's parallelism is
+        # whatever the pools add up to rather than a fixed per-endpoint number.
+        if args.auto_check_secondary_openai and api_config_in_play(args):
+            luna_reviewer, terra_reviewer = (
+                join_builder.prepare_model_auto_check_reviewers(args)
+            )
+            luna_max_inflight = int(
+                getattr(luna_reviewer, "max_parallelism", 0)
+                or args.luna_openai_max_inflight
+            )
+            terra_max_inflight = int(
+                getattr(terra_reviewer, "max_parallelism", 0)
+                or args.terra_openai_max_inflight
+            )
+        else:
+            luna_reviewer = prepare_cascade_openai_reviewer(
+                args,
+                role="luna",
+                usage_journal_path=luna_usage_path,
+            )
+            terra_reviewer = prepare_cascade_openai_reviewer(
+                args,
+                role="terra",
+                usage_journal_path=terra_usage_path,
+            )
+            luna_max_inflight = args.luna_openai_max_inflight
+            terra_max_inflight = args.terra_openai_max_inflight
         config = AutoCheckConfig(
             output_dir=output_dir,
             cache_path=cache_path,
@@ -1979,8 +2056,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_asset_chars=args.max_asset_chars,
             index_path=Path(args.index_path).resolve() if args.index_path else None,
             progress_every=max(0, args.progress_every),
-            secondary_workers=args.luna_openai_max_inflight,
-            terra_workers=args.terra_openai_max_inflight,
+            secondary_workers=luna_max_inflight,
+            terra_workers=terra_max_inflight,
         )
         summary = run_auto_check(config, reviewer, luna_reviewer, terra_reviewer)
         primary_usage = (
@@ -2007,8 +2084,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(output, ensure_ascii=False, sort_keys=True), flush=True)
         return 0 if summary["execution"]["complete"] else 1
     except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as error:
+        # The type alone is not enough to act on: a validation failure deep in
+        # the cascade and a bad argument look identical from the summary line.
+        LOG.exception("auto checker stopped")
         print(
-            f"ERROR: auto checker stopped ({type(error).__name__})",
+            f"ERROR: auto checker stopped ({type(error).__name__}): {error}",
             file=sys.stderr,
             flush=True,
         )

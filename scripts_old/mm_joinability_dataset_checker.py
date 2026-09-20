@@ -25,6 +25,24 @@ from stage1_gui import format_gui_urls, resolve_gui_host
 
 CHECKER_SCHEMA_VERSION = "mm-joinability-quality-checker-v1"
 VALID_RATINGS = {"qualified", "unqualified"}
+#: The two verdicts a human can give one recovery.  "clear" is accepted by the
+#: store as a delete, the same way the query-level rating treats it.
+RECOVERY_VERDICTS = ("reasonable", "unreasonable")
+
+#: One verdict per recovery, not per query: a query is a whole 5-row question
+#: and it can hold a sound recovery and an absurd one at the same time, which
+#: the query-level rating cannot say.  No foreign key to ``samples``: a recovery
+#: can belong to a query the sample never drew.  Created lazily so the store is
+#: usable standalone -- the apply step only ever reads it.
+RECOVERY_REVIEWS_DDL = """
+CREATE TABLE IF NOT EXISTS recovery_reviews (
+    recovery_id TEXT PRIMARY KEY,
+    query_table_id TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('reasonable','unreasonable')),
+    note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+)
+"""
+
 
 PAGE_TEMPLATE = """
 <!doctype html>
@@ -61,6 +79,12 @@ PAGE_TEMPLATE = """
     .recovery-head { padding:0 10px; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
     .recovery-row { padding:10px; border:1px solid var(--line); border-left:4px solid #93c5fd; border-radius:8px; background:#fbfcff; }
     .recovery-cell { min-width:0; padding:10px; border:1px solid var(--line); border-radius:7px; background:white; }
+    /* The verdict bar spans the card: it judges the whole recovery, not one of
+       the four cells, and it has to stay reachable without hunting. */
+    .recovery-verdict { grid-column:1 / -1; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+                        padding:8px 10px 2px; border-top:1px dashed var(--line); }
+    .recovery-verdict form { display:flex; gap:8px; margin:0; }
+    .recovery-verdict button { min-height:32px; padding:0 12px; }
     .cell-list { display:grid; gap:4px; margin-top:8px; }
     .cell-item { display:grid; grid-template-columns:minmax(70px,.45fr) minmax(90px,1fr); gap:7px; padding-top:4px; border-top:1px solid #eef2f7; }
     .attribute-value { margin:8px 0; padding:9px; border-radius:6px; background:#ecfdf3; color:var(--green); font-size:16px; font-weight:700; overflow-wrap:anywhere; }
@@ -82,7 +106,12 @@ PAGE_TEMPLATE = """
 <body>
 <header>
   <div><h1>{{ dataset_name }} 数据质量 Checker</h1><div class="muted">固定随机种子 {{ seed }} · 抽取 implicit query 的 {{ sample_percent }}</div></div>
-  <div class="row"><a class="button" href="{{ url_for('next_unreviewed') }}">下一个未评</a><a class="button" href="{{ url_for('export_reviews') }}">导出审核结果</a></div>
+  <div class="row">
+    <span class="badge good-text">recovery 合理 {{ summary.recovery_reasonable }}</span>
+    <span class="badge bad-text">不合理 {{ summary.recovery_unreasonable }}</span>
+    <a class="button" href="{{ url_for('next_unreviewed') }}">下一个未评 query</a>
+    <a class="button" href="{{ url_for('export_reviews') }}">导出审核结果</a>
+  </div>
 </header>
 <main>
   {% if error %}<section class="panel"><strong>无法加载 Checker</strong><div class="muted">{{ error }}</div></section>
@@ -170,6 +199,19 @@ PAGE_TEMPLATE = """
           {% for target_row in item.target_rows %}<div class="cell-list"><div class="muted">target row {{ target_row.row_id }}</div>{% for cell in target_row.cells %}<div class="cell-item"><span class="label">{{ cell.column }}</span><span>{{ cell.value or '—' }}</span></div>{% endfor %}</div>
           {% else %}<div class="muted">没有可显示的 target row。</div>{% endfor %}
         </div>
+        {% if item.path and item.path.recovery_id %}
+        <div class="recovery-verdict">
+          <span class="badge {{ 'good-text' if item.verdict == 'reasonable' else 'bad-text' if item.verdict == 'unreasonable' else '' }}">{{ item.verdict_label }}</span>
+          <form method="post" action="{{ url_for('review_recovery') }}">
+            <input type="hidden" name="recovery_id" value="{{ item.path.recovery_id }}">
+            <input type="hidden" name="query_id" value="{{ group.query_id }}">
+            <input type="hidden" name="page" value="{{ page }}">
+            <button class="good" name="verdict" value="reasonable" type="submit">✓ 这条合理</button>
+            <button class="bad" name="verdict" value="unreasonable" type="submit">✕ 不合理</button>
+            {% if item.verdict %}<button name="verdict" value="clear" type="submit">清除</button>{% endif %}
+          </form>
+        </div>
+        {% endif %}
       </article>
       {% else %}<div class="missing">当前 query 没有可显示的 row。</div>{% endfor %}
     </div>
@@ -238,6 +280,10 @@ class QualityReviewStore:
                     note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
                     FOREIGN KEY (query_table_id) REFERENCES samples(query_table_id)
                 );
+                """)
+            connection.executescript(RECOVERY_REVIEWS_DDL)
+            connection.executescript(
+                """
                 """
             )
             existing = dict(connection.execute("SELECT key, value FROM meta"))
@@ -300,6 +346,70 @@ class QualityReviewStore:
                 (query_id, rating, clean_text(note), datetime.now(timezone.utc).isoformat()),
             )
 
+    def _has_recovery_table(self) -> bool:
+        if not self.path.exists():
+            return False
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_reviews'"
+            ).fetchone() is not None
+
+    def save_recovery(self, recovery_id: str, query_table_id: str, verdict: str,
+                      note: str = "") -> None:
+        with self._connect() as connection:
+            connection.executescript(RECOVERY_REVIEWS_DDL)
+            if verdict == "clear":
+                connection.execute(
+                    "DELETE FROM recovery_reviews WHERE recovery_id = ?", (recovery_id,))
+                return
+            if verdict not in RECOVERY_VERDICTS:
+                raise ValueError(f"invalid recovery verdict: {verdict}")
+            connection.execute(
+                """
+                INSERT INTO recovery_reviews(recovery_id,query_table_id,verdict,note,updated_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(recovery_id) DO UPDATE SET
+                    verdict=excluded.verdict,note=excluded.note,updated_at=excluded.updated_at
+                """,
+                (recovery_id, query_table_id, verdict, clean_text(note),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+
+    def recovery_verdicts(self, query_table_id: str) -> dict[str, str]:
+        if not self._has_recovery_table():
+            return {}
+        with self._connect() as connection:
+            return {
+                str(row["recovery_id"]): str(row["verdict"])
+                for row in connection.execute(
+                    "SELECT recovery_id,verdict FROM recovery_reviews WHERE query_table_id = ?",
+                    (clean_text(query_table_id),),
+                )
+            }
+
+    def export_recovery_rows(self) -> list[dict[str, Any]]:
+        if not self._has_recovery_table():
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT recovery_id,query_table_id,verdict,note,updated_at
+                FROM recovery_reviews ORDER BY query_table_id,recovery_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recovery_counts(self) -> dict[str, int]:
+        if not self._has_recovery_table():
+            return {"reasonable": 0, "unreasonable": 0}
+        with self._connect() as connection:
+            counts = dict(connection.execute(
+                "SELECT verdict,COUNT(*) FROM recovery_reviews GROUP BY verdict"))
+        return {
+            "reasonable": int(counts.get("reasonable", 0)),
+            "unreasonable": int(counts.get("unreasonable", 0)),
+        }
+
     def summary(self) -> dict[str, Any]:
         with self._connect() as connection:
             meta = dict(connection.execute("SELECT key,value FROM meta"))
@@ -311,7 +421,10 @@ class QualityReviewStore:
         unqualified = int(counts.get("unqualified", 0))
         reviewed = qualified + unqualified
         complete = sampled > 0 and reviewed == sampled
+        recovery = self.recovery_counts()
         return {
+            "recovery_reasonable": recovery["reasonable"],
+            "recovery_unreasonable": recovery["unreasonable"],
             "population": int(meta.get("population", 0)), "sampled": sampled,
             "reviewed": reviewed, "qualified": qualified, "unqualified": unqualified,
             "pending": sampled - reviewed, "complete": complete,
@@ -472,6 +585,15 @@ def create_checker_app(
                     "review_rows": build_review_rows(pair),
                 }
             )
+        verdicts = store.recovery_verdicts(query_id)
+        labels = {"reasonable": "已评：合理", "unreasonable": "已评：不合理"}
+        for pair in pairs:
+            for row in pair["review_rows"]:
+                recovery_id = clean_text(
+                    (row.get("path") or {}).get("recovery_id"))
+                verdict = verdicts.get(recovery_id, "")
+                row["verdict"] = verdict
+                row["verdict_label"] = labels.get(verdict, "未评")
         review_data = store.review_for(query_id)
         return {
             "query_id": query_id,
@@ -518,6 +640,20 @@ def create_checker_app(
         next_page = store.next_unreviewed_page(after_page=page)
         return redirect(url_for("index", page=next_page or page))
 
+    @app.post("/review-recovery")
+    def review_recovery() -> Any:
+        """One verdict for one recovery; stay on the page to keep judging."""
+        recovery_id = clean_text(request.form.get("recovery_id"))
+        query_id = clean_text(request.form.get("query_id"))
+        verdict = clean_text(request.form.get("verdict"))
+        try:
+            page = max(1, int(request.form.get("page", "1")))
+            store.save_recovery(recovery_id, query_id, verdict,
+                                clean_text(request.form.get("note")))
+        except (KeyError, ValueError) as exc:
+            abort(400, str(exc))
+        return redirect(url_for("index", page=page))
+
     @app.get("/next-unreviewed")
     def next_unreviewed() -> Any:
         try:
@@ -528,7 +664,9 @@ def create_checker_app(
 
     @app.get("/export")
     def export_reviews() -> Response:
-        content = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in store.export_rows())
+        rows = [{"unit": "query", **row} for row in store.export_rows()]
+        rows += [{"unit": "recovery", **row} for row in store.export_recovery_rows()]
+        content = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
         return Response(
             content, mimetype="application/x-ndjson",
             headers={"Content-Disposition": f'attachment; filename="{dataset_name.casefold()}_quality_reviews.jsonl"'},

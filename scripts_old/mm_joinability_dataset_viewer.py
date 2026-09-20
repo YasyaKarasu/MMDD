@@ -29,7 +29,7 @@ from stage1_io import (
 
 
 LOG = logging.getLogger(__name__)
-VIEWER_INDEX_SCHEMA_VERSION = "mm-joinability-viewer-index-v2"
+VIEWER_INDEX_SCHEMA_VERSION = "mm-joinability-viewer-index-v3"
 DEFAULT_INDEX_FILENAME = ".mm_joinability_viewer.sqlite3"
 IMPLICIT_JOIN_REASON = "model_recoverable_join_column"
 JSONL_SCAN_CHUNK_BYTES = 1024 * 1024
@@ -135,9 +135,14 @@ PAGE_TEMPLATE = """
       gap: 14px;
       align-items: start;
     }
-    .table-box { min-width: 0; overflow: auto; }
-    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
-    th, td { border: 1px solid var(--line); padding: 5px 6px; vertical-align: top; overflow-wrap: anywhere; }
+    .table-box { min-width: 0; max-width: 100%; overflow: auto; }
+    /* ``table-layout: fixed`` at ``width: 100%`` squeezed every column into the
+       panel, so a 31-column lake table wrapped into unreadable slivers and the
+       box never had an overflow to scroll.  Size to the content instead and let
+       the box scroll sideways; the cell bounds keep one long value from
+       stretching a single column across the whole table. */
+    table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border: 1px solid var(--line); padding: 5px 6px; vertical-align: top; overflow-wrap: anywhere; min-width: 104px; max-width: 280px; }
     th { background: #eef2f7; text-align: left; }
     tr.highlight td { background: #fff7e0; }
     .paths { display: grid; gap: 10px; }
@@ -299,7 +304,7 @@ PAGE_TEMPLATE = """
             <div class="asset-box">
               <span class="label">Entity</span>
               <div><strong>{{ path.query_entity.cell_text or path.query_entity.wiki_title }}</strong></div>
-              <div class="muted">{{ path.query_entity.wiki_title }}</div>
+              <div class="muted">{{ path.query_entity.wiki_title or path.query_entity.entity_column_name }}</div>
               <hr>
               <div><span class="label">Model Value</span>{{ path.recovered_attribute.model_value }}</div>
               <div><span class="label">Expected Value</span>{{ path.recovered_attribute.value }}</div>
@@ -413,7 +418,14 @@ def artifact_paths(output_dir: Path, artifact: str, manifest: dict[str, Any] | N
     manifest = manifest if manifest is not None else load_manifest(output_dir)
     if manifest:
         item = manifest.get("artifacts", {}).get(artifact) or {}
-        return [output_dir / shard["path"] for shard in item.get("shards", []) if shard.get("path")]
+        # Two manifest layouts are in the wild: the sharded one lists
+        # ``shards: [{path, records}]``, the flat one puts the single ``path``
+        # (and its record count) directly on the artifact.  Both name the same
+        # files, so read either rather than making every producer adopt one.
+        shards = item.get("shards") or ([item] if item.get("path") else [])
+        paths = [output_dir / shard["path"] for shard in shards if shard.get("path")]
+        if paths:
+            return paths
     artifact_dir = output_dir / artifact
     if artifact_dir.exists():
         return sorted(artifact_dir.glob("*.jsonl"))
@@ -603,8 +615,12 @@ def recovery_preview(
         "query_entity": {
             "entity_id": clean_text(entity.get("entity_id")),
             "wiki_title": clean_text(entity.get("wiki_title")),
-            "cell_text": clean_text(entity.get("cell_text")),
-            "entity_column_name": clean_text(entity.get("entity_column_name")),
+            # A provider with no entity layer names the cell and its column
+            # instead of pointing at a wiki page; show the same thing either way.
+            "cell_text": clean_text(entity.get("cell_text") or entity.get("text")),
+            "entity_column_name": clean_text(
+                entity.get("entity_column_name") or entity.get("column_name")
+            ),
             "row_attributes": [
                 {
                     "name": clean_text(item.get("name")),
@@ -1167,6 +1183,13 @@ class ViewerDataset:
                 split, source_table_id, chain_id, row_view_index,
                 query_table_id, target_table_id
             );
+            -- ``_index_artifact_records`` updates every indexed query record with
+            -- ``WHERE query_table_id = ?``. query_table_id is only the fifth column
+            -- of pairs_order_idx, so without this index each update scans the whole
+            -- pairs table: O(queries x pairs). On the 200K WDC build that is 70,403
+            -- full scans of a 79,277-row table (~21 minutes); with the index a
+            -- single query's rows are located directly.
+            CREATE INDEX pairs_query_idx ON pairs (query_table_id);
             CREATE INDEX recoveries_pair_idx ON recoveries (pair_key, ordinal);
             CREATE INDEX recoveries_asset_idx ON recoveries (asset_id);
             CREATE INDEX pair_asset_types_type_idx ON pair_asset_types (
@@ -1741,6 +1764,29 @@ class ViewerDataset:
                     """
                     SELECT DISTINCT query_table_id FROM pairs
                     WHERE reason = ?
+                    ORDER BY query_table_id
+                    """,
+                    (IMPLICIT_JOIN_REASON,),
+                )
+            ]
+
+    def auditable_implicit_query_ids(self) -> list[str]:
+        """Implicit queries the checker can audit: exactly one target each.
+
+        The shared builder merges join families that project to the same visible
+        query, so one query record can stand for several attribute-target pairs.
+        The checker audits one pair per query, so those are left out of the
+        population rather than half-audited; the caller reports the difference.
+        """
+        with self._connect() as connection:
+            return [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT query_table_id FROM pairs
+                    WHERE reason = ?
+                    GROUP BY query_table_id
+                    HAVING COUNT(*) = 1
                     ORDER BY query_table_id
                     """,
                     (IMPLICIT_JOIN_REASON,),

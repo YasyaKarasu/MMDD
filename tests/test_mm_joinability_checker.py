@@ -139,6 +139,9 @@ def test_checker_samples_one_percent_and_persists_final_quality_rate(
     )
     store = app.config["QUALITY_CHECKER_STORE"]
     assert store.summary() == {
+        # per-recovery verdicts are counted alongside the per-query rating
+        "recovery_reasonable": 0,
+        "recovery_unreasonable": 0,
         "population": 100,
         "sampled": 1,
         "reviewed": 0,
