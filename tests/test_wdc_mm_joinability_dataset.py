@@ -2066,6 +2066,13 @@ def test_build_dataset_small_wdc_end_to_end(tmp_path):
     for table in [*sources, *queries, *targets]:
         assert "image" not in [column["column_name"] for column in table["columns"]]
         assert '"column_name": "image"' not in json.dumps(table)
+        # WDC mints a synthetic ``wdc_<hash>`` wiki title, so a URL derived from it
+        # would name no page. The shared builder must not append the synthetic
+        # ``entity_url`` column to these tables.
+        assert "entity_url" not in [
+            column["column_name"] for column in table["columns"]
+        ]
+        assert '"column_name": "entity_url"' not in json.dumps(table)
 
     manifest = json.loads((output_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
     persisted_stats = json.loads((output_dir / "stats.json").read_text(encoding="utf-8"))

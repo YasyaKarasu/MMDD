@@ -316,6 +316,54 @@ def test_low_cardinality_column_is_not_qualified(lake: dict[str, Any]) -> None:
     assert "edition_marker" not in names
 
 
+@pytest.mark.parametrize("renamed", sorted(algo.EXCLUDED_COLUMNS))
+def test_an_excluded_column_is_never_a_join_candidate(
+        lake: dict[str, Any], renamed: str) -> None:
+    """Some columns cannot be a join key whatever a model says about them.
+
+    Two defects, both measured on the real lake.  ``stock_image_flag`` and its
+    two spellings describe the *photograph*, so recovering one from the
+    photograph is circular -- and in a small table a two-valued column can land
+    on an even split by chance and clear the discrimination gate.
+    ``about_author_text`` is a 483-character biography that the model answers
+    with the author's name: the median recovery covers 3% of the cell and
+    ``values_match`` accepts it because the biography begins with that name.
+
+    The column is taken from one that passes *every* gate and renamed, so what is
+    under test is the exclusion and not another gate firing first.  Parametrised
+    over the mapping itself: a column added there without being wired in fails
+    here.
+    """
+    table = lake["table"]
+    table = {
+        **table,
+        "columns": [
+            {**column, "column_name": renamed if column["column_index"] == PUBLISHER
+             else column["column_name"]}
+            for column in table["columns"]
+        ],
+    }
+    names = {index: name for index, name in enumerate(COLUMNS)}
+    names[PUBLISHER] = renamed
+    index = algo.extraction_index([
+        {"source_table_id": TABLE_ID, "source_row_id": row["row_id"],
+         "attribute_name": name, "asset_id": "ev:x", "asset_family": "image",
+         "value": row["cells"][column]["text"]}
+        for row in table["rows"]
+        for column, name in names.items()
+    ])
+
+    qualified, rejected = algo.qualified_columns(table, TITLE, index, config())
+
+    assert "publisher" not in rejected, "the renamed column passes the other gates"
+    assert rejected[renamed] == algo.EXCLUDED_COLUMNS[renamed]
+    assert renamed not in {item["column_name"] for item in qualified}
+    tasks = algo.extraction_tasks(table, lake["by_row"], TITLE, config())
+    assert not any(task["attribute_name"] == renamed for task in tasks), (
+        "a column that can never qualify must not be paid for"
+    )
+
+
 def test_target_row_gate_rejects_a_column_filled_on_four_of_six_rows(
         lake: dict[str, Any]) -> None:
     """Target rows are the rows with a non-empty join cell: 4 < 5, so no target."""
@@ -540,6 +588,81 @@ def test_extractions_survive_a_crash_partway_through_the_pass(
         "the retry did not pick the partial cache up, or the crash cached "
         "everything after all"
     )
+
+
+def test_a_row_only_resplit_reuses_every_extraction(tmp_path: Path) -> None:
+    """Splitting the same rows into different tables is not new model work.
+
+    An extraction is a property of ``(row, asset, attribute)``: ``visible_cells``
+    reads one row, every book table carries the same columns in the same order,
+    and the prompt is assembled from those two.  Which table a row lands in
+    changes nothing the model was asked -- but ``extraction_id`` embeds the table
+    id, so a re-split rewritten only by rows would miss the entire cache and pay
+    for every call a second time.
+    """
+    table = make_table(num_rows=10)          # 5+5, so each half clears the 5-row floor
+    assets = make_assets(table, tmp_path / "images")
+    lake_dir = tmp_path / "lake"
+    lake_dir.mkdir()
+    _write_jsonl(lake_dir / "source_tables.jsonl", [table])
+    _write_jsonl(lake_dir / "bridge_assets.jsonl", assets)
+    lake = {"dir": lake_dir, "table": table, "assets": assets}
+
+    cache = tmp_path / "cache" / "abe.jsonl"
+    first, _ = run(lake, tmp_path / "one", "--extraction-cache", str(cache))
+    assert first["extractor_calls"] > 0
+
+    rows = table["rows"]
+    tables = [{**table, "source_table_id": f"st_book_{n:03d}", "rows": half}
+              for n, half in enumerate([rows[:5], rows[5:]], 1)]
+    resplit = tmp_path / "resplit"
+    resplit.mkdir()
+    _write_jsonl(resplit / "source_tables.jsonl", tables)
+    _write_jsonl(resplit / "bridge_assets.jsonl", assets)
+
+    args = builder.parser().parse_args([
+        "--lake-dir", str(resplit), "--output-dir", str(tmp_path / "two"),
+        "--limit-tables", "2", "--extractions-jsonl", str(cache)])
+    oracle = Oracle(table)
+    original = builder.build_extractors
+    builder.build_extractors = lambda _args: {"text": oracle, "image": oracle}
+    try:
+        second = builder.build(args)
+    finally:
+        builder.build_extractors = original
+
+    assert second["tasks_planned"] > 0
+    assert second["tasks_reused_from_another_split"] > 0, (
+        "the re-split reused nothing, so the cache is keyed on the table after all"
+    )
+    # The extraction pass, not every call: the local attribute check is
+    # deliberately not cached, and it does call the model again.
+    assert second["extractor_calls"] == 0, "the re-split called the model again"
+    assert oracle.calls > 0, "the attribute check did not run"
+
+
+def test_a_reused_extraction_is_relabelled_onto_the_task_that_reuses_it() -> None:
+    """A record reused from another split kept the old table id would be lost.
+
+    The extraction index is keyed by ``(table, row, attribute)``, so a record
+    still carrying the table it was first produced for is filed somewhere no
+    query of this run will ever look.
+    """
+    record = {"extraction_id": "ext_old", "source_table_id": "st_book_007",
+              "source_row_id": "bk_0001", "asset_id": "ev:1",
+              "attribute_name": "publisher", "asset_type": "image",
+              "asset_family": "abebooks_catalogue_cover", "value": "Acme"}
+    task = {"extraction_id": "ext_new", "source_table_id": "st_book_001",
+            "source_row_id": "bk_0001", "asset_id": "ev:1",
+            "attribute_name": "publisher"}
+
+    reused, pending = builder.split_cached_tasks([task], {"ext_old": record})
+
+    assert pending == []
+    assert len(reused) == 1
+    assert reused[0]["source_table_id"] == "st_book_001"
+    assert reused[0]["extraction_id"] == "ext_new"
+    assert reused[0]["value"] == "Acme"          # the measurement is untouched
 
 
 def test_a_text_only_run_does_not_cache_its_image_tasks(

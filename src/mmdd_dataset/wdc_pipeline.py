@@ -1229,6 +1229,7 @@ def _build_config(config: WdcPipelineConfig) -> BuildConfig:
         min_column_non_empty_ratio=config.min_column_non_empty_ratio,
         max_query_additional_columns=config.max_query_additional_columns,
         max_target_additional_columns=config.max_target_additional_columns,
+        synthetic_entity_url=False,
     )
 
 

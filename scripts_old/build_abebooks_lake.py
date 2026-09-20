@@ -137,6 +137,45 @@ TEXT_SOURCE_COLUMNS = {
     "shipping_policy": "shipping_terms",
 }
 
+#: Columns that are never emitted into a table, and why each is absent.
+#:
+#: Three separate defects collapse into one fix, because all three are the same
+#: thing: the column's value is already sitting in the row's evidence or in
+#: another column, so "recovering" it asks a model to copy something it can see.
+#: Deleting the column removes the possibility; the alternative was teaching the
+#: shared builder three guards it has no notion of, for a corpus whose assets are
+#: column copies rather than documents.
+#:
+#: ``evidence_copy`` -- the text asset *is* this column, verbatim (its
+#: ``source_column``; 1141/1141/1099/100/94 assets each).  Asking for the column
+#: from that asset is a lookup that scores 100% without reading anything.
+#:
+#: ``contained_in_another_column`` -- measured on the 130-table lake with the
+#: same judgement the copy-channel detector uses (casefold, either side contains
+#: the other, contained side at least 4 characters; the floor matters, or short
+#: numbers make every numeric pair look like a match).  In each pair the survivor
+#: is the one the external review endorsed more often: ``copy_condition_grade``
+#: 69% against ``condition`` 49%, ``publisher`` 45% against ``series``, and
+#: ``location_raw`` against ``city``/``country`` on the seller side.
+#:
+#: ``describes_the_asset`` -- image metadata (is this a stock cover or a seller's
+#: own photo).  Recovering it from the photograph is circular.
+EXCLUDED_COLUMNS = {
+    "about_author_text": "evidence_copy",
+    "synopsis_text": "evidence_copy",
+    "vendor_description": "evidence_copy",
+    "terms_of_sale": "evidence_copy",
+    "shipping_terms": "evidence_copy",
+    "condition": "contained_in_another_column",
+    "publication_year_raw": "contained_in_another_column",
+    "series": "contained_in_another_column",
+    "city": "contained_in_another_column",
+    "country": "contained_in_another_column",
+    "image_kind": "describes_the_asset",
+    "catalogue_image_kind": "describes_the_asset",
+    "stock_image_flag": "describes_the_asset",
+}
+
 #: Asset types that describe the *seller* rather than the book, and so hang off
 #: a seller row.  Their evidence records carry a ``listing_id``; the seller is
 #: reached through ``book_listing.listing_id -> seller_id``.  ``seller_cover``
@@ -514,8 +553,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         ("book", books, list(BOOK_EDITION_COLUMNS) + list(BOOK_LISTING_COLUMNS), "title"),
         ("seller", seller_records, list(SELLER_COLUMNS), "seller_name"),
     ):
+        # The exclusion is applied here rather than downstream so no cell, profile
+        # or asset ever refers to the column: an absent column cannot be offered
+        # as a hidden join key, cannot be shown as context, and cannot be the
+        # answer a model copies out of the evidence that contains it.
+        if entity in EXCLUDED_COLUMNS:
+            raise SystemExit(
+                f"{entity!r} is the entity column for {name} tables and cannot be "
+                "excluded; every table would lose its identity")
+        kept = [column for column in columns if column not in EXCLUDED_COLUMNS]
+        if not kept:
+            raise SystemExit(f"excluding columns left the {name} table with none")
         for index, part in enumerate(chunk(rows, counts[name]), 1):
-            tables.append(as_source_table(name, f"st_{name}_{index:03d}", columns, part, entity))
+            tables.append(as_source_table(name, f"st_{name}_{index:03d}", kept, part, entity))
 
     manifest_path = Path(args.image_manifest)
     images = ({row["url"]: row for row in read_jsonl(manifest_path)}
@@ -558,6 +608,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "max": max(table["num_rows"] for table in tables),
         },
         "columns": {"book": tables[0]["num_cols"], "seller": tables[-1]["num_cols"]},
+        "excluded_columns": dict(sorted(EXCLUDED_COLUMNS.items())),
         "bridge_assets": by_type,
         "bridge_assets_by_family": by_family,
         "bridge_assets_before_dedupe": len(raw_assets),

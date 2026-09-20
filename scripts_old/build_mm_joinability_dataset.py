@@ -539,10 +539,14 @@ class BalancedAutoCheckReviewerPool:
                     last_error = error
                     self.load_balancer.record_failure(profile_name, self.role)
                     logging.warning(
-                        "Auto-check %s provider %s failed (%s); trying another provider",
+                        "Auto-check %s provider %s failed (%s: %s); trying "
+                        "another provider",
                         self.role,
                         profile_name,
                         type(error).__name__,
+                        # The type alone cannot be acted on -- a rejected schema,
+                        # a bad key and a dead endpoint all look alike without it.
+                        str(error).replace("\n", " ")[:240],
                     )
                     continue
                 self.load_balancer.record_success(profile_name, self.role)
@@ -6922,6 +6926,27 @@ def project_selected_rows(
     return rows, source_rows
 
 
+#: Builders whose tables *mint* the entity key instead of naming a real page.
+#: Their ``wiki_title`` is an opaque ``<prefix>_<hash>``, so the URL derived from
+#: it is fabricated: a value that reads as evidence and is not.
+SYNTHETIC_ENTITY_BUILDERS = (
+    "wdc_mm_joinability_dataset",
+    "abebooks_mm_joinability_dataset",
+)
+
+
+def entity_url_column_applies(source_table: dict[str, Any]) -> bool:
+    """Whether this source table should carry the synthetic ``entity_url`` column.
+
+    The cell is derived from the entity cell's ``wiki_title``, so it only names a
+    real page for a Wikipedia-shaped corpus.  A corpus with no pages behind it
+    declares its builder in ``provenance_builder``, and that field is what this
+    test keys on.
+    """
+    builder = clean_text(source_table.get("provenance_builder"))
+    return not any(name in builder for name in SYNTHETIC_ENTITY_BUILDERS)
+
+
 def append_entity_url_column(
     query_rows: list[dict[str, Any]],
     source_table: dict[str, Any],
@@ -7700,7 +7725,8 @@ def _materialize_explicit_join_candidate(
         {int(value) for value in candidate["selected_source_row_ids"]},
         min_required_cols=2,
     )
-    query_rows = append_entity_url_column(query_rows, source_table, entity_col)
+    if entity_url_column_applies(source_table):
+        query_rows = append_entity_url_column(query_rows, source_table, entity_col)
     all_source_rows = {
         row_id(source_row, fallback)
         for fallback, source_row in enumerate(source_table.get("rows", []))
@@ -7738,14 +7764,15 @@ def _materialize_explicit_join_candidate(
             "row_view_index": 0,
         },
     )
-    query_table["columns"] = [
-        *query_table["columns"],
-        {
-            "column_index": len(query_table["columns"]),
-            "source_column_index": -1,
-            "column_name": "entity_url",
-        },
-    ]
+    if entity_url_column_applies(source_table):
+        query_table["columns"] = [
+            *query_table["columns"],
+            {
+                "column_index": len(query_table["columns"]),
+                "source_column_index": -1,
+                "column_name": "entity_url",
+            },
+        ]
     targets: list[dict[str, Any]] = []
     qrels: list[dict[str, Any]] = []
     for member_ordinal, member_index in enumerate(target_members):
@@ -10511,7 +10538,10 @@ def _build_table_join_records_once(
                 selected_source_row_set,
                 min_required_cols=1,
             )
-            query_rows = append_entity_url_column(query_rows, source_table, entity_col)
+            if entity_url_column_applies(source_table):
+                query_rows = append_entity_url_column(
+                    query_rows, source_table, entity_col
+                )
             if not set(query_source_rows).issubset(target_source_rows):
                 continue
             if len(query_rows) != query_rows_per_table:
@@ -10675,14 +10705,15 @@ def _build_table_join_records_once(
                         "row_view_index": row_view_index,
                     },
                 )
-                query_table["columns"] = [
-                    *query_table["columns"],
-                    {
-                        "column_index": len(query_table["columns"]),
-                        "source_column_index": -1,
-                        "column_name": "entity_url",
-                    },
-                ]
+                if entity_url_column_applies(source_table):
+                    query_table["columns"] = [
+                        *query_table["columns"],
+                        {
+                            "column_index": len(query_table["columns"]),
+                            "source_column_index": -1,
+                            "column_name": "entity_url",
+                        },
+                    ]
                 query_by_fingerprint[query_fingerprint] = query_table
                 query_tables.append(query_table)
 

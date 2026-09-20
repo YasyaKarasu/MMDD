@@ -777,6 +777,76 @@ def test_recovery_threshold_is_defined_on_query_size(tmp_path: Path) -> None:
     assert hidden["recovered_value_ratio"] == 0.6
 
 
+def test_a_dropped_connection_is_retried_instead_of_ending_the_run() -> None:
+    """One transient drop must not throw away a long extraction pass.
+
+    A tunnel or a loaded engine closes a connection every so often.  The pass
+    that hit this was six hours in and wrote nothing, because the failure
+    surfaced as an exception out of ``extract`` rather than as a retry.
+    """
+    import requests
+
+    attempts = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"value":"1900","evidence":""}'}}]}
+
+    extractor = OpenAICompatibleExtractor("http://model.test/v1", "model",
+                                          retry_sleep_seconds=0.0)
+
+    def post(_url, *, json, timeout):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise requests.exceptions.ConnectionError("Remote end closed connection")
+        return Response()
+
+    extractor.session.post = post
+    result = extractor.extract(
+        attribute="Founded",
+        visible_cells=[{"name": "Entity", "value": "Alpha"}],
+        asset={"asset_type": "text", "asset_id": "ev:1", "content": "Evidence."},
+    )
+
+    assert result["value"] == "1900"
+    assert len(attempts) == 3, "the drop was not retried"
+
+
+def test_a_rejected_request_is_not_retried() -> None:
+    """A 4xx is an answer, not a hiccup: retrying it only burns the budget."""
+    import requests
+
+    attempts = []
+
+    class Response:
+        status_code = 400
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError(response=self)
+
+        def json(self):
+            return {}
+
+    extractor = OpenAICompatibleExtractor("http://model.test/v1", "model",
+                                          retry_sleep_seconds=0.0)
+
+    def post(_url, *, json, timeout):
+        attempts.append(1)
+        return Response()
+
+    extractor.session.post = post
+    with pytest.raises(requests.exceptions.HTTPError):
+        extractor.extract(
+            attribute="Founded",
+            visible_cells=[{"name": "Entity", "value": "Alpha"}],
+            asset={"asset_type": "text", "asset_id": "ev:1", "content": "Evidence."},
+        )
+    assert len(attempts) == 1, "a rejected request was retried"
+
+
 def test_wdc_adapter_uses_the_same_source_table_schema(tmp_path: Path) -> None:
     input_dir = tmp_path / "wdc"
     path = input_dir / "Thing" / "Thing_example.json.gz"
@@ -807,6 +877,164 @@ def test_wdc_adapter_uses_the_same_source_table_schema(tmp_path: Path) -> None:
     ]
     assert table["rows"][0]["cells"][1]["text"] == '{"lat":0}'
     assert prepared.entities[0]["image_urls"] == ["https://example.test/image-0.jpg"]
+
+
+def test_wdc_queries_omit_the_synthetic_entity_url_column(tmp_path: Path) -> None:
+    """The synthetic ``entity_url`` is a Wikipedia URL built from ``wiki_title``.
+
+    WDC mints a ``wdc_<hash>`` title rather than a real article title, so the
+    column would hold a fabricated ``en.wikipedia.org`` link that reads as
+    evidence and is not.  The WDC entry points therefore turn it off.
+    """
+    input_dir = tmp_path / "wdc"
+    path = input_dir / "Organization" / "Organization_example.json.gz"
+    path.parent.mkdir(parents=True)
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        for row in range(5):
+            handle.write(
+                json.dumps(
+                    {
+                        "row_id": row,
+                        "name": f"Entity {row}",
+                        "founded": str(1900 + row),
+                        "location": f"City {row}",
+                        "industry": f"Industry {row}",
+                        "page_url": f"https://example.test/{row}",
+                    }
+                )
+                + "\n"
+            )
+
+    prepared = prepare_wdc(input_dir, min_rows=5, min_cols=2)
+    assets, extractions = synthetic_materials(prepared)
+
+    with_column = build_with(prepared, assets, extractions)
+    without_column = build_with(
+        prepared, assets, extractions, synthetic_entity_url=False
+    )
+
+    assert len(with_column["query_tables"]) == 1
+    assert len(without_column["query_tables"]) == 1
+    fabricated = with_column["query_tables"][0]
+    assert fabricated["columns"][-1]["column_name"] == "entity_url"
+    assert fabricated["rows"][0]["cells"][-1]["text"].startswith(
+        "https://en.wikipedia.org/wiki/wdc_"
+    )
+
+    query = without_column["query_tables"][0]
+    assert "entity_url" not in [column["column_name"] for column in query["columns"]]
+    assert '"column_name": "entity_url"' not in json.dumps(query)
+
+
+def test_abebooks_adapter_fills_the_entity_slot_without_wikipedia(tmp_path: Path) -> None:
+    """The shared gates read ``wiki_title``; AbeBooks has no Wikipedia.
+
+    That field is only the row -> entity pointer -- the entity-column gate counts
+    non-empty ones and the asset linkage looks entities up by it -- so an opaque
+    ``abe_<hash>`` satisfies it exactly as WDC's ``wdc_<hash>`` does.  The row id
+    becomes an integer because the shared builder keys tasks and join records
+    that way, and the lake's ``bk_0001`` string stays recoverable for audit.
+    """
+    from mmdd_dataset.abebooks_adapter import prepare_abebooks
+
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    write_jsonl(lake / "source_tables.jsonl", [_synthetic_lake_table()])
+
+    prepared = prepare_abebooks(lake, min_rows=2, min_cols=2)
+
+    assert prepared.skipped == {}
+    table = prepared.source_tables[0]
+    assert sorted(table) == ["columns", "metadata", "num_cols", "num_rows",
+                             "provenance_builder", "rows", "source_file",
+                             "source_table_id"]
+    entity_column = table["metadata"]["candidate_entity_columns"][0]
+    assert table["columns"][entity_column]["column_name"] == "title"
+    first = table["rows"][0]
+    assert isinstance(first["row_id"], int), "the shared builder keys rows by int"
+    key = first["cells"][entity_column]["wiki_title"]
+    assert key.startswith("abe_") and first["cells"][entity_column]["has_wiki_link"]
+    assert table["metadata"]["column_profiles"][entity_column]["wiki_link_ratio"] == 1.0
+    # The two things ``choose_entity_column`` reads: a non-empty wiki_title on
+    # every row's entity cell, and a wiki-link ratio the gate accepts.  (Verified
+    # separately against the real 130-table lake: it accepts all of them.)
+    assert all(row["cells"][entity_column]["wiki_title"] for row in table["rows"])
+
+    entity = prepared.entities[0]
+    assert entity["wiki_title"] == key
+    assert entity["source_row_id"] == 1
+    assert entity["lake_row_id"] == "bk_0001", "the lake id stays for audit"
+
+    # Declares itself as a corpus that mints its entity keys, which is what tells
+    # the shared builder not to append a synthetic ``entity_url`` column: the URL
+    # would be https://en.wikipedia.org/wiki/abe_<hash>, a fabricated page.  WDC
+    # opts out the same way; EntiTables, which has real pages, does not.
+    assert table["provenance_builder"] == "abebooks_mm_joinability_dataset"
+
+
+def test_abebooks_adapter_links_assets_to_their_rows_entity(tmp_path: Path) -> None:
+    """The lake keys assets by row; the shared builder reaches them by entity."""
+    from mmdd_dataset.abebooks_adapter import adapt_assets, prepare_abebooks
+
+    lake = tmp_path / "lake"
+    (lake / "images").mkdir(parents=True)
+    image = lake / "images" / "cover.jpg"
+    image.write_bytes(b"\xff\xd8\xff")
+    table = _synthetic_lake_table()
+    write_jsonl(lake / "source_tables.jsonl", [table])
+    write_jsonl(lake / "bridge_assets.jsonl", [
+        {"asset_id": "ev:text", "asset_type": "text", "source": "abebooks_synopsis",
+         "source_column": "vendor_description", "row_id": "bk_0001",
+         "content": "A text excerpt.", "url": "None", "local_path": "None"},
+        {"asset_id": "ev:image", "asset_type": "image", "source": "abebooks_catalogue_cover",
+         "source_column": None, "row_id": "bk_0002", "content": "None", "url": "None",
+         "local_path": str(image.relative_to(tmp_path))},
+    ])
+
+    prepared = prepare_abebooks(lake, min_rows=2, min_cols=2)
+    assets = adapt_assets(lake, root=tmp_path)
+
+    by_id = {asset["asset_id"]: asset for asset in assets}
+    assert by_id["ev:text"]["entity_id"] == prepared.entities[0]["entity_id"]
+    assert by_id["ev:image"]["entity_id"] == prepared.entities[1]["entity_id"]
+    assert by_id["ev:text"]["source_table_id"] == table["source_table_id"]
+    assert by_id["ev:image"]["source_row_id"] == 2
+    assert by_id["ev:image"]["content"] == "None", "a text field is left as the lake wrote it"
+    # image paths are opened by the client, so they cannot stay relative
+    assert Path(by_id["ev:image"]["local_path"]).is_absolute()
+    assert Path(by_id["ev:image"]["local_path"]).exists()
+
+
+def _synthetic_lake_table() -> dict:
+    """A two-row lake table in the shape ``build_abebooks_lake.py`` writes."""
+
+    def cell(index: int, name: str, text: str) -> dict:
+        return {"column_index": index, "column_name": name, "raw": text, "text": text,
+                "wiki_title": None, "has_wiki_link": False}
+
+    columns = ["title", "authors", "publisher"]
+    rows = [
+        {"row_id": f"bk_{n:04d}",
+         "cells": [cell(0, "title", f"Book {n}"), cell(1, "authors", f"Author {n}"),
+                   cell(2, "publisher", "Acme")]}
+        for n in (1, 2)
+    ]
+    return {
+        "source_table_id": "st_book_001",
+        "source_name": "book",
+        "num_rows": len(rows),
+        "num_cols": len(columns),
+        "columns": [{"column_index": i, "column_name": name} for i, name in enumerate(columns)],
+        "rows": rows,
+        "metadata": {
+            "candidate_entity_columns": [0],
+            "column_profiles": [
+                {"column_index": i, "non_empty_ratio": 1.0, "wiki_link_ratio": 0.0,
+                 "unique_ratio": 1.0, "numeric_ratio": 0.0}
+                for i in range(len(columns))
+            ],
+        },
+    }
 
 
 def test_offline_cli_pipeline_is_self_contained(tmp_path: Path) -> None:

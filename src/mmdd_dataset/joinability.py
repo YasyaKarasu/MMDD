@@ -35,6 +35,12 @@ class BuildConfig:
     max_query_additional_columns: int = 1
     max_target_additional_columns: int = 2
     seed: int = 13
+    #: Append the synthetic ``entity_url`` column to every query.  The cell is
+    #: derived from the entity cell's ``wiki_title``, so it only names a real page
+    #: for a Wikipedia-shaped corpus.  WDC mints a synthetic ``wdc_<hash>`` wiki
+    #: title, which would become a fabricated ``en.wikipedia.org`` URL, so the WDC
+    #: entry points turn this off.
+    synthetic_entity_url: bool = True
 
 
 def _profiles(table: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -425,7 +431,8 @@ def _materialize_join(
 
     query_source_rows = _select_query_rows(candidate, config.query_rows)
     query_rows, retained_query_rows = _project(table, query_columns, set(query_source_rows))
-    _append_entity_url_column(query_rows, table, entity_col)
+    if config.synthetic_entity_url:
+        _append_entity_url_column(query_rows, table, entity_col)
     query_fingerprint = _visible_query_fingerprint(table, query_columns, query_rows)
     query_id = f"query_{stable_hash(source_table_id, query_fingerprint)}"
     query_row_by_source = {row["source_row_id"]: row["row_id"] for row in query_rows}
@@ -573,14 +580,15 @@ def _materialize_join(
             "target_table_ids": [qrel["target_table_id"] for qrel in qrels],
         },
     )
-    query["columns"] = [
-        *query["columns"],
-        {
-            "column_index": len(query["columns"]),
-            "source_column_index": -1,
-            "column_name": "entity_url",
-        },
-    ]
+    if config.synthetic_entity_url:
+        query["columns"] = [
+            *query["columns"],
+            {
+                "column_index": len(query["columns"]),
+                "source_column_index": -1,
+                "column_name": "entity_url",
+            },
+        ]
     return query, targets, qrels, recoveries
 
 

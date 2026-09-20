@@ -927,6 +927,8 @@ met and sources that cannot reach it emit no implicit queries. Exact redundant
 columns (identical row-aligned cell values after serialization) share one query
 bridge that fans out to a seeded 1..k subset of their physical members, each
 with its own chain, target table, qrel, and member-specific evidence
-recoveries. Every materialized query table gains a synthetic `entity_url`
-column derived from the entity cell's wiki title, and dataset cell text is
-cleaned and truncated to 1024 characters with URLs preserved.
+recoveries. A materialized query table from a Wikipedia-shaped corpus also gains
+a synthetic `entity_url` column derived from the entity cell's wiki title
+(`entitables`); WDC tables mint a synthetic `wdc_<hash>` title instead, so that
+column would hold a fabricated `en.wikipedia.org` URL and is omitted. Dataset
+cell text is cleaned and truncated to 1024 characters with URLs preserved.

@@ -119,6 +119,33 @@ JOIN_SHAPES = ("attribute", "identity")
 #: photograph is exactly what makes ``publisher`` recoverable.
 MAX_VALUE_SHARE = 0.5
 
+#: Columns that can never be a hidden join column, each with the reason the
+#: decision record gives.  Two different defects land here, so the reason is per
+#: column rather than per list.
+#:
+#: ``describes_the_asset`` -- ``stock_image_flag`` says whether a photograph is a
+#: stock cover or a seller's own shot of the copy, and ``image_kind`` and
+#: ``catalogue_image_kind`` say the same thing again in two more spellings.
+#: Asking a model to recover one of these from the asset is circular: it is
+#: reading a label off the very thing the label describes.  They reached the
+#: qualified set at all only in the small-table split, where a two-valued column
+#: landing on an even split by chance slips past the discrimination gate.
+#:
+#: ``evidence_is_a_fragment_of_the_cell`` -- ``about_author_text`` is a biography
+#: of median 483 characters, and the model answers with the author's *name*: over
+#: 476 recoveries the median answer covers 3% of the cell and only 14 reach half
+#: of it.  ``values_match`` accepts the fragment because the biography happens to
+#: begin with the name, so the pass reports that a biography was recovered when
+#: what was recovered is a string printed on the cover -- and one that is a
+#: visible column of the query anyway.  Every other column in this lake has a
+#: median coverage of 1.00, so the defect is this column rather than the match.
+EXCLUDED_COLUMNS = {
+    "image_kind": "describes_the_asset",
+    "catalogue_image_kind": "describes_the_asset",
+    "stock_image_flag": "describes_the_asset",
+    "about_author_text": "evidence_is_a_fragment_of_the_cell",
+}
+
 #: Share of rows on which an asset must reproduce a column's value (by equality
 #: or containment) before the pair counts as a lookup rather than a recovery.
 COPY_CHANNEL_THRESHOLD = 0.5
@@ -233,6 +260,10 @@ def extraction_tasks(
         column for column in table["columns"]
         if profiles[column["column_index"]]["non_empty_ratio"]
         >= config.min_column_non_empty_ratio
+        # Never asked for, so never paid for: these are rejected by name
+        # further down the pipeline whatever the model says about them (see
+        # EXCLUDED_COLUMNS).
+        and column["column_name"] not in EXCLUDED_COLUMNS
     ]
     blocked = set(channels)
     tasks: list[dict[str, Any]] = []
@@ -460,8 +491,13 @@ def qualified_columns(
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Columns a model was actually able to recover, with the reason for the rest.
 
-    Three gates, in order, and the second one is new:
+    Three gates, in order, plus one exclusion ahead of them:
 
+    excluded by name
+        A handful of columns cannot be a join key whatever a model says about
+        them, for reasons no threshold expresses -- one describes the evidence
+        asset, one is recovered only as a fragment of itself.  Each carries its
+        own reason in the decision record (see ``EXCLUDED_COLUMNS``).
     row gate
         The column needs ``min_target_rows`` non-empty rows, because target rows
         *are* the rows with a non-empty join cell.
@@ -493,6 +529,9 @@ def qualified_columns(
     rejected: dict[str, str] = {}
     for attribute_col in candidates:
         attribute_name = get_column_name(table, attribute_col)
+        if attribute_name in EXCLUDED_COLUMNS:
+            rejected[attribute_name] = EXCLUDED_COLUMNS[attribute_name]
+            continue
         non_empty = sum(
             1 for row in table["rows"]
             if clean_text(get_cell(row, attribute_col).get("text"))

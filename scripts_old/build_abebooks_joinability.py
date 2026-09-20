@@ -155,20 +155,12 @@ class AbeBooksExtractor(OpenAICompatibleExtractor):
                 {"type": "image_url",
                  "image_url": {"url": f"data:{media_type};base64,{encoded}"}},
             ]
-        response = self.session.post(
-            self.url,
-            json=self.request_body(content),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        answer = response.json()["choices"][0]["message"]["content"]
-        if isinstance(answer, list):
-            answer = "".join(item.get("text", "") for item in answer if isinstance(item, dict))
-        start = answer.find("{")
+        response_answer = self.answer(content)
+        start = response_answer.find("{")
         parsed: dict[str, Any] = {}
         if start >= 0:
             try:
-                parsed, _ = json.JSONDecoder().raw_decode(answer[start:])
+                parsed, _ = json.JSONDecoder().raw_decode(response_answer[start:])
             except json.JSONDecodeError:
                 parsed = {}
         if not isinstance(parsed, dict):
@@ -186,7 +178,9 @@ def build_extractors(args: argparse.Namespace) -> dict[str, Any]:
             return None
         return AbeBooksExtractor(base_url, model, api_key_env=key_env,
                                  timeout=args.model_timeout,
-                                 max_tokens=max_tokens)
+                                 max_tokens=max_tokens,
+                                 max_retries=args.model_max_retries,
+                                 retry_sleep_seconds=args.model_retry_sleep)
 
     return {
         "text": make(args.text_model_base_url, args.text_model_name,
@@ -400,6 +394,50 @@ def load_cached(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
     return cached
 
 
+def cache_row_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    """What an extraction actually depends on: the row, the asset, the attribute.
+
+    Not the table.  ``visible_cells`` reads one row's cells, every book table
+    carries the same columns in the same order, and the prompt is assembled from
+    those two -- so splitting the same rows into different tables changes the
+    bucket a row lands in and nothing else about the question that was asked.
+    ``extraction_id`` embeds the table id anyway, which is why a re-split by rows
+    alone misses the whole cache unless it is also looked up this way.
+    """
+    return (record["source_row_id"], record["asset_id"], record["attribute_name"])
+
+
+def split_cached_tasks(
+    tasks: list[dict[str, Any]],
+    cached: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(reused, pending)``, with reused records re-labelled onto these tasks.
+
+    A record reused from another split is the same measurement under a different
+    table id, so it is returned carrying *this* task's ``source_table_id`` and
+    ``extraction_id``.  Without the re-labelling the extraction index would file
+    it under the table it was first produced for and the query would find nothing.
+    """
+    by_row_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in cached.values():
+        by_row_key.setdefault(cache_row_key(record), record)
+    reused: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for task in tasks:
+        record = cached.get(task["extraction_id"])
+        if record is None:
+            record = by_row_key.get((task["source_row_id"], task["asset_id"],
+                                     task["attribute_name"]))
+            if record is None:
+                pending.append(task)
+                continue
+            record = {**record,
+                      "source_table_id": task["source_table_id"],
+                      "extraction_id": task["extraction_id"]}
+        reused.append(record)
+    return reused, pending
+
+
 # --------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------
@@ -514,7 +552,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     }
     cached = load_cached([*args.extractions_jsonl, *([args.extraction_cache]
                                                       if args.extraction_cache else [])])
-    pending = [task for task in tasks if task["extraction_id"] not in cached]
+    reused, pending = split_cached_tasks(tasks, cached)
 
     extractors = build_extractors(args)
     if pending and not any(extractors.values()):
@@ -546,7 +584,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             cache_handle.close()
     skipped_no_extractor = len(pending) - len(produced)
 
-    extractions = [*cached.values(), *produced]
+    # ``reused`` rather than every loaded record: it holds exactly this split's
+    # tasks, re-labelled onto this split's table ids.  Records cached under a
+    # previous split would otherwise be filed under their old table and could
+    # never be looked up, and the ones for tables this run does not build are
+    # noise either way.
+    extractions = [*reused, *produced]
     index = extraction_index(extractions, channels=channels)
 
     splits, split_of = source_splits(tables, ratios=tuple(args.split_ratio), seed=args.seed)
@@ -580,9 +623,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         # Mandatory by default: an extraction is not evidence of recoverability
         # until it is re-confirmed from the query's visible row and the raw
         # evidence.  Fail-closed -- qrels below their required row count drop.
+        #
+        # This is the local pass only.  The external cascade -- a second opinion
+        # from the auto-check API profiles and a final judge for disagreements --
+        # is not run here: it audits a *finished* dataset, through
+        # ``scripts_old/mm_joinability_dataset_auto_checker.py``, which owns the
+        # provider routing, the adaptive per-profile concurrency and the cache.
+        # Rebuilding that here would be a second, weaker copy of it.
         artifacts = auto_check_recoveries(
             artifacts, assets, extractors["text"],
             image_extractor=extractors["image"], review_mode="local",
+            workers=args.auto_check_workers,
         )
 
     artifacts["bridge_assets"] = assets
@@ -616,6 +667,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_columns": dict(sorted(hidden.items())),
         "tasks_planned": len(tasks),
         "tasks_cached": len(cached),
+        "tasks_reused_from_another_split": sum(
+            1 for record in reused if record["extraction_id"] not in cached),
         "tasks_skipped_no_extractor": skipped_no_extractor,
         "extractions_used": len(extractions),
         "extractions_empty": sum(1 for record in extractions if not record.get("value")),
@@ -645,6 +698,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "attribute_extraction_check": (
                 "skipped" if args.no_auto_check else "local_model_fail_closed"
             ),
+            "attribute_extraction_cascade": (
+                "run separately via mm_joinability_dataset_auto_checker.py"
+            ),
             "raw_data_lake_refs": bool(args.raw_data_lake_refs),
             "row_id_scheme": "string_positional",
             "image_local_path_policy": "absolute",
@@ -665,8 +721,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "prompt_version": PROMPT_VERSION,
             "thinking_policy": "enable_thinking=false_on_every_call",
             "workers": {"text": args.text_model_workers,
-                        "image": args.image_model_workers},
+                        "image": args.image_model_workers,
+                        "auto_check": args.auto_check_workers},
             "timeout_seconds": args.model_timeout,
+            "max_retries": args.model_max_retries,
+            "retry_sleep_seconds": args.model_retry_sleep,
         },
         "artifact_references": (
             {"data_lake_tables": {"field": "source_table_ref",
@@ -811,7 +870,17 @@ def parser() -> argparse.ArgumentParser:
         default=32,
         help="in-flight image requests; text and image are budgeted separately "
              "because the vision encoder is the scarcer of the two")
+    result.add_argument(
+        "--auto-check-workers", type=int, default=32,
+        help="the attribute check is one independent call per recovery, so it is "
+             "parallelised the same way the extraction pass is; 1 restores the "
+             "serial loop it used to run")
     result.add_argument("--model-timeout", type=float, default=120.0)
+    result.add_argument(
+        "--model-max-retries", type=int, default=2,
+        help="a dropped connection or a 429/5xx is retried with exponential "
+             "backoff; without it one transient failure ends the whole pass")
+    result.add_argument("--model-retry-sleep", type=float, default=2.0)
     # Output is one small JSON object; the caps only matter as a guard against a
     # runaway generation, and they mirror the EntiTables builder's (1024/384).
     result.add_argument("--text-model-max-tokens", type=int, default=1024)

@@ -16,8 +16,9 @@ from pathlib import Path
 import pytest
 
 from build_abebooks_lake import (BOOK_EDITION_COLUMNS, BOOK_LISTING_COLUMNS,
-                                 SELLER_COLUMNS, _strip_boilerplate, build, chunk,
-                                 dedupe_assets, parser, piece_counts)
+                                 EXCLUDED_COLUMNS, SELLER_COLUMNS,
+                                 _strip_boilerplate, build, chunk, dedupe_assets,
+                                 parser, piece_counts)
 from mmdd_dataset.workload import generate_query_views
 
 ISBN = "9780201616477"
@@ -109,13 +110,26 @@ def test_row_ids_cannot_be_traced_back_to_the_isbn(dataset: Path, tmp_path: Path
     assert len(key_map) == 2  # audit side only, never a model input
 
 
-def test_the_boilerplate_and_the_isbn_it_carries_both_go(dataset: Path, tmp_path: Path) -> None:
+def test_the_text_columns_that_carry_the_isbn_leak_are_absent(
+        dataset: Path, tmp_path: Path) -> None:
+    """The columns an asset is a verbatim copy of are not emitted at all.
+
+    ``about_author_text`` and ``synopsis_text`` used to be tested here for
+    having had their boilerplate and ISBN stripped.  They are no longer in the
+    lake: a text asset *is* those columns, so asking a model to recover one from
+    the other is a lookup, and no amount of stripping changes that.  What is
+    still worth pinning is the guarantee that carried them -- no emitted cell
+    repeats the ISBN or the boilerplate notice.
+    """
     run(dataset, tmp_path)
-    table = read_lake(tmp_path / "lake")[0]
-    index = [c["column_name"] for c in table["columns"]].index("about_author_text")
-    text = table["rows"][0]["cells"][index]["text"]
-    assert text == "Evi Nemeth writes books."
-    assert "About the title" not in text
+    tables = read_lake(tmp_path / "lake")
+    emitted = {column["column_name"] for table in tables for column in table["columns"]}
+    assert {"about_author_text", "synopsis_text", "vendor_description"} & emitted == set()
+    declared = set(BOOK_EDITION_COLUMNS) | set(BOOK_LISTING_COLUMNS) | set(SELLER_COLUMNS)
+    assert emitted == declared - set(EXCLUDED_COLUMNS)
+    blob = json.dumps([table for table in tables], ensure_ascii=False)
+    assert ISBN not in blob
+    assert "About the title" not in blob
 
 
 def test_a_truncated_notice_is_still_removed(tmp_path: Path) -> None:
@@ -149,13 +163,6 @@ def test_urls_in_prose_are_masked(dataset: Path, tmp_path: Path) -> None:
     blob = (tmp_path / "lake" / "source_tables.jsonl").read_text(encoding="utf-8")
     assert "http" not in blob and "www." not in blob
     assert "[link]" in blob
-
-
-def test_an_isbn_quoted_in_a_synopsis_is_masked(dataset: Path, tmp_path: Path) -> None:
-    run(dataset, tmp_path)
-    table = read_lake(tmp_path / "lake")[0]
-    index = [c["column_name"] for c in table["columns"]].index("synopsis_text")
-    assert table["rows"][0]["cells"][index]["text"] == "Classic text. ISBN [ISBN] on the back."
 
 
 def test_each_table_declares_its_name_column_as_the_entity(dataset: Path, tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,26 @@ from .utils import (
     stable_hash,
     values_match,
 )
+from .wdc_runtime import bounded_map
 
 PROMPT_VERSION = "leave_one_attribute_out_v4_entity_evidence_grounding"
 AUTO_CHECK_PROMPT_VERSION = "query_visible_row_raw_evidence_only_v2"
 AUTO_CHECK_CASCADE_POLICY = "local_luna_consensus_terra_adjudication_v1"
 AUTO_CHECK_LOCAL_POLICY = "local_only"
+
+
+def is_transient_failure(error: BaseException) -> bool:
+    """Whether retrying this call could plausibly help.
+
+    A tunnel or a loaded engine drops a connection every so often; a run of
+    119,729 calls is long enough that this stops being hypothetical, and the
+    whole pass dies on it.  HTTP 4xx is excluded -- retrying a malformed request
+    or a rejected image only wastes the retry budget.
+    """
+    if isinstance(error, requests.exceptions.HTTPError):
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return status == 429 or (status is not None and status >= 500)
+    return isinstance(error, requests.exceptions.RequestException)
 
 
 class OpenAICompatibleExtractor:
@@ -37,12 +53,16 @@ class OpenAICompatibleExtractor:
         timeout: float = 120,
         max_tokens: int | None = None,
         enable_thinking: bool = False,
+        max_retries: int = 2,
+        retry_sleep_seconds: float = 2.0,
     ) -> None:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.enable_thinking = enable_thinking
+        self.max_retries = max_retries
+        self.retry_sleep_seconds = retry_sleep_seconds
         self.session = requests.Session()
         api_key = os.environ.get(api_key_env)
         if api_key:
@@ -70,6 +90,33 @@ class OpenAICompatibleExtractor:
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
         return payload
+
+    def answer(self, content: str | list[dict[str, Any]]) -> str:
+        """The model's raw answer text, retrying transient failures.
+
+        Shared by this class and its subclasses so the retry exists once: a
+        subclass that posts for itself would silently lose it, and the failure it
+        guards against -- one dropped connection ending a six-hour pass -- is
+        exactly the kind that does not show up in a short test.
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(
+                    self.url,
+                    json=self.request_body(content),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                answer = response.json()["choices"][0]["message"]["content"]
+                if isinstance(answer, list):
+                    answer = "".join(item.get("text", "") for item in answer
+                                     if isinstance(item, dict))
+                return answer
+            except Exception as error:
+                if attempt >= self.max_retries or not is_transient_failure(error):
+                    raise
+                time.sleep(self.retry_sleep_seconds * (2 ** attempt))
+        raise AssertionError("unreachable: the retry loop returns or raises")
 
     def extract(
         self,
@@ -100,16 +147,7 @@ class OpenAICompatibleExtractor:
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{encoded}"}},
             ]
-        response = self.session.post(
-            self.url,
-            json=self.request_body(content),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        answer = response.json()["choices"][0]["message"]["content"]
-        if isinstance(answer, list):
-            answer = "".join(item.get("text", "") for item in answer if isinstance(item, dict))
-        parsed = _json_object(answer)
+        parsed = _json_object(self.answer(content))
         return {
             "value": clean_text(parsed.get("value")),
             "evidence": clean_text(parsed.get("evidence")),
@@ -219,8 +257,16 @@ def auto_check_recoveries(
     review_mode: str = "cascade",
     luna_extractor: OpenAICompatibleExtractor | None = None,
     terra_extractor: OpenAICompatibleExtractor | None = None,
+    workers: int = 1,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Fail closed using local-only or local/Luna/Terra review."""
+    """Fail closed using local-only or local/Luna/Terra review.
+
+    ``workers`` parallelises the check.  It defaults to 1 because the call sites
+    that predate it were written against a serial loop, and a caller that has not
+    thought about concurrency should not silently acquire it; the check is one
+    independent call per recovery, so raising it changes nothing but the wall
+    clock.  Results are assembled in input order either way.
+    """
     if review_mode not in {"cascade", "local"}:
         raise ValueError("review_mode must be 'cascade' or 'local'")
     if review_mode == "cascade" and (
@@ -242,16 +288,13 @@ def auto_check_recoveries(
     checked_recoveries: list[dict[str, Any]] = []
     supported_rows: dict[tuple[str, str], set[int]] = {}
 
-    for recovery in progress(
-        artifacts["evidence_recoveries"],
-        desc="Check recoveries",
-        unit="recovery",
-    ):
+    def check(recovery: dict[str, Any]) -> dict[str, Any] | None:
+        """The checked copy of one recovery, or None if it is not supported."""
         query_id = recovery["query_table_id"]
         query = query_by_id.get(query_id)
         asset = asset_by_id.get(recovery["evidence"]["asset_id"])
         if query is None or asset is None:
-            continue
+            return None
         query_row_id = int(recovery["query_row_id"])
         query_row = next(
             (
@@ -262,7 +305,7 @@ def auto_check_recoveries(
             None,
         )
         if query_row is None:
-            continue
+            return None
         visible_cells = [
             {
                 "name": clean_text(cell.get("column_name")),
@@ -277,7 +320,7 @@ def auto_check_recoveries(
             else text_extractor
         )
         if extractor is None:
-            continue
+            return None
         recovered = recovery["recovered_attribute"]
         local_result = extractor.extract(
             attribute=clean_text(recovered.get("column_name")),
@@ -313,37 +356,49 @@ def auto_check_recoveries(
                 decision_source = "terra_adjudication"
         claimed_value = clean_text(recovered.get("value"))
         if not values_match(extracted_value, claimed_value):
-            continue
-        checked_recoveries.append(
-            {
-                **recovery,
-                "auto_check": {
-                    "prompt_version": AUTO_CHECK_PROMPT_VERSION,
-                    "input_policy": "query_visible_row_and_raw_evidence_only",
-                    "review_policy": (
-                        AUTO_CHECK_CASCADE_POLICY
-                        if review_mode == "cascade"
-                        else AUTO_CHECK_LOCAL_POLICY
-                    ),
-                    "decision_source": decision_source,
-                    "extracted_value": extracted_value,
-                    "primary_extracted_value": local_value,
-                    "luna_triggered": review_mode == "cascade",
-                    "luna_extracted_value": luna_value,
-                    "luna_agrees_with_local": (
-                        results_agree(local_value, luna_value)
-                        if luna_value is not None
-                        else None
-                    ),
-                    "terra_triggered": terra_triggered,
-                    "terra_extracted_value": terra_value,
-                    "verdict": "supported",
-                },
-            }
+            return None
+        return {
+            **recovery,
+            "auto_check": {
+                "prompt_version": AUTO_CHECK_PROMPT_VERSION,
+                "input_policy": "query_visible_row_and_raw_evidence_only",
+                "review_policy": (
+                    AUTO_CHECK_CASCADE_POLICY
+                    if review_mode == "cascade"
+                    else AUTO_CHECK_LOCAL_POLICY
+                ),
+                "decision_source": decision_source,
+                "extracted_value": extracted_value,
+                "primary_extracted_value": local_value,
+                "luna_triggered": review_mode == "cascade",
+                "luna_extracted_value": luna_value,
+                "luna_agrees_with_local": (
+                    results_agree(local_value, luna_value)
+                    if luna_value is not None
+                    else None
+                ),
+                "terra_triggered": terra_triggered,
+                "terra_extracted_value": terra_value,
+                "verdict": "supported",
+            },
+        }
+
+    candidates = artifacts["evidence_recoveries"]
+    checked_recoveries = [
+        record
+        for record in progress(
+            bounded_map(check, candidates, workers=max(1, int(workers))),
+            total=len(candidates),
+            desc="Check recoveries",
+            unit="recovery",
         )
+        if record is not None
+    ]
+    supported_rows: dict[tuple[str, str], set[int]] = {}
+    for record in checked_recoveries:
         supported_rows.setdefault(
-            (query_id, recovery["target_table_id"]), set()
-        ).add(query_row_id)
+            (record["query_table_id"], record["target_table_id"]), set()
+        ).add(int(record["query_row_id"]))
 
     retained_qrels: list[dict[str, Any]] = []
     hidden_by_query: dict[str, list[dict[str, Any]]] = {}

@@ -142,6 +142,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         min_column_non_empty_ratio=args.min_column_non_empty_ratio,
         max_query_additional_columns=args.max_query_additional_columns,
         max_target_additional_columns=args.max_target_additional_columns,
+        synthetic_entity_url=args.source == "entitables",
     )
     artifacts = build_joinability_dataset(
         prepared.source_tables, assets, extractions, split_of, config
