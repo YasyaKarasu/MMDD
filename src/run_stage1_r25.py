@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "mmdd_r24_review"
+PACKAGE = ROOT / "mmdd_r24_review" if (ROOT / "mmdd_r24_review").exists() else ROOT / "audit" / "mmdd_r24_review"
 OUT_NAME = "stage1_optimization_r25_final_20260914"
 SEEDS = (13, 29)
 ARMS = ("B13-FULL", "EDGE-CONT", "SPLIT-SUP", "SPLIT-QTKD", "SPLIT-U", "SPLIT-UQTKD", "LSE-QTKD")

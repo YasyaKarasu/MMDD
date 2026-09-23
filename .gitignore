@@ -61,6 +61,7 @@ hf_models/
 /ImageAttribute.zip
 /gate_inputs/
 /wdc_schemaorg_*/
+/table-column-annotation-benchmark/
 
 # Large model / index / tensor artifacts
 *.pt
@@ -94,7 +95,6 @@ AGENTS.md
 book.txt
 
 # Local experiment review, plan and audit bundles
-/mmdd_r*/
-/mmdd_s2_*/
-/mmdd_s1_audit_*.tar.gz
-/_codex_*_transcript.txt
+/audit/
+/MMDD_FRESH_RECOVERY_*
+/abebooks_*
