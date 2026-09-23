@@ -70,7 +70,8 @@ def make_dataset(root: Path, *, with_explicit_qrel: bool = True) -> Path:
 def run(dataset: Path, db: Path, out: Path, *extra: str) -> dict:
     return apply_review(argparse.Namespace(
         dataset_dir=str(dataset), review_db=str(db), output_dir=str(out),
-        drop_unreviewed="--drop-unreviewed" in extra))
+        drop_unreviewed="--drop-unreviewed" in extra,
+        balance_explicit="--balance-explicit" in extra, seed=13))
 
 
 def test_an_unreviewed_dataset_passes_through_unchanged(tmp_path: Path) -> None:
@@ -93,7 +94,7 @@ def test_a_rejected_recovery_can_take_its_query_out_with_it(tmp_path: Path) -> N
 
     report = run(dataset, db, tmp_path / "out")
 
-    assert report["recoveries"] == {"total": 3, "kept": 2, "dropped": 1, "unreviewed": 2}
+    assert report["recoveries"] == {"total": 3, "kept": 0, "dropped": 3, "unreviewed": 2}
     assert [item["column_name"] for item in report["dropped_qrels"]] == ["Publisher"]
     assert report["dropped_qrels"][0]["recovered_rows"] == 2
     assert report["dropped_qrels"][0]["required_recovered_rows"] == 3
@@ -105,7 +106,10 @@ def test_a_rejected_recovery_can_take_its_query_out_with_it(tmp_path: Path) -> N
 
     written = [json.loads(line) for line in
                (tmp_path / "out" / "evidence_recoveries.jsonl").open()]
-    assert {record["recovery_id"] for record in written} == {"rec_0", "rec_2"}
+    assert written == []
+    assert {item["reason"] for item in report["dropped_recoveries"]} == {
+        "marked_unreasonable", "qrel_removed"
+    }
 
 
 def test_a_query_with_no_surviving_qrel_is_dropped(tmp_path: Path) -> None:
@@ -145,5 +149,93 @@ def test_drop_unreviewed_is_opt_in(tmp_path: Path) -> None:
 
     report = run(dataset, db, tmp_path / "out", "--drop-unreviewed")
 
-    assert report["recoveries"] == {"total": 3, "kept": 1, "dropped": 2, "unreviewed": 2}
+    assert report["recoveries"] == {"total": 3, "kept": 0, "dropped": 3, "unreviewed": 2}
     assert report["dropped_qrels"][0]["reason"] == "below_required_recovered_rows"
+
+
+def test_balances_explicit_queries_per_split_and_refreshes_metadata(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "data"
+    dataset.mkdir()
+    queries = [
+        {"table_id": "implicit_train", "source_table_id": "st_i_train",
+         "role": "query", "split": "train", "hidden_attributes": [
+             {"source_column_index": 1, "column_name": "Publisher"}],
+         "target_table_ids": ["target_i_train"]},
+        {"table_id": "explicit_train_a", "source_table_id": "st_e_train_a",
+         "role": "query", "split": "train", "hidden_attributes": [],
+         "target_table_ids": ["target_e_train_a"]},
+        {"table_id": "explicit_train_b", "source_table_id": "st_e_train_b",
+         "role": "query", "split": "train", "hidden_attributes": [],
+         "target_table_ids": ["target_e_train_b"]},
+        {"table_id": "implicit_dev", "source_table_id": "st_i_dev",
+         "role": "query", "split": "dev", "hidden_attributes": [
+             {"source_column_index": 1, "column_name": "Publisher"}],
+         "target_table_ids": ["target_i_dev"]},
+        {"table_id": "explicit_dev", "source_table_id": "st_e_dev",
+         "role": "query", "split": "dev", "hidden_attributes": [],
+         "target_table_ids": ["target_e_dev"]},
+    ]
+    write_jsonl(dataset / "query_tables.jsonl", queries)
+    targets = [
+        {"table_id": query["target_table_ids"][0], "role": "target_data_lake_table"}
+        for query in queries
+    ]
+    write_jsonl(dataset / "data_lake_tables.jsonl", targets)
+    recoveries = [
+        {"recovery_id": f"rec_{split}", "query_table_id": f"implicit_{split}",
+         "target_table_id": f"target_i_{split}", "query_row_id": 0,
+         "split": split}
+        for split in ("train", "dev")
+    ]
+    write_jsonl(dataset / "evidence_recoveries.jsonl", recoveries)
+    implicit_attribute = {
+        "source_column_index": 1, "column_name": "Publisher",
+        "role": "model_recoverable_join_column", "selected_rows": 2,
+        "eligible_rows": 10, "recovered_rows": 1, "required_recovered_rows": 1,
+        "recovered_value_ratio": 0.5,
+    }
+    qrels = [
+        {"query_table_id": f"implicit_{split}",
+         "target_table_id": f"target_i_{split}", "split": split,
+         "join_attribute": implicit_attribute}
+        for split in ("train", "dev")
+    ] + [
+        {"query_table_id": query["table_id"],
+         "target_table_id": query["target_table_ids"][0], "split": query["split"],
+         "join_attribute": {"column_name": "Price", "role": "visible_join_column"}}
+        for query in queries if query["table_id"].startswith("explicit")
+    ]
+    write_jsonl(dataset / "qrels.jsonl", qrels)
+    (dataset / "stats.json").write_text(
+        json.dumps({"source_tables": 5, "tables": {}}), encoding="utf-8")
+    (dataset / "dataset_manifest.json").write_text(json.dumps({
+        "format": "flat_jsonl",
+        "artifacts": {
+            "query_tables": {"path": "query_tables.jsonl", "records": 5},
+            "data_lake_tables": {"path": "data_lake_tables.jsonl", "records": 5},
+            "evidence_recoveries": {
+                "path": "evidence_recoveries.jsonl", "records": 2},
+        },
+    }), encoding="utf-8")
+
+    report = run(dataset, tmp_path / "missing.sqlite3", tmp_path / "out",
+                 "--balance-explicit")
+
+    assert report["query_tables"]["implicit"] == 2
+    assert report["query_tables"]["explicit"] == 2
+    assert report["split"]["by_split"]["train"]["total"] == 2
+    assert report["split"]["by_split"]["dev"]["total"] == 2
+    assert len(report["dropped_explicit_query_ids"]) == 1
+    written_qrels = [json.loads(line) for line in
+                     (tmp_path / "out" / "qrels.jsonl").open()]
+    assert len(written_qrels) == 4
+    implicit = next(row for row in written_qrels
+                    if row["query_table_id"] == "implicit_train")
+    assert implicit["join_attribute"]["recovered_value_ratio"] == 0.5
+    stats = json.loads((tmp_path / "out" / "stats.json").read_text())
+    assert stats["query_tables"] == 4
+    assert stats["qrels"] == 4
+    manifest = json.loads((tmp_path / "out" / "dataset_manifest.json").read_text())
+    assert manifest["artifacts"]["query_tables"]["records"] == 4

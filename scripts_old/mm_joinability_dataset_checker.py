@@ -169,7 +169,7 @@ PAGE_TEMPLATE = """
     <div class="recovery-list">
       <div class="recovery-head"><div>Query row</div><div>Multimodal evidence</div><div>Recovered attribute</div><div>Target row</div></div>
       {% for item in target.review_rows %}
-      <article class="recovery-row" data-query-row-id="{{ item.query_row_id }}">
+      <article class="recovery-row" id="recovery-{{ item.path.recovery_id if item.path else item.query_row_id }}" data-query-row-id="{{ item.query_row_id }}">
         <div class="recovery-cell">
           <div class="pair-head"><span class="badge">QUERY ROW {{ item.query_row_id }}</span>{% if item.path %}<span class="muted">{{ item.path.query_entity.entity_column_name }}</span>{% endif %}</div>
           {% if item.path %}<h3>{{ item.path.query_entity.cell_text or item.path.query_entity.wiki_title or '未命名 entity' }}</h3>{% endif %}
@@ -201,8 +201,8 @@ PAGE_TEMPLATE = """
         </div>
         {% if item.path and item.path.recovery_id %}
         <div class="recovery-verdict">
-          <span class="badge {{ 'good-text' if item.verdict == 'reasonable' else 'bad-text' if item.verdict == 'unreasonable' else '' }}">{{ item.verdict_label }}</span>
-          <form method="post" action="{{ url_for('review_recovery') }}">
+          <span class="badge verdict-badge {{ 'good-text' if item.verdict == 'reasonable' else 'bad-text' if item.verdict == 'unreasonable' else '' }}">{{ item.verdict_label }}</span>
+          <form class="verdict-form" method="post" action="{{ url_for('review_recovery') }}">
             <input type="hidden" name="recovery_id" value="{{ item.path.recovery_id }}">
             <input type="hidden" name="query_id" value="{{ group.query_id }}">
             <input type="hidden" name="page" value="{{ page }}">
@@ -222,7 +222,46 @@ PAGE_TEMPLATE = """
     <span>第 {{ page }} / {{ pages }} 页</span><a class="button primary" href="{{ page_url(page+1) }}">下一页</a><a class="button" href="{{ page_url(pages) }}">末页</a></nav>
   {% else %}<section class="panel">数据集中没有可抽检的 implicit query。</section>{% endif %}
   {% endif %}
-</main></body></html>
+</main>
+<script>
+// Submit a verdict without navigating: a plain form POST reloads the page and
+// the browser lands back at the top, which loses your place in a long list of
+// recoveries.  The form still posts normally if this fails, and the redirect
+// carries a #recovery-... fragment so the no-JS path returns to the card too.
+document.querySelectorAll("form.verdict-form").forEach(function (form) {
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var pressed = event.submitter || form.querySelector("button[type=submit]");
+    var data = new FormData(form);
+    if (pressed && pressed.name) { data.set(pressed.name, pressed.value); }
+    fetch(form.action, { method: "POST", body: data })
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        applyVerdict(form, data.get("verdict"));
+      })
+      .catch(function () { form.submit(); });
+  });
+});
+
+function applyVerdict(form, verdict) {
+  var bar = form.closest(".recovery-verdict");
+  var badge = bar.querySelector(".verdict-badge");
+  var labels = { reasonable: "已评：合理", unreasonable: "已评：不合理", clear: "未评" };
+  badge.textContent = labels[verdict] || "未评";
+  badge.classList.toggle("good-text", verdict === "reasonable");
+  badge.classList.toggle("bad-text", verdict === "unreasonable");
+  var clear = form.querySelector("button[value=clear]");
+  var clearing = verdict === "clear";
+  if (clearing && clear) { clear.remove(); }
+  if (!clearing && !clear) {
+    clear = document.createElement("button");
+    clear.name = "verdict"; clear.value = "clear"; clear.type = "submit";
+    clear.textContent = "清除";
+    form.appendChild(clear);
+  }
+}
+</script>
+</body></html>
 """
 
 
@@ -652,7 +691,7 @@ def create_checker_app(
                                 clean_text(request.form.get("note")))
         except (KeyError, ValueError) as exc:
             abort(400, str(exc))
-        return redirect(url_for("index", page=page))
+        return redirect(f"{url_for('index', page=page)}#recovery-{recovery_id}")
 
     @app.get("/next-unreviewed")
     def next_unreviewed() -> Any:

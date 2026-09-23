@@ -34,9 +34,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import os
 import json
+import signal
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -153,6 +156,23 @@ def _table_asset_links(
     return links
 
 
+def install_stack_dump_handler() -> None:
+    """Dump every thread's Python stack on SIGUSR1.
+
+    The reviewer pool can stall with the main thread blocked acquiring a lock --
+    measured on a real run: 134 threads all in ``futex_wait``, 0% CPU, and
+    SIGINT unable to interrupt, because the interpreter never gets to run a
+    Python-level handler.  ``py-spy`` needs ptrace permission the deployment may
+    not grant; ``faulthandler`` writes from the signal handler itself, so it
+    still produces a stack for a run that cannot otherwise be inspected.  A
+    missing or unsupported signal must never cost the run.
+    """
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def build_dataset(
     args: argparse.Namespace,
     lake_args: argparse.Namespace,
@@ -259,6 +279,14 @@ def build_dataset(
     qrels: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
     counts = defaultdict(int)
+    implicit_query_counts_by_split = {"train": 0, "dev": 0, "test": 0}
+    # A table can hold a multimodal query *and* be an explicit-join candidate; the
+    # candidate is only realised if the balance pass picks it, so its data-lake
+    # tables are written after the loop rather than here.
+    explicit_candidate_splits: dict[str, str] = {}
+    explicit_candidate_source_ids: dict[str, str] = {}
+    explicit_candidate_decision_indices: dict[str, int] = {}
+    deferred_tables: set[str] = set()
     with (
         query_writer as query_handle,
         data_lake_writer as data_lake_handle,
@@ -267,10 +295,11 @@ def build_dataset(
     ):
         for table in prepared.source_tables:
             source_table_id = table["source_table_id"]
+            split = source_to_split.get(source_table_id, "test")
             query_tables, data_lake_tables, table_qrels, decision = (
                 join_builder.build_table_join_records(
                     source_table=table,
-                    split=source_to_split.get(source_table_id, "test"),
+                    split=split,
                     assets=loaded_assets,
                     entity_to_assets=entity_to_assets,
                     wiki_to_entity_id=wiki_to_entity_id,
@@ -285,16 +314,138 @@ def build_dataset(
                     finalize_query_recoveries=True,
                 )
             )
+            if query_tables:
+                counts["queryable_tables"] += 1
+                if decision.get("reason") == "explicit_join_fallback":
+                    counts["explicit_join_tables"] += 1
+                else:
+                    counts["multimodal_queryable_tables"] += 1
+                    implicit_query_counts_by_split[split] += len(query_tables)
+            else:
+                counts["rejected_tables"] += 1
+            candidates = decision.get("explicit_join_candidates")
+            if not isinstance(candidates, list):
+                candidate = decision.get("explicit_join_candidate")
+                candidates = [candidate] if isinstance(candidate, dict) else []
+            deferred_candidate = (
+                args.explicit_join_fallback_mode == "match_implicit"
+                and bool(candidates)
+            )
+            decision["source_table_id"] = source_table_id
+            if args.explicit_join_fallback_mode == "match_implicit" and not candidates:
+                # Any table can host an explicit join -- it only needs a visible
+                # non-entity column with enough rows -- so the candidate pool is
+                # every table, not just the ones whose multimodal recovery failed.
+                # The parent draws candidates for those failures only, and at a
+                # low recovery threshold most tables succeed: too few candidates
+                # survive to give one explicit join per multimodal query, which is
+                # what ``match_implicit`` has to balance.
+                entity_col = (
+                    table["metadata"].get("candidate_entity_columns") or [None]
+                )[0]
+                candidates = join_builder.build_explicit_join_fallback_candidates(
+                    source_table=table,
+                    split=split,
+                    entity_col=entity_col,
+                    rejected_multimodal_reason=clean_text(decision.get("reason")),
+                    args=args,
+                    force=True,
+                )
+                if candidates:
+                    decision["explicit_join_candidates"] = candidates
+                    decision["explicit_join_candidate"] = candidates[0]
+            if args.explicit_join_fallback_mode == "match_implicit" and candidates:
+                for candidate in candidates:
+                    candidate_id = clean_text(candidate.get("candidate_id"))
+                    if not candidate_id:
+                        raise ValueError(
+                            f"explicit join candidate for {source_table_id} has no "
+                            "candidate_id, so the balance pass cannot select it")
+                    explicit_candidate_splits[candidate_id] = split
+                    explicit_candidate_source_ids[candidate_id] = source_table_id
+                    explicit_candidate_decision_indices[candidate_id] = len(decisions)
+            if deferred_candidate:
+                deferred_tables.add(source_table_id)
+            decisions.append(decision)
             for record in query_tables:
                 query_handle.write_record(record)
-            for record in data_lake_tables:
+                counts["query_tables"] += 1
+            for record in ([] if deferred_candidate else data_lake_tables):
                 data_lake_handle.write_record(record)
+                counts["data_lake_tables"] += 1
             qrels.extend(table_qrels)
-            decisions.append(decision)
-            counts[clean_text(decision.get("reason")) or "unknown"] += 1
-            counts["query_tables"] += len(query_tables)
-            counts["data_lake_tables"] += len(data_lake_tables)
             counts["qrels"] += len(table_qrels)
+
+        if args.explicit_join_fallback_mode == "match_implicit":
+            # One explicit join per multimodal query per split, so the two kinds
+            # come out balanced and the split holds for both.  This is the mode
+            # the EntiTables dataset was built with; ``ratio`` (the default) just
+            # lets whichever tables failed multimodal recovery fall back.
+            selected_explicit, counts["explicit_candidates_by_split"] = (
+                join_builder.select_balanced_explicit_join_candidates(
+                    candidate_splits=explicit_candidate_splits,
+                    implicit_query_counts=implicit_query_counts_by_split,
+                    args=args,
+                )
+            )
+            counts["explicit_selected_ids"] = len(selected_explicit)
+            counts["explicit_needed"] = sum(implicit_query_counts_by_split.values())
+            selected_by_source: dict[str, list[str]] = defaultdict(list)
+            for candidate_id in selected_explicit:
+                selected_by_source[explicit_candidate_source_ids[candidate_id]].append(
+                    candidate_id)
+            for table in prepared.source_tables:
+                source_table_id = table["source_table_id"]
+                if source_table_id not in set(explicit_candidate_source_ids.values()):
+                    continue
+                split = source_to_split.get(source_table_id, "test")
+                selected_ids = sorted(selected_by_source.get(source_table_id, []))
+                if not selected_ids:
+                    if source_table_id in deferred_tables:
+                        # Its data-lake record was held back in the loop; a
+                        # candidate nobody picked is still a data-lake table.
+                        data_lake_handle.write_record(
+                            join_builder.raw_data_lake_record(table))
+                        counts["data_lake_tables"] += 1
+                    continue
+                decision_index = explicit_candidate_decision_indices[selected_ids[0]]
+                original = decisions[decision_index]
+                materialized: list[dict[str, Any]] = []
+                explicit_queries: list[dict[str, Any]] = []
+                explicit_targets: list[dict[str, Any]] = []
+                explicit_qrels: list[dict[str, Any]] = []
+                for candidate_id in selected_ids:
+                    candidate_decision = next(
+                        item for item in original["explicit_join_candidates"]
+                        if clean_text(item.get("candidate_id")) == candidate_id)
+                    for candidate in join_builder.rebuild_selected_explicit_join_candidates(
+                            source_table=table, split=split,
+                            candidate_decisions=[candidate_decision], args=args):
+                        queries, targets, candidate_qrels, result = (
+                            join_builder.materialize_balanced_explicit_join_candidate(
+                                source_table=table, split=split,
+                                candidate_decision=candidate, args=args))
+                        materialized.append(candidate)
+                        explicit_queries.extend(queries)
+                        explicit_targets.extend(targets)
+                        explicit_qrels.extend(candidate_qrels)
+                decisions[decision_index] = {
+                    **original,
+                    "source_table_id": source_table_id,
+                    "explicit_join_candidates": materialized,
+                    "explicit_join_query_count": len(explicit_queries),
+                }
+                counts["explicit_join_tables"] += 1
+                counts["explicit_selected"] += len(selected_ids)
+                counts["explicit_materialized"] += len(explicit_queries)
+                for record in explicit_queries:
+                    query_handle.write_record(record)
+                    counts["query_tables"] += 1
+                for record in explicit_targets:
+                    data_lake_handle.write_record(record)
+                    counts["data_lake_tables"] += 1
+                qrels.extend(explicit_qrels)
+                counts["qrels"] += len(explicit_qrels)
 
     write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", decisions)
@@ -309,8 +460,10 @@ def build_dataset(
         "query_tables": counts["query_tables"],
         "data_lake_tables": counts["data_lake_tables"],
         "qrels": counts["qrels"],
-        "decisions": {key: counts[key] for key in sorted(counts) if key not in
-                      {"query_tables", "data_lake_tables", "qrels"}},
+        "decisions": dict(sorted(
+            Counter(clean_text(d.get("reason")) or "unknown" for d in decisions).items())),
+        "tables": {key: counts[key] for key in sorted(counts) if key not in
+                   {"query_tables", "data_lake_tables", "qrels"}},
         "skipped_source_tables": prepared.skipped,
     }
     write_json(output_dir / "stats.json", stats)
@@ -350,6 +503,7 @@ def build_dataset(
 
 
 def main(argv: list[str] | None = None) -> int:
+    install_stack_dump_handler()
     args, lake_args = parse_args(argv)
     stats = build_dataset(args, lake_args)
     print(json.dumps(stats, indent=2, sort_keys=True))
