@@ -33,7 +33,9 @@ def _protocol(args) -> dict:
 def _teacher_cache(rt: pipeline.Runtime, model, seed: int, branch: str) -> FrozenTeacherLogitCache:
     """Open a run-local frozen-logit cache for one immutable Teacher branch."""
     path = rt.paths.work_dir / "teacher_logits" / f"seed{seed}_{branch}.pt"
-    return FrozenTeacherLogitCache.for_model(model, rt.paths.protocol, path=path).load_existing()
+    return FrozenTeacherLogitCache.for_model(
+        model, rt.paths.protocol, teacher_branch=branch, path=path,
+    ).load_existing()
 
 
 def _adamw(parameters, lr: float) -> torch.optim.Optimizer:
@@ -196,7 +198,8 @@ def cmd_train_teacher(args) -> int:
                                      out_dir=rt.stage_dir(seed, "T_PATH"), protocol_path=paths.protocol,
                                      parent_dirs=[rt.stage_dir(seed, "T_EDGE")], batch=args.path_batch,
                                      optimizer=optimizer, start_epoch=start_epoch, counters=counters,
-                                     conditional_registry=post.get("conditional_registry"))
+                                     conditional_registry=post.get("conditional_registry"),
+                                     anchor_registry=post.get("anchor_registry"))
         else:
             resume = _resume_stage(
                 model, stage_dir=rt.stage_dir(seed, "T_QT"), stage="T_QT", seed=seed,
@@ -283,7 +286,8 @@ def cmd_train_student(args) -> int:
                                            kd=kd, eonly=eonly, parent_dirs=[rt.stage_dir(seed, c1)],
                                            full_chunk=student["full_target_chunk"], batch=args.path_batch,
                                            teacher_cache=cache, optimizer=optimizer, start_epoch=start_epoch,
-                                           counters=counters, conditional_registry=post.get("conditional_registry"))
+                                           counters=counters, conditional_registry=post.get("conditional_registry"),
+                                           anchor_registry=post.get("anchor_registry"))
     elif stage == "S_KD_NATIVE_C2":
         model = rt.load_student(seed, "S_KD_C1", args.device, adapter=False)
         teacher = rt.load_teacher(seed, "T_QT", args.device)
@@ -304,7 +308,7 @@ def cmd_train_student(args) -> int:
                                    out_dir=rt.stage_dir(seed, stage), protocol_path=paths.protocol,
                                    parent_dirs=[rt.stage_dir(seed, "S_KD_C1")], batch=args.path_batch,
                                    teacher_cache=cache, optimizer=optimizer, start_epoch=start_epoch,
-                                   counters=counters)
+                                   counters=counters, anchor_registry=post.get("anchor_registry"))
     elif stage in QT_STUDENTS:
         # QT-SUP needs no Teacher at all, so this branch can run while T_EDGE is
         # still training (SPEC 13.5 item 1).  Only the QT-KD stages distil T_QT.
@@ -447,25 +451,33 @@ def cmd_smoke(args) -> int:
 
 
 def cmd_evaluate_dev(args) -> int:
-    """Own retrieval + fixed-teacher-pool tables on all original dev queries (SPEC 12.1)."""
+    return _evaluate_split(args, split="dev")
+
+
+def _evaluate_split(args, *, split: str) -> int:
+    """Own retrieval + fixed-teacher-pool tables on one evaluation split (SPEC 12)."""
     from fresh_path import evaluate, retrieval
 
     paths = _paths(args)
     protocol = _protocol(args)
     rt = pipeline.Runtime(paths, protocol)
     rt.bank.attach_device(args.device)
-    dev_queries = sorted([q for q, s in rt.view_query_split().items() if s == "dev"], key=lambda x: x.encode("utf-8"))
-    gold = inputs.load_split_gt(paths.dataset_root, "dev")
-    kinds = rt.dev_query_kinds(paths.dataset_root, dev_queries)
-    raw_dev_path = paths.work_dir / "raw" / "raw_dev.pkl"
-    if raw_dev_path.exists():
-        raw_dev = candidates.load_pickle(raw_dev_path)
+    queries = sorted([q for q, s in rt.view_query_split().items() if s == split],
+                     key=lambda x: x.encode("utf-8"))
+    gold = inputs.load_split_gt(paths.dataset_root, split)
+    kinds = inputs.split_query_kinds(paths.dataset_root, split)
+    kinds = {q: kinds.get(q, "unknown") for q in queries}
+    raw_path = paths.work_dir / "raw" / f"raw_{split}.pkl"
+    if raw_path.exists():
+        raw_split = candidates.load_pickle(raw_path)
     else:
-        raw_dev = candidates.build_raw(rt.z, rt.labels, query_ids=dev_queries, device=args.device,
-                                       progress=250, et_anchors=[])
-        candidates.save_pickle(raw_dev_path, raw_dev)
+        raw_split = candidates.build_raw(rt.z, rt.labels, query_ids=queries, device=args.device,
+                                         progress=250, et_anchors=[])
+        candidates.save_pickle(raw_path, raw_split)
 
-    out_dir = paths.work_dir / "seed13" / "eval"
+    import gzip
+
+    out_dir = paths.work_dir / f"seed{args.seed}" / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
     def _try_teacher(stage):
         try:
@@ -481,20 +493,42 @@ def cmd_evaluate_dev(args) -> int:
 
     rows: dict[str, dict[str, object]] = {}
     rankings: dict[str, dict[str, list[str]]] = {}
+    fixed_pool: dict[str, dict[str, list[str]]] = {}
 
     # Raw rows share the raw admission candidate pool.
-    raw_direct = {q: list(raw_dev["admission"][q]["direct"]) for q in dev_queries}
+    raw_direct = {q: list(raw_split["admission"][q]["direct"]) for q in queries}
     rankings["Raw_Direct"] = raw_direct
-    raw_two = {q: list(raw_dev["admission"][q]["C100"]) for q in dev_queries}
+    raw_two = {q: list(raw_split["admission"][q]["C100"]) for q in queries}
     rankings["Raw_two_way"] = raw_two
     if teacher_qt is not None:
         rankings["Raw_plus_T_QT"] = {q: _rank_from_scores(teacher_qt, rt, q, raw_two[q], args.device, paths=None)
-                                     for q in dev_queries}
+                                     for q in queries}
     if teacher_path is not None:
         rankings["Raw_plus_T_PATH_Real"] = {
-            q: _rank_from_paths(teacher_path, rt, raw_dev, q, raw_two[q], args.device) for q in dev_queries}
+            q: _rank_from_paths(teacher_path, rt, raw_split, q, raw_two[q], args.device) for q in queries}
+
+    # SPEC 12.5: the same fixed raw pool under each Teacher read-out, so the
+    # Teacher comparison never mixes candidate differences into the score gap.
+    if teacher_edge is not None:
+        fixed_pool["T_EDGE_QT"] = {q: _rank_from_scores(teacher_edge, rt, q, raw_two[q], args.device, paths=None)
+                                   for q in queries}
+    if teacher_qt is not None:
+        fixed_pool["T_QT"] = rankings["Raw_plus_T_QT"]
+    if teacher_path is not None:
+        # f0 is the same T_PATH weights with the evidence input removed.
+        fixed_pool["T_PATH_f0"] = {q: _rank_from_scores(teacher_path, rt, q, raw_two[q], args.device, paths=None)
+                                   for q in queries}
+        fixed_pool["T_PATH_Real"] = rankings["Raw_plus_T_PATH_Real"]
+        content_key, modality = inputs.bridge_content_keys(paths.dataset_root)
+        swap = evaluate.e_swap_map(content_key, modality)
+        (out_dir / f"{split.upper()}_ESWAP.json").write_text(json.dumps(
+            {"pairs": len(swap), "map": swap}, indent=1))
+        fixed_pool["T_PATH_Eswap"] = {
+            q: _rank_from_paths(teacher_path, rt, raw_split, q, raw_two[q], args.device, swapped=swap)
+            for q in queries}
 
     endpoints = ["S_KD_QE_C2", "S_KD_NATIVE_C2", "S_SUP_QE_C2", "S_KD_EONLY_C2"]
+    own = {}
     for stage in endpoints:
         ckpt = rt.stage_dir(args.seed, stage) / "checkpoint.pt"
         if not ckpt.exists():
@@ -502,21 +536,25 @@ def cmd_evaluate_dev(args) -> int:
         name = stage.replace("S_", "").replace("_C2", "")
         student = (rt.load_student(args.seed, stage, args.device, adapter=False)
                    if stage == "S_KD_NATIVE_C2" else rt.load_student(args.seed, stage, args.device))
-        retriever = retrieval.OwnRetriever(student, rt.bank, rt.labels.legal, raw_dev["text_assets"],
-                                           raw_dev["image_assets"], device=args.device)
-        two = {q: retriever.two_way(q) for q in dev_queries}
-        rankings[f"{name}_own_C100"] = {q: two[q]["C100"] for q in dev_queries}
-        rankings[f"{name}_own_D100"] = {q: [t for t, _ in two[q]["direct"]] for q in dev_queries}
+        # KD-EONLY is the same C1/adapter recipe with the query zeroed in the
+        # conditional input, so its second-hop vector must be built read_q=False.
+        retriever = retrieval.OwnRetriever(student, rt.bank, rt.labels.legal, raw_split["text_assets"],
+                                           raw_split["image_assets"], device=args.device,
+                                           read_q=stage != "S_KD_EONLY_C2")
+        two = {q: retriever.two_way(q) for q in queries}
+        own[name] = {"two": two, "retriever": retriever}
+        rankings[f"{name}_own_C100"] = {q: two[q]["C100"] for q in queries}
+        rankings[f"{name}_own_D100"] = {q: [t for t, _ in two[q]["direct"]] for q in queries}
         if teacher_qt is not None:
             rankings[f"{name}_plus_T_QT"] = {q: _rank_from_scores(teacher_qt, rt, q, two[q]["C100"], args.device,
-                                                                  paths=None) for q in dev_queries}
+                                                                  paths=None) for q in queries}
         if teacher_path is not None:
-            rankings[f"{name}_plus_T_PATH"] = {q: _rank_from_paths(teacher_path, rt, raw_dev, q, two[q]["C100"],
-                                                                   args.device) for q in dev_queries}
+            rankings[f"{name}_plus_T_PATH"] = {q: _rank_from_paths(teacher_path, rt, raw_split, q, two[q]["C100"],
+                                                                   args.device) for q in queries}
         if stage in ("S_KD_QE_C2", "S_KD_NATIVE_C2") and teacher_qt is not None:
-            direct_rank = {q: [t for t, _ in retriever.direct(q)] for q in dev_queries}
+            direct_rank = {q: [t for t, _ in retriever.direct(q)] for q in queries}
             rankings[f"{name}_D100_plus_T_QT"] = {
-                q: _rank_from_scores(teacher_qt, rt, q, direct_rank[q], args.device, paths=None) for q in dev_queries}
+                q: _rank_from_scores(teacher_qt, rt, q, direct_rank[q], args.device, paths=None) for q in queries}
 
     for name in ("QT_SUP", "QT_KD"):
         ckpt = rt.stage_dir(args.seed, f"S_{name}_C2") / "checkpoint.pt"
@@ -526,28 +564,82 @@ def cmd_evaluate_dev(args) -> int:
         payload = lineage.load_checkpoint(ckpt)
         model.load_state_dict(payload["state_dict"])
         model = model.to(args.device)
-        direct = retrieval.direct_only(model, rt.bank, rt.labels.legal, dev_queries, device=args.device)
-        rankings[f"{name}_D100"] = {q: [t for t, _ in direct[q]] for q in dev_queries}
+        direct = retrieval.direct_only(model, rt.bank, rt.labels.legal, queries, device=args.device)
+        rankings[f"{name}_D100"] = {q: [t for t, _ in direct[q]] for q in queries}
         if teacher_qt is not None:
             rankings[f"{name}_plus_T_QT"] = {q: _rank_from_scores(teacher_qt, rt, q, rankings[f"{name}_D100"][q],
-                                                                  args.device, paths=None) for q in dev_queries}
+                                                                  args.device, paths=None) for q in queries}
 
     for name, ranking in rankings.items():
         rows[name] = evaluate.grouped_metrics(gold, ranking, kinds)
-    (out_dir / "DEV_METRICS.json").write_text(json.dumps(rows, indent=1))
-    import gzip
-
-    with gzip.open(out_dir / "DEV_RANKINGS.json.gz", "wt", encoding="utf-8") as fh:
+    (out_dir / f"{split.upper()}_METRICS.json").write_text(json.dumps(rows, indent=1))
+    with gzip.open(out_dir / f"{split.upper()}_RANKINGS.json.gz", "wt", encoding="utf-8") as fh:
         json.dump(rankings, fh)
-    probe_pairs = rt.dev_probe_pairs(paths.dataset_root, dev_queries, raw_dev)
-    if probe_pairs:
-        qe = rt.load_student(args.seed, "S_KD_QE_C2", args.device)
-        eonly = rt.load_student(args.seed, "S_KD_EONLY_C2", args.device)
-        (out_dir / "PROBE.json").write_text(json.dumps({
-            "KD_QE": evaluate.probe_et(qe, rt.bank, rt.labels.legal, probe_pairs, args.device),
-            "KD_EONLY": evaluate.probe_et(eonly, rt.bank, rt.labels.legal, probe_pairs, args.device),
-        }, indent=1))
-    print(json.dumps({"event": "evaluate_dev", "systems": len(rows), "dev_queries": len(dev_queries)}))
+    if fixed_pool:
+        (out_dir / f"{split.upper()}_FIXED_POOL.json").write_text(json.dumps(
+            {name: evaluate.grouped_metrics(gold, ranking, kinds) for name, ranking in fixed_pool.items()}, indent=1))
+        # Keep the per-query ids too: SPEC 12.5 requires the three Teacher
+        # differences to be recomputable on the identical frozen pool.
+        with gzip.open(out_dir / f"{split.upper()}_FIXED_RANKINGS.json.gz", "wt", encoding="utf-8") as fh:
+            json.dump(fixed_pool, fh)
+
+    # SPEC 12.4 strict evidence-only retention for the two conditional endpoints.
+    strict = {}
+    for stage, read_q in (("S_KD_QE_C2", True), ("S_KD_EONLY_C2", False)):
+        name = stage.replace("S_", "").replace("_C2", "")
+        if name not in own:
+            continue
+        two, retriever = own[name]["two"], own[name]["retriever"]
+        d_ann = {q: [t for t, _ in two[q]["direct"]] for q in queries}
+        d_exact = {q: retriever.direct_exact(q) for q in queries}
+        strict[name] = evaluate.strict_report(
+            gold, {q: two[q]["evidence"] for q in queries}, d_ann, d_exact,
+            rankings[f"{name}_plus_T_PATH"],
+            pools={"U": {q: two[q]["U"] for q in queries}, "C100": {q: two[q]["C100"] for q in queries}},
+        )
+    if strict:
+        (out_dir / f"{split.upper()}_STRICT.json").write_text(json.dumps(strict, indent=1))
+
+    if teacher_path is not None and "T_PATH_Real" in fixed_pool:
+        # SPEC 12.5: the three Teacher contrasts are computed on the SAME frozen
+        # raw pool, so a difference is a read-out/input effect and never a
+        # candidate-pool effect.  The main-method row (own C100) is reported
+        # separately and is not mixed into these deltas.
+        stats = {}
+        base = fixed_pool["T_PATH_Real"]
+        for label, other in (("T_PATH_Real_vs_T_QT", fixed_pool.get("T_QT")),
+                             ("T_PATH_Real_vs_f0", fixed_pool.get("T_PATH_f0")),
+                             ("T_PATH_Real_vs_Eswap", fixed_pool.get("T_PATH_Eswap"))):
+            if other is None:
+                continue
+            stats[label] = {
+                "candidate_pool": "raw C100 (fixed, identical ids for both rows)",
+                "wlt": evaluate.wlt(gold, base, other),
+                "bootstrap": evaluate.bootstrap_delta(gold, base, other, rt.view.query_source_group, 10),
+            }
+        main = rankings.get("KD_QE_plus_T_PATH")
+        qt = rankings.get("KD_QE_plus_T_QT")
+        if main is not None and qt is not None:
+            stats["KD_QE_own_C100_T_PATH_vs_T_QT"] = {
+                "candidate_pool": "KD-QE own C100 (identical ids for both rows)",
+                "wlt": evaluate.wlt(gold, main, qt),
+                "bootstrap": evaluate.bootstrap_delta(gold, main, qt, rt.view.query_source_group, 10),
+            }
+        (out_dir / f"{split.upper()}_STATS.json").write_text(json.dumps(stats, indent=1))
+
+    # SPEC 12.3 defines the conditional second-hop probe on the dev split only;
+    # the test split is used once for the final table and is not probed.
+    if split == "dev":
+        probe_pairs = rt.dev_probe_pairs(paths.dataset_root, queries, raw_split, split=split)
+        if probe_pairs:
+            qe = rt.load_student(args.seed, "S_KD_QE_C2", args.device)
+            eonly = rt.load_student(args.seed, "S_KD_EONLY_C2", args.device)
+            (out_dir / f"{split.upper()}_PROBE.json").write_text(json.dumps({
+                "KD_QE": evaluate.probe_et(qe, rt.bank, rt.labels.legal, probe_pairs, args.device),
+                "KD_EONLY": evaluate.probe_et(eonly, rt.bank, rt.labels.legal, probe_pairs, args.device, read_q=False),
+            }, indent=1))
+    print(json.dumps({"event": f"evaluate_{split}", "systems": len(rows),
+                      "fixed_pool": len(fixed_pool), "queries": len(queries)}))
     return 0
 
 
@@ -558,11 +650,11 @@ def _rank_from_scores(teacher, rt, qid, candidates, device, *, paths):
     return sorted(scores, key=lambda t: (-scores[t], t.encode("utf-8")))
 
 
-def _rank_from_paths(teacher, rt, raw_dev, qid, candidates, device):
+def _rank_from_paths(teacher, rt, raw_dev, qid, candidates, device, *, swapped=None):
     from fresh_path.evaluate import rerank_path
 
     paths = raw_dev["admission"][qid]["paths"]
-    scores = rerank_path(teacher, rt.bank, qid, candidates, paths, device)
+    scores = rerank_path(teacher, rt.bank, qid, candidates, paths, device, swapped=swapped)
     return sorted(scores, key=lambda t: (-scores[t], t.encode("utf-8")))
 
 
@@ -621,12 +713,20 @@ def _stage_completed(paths, seed: int, stage: str, expected) -> bool:
         checkpoint_payload = lineage.load_checkpoint(checkpoint)
     except Exception:
         return False
-    required = {"rng_state", "data_state", "optimizer_state_dict"}
+    # Early QT-only jobs used an accidental double-S receipt name and were
+    # written before strict epoch-resume metadata was added.  A checkpoint at
+    # the fixed terminal epoch is reusable without resuming its RNG stream;
+    # incomplete checkpoints still go through _resume_stage and require the
+    # full optimizer/RNG/order contract.
+    accepted_names = {stage, f"S_{stage}"} if stage.startswith("S_") else {stage}
+    required = {"state_dict", "optimizer_state_dict", "counters"}
     return (
         int(payload.get("epoch", -1)) == int(expected)
-        and checkpoint_payload.get("stage") == stage
+        and payload.get("stage") in accepted_names
+        and checkpoint_payload.get("stage") in accepted_names
         and checkpoint_payload.get("model_seed") == seed
         and int(checkpoint_payload.get("epoch", -1)) == int(expected)
+        and checkpoint_payload.get("protocol_hash") == lineage.protocol_hash(paths.protocol)
         and required <= set(checkpoint_payload)
     )
 
@@ -723,6 +823,111 @@ def cmd_run(args) -> int:
 
 
 
+def cmd_evaluate_test(args) -> int:
+    """SPEC 12.6: the original test split, opened exactly once after locking."""
+    return _evaluate_split(args, split="test")
+
+
+def _metric(rows: dict, system: str, group: str, key: str = "R10") -> float | None:
+    entry = rows.get(system)
+    if not entry:
+        return None
+    bucket = entry.get(group)
+    if not bucket:
+        return None
+    return float(bucket[key])
+
+
+def cmd_decide_repeat(args) -> int:
+    """SPEC 13.3 repeat gate: pure arithmetic on the completed seed13 dev tables."""
+    paths = _paths(args)
+    protocol = _protocol(args)
+    out_dir = paths.work_dir / f"seed{args.seed}" / "eval"
+    metrics_path = out_dir / "DEV_METRICS.json"
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"{metrics_path}: run evaluate-dev first")
+    rows = json.loads(metrics_path.read_text())
+    gate = protocol["repeat_gate"]
+
+    main = "KD_QE_plus_T_PATH"
+    raw_same_teacher = "Raw_plus_T_PATH_Real"
+    checks: list[dict] = []
+
+    def add(name: str, lhs: float | None, rhs: float | None, minimum: float, *, note: str = "") -> None:
+        if lhs is None or rhs is None:
+            checks.append({"name": name, "status": "EVIDENCE_INSUFFICIENT", "note": note or "metric missing"})
+            return
+        delta = lhs - rhs
+        checks.append({"name": name, "lhs": lhs, "rhs": rhs, "delta": delta,
+                       "minimum": minimum, "passed": bool(delta >= minimum), "note": note})
+
+    add("R10_main_minus_raw_same_teacher",
+        _metric(rows, main, "overall"), _metric(rows, raw_same_teacher, "overall"),
+        gate["R10_main_minus_raw_same_teacher_min"])
+    add("implicit_main_minus_raw_same_teacher",
+        _metric(rows, main, "implicit"), _metric(rows, raw_same_teacher, "implicit"),
+        gate["implicit_main_minus_raw_same_teacher_min"])
+    add("R10_path_minus_same_teacher_QT",
+        _metric(rows, "Raw_plus_T_PATH_Real", "overall"), _metric(rows, "Raw_plus_T_QT", "overall"),
+        gate["R10_path_minus_same_teacher_QT_min"])
+    add("R10_path_minus_independently_trained_QT",
+        _metric(rows, "Raw_plus_T_PATH_Real", "overall"), _metric(rows, "Raw_plus_T_QT", "overall"),
+        gate["R10_path_minus_independently_trained_QT_min"])
+    add("ET_R10_QE_minus_EONLY",
+        _metric(rows, "KD_QE_plus_T_PATH", "overall"), _metric(rows, "KD_EONLY_plus_T_PATH", "overall"),
+        gate["ET_R10_QE_minus_EONLY_min"])
+    add("R10_KD_minus_SUP",
+        _metric(rows, main, "overall"), _metric(rows, "SUP_QE_plus_T_PATH", "overall"),
+        gate["R10_KD_minus_SUP_min"])
+
+    strict_path = out_dir / "DEV_STRICT.json"
+    strict = json.loads(strict_path.read_text()) if strict_path.exists() else {}
+    qe_strict = strict.get("KD_QE", {}).get("strict_pairs")
+    eo_strict = strict.get("KD_EONLY", {}).get("strict_pairs")
+    if qe_strict is None:
+        checks.append({"name": "strict_EO_total_gt_pairs", "status": "EVIDENCE_INSUFFICIENT",
+                       "note": "STRICT.json missing"})
+    else:
+        checks.append({"name": "strict_EO_total_gt_pairs", "lhs": qe_strict,
+                       "minimum": gate["strict_EO_total_gt_pairs_min"],
+                       "passed": bool(qe_strict >= gate["strict_EO_total_gt_pairs_min"])})
+        qe_ret = strict.get("KD_QE", {}).get("retained", {}).get("C100")
+        eo_ret = strict.get("KD_EONLY", {}).get("retained", {}).get("C100")
+        if qe_ret is None or eo_ret is None:
+            checks.append({"name": "strict_EO_retained_QE_minus_EONLY", "status": "EVIDENCE_INSUFFICIENT",
+                           "note": "strict retention missing"})
+        else:
+            checks.append({"name": "strict_EO_retained_QE_minus_EONLY",
+                           "lhs": qe_ret, "rhs": eo_ret, "delta": qe_ret - eo_ret,
+                           "minimum": gate["strict_EO_retained_QE_minus_EONLY_min"],
+                           "passed": bool(qe_ret - eo_ret >= gate["strict_EO_retained_QE_minus_EONLY_min"])})
+
+    # The fixed-pool implicit Real-vs-E-swap contrast needs both rows.
+    fixed_path = out_dir / "DEV_FIXED_POOL.json"
+    if fixed_path.exists():
+        fixed = json.loads(fixed_path.read_text())
+        add("implicit_R10_real_minus_Eswap",
+            _metric(fixed, "T_PATH_Real", "implicit"), _metric(fixed, "T_PATH_Eswap", "implicit"),
+            gate["implicit_R10_real_minus_Eswap_min"])
+
+    decided = all(c.get("passed") for c in checks if "passed" in c)
+    insufficient = any(c.get("status") == "EVIDENCE_INSUFFICIENT" for c in checks)
+    decision = "COMPLETE_SEED13_STOP_NO_REPEAT" if (not decided or insufficient) else "REPEAT_SEED29"
+    payload = {
+        "seed": args.seed,
+        "decision": decision,
+        "repeat_authorised": decision == "REPEAT_SEED29",
+        "gate": gate,
+        "checks": checks,
+        "note": ("SPEC 13.3: any unmet condition locks seed13 only and ends after the "
+                 "single mandated test evaluation."),
+    }
+    (paths.work_dir / "DECISION.json").write_text(json.dumps(payload, indent=1))
+    print(json.dumps({"event": "decide_repeat", "decision": decision,
+                      "failed": [c["name"] for c in checks if c.get("passed") is False]}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="run_stage1_fresh_path")
     ap.add_argument("--dataset-root", required=True)
@@ -792,6 +997,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda:0")
     p.set_defaults(func=cmd_evaluate_dev)
 
+    p = sub.add_parser("evaluate-test")
+    p.add_argument("--seed", type=int, default=13)
+    p.add_argument("--device", default="cuda:0")
+    p.set_defaults(func=cmd_evaluate_test)
+
+    p = sub.add_parser("decide-repeat")
+    p.add_argument("--seed", type=int, default=13)
+    p.set_defaults(func=cmd_decide_repeat)
+
     return ap
 
 
@@ -803,6 +1017,15 @@ def main(argv=None) -> int:
     # unaffected numerically.
     torch.set_num_threads(int(os.environ.get("MMDD_CPU_THREADS", "8")))
     args = build_parser().parse_args(argv)
+    # Initialize the CUDA context in the top-level stage process.  On this host
+    # a lazy first allocation from ObjectBank can intermittently fail even when
+    # the device is visible; eagerly selecting the requested physical ordinal
+    # keeps the normal CLI path deterministic without changing any computation.
+    device = getattr(args, "device", None)
+    if device is not None and str(device).startswith("cuda"):
+        requested = torch.device(device)
+        torch.cuda.init()
+        torch.cuda.set_device(requested)
     return args.func(args)
 
 

@@ -20,7 +20,7 @@ from .inputs import TrainLabels
 from .losses import mean_active
 from .score import ObjectBank
 from .teacher_cache import FrozenTeacherLogitCache
-from .train_teacher import PATH_BLOCK
+from .train_teacher import PATH_BLOCK, rank_active
 
 
 # ------------------------------------------------------------ vector helpers ---
@@ -84,9 +84,10 @@ def edge_losses(model, teacher, bank: ObjectBank, labels: TrainLabels, query_id:
             relation = key
             logits = first_hop_logits(model, bank, query_id, key[2:], candidates, device)
         else:
-            relation = "ET"
-            logits = et_logits(model, bank, key[2:], candidates, device)
-        loss = rank_loss(logits, p, allowed)
+            asset = key[2:]
+            relation = f"E_{bank.kind(asset)}"
+            logits = et_logits(model, bank, asset, candidates, device)
+        loss = rank_loss(logits, p, allowed, active=rank_active(candidates, positives))
         if kd:
             from .train_teacher import pair_logits
 
@@ -294,7 +295,7 @@ def conditional_c2_query(model, teacher, bank: ObjectBank, labels: TrainLabels, 
         full = streamed_full_loss(
             v_qe, keys_full, pos_mask, legal_mask, full_chunk,
             active=condition.full_active, chunk_activity=condition.full_chunk_activity,
-            validate_finite=False,
+            validate_finite=False, validate_masks=False,
         )
         if full is not None:
             full_terms.append(full)
@@ -323,7 +324,7 @@ def conditional_c2_query(model, teacher, bank: ObjectBank, labels: TrainLabels, 
                 t: tuple(dict.fromkeys([*per_target[t], augmented_e])) for t in graph
             }
         flat = [(e, t) for t in graph for e in per_target[t]]
-        path_scores = _conditional_path_scores(model, bank, query_id, flat, device)
+        path_scores = _conditional_path_scores(model, bank, query_id, flat, device, read_q=read_q)
         stacked = []
         cursor = 0
         for i, t in enumerate(graph):
@@ -352,19 +353,56 @@ def conditional_c2_query(model, teacher, bank: ObjectBank, labels: TrainLabels, 
     )
 
 
-def _conditional_path_scores(model, bank: ObjectBank, query_id: str, flat: Sequence[tuple[str, str]], device) -> torch.Tensor:
+def _grouped_path_scores(
+    flat: Sequence[tuple[str, str]],
+    score_group,
+    *,
+    device,
+) -> torch.Tensor:
+    """Score grouped paths and restore the caller's original slot order.
+
+    Grouping avoids repeating the query/evidence encoding, but concatenating
+    group outputs directly changes ``[(e1,t1),(e2,t1),...]`` into evidence-
+    major order.  The inverse permutation below is a differentiable gather,
+    so both values and gradients remain aligned with the original slots.
+    """
     if not flat:
         return torch.zeros(0, device=device)
-    out = []
-    by_asset: dict[str, list[str]] = {}
-    for e, t in flat:
-        by_asset.setdefault(e, []).append(t)
-    for e, targets in by_asset.items():
-        v_qe = adapter_vector(model, bank, query_id, e, device)
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    for slot, (evidence_id, target_id) in enumerate(flat):
+        grouped.setdefault(evidence_id, []).append((slot, target_id))
+    values: list[torch.Tensor] = []
+    positions: list[int] = []
+    for evidence_id, items in grouped.items():
+        scores = score_group(evidence_id, [target for _, target in items]).reshape(-1)
+        if scores.numel() != len(items):
+            raise ValueError("grouped path scorer returned the wrong number of slots")
+        values.append(scores)
+        positions.extend(slot for slot, _ in items)
+    grouped_values = torch.cat(values)
+    inverse = torch.argsort(torch.tensor(positions, dtype=torch.long, device=grouped_values.device))
+    return grouped_values[inverse]
+
+
+def _conditional_path_scores(
+    model,
+    bank: ObjectBank,
+    query_id: str,
+    flat: Sequence[tuple[str, str]],
+    device,
+    *,
+    read_q: bool = True,
+) -> torch.Tensor:
+    if not flat:
+        return torch.zeros(0, device=device)
+
+    def score_group(evidence_id: str, targets: Sequence[str]) -> torch.Tensor:
+        v_qe = adapter_vector(model, bank, query_id, evidence_id, device, read_q=read_q)
         keys = target_keys(model, bank, targets, device)
-        first = first_hop_logits(model, bank, query_id, bank.kind(e), [e], device)[0]
-        out.append((v_qe @ keys.T).reshape(-1) + first)
-    return torch.cat(out)
+        first = first_hop_logits(model, bank, query_id, bank.kind(evidence_id), [evidence_id], device)[0]
+        return (v_qe @ keys.T).reshape(-1) + first
+
+    return _grouped_path_scores(flat, score_group, device=device)
 
 
 def teacher_target_view(teacher, bank: ObjectBank, raw: dict, query_id: str, graph: Sequence[str],
@@ -405,8 +443,9 @@ def train_conditional_c2(model, teacher, bank: ObjectBank, labels: TrainLabels, 
                          counters: dict | None = None,
                          teacher_cache: FrozenTeacherLogitCache | None = None,
                          conditional_registry=None,
+                         anchor_registry=None,
                          log=print) -> dict:
-    from .train_teacher import _accumulate, _epoch_data_state, _save, _save_initial, anchor_choice, query_order
+    from .train_teacher import _accumulate, _epoch_data_state, _save, _save_initial, build_anchor_registry, query_order
 
     for param in model.parameters():
         param.requires_grad_(False)
@@ -421,6 +460,7 @@ def train_conditional_c2(model, teacher, bank: ObjectBank, labels: TrainLabels, 
     static_index = build_c2_static_index(
         labels, raw, graph, full_chunk=full_chunk, conditional_registry=conditional_registry,
     )
+    anchor_registry = anchor_registry or build_anchor_registry(labels, epochs)
     model.eval()
     counters = dict(counters or {"updates": 0, "active_queries": 0, "items": 0, "zero_trainable_path": 0})
     _save_initial(model, optimizer, out_dir, seed, stage, protocol_path, parent_dirs)
@@ -430,7 +470,7 @@ def train_conditional_c2(model, teacher, bank: ObjectBank, labels: TrainLabels, 
         pending = 0
         encode_cache: dict = {}
         for qid in order:
-            anchor = anchor_choice(labels, qid, epoch)
+            anchor = anchor_registry[epoch][qid]
             terms, target_terms = conditional_c2_query(
                 model, teacher, bank, labels, raw, qid, graph[qid], keys_full, legal_index, device,
                 kd=kd, read_q=not eonly, full_chunk=full_chunk, batch=batch, anchor=anchor,
@@ -492,7 +532,8 @@ def native_query_loss(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, 
     s_direct = qt_logits(model, bank, query_id, graph, device)
     p = torch.tensor([t in positives for t in graph], dtype=torch.bool, device=device)
     allowed = torch.ones(len(graph), dtype=torch.bool, device=device)
-    sup_direct = rank_loss(s_direct, p, allowed)
+    active = rank_active(graph, positives)
+    sup_direct = rank_loss(s_direct, p, allowed, active=active)
     t_direct = pair_logits(
         teacher_qt, bank, query_id, graph, device, batch=batch,
         teacher_cache=teacher_cache, encode_cache=encode_cache, view="native:direct",
@@ -522,7 +563,7 @@ def native_query_loss(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, 
             else:
                 stacked.append(zero[i])
         S = torch.stack(stacked)
-        path_sup.append(rank_loss(S, p, allowed))
+        path_sup.append(rank_loss(S, p, allowed, active=active))
         t_scores = native_teacher_paths(
             teacher_qt, bank, raw, query_id, graph, augmented_e, device, batch=batch,
             teacher_cache=teacher_cache, encode_cache=encode_cache,
@@ -543,18 +584,15 @@ def native_query_loss(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, 
 def _native_path_scores(model, bank: ObjectBank, query_id: str, flat: Sequence[tuple[str, str]], device) -> torch.Tensor:
     if not flat:
         return torch.zeros(0, device=device)
-    out = []
-    by_asset: dict[str, list[str]] = {}
-    for e, t in flat:
-        by_asset.setdefault(e, []).append(t)
-    for e, targets in by_asset.items():
-        kind = bank.kind(e)
-        ue = model.u(kind, bank.z(e).to(device))
+    def score_group(evidence_id: str, targets: Sequence[str]) -> torch.Tensor:
+        kind = bank.kind(evidence_id)
+        ue = model.u(kind, bank.z(evidence_id).to(device))
         v_e = ue @ model.relations[f"{kind}_to_T"]
         keys = target_keys(model, bank, targets, device)
-        first = first_hop_logits(model, bank, query_id, kind, [e], device)[0]
-        out.append((v_e @ keys.T).reshape(-1) + first)
-    return torch.cat(out)
+        first = first_hop_logits(model, bank, query_id, kind, [evidence_id], device)[0]
+        return (v_e @ keys.T).reshape(-1) + first
+
+    return _grouped_path_scores(flat, score_group, device=device)
 
 
 def native_teacher_paths(teacher_qt, bank: ObjectBank, raw: dict, query_id: str, graph: Sequence[str],
@@ -601,8 +639,10 @@ def train_native(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, raw: 
                  protocol_path: Path, parent_dirs: list[Path], optimizer=None, start_epoch: int = 1,
                  counters: dict | None = None,
                  batch: int = 32, teacher_cache: FrozenTeacherLogitCache | None = None,
+                 anchor_registry=None,
                  log=print) -> dict:
-    from .train_teacher import _epoch_data_state, _finish_batch, _save, _save_initial, anchor_choice, backward_scaled, query_order
+    from .train_teacher import (_epoch_data_state, _finish_batch, _save, _save_initial,
+                                backward_scaled, build_anchor_registry, query_order)
 
     for param in model.parameters():
         param.requires_grad_(True)
@@ -611,6 +651,7 @@ def train_native(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, raw: 
     optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
     model.train()
     counters = dict(counters or {"updates": 0, "active_queries": 0, "items": 0})
+    anchor_registry = anchor_registry or build_anchor_registry(labels, epochs)
     _save_initial(model, optimizer, out_dir, seed, "S_KD_NATIVE_C2", protocol_path, parent_dirs)
     for epoch in range(start_epoch, epochs + 1):
         order = query_order(labels, seed, epoch, namespace="order")
@@ -620,7 +661,7 @@ def train_native(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, raw: 
             done = 0
             encode_cache: dict = {}
             for qid in batch_q:
-                anchor = anchor_choice(labels, qid, epoch)
+                anchor = anchor_registry[epoch][qid]
                 loss = native_query_loss(
                     model, teacher_qt, bank, labels, raw, qid, graph[qid], device, anchor,
                     batch=batch, teacher_cache=teacher_cache, encode_cache=encode_cache,
@@ -681,13 +722,58 @@ def qt_c2_kd_list(teacher_qt, bank: ObjectBank, labels: TrainLabels, raw: dict, 
     return list(dict.fromkeys([*positives, *hard_ids, *rand]))
 
 
+@dataclass(frozen=True)
+class QTListIndex:
+    candidates: tuple[str, ...]
+    teacher_logits: torch.Tensor | None
+
+
+def build_qt_static_registry(teacher_qt, bank: ObjectBank, labels: TrainLabels, raw: dict, *,
+                             stage: str, device, batch: int = 128,
+                             teacher_cache: FrozenTeacherLogitCache | None = None,
+                             log=print) -> dict[str, QTListIndex]:
+    """Freeze QT candidate lists and all T_QT logits before epoch training."""
+    if not stage.endswith("_C1") and "KD" not in stage:
+        return {}
+    if "KD" in stage:
+        teacher_qt.eval()
+    registry: dict[str, QTListIndex] = {}
+    query_ids = sorted(labels.queries, key=lambda x: x.encode("utf-8"))
+    with torch.no_grad():
+        for number, query_id in enumerate(query_ids, 1):
+            encode_cache: dict = {}
+            if stage.endswith("_C1"):
+                candidates = qt_c1_list(labels, raw, query_id)
+                view = "qt_c1"
+            else:
+                candidates = qt_c2_kd_list(
+                    teacher_qt, bank, labels, raw, query_id, device, batch=batch,
+                    teacher_cache=teacher_cache, encode_cache=encode_cache,
+                )
+                view = "qt_c2_kd"
+            teacher_logits = None
+            if "KD" in stage:
+                from .train_teacher import pair_logits
+
+                teacher_logits = pair_logits(
+                    teacher_qt, bank, query_id, candidates, device, batch=batch,
+                    teacher_cache=teacher_cache, encode_cache=encode_cache, view=view,
+                ).detach().to(dtype=torch.float32, device="cpu")
+            registry[query_id] = QTListIndex(tuple(candidates), teacher_logits)
+            if log and number % 250 == 0:
+                log(json.dumps({"event": "static_registry", "stage": stage, "queries": number}))
+    if teacher_cache is not None:
+        teacher_cache.save()
+    return registry
+
+
 def streamed_full_trainable(model, bank: ObjectBank, query_id: str, positives: set[str], legal: Sequence[str],
                             device, *, chunk: int = 4096) -> torch.Tensor | None:
     """Full-denominator loss whose target keys follow the current P (trainable)."""
+    if not rank_active(legal, positives):
+        return None
     q = model.query(bank.z(query_id).to(device))
     legal_tensor = torch.tensor([t in positives for t in legal], dtype=torch.bool, device=device)
-    if not legal_tensor.any():
-        return None
     alls, poss = [], []
     for start in range(0, len(legal), chunk):
         group = legal[start : start + chunk]
@@ -695,10 +781,8 @@ def streamed_full_trainable(model, bank: ObjectBank, query_id: str, positives: s
         scores = q @ keys.T
         p = legal_tensor[start : start + chunk]
         alls.append(torch.logsumexp(scores, 0))
-        if p.any():
+        if any(t in positives for t in group):
             poss.append(torch.logsumexp(scores[p], 0))
-    if not poss:
-        return None
     return torch.logsumexp(torch.stack(alls), 0) - torch.logsumexp(torch.stack(poss), 0)
 
 
@@ -707,7 +791,7 @@ def train_qt_student(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, r
                      out_dir: Path, protocol_path: Path, parent_dirs: list[Path], optimizer=None,
                      start_epoch: int = 1, counters: dict | None = None, batch: int = 128, full_chunk: int = 4096,
                      teacher_cache: FrozenTeacherLogitCache | None = None, log=print) -> dict:
-    from .train_teacher import _epoch_data_state, _finish_batch, _save, _save_initial, backward_scaled, pair_logits, query_order
+    from .train_teacher import _epoch_data_state, _finish_batch, _save, _save_initial, backward_scaled, query_order
 
     checkpoint_stage = stage if stage.startswith("S_") else f"S_{stage}"
     for param in model.parameters():
@@ -715,6 +799,10 @@ def train_qt_student(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, r
     optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
     model.train()
     counters = dict(counters or {"updates": 0, "active_queries": 0, "items": 0})
+    qt_registry = build_qt_static_registry(
+        teacher_qt, bank, labels, raw, stage=stage, device=device, batch=batch,
+        teacher_cache=teacher_cache, log=log,
+    )
     _save_initial(model, optimizer, out_dir, seed, checkpoint_stage, protocol_path, parent_dirs)
     for epoch in range(start_epoch, epochs + 1):
         order = query_order(labels, seed, epoch, namespace="order")
@@ -722,38 +810,28 @@ def train_qt_student(model, teacher_qt, bank: ObjectBank, labels: TrainLabels, r
             batch_q = order[batch_start : batch_start + logical_batch]
             active = len(batch_q)
             done = 0
-            encode_cache: dict = {}
             for qid in batch_q:
                 entry = labels.queries[qid]
                 positives = set(entry["G"])
                 if stage.endswith("_C1"):
-                    candidates = qt_c1_list(labels, raw, qid)
+                    prepared = qt_registry[qid]
+                    candidates = list(prepared.candidates)
                     logits = model(bank.z(qid).to(device), bank.z_many(candidates).to(device))
                     p = torch.tensor([t in positives for t in candidates], dtype=torch.bool, device=device)
                     allowed = torch.ones(len(candidates), dtype=torch.bool, device=device)
-                    loss = rank_loss(logits, p, allowed)
+                    loss = rank_loss(logits, p, allowed, active=rank_active(candidates, positives))
                     if "KD" in stage:
-                        t_logits = pair_logits(
-                            teacher_qt, bank, qid, candidates, device, batch=batch,
-                            teacher_cache=teacher_cache, encode_cache=encode_cache,
-                            view="qt_c1",
-                        ).detach()
+                        t_logits = prepared.teacher_logits.to(device)
                         kd_term = kd_loss(logits, t_logits, allowed, temperature=2.0)
                         loss = kd_term if loss is None else loss + kd_term
                 else:
                     loss = streamed_full_trainable(model, bank, qid, positives, raw["legal"], device, chunk=full_chunk)
                     if loss is not None and "KD" in stage:
-                        candidates = qt_c2_kd_list(
-                            teacher_qt, bank, labels, raw, qid, device, batch=batch,
-                            teacher_cache=teacher_cache, encode_cache=encode_cache,
-                        )
+                        prepared = qt_registry[qid]
+                        candidates = list(prepared.candidates)
                         logits = model(bank.z(qid).to(device), bank.z_many(candidates).to(device))
                         allowed = torch.ones(len(candidates), dtype=torch.bool, device=device)
-                        t_logits = pair_logits(
-                            teacher_qt, bank, qid, candidates, device, batch=batch,
-                            teacher_cache=teacher_cache, encode_cache=encode_cache,
-                            view="qt_c2_kd",
-                        ).detach()
+                        t_logits = prepared.teacher_logits.to(device)
                         loss = loss + kd_loss(logits, t_logits, allowed, temperature=2.0)
                 if loss is None:
                     continue

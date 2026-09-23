@@ -22,6 +22,37 @@ HNSW_SEED = 20260920
 HNSW_THREADS = 1
 
 
+@dataclass(frozen=True)
+class PathPool:
+    """A model-owned path pool with explicit generator identity.
+
+    Candidate IDs and retained evidence paths are produced by the same
+    retriever instance.  Keeping the identity beside the data prevents an
+    evaluator from silently falling back to the raw split's paths.
+    """
+
+    query_id: str
+    generator_id: str
+    checkpoint_sha: str
+    candidates: tuple[str, ...]
+    paths: dict[str, list[list[object]]]
+
+    def validate(self, *, expected_generator: str, expected_checkpoint: str | None = None) -> None:
+        if self.generator_id != expected_generator:
+            raise ValueError("foreign generator paths")
+        if expected_checkpoint is not None and self.checkpoint_sha != expected_checkpoint:
+            raise ValueError("foreign checkpoint paths")
+        if len(set(self.candidates)) != len(self.candidates):
+            raise ValueError("duplicate candidates")
+        candidate_set = set(self.candidates)
+        if any(target not in candidate_set for target in self.paths):
+            raise ValueError("path pool contains foreign target")
+        for entries in self.paths.values():
+            evidence = [str(entry[0]) for entry in entries]
+            if len(evidence) != len(set(evidence)):
+                raise ValueError("path pool requires canonical evidence dedup")
+
+
 @dataclass
 class Index:
     index: object
@@ -89,13 +120,24 @@ def retain_paths(paths: dict[str, list[tuple[float, str]]], *, content_key: dict
 
 
 class OwnRetriever:
-    """Per-model Direct / first-hop / second-hop retrieval over its own vectors."""
+    """Per-model Direct / first-hop / second-hop retrieval over its own vectors.
+
+    The second hop must use the same vector function as training (SPEC 8.3:
+    ``train/full exact/ANN/cache`` all call one function).  For the conditional
+    endpoints that is the C2 adapter ``v_qe = adapter(u_q, u_e, base)``; for the
+    old-style KD-NATIVE endpoint, which has no adapter, it is the plain
+    ``u_e @ R_{e->T}``.  ``read_q=False`` is the Q-zeroed E-only control.
+    """
 
     def __init__(self, model, bank, legal: Sequence[str], text_ids: Sequence[str], image_ids: Sequence[str],
-                 *, device: str = "cpu", chunk: int = 4096) -> None:
+                 *, device: str = "cpu", chunk: int = 4096, read_q: bool = True,
+                 generator_id: str = "own", checkpoint_sha: str = "") -> None:
         self.model = model
         self.bank = bank
         self.device = torch.device(device)
+        self.read_q = read_q
+        self.generator_id = generator_id
+        self.checkpoint_sha = checkpoint_sha
         self.legal = list(legal)
         self.text_ids = list(text_ids)
         self.image_ids = list(image_ids)
@@ -132,6 +174,13 @@ class OwnRetriever:
     def direct(self, qid: str, k: int = 100) -> list[tuple[str, float]]:
         return self.target_index.search(self._query_vector(qid, "QT"), k)
 
+    def direct_exact(self, qid: str, k: int = 100) -> list[str]:
+        """Exact full-space Direct ranking (SPEC 12.4 ``D_exact100``)."""
+        query = self._query_vector(qid, "QT")
+        scores = self.target_vectors @ query
+        order = sorted(range(len(self.legal)), key=lambda i: (-float(scores[i]), self.legal[i].encode("utf-8")))
+        return [self.legal[i] for i in order[:k]]
+
     def first_hop(self, qid: str, modality: str, k: int = 20) -> list[tuple[str, float]]:
         key = (qid, modality)
         if key not in self._first_hop:
@@ -139,9 +188,21 @@ class OwnRetriever:
             self._first_hop[key] = index.search(self._query_vector(qid, f"Q_to_{modality}"), k)
         return self._first_hop[key]
 
-    def second_hop(self, evidence_id: str, modality: str, k: int = 20) -> list[tuple[str, float]]:
-        return self.target_index.search(
-            self._query_vector(None, f"{modality}_to_T", evidence_id=evidence_id, kind=modality), k)
+    @torch.no_grad()
+    def _second_hop_vector(self, qid: str, evidence_id: str, modality: str) -> np.ndarray:
+        """Conditional (or native) second-hop query vector, matching training."""
+        if getattr(self.model, "adapter", None) is None:
+            # KD-NATIVE: plain unconditional E->T, no conditional module exists.
+            ue = self.model.u(modality, self.bank.z(evidence_id).to(self.device))
+            vec = ue @ self.model.relations[f"{modality}_to_T"]
+        else:
+            from .train_student import adapter_vector
+
+            vec = adapter_vector(self.model, self.bank, qid, evidence_id, self.device, read_q=self.read_q)
+        return vec.float().cpu().numpy()
+
+    def second_hop(self, qid: str, evidence_id: str, modality: str, k: int = 20) -> list[tuple[str, float]]:
+        return self.target_index.search(self._second_hop_vector(qid, evidence_id, modality), k)
 
     def two_way(self, qid: str, *, direct_k: int = 100, evidence_k: int = 20, per_evidence: int = 20,
                 retained: int = 4, content_key: dict[str, str] | None = None) -> dict:
@@ -152,7 +213,7 @@ class OwnRetriever:
             hits = self.first_hop(qid, modality, evidence_k)
             evidence_lists[modality] = hits
             for eid, first_score in hits:
-                for tid, second in self.second_hop(eid, modality, per_evidence):
+                for tid, second in self.second_hop(qid, eid, modality, per_evidence):
                     path_map.setdefault(tid, []).append((first_score + second, eid))
         paths = retain_paths(path_map, content_key=content_key, budget=retained)
         evidence_scored = sorted(
@@ -165,6 +226,14 @@ class OwnRetriever:
             "direct": direct,
             "first_hop": evidence_lists,
             "paths": paths,
+            "path_pool": PathPool(
+                query_id=qid,
+                generator_id=self.generator_id,
+                checkpoint_sha=self.checkpoint_sha,
+                candidates=tuple(sorted(set([t for t, _ in direct]) | set(evidence_ids),
+                                          key=lambda x: x.encode("utf-8"))),
+                paths=paths,
+            ),
             "evidence": evidence_ids,
             "U": utf8_sorted(set([t for t, _ in direct]) | set(evidence_ids)),
             "C100": c100,

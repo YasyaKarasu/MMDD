@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from . import inputs
-from .retrieval import _lse
+from .retrieval import PathPool, _lse
 from .score import ObjectBank
 
 
@@ -69,18 +69,34 @@ def rerank_zero_hop(teacher, bank: ObjectBank, query_id: str, candidates: Sequen
 
 
 def rerank_path(teacher, bank: ObjectBank, query_id: str, candidates: Sequence[str],
-                paths: Mapping[str, Sequence], device, *, batch: int = 32,
-                swapped: Mapping[str, str] | None = None) -> dict[str, float]:
+                paths: Mapping[str, Sequence] | PathPool, device, *, batch: int = 32,
+                swapped: Mapping[str, str] | None = None,
+                expected_generator: str | None = None,
+                expected_checkpoint: str | None = None) -> dict[str, float]:
     """T_PATH-Real: LSE(zero hop, QET over the retained natural paths)."""
     from .train_teacher import pair_logits, triplet_pairs
 
     if not candidates:
         return {}
+    if isinstance(paths, PathPool):
+        if paths.query_id != query_id:
+            raise ValueError("path pool query does not match rerank query")
+        paths.validate(
+            expected_generator=expected_generator or paths.generator_id,
+            expected_checkpoint=expected_checkpoint,
+        )
+        path_map: Mapping[str, Sequence] = paths.paths
+    else:
+        # Raw split paths are valid for fixed raw/f0 reference rows, but an
+        # own-candidate rerank must provide the explicit PathPool identity.
+        if expected_generator is not None:
+            raise ValueError("own-candidate rerank requires a PathPool from the same generator")
+        path_map = paths
     zero = pair_logits(teacher, bank, query_id, list(candidates), device, batch=batch)
     flat: list[tuple[str, str]] = []
     counts: dict[str, int] = {}
     for t in candidates:
-        slots = list(paths.get(t, []))
+        slots = list(path_map.get(t, []))
         counts[t] = len(slots)
         for slot in slots:
             eid = slot[0]
@@ -127,7 +143,8 @@ def apply_swap(paths: Mapping[str, Sequence], swap: Mapping[str, str]) -> dict[s
 
 
 def probe_et(model, bank: ObjectBank, legal: Sequence[str], pairs: Sequence[tuple[str, str, Sequence[str]]],
-             device, *, ks: Sequence[int] = (10, 20), modality: Mapping[str, str] | None = None) -> dict:
+             device, *, ks: Sequence[int] = (10, 20), modality: Mapping[str, str] | None = None,
+             read_q: bool = True) -> dict:
     """SPEC 12.3: rank the whole static target space for fixed dev (q, e) pairs."""
     from .train_student import adapter_vector, target_keys
 
@@ -137,7 +154,7 @@ def probe_et(model, bank: ObjectBank, legal: Sequence[str], pairs: Sequence[tupl
     for qid, eid, positive in pairs:
         if not positive:
             continue
-        v = adapter_vector(model, bank, qid, eid, device)
+        v = adapter_vector(model, bank, qid, eid, device, read_q=read_q)
         scores = (v @ keys.T).float().cpu()
         order = sorted(range(len(legal)), key=lambda i: (-float(scores[i]), legal[i].encode("utf-8")))
         rank_of = {t: i + 1 for i, t in enumerate(legal[i] for i in order)}
@@ -176,20 +193,31 @@ def strict_eo(gold: Sequence[str], evidence: Sequence[str], d_ann: Sequence[str]
 
 def strict_report(queue: Mapping[str, Sequence[str]], evidence: Mapping[str, Sequence[str]],
                   d_ann: Mapping[str, Sequence[str]], d_exact: Mapping[str, Sequence[str]],
-                  final: Mapping[str, Sequence[str]], *, ks: Sequence[int] = (10, 50)) -> dict:
+                  final: Mapping[str, Sequence[str]], *, ks: Sequence[int] = (10, 50),
+                  pools: Mapping[str, Mapping[str, Sequence[str]]] | None = None) -> dict:
+    """SPEC 12.4 retention of each model's newly-discovered strict targets.
+
+    ``Z_{m,q} = G_q ∩ E_{m,q} \\ (D_ann ∪ D_exact)`` is the set this model newly
+    found.  The denominator is the model's own queue size, so it must not be
+    recomputed per stage.  ``pools`` maps a pool name (``U``/``C100``) to that
+    pool's per-query ids; ``final`` is the final ranked list.
+    """
     total = 0
-    entered_u = 0                      # was aliased to `top`: dict += int -> TypeError
+    retained = {name: 0 for name in ("U", "C100")}
     top = {k: 0 for k in ks}
+    per_query: dict[str, int] = {}
     for q, gold in queue.items():
         z = strict_eo(gold, evidence.get(q, ()), d_ann.get(q, ()), d_exact.get(q, ()))
         total += len(z)
-        if z & set(evidence.get(q, ())):
-            entered_u += 1
+        per_query[q] = len(z)
+        for name, pool in (pools or {}).items():
+            retained[name] = retained.get(name, 0) + len(z & set(pool.get(q, ())))
         for k in ks:
-            if z & set(final.get(q, ())[:k]):
-                top[k] += 1
-    return {"strict_pairs": total, "entered_evidence": entered_u,
-            "top_hits": {f"top{k}": v for k, v in top.items()}}
+            top[k] += len(z & set(final.get(q, ())[:k]))
+    return {"strict_pairs": total, "denominator": total,
+            "retained": {**retained, **{f"top{k}": v for k, v in top.items()}},
+            "per_query_nonzero": sum(1 for v in per_query.values() if v),
+            "queries": len(queue)}
 
 
 # -------------------------------------------------------------- statistics ----

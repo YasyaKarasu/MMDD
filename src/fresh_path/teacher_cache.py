@@ -38,6 +38,7 @@ class FrozenTeacherLogitCache:
     branches or protocol revisions.
     """
 
+    teacher_branch: str
     teacher_hash: str
     protocol_hash: str
     path: Path | None = None
@@ -46,8 +47,10 @@ class FrozenTeacherLogitCache:
     misses: int = 0
 
     @classmethod
-    def for_model(cls, model, protocol_path: Path, path: Path | None = None):
+    def for_model(cls, model, protocol_path: Path, *, teacher_branch: str,
+                  path: Path | None = None):
         return cls(
+            teacher_branch=str(teacher_branch),
             teacher_hash=lineage.tensor_state_hash(model.state_dict()),
             protocol_hash=lineage.protocol_hash(protocol_path),
             path=Path(path) if path is not None else None,
@@ -73,6 +76,7 @@ class FrozenTeacherLogitCache:
             return str(value)
 
         return {
+            "teacher_branch": self.teacher_branch,
             "teacher_hash": self.teacher_hash,
             "protocol_hash": self.protocol_hash,
             "kind": str(kind),
@@ -130,7 +134,8 @@ class FrozenTeacherLogitCache:
         if destination is None:
             return
         payload = {
-            "format": 1,
+            "format": 2,
+            "teacher_branch": self.teacher_branch,
             "teacher_hash": self.teacher_hash,
             "protocol_hash": self.protocol_hash,
             "entries": self.entries,
@@ -138,17 +143,26 @@ class FrozenTeacherLogitCache:
         lineage.atomic_save(destination, payload)
 
     @classmethod
-    def load(cls, path: Path, *, teacher_hash: str, protocol_hash: str):
+    def load(cls, path: Path, *, teacher_branch: str, teacher_hash: str,
+             protocol_hash: str):
         payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-        if payload.get("format") != 1:
+        if payload.get("format") != 2:
             raise ValueError(f"unsupported Teacher-logit cache format: {path}")
-        if payload.get("teacher_hash") != teacher_hash or payload.get("protocol_hash") != protocol_hash:
+        if (payload.get("teacher_branch") != teacher_branch
+                or payload.get("teacher_hash") != teacher_hash
+                or payload.get("protocol_hash") != protocol_hash):
             raise ValueError(f"Teacher-logit cache metadata mismatch: {path}")
-        return cls(teacher_hash, protocol_hash, Path(path), dict(payload.get("entries", {})))
+        return cls(teacher_branch, teacher_hash, protocol_hash, Path(path),
+                   dict(payload.get("entries", {})))
 
     def load_existing(self) -> "FrozenTeacherLogitCache":
         if self.path is None or not self.path.exists():
             return self
-        loaded = self.load(self.path, teacher_hash=self.teacher_hash, protocol_hash=self.protocol_hash)
+        loaded = self.load(
+            self.path,
+            teacher_branch=self.teacher_branch,
+            teacher_hash=self.teacher_hash,
+            protocol_hash=self.protocol_hash,
+        )
         self.entries = loaded.entries
         return self

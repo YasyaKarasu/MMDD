@@ -73,9 +73,10 @@ def target_parts(record: dict, sources: dict[str, dict]) -> list[str]:
 
 def plan_work(dataset_root: Path, cache_dir: Path, kinds: set[str], shard: int, num_shards: int,
               *, max_objects: int = 0, skip: set[str] | None = None) -> list[dict]:
-    prompts = json.loads(
-        (Path(__file__).resolve().parents[2] / "MMDD_STAGE1_FRESH_PATH_v2_1_20260920" / "ENCODER_PROMPTS.json").read_text()
-    )["instructions"]
+    prompts_path = Path(__file__).resolve().parents[2] / "MMDD_STAGE1_FRESH_PATH_v2_1_20260920" / "ENCODER_PROMPTS.json"
+    if not prompts_path.exists():
+        prompts_path = Path(__file__).resolve().parents[2] / "audit" / "MMDD_STAGE1_FRESH_PATH_v2_1_20260920" / "ENCODER_PROMPTS.json"
+    prompts = json.loads(prompts_path.read_text())["instructions"]
     covered = {
         e.object_id
         for e in features.read_manifest(cache_dir / "teacher_manifest.jsonl", "teacher_feature_path")

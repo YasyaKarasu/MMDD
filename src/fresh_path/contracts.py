@@ -41,7 +41,7 @@ def masks(ids: Sequence[str], p: set[str], ignore: set[str], *, device=None) -> 
 
 
 def rank_loss(logits: Tensor, positive: Tensor, allowed: Tensor | None = None, *,
-              active: bool | None = None, validate_finite: bool = True,
+              active: bool, validate_finite: bool = True,
               validate_masks: bool = True) -> Tensor | None:
     if logits.ndim != 1 or positive.shape != logits.shape or positive.dtype != torch.bool:
         raise ValueError('rank_loss expects aligned one-dimensional logits and Boolean positive mask')
@@ -50,9 +50,7 @@ def rank_loss(logits: Tensor, positive: Tensor, allowed: Tensor | None = None, *
         raise ValueError('positive must be in allowed set')
     if validate_masks and torch.any(positive & ~a):
         raise ValueError('positive must be in allowed set')
-    if active is False:
-        return None
-    if active is None and (not positive.any().item() or not (a & ~positive).any().item()):
+    if not active:
         return None
     if validate_finite and not torch.isfinite(logits[a]).all():
         raise ValueError('non-finite allowed score')
@@ -60,21 +58,20 @@ def rank_loss(logits: Tensor, positive: Tensor, allowed: Tensor | None = None, *
 
 
 def streamed_full_loss(query: Tensor, keys: Tensor, positive: Tensor, allowed: Tensor, chunk: int, *,
-                       active: bool | None = None,
-                       chunk_activity: Sequence[tuple[bool, bool]] | None = None,
-                       validate_finite: bool = True) -> Tensor | None:
+                       active: bool,
+                       chunk_activity: Sequence[tuple[bool, bool]],
+                       validate_finite: bool = True,
+                       validate_masks: bool = True) -> Tensor | None:
     """Full denominator, not a mean of per-chunk losses; differentiable reference."""
     if query.ndim != 1 or keys.ndim != 2 or query.shape[0] != keys.shape[1]:
         raise ValueError('query/key dimensions')
     if chunk <= 0 or positive.shape != keys.shape[:1] or allowed.shape != positive.shape:
         raise ValueError('invalid chunk or masks')
-    if torch.any(positive & ~allowed):
+    if validate_masks and torch.any(positive & ~allowed):
         raise ValueError('excluded positive')
-    if active is False:
+    if not active:
         return None
-    if active is None and (not positive.any().item() or not (allowed & ~positive).any().item()):
-        return None
-    if chunk_activity is not None and len(chunk_activity) != (len(keys) + chunk - 1) // chunk:
+    if len(chunk_activity) != (len(keys) + chunk - 1) // chunk:
         raise ValueError('chunk activity does not align with keys')
     alls, poss = [], []
     for chunk_no, start in enumerate(range(0, len(keys), chunk)):
@@ -83,14 +80,12 @@ def streamed_full_loss(query: Tensor, keys: Tensor, positive: Tensor, allowed: T
         aa, pp = allowed[start:end], positive[start:end]
         # Empty logsumexp entries are not inserted in differentiable logaddexp:
         # logaddexp(-inf,-inf) has undefined derivative.
-        chunk_has_allowed, chunk_has_positive = (
-            chunk_activity[chunk_no] if chunk_activity is not None else (None, None)
-        )
-        if chunk_has_allowed if chunk_activity is not None else aa.any().item():
+        chunk_has_allowed, chunk_has_positive = chunk_activity[chunk_no]
+        if chunk_has_allowed:
             if validate_finite and not torch.isfinite(score[aa]).all():
                 raise ValueError('non-finite allowed score')
             alls.append(torch.logsumexp(score[aa], 0))
-        if chunk_has_positive if chunk_activity is not None else pp.any().item():
+        if chunk_has_positive:
             poss.append(torch.logsumexp(score[pp], 0))
     return torch.logsumexp(torch.stack(alls), 0) - torch.logsumexp(torch.stack(poss), 0)
 

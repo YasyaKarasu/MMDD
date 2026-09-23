@@ -23,7 +23,9 @@ from .teacher_cache import FrozenTeacherLogitCache
 
 # SPEC 7.4: the path forward block is capped at 8 and must be the largest value
 # that fits memory; list batching (edges, conditional KD) is a separate knob.
-PATH_BLOCK = 8
+# On the 24-GiB RTX 4090 the full path graph plus conditional QET backward graph
+# exceeds memory at 8, so this run selects the protocol-approved next choice.
+PATH_BLOCK = 4
 
 
 # ------------------------------------------------------------------ helpers ---
@@ -72,6 +74,14 @@ def anchor_choice(labels: TrainLabels, query_id: str, epoch: int) -> tuple[str, 
         return None
     offset = local_rng(config.namespace("anchor", query_id)).randrange(len(annotations))
     return annotations[(offset + epoch - 1) % len(annotations)]
+
+
+def build_anchor_registry(labels: TrainLabels, epochs: int) -> dict[int, dict[str, tuple[str, str] | None]]:
+    """Materialize the fixed namespace-derived anchor sequence once."""
+    return {
+        epoch: {query_id: anchor_choice(labels, query_id, epoch) for query_id in labels.queries}
+        for epoch in range(1, epochs + 1)
+    }
 
 
 def _pair_logits_online(model, bank: ObjectBank, anchor_id: str, dest_ids: Sequence[str], device, *,
@@ -177,8 +187,11 @@ def edge_relation_losses(model, bank: ObjectBank, query_id: str, groups: dict, e
             logits = pair_logits(model, bank, query_id, candidates, device, batch=batch,
                                  encode_cache=encode_cache)
         else:
-            relation = "ET"
             asset = key[2:]
+            # E-text and E-image are separate relations.  Averaging them
+            # under one ET bucket gives the image/text mix an unintended
+            # weight and violates the five-relation list contract.
+            relation = f"E_{bank.kind(asset)}"
             logits = pair_logits(model, bank, asset, candidates, device, batch=batch,
                                  encode_cache=encode_cache)
         p, allowed = masks(candidates, positives, set(), device)
@@ -246,7 +259,12 @@ def _accumulate(buffer: list[torch.Tensor], active: int, optimizer) -> None:
     _finish_batch(optimizer)
 
 
-def _finish_batch(optimizer) -> None:
+def _finish_batch(optimizer, *, grad_scale: float = 1.0) -> None:
+    if grad_scale != 1.0:
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(grad_scale)
     torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], 1.0)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
@@ -553,7 +571,7 @@ def target_view_loss(model, bank: ObjectBank, labels: TrainLabels, raw: dict, qu
     S = target_view_scores(model, bank, labels, raw, query_id, graph, augmented_e, device, batch=batch)
     p = torch.tensor([t in positive for t in graph], dtype=torch.bool, device=device)
     allowed = torch.ones(len(graph), dtype=torch.bool, device=device)
-    return rank_loss(S, p, allowed)
+    return rank_loss(S, p, allowed, active=rank_active(graph, positive))
 
 
 def conditional_loss(model, bank: ObjectBank, labels: TrainLabels, raw: dict, query_id: str,
@@ -602,21 +620,22 @@ def train_path(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_po
                edge_weight: float = 0.5, conditional_weight: float = 0.5, support_weight: float = 0.2,
                batch: int = 32, counters: dict | None = None,
                conditional_registry: Mapping[str, Mapping[str, ConditionalList]] | None = None,
+               anchor_registry: Mapping[int, Mapping[str, tuple[str, str] | None]] | None = None,
                log=print) -> dict:
     optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
     model.train()
     _stage_name = "T_PATH"
     counters = dict(counters or {"updates": 0, "active_queries": 0, "items": 0})
     conditional_registry = conditional_registry or build_conditional_registry(labels, raw)
+    anchor_registry = anchor_registry or build_anchor_registry(labels, epochs)
     _save_initial(model, optimizer, out_dir, seed, _stage_name, protocol_path, parent_dirs)
     for epoch in range(start_epoch, epochs + 1):
         order = query_order(labels, seed, epoch)
-        buffer: list[torch.Tensor] = []
         pending = 0
         encode_cache: dict = {}
         for qid in order:
             entry = labels.queries[qid]
-            anchor = anchor_choice(labels, qid, epoch)
+            anchor = anchor_registry[epoch][qid]
             targets = graph[qid]
             positive = set(entry["G"]) & set(targets)
             p_mask = torch.tensor([t in positive for t in targets], dtype=torch.bool, device=device)
@@ -626,6 +645,11 @@ def train_path(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_po
             active = rank_active(targets, positive)
             natural = rank_loss(natural_scores, p_mask, allowed, active=active,
                                 validate_finite=False, validate_masks=False)
+            del natural_scores
+            # Natural and augmented views must not share autograd encodings:
+            # each view is backwarded independently below.  Encoding has no
+            # dropout, so recomputing it preserves the forward/RNG contract.
+            encode_cache.clear()
             augmented = None
             if anchor is not None:
                 # Training must not reuse Natural logits: each view needs its
@@ -634,35 +658,43 @@ def train_path(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_po
                                                 batch=PATH_BLOCK, encode_cache=encode_cache)
                 augmented = rank_loss(aug_scores, p_mask, allowed, active=active,
                                       validate_finite=False, validate_masks=False)
-            target_loss = mean_active([natural, augmented])
+                del aug_scores
+            target_terms = [term for term in (natural, augmented) if term is not None]
+            # Backward each view before constructing the next large graph.  The
+            # view mean is linear, so this is gradient-equivalent to one
+            # stacked backward while releasing path activations immediately.
+            for term in target_terms:
+                _require_finite(term, _stage_name, qid)
+                (term / len(target_terms)).backward()
+                encode_cache.clear()
             edges = edge_relation_losses(model, bank, qid, edge[qid], edge_positives, labels, device,
                                         batch=batch, encode_cache=encode_cache)
             edge_loss = mean_active(edges.values())
+            if edge_loss is not None:
+                _require_finite(edge_loss, _stage_name, qid)
+                (edge_weight * edge_loss).backward()
+                encode_cache.clear()
             cond = conditional_loss(model, bank, labels, raw, qid, device, batch=batch,
                                     encode_cache=encode_cache, conditional_registry=conditional_registry)
+            if cond is not None:
+                _require_finite(cond, _stage_name, qid)
+                (conditional_weight * cond).backward()
+                encode_cache.clear()
             support = support_loss(model, bank, labels, qid, anchor, device,
                                    encode_cache=encode_cache)
-            terms = []
-            if target_loss is not None:
-                terms.append(target_loss)
-            if edge_loss is not None:
-                terms.append(edge_weight * edge_loss)
-            if cond is not None:
-                terms.append(conditional_weight * cond)
             if support is not None:
-                terms.append(support_weight * support)
-            if not terms:
+                _require_finite(support, _stage_name, qid)
+                (support_weight * support).backward()
+                encode_cache.clear()
+            if not target_terms and edge_loss is None and cond is None and support is None:
                 continue
-            total = torch.stack(terms).sum()
-            _require_finite(total, _stage_name, qid)
-            buffer.append(total)
             pending += 1
             counters["items"] += len(graph[qid])
             if pending == logical_batch:
-                _accumulate(buffer, pending, optimizer)
+                _finish_batch(optimizer, grad_scale=1.0 / pending)
                 counters["updates"] += 1
                 counters["active_queries"] += pending
-                buffer, pending, encode_cache = [], 0, {}
+                pending, encode_cache = 0, {}
                 if counters["updates"] % 50 == 0:
                     log(json.dumps({"event": "progress", "stage": _stage_name, "epoch": epoch,
                                     "updates": counters["updates"],
@@ -672,7 +704,7 @@ def train_path(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_po
                                     "allocated_GiB": round(torch.cuda.memory_allocated() / 2**30, 2)
                                     if torch.cuda.is_available() else None}))
         if pending:
-            _accumulate(buffer, pending, optimizer)
+            _finish_batch(optimizer, grad_scale=1.0 / pending)
             counters["updates"] += 1
             counters["active_queries"] += pending
         log(json.dumps({"event": "epoch", "stage": "T_PATH", "epoch": epoch, **counters}))
@@ -694,7 +726,6 @@ def train_qt(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_posi
     _save_initial(model, optimizer, out_dir, seed, _stage_name, protocol_path, parent_dirs)
     for epoch in range(start_epoch, epochs + 1):
         order = query_order(labels, seed, epoch)
-        buffer: list[torch.Tensor] = []
         pending = 0
         encode_cache: dict = {}
         for qid in order:
@@ -719,14 +750,23 @@ def train_qt(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_posi
                 continue
             total = torch.stack(terms).sum()
             _require_finite(total, _stage_name, qid)
-            buffer.append(total)
+            # Accumulate parameter gradients, not complete query graphs.  The
+            # old buffer kept ``logical_batch`` QT/edge graphs alive until the
+            # optimizer step; one large candidate list could therefore push a
+            # 24-GiB device over the limit even with a small list batch.  A
+            # linear sum of per-query backwards is gradient-equivalent to the
+            # stacked loss below, while releasing this query's activations
+            # before constructing the next one.
+            total.backward()
+            del logits, target_loss, edges, edge_loss, terms, total
+            encode_cache.clear()
             pending += 1
             counters["items"] += len(candidates)
             if pending == logical_batch:
-                _accumulate(buffer, pending, optimizer)
+                _finish_batch(optimizer, grad_scale=1.0 / pending)
                 counters["updates"] += 1
                 counters["active_queries"] += pending
-                buffer, pending, encode_cache = [], 0, {}
+                pending, encode_cache = 0, {}
                 if counters["updates"] % 50 == 0:
                     log(json.dumps({"event": "progress", "stage": _stage_name, "epoch": epoch,
                                     "updates": counters["updates"],
@@ -736,7 +776,7 @@ def train_qt(model, bank: ObjectBank, labels: TrainLabels, edge: dict, edge_posi
                                     "allocated_GiB": round(torch.cuda.memory_allocated() / 2**30, 2)
                                     if torch.cuda.is_available() else None}))
         if pending:
-            _accumulate(buffer, pending, optimizer)
+            _finish_batch(optimizer, grad_scale=1.0 / pending)
             counters["updates"] += 1
             counters["active_queries"] += pending
         log(json.dumps({"event": "epoch", "stage": "T_QT", "epoch": epoch, **counters}))

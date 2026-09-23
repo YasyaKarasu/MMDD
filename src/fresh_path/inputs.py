@@ -311,6 +311,29 @@ def load_split_witness(root: Path, split: str) -> tuple[dict[tuple[str, str], se
     return pairs, modality
 
 
+def bridge_content_keys(root: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Canonical content key and modality per bridge asset, from this run's dataset.
+
+    SPEC 12.5 E-swap permutes evidence by modality and *content*, so the swap
+    needs a content identity that is independent of the object id.  Image assets
+    carry ``sha256``; text assets carry their ``content``.  Both are read from
+    the raw dataset itself rather than any historical sidecar artifact.
+    """
+    content_key: dict[str, str] = {}
+    modality: dict[str, str] = {}
+    for part in sorted((Path(root) / "bridge_assets").glob("part-*.jsonl")):
+        for row in iter_jsonl(part):
+            asset = str(row.get("asset_id"))
+            kind = str(row.get("asset_type"))
+            if kind == "image":
+                key = str(row.get("sha256") or row.get("file_name") or asset)
+            else:
+                key = str(row.get("content") or asset)
+            content_key[asset] = key
+            modality[asset] = kind
+    return content_key, modality
+
+
 def split_query_kinds(root: Path, split: str) -> dict[str, str]:
     reasons: dict[str, set[str]] = {}
     for row in iter_jsonl(Path(root) / "qrels.jsonl"):
