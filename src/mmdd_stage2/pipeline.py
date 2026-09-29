@@ -296,11 +296,25 @@ class Stage2Verifier:
         evidence: dict[str, dict[str, Any]],
     ) -> list[torch.Tensor]:
         device = next(self.scorer.parameters()).device
-        logits = []
+        requests = []
         for bundle in bundles:
             target = self._reader_target(targets[bundle.target_id])
             selected_evidence = [evidence[evidence_id] for evidence_id in bundle.evidence_ids]
-            open_states, close_states = self.backend.reader_states(query, target, selected_evidence)
+            requests.append((query, target, selected_evidence))
+        batch_reader = getattr(self.backend, "reader_states_batch", None)
+        if callable(batch_reader):
+            batch_size = int(getattr(self.backend, "reader_batch_size", len(requests)))
+            if batch_size <= 0:
+                raise ValueError("reader_batch_size must be positive")
+            states = []
+            for start in range(0, len(requests), batch_size):
+                states.extend(batch_reader(requests[start : start + batch_size]))
+        else:
+            states = [self.backend.reader_states(*request) for request in requests]
+        logits = []
+        for bundle, (_query, target, _evidence), (open_states, close_states) in zip(
+            bundles, requests, states, strict=True
+        ):
             if open_states.shape[0] != len(target["columns"]):
                 raise ValueError(f"{bundle.target_id}: reader did not return one marker pair per column")
             logits.append(self.scorer(open_states.to(device), close_states.to(device)))
