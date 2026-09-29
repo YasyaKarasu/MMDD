@@ -43,6 +43,17 @@ output_medium/
 # (multi-hundred-MB tarballs produced by the package_* runners; regenerable)
 /deliveries/
 /packages/
+/exp_packages/
+/experiments/
+/*.tar.gz
+/src.zip
+
+# Local experiment run products and agent scratch state
+/checkpoints/
+/code_patch_backups/
+/speed_check/
+/.dsh_tmp/
+/.scratch_ctx/
 
 # Local input datasets and downloaded assets
 /references/
