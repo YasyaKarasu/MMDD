@@ -19,6 +19,19 @@ def main() -> None:
     parser.add_argument('--kind', choices=['flat', 'separate', 'test', 'prior-test'], default='flat')
     parser.add_argument('--arm', choices=['OO_CONTROL', 'FLAT_MIX', 'PRIOR', 'PVR_BUNDLE', 'PVR_SEPARATE', 'PVR_SUPPORT'])
     parser.add_argument('--seed', type=int, choices=[13,29], default=13)
+    parser.add_argument('--head-execution', choices=['scalar', 'batched'], default='batched',
+                        help='Batch selector MLPs, retaining per-pair dropout and the full training population')
+    parser.add_argument('--training-output', type=Path,
+                        help='Write a new training run here while reading existing features from --output')
+    parser.add_argument('--epochs', type=int, default=20, help='Maximum selector training epochs')
+    parser.add_argument('--early-stopping-patience', type=int,
+                        help='Dev-MRR plateau checks; default 5 for PRIOR, 0 (disabled) for matched ablations')
+    parser.add_argument('--min-epochs', type=int, default=10,
+                        help='Start counting early-stop plateaus at this epoch')
+    parser.add_argument('--min-delta', type=float, default=.0005,
+                        help='Minimum dev-MRR improvement that resets patience')
+    parser.add_argument('--log-every-pairs', type=int, default=1024,
+                        help='Print recent loss after this many Q-T pairs; 0 disables progress logs')
     parser.add_argument('phase', choices=['audit', 'prepare-a', 'reader', 'evaluate-a', 'natural-train',
                                          'prepare-jobs', 'train', 'freeze-shortlists', 'audit-support',
                                          'lock-selection', 'formal-test', 'analyze', 'cost', 'report', 'audit-reader-inputs', 'freeze-runtime'])
@@ -47,7 +60,12 @@ def main() -> None:
         prepare_jobs(r1, output, args.kind)
     elif args.phase == 'train':
         from mmdd_stage2.column_r2_training import train_arm
-        train_arm(r1, output, args.arm, args.seed)
+        if args.arm is None:
+            parser.error('train requires --arm')
+        train_arm(r1, output, args.arm, args.seed, execution=args.head_execution,
+                  training_output=args.training_output, epochs=args.epochs,
+                  early_stopping_patience=args.early_stopping_patience, min_epochs=args.min_epochs,
+                  min_delta=args.min_delta, log_every_pairs=args.log_every_pairs)
     elif args.phase == 'freeze-shortlists':
         from mmdd_stage2.column_r2_training import freeze_shortlists
         freeze_shortlists(r1, output)

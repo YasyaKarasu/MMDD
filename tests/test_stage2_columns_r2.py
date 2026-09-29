@@ -14,6 +14,24 @@ from mmdd_stage2.column_metrics import prediction
 from mmdd_stage2.column_r2_models import EvidenceCorrection, complete_scores, mix_condition, shortlist
 
 
+def test_dev_early_stopping_warmup_patience_and_small_cumulative_gains():
+    from mmdd_stage2.column_r2_training import DevPlateauStopper
+    stop = DevPlateauStopper(patience=2, min_epochs=3, min_delta=.01)
+    assert not stop.update(1, .8)
+    assert not stop.update(2, .79)
+    assert stop.bad_checks == 0
+    assert not stop.update(3, .805)
+    assert stop.bad_checks == 1
+    # Improvements accumulate relative to the last meaningful best, not the
+    # preceding noisy minibatch/epoch. This resets patience at epoch four.
+    assert not stop.update(4, .811)
+    assert stop.bad_checks == 0
+    assert not stop.update(5, .810)
+    assert stop.update(6, .810)
+    disabled = DevPlateauStopper(patience=0, min_epochs=1)
+    assert not any(disabled.update(epoch, .8) for epoch in range(1, 25))
+
+
 def test_phase_a_normalizes_each_pass_before_aggregation():
     scores = torch.tensor([[2., 1., 0.], [-1., 0., 3.]])
     base = normalized_aggregates(scores)
@@ -195,6 +213,8 @@ def test_flat_control_and_mix_run_matched_complete_schedules(tmp_path, monkeypat
     monkeypatch.setattr(training,'inputs_for',lambda *args:inputs)
     control = training.train_arm(r1,output,'OO_CONTROL',13)
     mixed = training.train_arm(r1,output,'FLAT_MIX',13)
+    scalar_output = tmp_path/'scalar'
+    scalar = training.train_arm(r1,output,'FLAT_MIX',13,execution='scalar',training_output=scalar_output)
     assert control['optimizer_steps'] == mixed['optimizer_steps'] == 20
     assert control['initial_parameter_sha256'] == mixed['initial_parameter_sha256'] == initial
     a = read_json(output/'OO_CONTROL/checkpoints/13/history.json')
@@ -203,8 +223,36 @@ def test_flat_control_and_mix_run_matched_complete_schedules(tmp_path, monkeypat
     assert [h['visits_sha256'] for h in a] == [h['visits_sha256'] for h in b]
     assert all(h['base_samples_seen']==h['unique_base_visits']==2 for h in a+b)
     assert all(sum(h['conditions'].values())==2 for h in b)
+    reference = read_json(scalar_output/'FLAT_MIX/checkpoints/13/history.json')
+    assert scalar['head_execution'] == 'scalar' and mixed['head_execution'] == 'batched'
+    assert scalar['optimizer_steps'] == mixed['optimizer_steps']
+    for actual, expected in zip(b, reference):
+        for key in ('base_samples_seen','unique_base_visits','visits_sha256',
+                    'condition_and_evidence_schedule_sha256','admitted_samples','optimizer_steps'):
+            assert actual[key] == expected[key]
+        assert actual['train_loss'] == pytest.approx(expected['train_loss'], abs=2e-5)
+    assert scalar['selected_epoch'] == mixed['selected_epoch']
+    assert not (scalar_output/'NATURAL_TRAIN').exists()
     with pytest.raises(ValueError,match='immutable'):
         training.train_arm(r1,output,'OO_CONTROL',13)
+    original_report = training.report_metrics
+    def constant_selection_metrics(*args):
+        report, rows = original_report(*args)
+        report['query_macro'].update(MRR=.5, **{'ColHit@1':.5})
+        return report, rows
+    monkeypatch.setattr(training,'report_metrics',constant_selection_metrics)
+    stopped = training.train_arm(r1,output,'PRIOR',13,early_stopping_patience=2,
+                                 min_epochs=3,log_every_pairs=1)
+    assert stopped['actual_epochs'] == stopped['optimizer_steps'] == 4
+    assert stopped['stopped_early'] and stopped['stop_reason'] == 'dev_mrr_plateau'
+    assert stopped['selected_epoch'] == 1
+    history = read_json(output/'PRIOR/checkpoints/13/history.json')
+    assert history[-1]['early_stop_triggered']
+    assert all(row['base_samples_seen'] == 2 for row in history)
+    assert all(row['loss_progress'][-1]['pairs_seen'] == 2 for row in history)
+    selected = torch.load(output/'PRIOR/checkpoints/13/selected.pt',weights_only=True)
+    assert selected['metadata']['selected_epoch'] == 1
+    assert selected['metadata']['parameter_sha256'] == history[0]['parameter_sha256']
 
 
 def test_final_report_is_generated_from_completed_artifacts(tmp_path):

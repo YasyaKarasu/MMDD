@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import random
+import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
+from .column_batching import score_records
 from .column_data import digest, file_hash, read_jsonl, write_json, write_jsonl
 from .column_metrics import pair_key, prediction
 from .column_r2_audit import read_json
@@ -15,6 +18,25 @@ from .column_r2_metrics import report_metrics
 from .column_r2_models import EvidenceCorrection, complete_scores, mix_condition, shortlist
 from .column_training import column_loss, parameter_hash
 from .verifier import CandidateColumnScorer
+
+
+@dataclass
+class DevPlateauStopper:
+    """Count dev-MRR plateaus only after warmup; checkpoint selection is separate."""
+    patience: int = 5
+    min_epochs: int = 10
+    min_delta: float = .0005
+    best_mrr: float | None = None
+    bad_checks: int = 0
+
+    def update(self, epoch: int, mrr: float) -> bool:
+        if self.best_mrr is None or mrr > self.best_mrr + self.min_delta:
+            self.best_mrr, self.bad_checks = mrr, 0
+        elif epoch >= self.min_epochs:
+            self.bad_checks += 1
+        if epoch < self.min_epochs:
+            self.bad_checks = 0
+        return self.patience > 0 and epoch >= self.min_epochs and self.bad_checks >= self.patience
 
 
 def inputs_for(r1: Path, output: Path, split: str) -> list[dict]:
@@ -146,29 +168,50 @@ def pvr_forward(data: TrainingData, model: EvidenceCorrection, prior: torch.nn.M
 
 @torch.inference_mode()
 def predict_model(data: TrainingData, model: torch.nn.Module, items: list[dict], arm: str,
-                  prior: torch.nn.Module | None = None, view: int = 0) -> tuple[list[dict], list[dict]]:
+                  prior: torch.nn.Module | None = None, view: int = 0, *,
+                  execution: str = 'scalar') -> tuple[list[dict], list[dict]]:
     model.eval()
     predictions, priors = [], []
+    if prior is None:
+        for start in range(0, len(items), 32):
+            batch = items[start:start+32]
+            evidence = [[] if arm == 'PRIOR' else item['evidence_ids']['O-R'] for item in batch]
+            records = [data.get(item, ids, view) for item, ids in zip(batch, evidence)]
+            logits = score_records(model, records, execution=execution)
+            predictions.extend(prediction(record, scores.tolist(), evidence_ids=ids)
+                               for record, scores, ids in zip(records, logits, evidence))
+        return predictions, priors
     for item in items:
         ids = [] if arm == 'PRIOR' else item['evidence_ids']['O-R']
-        if prior is None:
-            record = data.get(item, ids, view)
-            logits = model(record['open_states'], record['close_states'])
-            p = prediction(record, logits.tolist(), evidence_ids=ids)
-        else:
-            record, base, corrected, positions = pvr_forward(data, model, prior, item, ids, view)
-            columns = record['candidate_column_indices']
-            logits = complete_scores(base, corrected, positions, columns) if ids else base
-            p = prediction(record, logits.tolist(), evidence_ids=ids,
-                prior_logits=base.tolist(), shortlist_columns=[columns[i] for i in positions],
-                shortlist_correction_logits=corrected.tolist(), outside_scores='ranking_only_sentinels' if ids else 'prior')
-            priors.append(prediction(record, base.tolist()))
+        record, base, corrected, positions = pvr_forward(data, model, prior, item, ids, view)
+        columns = record['candidate_column_indices']
+        logits = complete_scores(base, corrected, positions, columns) if ids else base
+        p = prediction(record, logits.tolist(), evidence_ids=ids,
+            prior_logits=base.tolist(), shortlist_columns=[columns[i] for i in positions],
+            shortlist_correction_logits=corrected.tolist(), outside_scores='ranking_only_sentinels' if ids else 'prior')
+        priors.append(prediction(record, base.tolist()))
         predictions.append(p)
     return predictions, priors
 
 
-def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
+def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = 'batched',
+              training_output: Path | None = None, epochs: int = 20,
+              early_stopping_patience: int | None = None, min_epochs: int = 10,
+              min_delta: float = .0005, log_every_pairs: int = 1024) -> dict:
+    if execution not in {'scalar', 'batched'}:
+        raise ValueError(f'Unknown head execution: {execution}')
+    # Only the deployed selector changes its default stopping policy. Matched
+    # evidence ablations retain complete schedules unless explicitly requested.
+    patience = (5 if arm == 'PRIOR' else 0) if early_stopping_patience is None else early_stopping_patience
+    if epochs < 1 or patience < 0 or min_epochs < 1 or min_delta < 0 or log_every_pairs < 0:
+        raise ValueError('Invalid training or early-stopping schedule')
+    stopper = DevPlateauStopper(patience, min_epochs, min_delta)
+    training_output = training_output or output
+    folder = training_output / f'{arm}/checkpoints/{seed}'
+    if (folder/'MANIFEST.json').exists():
+        raise ValueError('Completed training arm is immutable; use its selected checkpoint')
     torch.set_num_threads(4)
+    started = time.perf_counter()
     data = TrainingData(r1, output)
     train, dev = inputs_for(r1, output, 'train'), inputs_for(r1, output, 'dev')
     train_meta = {pair_key(p): p for p in read_jsonl(r1 / 'COLUMN_POPULATION.train.jsonl')}
@@ -199,22 +242,27 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
             raise ValueError('Flat/Prior initialization differs from R1 C2')
     lr = 1e-4 if pvr else 3e-4
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    folder = output / f'{arm}/checkpoints/{seed}'
-    if (folder/'MANIFEST.json').exists():
-        raise ValueError('Completed training arm is immutable; use its selected checkpoint')
     folder.mkdir(parents=True, exist_ok=True)
     meta = {'arm': arm, 'seed': seed, 'hidden_dim': hidden_dim, 'initial_parameter_sha256': initial,
         'reader_layout': 'tail_candidates_v1', 'reader_identity_sha256': file_hash(r1/'READER_IDENTITY.json'),
         'data_manifest_sha256': file_hash(output/'NATURAL_TRAIN/MANIFEST.json'),
         'prior_sha256': file_hash(prior_path) if pvr else None,
-        'sources': {p.name: file_hash(p) for p in sorted(Path(__file__).parent.glob('column_r2_*.py'))},
+        'sources': {p.name: file_hash(p) for p in sorted(Path(__file__).parent.glob('column_r2_*.py'))
+                    + [Path(__file__).with_name(name) for name in ('column_batching.py', 'column_training.py', 'verifier.py')]},
         'optimizer': 'AdamW', 'lr': lr, 'weight_decay': 1e-4, 'gradient_clip': 1., 'effective_batch': 32,
-        'epochs': 20, 'head_parameters': sum(p.numel() for p in model.parameters()),
+        'epochs': epochs, 'head_parameters': sum(p.numel() for p in model.parameters()),
+        'early_stopping': {'enabled': patience > 0, 'metric': 'dev query_macro MRR',
+                           'patience': patience, 'min_epochs': min_epochs, 'min_delta': min_delta,
+                           'check_every': 'complete_epoch', 'restore': 'best_selected_checkpoint'},
+        'log_every_pairs': log_every_pairs,
         'selection': 'dev No-E MRR, H1, earlier epoch' if arm == 'PRIOR' else
             'dev O-R full MRR, non-empty H1, lower damage (PVR only), earlier epoch',
         'condition_schedule': 'No-E' if arm == 'PRIOR' else 'O-O' if arm == 'OO_CONTROL' else
             'sha256(seed,epoch,query_id,target_id) parity: even O-O, odd O-R',
-        'view_schedule': '(epoch-1)%2', 'prior_frozen': pvr, 'backbone_frozen': True}
+        'view_schedule': '(epoch-1)%2', 'prior_frozen': pvr, 'backbone_frozen': True,
+        'head_execution': 'scalar' if pvr else execution,
+        'dropout_schedule': 'per_pair_original_order_and_shape',
+        'training_feature_root': str(output.resolve())}
     runtime_manifest = output/'RUNTIME_SOURCE/MANIFEST.json'
     if runtime_manifest.exists():
         meta['runtime_source_manifest_sha256'] = file_hash(runtime_manifest)
@@ -227,26 +275,36 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
     counts = Counter((p['dataset'], p['query_id']) for p in train)
     lakes = Counter(k[0] for k in counts)
     weights = {pair_key(p): len(train)/(len(lakes)*lakes[p['dataset']]*counts[p['dataset'],p['query_id']]) for p in train}
-    history, best, steps = [], None, 0
-    for epoch in range(1, 21):
+    history, best, steps, stopped_early = [], None, 0, False
+    for epoch in range(1, epochs+1):
+        epoch_started = time.perf_counter()
         model.train()
         view = (epoch-1)%2
         order = list(range(len(train)))
         random.Random(seed*1000+epoch).shuffle(order)
         visits, selected_conditions, losses = [], [], []
+        progress, recent_losses, seen_queries = [], [], set()
+        next_log = log_every_pairs
         admitted = nonempty = support_pairs = 0
         for start in range(0, len(order), 32):
             batch = order[start:start+32]
             optimizer.zero_grad(set_to_none=True)
             batch_losses = []
+            prepared = []
             for i in batch:
                 item = train[i]
                 key = pair_key(item)
                 visits.append(key)
+                seen_queries.add((item['dataset'], item['query_id']))
                 condition = 'No-E' if arm == 'PRIOR' else 'O-O' if arm == 'OO_CONTROL' else mix_condition(seed,epoch,item['query_id'],item['target_id'])
                 ids = [] if condition == 'No-E' else item['evidence_ids'][condition]
                 selected_conditions.append([key, condition, ids])
                 nonempty += int(bool(ids))
+                prepared.append((item, key, ids))
+            if not pvr:
+                records = [data.get(item, ids, view) for item, _, ids in prepared]
+                scores = score_records(model, records, execution=execution)
+            for j, (item, key, ids) in enumerate(prepared):
                 gold = train_meta[key]['gold_column_indices']
                 if pvr:
                     record, base, logits, positions = pvr_forward(data, model, prior, item, ids, view)
@@ -254,9 +312,9 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
                     if not set(gold).intersection(columns):
                         continue
                 else:
-                    record = data.get(item, ids, view)
+                    record = records[j]
                     columns = record['candidate_column_indices']
-                    logits = model(record['open_states'], record['close_states'])
+                    logits = scores[j]
                 admitted += 1
                 loss = column_loss(logits, columns, gold)
                 if support and ids and key in witnesses:
@@ -276,6 +334,7 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
                         support_pairs += 1
                 batch_losses.append(weights[key]*loss)
                 losses.append(float(loss.detach()))
+                recent_losses.append(losses[-1])
             # Keep the same base-batch schedule even for all-empty/all-missed verifier batches.
             loss = torch.stack(batch_losses).sum()/len(batch) if batch_losses else torch.tensor(0.)
             loss = loss + next(model.parameters()).sum()*0
@@ -285,17 +344,33 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
                 raise ValueError('Non-finite R2 gradient')
             optimizer.step()
             steps += 1
-        predictions, prior_predictions = predict_model(data, model, dev, arm, prior)
+            if log_every_pairs and (len(visits) >= next_log or len(visits) == len(train)):
+                point = {'pairs_seen': len(visits), 'unique_queries_seen': len(seen_queries),
+                         'optimizer_steps': steps, 'view': view,
+                         'mean_loss': sum(recent_losses)/len(recent_losses) if recent_losses else None}
+                progress.append(point)
+                print(f'{arm} seed{seed} epoch{epoch}: {len(visits)}/{len(train)} Q-T pairs, '
+                      f'{len(seen_queries)} unique queries, recent loss={point["mean_loss"]}', flush=True)
+                recent_losses = []
+                next_log = (len(visits)//log_every_pairs+1)*log_every_pairs
+        train_seconds = time.perf_counter() - epoch_started
+        dev_started = time.perf_counter()
+        predictions, prior_predictions = predict_model(data, model, dev, arm, prior, execution=execution)
         metrics, _ = report_metrics(dev_meta, predictions, prior_predictions if pvr else None)
         macro = metrics['query_macro']
         nonempty_h1 = metrics['subsets']['non_empty']['query_macro']['ColHit@1']
         damage = metrics['subsets']['full'].get('damage_rate') or 0.
         score = (macro['MRR'], macro['ColHit@1']) if arm == 'PRIOR' else (macro['MRR'], nonempty_h1, -damage if pvr else 0.)
+        stopped_early = stopper.update(epoch, macro['MRR'])
         history.append({'epoch': epoch, 'base_samples_seen': len(visits), 'unique_base_visits': len(set(visits)),
             'visits_sha256': digest(visits), 'condition_and_evidence_schedule_sha256': digest(selected_conditions),
             'conditions': dict(Counter(c[1] for c in selected_conditions)), 'nonempty_samples': nonempty,
             'admitted_samples': admitted, 'optimizer_steps': steps, 'train_loss': sum(losses)/len(losses),
             'support_pairs': support_pairs,
+            'loss_progress': progress, 'early_stopping_bad_checks': stopper.bad_checks,
+            'early_stopping_reference_mrr': stopper.best_mrr,
+            'early_stop_triggered': stopped_early,
+            'train_seconds': train_seconds, 'dev_seconds': time.perf_counter() - dev_started,
             'dev_metrics': metrics, 'parameter_sha256': parameter_hash(model)})
         if best is None or score > best:
             best = score
@@ -304,14 +379,20 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int) -> dict:
             torch.save({'metadata': selected_meta, 'state_dict': model.state_dict()}, folder/'selected.pt')
         write_json(folder/'history.json', history)
         print(f'{arm} seed{seed} epoch{epoch}: loss={history[-1]["train_loss"]:.5f} dev H1={macro["ColHit@1"]:.5f} MRR={macro["MRR"]:.5f}', flush=True)
+        if stopped_early:
+            print(f'Early stop at epoch {epoch}; restore best checkpoint from epoch {selected_epoch}.', flush=True)
+            break
     loaded, _ = load_head(folder/'selected.pt')
-    predictions, prior_predictions = predict_model(data, loaded, dev, arm, prior)
+    predictions, prior_predictions = predict_model(data, loaded, dev, arm, prior, execution=execution)
     metrics, _ = report_metrics(dev_meta, predictions, prior_predictions if pvr else None)
-    write_jsonl(output/f'{arm}/predictions/{seed}/dev.jsonl.gz', predictions)
-    write_json(output/f'{arm}/metrics/{seed}/dev.json', metrics)
+    write_jsonl(training_output/f'{arm}/predictions/{seed}/dev.jsonl.gz', predictions)
+    write_json(training_output/f'{arm}/metrics/{seed}/dev.json', metrics)
     feature_hashes = {k: data.index.entries[k]['sha256'] for k in sorted(data.loaded)}
     write_json(folder/'FEATURES.json', feature_hashes)
     receipt = {**meta, 'selected_epoch': selected_epoch, 'optimizer_steps': steps,
+        'actual_epochs': len(history), 'stopped_early': stopped_early,
+        'stop_reason': 'dev_mrr_plateau' if stopped_early else 'epoch_budget',
+        'wall_seconds': time.perf_counter() - started,
         'selected_sha256': file_hash(folder/'selected.pt'), 'feature_hashes_sha256': file_hash(folder/'FEATURES.json'),
         'planned': True, 'implemented': True, 'actually_executed': True, 'actually_evaluated': ['dev']}
     write_json(folder/'MANIFEST.json', receipt)
