@@ -135,6 +135,18 @@ def existing_ids(chunk_dir: Path) -> set[str]:
     return ids
 
 
+def batches_with_pending(
+    queue: list[dict], batch_size: int, pending_ids: set[str]
+) -> list[list[dict]]:
+    """Keep full-shard batch boundaries while skipping fully cached batches."""
+    batches = [queue[start : start + batch_size] for start in range(0, len(queue), batch_size)]
+    return [
+        batch
+        for batch in batches
+        if any(str(item["object_id"]) in pending_ids for item in batch)
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-root", required=True)
@@ -159,16 +171,26 @@ def main(argv: list[str] | None = None) -> int:
 
     skip = existing_ids(chunk_dir)
     work = plan_work(dataset_root, Path(args.cache_dir), set(args.kinds.split(",")),
-                     args.shard, args.num_shards, max_objects=args.max_objects, skip=skip)
+                     args.shard, args.num_shards, max_objects=args.max_objects)
+    pending_ids = {str(item["object_id"]) for item in work} - skip
     if args.object_ids_file:
         wanted = {line.strip() for line in Path(args.object_ids_file).read_text().split() if line.strip()}
-        work = [w for w in work if w["object_id"] in wanted]
+        pending_ids &= wanted
     text_queue = [w for w in work if w["object_type"] == "text"]
     image_queue = [w for w in work if w["object_type"] == "image"]
     table_queue = [w for w in work if w["object_type"] == "table"]
-    print(json.dumps({"event": "shard_plan", "shard": args.shard, "text": len(text_queue),
-                      "image": len(image_queue), "table": len(table_queue)}), flush=True)
-    if not work:
+    pending_types = {
+        kind: sum(
+            str(item["object_id"]) in pending_ids
+            for item in queue
+        )
+        for kind, queue in (("text", text_queue), ("image", image_queue), ("table", table_queue))
+    }
+    print(json.dumps({"event": "shard_plan", "shard": args.shard,
+                      "pending": pending_types,
+                      "batch_context": {"text": len(text_queue), "image": len(image_queue),
+                                        "table": len(table_queue)}}), flush=True)
+    if not pending_ids:
         print(json.dumps({"event": "shard_done", "shard": args.shard, "objects": 0}), flush=True)
         return 0
 
@@ -224,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
             fail(batch[0]["object_id"], "wrapper_returned_no_output_for_single_object")
             return
         for b, (hidden, input_ids) in zip(batch, pairs):
+            if str(b["object_id"]) not in pending_ids:
+                continue
             try:
                 if kind == "table":
                     item = {"text": "\n".join(b["parts"]), "image": None, "instruction": b["instruction"]}
@@ -245,8 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     for queue, size, tag in ((text_queue, args.text_batch, "text"),
                              (image_queue, args.image_batch, "image"),
                              (table_queue, 1, "table")):
-        for start in range(0, len(queue), size):
-            handle(queue[start : start + size])
+        for batch in batches_with_pending(queue, size, pending_ids):
+            handle(batch)
         flush(force=True)
         print(json.dumps({"event": "queue_done", "shard": args.shard, "kind": tag,
                           "next_chunk": state["chunk"]}), flush=True)
