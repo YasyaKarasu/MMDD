@@ -28,6 +28,29 @@ FUSION_MODES = (
 )
 
 
+def _hnsw_incomplete_result(error: RuntimeError) -> bool:
+    return "Cannot return the results in a contiguous 2D array" in str(error)
+
+
+def _exact_inner_product_topk(
+    queries: torch.Tensor,
+    destinations: torch.Tensor,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    scores = queries.float() @ destinations.float().T
+    values, labels = torch.topk(
+        scores,
+        k=min(int(k), destinations.shape[0]),
+        dim=1,
+        largest=True,
+        sorted=True,
+    )
+    return (
+        labels.detach().cpu().numpy(),
+        values.detach().cpu().numpy(),
+    )
+
+
 def _load_persistent_index(
     hnswlib: Any,
     index_dir: Path,
@@ -338,6 +361,8 @@ class StudentANNIndices:
         self.score_space = score_space
         self.indices = {}
         self.object_ids = {}
+        self.index_types = {}
+        self._exact_index_vectors: dict[str, torch.Tensor] = {}
         self.ef_search = int(manifest["ef_search"])
         self._relation_queries: dict[tuple[str, str, str], np.ndarray] = {}
         selected_types = (
@@ -358,6 +383,43 @@ class StudentANNIndices:
             )
             self.indices[record_key] = index
             self.object_ids[record_key] = object_ids
+            self.index_types[record_key] = (
+                record.get("source_type"),
+                destination_type,
+            )
+
+    def _exact_search(
+        self,
+        index_key: str,
+        query_array: np.ndarray,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if index_key not in self._exact_index_vectors:
+            source_type, destination_type = self.index_types[index_key]
+            embeddings = torch.stack(
+                [
+                    self.store.embedding_features(object_id).embedding
+                    for object_id in self.object_ids[index_key]
+                ]
+            ).to(device=self.device, dtype=torch.float32)
+            vectors = (
+                self.model.index_vector(embeddings, destination_type)
+                if getattr(self, "relation_param", "full") == "full"
+                else self.model.index_vector(
+                    embeddings,
+                    destination_type,
+                    source_type=source_type,
+                )
+            )
+            self._exact_index_vectors[index_key] = vectors.detach()
+        queries = torch.from_numpy(query_array).to(
+            device=self.device, dtype=torch.float32
+        )
+        return _exact_inner_product_topk(
+            queries,
+            self._exact_index_vectors[index_key],
+            k,
+        )
 
     @torch.no_grad()
     def search(self, source_id: str, destination_type: str, k: int) -> list[tuple[str, float]]:
@@ -427,7 +489,6 @@ class StudentANNIndices:
             if index_key not in self.indices:
                 continue
             index = self.indices[index_key]
-            index.set_ef(max(self.ef_search, int(k)))
             query_array = np.stack(
                 [
                     self._relation_queries[
@@ -441,13 +502,28 @@ class StudentANNIndices:
                 ]
             )
             count = len(self.object_ids[index_key])
-            labels, distances = index.knn_query(
-                query_array, k=min(k, count)
-            )
-            for position, row_labels, row_distances in zip(
-                positions, labels, distances
+            effective_k = min(k, count)
+            if effective_k * 2 >= count:
+                labels, score_rows = self._exact_search(
+                    index_key, query_array, effective_k
+                )
+            else:
+                index.set_ef(max(self.ef_search, int(effective_k)))
+                try:
+                    labels, distances = index.knn_query(
+                        query_array, k=effective_k
+                    )
+                    score_rows = 1.0 - np.asarray(distances)
+                except RuntimeError as error:
+                    if not _hnsw_incomplete_result(error):
+                        raise
+                    labels, score_rows = self._exact_search(
+                        index_key, query_array, effective_k
+                    )
+            for position, row_labels, row_scores in zip(
+                positions, labels, score_rows
             ):
-                raw_scores = [1.0 - float(distance) for distance in row_distances]
+                raw_scores = [float(score) for score in row_scores]
                 score_space = getattr(self, "score_space", "raw_logit")
                 if score_space == "raw_logit":
                     output_scores = raw_scores
@@ -502,6 +578,7 @@ class RawEmbeddingANNIndices:
         self.ef_search = int(manifest["ef_search"])
         self.indices = {}
         self.object_ids = {}
+        self._exact_embeddings: dict[str, torch.Tensor] = {}
         selected_types = (
             set(OBJECT_TYPES)
             if destination_types is None
@@ -520,6 +597,25 @@ class RawEmbeddingANNIndices:
             self.indices[object_type] = index
             self.object_ids[object_type] = object_ids
 
+    def _exact_search(
+        self,
+        destination_type: str,
+        query_array: np.ndarray,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if destination_type not in self._exact_embeddings:
+            self._exact_embeddings[destination_type] = torch.stack(
+                [
+                    self.store.embedding_features(object_id).embedding.float()
+                    for object_id in self.object_ids[destination_type]
+                ]
+            )
+        return _exact_inner_product_topk(
+            torch.from_numpy(query_array),
+            self._exact_embeddings[destination_type],
+            k,
+        )
+
     def search(
         self, source_id: str, destination_type: str, k: int
     ) -> list[tuple[str, float]]:
@@ -533,7 +629,6 @@ class RawEmbeddingANNIndices:
             return []
         if k <= 0 or destination_type not in self.indices:
             return [[] for _source_id in source_ids]
-        self.indices[destination_type].set_ef(max(self.ef_search, int(k)))
         embeddings = torch.stack(
             [
                 self.store.embedding_features(source_id).embedding
@@ -544,18 +639,34 @@ class RawEmbeddingANNIndices:
             raise ValueError("Raw embedding dimension does not match the index")
         query_array = embeddings.numpy().astype("float32")
         count = len(self.object_ids[destination_type])
-        labels, distances = self.indices[destination_type].knn_query(
-            query_array, k=min(k, count)
-        )
+        effective_k = min(k, count)
+        index = self.indices[destination_type]
+        if effective_k * 2 >= count:
+            labels, score_rows = self._exact_search(
+                destination_type, query_array, effective_k
+            )
+        else:
+            index.set_ef(max(self.ef_search, int(effective_k)))
+            try:
+                labels, distances = index.knn_query(
+                    query_array, k=effective_k
+                )
+                score_rows = 1.0 - np.asarray(distances)
+            except RuntimeError as error:
+                if not _hnsw_incomplete_result(error):
+                    raise
+                labels, score_rows = self._exact_search(
+                    destination_type, query_array, effective_k
+                )
         return [
             [
                 (
                     self.object_ids[destination_type][int(label)],
-                    1.0 - float(distance),
+                    float(score),
                 )
-                for label, distance in zip(row_labels, row_distances)
+                for label, score in zip(row_labels, row_scores)
             ]
-            for row_labels, row_distances in zip(labels, distances)
+            for row_labels, row_scores in zip(labels, score_rows)
         ]
 
 

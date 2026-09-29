@@ -3231,7 +3231,7 @@ def test_ann_search_raises_ef_to_the_requested_k():
         def knn_query(self, _queries, k):
             return [list(range(k))], [[0.0] * k]
 
-    object_ids = [f"t{index}" for index in range(10)]
+    object_ids = [f"t{index}" for index in range(20)]
     raw_index = FakeIndex()
     raw = object.__new__(RawEmbeddingANNIndices)
     raw.store = feature_store()
@@ -3261,6 +3261,61 @@ def test_ann_search_raises_ef_to_the_requested_k():
 
     assert raw_index.ef_values == [8]
     assert student_index.ef_values == [8]
+
+
+def test_ann_search_uses_exact_topk_for_near_exhaustive_small_index():
+    class ANNMustNotRun:
+        def set_ef(self, _value):
+            raise AssertionError("near-exhaustive search must bypass HNSW")
+
+    store = feature_store()
+    object_ids = ["positive", "negative"]
+    expected = sorted(
+        (
+            (
+                object_id,
+                torch.dot(
+                    store.embedding_features("q").embedding,
+                    store.embedding_features(object_id).embedding,
+                ).item(),
+            )
+            for object_id in object_ids
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    raw = object.__new__(RawEmbeddingANNIndices)
+    raw.store = store
+    raw.embedding_dim = 4
+    raw.ef_search = 5
+    raw.indices = {"table": ANNMustNotRun()}
+    raw.object_ids = {"table": object_ids}
+    raw._exact_embeddings = {}
+
+    student = object.__new__(StudentANNIndices)
+    student.store = store
+    student.device = torch.device("cpu")
+    student.ef_search = 5
+    student.indices = {"table": ANNMustNotRun()}
+    student.object_ids = {"table": object_ids}
+    student.index_types = {"table": (None, "table")}
+    student._relation_queries = {}
+    student._exact_index_vectors = {}
+    student.relation_param = "full"
+    student.score_space = "raw_logit"
+    student.model = IdentityStudentJoinabilityModel(4)
+
+    raw_hits = raw.search_many(["q"], "table", 2)[0]
+    student_hits = student.search_many(["q"], "table", 2)[0]
+    assert [item[0] for item in raw_hits] == [item[0] for item in expected]
+    assert [item[1] for item in raw_hits] == pytest.approx(
+        [item[1] for item in expected]
+    )
+    assert [item[0] for item in student_hits] == [item[0] for item in expected]
+    assert [item[1] for item in student_hits] == pytest.approx(
+        [item[1] for item in expected]
+    )
 
 
 def test_student_path_dev_record_includes_reused_raw_embedding_baseline(tmp_path):
