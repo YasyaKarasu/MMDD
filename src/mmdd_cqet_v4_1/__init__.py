@@ -1,0 +1,6 @@
+"""MMDD Stage1 V4.1 correctness-locked experiment implementation."""
+
+EXPERIMENT_ID = "MMDD_STAGE1_V4_1_CORRECTNESS_LOCKED_CQET"
+SCHEMA_VERSION = "4.1.0"
+VERSION = SCHEMA_VERSION
+DATE = "2026-09-25"
