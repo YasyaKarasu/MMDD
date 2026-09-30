@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import build_mm_joinability_dataset as join_builder  # noqa: E402
 from build_mm_table_dataset import ShardedJsonlWriter, write_jsonl  # noqa: E402
 from mmdd_dataset.abebooks_adapter import adapt_assets, prepare_abebooks  # noqa: E402
+from mmdd_dataset.abebooks_explicit import assert_disjoint_sources  # noqa: E402
 from mmdd_dataset.joinability import JOINABILITY_POLICY_VERSION  # noqa: E402
 from mmdd_dataset.utils import clean_text, write_json  # noqa: E402
 
@@ -280,9 +281,7 @@ def build_dataset(
     decisions: list[dict[str, Any]] = []
     counts = defaultdict(int)
     implicit_query_counts_by_split = {"train": 0, "dev": 0, "test": 0}
-    # A table can hold a multimodal query *and* be an explicit-join candidate; the
-    # candidate is only realised if the balance pass picks it, so its data-lake
-    # tables are written after the loop rather than here.
+    # Only rejected implicit sources can enter the deferred explicit pool.
     explicit_candidate_splits: dict[str, str] = {}
     explicit_candidate_source_ids: dict[str, str] = {}
     explicit_candidate_decision_indices: dict[str, int] = {}
@@ -327,33 +326,14 @@ def build_dataset(
             if not isinstance(candidates, list):
                 candidate = decision.get("explicit_join_candidate")
                 candidates = [candidate] if isinstance(candidate, dict) else []
+            if query_tables and decision.get("reason") != "explicit_join_fallback":
+                if candidates:
+                    raise ValueError(f"implicit source entered explicit pool: {source_table_id}")
             deferred_candidate = (
                 args.explicit_join_fallback_mode == "match_implicit"
                 and bool(candidates)
             )
             decision["source_table_id"] = source_table_id
-            if args.explicit_join_fallback_mode == "match_implicit" and not candidates:
-                # Any table can host an explicit join -- it only needs a visible
-                # non-entity column with enough rows -- so the candidate pool is
-                # every table, not just the ones whose multimodal recovery failed.
-                # The parent draws candidates for those failures only, and at a
-                # low recovery threshold most tables succeed: too few candidates
-                # survive to give one explicit join per multimodal query, which is
-                # what ``match_implicit`` has to balance.
-                entity_col = (
-                    table["metadata"].get("candidate_entity_columns") or [None]
-                )[0]
-                candidates = join_builder.build_explicit_join_fallback_candidates(
-                    source_table=table,
-                    split=split,
-                    entity_col=entity_col,
-                    rejected_multimodal_reason=clean_text(decision.get("reason")),
-                    args=args,
-                    force=True,
-                )
-                if candidates:
-                    decision["explicit_join_candidates"] = candidates
-                    decision["explicit_join_candidate"] = candidates[0]
             if args.explicit_join_fallback_mode == "match_implicit" and candidates:
                 for candidate in candidates:
                     candidate_id = clean_text(candidate.get("candidate_id"))
@@ -414,21 +394,20 @@ def build_dataset(
                 explicit_queries: list[dict[str, Any]] = []
                 explicit_targets: list[dict[str, Any]] = []
                 explicit_qrels: list[dict[str, Any]] = []
-                for candidate_id in selected_ids:
-                    candidate_decision = next(
-                        item for item in original["explicit_join_candidates"]
-                        if clean_text(item.get("candidate_id")) == candidate_id)
-                    for candidate in join_builder.rebuild_selected_explicit_join_candidates(
+                selected_candidates = [
+                    item for item in original["explicit_join_candidates"]
+                    if clean_text(item.get("candidate_id")) in selected_ids]
+                for candidate in join_builder.rebuild_selected_explicit_join_candidates(
+                        source_table=table, split=split,
+                        candidate_decisions=selected_candidates, args=args):
+                    queries, targets, candidate_qrels, result = (
+                        join_builder.materialize_balanced_explicit_join_candidate(
                             source_table=table, split=split,
-                            candidate_decisions=[candidate_decision], args=args):
-                        queries, targets, candidate_qrels, result = (
-                            join_builder.materialize_balanced_explicit_join_candidate(
-                                source_table=table, split=split,
-                                candidate_decision=candidate, args=args))
-                        materialized.append(candidate)
-                        explicit_queries.extend(queries)
-                        explicit_targets.extend(targets)
-                        explicit_qrels.extend(candidate_qrels)
+                            candidate_decision=candidate, args=args))
+                    materialized.append(candidate)
+                    explicit_queries.extend(queries)
+                    explicit_targets.extend(targets)
+                    explicit_qrels.extend(candidate_qrels)
                 decisions[decision_index] = {
                     **original,
                     "source_table_id": source_table_id,
@@ -447,6 +426,7 @@ def build_dataset(
                 qrels.extend(explicit_qrels)
                 counts["qrels"] += len(explicit_qrels)
 
+    assert_disjoint_sources(qrels)
     write_jsonl(output_dir / "qrels.jsonl", qrels)
     write_jsonl(output_dir / "table_queryability_decisions.jsonl", decisions)
     write_json(output_dir / "splits.json", splits)
