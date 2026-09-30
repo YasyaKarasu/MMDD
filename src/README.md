@@ -2,9 +2,151 @@
 
 `src/` contains the standalone research implementation for MMDD. Dataset
 construction lives in `mmdd_dataset/`; the directed multimodal joinability
-Teacher/Student implementation lives in `mmdd_stage1/`. Neither package
-imports `scripts_old/`. Annotation, GPU scheduling, marker protocols, and
+Teacher/Student implementation lives in `mmdd_stage1/`. The AbeBooks explicit
+regeneration utility reuses the maintained dataset builder in `scripts_old/`;
+the training package does not depend on legacy consumers. Annotation, GPU scheduling, marker protocols, and
 service orchestration remain outside `src/`.
+
+Regenerate AbeBooks explicit tasks on sources that never successfully produced
+implicit queries (including historical queries removed by later cleaning):
+
+```bash
+conda run -n MMDD python src/regenerate_abebooks_explicit.py \
+  --source dataset/abebooks_joinability_no4_balanced_20260930 \
+  --output dataset/abebooks_joinability_no4_disjoint_20260930
+```
+
+This preserves implicit queries, labels, evidence and splits; rebuilds explicit
+queries, targets and labels together; and removes obsolete explicit targets,
+including orphan targets. Source groups stay in one split. Candidate shortages
+are recorded in `REGENERATION.json`, never filled from implicit sources.
+`explicit/` contains the standalone explicit export. Rebuild Stage-1 files and
+all feature/ANN caches against the resulting full dataset before evaluating it.
+
+For a source-field ablation, `rebuild_abebooks_sources.py` projects the original
+source tables before calling the maintained implicit and explicit constructors.
+Its default book schema retains title, authors, publisher, and publication year.
+It replays only approved facts in the input dataset's `evidence_recoveries`,
+never unreviewed extraction candidates or new model annotations. Every generated
+implicit query is retained; explicit candidates are deterministically balanced
+on disjoint source tables. Whole source groups are split approximately 80/10/10,
+with equal implicit/explicit counts in each split. `REBUILD.json` records input
+hashes and any old facts not represented by the newly constructed row/layout
+views. Existing review provenance is preserved; the new layouts are not claimed
+to have undergone a new model review.
+`--keep-columns` can retain additional existing source fields such as
+`edition_number`. `--natural-authors` changes unambiguous catalog names from
+`Family, Given` to `Given Family` before construction. It preserves ambiguous
+lists and qualifiers, records every changed source cell, and maps normalized
+recovery values back to their original approved values for the fact audit.
+`--source-reference <original-dataset>` restores original source fields, entity
+references and asset links before projection, checking that all currently
+retained cells agree. It reads no annotations or query/target tables from that
+reference: approved facts still come only from `--dataset`. This can repair an
+entity anchor accidentally removed by an earlier column projection.
+`--strip-series-notes` removes parenthetical clauses containing the word
+`series` from all source book titles before query construction. It preserves
+main titles and other qualifiers, changes no evidence, and records each change
+in `TITLE_NORMALIZATION.jsonl`. When combined with title grouping, it runs
+after grouping so the source partition can remain fixed for a paired control.
+`--contextualize-book-text` restores the source-page heading to every attached
+book text asset as `Book title: ...`, followed by the complete original fragment.
+It uses source row identity only, treats labelled and unlabelled text equally,
+and preserves all images and seller text. `TEXT_CONTEXT.jsonl` records the
+prefix and original-content hash. Re-encode these changed texts before training.
+
+`--group-by-title` tests a different source-table construction: title-only
+word/bigram TF-IDF groups all book rows into the original number and sizes of
+tables. It uses no annotations or retrieval scores, preserves every row and
+evidence asset, and records original row locations for replaying existing facts.
+`--group-by-authors` uses the same capacity-constrained grouping with author
+text instead of titles. The two grouping options are mutually exclusive.
+`--group-by-publisher` instead makes one source table per exact original
+publisher value, preserving all rows and evidence. Table counts and sizes
+change under this option. It tests whether publisher values spread across
+many unrelated source tables make evidence-based target identification
+ambiguous. It uses no labels and introduces no publisher canonicalization.
+`--publisher-min-rows 5` coalesces smaller publisher groups into one tail table
+without deleting rows. This reduces candidate-table count and changes the task;
+report that change alongside recall. Source seller fields may need restoration
+to supply enough disjoint explicit candidates; construction refuses to discard
+implicit queries merely to force class balance.
+Alternatively, `encode_abebooks_source_titles.py --source-tables <source-jsonl>
+--output-dir <new-directory>` locally encodes every book title after removing
+series notes, using GPU 1 and the frozen Qwen encoder. Pass its
+`title_embeddings.npz` to `--title-embeddings` for semantic grouping with the
+same capacities and assignments. Row identities and original title inputs are
+checked before use. These vectors only construct source tables; they do not
+replace retrieval features or change the method's prompts or trainable models.
+The existing query constructor may then use fewer facts; inspect the retained
+fact counts rather than comparing scores as if the query set were unchanged.
+For small datasets, `--proportional-splits` keeps query counts near 80/10/10
+while maintaining global 50/50 class balance. An odd dev/test size necessarily
+has one extra class; this extra alternates between dev and test.
+
+Run this offline workflow from an isolated working directory, using absolute
+paths (replace `/path/to/MMDD` with the repository location):
+
+```bash
+cd /tmp
+conda run -n MMDD python /path/to/MMDD/src/rebuild_abebooks_sources.py \
+  --dataset /path/to/MMDD/dataset/abebooks_joinability_no4_disjoint_20260930 \
+  --output /path/to/MMDD/dataset/abebooks_source_bibliographic
+```
+
+`run_abebooks_source_experiment.py prepare --dataset <versioned-dataset>`
+prepares a new experiment directory and records its source reconstruction.
+`prepare_abebooks_ablation_features.py encode-tables` encodes its changed tables;
+`compose-reference --reference <previous-run>` can reuse frozen evidence features
+only after exact equality checks on encoder inputs. When text changes,
+`encode-changed-text --reference <previous-run>` encodes modified text in both
+retrieval and Teacher tiers; `compose-reference` then replaces its vectors and
+content tokens while reusing only unchanged evidence. For a split-only rebuild,
+`reuse-identical-tables --reference <previous-experiment-root>` also reuses table
+tensors after checking complete input equality apart from object IDs, updates
+input fingerprints, and writes `TABLE_INPUT_PARITY.json`. PCA and all learned
+models are still fitted afresh. `curate-reference-hubs`
+creates a separate evidence-filter control from train-only popularity counts,
+protecting every gold content alias and retaining identical tables and qrels.
+`curate-reference-text-hubs` applies the same 10%-of-training-queries threshold
+only to text content classes, retaining every image and all labelled aliases.
+`curate-reference-unlabelled-text` is a stronger catalog ablation: it retains
+all images and only text classes with existing recovery annotations. It uses
+all-split labels and must not be presented as an unlabeled deployment filter.
+`curate-reference-duplicate-book-images` compares covers only within identical
+title/author/publisher/year records. It removes unlabelled near copies whose
+complete-image RGB pixels differ by at most 3/255 on average after resizing to
+128x128, protecting every labelled content class. This is approximate image
+curation; original images, queries, targets and recovery facts remain intact.
+`curate-reference-supported-sources` retains whole evidence groups from sources
+with approved facts. `curate-reference-bibliographic-evidence` instead excludes
+seller descriptions and sales/shipping policies by their source provenance,
+retaining synopses, author descriptions, covers and all labelled content aliases.
+Both write independent views and preserve every query, target, split and fact.
+`curate-reference-title-anchored-text` requires text to mention two of the three
+rarest source-title words occurring in at most 1% of book rows (one word when
+only one distinctive anchor exists). It retains all images and labelled aliases.
+`curate-reference-positive-sources` keeps whole evidence groups for sources with
+any existing explicit or implicit positive qrel, plus labelled aliases. This
+uses all-split annotations for dataset curation, not an unlabeled deployment rule.
+`audit_abebooks_evidence_catalog.py` compares these catalogs on dev with a fixed
+checkpoint; its output is a retrieval diagnostic, not a newly trained result.
+`run_abebooks_source_experiment.py train/dev/test` uses the existing CQET method
+with 10 epochs and batch 16, and allows dev evaluation before opening test.
+For controlled optimizer comparisons, `--reference-inputs` reuses an unchanged
+dataset and frozen features in a new run, and `--student-lr-p`/`--student-lr-r`
+pass the training functions' existing parameters. Defaults remain unchanged.
+`summarize_abebooks_source_experiment.py` checks source/fact/split integrity and
+independently recomputes per-query and aggregate recall. Its primary metric is
+selected KD multimodal RRF Recall@10; Teacher scores remain diagnostics.
+The current numerical gate requires test overall Recall@10 >= 0.40 and implicit
+Recall@10 >= 0.10 simultaneously. Data integrity and construction constraints
+must also be checked before accepting an experiment.
+`audit_abebooks_recall_mechanism.py --run-root <experiment>` audits every
+implicit dev/test query for literal visibility of the known recovered values
+and retained known witnesses. Its extra metrics do not change qrels, model
+selection, or the main Recall denominator. They are evidence diagnostics,
+not new extraction labels or verification of generated values.
 
 ## Directed joinability Teacher/Student
 
