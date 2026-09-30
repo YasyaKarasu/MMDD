@@ -58,12 +58,10 @@ def validate_protocol(p: dict[str, Any]) -> None:
     if p.get("version") != VERSION:
         raise ValueError(f"Unexpected version: {p.get('version')}")
     hw = p.get("hardware", {})
-    if not isinstance(hw.get("physical_index"), int) or hw["physical_index"] < 0:
-        raise ValueError("hardware.physical_index must be a non-negative integer")
-    if not str(hw.get("uuid", "")).startswith("GPU-"):
-        raise ValueError("hardware.uuid must be a full GPU UUID")
-    if "RTX 4090" not in str(hw.get("model", "")):
-        raise ValueError("V4.1 requires an RTX 4090")
+    if hw.get("physical_index") != 0:
+        raise ValueError("hardware.physical_index must be 0")
+    if hw.get("uuid") != "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725":
+        raise ValueError("unexpected physical GPU0 UUID")
     if hw.get("gpu_processes") != 1 or hw.get("ddp") is not False:
         raise ValueError("V4.1 requires one non-DDP GPU process")
     if hw.get("max_cpu_workers") != 4 or hw.get("max_prefetch_units") != 16:
@@ -98,46 +96,19 @@ def validate_protocol(p: dict[str, Any]) -> None:
             raise ValueError(f"retrieval.{key} must be {expected}")
     if retrieval.get("formal_hops") != "all_ANN":
         raise ValueError("all formal hops must use ANN")
-    small_lake_exact = retrieval.get("small_lake_exact_when_k_reaches_half")
-    if small_lake_exact not in (None, True):
-        raise ValueError("small-lake exact fallback may only be enabled")
     numerics = p.get("numerics", {})
     if numerics.get("task_dtype") != "float32" or numerics.get("AMP") is not False:
         raise ValueError("task numerics must remain FP32 without AMP")
 
-    custom_paths = p.get("paths")
-    if custom_paths is not None:
-        required = {
-            "dataset_root", "backbone_dir", "pure_cache_dir",
-            "row_cache_manifest", "upstream_cache_dir", "upstream_data_dir",
-            "run_root",
-        }
-        if not isinstance(custom_paths, dict) or not required.issubset(custom_paths):
-            missing = sorted(required - set(custom_paths or {}))
-            raise ValueError(f"protocol paths are incomplete: {missing}")
-
 
 def resolve_default_paths(protocol_path: Path, run_root: Path) -> Paths:
     repo_root = Path(__file__).resolve().parents[2]
-    protocol = load_protocol(protocol_path)
-    configured = protocol.get("paths")
+    dataset_root = repo_root / "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9"
+    backbone_dir = repo_root / "hf_models" / "Qwen3-VL-Embedding-8B"
+    pure_cache_dir = repo_root / "work" / "mmdd_stage1_fresh_path_v2_1_20260920" / "features"
+    row_cache_manifest = repo_root / "work" / "stage1_optimization_r10_20260907" / "features_qwen3_vl_embedding_8b" / "manifest.jsonl"
 
-    def resolve(value: str) -> Path:
-        path = Path(value)
-        return (path if path.is_absolute() else repo_root / path).resolve()
-
-    if configured is None:
-        dataset_root = repo_root / "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9"
-        backbone_dir = repo_root / "hf_models" / "Qwen3-VL-Embedding-8B"
-        pure_cache_dir = repo_root / "work" / "mmdd_stage1_fresh_path_v2_1_20260920" / "features"
-        row_cache_manifest = repo_root / "work" / "stage1_optimization_r10_20260907" / "features_qwen3_vl_embedding_8b" / "manifest.jsonl"
-        expected_run_root = (repo_root / "work" / "mmdd_stage1_v4_1_correctness_locked").resolve()
-    else:
-        dataset_root = resolve(configured["dataset_root"])
-        backbone_dir = resolve(configured["backbone_dir"])
-        pure_cache_dir = resolve(configured["pure_cache_dir"])
-        row_cache_manifest = resolve(configured["row_cache_manifest"])
-        expected_run_root = resolve(configured["run_root"])
+    expected_run_root = (repo_root / "work" / "mmdd_stage1_v4_1_correctness_locked").resolve()
     requested_run_root = Path(run_root).resolve()
     if requested_run_root != expected_run_root:
         raise ValueError(f"run root is fixed by protocol: {expected_run_root}")

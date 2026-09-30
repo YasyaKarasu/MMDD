@@ -217,7 +217,6 @@ class HNSWIndex:
         self.ids = list(ids)
         self.ef_search_floor = ef_search_floor
         self.seed = seed
-        self._vectors = vectors
         digest = hashlib.sha256()
         digest.update(memoryview(np.ascontiguousarray(vectors)).cast("B"))
         self.vector_hash = digest.hexdigest()
@@ -236,28 +235,8 @@ class HNSWIndex:
         k = min(int(k), len(self.ids))
         if k <= 0:
             return []
-        if self._vectors is not None and k * 2 >= len(self.ids):
-            scores = self._vectors @ query_vector
-            order = sorted(
-                range(len(self.ids)),
-                key=lambda index: (-float(scores[index]), self.ids[index].encode("utf-8")),
-            )[:k]
-            return [(self.ids[index], float(scores[index])) for index in order]
         self.index.set_ef(max(self.ef_search_floor, k))
-        try:
-            labels, distances = self.index.knn_query(query_vector.reshape(1, -1), k=k)
-        except RuntimeError as error:
-            if (
-                self._vectors is None
-                or "Cannot return the results in a contiguous 2D array" not in str(error)
-            ):
-                raise
-            scores = self._vectors @ query_vector
-            order = sorted(
-                range(len(self.ids)),
-                key=lambda index: (-float(scores[index]), self.ids[index].encode("utf-8")),
-            )[:k]
-            return [(self.ids[index], float(scores[index])) for index in order]
+        labels, distances = self.index.knn_query(query_vector.reshape(1, -1), k=k)
         # hnswlib inner product space returns 1 - inner_product
         scores = 1.0 - distances[0]
         hits = [(self.ids[int(lbl)], float(scores[i])) for i, lbl in enumerate(labels[0])]
@@ -303,7 +282,6 @@ class HNSWIndex:
         obj.ef_search_floor = int(meta["ef_search_floor"])
         obj.seed = int(meta["seed"])
         obj.vector_hash = str(meta["vector_hash"])
-        obj._vectors = None
         obj.index = hnswlib.Index(space="ip", dim=obj.dim)
         obj.index.load_index(str(path), max_elements=len(obj.ids))
         obj.index.set_num_threads(1)

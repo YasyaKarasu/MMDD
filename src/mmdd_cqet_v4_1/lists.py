@@ -101,7 +101,6 @@ def _load_matching_index(path: Path, ids: Sequence[str], vectors: np.ndarray, se
     vector_hash = hashlib.sha256(memoryview(np.ascontiguousarray(vectors)).cast("B")).hexdigest()
     if index.ids != list(ids) or index.seed != seed or index.vector_hash != vector_hash:
         raise ValueError(f"reused Raw HNSW index does not match current objects: {path}")
-    index._vectors = np.asarray(vectors, dtype=np.float32)
     return index
 
 

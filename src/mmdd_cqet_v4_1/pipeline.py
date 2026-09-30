@@ -72,6 +72,7 @@ from .train import (
     train_tb,
 )
 
+GPU_UUID = "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725"
 STAGES = [
     "TA", "TB_CQET", "TB_LSE", "TB_QT", "NATIVE_C1_SUP",
     "QT_C1_SUP", "NATIVE_C2_SUP", "NATIVE_C2_KD", "QT_C2_SUP",
@@ -104,14 +105,14 @@ def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
     return sorted(ids, key=lambda value: (hashlib.sha256(value.encode()).digest(), value.encode()))[:count]
 
 
-def _gpu_guard(expected_uuid: str, expected_model: str) -> None:
+def _gpu_guard() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("formal/smoke execution requires exactly one visible CUDA device")
     props = torch.cuda.get_device_properties(0)
     uuid = str(props.uuid)
     if not uuid.startswith("GPU-"):
         uuid = "GPU-" + uuid
-    if uuid.lower() != expected_uuid.lower() or expected_model not in props.name:
+    if uuid.lower() != GPU_UUID.lower() or "RTX 4090" not in props.name:
         raise RuntimeError(f"BLOCKED_GPU_IDENTITY: cuda:0={uuid} {props.name}")
 
 
@@ -155,7 +156,7 @@ def prepare(protocol_path: Path, run_root: Path) -> None:
     preflight = read_json(paths.run_root / "FROZEN_RECIPE_LOCK.json")
     if preflight.get("status") != "PASS":
         raise RuntimeError("BLOCKED_FEATURE_PROVENANCE")
-    generate_provenance_manifests(paths, str(protocol["hardware"]["uuid"]))
+    generate_provenance_manifests(paths, GPU_UUID)
     canonical = build_content_aliases(paths)
     if not (paths.labels_dir / "label_stats.json").exists():
         build_labels(paths, canonical)
@@ -353,9 +354,7 @@ def _run_stage(
     if completed is not None:
         return completed
     attempt = record_stage_pre_run(
-        stage_dir, stage, seed, str(rt.protocol["hardware"]["uuid"]),
-        physical_index=int(rt.protocol["hardware"]["physical_index"]),
-        paths=rt.paths, parents=parents,
+        stage_dir, stage, seed, GPU_UUID, paths=rt.paths, parents=parents,
         config=config, inputs=inputs, lists=lists,
     )
     checkpoints = stage_dir / "attempts" / attempt / "checkpoints"
@@ -378,7 +377,7 @@ def _run_stage(
             "stage": stage,
             "attempt_id": attempt,
             "pid": os.getpid(),
-            "gpu_uuid": str(rt.protocol["hardware"]["uuid"]),
+            "gpu_uuid": GPU_UUID,
             "mapped_device": "cuda:0",
             "wall_seconds": time.time() - started,
             "cuda_event_seconds": cuda_seconds,
@@ -829,8 +828,7 @@ def _attach_student_gradient_probes(
 
 
 def smoke(protocol_path: Path, run_root: Path) -> None:
-    protocol = load_protocol(protocol_path)
-    _gpu_guard(str(protocol["hardware"]["uuid"]), str(protocol["hardware"]["model"]))
+    _gpu_guard()
     rt = load_runtime(protocol_path, run_root)
     if read_json(rt.paths.run_root / "PHASE_STATUS.json")["status"] != "PASS_READY_FOR_SMOKE":
         raise RuntimeError("prepare and CPU integration gates must pass before smoke")
@@ -1762,8 +1760,7 @@ def _verify_delivery_manifest(rt: Runtime) -> None:
 
 
 def run_formal(protocol_path: Path, run_root: Path) -> None:
-    protocol = load_protocol(protocol_path)
-    _gpu_guard(str(protocol["hardware"]["uuid"]), str(protocol["hardware"]["model"]))
+    _gpu_guard()
     rt = load_runtime(protocol_path, run_root)
     assert_declared_project_imports(rt.paths)
     smoke_result = read_json(rt.paths.run_root / "tests" / "smoke" / "LATEST.json")

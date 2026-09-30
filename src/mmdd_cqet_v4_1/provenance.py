@@ -138,7 +138,6 @@ def record_stage_pre_run(
     seed: int,
     gpu_uuid: str,
     *,
-    physical_index: int = 0,
     paths: Optional[Paths] = None,
     parents: Optional[dict[str, str]] = None,
     config: Optional[dict[str, Any]] = None,
@@ -158,7 +157,7 @@ def record_stage_pre_run(
         "status": "RUNNING",
         "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "gpu": {
-            "physical_index": physical_index,
+            "physical_index": 0,
             "uuid": gpu_uuid,
             "mapped_device": "cuda:0",
             "visible_device_count": torch.cuda.device_count(),

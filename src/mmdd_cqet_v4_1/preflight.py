@@ -21,7 +21,6 @@ from PIL import Image, ImageFile, ImageOps
 from torch.nn import functional as F
 
 from . import EXPERIMENT_ID, SCHEMA_VERSION
-from .config import load_protocol, resolve_default_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -32,36 +31,6 @@ UPSTREAM_CACHE_DIR = REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "
 UPSTREAM_DATA_DIR = REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "stage1_data"
 PACKAGE_DIR = REPO_ROOT / "audit" / "MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE"
 RUN_ROOT = REPO_ROOT / "work" / "mmdd_stage1_v4_1_correctness_locked"
-PROTOCOL_PATH = PACKAGE_DIR / "next_round" / "protocol.json"
-EXPECTED_GPU_UUID = "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725"
-
-
-def configure(protocol_path: Path, run_root: Path) -> None:
-    global DATASET_ROOT, BACKBONE_DIR, PURE_CACHE_DIR, UPSTREAM_CACHE_DIR
-    global UPSTREAM_DATA_DIR, PACKAGE_DIR, RUN_ROOT, PROTOCOL_PATH, EXPECTED_GPU_UUID
-
-    protocol_path = Path(protocol_path).resolve()
-    protocol = load_protocol(protocol_path)
-    paths = resolve_default_paths(protocol_path, run_root)
-    DATASET_ROOT = paths.dataset_root
-    BACKBONE_DIR = paths.backbone_dir
-    PURE_CACHE_DIR = paths.pure_cache_dir
-    UPSTREAM_CACHE_DIR = paths.row_cache_manifest.parent
-    configured = protocol.get("paths") or {}
-    upstream_data = configured.get(
-        "upstream_data_dir",
-        str(REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "stage1_data"),
-    )
-    upstream_data_path = Path(upstream_data)
-    UPSTREAM_DATA_DIR = (
-        upstream_data_path
-        if upstream_data_path.is_absolute()
-        else REPO_ROOT / upstream_data_path
-    ).resolve()
-    RUN_ROOT = paths.run_root
-    PROTOCOL_PATH = protocol_path
-    PACKAGE_DIR = protocol_path.parent
-    EXPECTED_GPU_UUID = str(protocol["hardware"]["uuid"])
 
 # Match the real frozen extractor's image boundary. Dataset images are trusted
 # local inputs and some legitimately exceed Pillow's heuristic pixel ceiling.
@@ -83,10 +52,9 @@ def sha256_json(value: Any) -> str:
 
 
 def file_identity(path: Path, *, root: Path | None = None, role: str | None = None) -> dict[str, Any]:
-    logical_path = Path(path).absolute()
     path = Path(path).resolve()
     record: dict[str, Any] = {
-        "path": str(logical_path.relative_to(Path(root).absolute())) if root is not None else str(path),
+        "path": str(path.relative_to(root.resolve())) if root is not None else str(path),
         "bytes": path.stat().st_size,
         "sha256": sha256_file(path),
     }
@@ -266,7 +234,7 @@ def build_recipe_lock() -> dict[str, Any]:
         REPO_ROOT / "src" / "mmdd_stage1" / "models.py",
         REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "run_feature_cache.sh",
         REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "split_feature_inputs.py",
-        PROTOCOL_PATH,
+        PACKAGE_DIR / "next_round" / "protocol.json",
         REPO_ROOT / "audit" / "MMDD_STAGE1_FRESH_PATH_v2_1_20260920" / "ENCODER_PROMPTS.json",
     ]
     recipe = {
@@ -319,11 +287,7 @@ def build_recipe_lock() -> dict[str, Any]:
             "storage_dtype": "float32",
         },
         "numeric_probe": {"samples_per_modality": 16, "train_queries": 16, "rtol": 1e-4, "atol": 1e-5},
-        "source_files": _hash_files(
-            [path for path in source_paths if path.is_file()],
-            root=REPO_ROOT,
-            role="frozen_recipe_source",
-        ),
+        "source_files": _hash_files(source_paths, root=REPO_ROOT, role="frozen_recipe_source"),
         "backbone_files": _hash_files(_backbone_files(), root=BACKBONE_DIR, role="frozen_backbone"),
     }
     recipe["recipe_sha256"] = sha256_json(recipe)
@@ -422,7 +386,7 @@ def build_content_aliases() -> dict[str, Any]:
 
 def build_identity() -> dict[str, Any]:
     protocol = RUN_ROOT / "protocol.json"
-    expected_protocol = PROTOCOL_PATH
+    expected_protocol = PACKAGE_DIR / "next_round" / "protocol.json"
     if sha256_file(protocol) != sha256_file(expected_protocol):
         raise ValueError("run protocol differs from delivered protocol")
     dataset_files = _required_dataset_files()
@@ -664,8 +628,8 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
     )
     from fresh_path.features import ContentStore, compress_bins
 
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != EXPECTED_GPU_UUID:
-        raise RuntimeError("BLOCKED_GPU_IDENTITY: CUDA_VISIBLE_DEVICES must match the protocol UUID")
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725":
+        raise RuntimeError("BLOCKED_GPU_IDENTITY: CUDA_VISIBLE_DEVICES must be the locked GPU0 UUID")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("BLOCKED_GPU_IDENTITY: expected one visible CUDA device")
     properties = torch.cuda.get_device_properties(0)
@@ -938,15 +902,12 @@ def run_lock() -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command", choices=("lock", "verify-features"))
-    ap.add_argument("--protocol", type=Path, required=True)
-    ap.add_argument("--run-root", type=Path, required=True)
     ap.add_argument("--device", default="cuda:0")
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    configure(args.protocol, args.run_root)
     result = run_lock() if args.command == "lock" else verify_feature_provenance(args.device)
     print(json.dumps({"status": "complete", "command": args.command, "result": result}, default=str))
     return 0

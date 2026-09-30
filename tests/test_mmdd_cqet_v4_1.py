@@ -20,7 +20,7 @@ from mmdd_cqet_v4_1.evaluate import (
     paired_bootstrap,
 )
 from mmdd_cqet_v4_1.artifacts import load_pool_bundle, save_pool_bundle
-from mmdd_cqet_v4_1.config import Paths, resolve_default_paths, validate_protocol
+from mmdd_cqet_v4_1.config import Paths
 from mmdd_cqet_v4_1.data import iter_jsonl, utf8_sorted, write_jsonl
 from mmdd_cqet_v4_1.data import build_content_aliases
 from mmdd_cqet_v4_1.labels import Labels
@@ -44,7 +44,6 @@ from mmdd_cqet_v4_1.losses import (
 from mmdd_cqet_v4_1.models import FreshPathTeacher, NativeStudent
 from mmdd_cqet_v4_1.retrieval import HNSWIndex, PathEntry, PoolRecord, d1_retain, p3_admission
 from mmdd_cqet_v4_1.provenance import assert_declared_project_imports
-from mmdd_cqet_v4_1.preflight import file_identity
 from mmdd_cqet_v4_1.pipeline import _completed_stage_result
 from mmdd_cqet_v4_1.probes import (
     student_gradient_probe,
@@ -110,81 +109,6 @@ class TinyRowStore:
 
     def get(self, object_id: str) -> np.ndarray:
         return self.rows[object_id]
-
-
-def test_protocol_accepts_gpu1_and_custom_paths(tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[1]
-    original = json.loads(
-        (
-            repo_root
-            / "audit"
-            / "MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE"
-            / "next_round"
-            / "protocol.json"
-        ).read_text(encoding="utf-8")
-    )
-    run_root = tmp_path / "run"
-    original["hardware"]["physical_index"] = 1
-    original["hardware"]["uuid"] = "GPU-b1fcd6e2-b542-a1b0-8656-202feee8afc7"
-    original["paths"] = {
-        "dataset_root": str(tmp_path / "dataset"),
-        "backbone_dir": str(tmp_path / "backbone"),
-        "pure_cache_dir": str(tmp_path / "pure"),
-        "row_cache_manifest": str(tmp_path / "upstream" / "manifest.jsonl"),
-        "upstream_cache_dir": str(tmp_path / "upstream"),
-        "upstream_data_dir": str(tmp_path / "data"),
-        "run_root": str(run_root),
-    }
-    validate_protocol(original)
-    protocol_path = tmp_path / "protocol.json"
-    protocol_path.write_text(json.dumps(original), encoding="utf-8")
-
-    paths = resolve_default_paths(protocol_path, run_root)
-    assert paths.dataset_root == (tmp_path / "dataset").resolve()
-    assert paths.backbone_dir == (tmp_path / "backbone").resolve()
-    assert paths.pure_cache_dir == (tmp_path / "pure").resolve()
-    assert paths.row_cache_manifest == (tmp_path / "upstream" / "manifest.jsonl").resolve()
-    assert paths.run_root == run_root.resolve()
-
-
-def test_original_protocol_keeps_entitables_default_paths():
-    repo_root = Path(__file__).resolve().parents[1]
-    protocol_path = (
-        repo_root
-        / "audit"
-        / "MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE"
-        / "next_round"
-        / "protocol.json"
-    )
-    run_root = repo_root / "work" / "mmdd_stage1_v4_1_correctness_locked"
-    paths = resolve_default_paths(protocol_path, run_root)
-    assert paths.dataset_root == (
-        repo_root
-        / "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9"
-    ).resolve()
-    assert paths.pure_cache_dir == (
-        repo_root / "work" / "mmdd_stage1_fresh_path_v2_1_20260920" / "features"
-    ).resolve()
-    assert paths.row_cache_manifest == (
-        repo_root
-        / "work"
-        / "stage1_optimization_r10_20260907"
-        / "features_qwen3_vl_embedding_8b"
-        / "manifest.jsonl"
-    ).resolve()
-
-
-def test_preflight_identity_keeps_logical_path_through_symlink(tmp_path: Path):
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "part.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
-    view = tmp_path / "view"
-    view.mkdir()
-    (view / "linked").symlink_to(source, target_is_directory=True)
-
-    identity = file_identity(view / "linked" / "part.jsonl", root=view)
-    assert identity["path"] == "linked/part.jsonl"
-    assert identity["bytes"] == len('{"ok": true}\n')
 
 
 def tiny_fixture(n_queries: int = 1):
@@ -476,70 +400,7 @@ def test_five_relation_ann_formula_and_reload(tmp_path: Path):
             path = tmp_path / "q_text.hnsw"
             index.save(path)
             reloaded = HNSWIndex.load(path)
-            reloaded_hits = reloaded.search(query.detach().numpy(), len(ids))
-            assert [object_id for object_id, _score in reloaded_hits] == [
-                object_id for object_id, _score in hits
-            ]
-            np.testing.assert_allclose(
-                [score for _object_id, score in reloaded_hits],
-                [score for _object_id, score in hits],
-                rtol=1e-4,
-                atol=1e-5,
-            )
-
-
-def test_small_hnsw_library_uses_exact_inner_product():
-    vectors = np.asarray(
-        [[1.0, 0.0], [0.7, 0.7], [0.0, 1.0], [-1.0, 0.0]],
-        dtype=np.float32,
-    )
-    ids = ["z", "b", "a", "n"]
-    index = HNSWIndex(vectors, ids, dim=2, seed=13)
-
-    def fail_hnsw(*_args, **_kwargs):
-        raise AssertionError("near-full small-library search must not call HNSW")
-
-    index.index = types.SimpleNamespace(
-        set_ef=lambda _value: None,
-        knn_query=fail_hnsw,
-    )
-    query = np.asarray([0.6, 0.8], dtype=np.float32)
-    hits = index.search(query, 3)
-    scores = vectors @ query
-    expected_order = sorted(
-        range(len(ids)), key=lambda i: (-float(scores[i]), ids[i].encode("utf-8"))
-    )[:3]
-    assert hits == [(ids[i], float(scores[i])) for i in expected_order]
-
-
-def test_reloaded_hnsw_uses_bound_vectors_for_small_library(
-    tmp_path: Path,
-):
-    vectors = np.asarray(
-        [[1.0, 0.0], [0.7, 0.7], [0.0, 1.0], [-1.0, 0.0]],
-        dtype=np.float32,
-    )
-    ids = ["z", "b", "a", "n"]
-    path = tmp_path / "small.hnsw"
-    HNSWIndex(vectors, ids, dim=2, seed=13).save(path)
-    reloaded = HNSWIndex.load(path)
-    reloaded._vectors = vectors
-
-    def fail_hnsw(*_args, **_kwargs):
-        raise AssertionError("bound reused index must use exact small-library search")
-
-    reloaded.index = types.SimpleNamespace(
-        set_ef=lambda _value: None,
-        knn_query=fail_hnsw,
-    )
-    query = np.asarray([0.6, 0.8], dtype=np.float32)
-    scores = vectors @ query
-    expected_order = sorted(
-        range(len(ids)), key=lambda i: (-float(scores[i]), ids[i].encode("utf-8"))
-    )[:3]
-    assert reloaded.search(query, 3) == [
-        (ids[i], float(scores[i])) for i in expected_order
-    ]
+            assert reloaded.search(query.detach().numpy(), len(ids)) == hits
 
 
 def test_cqet_and_lse_gradients_and_permutation():
