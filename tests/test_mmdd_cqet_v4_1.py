@@ -368,6 +368,37 @@ def test_actual_c2_resume_matches_continuous(tmp_path: Path):
     assert model_state_sha(resumed) == model_state_sha(continuous)
 
 
+def test_student_multiple_epochs_preserve_batches_and_optimizer_state(tmp_path: Path):
+    bank, records, basis, mean = tiny_fixture(n_queries=4)
+    base = NativeStudent(basis, mean, dim=2)
+    parent_hash = model_state_sha(base)
+    common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=3, epochs=3,
+                  expected_parent_hash=parent_hash, seed=13)
+    continuous = copy.deepcopy(base)
+    points = train_student_c2(continuous, records, None, bank, **common,
+        save_dir=tmp_path / "continuous", log_path=tmp_path / "steps.jsonl")
+    rows = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in rows] == [1, 1, 2, 2, 3, 3]
+    assert [r["batch_queries"] for r in rows] == [3, 1, 3, 1, 3, 1]
+    for epoch in (1, 2, 3):
+        assert sorted(q for r in rows if r["epoch"] == epoch for q in r["record_ids"]) == ["q0", "q1", "q2", "q3"]
+    endpoint = torch.load(points[1.0], map_location="cpu", weights_only=False)
+    assert all(int(state["step"]) == 6 for state in endpoint["optimizer"]["state"].values())
+    partial = copy.deepcopy(base)
+    train_student_c2(partial, records, None, bank, **common,
+                     save_dir=tmp_path / "partial", max_updates=2)
+    resumed = copy.deepcopy(base)
+    train_student_c2(resumed, records, None, bank, **common,
+                     resume_from=tmp_path / "partial/snapshot_epoch001.pt")
+    assert model_state_sha(resumed) == model_state_sha(continuous)
+    edges = [{"item_id": r["query_id"], "relation": "QT", "anchor_id": r["query_id"],
+              "candidates": r["targets"], "positives": r["positives"]} for r in records]
+    train_student_c1(copy.deepcopy(base), edges, None, bank, device="cpu", epochs=3,
+                     logical_batch=3, log_path=tmp_path / "c1_steps.jsonl")
+    c1_rows = [json.loads(line) for line in (tmp_path / "c1_steps.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in c1_rows] == [1, 1, 2, 2, 3, 3]
+
+
 def test_five_relation_ann_formula_and_reload(tmp_path: Path):
     torch.manual_seed(5)
     basis = torch.randn(3, 4)

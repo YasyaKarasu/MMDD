@@ -148,6 +148,31 @@ def _order_sha(records: Sequence[dict]) -> str:
     return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
 
 
+def _student_schedule(records: Sequence[dict], namespace: str, seed: int,
+                      epochs: int, logical_batch: int) -> tuple[list[dict], list[tuple[int, int, int]]]:
+    """Shuffle each epoch separately and keep its final partial batch separate."""
+    if epochs < 1 or logical_batch < 1:
+        raise ValueError("epochs and logical_batch must be positive")
+    ordered, batches = [], []
+    for epoch in range(1, epochs + 1):
+        offset = len(ordered)
+        ordered.extend(_hash_order(records, namespace, seed, epoch))
+        batches.extend((epoch, offset + start, offset + min(start + logical_batch, len(records)))
+                       for start in range(0, len(records), logical_batch))
+    return ordered, batches
+
+
+def _student_snapshot_steps(total_steps: int, epochs: int) -> dict[int, list[float]]:
+    steps: dict[int, list[float]] = defaultdict(list)
+    if epochs == 1:
+        for fraction in (0.25, 0.5, 0.75, 1.0):
+            steps[math.ceil(total_steps * fraction)].append(fraction)
+    else:
+        for epoch in range(1, epochs + 1):
+            steps[(total_steps // epochs) * epoch].append(epoch / epochs)
+    return steps
+
+
 def _log(path: Optional[Path], row: dict) -> None:
     if path is None:
         return
@@ -828,6 +853,7 @@ def train_student_c1(
     seed: int = 13,
     metadata: Optional[dict] = None,
     log_path: Optional[Path] = None,
+    epochs: int = 1,
 ) -> dict[float, Path]:
     if teacher is not None or "KD" in arm:
         raise ValueError("V4.1 C1 has no KD branch")
@@ -836,15 +862,12 @@ def train_student_c1(
     student.to(dev).train()
     is_qt = isinstance(student, QTStudent)
     valid_lists = [row for row in edge_lists if not is_qt or row["relation"] == "QT"]
-    ordered = _hash_order(valid_lists, "C1_QT" if is_qt else "C1_NATIVE", seed, 1)
+    ordered, batches = _student_schedule(valid_lists, "C1_QT" if is_qt else "C1_NATIVE", seed, epochs, logical_batch)
     optimizer = AdamW(student.param_groups(lr_p, lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
-    total_steps = math.ceil(len(ordered) / logical_batch)
-    fractions = (0.25, 0.5, 0.75, 1.0)
-    fraction_steps: dict[int, list[float]] = defaultdict(list)
-    for fraction in fractions:
-        fraction_steps[math.ceil(total_steps * fraction)].append(fraction)
+    total_steps = len(batches)
+    fraction_steps = _student_snapshot_steps(total_steps, epochs)
     stage = "QT_C1_SUP" if is_qt else "NATIVE_C1_SUP"
-    base_meta = dict(metadata or {})
+    base_meta = {**dict(metadata or {}), "epochs": epochs, "logical_batch": logical_batch}
     saved: dict[float, Path] = {}
     if save_dir:
         path = save_dir / "snapshot_frac000.pt"
@@ -856,8 +879,8 @@ def train_student_c1(
     logical_step = 0
     query_microbatch = 64
     started = time.time()
-    for start in range(0, len(ordered), logical_batch):
-        batch = ordered[start : start + logical_batch]
+    for epoch, start, end in batches:
+        batch = ordered[start:end]
         active_batch = [
             row for row in batch
             if any(candidate in set(row["positives"]) for candidate in row["candidates"])
@@ -920,7 +943,7 @@ def train_student_c1(
         logical_step += 1
         grad_norm_value = float(grad_norm)
         _log(log_path, {
-            "stage": stage, "epoch": 1, "step": logical_step,
+            "stage": stage, "epoch": epoch, "step": logical_step,
             "record_ids": [row["item_id"] for row in batch],
             "active_lists": active_lists, "batch_lists": len(batch),
             "loss": total_value, "grad_norm_preclip": grad_norm_value,
@@ -936,11 +959,12 @@ def train_student_c1(
         })
         if logical_step in fraction_steps and save_dir:
             for fraction in fraction_steps[logical_step]:
-                path = save_dir / f"snapshot_frac{int(fraction * 100):03d}.pt"
+                path = save_dir / (f"snapshot_frac{int(fraction * 100):03d}.pt" if epochs == 1
+                                   else f"snapshot_epoch{epoch:03d}.pt")
                 save_checkpoint(
                     path, student, optimizer,
-                    {**base_meta, "stage": stage, "epoch": 1, "logical_step": logical_step,
-                     "next_record_cursor": min(start + logical_batch, len(ordered)),
+                    {**base_meta, "stage": stage, "epoch": epoch, "logical_step": logical_step,
+                     "next_record_cursor": end,
                      "order_sha256": _order_sha(ordered), "fraction": fraction,
                      "student_query_microbatch": query_microbatch},
                 )
@@ -1066,6 +1090,7 @@ def train_student_c2(
     teacher_logits: Optional[Mapping[str, tuple[Tensor, Optional[Tensor]]]] = None,
     max_updates: Optional[int] = None,
     log_path: Optional[Path] = None,
+    epochs: int = 1,
 ) -> dict[float, Path]:
     is_qt = isinstance(student, QTStudent)
     is_kd = arm == "NATIVE_KD"
@@ -1086,16 +1111,13 @@ def train_student_c2(
             parameter.requires_grad_(False)
             parameter.grad = None
 
-    ordered = _hash_order(c2_records, "C2_SHARED", seed, 1)
+    ordered, batches = _student_schedule(c2_records, "C2_SHARED", seed, epochs, logical_batch)
     order_sha = _order_sha(ordered)
     optimizer = AdamW(student.param_groups(lr_p, lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     stage = "QT_C2_SUP" if is_qt else ("NATIVE_C2_KD" if is_kd else "NATIVE_C2_SUP")
-    total_steps = math.ceil(len(ordered) / logical_batch)
-    fractions = (0.25, 0.5, 0.75, 1.0)
-    fraction_steps: dict[int, list[float]] = defaultdict(list)
-    for fraction in fractions:
-        fraction_steps[math.ceil(total_steps * fraction)].append(fraction)
-    base_meta = dict(metadata or {})
+    total_steps = len(batches)
+    fraction_steps = _student_snapshot_steps(total_steps, epochs)
+    base_meta = {**dict(metadata or {}), "epochs": epochs, "logical_batch": logical_batch}
     saved: dict[float, Path] = {}
     logical_step = 0
     next_cursor = 0
@@ -1105,6 +1127,8 @@ def train_student_c2(
         extra = load_training_checkpoint(resume_from, student, optimizer, expected_stage=stage)
         if extra.get("order_sha256") != order_sha:
             raise ValueError("resume materialized query order changed")
+        if extra.get("logical_batch", logical_batch) != logical_batch:
+            raise ValueError("resume logical batch changed")
         logical_step = int(extra["logical_step"])
         next_cursor = int(extra["next_record_cursor"])
     elif save_dir:
@@ -1117,10 +1141,12 @@ def train_student_c2(
         )
         saved[0.0] = path
 
-    for start in range(next_cursor, len(ordered), logical_batch):
+    for epoch, start, end in batches:
+        if start < next_cursor:
+            continue
         if max_updates is not None and logical_step >= max_updates:
             break
-        batch = ordered[start : start + logical_batch]
+        batch = ordered[start:end]
         batch_rng = _rng_state()
         while True:
             optimizer.zero_grad(set_to_none=True)
@@ -1203,10 +1229,10 @@ def train_student_c2(
         grad_norm = nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
         logical_step += 1
-        next_cursor = min(start + logical_batch, len(ordered))
+        next_cursor = end
         grad_norm_value = float(grad_norm)
         _log(log_path, {
-            "stage": stage, "epoch": 1, "step": logical_step,
+            "stage": stage, "epoch": epoch, "step": logical_step,
             "record_ids": [row["query_id"] for row in batch],
             "active_queries": len(batch), "batch_queries": len(batch),
             "loss": total_value, "grad_norm_preclip": grad_norm_value,
@@ -1233,10 +1259,11 @@ def train_student_c2(
             raise RuntimeError("Teacher acquired gradients during C2 KD")
         if logical_step in fraction_steps and save_dir:
             for fraction in fraction_steps[logical_step]:
-                path = save_dir / f"snapshot_frac{int(fraction * 100):03d}.pt"
+                path = save_dir / (f"snapshot_frac{int(fraction * 100):03d}.pt" if epochs == 1
+                                   else f"snapshot_epoch{epoch:03d}.pt")
                 save_checkpoint(
                     path, student, optimizer,
-                    {**base_meta, "stage": stage, "epoch": 1, "logical_step": logical_step,
+                    {**base_meta, "stage": stage, "epoch": epoch, "logical_step": logical_step,
                      "next_record_cursor": next_cursor, "order_sha256": order_sha,
                      "parent_state_sha256": parent_hash, "fraction": fraction,
                      "student_query_microbatch": query_microbatch},
