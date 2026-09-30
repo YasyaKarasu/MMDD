@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AbeBooks · 检索路径查看器</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-icon">m<span>↗</span></span><div><strong>MMDD <span>/</span> Evidence Atlas</strong><small>ABEBOOKS · 检索路径查看器</small></div></a>
+    <div class="top-actions"><span class="local-tag"><i></i> 本地实验结果</span><button id="share" class="button ghost">复制当前视图链接 ↗</button></div>
+  </header>
+  <section class="controls" aria-label="实验设置">
+    <label>数据版本<select id="arm"><option value="baseline">原始数据</option><option value="hubs">仅过滤素材</option><option value="columns">仅精简列</option><option value="both">两者同时</option></select></label>
+    <label>检索模型<select id="generator"><option value="raw">Raw embedding</option></select></label>
+    <label>数据划分<select id="split"><option value="test">Test · 测试集</option><option value="dev">Dev · 验证集</option><option value="train">Train · 训练集</option></select></label>
+    <p id="mode-note">原始 embedding 的两跳检索路径</p>
+  </section>
+  <p id="dataset-note" class="dataset-note" aria-live="polite">当前为原始数据（baseline）：保留 currency / shipping_currency（USD）和 language。可在上方切换到「仅精简列」。</p>
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="side-head"><span class="eyebrow">QUERIES</span><span id="query-count" class="count">—</span></div>
+      <label class="search"><span>⌕</span><input id="query-search" type="search" placeholder="搜索书名或 Query ID" aria-label="搜索 query"></label>
+      <div id="query-list" class="query-list"></div>
+      <footer>seed 13 <span>·</span> AbeBooks bal04 clean</footer>
+    </aside>
+    <main id="main">
+      <div id="status" class="status" role="status">正在加载检索结果…</div>
+      <div id="content" hidden>
+        <section class="query-head">
+          <div class="eyebrow">01 / QUERY TABLE <span id="query-kind"></span></div>
+          <div class="title-line"><h1 id="query-title"></h1><button class="button" id="query-table">查看 Query 全表 ↗</button></div>
+          <div class="query-meta"><code id="query-id"></code><span id="query-shape"></span></div>
+          <div id="query-columns" class="chips"></div>
+          <div id="stats" class="stats"></div>
+        </section>
+        <div class="tabbar" role="tablist" aria-label="检索视图">
+          <button data-tab="paths" class="tab active" role="tab" aria-selected="true">Query → 素材 → Target</button>
+          <button data-tab="direct" class="tab" role="tab" aria-selected="false">直接召回 Target</button>
+          <button data-tab="gold" class="tab" role="tab" aria-selected="false">Gold 目标与证据</button>
+        </div>
+        <section id="paths-view" class="path-grid">
+          <div class="evidence-pane panel">
+            <div class="panel-head"><div><span class="eyebrow">02 / FIRST HOP</span><h2>召回的素材 <span id="evidence-count"></span></h2></div></div>
+            <div class="filter-row"><div class="segments" id="modality"><button data-value="all" class="active">全部</button><button data-value="text">文本</button><button data-value="image">图片</button></div><label class="check"><input type="checkbox" id="gold-evidence">仅 gold</label></div>
+            <input id="evidence-search" class="plain-search" type="search" placeholder="搜索素材内容或 ID" aria-label="搜索素材">
+            <div id="evidence-list" class="evidence-list"></div>
+          </div>
+          <div class="target-pane">
+            <div id="evidence-detail" class="panel evidence-detail"></div>
+            <section class="panel target-panel">
+              <div class="panel-head"><div><span class="eyebrow">03 / SECOND HOP</span><h2>这条素材召回的 Target <span id="target-count"></span></h2></div></div>
+              <div class="target-tools"><select id="target-filter" aria-label="筛选 target"><option value="all">全部 target</option><option value="gold">仅 gold target</option><option value="gold_path">仅正确证据链</option><option value="retained">仅 D1 保留</option><option value="c150">仅进入 C150</option></select><input id="target-search" type="search" placeholder="搜索 Target / 列名 / 内容" aria-label="搜索 target"></div>
+              <div class="legend"><span class="dot gold"></span>Gold target <span class="dot teal"></span>正确证据链 <span class="legend-note">按素材 → Target 的原始名次排列</span></div>
+              <div id="target-list" class="target-list"></div>
+            </section>
+          </div>
+        </section>
+        <section id="direct-view" class="panel alternate-view" hidden></section>
+        <section id="gold-view" class="panel alternate-view" hidden></section>
+      </div>
+    </main>
+  </div>
+  <dialog id="modal"><header><div><span id="modal-kicker" class="eyebrow"></span><h2 id="modal-title"></h2></div><button class="close" id="modal-close" aria-label="关闭">×</button></header><div id="modal-body"></div></dialog>
+  <div id="toast" role="status"></div>
+</body>
+</html>
