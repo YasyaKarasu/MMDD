@@ -63,7 +63,87 @@ def natural_evidence(record: dict[str, Any] | None, target: str) -> list[str]:
                              if p.get('kind') == 'evidence' and p.get('evidence_id')))[:4]
 
 
-def audit_data(roots: list[Path], output: Path, retrieval_paths: list[Path]) -> dict[str, Any]:
+def _read_candidate_scope(path: Path) -> tuple[dict[tuple[str, str], set[str]], dict[tuple[str, str, str], list[int]]]:
+    """Read a frozen target or candidate-column scope used to build a C30 population.
+
+    The scope is deliberately a separate input contract.  JSON mappings keyed by
+    ``dataset|query_id|target_id`` and JSON/JSONL records with the three identity
+    fields are accepted.  A Stage-1 ``{"query": {"C30": [...]}}`` export is
+    interpreted as a target-table scope.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.suffix in {'.jsonl', '.gz'}:
+        opener = gzip.open if path.suffix == '.gz' else open
+        with opener(path, 'rt', encoding='utf-8') as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+    else:
+        payload = json.loads(path.read_text())
+        if isinstance(payload, dict) and 'records' in payload:
+            rows = payload['records']
+        else:
+            rows = payload
+        if isinstance(rows, dict):
+            rows = [{key: value} for key, value in rows.items()]
+    target_result: dict[tuple[str, str], set[str]] = {}
+    column_result: dict[tuple[str, str, str], list[int]] = {}
+    for row in rows:
+        # Compact Stage-1 exports often use {query_id: {"C30": [target_ids]}}.
+        if not isinstance(row, dict):
+            raise ValueError('candidate scope records must be objects')
+        if len(row) == 1 and isinstance(next(iter(row.values())), dict):
+            query_id, payload = next(iter(row.items()))
+            targets = payload.get('C30', payload.get('c30', payload.get('target_ids')))
+            if targets is not None:
+                target_result.setdefault(('', str(query_id)), set()).update(map(str, targets))
+                continue
+        if len(row) == 1 and isinstance(next(iter(row.values())), list):
+            compact_key, columns = next(iter(row.items()))
+            parts = str(compact_key).split('|')
+            if len(parts) != 3:
+                raise ValueError(f'invalid candidate scope key: {compact_key!r}')
+            identity = tuple(parts)
+            values = [int(column) for column in columns]
+            if not values or len(set(values)) != len(values):
+                raise ValueError(f'candidate scope columns must be unique and non-empty: {compact_key!r}')
+            column_result[identity] = values
+            continue
+        key = row.get('scope_key') or row.get('key')
+        if key and not {'dataset', 'query_id', 'target_id'} <= row.keys():
+            parts = str(key).split('|')
+            if len(parts) != 3:
+                raise ValueError(f'invalid candidate scope key: {key!r}')
+            dataset, query_id, target_id = parts
+        else:
+            try:
+                dataset, query_id, target_id = (str(row[k]) for k in ('dataset', 'query_id', 'target_id'))
+            except KeyError as exc:
+                raise ValueError('candidate scope record lacks dataset/query_id/target_id') from exc
+        target_ids = row.get('candidate_target_ids', row.get('target_ids'))
+        if target_ids is not None:
+            target_result.setdefault((dataset, query_id), set()).update(map(str, target_ids))
+            continue
+        columns = row.get('candidate_column_indices', row.get('columns'))
+        if columns is None:
+            raise ValueError(f'candidate scope record lacks candidate columns: {row!r}')
+        values = [int(column) for column in columns]
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f'candidate scope columns must be unique and non-empty: {row!r}')
+        identity = (dataset, query_id, target_id)
+        if identity in column_result and column_result[identity] != values:
+            raise ValueError(f'conflicting candidate scope records: {identity}')
+        column_result[identity] = values
+    if not target_result and not column_result:
+        raise ValueError(f'candidate scope is empty: {path}')
+    return target_result, column_result
+
+
+load_candidate_scope = _read_candidate_scope
+
+
+def audit_data(roots: list[Path], output: Path, retrieval_paths: list[Path],
+               candidate_scope_file: Path | None = None) -> dict[str, Any]:
+    target_scope, column_scope = _read_candidate_scope(candidate_scope_file) if candidate_scope_file else ({}, {})
     retrieval = {}
     for path in retrieval_paths:
         for r in read_jsonl(path):
@@ -132,6 +212,27 @@ def audit_data(roots: list[Path], output: Path, retrieval_paths: list[Path]) -> 
             except (KeyError, ValueError) as error:
                 issues.append({**base, 'reason': str(error)})
                 continue
+            if candidate_scope_file is not None:
+                scope_key = (lake, qid, tid)
+                query_targets = target_scope.get((lake, qid), target_scope.get(('', qid)))
+                if target_scope and query_targets is None:
+                    raise ValueError(f'candidate target scope missing query: {(lake, qid)}')
+                if query_targets is not None and tid not in query_targets:
+                    continue
+                if column_scope:
+                    if scope_key not in column_scope:
+                        raise ValueError(f'candidate scope missing pair: {scope_key}')
+                    selected_columns = column_scope[scope_key]
+                    unknown = set(selected_columns) - set(columns)
+                    if unknown:
+                        raise ValueError(f'candidate scope has unknown columns for {scope_key}: {sorted(unknown)}')
+                    if not set(gold).issubset(selected_columns):
+                        # A qrel outside C30 is not a supervised pair in the C30 run.
+                        continue
+                    source_by_local = dict(zip(columns, sources))
+                    columns = selected_columns
+                    sources = [source_by_local[c] for c in columns]
+                    gold = sorted(set(gold).intersection(columns))
             for qrel in records:
                 split_groups['source'][(lake, qrel['source_table_id'])].add(split)
                 split_groups['chain'][(lake, qrel.get('chain_id', ''))].add(split)
@@ -175,6 +276,10 @@ def audit_data(roots: list[Path], output: Path, retrieval_paths: list[Path]) -> 
     populations = [r for r in populations if (r['dataset'], r['query_id']) not in excluded_keys]
     inputs = [r for r in inputs if (r['dataset'], r['query_id']) not in excluded_keys]
     audit = {'protocol': 'canonical train/dev/test; no R12 split remapping', 'roots': root_audits,
+             'candidate_scope': ({'path': str(candidate_scope_file.resolve()),
+                                  'sha256': file_hash(candidate_scope_file),
+                                  'pairs': len(target_scope) + len(column_scope), 'applied': True} if candidate_scope_file is not None
+                                 else {'applied': False}),
              'excluded_before_population_lock': issues, 'cross_split_overlaps': overlaps,
              'duplicate_content_exclusions': duplicate_exclusions,
              'duplicate_policy': 'exclude all exact visible query-content groups spanning splits before lock; retain published splits',

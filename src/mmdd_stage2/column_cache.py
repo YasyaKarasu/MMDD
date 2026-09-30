@@ -19,6 +19,13 @@ LAYOUTS = {'C0': 'header_markers_v0', 'C1': 'tail_candidates_v1', 'C2': 'tail_ca
 VIEW_SEEDS = (13001, 29001, 47001)
 
 
+def validate_view_seeds(view_seeds: tuple[int, ...] | list[int]) -> tuple[int, ...]:
+    seeds = tuple(int(seed) for seed in view_seeds)
+    if len(seeds) < 1 or any(seed < 0 for seed in seeds):
+        raise ValueError('view_seeds must contain one or more non-negative integers')
+    return seeds
+
+
 def source_fingerprints() -> dict[str, str]:
     folder = Path(__file__).parent
     return {p.name: file_hash(p) for p in sorted(folder.glob('*.py'))}
@@ -38,9 +45,14 @@ def reader_identity(model_dir: Path, *, image_pixels: int, dtype: str = 'bf16') 
 
 
 def condition_input(item: dict[str, Any], objects: dict[str, Any], *, condition: str, view: int,
-                    donor: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+                    donor: dict[str, Any] | None = None,
+                    view_seeds: tuple[int, ...] | list[int] = VIEW_SEEDS
+                    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    seeds = validate_view_seeds(view_seeds)
+    if view < 0 or view >= len(seeds):
+        raise ValueError(f'view {view} is outside view_seeds ({len(seeds)} available)')
     query = objects['queries'][item['query_id']]
-    target = permute_table_columns(objects['targets'][item['target_id']], seed=VIEW_SEEDS[view])
+    target = permute_table_columns(objects['targets'][item['target_id']], seed=seeds[view])
     ids = item['evidence_ids']['O-R' if condition == 'O-R' else 'O-O']
     if condition == 'No-E':
         ids = []
@@ -64,7 +76,9 @@ def condition_input(item: dict[str, Any], objects: dict[str, Any], *, condition:
 def build_features(output: Path, model_dir: Path, *, layout: str, split: str, condition: str,
                    view: int, device: str, image_pixels: int = 262144, limit: int | None = None,
                    backend: Any = None, identity: dict[str, Any] | None = None,
-                   historical_input: bool = False) -> Path:
+                   historical_input: bool = False,
+                   view_seeds: tuple[int, ...] | list[int] = VIEW_SEEDS) -> Path:
+    view_seeds = validate_view_seeds(view_seeds)
     manifest = json.loads((output / 'INPUT_MANIFEST.json').read_text())
     if not manifest['locked']:
         raise ValueError('Data audit has not locked the population')
@@ -79,6 +93,7 @@ def build_features(output: Path, model_dir: Path, *, layout: str, split: str, co
     objects = read_jsonl(output / 'OBJECTS.jsonl.gz')[0]
     identity = identity or reader_identity(model_dir, image_pixels=image_pixels)
     contract = {**identity, 'reader_layout_version': layout, 'condition': condition, 'view': view,
+                'view_seeds': list(view_seeds),
                 'input_manifest_sha256': file_hash(output / 'INPUT_MANIFEST.json'),
                 'split': split, 'limit': limit}
     if historical_input:
@@ -123,7 +138,8 @@ def build_features(output: Path, model_dir: Path, *, layout: str, split: str, co
                 def evidence_length(record: dict[str, Any]) -> int:
                     return sum(len(objects['evidence'][eid].get('content', '')) for eid in record['evidence_ids']['O-O'])
                 donor = min(eligible, key=lambda d: (abs(evidence_length(d) - evidence_length(item)), digest(d)), default=None)
-            query, target, evidence = condition_input(item, objects, condition=condition, view=view, donor=donor)
+            query, target, evidence = condition_input(item, objects, condition=condition, view=view, donor=donor,
+                                                      view_seeds=view_seeds)
             if historical_input:
                 target = objects['targets'][item['target_id']]
             content = {'query': serialize_table(query), 'target': serialize_table(target, mark_candidates=True, reader_layout_version=layout),

@@ -210,7 +210,7 @@ def test_flat_control_and_mix_run_matched_complete_schedules(tmp_path, monkeypat
             return {**item,'candidate_column_indices':[0,1,2,3],
                     'open_states':opened + .1*len(ids), 'close_states':closed + .01*view}
     monkeypatch.setattr(training,'TrainingData',FakeData)
-    monkeypatch.setattr(training,'inputs_for',lambda *args:inputs)
+    monkeypatch.setattr(training,'inputs_for',lambda *args,**kwargs:inputs)
     control = training.train_arm(r1,output,'OO_CONTROL',13)
     mixed = training.train_arm(r1,output,'FLAT_MIX',13)
     scalar_output = tmp_path/'scalar'

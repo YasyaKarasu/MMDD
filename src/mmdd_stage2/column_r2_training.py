@@ -17,7 +17,41 @@ from .column_r2_cache import FeatureIndex, job, job_key
 from .column_r2_metrics import report_metrics
 from .column_r2_models import EvidenceCorrection, complete_scores, mix_condition, shortlist
 from .column_training import column_loss, parameter_hash
+from .natural_evidence import NATURAL_EVIDENCE_KEY
 from .verifier import CandidateColumnScorer
+
+# Arms scored by the flat candidate head; the rest are evidence-correction arms (PVR_*).
+PLAIN_HEAD_ARMS = {'OO_CONTROL', 'FLAT_MIX', 'PRIOR', 'NAT_E'}
+NO_EVIDENCE_ARM = 'PRIOR'
+NATURAL_EVIDENCE_ARM = 'NAT_E'
+PROVENANCE_MODULES = ('column_batching.py', 'column_training.py', 'verifier.py',
+                      'natural_evidence.py', 'matched_row_score.py', 'bridge_first_rerank.py',
+                      'minilm.py', 'fresh_recovery_engine.py', 'b_plus_idf.py')
+
+
+def prediction_evidence(arm: str, item: dict) -> list[str]:
+    """Evidence ids used when scoring dev predictions.
+
+    Historical defaults are preserved exactly: the no-evidence arm and the witness arms keep their
+    previous ids, and only the natural-evidence arm reads the new key.
+    """
+    if arm == NO_EVIDENCE_ARM:
+        return []
+    if arm == NATURAL_EVIDENCE_ARM:
+        return list(item['evidence_ids'][NATURAL_EVIDENCE_KEY])
+    return list(item['evidence_ids']['O-R'])
+
+
+def training_condition(arm: str, item: dict, seed: int, epoch: int) -> tuple[str, list[str]]:
+    """Condition label and evidence ids for one (arm, epoch, pair) training sample."""
+    if arm == NO_EVIDENCE_ARM:
+        return 'No-E', []
+    if arm == NATURAL_EVIDENCE_ARM:
+        return 'NATURAL_E', list(item['evidence_ids'][NATURAL_EVIDENCE_KEY])
+    if arm == 'OO_CONTROL':
+        return 'O-O', list(item['evidence_ids']['O-O'])
+    condition = mix_condition(seed, epoch, item['query_id'], item['target_id'])
+    return condition, list(item['evidence_ids'][condition])
 
 
 @dataclass
@@ -39,37 +73,42 @@ class DevPlateauStopper:
         return self.patience > 0 and epoch >= self.min_epochs and self.bad_checks >= self.patience
 
 
-def inputs_for(r1: Path, output: Path, split: str) -> list[dict]:
+def inputs_for(r1: Path, output: Path, split: str, *, arm: str | None = None) -> list[dict]:
+    if arm == NATURAL_EVIDENCE_ARM:
+        folder = output / 'NAT_E'
+        path = folder / f'COLUMN_INPUTS.{split}.jsonl'
+        if file_hash(path) != read_json(folder / 'MANIFEST.json')['splits'][split]['sha256']:
+            raise ValueError('Frozen natural-evidence input changed')
+        return read_jsonl(path)
     path = output / 'NATURAL_TRAIN/COLUMN_INPUTS.train.jsonl' if split == 'train' else r1 / f'COLUMN_INPUTS.{split}.jsonl'
     if split == 'train' and file_hash(path) != read_json(output/'NATURAL_TRAIN/MANIFEST.json')['inputs_sha256']:
         raise ValueError('Frozen natural train input changed')
     return read_jsonl(path)
 
 
-def metadata_for(r1: Path, items: list[dict], objects: dict, split: str) -> list[dict]:
-    lookup = {pair_key(p): p for p in read_jsonl(r1 / f'COLUMN_POPULATION.{split}.jsonl')}
-    result = []
-    for item in items:
-        ids = item['evidence_ids']['O-R']
-        result.append({**lookup[pair_key(item)], 'natural_evidence_empty': not ids,
-            'natural_retrieval_available': True, 'evidence_count': len(ids),
-            'modality': '+'.join(sorted({objects['evidence'][e]['asset_type'] for e in ids})) or 'none'})
-    return result
-
-
 def prepare_jobs(r1: Path, output: Path, kind: str) -> Path:
+    """Enumerate reader jobs for one feature family.
+
+    ``nat_e`` / ``nat_e_test`` cache the natural retrieved evidence (augmented inputs); every other
+    kind keeps the witness-bundle schedule unchanged.
+    """
     jobs = {}
-    splits = ('test',) if kind in {'test', 'prior-test'} else ('train', 'dev')
+    natural = kind in {'nat_e', 'nat_e_test'}
+    arm = NATURAL_EVIDENCE_ARM if natural else None
+    splits = ('test',) if kind in {'test', 'prior-test', 'nat_e_test'} else ('train', 'dev')
     for split in splits:
-        for item in inputs_for(r1, output, split):
+        for item in inputs_for(r1, output, split, arm=arm):
             for view in (0, 1) if split == 'train' else (0,):
                 bundles = [[]]
-                conditions = () if kind == 'prior-test' else ('O-O', 'O-R') if split == 'train' else ('O-R',)
-                for condition in conditions:
-                    ids = item['evidence_ids'][condition]
-                    bundles.append(ids)
-                    if kind in {'separate', 'test'}:
-                        bundles.extend([[eid] for eid in ids])
+                if natural:
+                    bundles.append(list(item['evidence_ids'][NATURAL_EVIDENCE_KEY]))
+                else:
+                    conditions = () if kind == 'prior-test' else ('O-O', 'O-R') if split == 'train' else ('O-R',)
+                    for condition in conditions:
+                        ids = item['evidence_ids'][condition]
+                        bundles.append(ids)
+                        if kind in {'separate', 'test'}:
+                            bundles.extend([[eid] for eid in ids])
                 for ids in bundles:
                     record = job(item, ids, view)
                     jobs[job_key(record)] = record
@@ -79,15 +118,47 @@ def prepare_jobs(r1: Path, output: Path, kind: str) -> Path:
     return path
 
 
+def evidence_subset_ids(arm: str | None, item: dict) -> list[str]:
+    """Evidence ids that define the dev/test non-empty and full reporting subsets.
+
+    The historical default is the R1 natural-retrieval key for every arm, including the
+    no-evidence arm, so existing dev numbers are unchanged. Only the natural-evidence arm reports
+    its own Stage-1 evidence; mixing the two would rank its checkpoints on another run's retrieval.
+    """
+    if arm == NATURAL_EVIDENCE_ARM:
+        return list(item['evidence_ids'][NATURAL_EVIDENCE_KEY])
+    return list(item['evidence_ids']['O-R'])
+
+
+def metadata_for(r1: Path, items: list[dict], objects: dict, split: str, *, arm: str | None = None) -> list[dict]:
+    lookup = {pair_key(p): p for p in read_jsonl(r1 / f'COLUMN_POPULATION.{split}.jsonl')}
+    result = []
+    for item in items:
+        ids = evidence_subset_ids(arm, item)
+        result.append({**lookup[pair_key(item)], 'natural_evidence_empty': not ids,
+            'natural_retrieval_available': True, 'evidence_count': len(ids),
+            'modality': '+'.join(sorted({objects['evidence'][e]['asset_type'] for e in ids})) or 'none',
+            'evidence_source': NATURAL_EVIDENCE_KEY if arm == NATURAL_EVIDENCE_ARM else 'O-R'})
+    return result
+
+
 class TrainingData:
     def __init__(self, r1: Path, output: Path) -> None:
         self.r1, self.output = r1, output
         self.index = FeatureIndex(r1, output)
         self.objects = read_jsonl(r1 / 'OBJECTS.jsonl.gz')[0]
-        extra = output / 'NATURAL_TRAIN/EVIDENCE_OBJECTS.jsonl.gz'
-        if file_hash(extra) != read_json(output/'NATURAL_TRAIN/MANIFEST.json')['objects_sha256']:
-            raise ValueError('Frozen natural evidence objects changed')
-        self.objects['evidence'].update({e['asset_id']: e for e in read_jsonl(extra)})
+        extra_roots = [output / 'NAT_E/EVIDENCE_OBJECTS.jsonl.gz',
+                       output / 'NATURAL_TRAIN/EVIDENCE_OBJECTS.jsonl.gz']
+        for extra in extra_roots:
+            if not extra.is_file():
+                continue
+            manifest = read_json(output / ('NAT_E/MANIFEST.json' if extra.parent.name == 'NAT_E'
+                                           else 'NATURAL_TRAIN/MANIFEST.json'))
+            if file_hash(extra) != manifest['objects_sha256']:
+                raise ValueError('Frozen natural evidence objects changed')
+            self.objects['evidence'].update({e['asset_id']: e for e in read_jsonl(extra)})
+        if not any(extra.is_file() for extra in extra_roots):
+            raise FileNotFoundError('No frozen natural evidence object store')
         self.loaded = {}
         self.fixed_prior = {}
         self.prior_inputs_frozen = False
@@ -124,7 +195,7 @@ class TrainingData:
 def load_head(path: Path) -> tuple[torch.nn.Module, dict]:
     cp = torch.load(path, map_location='cpu', weights_only=True)
     meta = cp['metadata']
-    if meta['arm'] in {'OO_CONTROL', 'FLAT_MIX', 'PRIOR'}:
+    if meta['arm'] in PLAIN_HEAD_ARMS:
         model = CandidateColumnScorer(meta['hidden_dim'], head_type='mlp')
     else:
         model = EvidenceCorrection(meta['hidden_dim'], meta['arm'] != 'PVR_BUNDLE')
@@ -175,14 +246,14 @@ def predict_model(data: TrainingData, model: torch.nn.Module, items: list[dict],
     if prior is None:
         for start in range(0, len(items), 32):
             batch = items[start:start+32]
-            evidence = [[] if arm == 'PRIOR' else item['evidence_ids']['O-R'] for item in batch]
+            evidence = [prediction_evidence(arm, item) for item in batch]
             records = [data.get(item, ids, view) for item, ids in zip(batch, evidence)]
             logits = score_records(model, records, execution=execution)
             predictions.extend(prediction(record, scores.tolist(), evidence_ids=ids)
                                for record, scores, ids in zip(records, logits, evidence))
         return predictions, priors
     for item in items:
-        ids = [] if arm == 'PRIOR' else item['evidence_ids']['O-R']
+        ids = prediction_evidence(arm, item)
         record, base, corrected, positions = pvr_forward(data, model, prior, item, ids, view)
         columns = record['candidate_column_indices']
         logits = complete_scores(base, corrected, positions, columns) if ids else base
@@ -197,7 +268,15 @@ def predict_model(data: TrainingData, model: torch.nn.Module, items: list[dict],
 def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = 'batched',
               training_output: Path | None = None, epochs: int = 20,
               early_stopping_patience: int | None = None, min_epochs: int = 10,
-              min_delta: float = .0005, log_every_pairs: int = 1024) -> dict:
+              min_delta: float = .0005, log_every_pairs: int = 1024,
+              fixed_epoch: int | None = None) -> dict:
+    """Train one selector arm.
+
+    ``fixed_epoch`` switches on the controlled-comparison schedule: that single epoch's checkpoint
+    is kept and dev is monitored rather than used for selection. Arms launched with the same
+    ``seed`` share bit-identical initial parameters, so ``fixed_epoch`` with
+    ``early_stopping_patience=0`` leaves the evidence input as the only difference between them.
+    """
     if execution not in {'scalar', 'batched'}:
         raise ValueError(f'Unknown head execution: {execution}')
     # Only the deployed selector changes its default stopping policy. Matched
@@ -205,6 +284,8 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
     patience = (5 if arm == 'PRIOR' else 0) if early_stopping_patience is None else early_stopping_patience
     if epochs < 1 or patience < 0 or min_epochs < 1 or min_delta < 0 or log_every_pairs < 0:
         raise ValueError('Invalid training or early-stopping schedule')
+    if fixed_epoch is not None and (not 1 <= fixed_epoch <= epochs or patience):
+        raise ValueError('fixed_epoch requires 1 <= fixed_epoch <= epochs and no early stopping')
     stopper = DevPlateauStopper(patience, min_epochs, min_delta)
     training_output = training_output or output
     folder = training_output / f'{arm}/checkpoints/{seed}'
@@ -213,11 +294,12 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
     torch.set_num_threads(4)
     started = time.perf_counter()
     data = TrainingData(r1, output)
-    train, dev = inputs_for(r1, output, 'train'), inputs_for(r1, output, 'dev')
+    train, dev = inputs_for(r1, output, 'train', arm=arm), inputs_for(r1, output, 'dev', arm=arm)
     train_meta = {pair_key(p): p for p in read_jsonl(r1 / 'COLUMN_POPULATION.train.jsonl')}
-    dev_meta = metadata_for(r1, dev, data.objects, 'dev')
+    dev_meta = metadata_for(r1, dev, data.objects, 'dev', arm=arm)
     pvr = arm.startswith('PVR_')
-    dimension_ids = [] if arm == 'PRIOR' or pvr else train[0]['evidence_ids']['O-O']
+    dimension_ids = [] if arm == NO_EVIDENCE_ARM or pvr else train[0]['evidence_ids'][
+        NATURAL_EVIDENCE_KEY if arm == NATURAL_EVIDENCE_ARM else 'O-O']
     hidden_dim = data.get(train[0], dimension_ids, 0)['open_states'].shape[1]
     if pvr and not (output / 'PRIOR/SHORTLIST_MANIFEST.json').is_file():
         raise ValueError('Freeze label-blind prior shortlists before verifier training')
@@ -236,7 +318,7 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
     torch.manual_seed(seed)
     model = EvidenceCorrection(hidden_dim, arm != 'PVR_BUNDLE') if pvr else CandidateColumnScorer(hidden_dim, head_type='mlp')
     initial = parameter_hash(model)
-    if arm in {'OO_CONTROL', 'FLAT_MIX', 'PRIOR'}:
+    if arm in PLAIN_HEAD_ARMS - {NATURAL_EVIDENCE_ARM}:
         expected = read_json(r1 / f'RUN_RECEIPTS/C2/{seed}.json')['initial_parameter_hash']
         if initial != expected:
             raise ValueError('Flat/Prior initialization differs from R1 C2')
@@ -245,20 +327,27 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
     folder.mkdir(parents=True, exist_ok=True)
     meta = {'arm': arm, 'seed': seed, 'hidden_dim': hidden_dim, 'initial_parameter_sha256': initial,
         'reader_layout': 'tail_candidates_v1', 'reader_identity_sha256': file_hash(r1/'READER_IDENTITY.json'),
-        'data_manifest_sha256': file_hash(output/'NATURAL_TRAIN/MANIFEST.json'),
+        'data_manifest_sha256': file_hash(output / ('NAT_E/MANIFEST.json'
+                                                     if arm == NATURAL_EVIDENCE_ARM and (output / 'NAT_E/MANIFEST.json').is_file()
+                                                     else 'NATURAL_TRAIN/MANIFEST.json')),
         'prior_sha256': file_hash(prior_path) if pvr else None,
         'sources': {p.name: file_hash(p) for p in sorted(Path(__file__).parent.glob('column_r2_*.py'))
-                    + [Path(__file__).with_name(name) for name in ('column_batching.py', 'column_training.py', 'verifier.py')]},
+                    + [Path(__file__).with_name(name) for name in PROVENANCE_MODULES]},
         'optimizer': 'AdamW', 'lr': lr, 'weight_decay': 1e-4, 'gradient_clip': 1., 'effective_batch': 32,
         'epochs': epochs, 'head_parameters': sum(p.numel() for p in model.parameters()),
         'early_stopping': {'enabled': patience > 0, 'metric': 'dev query_macro MRR',
                            'patience': patience, 'min_epochs': min_epochs, 'min_delta': min_delta,
                            'check_every': 'complete_epoch', 'restore': 'best_selected_checkpoint'},
         'log_every_pairs': log_every_pairs,
-        'selection': 'dev No-E MRR, H1, earlier epoch' if arm == 'PRIOR' else
+        'selection': ('fixed epoch %d, dev monitoring only' % fixed_epoch) if fixed_epoch is not None else
+            'dev No-E MRR, H1, earlier epoch' if arm == NO_EVIDENCE_ARM else
+            'dev natural-evidence full MRR, non-empty H1, earlier epoch' if arm == NATURAL_EVIDENCE_ARM else
             'dev O-R full MRR, non-empty H1, lower damage (PVR only), earlier epoch',
-        'condition_schedule': 'No-E' if arm == 'PRIOR' else 'O-O' if arm == 'OO_CONTROL' else
+        'condition_schedule': 'No-E' if arm == NO_EVIDENCE_ARM else
+            'current Stage-1 retained paths, ordered, <=4' if arm == NATURAL_EVIDENCE_ARM else
+            'O-O' if arm == 'OO_CONTROL' else
             'sha256(seed,epoch,query_id,target_id) parity: even O-O, odd O-R',
+        'fixed_epoch_selection': fixed_epoch,
         'view_schedule': '(epoch-1)%2', 'prior_frozen': pvr, 'backbone_frozen': True,
         'head_execution': 'scalar' if pvr else execution,
         'dropout_schedule': 'per_pair_original_order_and_shape',
@@ -296,8 +385,7 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
                 key = pair_key(item)
                 visits.append(key)
                 seen_queries.add((item['dataset'], item['query_id']))
-                condition = 'No-E' if arm == 'PRIOR' else 'O-O' if arm == 'OO_CONTROL' else mix_condition(seed,epoch,item['query_id'],item['target_id'])
-                ids = [] if condition == 'No-E' else item['evidence_ids'][condition]
+                condition, ids = training_condition(arm, item, seed, epoch)
                 selected_conditions.append([key, condition, ids])
                 nonempty += int(bool(ids))
                 prepared.append((item, key, ids))
@@ -372,7 +460,8 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
             'early_stop_triggered': stopped_early,
             'train_seconds': train_seconds, 'dev_seconds': time.perf_counter() - dev_started,
             'dev_metrics': metrics, 'parameter_sha256': parameter_hash(model)})
-        if best is None or score > best:
+        keep = epoch == fixed_epoch if fixed_epoch is not None else (best is None or score > best)
+        if keep:
             best = score
             selected_epoch = epoch
             selected_meta = {**meta, 'selected_epoch': epoch, 'parameter_sha256': parameter_hash(model)}
@@ -391,7 +480,8 @@ def train_arm(r1: Path, output: Path, arm: str, seed: int, *, execution: str = '
     write_json(folder/'FEATURES.json', feature_hashes)
     receipt = {**meta, 'selected_epoch': selected_epoch, 'optimizer_steps': steps,
         'actual_epochs': len(history), 'stopped_early': stopped_early,
-        'stop_reason': 'dev_mrr_plateau' if stopped_early else 'epoch_budget',
+        'stop_reason': 'dev_mrr_plateau' if stopped_early else
+            'fixed_epoch' if fixed_epoch is not None else 'epoch_budget',
         'wall_seconds': time.perf_counter() - started,
         'selected_sha256': file_hash(folder/'selected.pt'), 'feature_hashes_sha256': file_hash(folder/'FEATURES.json'),
         'planned': True, 'implemented': True, 'actually_executed': True, 'actually_evaluated': ['dev']}

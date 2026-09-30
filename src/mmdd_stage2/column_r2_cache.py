@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from .column_cache import condition_input
+from .column_cache import VIEW_SEEDS, condition_input, validate_view_seeds
 from .column_data import digest, file_hash, read_jsonl, write_json, write_jsonl
 from .column_r2_audit import read_json, r1_caches
 from .data import escape_marker_literals
@@ -73,7 +73,9 @@ class FeatureIndex:
 
 
 def reader_worker(r1: Path, output: Path, model_dir: Path, jobs_path: Path,
-                  shard: int, shards: int, device: str) -> None:
+                  shard: int, shards: int, device: str,
+                  view_seeds: tuple[int, ...] | list[int] = VIEW_SEEDS) -> None:
+    view_seeds = validate_view_seeds(view_seeds)
     torch.set_num_threads(4)
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable: run with authorized GPU access')
@@ -100,15 +102,17 @@ def reader_worker(r1: Path, output: Path, model_dir: Path, jobs_path: Path,
     image_hashes = {}
     folder = output / 'FEATURES'
     folder.mkdir(parents=True, exist_ok=True)
-    index_path = output / f'FEATURE_INDEX/{jobs_path.name}.{shard}.json'
+    reuse_audited = view_seeds == tuple(VIEW_SEEDS)
+    seed_tag = digest(list(view_seeds))[:12]
+    index_path = output / f'FEATURE_INDEX/{jobs_path.name}.{seed_tag}.{shard}.json'
     for position, row in enumerate(jobs, 1):
         key = job_key(row)
-        if key in index.entries:
+        if reuse_audited and key in index.entries:
             entries[key] = index.entries[key]
             continue
         query, target, evidence = condition_input(
             {**row, 'evidence_ids': {'O-O': row['evidence_ids']}}, objects,
-            condition='O-O', view=row['view'])
+            condition='O-O', view=row['view'], view_seeds=view_seeds)
         images = {}
         for e in evidence:
             if e['asset_type'] == 'image':
@@ -117,6 +121,7 @@ def reader_worker(r1: Path, output: Path, model_dir: Path, jobs_path: Path,
                     image_hashes[path] = file_hash(Path(path))
                 images[e['asset_id']] = image_hashes[path]
         fingerprint = digest({'reader_identity': identity, 'layout': 'tail_candidates_v1',
+            'view_seeds': list(view_seeds),
             'query': query, 'target': target, 'evidence': evidence, 'image_bytes': images, 'job': row})
         destination = folder / f'{fingerprint}.pt'
         if destination.is_file():

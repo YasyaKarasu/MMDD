@@ -549,6 +549,18 @@ round selection has finished.
 
 ## Stage-2 verification
 
+The natural-evidence column selector (`NAT_E`) and the bridge-first reranking stage are documented
+in `EVIDENCE_SELECTOR_AND_BRIDGE_RERANK.md`. The merged provenance and remaining runtime limits are
+recorded in `MIGRATION_GAPS.md`.
+
+For a fresh R7-style C30 run, create a new audit output with
+`run_stage2_columns.py audit --candidate-scope-file <stage1-c30-scope.json>`. The scope may list
+candidate target tables per query or candidate columns per `(dataset, query, target)` pair. Pass
+`--view-seeds 13001 26002` to the cache entry points when reproducing the R7 second view; custom
+seeds are part of each cache contract. After fresh bridge score files exist,
+`run_stage2_b_plus_idf.py` fuses them with frozen IDF visible scores without loading a previous
+Stage-2 checkpoint.
+
 Stage 2 is an executable RATA/FOCUS pipeline over canonical dataset artifacts
 and Stage-1 retrieval JSON. `--input-candidate-budget` sets N (default 50): the
 first N unique targets in the Stage-1 result order. Duplicate target IDs and

@@ -13,6 +13,8 @@ def main() -> None:
     audit = sub.add_parser('audit')
     audit.add_argument('--dataset-root', type=Path, action='append', required=True)
     audit.add_argument('--retrieval', type=Path, action='append', default=[])
+    audit.add_argument('--candidate-scope-file', type=Path,
+                       help='Frozen JSON/JSONL C30 scope: target ids per query or columns per pair')
     cache = sub.add_parser('cache')
     cache.add_argument('--model-dir', type=Path, required=True)
     cache.add_argument('--layout', choices=['header_markers_v0', 'tail_candidates_v1'], required=True)
@@ -22,6 +24,8 @@ def main() -> None:
     cache.add_argument('--device', default='cuda:0')
     cache.add_argument('--image-pixels', type=int, default=262144)
     cache.add_argument('--limit', type=int)
+    cache.add_argument('--view-seeds', type=int, nargs='+', default=[13001, 29001, 47001],
+                       help='Column permutation seeds, one per view')
     train = sub.add_parser('train')
     train.add_argument('--arm', choices=['C0', 'C1', 'C2'], required=True)
     train.add_argument('--seed', type=int, choices=[13, 29], required=True)
@@ -45,13 +49,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == 'audit':
         from mmdd_stage2.column_data import audit_data
-        result = audit_data(args.dataset_root, args.output, args.retrieval)
+        result = audit_data(args.dataset_root, args.output, args.retrieval, args.candidate_scope_file)
         print(json.dumps({'locked': result['population_locked'], 'counts': result['split_counts']}))
     elif args.command == 'cache':
         from mmdd_stage2.column_cache import build_features
         build_features(args.output, args.model_dir, layout=args.layout, split=args.split,
                        condition=args.condition, view=args.view, device=args.device,
-                       image_pixels=args.image_pixels, limit=args.limit)
+                       image_pixels=args.image_pixels, limit=args.limit,
+                       view_seeds=tuple(args.view_seeds))
     elif args.command == 'train':
         from mmdd_stage2.column_training import train_head
         train_head(args.output, args.arm, args.seed, args.train_cache, args.dev_cache, tiny=args.tiny, epochs=args.epochs)
