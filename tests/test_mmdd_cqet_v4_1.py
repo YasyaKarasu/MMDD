@@ -1289,3 +1289,17 @@ def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
         with pytest.raises(ValueError, match=match):
             validate_protocol({**protocol, **broken})
     assert load_protocol(protocol_path)["student"]["logit_scale"] == 20.0
+
+
+def test_list_kl_divergence_takes_final_logits_without_hidden_temperature():
+    import inspect
+
+    import torch.nn.functional as F
+    from mmdd_cqet_v4_1.losses import list_kl_divergence
+
+    assert "temperature" not in inspect.signature(list_kl_divergence).parameters
+    student = torch.tensor([0.4, -1.2, 2.0], requires_grad=True)
+    teacher = torch.tensor([3.0, -2.0, 1.0])
+    p_t = F.softmax(teacher, 0)
+    expected = (p_t * (F.log_softmax(teacher, 0) - F.log_softmax(student, 0))).sum()
+    assert torch.allclose(list_kl_divergence(student, teacher), expected)

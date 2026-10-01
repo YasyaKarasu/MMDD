@@ -204,9 +204,13 @@ def list_kl_divergence(
     student_scores: Tensor,
     teacher_scores: Tensor,
     valid_mask: Optional[Tensor] = None,
-    temperature: float = 1.0,
 ) -> Optional[Tensor]:
-    """KL divergence D_KL(softmax(s_T/temp) || softmax(s_S/temp))."""
+    """KL divergence D_KL(softmax(teacher_scores) || softmax(student_scores)).
+
+    Both inputs are final logits. Callers apply the asymmetric scaling themselves:
+    student logits are already multiplied by ``logit_scale`` and teacher logits are
+    divided by ``kd_temperature`` (see ``train.train_student_c2``).
+    """
     if student_scores.shape != teacher_scores.shape:
         raise ValueError("student and teacher scores must match in shape")
     if valid_mask is not None:
@@ -220,12 +224,10 @@ def list_kl_divergence(
     if student_scores.numel() <= 1:
         return None
 
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
     if not student_scores.requires_grad:
         raise RuntimeError("student KL scores must remain grad-enabled")
-    t_log_p = F.log_softmax(teacher_scores.detach() / temperature, dim=0)
-    s_log_p = F.log_softmax(student_scores / temperature, dim=0)
+    t_log_p = F.log_softmax(teacher_scores.detach(), dim=0)
+    s_log_p = F.log_softmax(student_scores, dim=0)
     # KL = sum(p_T * (log_p_T - log_p_S))
     p_t = torch.exp(t_log_p)
     return (p_t * (t_log_p - s_log_p)).sum()
