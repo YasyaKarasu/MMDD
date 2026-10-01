@@ -7,6 +7,136 @@ regeneration utility reuses the maintained dataset builder in `scripts_old/`;
 the training package does not depend on legacy consumers. Annotation, GPU scheduling, marker protocols, and
 service orchestration remain outside `src/`.
 
+The current standalone AbeBooks version is
+`dataset/abebooks_authors_publishers_context2_all5_20261001`: **138 queries, all
+five rows and two visible columns**. The 69 implicit queries now show title plus
+publication year (67 queries) or publisher (2 author-join queries). Explicit
+queries retain title plus their join column. Query memberships, splits, labels,
+recoverable rows, and the 174 targets are preserved from the publisher version.
+Run `enrich_abebooks_query_context.py --dataset <publisher-copy> --output <new-copy>`
+to add real source context while checking hidden-value leakage, retained target
+enrichment, and direct context equality joins. Rebuild Stage-1 and validate with
+`validate_abebooks_standalone_dataset.py` afterwards. See the
+[two-column report](../docs/abebooks_query_context_20261001.zh-CN.md).
+
+Before CQET v4.1 training, migrate older standalone qrels in a new copy with
+`project_abebooks_sources.py --dataset <dataset> --output <new-copy>`.
+This preserves all facts and changes the legacy `explicit_join_column` reason
+to the existing training vocabulary `explicit_visible_join_column`; otherwise
+CQET classifies explicit queries as mixed and loses their Direct positives.
+The standalone builder now emits the compatible reason. Optional source-field
+deletion (`--drop-columns`) and conservative author display normalization
+(`--natural-authors`) regenerate table cells from original source rows. Every
+query, split, target membership, and pair judgment must remain valid, or the
+copy is rejected. `--remove-assets-json` accepts IDs from a recorded curation
+rule and refuses to remove annotated witnesses. Changed files are backed up
+inside the copy; original data remains unchanged. These are dataset controls,
+with fresh namespaces and retraining, not changes to the retrieval method.
+`--contextualize-book-text` restores the attached source book's title before
+each text fragment while preserving its full body. This content control
+requires fresh text features; existing recovery facts retain their original
+annotation provenance and record the content transformation.
+
+The previous title-only implicit-query version is
+`dataset/abebooks_authors_publishers_all5_balanced_20261001`: **82 train / 28 dev /
+28 test**, with exactly 50% implicit and 50% explicit in each split. It contains
+117 author-join queries and 21 publisher-join queries (9 implicit / 12 explicit).
+Both attributes occur in every split. All queries have five rows, and implicit
+queries require at least two verified rows. Publisher supervision uses reviewed
+cover text/logos, with blind local reader errors preserved in the audit; it is
+model-assisted annotation, not human gold. Parent-company logos do not establish
+specific imprints. All 174 target tables retain their previous columns and cells.
+See the [publisher expansion report](../docs/abebooks_authors_publishers_dataset_20261001.zh-CN.md)
+for commands, normalization rules, counts, and training inputs.
+
+The previous author-only standalone version is
+`dataset/abebooks_standalone_all5_balanced_20261001`: **80 train / 26 dev / 26 test**
+queries, with exactly 50% implicit and 50% explicit in each split. **Every query
+has five rows**, including explicit queries. Implicit queries need at least two
+verified recoverable rows. Unreviewed rows remain unsupervised. Each source row
+occurs in at most one query. To balance equally sized views, surplus implicit
+views expose their source author column and become explicit queries; they are
+not duplicated. Remaining odd explicit views are downsampled within each split.
+Build with `build_abebooks_standalone_dataset.py --implicit-rows 5 --explicit-rows 5
+--minimum-recovered-rows 2 --balanced`, build Stage-1, then run
+`validate_abebooks_standalone_dataset.py --dataset-root <copy> --stage1-dir <stage1>`.
+All original source records, assets, and candidate memberships are preserved.
+See the [all-query five-row report](../docs/abebooks_standalone_all5_dataset_20261001.zh-CN.md).
+
+The historical mixed-size standalone version is
+`dataset/abebooks_standalone_5row_balanced_20261001`: **140 train / 46 dev / 46 test**
+queries, with exactly 50% implicit and 50% explicit in each split. Every implicit
+query contains **five rows, with at least two verified recoverable rows**; explicit
+queries contain two rows. Unreviewed rows remain unsupervised. Source rows are
+never reused between queries. It retains all 174 candidates, 1,289 source records,
+and 5,441 assets. The original and both earlier standalone copies are preserved.
+Build a new copy with `build_abebooks_standalone_dataset.py --implicit-rows 5
+--explicit-rows 2 --minimum-recovered-rows 2 --balanced`, then build Stage-1 and run
+`validate_abebooks_standalone_dataset.py --dataset-root <copy> --stage1-dir <stage1>`
+to validate and export split-specific training inputs. See
+[`the five-row construction report`](../docs/abebooks_standalone_5row_dataset_20261001.zh-CN.md)
+for full commands, partial-recovery counts, and training inputs.
+
+The historical balanced two-row version is
+`dataset/abebooks_standalone_balanced_20261001`: **236 train / 78 dev / 78 test**
+queries, with exactly 50% implicit and 50% explicit in each split. It retains all
+196 implicit queries and downsamples 65 explicit queries within the existing
+split boundaries, using source-stratified rounds with seed 13. All candidate
+tables, evidence, retained query inputs/IDs, and source-group coverage are preserved.
+The parent remains unchanged. Use `rebalance_abebooks_standalone.py --dataset
+<parent> --output <new-copy>` to reproduce it, then rebuild Stage-1 supervision.
+See the balanced copy's `REPORT.md` and `TRAINING_PROTOCOL.json` for its files.
+
+The unbalanced parent is `dataset/abebooks_standalone_20261001`:
+457 nonoverlapping two-row queries, split into **273 train / 92 dev / 92 test**
+with 118/39/39 fully evidence-supported implicit queries. It retains all 174
+candidate memberships and 5,441 assets, changes complementary book projections,
+and qualifies new blind local author readings. See
+[`docs/abebooks_standalone_dataset_20261001.zh-CN.md`](../docs/abebooks_standalone_dataset_20261001.zh-CN.md)
+for annotation limits, independent group counts, reproduction commands, and
+training inputs. `build_abebooks_standalone_dataset.py` refuses an existing output
+directory. `review_abebooks_author_evidence.py prepare/infer` prepares and reads
+evidence without supplying the source author answer.
+
+Stage-1 construction honors this dataset's `recovery_records_only_no_provenance_fallback`
+manifest policy. It does not turn unreviewed source assets into positive evidence.
+Use `edge_lists` for edge supervision and `target_lists.evidence_supervised` for
+verified path supervision; use the complete `target_lists` for full-split retrieval
+evaluation. All three splits have both image and text supervision. Fresh features
+and model runs are required; dataset validation does not establish a training gain.
+
+The 13-query AbeBooks author pilot is an audit case set, **not a training or
+benchmark dataset**. Its 9/3/1 split does not meet the experiment's requirements;
+exported Stage-1 files establish format compatibility only. Do not use this
+subset as the final dataset optimization result.
+
+For this fixed-lake audit, `curate_abebooks_dataset.py` copies the
+dataset to a new directory, preserves every candidate/source/asset, and audits
+author queries using content-bound evidence reviews. Run it from an isolated
+working directory with absolute paths:
+
+```bash
+cd /tmp
+conda run -n MMDD python /path/to/MMDD/src/curate_abebooks_dataset.py \
+  --dataset /path/to/MMDD/dataset/abebooks_joinability_no4_disjoint_20260930 \
+  --output /path/to/MMDD/dataset/abebooks_author_join_pilot_20261001 \
+  --evidence-reviews /path/to/MMDD/configs/abebooks_author_evidence_review_20261001.jsonl
+```
+
+The output directory must not exist. Reviews record Codex inspection of existing
+approved assets; their content hashes are verified before use. Only full author
+values agreeing with the source are usable; partial lists, surname-only values,
+and editor/author uncertainty remain documented. Queries need at least two
+supported rows and complete judgments across the candidate lake. Equal author
+values that join different captured book records are rejected. Alternative
+valid target views are all exported as positives, including their recovery paths.
+Original splits and IDs remain; excluded queries and all original labels are
+archived. `audit/` contains per-query decisions, full-lake row-pair judgments,
+normalization mappings, source/evidence split audits, and offline value-replay
+controls. Replay is not fresh model recovery or a Direct retrieval result.
+The generated `REPORT.md` describes the exact scope and remaining limitations.
+Rebuild Stage-1 files and use a new cache namespace for this supervised subset.
+
 Regenerate AbeBooks explicit tasks on sources that never successfully produced
 implicit queries (including historical queries removed by later cleaning):
 
@@ -135,7 +265,7 @@ checkpoint; its output is a retrieval diagnostic, not a newly trained result.
 with 10 epochs and batch 16, and allows dev evaluation before opening test.
 For controlled optimizer comparisons, `--reference-inputs` reuses an unchanged
 dataset and frozen features in a new run, and `--student-lr-p`/`--student-lr-r`
-pass the training functions' existing parameters. Defaults remain unchanged.
+override the protocol recipe's learning rates (defaults 1e-4 / 1e-3).
 `summarize_abebooks_source_experiment.py` checks source/fact/split integrity and
 independently recomputes per-query and aggregate recall. Its primary metric is
 selected KD multimodal RRF Recall@10; Teacher scores remain diagnostics.
@@ -147,6 +277,66 @@ implicit dev/test query for literal visibility of the known recovered values
 and retained known witnesses. Its extra metrics do not change qrels, model
 selection, or the main Recall denominator. They are evidence diagnostics,
 not new extraction labels or verification of generated values.
+
+## Stage-1 CQET training pipeline (`mmdd_cqet_v4_1`, protocol 4.2.0)
+
+`src/mmdd_cqet_v4_1/` is the current Stage-1 Teacher/Student pipeline. One
+protocol file drives a run; the template is
+`configs/mmdd_stage1_cqet_protocol.json`. Nothing machine- or dataset-specific is
+in the code: the `paths` block names the dataset, backbone, feature caches and run
+root (relative paths are repo-relative), and the `hardware` block names the GPU the
+run is pinned to. The protocol must carry `version = "4.2.0"`; older 4.1.0 run roots
+cannot be resumed with this code.
+
+```bash
+# copy the template, edit paths/hardware, and keep it as <run_root>/protocol.json
+P=work/mmdd_stage1_v4_2_entitables/protocol.json
+RUN=work/mmdd_stage1_v4_2_entitables
+G="scripts/run_v4_1_gpu0.sh $P"          # pins CUDA_VISIBLE_DEVICES to hardware.uuid
+$G conda run -n MMDD python -m mmdd_cqet_v4_1.run lock            --protocol $P --run-root $RUN
+$G conda run -n MMDD python -m mmdd_cqet_v4_1.run verify-features --protocol $P --run-root $RUN
+   conda run -n MMDD python -m mmdd_cqet_v4_1.run prepare         --protocol $P --run-root $RUN
+   conda run -n MMDD python -m mmdd_cqet_v4_1.run validate        --protocol $P --run-root $RUN
+$G conda run -n MMDD python -m mmdd_cqet_v4_1.run smoke           --protocol $P --run-root $RUN
+$G conda run -n MMDD python -m mmdd_cqet_v4_1.run all             --protocol $P --run-root $RUN
+```
+
+Stages per seed, in order (`pipeline.train_seed`):
+
+1. Raw pools from frozen Qwen features (`lists.build_raw_pools_split`), then the
+   TA / TB_SHARED / C1 training lists.
+2. `TA` — fresh Teacher, `teacher.TA.epochs` epochs; `TB_CQET`, `TB_LSE`, `TB_QT`
+   — one epoch each from TA's endpoint, candidate list
+   `RawU ∪ RawDirect150 ∪ G ∪ U32`. Epochs, lr, weight decay, batch and support
+   weight come from `teacher.TA` / `teacher.TB`.
+3. `NATIVE_C1_SUP`, `QT_C1_SUP` — Students from PCA/identity on the C1 edge lists;
+   the C1 endpoint is selected on dev (`student.native_selection`).
+4. The selected C1 Student retrieves the train queries; its pool, the Raw pool and
+   the gold form the shared C2 graph (`lists.build_c2_shared_graph`); the frozen
+   `TB_CQET` endpoint scores every graph list once (`teacher_logits_cache`).
+5. `NATIVE_C2_SUP`, `NATIVE_C2_KD`, `QT_C2_SUP` from the same C1 parent; the KD arm
+   uses the SUP arm's selected fraction. Then the frozen dev/test evaluation.
+
+Student recipe (`train.StudentRecipe`, read from `protocol["student"]` and written
+into every stage receipt and training-log row, so a run can be audited post hoc):
+
+| key | value | why |
+|---|---|---|
+| `P_lr` / `R_lr` | 1e-4 / 1e-3 | at 1e-6 / 1e-5 the Student never left its PCA/identity initialisation |
+| `logit_scale` | 20 | bilinear scores are cosine-sized; without the scale every softmax loss sits at `log N` |
+| `temperature` | 10 | teacher logits span ~40; at τ=1 the KD target is one-hot and KD degenerates to SUP |
+| `kd_weight` | 1.0 | KD-only and SUP+KD both beat SUP by 3–5 pp dev R@10 once τ is matched |
+| `random_negatives` | 256 | uniform targets appended to every C2 direct list; without them a rank-one drift along the mean target direction destroys global retrieval |
+| `anchor_weight` | 0 | the elementwise MSE anchor was ~1e-6 and did nothing; drift is logged instead as `sigma1/sigma2_R_QT_minus_I` |
+
+The C2 kernel scores paths with index gathers instead of a per-path Python loop
+(≈0.5 s per 64-query step on a 4090 instead of ≈6 s); outputs are identical to
+float32 rounding. The diagnosis behind the recipe is in
+`docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`.
+
+The AbeBooks drivers (`run_abebooks_fresh.py`, `run_abebooks_data_ablation.py`,
+`run_abebooks_source_experiment.py`) build their protocol from the same template
+and bind the preflight module with `preflight.configure(paths)`.
 
 ## Directed joinability Teacher/Student
 
