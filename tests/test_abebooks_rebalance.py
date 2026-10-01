@@ -1,6 +1,38 @@
 from collections import Counter, defaultdict
+import copy
 
-from mmdd_dataset.abebooks_rebalance import grouped_split, query_kinds
+import pytest
+
+from mmdd_dataset.abebooks_rebalance import grouped_split, query_kinds, select_balanced_standalone
+
+
+def test_standalone_balance_preserves_all_implicit_and_split_boundaries_with_source_coverage():
+    queries = []
+    for split in ("train", "dev", "test"):
+        for i in range(4):
+            queries.append({"table_id": f"{split}_i{i}", "query_kind": "implicit", "split": split,
+                            "source_table_id": f"{split}_source{i}"})
+        for i in range(3):
+            for j in range(3):
+                queries.append({"table_id": f"{split}_e{i}_{j}", "query_kind": "explicit", "split": split,
+                                "source_table_id": f"{split}_source{i}"})
+    original = copy.deepcopy(queries)
+    selected = select_balanced_standalone(queries)
+    assert queries == original
+    assert len(selected) == len({q["table_id"] for q in selected}) == 24
+    assert {q["table_id"] for q in selected if q["query_kind"] == "implicit"} == {
+        q["table_id"] for q in queries if q["query_kind"] == "implicit"}
+    for split in ("train", "dev", "test"):
+        subset = [q for q in selected if q["split"] == split]
+        assert Counter(q["query_kind"] for q in subset) == {"implicit": 4, "explicit": 4}
+        assert len({q["source_table_id"] for q in subset if q["query_kind"] == "explicit"}) == 3
+    assert {q["table_id"] for q in selected} == {q["table_id"] for q in select_balanced_standalone(list(reversed(queries)))}
+
+
+def test_standalone_balance_refuses_to_fill_a_shortage_by_repeating_queries():
+    queries = [{"table_id": "i", "query_kind": "implicit", "split": "train", "source_table_id": "s"}]
+    with pytest.raises(ValueError, match="balance train"):
+        select_balanced_standalone(queries)
 
 
 def test_grouped_split_keeps_sources_together_and_balances_each_split():

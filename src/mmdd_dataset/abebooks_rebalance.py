@@ -4,12 +4,143 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from .abebooks_ablation import _entity_reference, project_table, read_rows, write_rows
+from .abebooks_curation import dataset_hashes, file_hash, load_artifacts
+from .abebooks_standalone import validate_queries
 
 REMOVED_COLUMNS = {"availability_quantity", "seller_rating", "copy_condition_grade", "binding"}
+
+
+def select_balanced_standalone(queries: list[dict], seed: int = 13) -> list[dict]:
+    """Keep all implicit queries; sample explicit sources in rounds within each split."""
+    selected = {q["table_id"] for q in queries if q["query_kind"] == "implicit"}
+    for split in ("train", "dev", "test"):
+        quota = sum(q["query_kind"] == "implicit" and q["split"] == split for q in queries)
+        buckets = defaultdict(list)
+        for q in queries:
+            if q["split"] == split and q["query_kind"] == "explicit":
+                buckets[q["source_table_id"]].append(q["table_id"])
+        if not quota or sum(map(len, buckets.values())) < quota:
+            raise ValueError(f"Cannot retain all implicit queries and balance {split}")
+        groups = hash_order(list(buckets), seed, f"{split}:sources")
+        ordered = {g: hash_order(buckets[g], seed, f"{split}:{g}") for g in groups}
+        candidates = [ordered[g][i] for i in range(max(map(len, ordered.values())))
+                      for g in groups if i < len(ordered[g])]
+        selected.update(candidates[:quota])
+    return [q for q in queries if q["table_id"] in selected]
+
+
+def balance_standalone(source: Path, destination: Path, seed: int = 13) -> dict:
+    """Copy a qualified standalone dataset, preserving its lake, annotations and split boundaries."""
+    source, destination = source.resolve(), destination.resolve()
+    if destination == source or source in destination.parents:
+        raise ValueError("Output must be outside the source dataset")
+    if destination.exists():
+        raise FileExistsError(destination)
+    before = dataset_hashes(source)
+    manifest, data = load_artifacts(source)
+    queries = select_balanced_standalone(data["query_tables"], seed)
+    kept = {q["table_id"] for q in queries}
+    removed = [q for q in data["query_tables"] if q["table_id"] not in kept]
+    qrels = [r for r in read_rows(source / manifest["single_files"]["qrels"]) if r["query_table_id"] in kept]
+    recoveries = [r for r in data["evidence_recoveries"] if r["query_table_id"] in kept]
+    judgments = [r for r in read_rows(source / "audit/candidate_judgments.jsonl") if r["query_table_id"] in kept]
+    source_rows = {(s["source_table_id"], r["row_id"]): r for s in data["source_tables"] for r in s["rows"]}
+    validation = validate_queries(queries, data["data_lake_tables"], judgments, recoveries, source_rows)
+    counts = {s: dict(Counter(q["query_kind"] for q in queries if q["split"] == s)) for s in ("train", "dev", "test")}
+    assert all(c["implicit"] == c["explicit"] for c in counts.values())
+    assert recoveries == data["evidence_recoveries"]
+    groups = {q["split_group"]: q["split"] for q in queries}
+    old_splits = json.loads((source / "splits.json").read_text())
+    splits = {**old_splits, "counts": counts, "query_splits": {q["table_id"]: q["split"] for q in queries},
+              "independent_components": len(groups), "component_splits": groups,
+              "groups_per_split": dict(Counter(groups.values())),
+              "source_groups_per_split": {s: len({q["source_table_id"] for q in queries if q["split"] == s}) for s in counts},
+              "largest_component_queries": max(Counter(q["split_group"] for q in queries).values()),
+              "balance_seed": seed, "balance_policy": "per_split_explicit_downsampling_round_robin_by_source",
+              "original_query_assignments_preserved": True}
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".env.openai"))
+    archive = destination / "provenance/before_balance"
+    changed = {"query_tables", "qrels.jsonl", "splits", "splits.json", "retrieval_catalog.json",
+               "explicit", "dataset_manifest.json", "BUILD.json", "REPORT.md", "VALIDATION.json",
+               "TRAINING_PROTOCOL.json", "table_queryability_decisions.jsonl",
+               "audit/candidate_judgments.jsonl", "audit/DELIVERY_VALIDATION.json", "audit/visual_spotchecks.jsonl"}
+    for name in sorted(changed):
+        old = destination / name
+        if old.exists():
+            archived = archive / name
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old), archived)
+    def save_json(name: str, value: dict) -> None:
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    query_path = "query_tables/part-00000.jsonl"
+    write_rows(destination / query_path, queries)
+    manifest["artifacts"]["query_tables"].update(total_records=len(queries), shards=[{"path": query_path, "records": len(queries)}])
+    write_rows(destination / "qrels.jsonl", qrels)
+    write_rows(destination / "audit/candidate_judgments.jsonl", judgments)
+    write_rows(destination / "audit/downsampled_explicit_queries.jsonl", removed)
+    decisions = read_rows(source / "table_queryability_decisions.jsonl")
+    removed_ids = {q["table_id"] for q in removed}
+    for decision in decisions:
+        if decision.get("query_table_id") in removed_ids:
+            decision.update(reason="explicit_downsampled_for_per_split_balance", previous_reason=decision["reason"])
+    write_rows(destination / "table_queryability_decisions.jsonl", decisions)
+    reviews_path = source / "audit/visual_spotchecks.jsonl"
+    if reviews_path.exists():
+        reviews = read_rows(reviews_path)
+        for r in reviews:
+            r["active_in_balanced_dataset"] = r.get("current_query_id") in kept
+        write_rows(destination / "audit/visual_spotchecks.jsonl", reviews)
+    catalog = json.loads((source / "retrieval_catalog.json").read_text())
+    catalog.update(query_ids=[q["table_id"] for q in queries],
+                   query_kinds={q["table_id"]: q["query_kind"] for q in queries},
+                   query_splits=splits["query_splits"], qrels={q["table_id"]: q["target_table_ids"] for q in queries},
+                   cache_namespace=destination.name)
+    save_json("retrieval_catalog.json", catalog)
+    save_json("splits.json", splits)
+    explicit = {q["table_id"] for q in queries if q["query_kind"] == "explicit"}
+    write_rows(destination / "explicit/queries.jsonl", [q for q in queries if q["table_id"] in explicit])
+    write_rows(destination / "explicit/qrels.jsonl", [r for r in qrels if r["query_table_id"] in explicit])
+    write_rows(destination / "explicit/targets.jsonl", data["data_lake_tables"])
+    for split in counts:
+        for name, records in (("queries", queries), ("qrels", qrels), ("recoveries", recoveries)):
+            write_rows(destination / f"splits/{split}.{name}.jsonl", [r for r in records if r["split"] == split])
+    prior = json.loads((source / "BUILD.json").read_text())
+    report = {**prior, "destination": str(destination), "queries": len(queries), "qrels": len(qrels),
+              "split_counts": counts, "validation": validation,
+              **{k: splits[k] for k in ("groups_per_split", "source_groups_per_split", "independent_components", "largest_component_queries")},
+              "query_decisions": dict(Counter(r["reason"] for r in decisions)),
+              "balance": {"source": str(source), "seed": seed, "input_hashes": before,
+                          "original_queries": len(data["query_tables"]), "removed_explicit_queries": len(removed),
+                          "removed_by_split": dict(Counter(q["split"] for q in removed)),
+                          "policy": splits["balance_policy"], "all_implicit_preserved": True,
+                          "query_inputs_ids_and_assignments_unchanged": True},
+              "balanced_source_unchanged": dataset_hashes(source) == before,
+              "preserved_artifacts_unchanged": all(file_hash(destination / sh["path"]) == before[sh["path"]]
+                  for name, spec in manifest["artifacts"].items() if name != "query_tables" for sh in spec["shards"])}
+    assert report["balanced_source_unchanged"] and report["preserved_artifacts_unchanged"]
+    save_json("BUILD.json", report)
+    save_json("VALIDATION.json", {**validation, "balanced_source_unchanged": True, "exact_balance_each_split": True})
+    manifest["curation"].update(cache_namespace=destination.name, balance_report="BUILD.json")
+    manifest["single_files"]["stats"] = "BUILD.json"
+    save_json("dataset_manifest.json", manifest)
+    lines = ["# AbeBooks 独立训练集：各 split 50% / 50%", "",
+             f"来源：`{source}`；新副本：`{destination}`。", "",
+             "| split | implicit | explicit | 合计 |", "|---|---:|---:|---:|"]
+    lines.extend(f"| {s} | {c['implicit']} | {c['explicit']} | {sum(c.values())} |" for s, c in counts.items())
+    lines += ["", f"保留全部 implicit，在各 split 内按源表轮流抽样 explicit，seed={seed}。共移出 {len(removed)} 个 explicit，未重复任何 query 或源行。",
+              "候选湖、源记录、素材和恢复标注保持原样；保留 query 的 ID、输入、正例与 split 均不变。",
+              "平衡比例按 query 计数；证据路径训练使用有恢复监督的 implicit 子集。",
+              "旧文件位于 `provenance/before_balance/`，移出清单位于 `audit/downsampled_explicit_queries.jsonl`。",
+              "标注仍为模型辅助标注，历史测试暴露限制继续适用。本次未执行模型训练。", ""]
+    (destination / "REPORT.md").write_text("\n".join(lines))
+    return report
 
 
 def hash_order(values: list[str], seed: int, namespace: str) -> list[str]:
