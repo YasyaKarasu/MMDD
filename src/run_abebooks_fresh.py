@@ -101,13 +101,14 @@ def prepare_data(run: Path, dataset: Path) -> None:
     objects = read_rows(data / "stage1_objects.jsonl")
     for shard in range(2):
         write_rows(data / f"objects_shard{shard}.jsonl", objects[shard::2])
-    protocol_path = ROOT / "audit/MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE/next_round/protocol.json"
+    protocol_path = ROOT / "configs/mmdd_stage1_cqet_protocol.json"
     protocol = json.loads(protocol_path.read_text())
     protocol.update(seeds=[13], max_registered_stages=9)
     protocol["evaluation"]["k"] = [5, 10, 15, 20]
     protocol["paths"] = {"dataset_root": str(view), "backbone_dir": str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"),
                          "pure_cache_dir": str(run / "features"), "row_cache_manifest": str(run / "encoder/manifest.jsonl"),
-                         "upstream_cache_dir": str(run / "encoder"), "upstream_data_dir": str(data), "run_root": str(run)}
+                         "upstream_cache_dir": str(run / "encoder"), "upstream_data_dir": str(data),
+                         "package_dir": str(run / "protocol_package"), "run_root": str(run)}
     write_json(run / "protocol.json", protocol)
     write_json(run / "protocol_package/next_round/protocol.json", protocol)
     print(json.dumps({"objects": len(objects), "usable_assets": len(kept), "excluded_assets": len(rejected)}), flush=True)
@@ -182,18 +183,9 @@ def pack(run: Path) -> None:
 
 def bind(run: Path):
     from mmdd_cqet_v4_1 import pipeline, preflight, provenance
-    from mmdd_cqet_v4_1.config import Paths, load_protocol
+    from mmdd_cqet_v4_1.config import resolve_default_paths
 
-    protocol = load_protocol(run / "protocol.json")
-    paths = Paths(ROOT, run / "dataset_view", ROOT / "hf_models/Qwen3-VL-Embedding-8B",
-                  run / "features", run / "encoder/manifest.jsonl", run / "protocol.json", run)
-    pipeline._protocol_paths = lambda protocol_path, run_root: (protocol, paths)
-    preflight.DATASET_ROOT = paths.dataset_root
-    preflight.PURE_CACHE_DIR = paths.pure_cache_dir
-    preflight.UPSTREAM_CACHE_DIR = run / "encoder"
-    preflight.UPSTREAM_DATA_DIR = run / "data"
-    preflight.RUN_ROOT = run
-    preflight.PACKAGE_DIR = run / "protocol_package"
+    preflight.configure(resolve_default_paths(run / "protocol.json", run))
     original_sources = provenance.source_files
     provenance.source_files = lambda paths: [*original_sources(paths), Path(__file__).resolve()]
     return pipeline, preflight

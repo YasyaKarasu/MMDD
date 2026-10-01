@@ -37,8 +37,7 @@ def runtime(run: Path, prepare: bool = False) -> pipeline.Runtime:
     paths = Paths(ROOT, run / "dataset_view", ROOT / "hf_models/Qwen3-VL-Embedding-8B",
                   run / "features", run / "encoder/manifest.jsonl", run / "protocol.json", run)
     if prepare:
-        preflight.DATASET_ROOT, preflight.RUN_ROOT = paths.dataset_root, run
-        preflight.PURE_CACHE_DIR = paths.pure_cache_dir
+        preflight.configure(paths)
         preflight.build_content_aliases()
         preflight.build_cache_manifest()
         build_labels(paths, build_content_aliases(paths))
@@ -74,7 +73,7 @@ def select(rt: pipeline.Runtime, checkpoints: dict, gt: dict, stage: str) -> dic
 
 
 def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
-          student_lr_p: float = 1e-6, student_lr_r: float = 1e-5) -> None:
+          student_lr_p: float = 1e-4, student_lr_r: float = 1e-3) -> None:
     if (run / "TRAINING_COMPLETE.json").exists():
         raise FileExistsError("Training already completed; use evaluate")
     started = time.time()
@@ -176,14 +175,15 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
     print("TRAINING COMPLETE", flush=True)
 
 
-def evaluate(run: Path, splits: tuple[str, ...] = ("dev", "test")) -> None:
+def evaluate(run: Path, splits: tuple[str, ...] = ("dev", "test"), device: str = "cuda:0",
+             retrieval_only: bool = False) -> None:
     if not (run.parent / "ALL_SELECTIONS_FROZEN.json").exists():
         raise ValueError("Freeze every registered arm before test evaluation")
     rt = runtime(run)
     freeze = read_json(run / "SELECTION_FREEZE.json")
     for p, digest in freeze["hashes"].items():
         assert sha256_file(Path(p)) == digest
-    teacher = pipeline._load_teacher(Path(freeze["teacher"]))
+    teacher = None if retrieval_only else pipeline._load_teacher(Path(freeze["teacher"]), device=device)
     checkpoints = {"raw": None, **{f"selected_{k.lower()}": v for k, v in freeze["selected"].items()},
                    **{f"endpoint_{k.lower()}": v for k, v in freeze["endpoints"].items()}}
     summaries, per_query = [], []
@@ -192,24 +192,27 @@ def evaluate(run: Path, splits: tuple[str, ...] = ("dev", "test")) -> None:
         for generator, checkpoint in checkpoints.items():
             print(f"EVAL {split} {generator}", flush=True)
             if checkpoint is None:
-                pools = build_raw_pools_split(rt.z_store, rt.row_store, sorted(gt), rt.labels, split, hnsw_seed=13)
+                pools = build_raw_pools_split(rt.z_store, rt.row_store, sorted(gt), rt.labels, split,
+                                             hnsw_seed=13, device=device)
             else:
-                model = pipeline._load_native(Path(checkpoint), rt)
+                model = pipeline._load_native(Path(checkpoint), rt, device=device)
                 pools = evaluate_student_retrieval(model, rt.z_store, rt.row_store, sorted(gt), rt.labels,
-                                                  split, hnsw_seed=13, generator_id=generator)
+                                                  split, hnsw_seed=13, generator_id=generator, device=device)
                 del model
             out = run / "eval" / split / generator
             save_pool_bundle(out, pools, rt.labels, seed=13, generator=generator)
-            matrix = evaluate_teacher_matrix({"TB_CQET": teacher}, rt.bank, pools, rt.labels,
-                seed=13, generator=generator, split=split, output_dir=out, split_gt=gt)
-            evaluate_matrix(pools, matrix, gt, out)
-            export_funnels(pools, matrix["TB_CQET"]["Real"], gt, rt.labels,
-                           out / "funnels", seed=13, generator=generator)
             orders = {"Direct": {q: [t for t, _ in p.direct] for q, p in pools.items()},
                       "Multimodal_RRF": {q: p.C150 for q, p in pools.items()}}
-            for view in ("Real", "f0", "Swap"):
-                orders[f"Teacher_{view}"] = {r["query_id"]: r["target_ids"] for r in
-                    iter_jsonl(out / f"rankings.TB_CQET.{view}.jsonl.gz")}
+            if not retrieval_only:
+                matrix = evaluate_teacher_matrix({"TB_CQET": teacher}, rt.bank, pools, rt.labels,
+                    seed=13, generator=generator, split=split, output_dir=out, split_gt=gt, device=device)
+                evaluate_matrix(pools, matrix, gt, out)
+                export_funnels(pools, matrix["TB_CQET"]["Real"], gt, rt.labels,
+                               out / "funnels", seed=13, generator=generator)
+                for view in ("Real", "f0", "Swap"):
+                    orders[f"Teacher_{view}"] = {r["query_id"]: r["target_ids"] for r in
+                        iter_jsonl(out / f"rankings.TB_CQET.{view}.jsonl.gz")}
+                del matrix
             for mode, rankings in orders.items():
                 scores = {}
                 for q, gold in gt.items():
@@ -225,12 +228,14 @@ def evaluate(run: Path, splits: tuple[str, ...] = ("dev", "test")) -> None:
                         "segment": segment, "queries": len(qids), **{f"R@{k}":
                         sum(scores[q][f"R@{k}"] for q in qids) / len(qids) if qids else None
                         for k in (5, 10, 15, 20)}})
-            write_json(run / "recall_summary.json", summaries)
-            write_jsonl(run / "recall_per_query.jsonl", per_query)
-            del pools, matrix
+            prefix = "retrieval_" if retrieval_only else ""
+            write_json(run / f"{prefix}recall_summary.json", summaries)
+            write_jsonl(run / f"{prefix}recall_per_query.jsonl", per_query)
+            del pools
             torch.cuda.empty_cache()
-    write_json(run / "EVALUATION_COMPLETE.json", {"status": "COMPLETE", "splits": list(splits),
-                                                "rows": len(summaries)})
+    completion = "RETRIEVAL_EVALUATION_COMPLETE.json" if retrieval_only else "EVALUATION_COMPLETE.json"
+    write_json(run / completion, {"status": "COMPLETE", "splits": list(splits),
+                                                "rows": len(summaries), "device": device})
 
 
 def main() -> None:
@@ -239,15 +244,19 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--student-epochs", type=int, default=1)
     parser.add_argument("--student-batch", type=int, default=64)
-    parser.add_argument("--student-lr-p", type=float, default=1e-6)
-    parser.add_argument("--student-lr-r", type=float, default=1e-5)
+    parser.add_argument("--student-lr-p", type=float, default=1e-4)
+    parser.add_argument("--student-lr-r", type=float, default=1e-3)
     parser.add_argument("--splits", choices=("dev", "test"), nargs="+", default=["dev", "test"])
+    parser.add_argument("--device", default="cuda:0", help="Evaluation device; training settings are unchanged")
+    parser.add_argument("--retrieval-only", action="store_true",
+                        help="Evaluate unchanged Direct/RRF retrieval without teacher reranking diagnostics")
     args = parser.parse_args()
     if args.command == "train":
         train(args.run_root.resolve(), args.student_epochs, args.student_batch,
               args.student_lr_p, args.student_lr_r)
     else:
-        evaluate(args.run_root.resolve(), tuple(args.splits))
+        evaluate(args.run_root.resolve(), tuple(args.splits), device=args.device,
+                 retrieval_only=args.retrieval_only)
 
 
 if __name__ == "__main__":

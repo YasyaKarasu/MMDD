@@ -29,8 +29,8 @@ def main() -> None:
     args = parser.parse_args()
     run = args.run_root.resolve()
     pipeline, _ = bind(run)
-    pipeline._gpu_guard()
     rt = pipeline.load_runtime(run / "protocol.json", run)
+    pipeline._gpu_guard(rt.paths)
     source = source_identity(rt.paths)
     stages = {}
     for stage in pipeline.STAGES:

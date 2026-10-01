@@ -14,15 +14,20 @@ def reference_inputs(root: Path, reference: Path) -> None:
     root.mkdir(parents=True, exist_ok=False)
     for name in ("dataset_view", "features", "encoder", "data", "FEATURE_COMPOSITION.json"):
         (root / name).symlink_to(reference / name)
-    protocol = json.loads((reference / "protocol.json").read_text())
-    protocol["paths"] = {k: v.replace(str(reference), str(root)) for k, v in protocol["paths"].items()}
+    # The recipe comes from the current template; only the frozen-input locations are inherited.
+    protocol = json.loads((ROOT / "configs/mmdd_stage1_cqet_protocol.json").read_text())
+    reference_protocol = json.loads((reference / "protocol.json").read_text())
+    protocol.update(seeds=[13], max_registered_stages=9)
+    protocol["evaluation"]["k"] = reference_protocol["evaluation"]["k"]
+    protocol["paths"] = {k: v.replace(str(reference), str(root)) for k, v in reference_protocol["paths"].items()}
+    protocol["paths"].setdefault("package_dir", str(root / "protocol_package"))
     write_json(root / "protocol.json", protocol)
     write_json(root / "FRESH_INPUTS.json", {"dataset": str(root / "dataset_view"),
         "reference": str(reference), "frozen_inputs_reused": True, "old_checkpoints_reused": False})
 
 
 def run_experiment(root: Path, command: str, gpu: int,
-                   student_lr_p: float = 1e-6, student_lr_r: float = 1e-5) -> None:
+                   student_lr_p: float = 1e-4, student_lr_r: float = 1e-3) -> None:
     run = root / "main"
     if command == "train":
         run.mkdir(exist_ok=False)
@@ -61,7 +66,7 @@ def run_experiment(root: Path, command: str, gpu: int,
             hypothesis = "Readable book-specific source headers improve representation with identical cells, rows, task facts and splits"
         if (root / "SOURCE_SCHEMA_PLAN.json").exists():
             hypothesis = json.loads((root / "SOURCE_SCHEMA_PLAN.json").read_text())["hypothesis"]
-        if (student_lr_p, student_lr_r) != (1e-6, 1e-5):
+        if (student_lr_p, student_lr_r) != (1e-4, 1e-3):
             hypothesis = "Existing P/R learning-rate parameters control underfitting on the complete small training set; all method components stay unchanged"
         write_json(root / "EXPERIMENT_PLAN.json", {"seed": 13, "method_source_hashes": hashes,
             "hypothesis": hypothesis,
@@ -89,8 +94,8 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, choices=(0, 1), default=1)
     parser.add_argument("--reference-inputs", type=Path)
     parser.add_argument("--dataset", type=Path, help="Versioned dataset for the prepare command")
-    parser.add_argument("--student-lr-p", type=float, default=1e-6)
-    parser.add_argument("--student-lr-r", type=float, default=1e-5)
+    parser.add_argument("--student-lr-p", type=float, default=1e-4)
+    parser.add_argument("--student-lr-r", type=float, default=1e-3)
     args = parser.parse_args()
     if args.command == "prepare":
         if args.dataset is None:
