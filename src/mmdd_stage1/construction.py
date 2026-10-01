@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import json
 import random
 import re
 from collections import Counter, defaultdict
@@ -273,6 +274,9 @@ def build_stage1_training_artifacts(
         raise ValueError(
             f"table_row_format must be one of: {', '.join(TABLE_ROW_FORMATS)}"
         )
+    manifest_path = dataset_root / "dataset_manifest.json"
+    dataset_policy = json.loads(manifest_path.read_text()).get("curation", {}) if manifest_path.exists() else {}
+    recovery_only = dataset_policy.get("evidence_supervision") == "recovery_records_only_no_provenance_fallback"
     queries = {
         str(record["table_id"]): record
         for record in _artifact_records(dataset_root, "query_tables")
@@ -350,7 +354,9 @@ def build_stage1_training_artifacts(
         for target_id, record in target_objects.items()
     }
     postings, inverse_document_frequency = _semantic_index(target_text)
-    evidence_by_target = _evidence_by_target(targets, assets, recoveries)
+    # Under strict annotation, candidate pools use provenance only. Held-out
+    # recovery labels must not select the evidence used in training negatives.
+    evidence_by_target = _evidence_by_target(targets, assets, [] if recovery_only else recoveries)
     recovery_evidence = _recovery_evidence(queries, targets, assets, recoveries)
     recovery_rows: dict[tuple[str, str, str], set[int]] = defaultdict(set)
     for recovery in recoveries:
@@ -398,7 +404,7 @@ def build_stage1_training_artifacts(
             for recovery_query_id, target_id in recovery_evidence
             if recovery_query_id == query_id
         ]
-        if not evidence_positive_target_ids:
+        if not evidence_positive_target_ids and not recovery_only:
             evidence_positive_target_ids = [
                 target_id
                 for target_id in direct_positive_target_ids
@@ -407,7 +413,7 @@ def build_stage1_training_artifacts(
         if not evidence_positive_target_ids:
             evidence_positive_target_ids = [direct_positive_target_ids[0]]
         positive_evidence_by_target = {
-            target_id: recovery_evidence.get((query_id, target_id), evidence_by_target[target_id])
+            target_id: recovery_evidence.get((query_id, target_id), [] if recovery_only else evidence_by_target[target_id])
             for target_id in evidence_positive_target_ids
         }
         positive_target_ids = list(
@@ -621,6 +627,7 @@ def build_stage1_training_artifacts(
                     for target_id in evidence_positive_target_ids
                 },
                 "query_row_count": len(query.get("rows", ())),
+                "has_recovery_supervision": bool(recovery_evidence.get((query_id, direct_positive_target_ids[0]))),
                 "query_kind": (
                     "implicit"
                     if qrel_reasons_by_query[query_id]
@@ -640,7 +647,7 @@ def build_stage1_training_artifacts(
         raise ValueError(
             "No query has both a positive and a non-joinable target in the shared data lake"
         )
-    return {
+    artifacts = {
         "stage1_objects": [*query_objects.values(), *target_objects.values(), *asset_objects],
         "edge_lists": edge_lists,
         "target_lists": target_lists,
@@ -655,3 +662,6 @@ def build_stage1_training_artifacts(
             ),
         ],
     }
+    if recovery_only:
+        artifacts["target_lists.evidence_supervised"] = [r for r in target_lists if r["has_recovery_supervision"]]
+    return artifacts

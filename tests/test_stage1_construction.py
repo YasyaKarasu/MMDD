@@ -96,6 +96,36 @@ def test_artifact_records_prefers_manifest_over_stale_flat_file(tmp_path: Path):
     assert _artifact_records(tmp_path, "query_tables") == [listed]
 
 
+def test_recovery_only_dataset_does_not_promote_source_assets_to_query_positives(tmp_path):
+    records = {
+        "query_tables": [_table("implicit", ["Title"], [["Book A"]]),
+                         _table("explicit", ["Author"], [["Jane Doe"]])],
+        "data_lake_tables": [_table("positive", ["Author"], [["Jane Doe"]]),
+                             _table("negative", ["Author"], [["Alex Smith"]])],
+        "bridge_assets": [{"asset_id": "reviewed", "asset_type": "text", "content": "Jane Doe",
+                           "source_table_id": "source_positive"},
+                          {"asset_id": "unreviewed", "asset_type": "text", "content": "Shipping policy",
+                           "source_table_id": "source_positive"}],
+        "qrels": [{"query_table_id": q, "target_table_id": "positive", "rel": 3}
+                  for q in ("implicit", "explicit")],
+        "evidence_recoveries": [{"query_table_id": "implicit", "target_table_id": "positive",
+                                 "query_row_id": 0, "evidence": {"asset_id": "reviewed"}}],
+    }
+    manifest = {"artifacts": {}, "curation": {
+        "evidence_supervision": "recovery_records_only_no_provenance_fallback"}}
+    for name, values in records.items():
+        _write_jsonl(tmp_path / f"{name}.jsonl", values)
+        manifest["artifacts"][name] = {"shards": [{"path": f"{name}.jsonl"}]}
+    (tmp_path / "dataset_manifest.json").write_text(json.dumps(manifest))
+    artifacts = build_stage1_training_artifacts(tmp_path, dataset_name="strict")
+    explicit = next(r for r in artifacts["target_lists"] if r["query_id"] == "explicit")
+    assert explicit["positive_evidence_by_target"] == {"positive": []}
+    assert not explicit["has_recovery_supervision"]
+    assert not any(r["query_id"] == "explicit" and r["destination_type"] != "table" for r in artifacts["edge_lists"])
+    assert not any(r["positive_id"] == "unreviewed" for r in artifacts["edge_lists"])
+    assert "unreviewed" in {r["object_id"] for r in artifacts["stage1_corpus"]}
+
+
 def test_stage1_constructor_builds_all_files_and_four_initial_negative_kinds(tmp_path):
     query = _table("q", ["Player", "Country"], [["Messi", "Argentina"], ["Mbappe", "France"]])
     query.update(
