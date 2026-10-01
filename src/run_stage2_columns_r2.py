@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument('--fixed-epoch', type=int,
                         help='Keep this epoch and monitor dev instead of selecting on it; requires '
                              '--early-stopping-patience 0 and is the controlled-comparison schedule')
-    parser.add_argument('phase', choices=['audit', 'prepare-a', 'reader', 'evaluate-a', 'natural-train',
+    parser.add_argument('phase', choices=['audit', 'prepare-a', 'reader', 'evaluate-a',
                                          'build-natural-evidence', 'prepare-jobs', 'train', 'freeze-shortlists',
                                          'audit-support', 'lock-selection', 'formal-test', 'analyze', 'cost',
                                          'report', 'audit-reader-inputs', 'freeze-runtime'])
@@ -63,9 +63,6 @@ def main() -> None:
     elif args.phase == 'evaluate-a':
         from mmdd_stage2.column_r2_phase_a import evaluate_phase_a
         evaluate_phase_a(r1, output)
-    elif args.phase == 'natural-train':
-        from mmdd_stage2.column_r2_natural import build_natural_train
-        build_natural_train(root, r1, output)
     elif args.phase == 'build-natural-evidence':
         from mmdd_stage2.natural_evidence import build_inputs, stage1_directory_loader
         if args.stage1_dir is None:

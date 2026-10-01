@@ -5,8 +5,8 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from mmdd_cqet_v4_1.data import iter_jsonl, read_json, sha256_file, write_json
-from mmdd_cqet_v4_1.evaluate import paired_bootstrap
+from mmdd_stage1.data import iter_jsonl, read_json, sha256_file, write_json
+from mmdd_stage1.evaluate import paired_bootstrap
 from run_abebooks_balanced import SCHEDULES
 from summarize_abebooks_balanced import learning_diagnostics, training_audit
 from summarize_abebooks_data_ablation import diagnostics

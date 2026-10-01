@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from mmdd_cqet_v4_1.data import iter_jsonl, read_json, write_json
+from mmdd_stage1.data import iter_jsonl, read_json, write_json
 from run_abebooks_balanced import SCHEDULES
 from summarize_abebooks_data_ablation import diagnostics
 

@@ -266,8 +266,8 @@ def test_explicit_queries_default_to_five_rows_with_visible_authors(tmp_path):
     qrels, recoveries = make_supervision(queries, judgments, [], [], [])
     assert not recoveries
     from mmdd_dataset.abebooks_ablation import write_rows
-    from mmdd_cqet_v4_1.config import Paths
-    from mmdd_cqet_v4_1.labels import build_labels
+    from mmdd_stage1.config import Paths
+    from mmdd_stage1.labels import build_labels
     for name, records in [("query_tables/part-00000.jsonl", queries),
                            ("data_lake_tables/part-00000.jsonl", targets),
                            ("evidence_recoveries/part-00000.jsonl", []), ("qrels.jsonl", qrels)]:

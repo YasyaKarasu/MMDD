@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GPUS = ("GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725", "GPU-b1fcd6e2-b542-a1b0-8656-202feee8afc7")
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -32,18 +31,19 @@ def write_rows(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
 
 
-def environment(gpu: int = 0) -> dict[str, str]:
+def environment(gpu: int | str) -> dict[str, str]:
+    """Child-process environment pinned to one GPU (physical index in PCI bus order, or a UUID)."""
     return {**os.environ, "PYTHONPATH": str(ROOT / "src"),
-            "CUDA_VISIBLE_DEVICES": GPUS[gpu], "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "CUDA_VISIBLE_DEVICES": str(gpu), "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "PYTHONUNBUFFERED": "1"}
 
 
-def launch(run: Path, name: str, arguments: list[str], gpu: int = 0) -> subprocess.Popen:
+def launch(run: Path, name: str, arguments: list[str], gpu: int | str) -> subprocess.Popen:
     log = run / "logs" / f"{name}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, *arguments]
     with (run / "COMMANDS.jsonl").open("a") as handle:
-        handle.write(json.dumps({"name": name, "command": command, "cwd": str(run / "isolated_cwd"), "gpu": GPUS[gpu]}) + "\n")
+        handle.write(json.dumps({"name": name, "command": command, "cwd": str(run / "isolated_cwd"), "gpu": str(gpu)}) + "\n")
     print(f"START {name}: {log}", flush=True)
     with log.open("w") as handle:
         return subprocess.Popen(command, cwd=run / "isolated_cwd", env=environment(gpu), stdout=handle, stderr=subprocess.STDOUT)
@@ -56,7 +56,12 @@ def finish(name: str, process: subprocess.Popen) -> None:
     print(f"DONE {name}", flush=True)
 
 
-def prepare_data(run: Path, dataset: Path) -> None:
+def prepare_data(run: Path, dataset: Path, gpu: int) -> None:
+    """Copy and filter the dataset into ``run/dataset_view``, bind the protocol, build Stage-1 data.
+
+    Features go to ``work/stage1_features/<run name>``: the view is filtered per run, so the
+    encoding is per run as well, but it still lives outside the run directory.
+    """
     if run.exists():
         raise FileExistsError(f"Fresh run requires a new output directory: {run}")
     (run / "isolated_cwd").mkdir(parents=True)
@@ -93,97 +98,32 @@ def prepare_data(run: Path, dataset: Path) -> None:
     write_json(run / "FRESH_INPUTS.json", {"dataset": str(dataset), "old_features_reused": False,
                "old_checkpoints_reused": False, "excluded_assets": len(rejected),
                "excluded_positive_witnesses": 0, "feature_backbone": str(ROOT / "hf_models/Qwen3-VL-Embedding-8B")})
-    data = run / "data"
-    process = launch(run, "build_data", [str(ROOT / "src/build_stage1_training_data.py"),
-                     "--dataset-root", str(view), "--dataset-name", dataset.name,
-                     "--output-dir", str(data), "--max-rows", "20", "--seed", "13"])
-    finish("build_data", process)
-    objects = read_rows(data / "stage1_objects.jsonl")
-    for shard in range(2):
-        write_rows(data / f"objects_shard{shard}.jsonl", objects[shard::2])
-    protocol_path = ROOT / "configs/mmdd_stage1_cqet_protocol.json"
-    protocol = json.loads(protocol_path.read_text())
-    protocol.update(seeds=[13], max_registered_stages=9)
-    protocol["evaluation"]["k"] = [5, 10, 15, 20]
-    protocol["paths"] = {"dataset_root": str(view), "backbone_dir": str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"),
-                         "pure_cache_dir": str(run / "features"), "row_cache_manifest": str(run / "encoder/manifest.jsonl"),
-                         "upstream_cache_dir": str(run / "encoder"), "upstream_data_dir": str(data),
-                         "package_dir": str(run / "protocol_package"), "run_root": str(run)}
+    import run_stage1
+
+    template = json.loads(run_stage1.TEMPLATE.read_text())
+    template["seeds"] = [13]
+    template["evaluation"]["k"] = [5, 10, 15, 20]
+    protocol = run_stage1.build_protocol(
+        template, dataset_root=view, run_root=run, features_dir=run_stage1.FEATURES_ROOT / run.name,
+        backbone_dir=run_stage1.DEFAULT_BACKBONE, hardware=run_stage1.query_gpu(gpu),
+    )
+    protocol["paths"]["package_dir"] = str(run / "protocol_package")
     write_json(run / "protocol.json", protocol)
     write_json(run / "protocol_package/next_round/protocol.json", protocol)
-    print(json.dumps({"objects": len(objects), "usable_assets": len(kept), "excluded_assets": len(rejected)}), flush=True)
+    run_stage1.build_data(protocol, dataset_name=dataset.name)
+    print(json.dumps({"usable_assets": len(kept), "excluded_assets": len(rejected),
+                      "features_dir": protocol["paths"]["features_dir"]}), flush=True)
 
 
-def encode(run: Path) -> None:
-    from cache_stage1_features import teacher_object_ids
+def encode(run: Path, gpus: list[int]) -> None:
+    import run_stage1
 
-    teacher_ids = teacher_object_ids([run / "data/edge_lists.jsonl", run / "data/target_lists.jsonl"], split=None)
-    # Evaluation scores every lake table, including tables absent from training lists.
-    teacher_ids.update(row["object_id"] for row in read_rows(run / "data/stage1_objects.jsonl")
-                       if row["object_type"] == "table")
-    jobs = []
-    for shard in range(2):
-        shard_ids = {row["object_id"] for row in read_rows(run / f"data/objects_shard{shard}.jsonl")}
-        teacher_path = run / f"data/teacher_shard{shard}.jsonl"
-        write_rows(teacher_path, [{"object_id": oid} for oid in sorted(teacher_ids & shard_ids)])
-        name = f"encode_base_{shard}"
-        arguments = [str(ROOT / "src/cache_stage1_features.py"), "--input-jsonl", str(run / f"data/objects_shard{shard}.jsonl"),
-                     "--output-dir", str(run / f"encoder_shard{shard}"), "--model-dir", str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"),
-                     "--device", "cuda:0", "--object-batch-size", "4", "--teacher-data",
-                     str(teacher_path), "--teacher-split", "all"]
-        jobs.append((name, launch(run, name, arguments, shard)))
-    for name, process in jobs:
-        finish(name, process)
-    merged = run / "encoder"
-    for tier in ("objects", "teacher_objects"):
-        (merged / tier).mkdir(parents=True, exist_ok=True)
-        for shard in range(2):
-            for source in (run / f"encoder_shard{shard}" / tier).glob("*.pt"):
-                os.link(source, merged / tier / source.name)
-    for filename in ("manifest.jsonl", "teacher_manifest.jsonl"):
-        records = sum((read_rows(run / f"encoder_shard{shard}" / filename) for shard in range(2)), [])
-        records.sort(key=lambda row: row["object_id"].encode())
-        if len({r["object_id"] for r in records}) != len(records):
-            raise ValueError("Duplicate object in fresh feature shards")
-        write_rows(merged / filename, records)
-    shutil.copyfile(run / "encoder_shard0/metadata.json", merged / "metadata.json")
-    jobs = []
-    for shard in range(2):
-        name = f"encode_content_{shard}"
-        args = ["-m", "fresh_path.gen_content", "--dataset-root", str(run / "dataset_view"),
-                "--backbone-dir", str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"), "--cache-dir", str(merged),
-                "--out-dir", str(run / f"content_shard{shard}"), "--shard", str(shard), "--num-shards", "2", "--kinds", "text,image"]
-        jobs.append((name, launch(run, name, args, shard)))
-    for name, process in jobs:
-        finish(name, process)
-    finish("pack", launch(run, "pack", [str(Path(__file__).resolve()), "pack", "--run-root", str(run)]))
-
-
-def pack(run: Path) -> None:
-    import numpy as np
-    import torch
-    from fresh_path import features
-
-    features.build_z_memmap(run / "encoder", run / "features/z")
-    rows = []
-    for entry in features.read_manifest(run / "encoder/teacher_manifest.jsonl", "teacher_feature_path"):
-        if entry.object_type == "table":
-            payload = torch.load(run / "encoder" / entry.path, map_location="cpu", weights_only=False)
-            rows.append((entry.object_id, entry.object_type, features.table_tokens(payload["hidden_states"]).numpy()))
-    features.write_chunk(run / "table_content/chunks", 0, rows)
-    sources = [run / "table_content/chunks", *(run / f"content_shard{i}/chunks" for i in range(2))]
-    index = features.merge_chunk_dirs(sources, run / "features/content/chunks")
-    expected = {r["object_id"] for r in read_rows(run / "data/stage1_objects.jsonl")}
-    if set(index["ids"]) != expected:
-        raise ValueError(f"Incomplete content features: missing {len(expected-set(index['ids']))}")
-    if not np.isfinite(np.load(run / "features/z/z.f32.npy", mmap_mode="r")).all():
-        raise ValueError("Nonfinite fresh embeddings")
-    print(json.dumps({"content_objects": len(index["ids"]), "status": "PASS"}), flush=True)
+    run_stage1.encode(run, json.loads((run / "protocol.json").read_text()), gpus)
 
 
 def bind(run: Path):
-    from mmdd_cqet_v4_1 import pipeline, preflight, provenance
-    from mmdd_cqet_v4_1.config import resolve_default_paths
+    from mmdd_stage1 import pipeline, preflight, provenance
+    from mmdd_stage1.config import resolve_default_paths
 
     preflight.configure(resolve_default_paths(run / "protocol.json", run))
     original_sources = provenance.source_files
@@ -192,9 +132,9 @@ def bind(run: Path):
 
 
 def endpoint_evaluation(run: Path) -> None:
-    from mmdd_cqet_v4_1.artifacts import save_pool_bundle
-    from mmdd_cqet_v4_1.data import load_split_gt
-    from mmdd_cqet_v4_1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
+    from mmdd_stage1.artifacts import save_pool_bundle
+    from mmdd_stage1.data import load_split_gt
+    from mmdd_stage1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
 
     pipeline, _ = bind(run)
     freeze = json.loads((run / "GLOBAL_SELECTION_FREEZE.json").read_text())
@@ -280,17 +220,22 @@ def main() -> None:
     parser.add_argument("command", choices=["prepare-data", "encode", "pack", "lock", "verify-features", "prepare", "validate", "smoke", "all", "train", "endpoints", "summarize"])
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, default=ROOT / "abebooks_joinability_bal04_clean")
+    parser.add_argument("--gpu", type=int, default=0, help="physical GPU index (PCI bus order) the run is pinned to")
+    parser.add_argument("--gpus", type=int, nargs="+", help="encode: GPU indices for the two shards (default: --gpu)")
     args = parser.parse_args()
     run = args.run_root.resolve()
     if args.command == "prepare-data":
-        prepare_data(run, args.dataset_root.resolve())
+        prepare_data(run, args.dataset_root.resolve(), args.gpu)
     elif args.command == "encode":
-        encode(run)
+        encode(run, args.gpus or [args.gpu])
     elif args.command == "pack":
-        pack(run)
+        import run_stage1
+
+        run_stage1.pack(run_stage1.features_root(json.loads((run / "protocol.json").read_text())))
     elif args.command == "train":
+        gpu = json.loads((run / "protocol.json").read_text())["hardware"]["uuid"]
         for stage in ("lock", "verify-features", "prepare", "validate", "smoke", "all", "endpoints", "summarize"):
-            finish(stage, launch(run, stage, [str(Path(__file__).resolve()), stage, "--run-root", str(run)]))
+            finish(stage, launch(run, stage, [str(Path(__file__).resolve()), stage, "--run-root", str(run)], gpu))
     elif args.command == "endpoints":
         endpoint_evaluation(run)
     elif args.command == "summarize":

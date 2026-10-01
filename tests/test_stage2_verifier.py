@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import mmdd_stage2.qwen as stage2_qwen
 import train_stage2 as stage2_train
-from mmdd_stage1.features import FeatureStore, ObjectFeatures
+from mmdd_stage1.feature_cache import FeatureStore, ObjectFeatures
 from mmdd_stage2.checkpoints import load_candidate_scorer, save_candidate_scorer
 from mmdd_stage2.data import (
     ATTRIBUTE_CLOSE,

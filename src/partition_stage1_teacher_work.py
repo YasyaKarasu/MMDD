@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cache_stage1_features import _completed_records, teacher_object_ids
-from mmdd_stage1.features import normalize_object_type
+from mmdd_stage1.feature_cache import normalize_object_type
 
 
 def partition_pending_objects(

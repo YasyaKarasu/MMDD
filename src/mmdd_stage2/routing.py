@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.feature_cache import FeatureStore
 from torch.nn import functional as F
 
 

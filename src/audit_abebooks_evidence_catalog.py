@@ -14,9 +14,9 @@ from pathlib import Path
 
 import torch
 
-from mmdd_cqet_v4_1 import pipeline
-from mmdd_cqet_v4_1.evaluate import evaluate_student_retrieval
-from mmdd_cqet_v4_1.labels import export_eval_labels
+from mmdd_stage1 import pipeline
+from mmdd_stage1.evaluate import evaluate_student_retrieval
+from mmdd_stage1.labels import export_eval_labels
 from mmdd_dataset.abebooks_ablation import duplicate_book_image_assets, nongold_text_hubs, read_rows, unanchored_text_assets
 from run_abebooks_data_ablation import runtime
 from run_abebooks_fresh import write_json

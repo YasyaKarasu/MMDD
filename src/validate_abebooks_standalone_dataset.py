@@ -10,7 +10,6 @@ from pathlib import Path
 from mmdd_dataset.abebooks_ablation import read_rows, write_rows
 from mmdd_dataset.abebooks_curation import cell_values, dataset_hashes, file_hash, load_artifacts
 from mmdd_dataset.abebooks_standalone import validate_queries
-from mmdd_stage1.data import load_edge_examples, load_target_examples
 
 
 def validate_delivery(root: Path, stage: Path, snapshot: Path | None = None) -> dict:
@@ -83,14 +82,14 @@ def validate_delivery(root: Path, stage: Path, snapshot: Path | None = None) -> 
         for split in ("train", "dev", "test"):
             write_rows(stage / f"{name}.{split}.jsonl", [r for r in records if r["split"] == split])
     for split in ("train", "dev", "test"):
-        examples = load_target_examples(stage / f"target_lists.{split}.jsonl", split=split)
-        paths = load_target_examples(stage / f"target_lists.evidence_supervised.{split}.jsonl", split=split)
-        edges = load_edge_examples(stage / f"edge_lists.{split}.jsonl", split=split)
+        examples = read_rows(stage / f"target_lists.{split}.jsonl")
+        paths = read_rows(stage / f"target_lists.evidence_supervised.{split}.jsonl")
+        edges = read_rows(stage / f"edge_lists.{split}.jsonl")
         expected = {qid for qid, q in queries.items() if q["split"] == split}
-        assert {e.query_id for e in examples} == expected
-        assert {e.query_id for e in paths} == {qid for qid in expected if queries[qid]["query_kind"] == "implicit"}
-        assert all(e.query_row_count == len(queries[e.query_id]["rows"]) for e in examples)
-        counts = Counter(e.query_kind for e in examples)
+        assert {e["query_id"] for e in examples} == expected
+        assert {e["query_id"] for e in paths} == {qid for qid in expected if queries[qid]["query_kind"] == "implicit"}
+        assert all(e["query_row_count"] == len(queries[e["query_id"]]["rows"]) for e in examples)
+        counts = Counter(e["query_kind"] for e in examples)
         assert counts == build["split_counts"][split]
         if build["balanced_each_split"]:
             assert counts["implicit"] == counts["explicit"] > 0
@@ -98,7 +97,7 @@ def validate_delivery(root: Path, stage: Path, snapshot: Path | None = None) -> 
             assert read_rows(root / f"splits/{split}.{name}.jsonl") == [r for r in full if r["split"] == split]
         summary["stage1_split_counts"][split] = {
             "queries": len(examples), "evidence_supervised_queries": len(paths), "edges": len(edges),
-            "edge_relations": dict(Counter(f"{e.source_type}->{e.destination_type}" for e in edges))}
+            "edge_relations": dict(Counter(f"{e['source_type']}->{e['destination_type']}" for e in edges))}
 
     explicit = {qid for qid, q in queries.items() if q["query_kind"] == "explicit"}
     assert {q["table_id"] for q in read_rows(root / "explicit/queries.jsonl")} == explicit

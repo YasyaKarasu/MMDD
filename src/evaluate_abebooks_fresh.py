@@ -14,13 +14,13 @@ from pathlib import Path
 import torch
 
 from run_abebooks_fresh import bind, summarize, write_json
-from mmdd_cqet_v4_1.artifacts import json_identity, load_pool_bundle, save_pool_bundle
-from mmdd_cqet_v4_1.data import sha256_file
-from mmdd_cqet_v4_1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
-from mmdd_cqet_v4_1.labels import export_eval_labels
-from mmdd_cqet_v4_1.lists import build_raw_pools_split
-from mmdd_cqet_v4_1.metrics import evaluate_matrix, export_funnels
-from mmdd_cqet_v4_1.provenance import source_identity
+from mmdd_stage1.artifacts import json_identity, load_pool_bundle, save_pool_bundle
+from mmdd_stage1.data import sha256_file
+from mmdd_stage1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
+from mmdd_stage1.labels import export_eval_labels
+from mmdd_stage1.lists import build_raw_pools_split
+from mmdd_stage1.metrics import evaluate_matrix, export_funnels
+from mmdd_stage1.provenance import source_identity
 
 
 def main() -> None:

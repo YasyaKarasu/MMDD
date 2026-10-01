@@ -1,1497 +1,528 @@
-"""Neural models from the directed joinability Teacher/Student formulation."""
-
+"""Teacher and Student architectures for Stage-1 CQET."""
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
-import math
-
+from typing import Mapping, Optional, Sequence, Union
 import torch
-from torch import nn
-from torch.nn import functional as F
+import gc
+import traceback
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
-from .features import OBJECT_TYPES, ObjectFeatures, normalize_object_type
+from .execution_layout import TEACHER_INFERENCE_CHUNK
+from .losses import global_features
 
-TYPE_TO_ID = {name: index for index, name in enumerate(OBJECT_TYPES)}
-STUDENT_INITIALIZATIONS = (
-    "random",
-    "identity",
-    "identity_noise",
-    "orthogonal",
-    "random_orthogonal",
-    "pca",
-)
-STUDENT_RELATION_PARAMS = ("full", "lowrank")
-STUDENT_SCORE_SPACES = ("raw_logit", "confidence_logit", "confidence")
-STUDENT_PROJECTION_MODES = ("shared", "split")
-STUDENT_PROJECTION_ADAPTERS = ("none", "linear", "gelu")
-TABLE_ROLES = ("query", "target")
+KINDS = ("table", "text", "image")
+STUDENT_RELATIONS = ("QT", "Q_text", "Q_image", "text_T", "image_T")
+PATH_FROZEN_PREFIXES = ("adapters", "poolers", "globals", "modality", "table_kind")
 
 
-def structural_table_pool_with_groups(
-    hidden_states: torch.Tensor,
-    token_groups: torch.Tensor | None,
-    tokens_per_group: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Pool each schema/row into ordered contiguous semantic segments."""
+class QueryPool(nn.Module):
+    """Multi-query cross-attention pooling for variable-length token sequences."""
 
-    if hidden_states.shape[0] == 0:
-        raise ValueError("A table must contain at least one hidden-state token")
-    if tokens_per_group <= 0:
-        raise ValueError("tokens_per_group must be positive")
-    if token_groups is None:
-        return hidden_states, None
-    pooled = []
-    pooled_groups = []
-    for group in torch.unique(token_groups, sorted=True):
-        values = hidden_states[token_groups == group]
-        chunks = torch.tensor_split(values, min(tokens_per_group, values.shape[0]))
-        pooled.extend(chunk.mean(dim=0) for chunk in chunks)
-        pooled_groups.extend([int(group)] * len(chunks))
-    return torch.stack(pooled), torch.tensor(
-        pooled_groups,
-        dtype=token_groups.dtype,
-        device=token_groups.device,
-    )
-
-
-def structural_table_pool(
-    hidden_states: torch.Tensor,
-    token_groups: torch.Tensor | None,
-    tokens_per_group: int = 1,
-) -> torch.Tensor:
-    """Return up to ``tokens_per_group`` tokens per schema/example-row group."""
-
-    pooled, _ = structural_table_pool_with_groups(
-        hidden_states,
-        token_groups,
-        tokens_per_group,
-    )
-    return pooled
-
-
-class LearnedQueryPooler(nn.Module):
-    """Compress variable-length text/image tokens into learned semantic slots."""
-
-    def __init__(self, model_dim: int, num_heads: int, num_latents: int) -> None:
+    def __init__(self, width: int, heads: int, slots: int):
         super().__init__()
-        self.queries = nn.Parameter(torch.empty(num_latents, model_dim))
-        self.attention = nn.MultiheadAttention(model_dim, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(model_dim)
-        nn.init.normal_(self.queries, std=0.02)
+        self.queries = nn.Parameter(torch.empty(slots, width))
+        self.attn = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.norm = nn.LayerNorm(width)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            raise ValueError("Cannot pool an object with no hidden-state tokens")
-        return self.forward_batch(
-            hidden_states.unsqueeze(0),
-            torch.zeros(
-                (1, hidden_states.shape[0]),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            ),
-        ).squeeze(0)
-
-    def forward_batch(
-        self, hidden_states: torch.Tensor, padding_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Pool a padded batch of objects into learned semantic slots."""
-
-        if hidden_states.ndim != 3 or hidden_states.shape[1] == 0:
-            raise ValueError("Batched hidden states must have shape [batch, tokens, dim]")
-        if padding_mask.shape != hidden_states.shape[:2]:
-            raise ValueError("Pooler padding mask must match batch and token dimensions")
-        queries = self.queries.unsqueeze(0).expand(hidden_states.shape[0], -1, -1)
-        pooled, _ = self.attention(
-            query=queries,
-            key=hidden_states,
-            value=hidden_states,
-            key_padding_mask=padding_mask,
-            need_weights=False,
-        )
-        return self.norm(pooled + queries)
+    def forward(self, x: Tensor) -> Tensor:
+        q = self.queries.unsqueeze(0).expand(x.size(0), -1, -1)
+        pooled, _ = self.attn(q, x, x, need_weights=False)
+        return self.norm(q + pooled)
 
 
-class TeacherJoinabilityModel(nn.Module):
-    """Shared cross-object Relation Transformer over frozen Qwen tokens."""
+class FreshPathTeacher(nn.Module):
+    """Shared-head Teacher with 11h global_relation input."""
 
     def __init__(
         self,
-        input_dim: int,
-        model_dim: int = 512,
-        num_heads: int = 8,
-        num_layers: int = 3,
-        text_latents: int = 16,
-        image_latents: int = 24,
-        table_tokens_per_group: int = 1,
+        input_dim: int = 4096,
+        width: int = 512,
+        heads: int = 8,
+        layers: int = 3,
+        ffn: int = 2048,
+        text_slots: int = 16,
+        image_slots: int = 24,
         dropout: float = 0.1,
-        confidence_transform: bool = False,
-        confidence_epsilon: float = 1e-6,
     ) -> None:
         super().__init__()
-        if model_dim % num_heads:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if table_tokens_per_group <= 0:
-            raise ValueError("table_tokens_per_group must be positive")
-        if not 0 < confidence_epsilon < 1:
-            raise ValueError("confidence_epsilon must be between 0 and 1")
-        self.input_dim = input_dim
-        self.model_dim = model_dim
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.text_latents = text_latents
-        self.image_latents = image_latents
-        self.table_tokens_per_group = table_tokens_per_group
+        self.width = width
         self.dropout = dropout
-        self.confidence_transform = False
-        self.confidence_epsilon = float(confidence_epsilon)
-        self.compute_dtype: torch.dtype | None = None
-
-        self.adapters = nn.ModuleDict(
-            {object_type: nn.Linear(input_dim, model_dim) for object_type in OBJECT_TYPES}
-        )
+        self.adapters = nn.ModuleDict({k: nn.Linear(input_dim, width) for k in KINDS})
         self.poolers = nn.ModuleDict(
             {
-                "text": LearnedQueryPooler(model_dim, num_heads, text_latents),
-                "image": LearnedQueryPooler(model_dim, num_heads, image_latents),
+                "text": QueryPool(width, heads, text_slots),
+                "image": QueryPool(width, heads, image_slots),
             }
         )
-        self.modality_embeddings = nn.Embedding(len(OBJECT_TYPES), model_dim)
-        self.role_embeddings = nn.Embedding(2, model_dim)
-        self.table_token_embeddings = nn.Embedding(2, model_dim)
-        self.type_pair_embeddings = nn.Embedding(len(OBJECT_TYPES) ** 2, model_dim)
-        self.rel_token = nn.Parameter(torch.empty(model_dim))
-        self.sep_token = nn.Parameter(torch.empty(model_dim))
-
-        layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dim_feedforward=model_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.globals = nn.ModuleDict(
+            {k: nn.Sequential(nn.Linear(input_dim, width), nn.LayerNorm(width)) for k in KINDS}
         )
-        self.relation_transformer = nn.TransformerEncoder(
-            layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(model_dim),
+        self.roles = nn.Embedding(3, width)
+        self.modality = nn.Embedding(3, width)
+        self.table_kind = nn.Embedding(2, width)
+        self.pair_kind = nn.Embedding(9, width)
+        self.rel = nn.Parameter(torch.empty(width))
+        self.sep = nn.Parameter(torch.empty(width))
+
+        self.relation = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                width, heads, ffn, dropout, activation="gelu", batch_first=True, norm_first=True
+            ),
+            layers,
+            norm=nn.LayerNorm(width),
             enable_nested_tensor=False,
         )
+        # v4.0: global_relation input expanded to 11 * width
+        self.global_relation = nn.Sequential(
+            nn.Linear(11 * width, width),
+            nn.GELU(),
+            nn.Linear(width, width),
+        )
         self.scoring_head = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
+            nn.Linear(width, width),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(model_dim, 1),
+            nn.Linear(width, 1),
         )
-        self.confidence_alphas = nn.ParameterDict()
-        self.confidence_biases = nn.ParameterDict()
-        nn.init.normal_(self.rel_token, std=0.02)
-        nn.init.normal_(self.sep_token, std=0.02)
-        self.set_confidence_transform(confidence_transform)
+        self.reset_fresh()
 
-    @staticmethod
-    def relation_key(source_type: str, destination_type: str) -> str:
-        return (
-            f"{normalize_object_type(source_type)}_to_"
-            f"{normalize_object_type(destination_type)}"
+    def reset_fresh(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.MultiheadAttention):
+                nn.init.xavier_uniform_(m.in_proj_weight)
+                if m.in_proj_bias is not None:
+                    nn.init.zeros_(m.in_proj_bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+        for x in (self.rel, self.sep, self.poolers["text"].queries, self.poolers["image"].queries):
+            nn.init.normal_(x, std=0.02)
+
+    def encode_one(self, kind: str, z: Tensor, content: Tensor) -> tuple[Tensor, Tensor]:
+        if kind not in KINDS:
+            raise ValueError(f"unknown object kind {kind!r}")
+        adapter = self.adapters[kind]
+        if content.dtype != adapter.weight.dtype:
+            content = content.to(adapter.weight.dtype)
+        if z.dtype != adapter.weight.dtype:
+            z = z.to(adapter.weight.dtype)
+        x = adapter(content)
+        if kind == "table":
+            kinds = torch.ones(len(x), dtype=torch.long, device=x.device)
+            kinds[0] = 0
+            x = x + self.table_kind(kinds)
+        else:
+            x = self.poolers[kind](x.unsqueeze(0))[0]
+        g = self.globals[kind](z)
+        return x, g
+
+    def _encode_memo(
+        self, cache: Optional[dict], kind: str, z: Tensor, content: Tensor, object_key=None
+    ) -> tuple[Tensor, Tensor]:
+        if cache is None:
+            return self.encode_one(kind, z, content)
+        key = (kind, object_key) if object_key is not None else (
+            kind, z.data_ptr(), content.data_ptr(), content.shape[0]
         )
+        hit = cache.get(key)
+        if hit is None:
+            hit = self.encode_one(kind, z, content)
+            cache[key] = hit
+        return hit
 
-    def config(self) -> dict[str, int | float | bool]:
-        return {
-            "input_dim": self.input_dim,
-            "model_dim": self.model_dim,
-            "num_heads": self.num_heads,
-            "num_layers": self.num_layers,
-            "text_latents": self.text_latents,
-            "image_latents": self.image_latents,
-            "table_tokens_per_group": self.table_tokens_per_group,
-            "dropout": self.dropout,
-            "confidence_transform": self.confidence_transform,
-            "confidence_epsilon": self.confidence_epsilon,
-        }
+    def _seg(self, kind: str, tokens: Tensor, g: Tensor, role: int, *, prepend_g: bool = False) -> Tensor:
+        extra = self.modality.weight[KINDS.index(kind)] + self.roles.weight[role]
+        if prepend_g:
+            return torch.cat([g.unsqueeze(0), tokens], 0) + extra
+        return tokens + extra
 
-    def set_confidence_transform(self, enabled: bool) -> None:
-        """Enable monotonic type-pair confidence logits for Teacher edges."""
-
-        enabled = bool(enabled)
-        if enabled == self.confidence_transform:
-            return
-        if not enabled:
-            self.confidence_alphas = nn.ParameterDict()
-            self.confidence_biases = nn.ParameterDict()
-            self.confidence_transform = False
-            return
-        parameter = next(self.parameters())
-        initial_alpha = math.log(math.expm1(1.0 - self.confidence_epsilon))
-        self.confidence_alphas = nn.ParameterDict(
-            {
-                self.relation_key(source_type, destination_type): nn.Parameter(
-                    parameter.new_tensor(initial_alpha)
-                )
-                for source_type in OBJECT_TYPES
-                for destination_type in OBJECT_TYPES
-            }
-        )
-        self.confidence_biases = nn.ParameterDict(
-            {
-                self.relation_key(source_type, destination_type): nn.Parameter(
-                    parameter.new_tensor(0.0)
-                )
-                for source_type in OBJECT_TYPES
-                for destination_type in OBJECT_TYPES
-            }
-        )
-        self.confidence_transform = True
-
-    def confidence_scale(
-        self, source_type: str, destination_type: str
-    ) -> torch.Tensor:
-        key = self.relation_key(source_type, destination_type)
-        if self.confidence_transform:
-            return F.softplus(self.confidence_alphas[key]) + self.confidence_epsilon
-        return next(self.parameters()).new_tensor(1.0)
-
-    def transform_edge_scores(
-        self,
-        raw_scores: torch.Tensor,
-        source_type: str,
-        destination_type: str,
-        score_space: str,
-    ) -> torch.Tensor:
-        """Map raw Teacher scores to confidence logits or confidences."""
-
-        if score_space not in STUDENT_SCORE_SPACES:
-            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
-        if score_space == "raw_logit":
-            return raw_scores
-        logits = raw_scores
-        if self.confidence_transform:
-            key = self.relation_key(source_type, destination_type)
-            logits = (
-                self.confidence_scale(source_type, destination_type) * raw_scores
-                + self.confidence_biases[key]
-            )
-        return logits if score_space == "confidence_logit" else torch.sigmoid(logits)
-
-    def transform_pair_scores(
-        self,
-        raw_scores: torch.Tensor,
-        source_types: Sequence[str],
-        destination_types: Sequence[str],
-        score_space: str,
-    ) -> torch.Tensor:
-        """Transform a heterogeneous batch without changing pair order."""
-
-        if raw_scores.shape != (len(source_types),) or len(source_types) != len(
-            destination_types
-        ):
-            raise ValueError("Pair score and type inputs must have equal lengths")
-        if score_space == "raw_logit" or not source_types:
-            return raw_scores
-        transformed = torch.empty_like(raw_scores)
-        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for index, pair in enumerate(zip(source_types, destination_types)):
-            groups[pair].append(index)
-        for (source_type, destination_type), indices in groups.items():
-            index_tensor = torch.tensor(indices, device=raw_scores.device)
-            transformed[index_tensor] = self.transform_edge_scores(
-                raw_scores.index_select(0, index_tensor),
-                source_type,
-                destination_type,
-                score_space,
-            )
-        return transformed
-
-    def set_compute_dtype(self, dtype: torch.dtype | None) -> None:
-        """Select optional autocast compute without changing checkpoint weights."""
-
-        if dtype not in {None, torch.bfloat16}:
-            raise ValueError("Teacher compute dtype must be None or torch.bfloat16")
-        self.compute_dtype = dtype
-
-    def _autocast_context(self):
-        device_type = self.rel_token.device.type
-        if self.compute_dtype is None or device_type != "cuda":
-            return nullcontext()
-        return torch.autocast(device_type, dtype=self.compute_dtype)
-
-    def compress(self, features: ObjectFeatures) -> torch.Tensor:
-        object_type = normalize_object_type(features.object_type)
-        if features.hidden_states is None:
-            raise ValueError(f"{features.object_id}: Teacher requires hidden_states")
-        if object_type == "table":
-            # Segment pooling commutes with the affine adapter. Pool first to
-            # avoid projecting table-token detail that is discarded.
-            tokens, groups = structural_table_pool_with_groups(
-                features.hidden_states,
-                features.token_groups,
-                self.table_tokens_per_group,
-            )
-            tokens = self.adapters[object_type](tokens)
-            if groups is None:
-                token_kinds = torch.ones(
-                    tokens.shape[0], dtype=torch.long, device=tokens.device
-                )
-                token_kinds[0] = 0
-            else:
-                token_kinds = groups.ne(0).long()
-            return tokens + self.table_token_embeddings(token_kinds)
-        hidden = self.adapters[object_type](features.hidden_states)
-        return self.poolers[object_type](hidden)
-
-    @staticmethod
-    def _compression_buckets(
-        features: Sequence[ObjectFeatures], max_padded_tokens: int = 8192
-    ) -> list[list[ObjectFeatures]]:
-        """Group similarly sized objects without creating oversized padded tensors."""
-
-        ordered = sorted(
-            features,
-            key=lambda item: int(item.hidden_states.shape[0]),
-        )
-        buckets: list[list[ObjectFeatures]] = []
-        current: list[ObjectFeatures] = []
-        current_max = 0
-        for item in ordered:
-            length = int(item.hidden_states.shape[0])
-            next_max = max(current_max, length)
-            if current and next_max * (len(current) + 1) > max_padded_tokens:
-                buckets.append(current)
-                current = []
-                current_max = 0
-            current.append(item)
-            current_max = max(current_max, length)
-        if current:
-            buckets.append(current)
-        return buckets
-
-    def compress_many(
-        self,
-        features: Sequence[ObjectFeatures],
-        compression_cache: dict[str, torch.Tensor],
-    ) -> None:
-        """Compress missing objects in modality and length batches."""
-
-        grouped: dict[str, list[ObjectFeatures]] = defaultdict(list)
-        for item in features:
-            if item.hidden_states is None:
-                raise ValueError(f"{item.object_id}: Teacher requires hidden_states")
-            grouped[normalize_object_type(item.object_type)].append(item)
-
-        table_features = grouped.pop("table", [])
-        if table_features:
-            pooled_with_groups = [
-                structural_table_pool_with_groups(
-                    item.hidden_states,
-                    item.token_groups,
-                    self.table_tokens_per_group,
-                )
-                for item in table_features
-            ]
-            pooled = [tokens for tokens, _groups in pooled_with_groups]
-            lengths = [tokens.shape[0] for tokens in pooled]
-            projected = self.adapters["table"](
-                pad_sequence(pooled, batch_first=True)
-            )
-            token_kinds = pad_sequence(
-                [
-                    groups.ne(0).long()
-                    if groups is not None
-                    else torch.cat(
-                        [
-                            torch.zeros(1, dtype=torch.long, device=tokens.device),
-                            torch.ones(
-                                tokens.shape[0] - 1,
-                                dtype=torch.long,
-                                device=tokens.device,
-                            ),
-                        ]
-                    )
-                    for tokens, groups in pooled_with_groups
-                ],
-                batch_first=True,
-                padding_value=1,
-            )
-            projected = projected + self.table_token_embeddings(token_kinds)
-            for item, tokens, length in zip(table_features, projected, lengths):
-                compression_cache[item.object_id] = tokens[:length]
-
-        for object_type, items in grouped.items():
-            for bucket in self._compression_buckets(items):
-                lengths = torch.tensor(
-                    [item.hidden_states.shape[0] for item in bucket],
-                    device=bucket[0].hidden_states.device,
-                )
-                hidden = pad_sequence(
-                    [item.hidden_states for item in bucket], batch_first=True
-                )
-                hidden = self.adapters[object_type](hidden)
-                positions = torch.arange(
-                    hidden.shape[1], device=hidden.device
-                ).unsqueeze(0)
-                padding_mask = positions >= lengths.unsqueeze(1)
-                pooled = self.poolers[object_type].forward_batch(
-                    hidden, padding_mask
-                )
-                for item, tokens in zip(bucket, pooled):
-                    compression_cache[item.object_id] = tokens
-
-    def score_compressed_pairs(
-        self,
-        source_tokens: Sequence[torch.Tensor],
-        source_types: Sequence[str],
-        destination_tokens: Sequence[torch.Tensor],
-        destination_types: Sequence[str],
-    ) -> torch.Tensor:
-        if not source_tokens:
-            return self.rel_token.new_empty(0)
-        if not (
-            len(source_tokens)
-            == len(source_types)
-            == len(destination_tokens)
-            == len(destination_types)
-        ):
-            raise ValueError("Pair inputs must have equal lengths")
-
-        device = source_tokens[0].device
-        batch_size = len(source_tokens)
-        source_lengths = torch.tensor(
-            [tokens.shape[0] for tokens in source_tokens], device=device
-        )
-        destination_lengths = torch.tensor(
-            [tokens.shape[0] for tokens in destination_tokens], device=device
-        )
-        source_ids = torch.tensor(
-            [TYPE_TO_ID[normalize_object_type(value)] for value in source_types],
-            device=device,
-        )
-        destination_ids = torch.tensor(
-            [
-                TYPE_TO_ID[normalize_object_type(value)]
-                for value in destination_types
-            ],
-            device=device,
-        )
-        lengths = source_lengths + destination_lengths + 2
-        input_dtype = self.compute_dtype or self.rel_token.dtype
-        inputs = torch.zeros(
-            (batch_size, int(lengths.max()), self.model_dim),
-            dtype=input_dtype,
-            device=device,
-        )
-        rows = torch.arange(batch_size, device=device)
-        pair_ids = source_ids * len(OBJECT_TYPES) + destination_ids
-        inputs[:, 0] = (
-            self.rel_token + self.type_pair_embeddings(pair_ids)
-        ).to(input_dtype)
-
-        padded_sources = pad_sequence(source_tokens, batch_first=True).to(input_dtype)
-        padded_sources = padded_sources + (
-            self.modality_embeddings(source_ids) + self.role_embeddings.weight[0]
-        ).to(input_dtype).unsqueeze(1)
-        inputs[:, 1 : 1 + padded_sources.shape[1]] = padded_sources
-        inputs[rows, source_lengths + 1] = self.sep_token.to(input_dtype)
-
-        padded_destinations = pad_sequence(
-            destination_tokens, batch_first=True
-        ).to(input_dtype)
-        padded_destinations = padded_destinations + (
-            self.modality_embeddings(destination_ids)
-            + self.role_embeddings.weight[1]
-        ).to(input_dtype).unsqueeze(1)
-        destination_offsets = torch.arange(
-            padded_destinations.shape[1], device=device
-        ).unsqueeze(0)
-        destination_positions = source_lengths.unsqueeze(1) + 2 + destination_offsets
-        destination_mask = destination_offsets < destination_lengths.unsqueeze(1)
-        destination_rows = rows.unsqueeze(1).expand_as(destination_positions)
-        inputs[
-            destination_rows[destination_mask],
-            destination_positions[destination_mask],
-        ] = padded_destinations[destination_mask]
-
-        positions = torch.arange(inputs.shape[1], device=inputs.device).unsqueeze(0)
-        padding_mask = positions >= lengths.unsqueeze(1)
-        encoded = self.relation_transformer(inputs, src_key_padding_mask=padding_mask)
-        return self.scoring_head(encoded[:, 0]).squeeze(-1)
+    def _pair_embedding(self, a_kind: str, b_kind: str) -> Tensor:
+        return self.pair_kind.weight[3 * KINDS.index(a_kind) + KINDS.index(b_kind)]
 
     def score_pairs(
         self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-        *,
-        compression_cache: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        if len(sources) != len(destinations):
-            raise ValueError("Pair inputs must have equal lengths")
-        if not sources:
-            return self.rel_token.new_empty(0)
-        compressed = compression_cache if compression_cache is not None else {}
-        missing = []
-        seen = set(compressed)
-        for features in (*sources, *destinations):
-            if features.object_id not in seen:
-                missing.append(features)
-                seen.add(features.object_id)
-        with self._autocast_context():
-            self.compress_many(missing, compressed)
-            scores = self.score_compressed_pairs(
-                [compressed[features.object_id] for features in sources],
-                [features.object_type for features in sources],
-                [compressed[features.object_id] for features in destinations],
-                [features.object_type for features in destinations],
+        pairs: Sequence[tuple[str, Tensor, Tensor, str, Tensor, Tensor]],
+        cache: Optional[dict] = None,
+        cache_keys: Optional[Sequence[tuple]] = None,
+    ) -> Tensor:
+        """pairs: (a_kind, z_a, C_a, b_kind, z_b, C_b) -> scores (N,)."""
+        seqs: list[list[Tensor]] = []
+        globs: list[Tensor] = []
+        if cache_keys is not None and len(cache_keys) != len(pairs):
+            raise ValueError("score_pairs cache_keys must align with pairs")
+        for i, (a_kind, z_a, c_a, b_kind, z_b, c_b) in enumerate(pairs):
+            key = None if cache_keys is None else cache_keys[i]
+            ca, ga = self._encode_memo(cache, a_kind, z_a, c_a, None if key is None else key[0])
+            cb, gb = self._encode_memo(cache, b_kind, z_b, c_b, None if key is None else key[1])
+            pair = self._pair_embedding(a_kind, b_kind)
+            seqs.append(
+                [
+                    (self.rel + pair).unsqueeze(0),
+                    self._seg(a_kind, ca, ga, 0),
+                    self.sep.unsqueeze(0),
+                    self._seg(b_kind, cb, gb, 1),
+                ]
             )
-        return scores.float()
+            # Empty evidence: exact 6h zeros extension via global_features
+            globs.append(global_features(ga, gb, pair, evidence=None, evidence_type_embedding=None))
+        return self._score(seqs, globs)
+
+    def score_triplets(
+        self,
+        triplets: Sequence[tuple[str, Tensor, Tensor, str, Tensor, Tensor, str, Tensor, Tensor]],
+        cache: Optional[dict] = None,
+        cache_keys: Optional[Sequence[tuple]] = None,
+    ) -> Tensor:
+        """triplets: (q_kind, z_q, C_q, e_kind, z_e, C_e, t_kind, z_t, C_t) -> scores (N,)."""
+        seqs: list[list[Tensor]] = []
+        globs: list[Tensor] = []
+        if cache_keys is not None and len(cache_keys) != len(triplets):
+            raise ValueError("score_triplets cache_keys must align with triplets")
+        for i, (q_kind, z_q, c_q, e_kind, z_e, c_e, t_kind, z_t, c_t) in enumerate(triplets):
+            if q_kind != "table" or t_kind != "table" or e_kind == "table":
+                raise ValueError("QET is only defined for table-evidence-table")
+            key = None if cache_keys is None else cache_keys[i]
+            cq, gq = self._encode_memo(cache, q_kind, z_q, c_q, None if key is None else key[0])
+            ce, ge = self._encode_memo(cache, e_kind, z_e, c_e, None if key is None else key[1])
+            ct, gt = self._encode_memo(cache, t_kind, z_t, c_t, None if key is None else key[2])
+            pair = self._pair_embedding("table", "table")
+            etype = self.modality.weight[KINDS.index(e_kind)]
+            seqs.append(
+                [
+                    (self.rel + pair).unsqueeze(0),
+                    self._seg(q_kind, cq, gq, 0),
+                    self.sep.unsqueeze(0),
+                    self._seg(e_kind, ce, ge, 2, prepend_g=True),
+                    self.sep.unsqueeze(0),
+                    self._seg(t_kind, ct, gt, 1),
+                ]
+            )
+            globs.append(global_features(gq, gt, pair, evidence=ge, evidence_type_embedding=etype))
+        return self._score(seqs, globs)
+
+    def _score(self, seqs: list[list[Tensor]], globs: Union[list[Tensor], Tensor]) -> Tensor:
+        width = self.width
+        n = len(seqs)
+        if n == 0:
+            dev = globs.device if isinstance(globs, Tensor) else (globs[0].device if globs else self.rel.device)
+            return torch.empty(0, device=dev)
+        lengths = [sum(len(s) for s in segs) for segs in seqs]
+        total = max(lengths)
+        batch = n
+        device = globs.device if isinstance(globs, Tensor) else globs[0].device
+        flat = torch.cat([s for segs in seqs for s in segs], dim=0)
+        tokens = flat.shape[0]
+        length_t = torch.tensor(lengths, device=device, dtype=torch.long)
+        rows = torch.repeat_interleave(torch.arange(batch, device=device), length_t, output_size=tokens)
+        starts = torch.cumsum(length_t, 0) - length_t
+        cols = torch.arange(tokens, device=device) - torch.repeat_interleave(starts, length_t, output_size=tokens)
+        dst = rows * total + cols
+        x = flat.new_zeros(batch * total, width)
+        x[dst] = flat
+        x = x.view(batch, total, width)
+        pad = torch.ones(batch * total, dtype=torch.bool, device=device)
+        pad[dst] = False
+        pad = pad.view(batch, total)
+        out = self.relation(x, src_key_padding_mask=pad)
+        local = out[:, 0]
+        globs_t = globs if isinstance(globs, Tensor) else torch.stack(globs)
+        glob = self.global_relation(globs_t)
+        return self.scoring_head(local + glob).squeeze(-1)
+
+    def encode_many(
+        self, kind: str, z: Tensor, tokens: Sequence[Tensor]
+    ) -> tuple[Tensor, list[int], Tensor]:
+        """Batched encoding of objects of the same kind.
+        Returns:
+            segments: (N, Lmax, W) for table; (N, 1 + slots, W) for text/image with prepended g
+            lengths: list of token lengths for each object
+            g: (N, W) global features
+        """
+        if kind not in KINDS:
+            raise ValueError(f"unknown object kind {kind!r}")
+        n = len(tokens)
+        adapter = self.adapters[kind]
+        dev = z.device if isinstance(z, Tensor) else adapter.weight.device
+        if n == 0:
+            return torch.empty(0, 0, self.width, device=dev), [], torch.empty(0, self.width, device=dev)
+
+        if z.dtype != adapter.weight.dtype:
+            z = z.to(adapter.weight.dtype)
+
+        if kind == "table":
+            lengths = [t.shape[0] for t in tokens]
+            pad_tokens = pad_sequence(tokens, batch_first=True)
+            if pad_tokens.dtype != adapter.weight.dtype:
+                pad_tokens = pad_tokens.to(adapter.weight.dtype)
+            x = adapter(pad_tokens)  # (N, Lmax, W)
+            kinds = torch.ones(x.shape[1], dtype=torch.long, device=x.device)
+            kinds[0] = 0
+            x = x + self.table_kind(kinds)
+            g = self.globals["table"](z)
+            return x, lengths, g
+        else:
+            lengths = [t.shape[0] for t in tokens]
+            if len(set(lengths)) <= 1:
+                stack_tokens = torch.stack(list(tokens))
+                if stack_tokens.dtype != adapter.weight.dtype:
+                    stack_tokens = stack_tokens.to(adapter.weight.dtype)
+                x = adapter(stack_tokens)  # (N, L, W)
+                pooled = self.poolers[kind](x)  # (N, slots, W)
+            else:
+                pooled_list = []
+                for t in tokens:
+                    if t.dtype != adapter.weight.dtype:
+                        t = t.to(adapter.weight.dtype)
+                    xt = adapter(t).unsqueeze(0)
+                    pooled_list.append(self.poolers[kind](xt)[0])
+                pooled = torch.stack(pooled_list)
+            g = self.globals[kind](z)  # (N, W)
+            seg = torch.cat([g.unsqueeze(1), pooled], dim=1)  # (N, 1 + slots, W)
+            lengths = [seg.shape[1]] * n
+            return seg, lengths, g
+
+    def score_query_lists(self, q, targets, evidence, paths,
+                          chunk: int = TEACHER_INFERENCE_CHUNK) -> tuple[Tensor, Tensor]:
+        """Same full query scores, larger execution chunk; eval-only OOM retries.
+
+        Training callers keep ordinary autograd semantics without implicit retries.
+        Eval fallback retries the full query and never truncates target/path lists.
+        """
+        if chunk < 1:
+            raise ValueError("inference chunk must be positive")
+        if self.training or torch.is_grad_enabled():
+            return self._score_query_lists_once(q, targets, evidence, paths, chunk)
+        while True:
+            failed = False
+            try:
+                return self._score_query_lists_once(q, targets, evidence, paths, chunk)
+            except BaseException as error:
+                is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or (
+                    isinstance(error, RuntimeError) and "out of memory" in str(error).lower())
+                if not is_oom:
+                    raise
+                if chunk == 1:
+                    raise RuntimeError("BLOCKED_RESOURCE: inference chunk 1 OOM") from error
+                traceback.clear_frames(error.__traceback__)
+                error.__traceback__ = None
+                failed = True
+            if failed:
+                old_chunk = chunk
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                chunk = max(1, chunk // 2)
+                print(f"[Teacher inference OOM] full-query retry chunk={old_chunk}->{chunk}", flush=True)
+
+    def _score_query_lists_once(
+        self,
+        q: tuple[Tensor, Tensor],
+        targets: tuple[Tensor, Sequence[Tensor]],
+        evidence: Mapping[str, tuple[str, Tensor, Tensor]],
+        paths: Sequence[tuple[int, str]],
+        chunk: int = 1024,
+    ) -> tuple[Tensor, Tensor]:
+        """Batched scoring for one query: returns f0 (Nt,) and path_scores (P,)."""
+        zq, cq = q
+        xq, gq = self.encode_one("table", zq, cq)
+        pair = self._pair_embedding("table", "table")
+        prefix = [(self.rel + pair).unsqueeze(0), self._seg("table", xq, gq, 0), self.sep.unsqueeze(0)]
+        sep = self.sep.unsqueeze(0)
+
+        zt, ct_list = targets
+        Nt = len(ct_list)
+        dev = zq.device
+
+        if Nt > 0:
+            x_t, L_t, g_t = self.encode_many("table", zt, ct_list)
+            x_t = x_t + self.modality.weight[0] + self.roles.weight[1]
+            seqs_pairs = [prefix + [x_t[k, :L_t[k]]] for k in range(Nt)]
+            globs_pairs = global_features(gq.expand(Nt, -1), g_t, pair.expand(Nt, -1), None, None)
+            f0 = torch.cat([self._score(seqs_pairs[i : i + chunk], globs_pairs[i : i + chunk]) for i in range(0, Nt, chunk)])
+        else:
+            f0 = torch.empty(0, device=dev)
+
+        P = len(paths)
+        if P > 0:
+            e_ids = list(dict.fromkeys(p[1] for p in paths))
+            seg_e: dict[str, Tensor] = {}
+            g_e: dict[str, Tensor] = {}
+            etype_e: dict[str, Tensor] = {}
+
+            for k in ("text", "image"):
+                ids_k = [e for e in e_ids if evidence[e][0] == k]
+                if not ids_k:
+                    continue
+                k_idx = KINDS.index(k)
+                z_k = torch.stack([evidence[e][1] for e in ids_k])
+                toks_k = [evidence[e][2] for e in ids_k]
+                seg_k, _, g_k = self.encode_many(k, z_k, toks_k)
+                seg_k = seg_k + self.modality.weight[k_idx] + self.roles.weight[2]
+                for i, e in enumerate(ids_k):
+                    seg_e[e] = seg_k[i]
+                    g_e[e] = g_k[i]
+                    etype_e[e] = self.modality.weight[k_idx]
+
+            t_rows = torch.tensor([p[0] for p in paths], device=dev, dtype=torch.long)
+            seqs_trip = [prefix + [seg_e[p[1]], sep, x_t[p[0], :L_t[p[0]]]] for p in paths]
+            globs_trip = global_features(
+                gq.expand(P, -1),
+                g_t[t_rows],
+                pair.expand(P, -1),
+                torch.stack([g_e[p[1]] for p in paths]),
+                torch.stack([etype_e[p[1]] for p in paths]),
+            )
+            path_scores = torch.cat([self._score(seqs_trip[i : i + chunk], globs_trip[i : i + chunk]) for i in range(0, P, chunk)])
+        else:
+            path_scores = torch.empty(0, device=dev)
+
+        return f0, path_scores
+
+    def set_tb_trainable(self) -> list[nn.Parameter]:
+        """Freeze object representations and poolers for T_B stages (SPEC 13.2)."""
+        params = []
+        for name, param in self.named_parameters():
+            frozen = name.startswith(PATH_FROZEN_PREFIXES)
+            param.requires_grad_(not frozen)
+            if not frozen:
+                params.append(param)
+        return params
 
 
-class StudentJoinabilityModel(nn.Module):
-    """Independent type projections with an ordered relation per type pair."""
+class NativeStudent(nn.Module):
+    """Native linear projection + bilinear relation Student (no adapter, SPEC 14)."""
 
     def __init__(
         self,
-        input_dim: int,
-        student_dim: int = 128,
-        initialization: str = "random",
-        initialization_noise_std: float = 0.01,
-        initialization_basis: torch.Tensor | None = None,
-        freeze_projections: bool = False,
-        relation_param: str = "full",
-        relation_rank: int = 16,
-        confidence_transform: bool = False,
-        confidence_epsilon: float = 1e-6,
-        projection_mode: str = "shared",
-        projection_adapter: str = "none",
-        projection_hidden_dim: int = 256,
-        projection_scales: Mapping[str, float] | None = None,
+        pca_basis: Tensor,  # (1024, 4096)
+        pca_mean: Tensor,   # (4096,)
+        dim: int = 1024,
     ) -> None:
         super().__init__()
-        if input_dim <= 0 or student_dim <= 0:
-            raise ValueError("input_dim and student_dim must be positive")
-        if initialization not in STUDENT_INITIALIZATIONS:
-            raise ValueError(
-                f"initialization must be one of {STUDENT_INITIALIZATIONS}"
-            )
-        if initialization_noise_std < 0:
-            raise ValueError("initialization_noise_std must be non-negative")
-        if relation_param not in STUDENT_RELATION_PARAMS:
-            raise ValueError(
-                f"relation_param must be one of {STUDENT_RELATION_PARAMS}"
-            )
-        if relation_rank <= 0:
-            raise ValueError("relation_rank must be positive")
-        if not 0 < confidence_epsilon < 1:
-            raise ValueError("confidence_epsilon must be between 0 and 1")
-        if projection_mode not in STUDENT_PROJECTION_MODES:
-            raise ValueError(
-                f"projection_mode must be one of {STUDENT_PROJECTION_MODES}"
-            )
-        if projection_adapter not in STUDENT_PROJECTION_ADAPTERS:
-            raise ValueError(
-                f"projection_adapter must be one of {STUDENT_PROJECTION_ADAPTERS}"
-            )
-        if projection_hidden_dim <= 0:
-            raise ValueError("projection_hidden_dim must be positive")
-        if initialization in {"identity", "identity_noise"} and student_dim != input_dim:
-            raise ValueError(
-                f"{initialization} initialization requires student_dim == input_dim"
-            )
-        if initialization in {"orthogonal", "random_orthogonal", "pca"} and student_dim > input_dim:
-            raise ValueError(
-                f"{initialization} initialization requires student_dim <= input_dim"
-            )
-        if initialization == "pca":
-            if initialization_basis is None:
-                raise ValueError("pca initialization requires initialization_basis")
-            if initialization_basis.shape != (student_dim, input_dim):
-                raise ValueError(
-                    "initialization_basis must have shape [student_dim, input_dim]"
-                )
-            if not torch.isfinite(initialization_basis).all():
-                raise ValueError("initialization_basis must be finite")
-            gram = initialization_basis @ initialization_basis.T
-            if not torch.allclose(
-                gram,
-                torch.eye(student_dim, device=gram.device, dtype=gram.dtype),
-                atol=1e-4,
-                rtol=1e-4,
-            ):
-                raise ValueError("initialization_basis rows must be orthonormal")
-        self.input_dim = input_dim
-        self.student_dim = student_dim
-        self.initialization = initialization
-        self.initialization_noise_std = initialization_noise_std
-        self.freeze_projections = bool(freeze_projections)
-        self.relation_param = relation_param
-        self.relation_rank = relation_rank
-        self.confidence_transform = False
-        self.confidence_epsilon = float(confidence_epsilon)
-        self.projection_mode = projection_mode
-        self.projection_adapter = projection_adapter
-        self.projection_hidden_dim = int(projection_hidden_dim)
-        projection_keys = (
-            ("table_query", "table_target", "text", "image")
-            if projection_mode == "split"
-            else OBJECT_TYPES
+        self.dim = dim
+        self.register_buffer("pca_mean", pca_mean.clone().detach().float())
+        self.register_buffer("pca_basis", pca_basis.clone().detach().float())
+
+        self.P = nn.ParameterDict(
+            {kind: nn.Parameter(pca_basis.clone().detach().float()) for kind in KINDS}
         )
-        self.projections = nn.ModuleDict(
-            {key: nn.Linear(input_dim, student_dim, bias=False) for key in projection_keys}
+        self.R = nn.ParameterDict(
+            {rel: nn.Parameter(torch.eye(dim, dtype=torch.float32)) for rel in STUDENT_RELATIONS}
         )
-        scales = dict(projection_scales or {})
-        unknown_scale_keys = set(scales) - set(projection_keys)
-        if unknown_scale_keys:
-            raise ValueError(
-                f"Unknown projection scale keys: {sorted(unknown_scale_keys)}"
-            )
-        self.projection_scales = {
-            key: float(scales.get(key, 1.0)) for key in projection_keys
-        }
-        if any(not math.isfinite(value) or value <= 0 for value in self.projection_scales.values()):
-            raise ValueError("projection scales must be finite and positive")
-        self.projection_residual_inputs = nn.ModuleDict()
-        self.projection_residual_outputs = nn.ModuleDict()
-        if projection_adapter != "none":
-            for key in projection_keys:
-                self.projection_residual_inputs[key] = nn.Linear(
-                    input_dim, self.projection_hidden_dim, bias=False
-                )
-                self.projection_residual_outputs[key] = nn.Linear(
-                    self.projection_hidden_dim, student_dim, bias=False
-                )
-                nn.init.zeros_(self.projection_residual_outputs[key].weight)
 
-        if initialization in {"identity", "identity_noise"}:
-            with torch.no_grad():
-                for projection in self.projections.values():
-                    nn.init.eye_(projection.weight)
-                    if initialization == "identity_noise":
-                        projection.weight.add_(
-                            initialization_noise_std
-                            * torch.randn_like(projection.weight)
-                        )
-        elif initialization in {"orthogonal", "random_orthogonal", "pca"}:
-            if initialization in {"orthogonal", "random_orthogonal"}:
-                basis, _ = torch.linalg.qr(
-                    torch.randn(input_dim, student_dim), mode="reduced"
-                )
-                projection_weight = basis.T
-            else:
-                assert initialization_basis is not None
-                projection_weight = initialization_basis
-            with torch.no_grad():
-                for projection in self.projections.values():
-                    projection.weight.copy_(projection_weight)
+    def u(self, kind: str, z: Tensor) -> Tensor:
+        centered = z - self.pca_mean
+        return centered @ self.P[kind].T
 
-        self.register_buffer(
-            "initial_projection_weights",
-            torch.stack(
-                [self.projections[key].weight.detach().clone() for key in self.projection_keys]
-            ),
-            persistent=True,
-        )
-        self.register_buffer(
-            "stage_initial_projection_weights",
-            self.initial_projection_weights.detach().clone(),
-        )
-        self.projection_reference_origin = "initialization"
-        self.set_projection_frozen(self.freeze_projections)
+    def query_vector(self, z_query: Tensor) -> Tensor:
+        return self.u("table", z_query)
 
-        self.relations = nn.ParameterDict()
-        self.relation_as = nn.ParameterDict()
-        self.relation_bs = nn.ParameterDict()
-        self.confidence_alphas = nn.ParameterDict()
-        self.confidence_biases = nn.ParameterDict()
-        for source_type in OBJECT_TYPES:
-            for destination_type in OBJECT_TYPES:
-                key = self.relation_key(source_type, destination_type)
-                if relation_param == "full":
-                    relation = torch.eye(student_dim)
-                    if initialization not in {
-                        "identity",
-                        "orthogonal",
-                        "random_orthogonal",
-                        "pca",
-                    }:
-                        relation = relation + 0.01 * torch.randn(
-                            student_dim, student_dim
-                        )
-                    self.relations[key] = nn.Parameter(relation)
-                else:
-                    self.relation_as[key] = nn.Parameter(
-                        0.01 * torch.randn(student_dim, relation_rank)
-                    )
-                    self.relation_bs[key] = nn.Parameter(
-                        torch.zeros(student_dim, relation_rank)
-                    )
-        self.set_confidence_transform(confidence_transform)
+    def ann_query(self, relation: str, z_left: Tensor) -> Tensor:
+        """Transformed row query whose dot with indexed right u equals bilinear score."""
+        if relation not in STUDENT_RELATIONS:
+            raise ValueError(f"unknown Student relation: {relation}")
+        left_kind = "table" if relation.startswith("Q") else relation.removesuffix("_T")
+        return self.u(left_kind, z_left) @ self.R[relation]
 
-    @staticmethod
-    def relation_key(source_type: str, destination_type: str) -> str:
-        return f"{normalize_object_type(source_type)}_to_{normalize_object_type(destination_type)}"
+    def index_vectors(self, relation: str, z_right: Tensor) -> Tensor:
+        if relation == "QT" or relation.endswith("_T"):
+            right_kind = "table"
+        elif relation == "Q_text":
+            right_kind = "text"
+        elif relation == "Q_image":
+            right_kind = "image"
+        else:
+            raise ValueError(f"unknown Student relation: {relation}")
+        return self.u(right_kind, z_right)
 
-    def config(self) -> dict[str, int | float | str | bool]:
-        return {
-            "input_dim": self.input_dim,
-            "student_dim": self.student_dim,
-            "initialization": self.initialization,
-            "initialization_noise_std": self.initialization_noise_std,
-            "freeze_projections": self.freeze_projections,
-            "relation_param": self.relation_param,
-            "relation_rank": self.relation_rank,
-            "confidence_transform": self.confidence_transform,
-            "confidence_epsilon": self.confidence_epsilon,
-            "projection_mode": self.projection_mode,
-            "projection_adapter": self.projection_adapter,
-            "projection_hidden_dim": self.projection_hidden_dim,
-            "projection_scales": dict(self.projection_scales),
-        }
+    def score(self, a_kind: str, z_a: Tensor, b_kind: str, z_b: Tensor) -> Tensor:
+        ua = self.u(a_kind, z_a)
+        ub = self.u(b_kind, z_b)
+        rel_key = self._rel_key(a_kind, b_kind)
+        return (ua @ self.R[rel_key] * ub).sum(dim=-1)
 
-    @property
-    def projection_keys(self) -> tuple[str, ...]:
-        return tuple(self.projections.keys())
+    def _rel_key(self, a_kind: str, b_kind: str) -> str:
+        if a_kind == "table" and b_kind == "table":
+            return "QT"
+        if a_kind == "table" and b_kind == "text":
+            return "Q_text"
+        if a_kind == "table" and b_kind == "image":
+            return "Q_image"
+        if a_kind == "text" and b_kind == "table":
+            return "text_T"
+        if a_kind == "image" and b_kind == "table":
+            return "image_T"
+        raise ValueError(f"unsupported student relation pair ({a_kind}, {b_kind})")
 
-    def projection_key(self, object_type: str, role: str | None = None) -> str:
-        """Resolve an object projection from its runtime endpoint role."""
+    def anchor_loss(self) -> Tensor:
+        p_loss = torch.stack(
+            [F.mse_loss(self.P[k], self.pca_basis) for k in KINDS]
+        ).mean()
+        eye = torch.eye(self.dim, device=self.pca_basis.device, dtype=torch.float32)
+        r_loss = torch.stack(
+            [F.mse_loss(self.R[r], eye) for r in STUDENT_RELATIONS]
+        ).mean()
+        return p_loss + r_loss
 
-        object_type = normalize_object_type(object_type)
-        if object_type != "table" or self.projection_mode == "shared":
-            return object_type
-        if role not in TABLE_ROLES:
-            raise ValueError("Split table projection requires role='query' or 'target'")
-        return f"table_{role}"
-
-    @property
-    def ann_dim(self) -> int:
-        """Vector dimension used by exact inner-product ANN retrieval."""
-
-        if self.relation_param == "lowrank":
-            return self.student_dim + self.relation_rank
-        return self.student_dim
-
-    def relation_parameters(self) -> list[nn.Parameter]:
-        """Return the trainable parameters of all directed relations."""
-
-        relation_parameters = (
-            list(self.relations.parameters())
-            if self.relation_param == "full"
-            else [
-                *self.relation_as.parameters(),
-                *self.relation_bs.parameters(),
-            ]
-        )
-        return [*relation_parameters, *self.confidence_parameters()]
-
-    def projection_parameters(self) -> list[nn.Parameter]:
-        """Return base and optional residual projection parameters."""
-
+    def param_groups(self, p_lr: float = 1e-6, r_lr: float = 1e-5) -> list[dict]:
         return [
-            *self.projections.parameters(),
-            *self.projection_residual_inputs.parameters(),
-            *self.projection_residual_outputs.parameters(),
+            {"params": list(self.P.values()), "lr": p_lr},
+            {"params": list(self.R.values()), "lr": r_lr},
         ]
 
-    def confidence_parameters(self) -> list[nn.Parameter]:
-        """Return the optional monotonic type-pair calibration parameters."""
 
+class QTStudent(nn.Module):
+    """QT-only linear projection + bilinear relation Student (SPEC 14.1)."""
+
+    def __init__(
+        self,
+        pca_basis: Tensor,
+        pca_mean: Tensor,
+        dim: int = 1024,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.register_buffer("pca_mean", pca_mean.clone().detach().float())
+        self.register_buffer("pca_basis", pca_basis.clone().detach().float())
+
+        self.P_table = nn.Parameter(pca_basis.clone().detach().float())
+        self.R_QT = nn.Parameter(torch.eye(dim, dtype=torch.float32))
+
+    def u(self, z: Tensor) -> Tensor:
+        centered = z - self.pca_mean
+        return centered @ self.P_table.T
+
+    def query_vector(self, z_query: Tensor) -> Tensor:
+        return self.u(z_query)
+
+    def ann_query(self, z_left: Tensor) -> Tensor:
+        return self.u(z_left) @ self.R_QT
+
+    def index_vectors(self, z_right: Tensor) -> Tensor:
+        return self.u(z_right)
+
+    def score(self, z_a: Tensor, z_b: Tensor) -> Tensor:
+        ua = self.u(z_a)
+        ub = self.u(z_b)
+        return (ua @ self.R_QT * ub).sum(dim=-1)
+
+    def anchor_loss(self) -> Tensor:
+        p_loss = F.mse_loss(self.P_table, self.pca_basis)
+        eye = torch.eye(self.dim, device=self.pca_basis.device, dtype=torch.float32)
+        r_loss = F.mse_loss(self.R_QT, eye)
+        return p_loss + r_loss
+
+    def param_groups(self, p_lr: float = 1e-6, r_lr: float = 1e-5) -> list[dict]:
         return [
-            *self.confidence_alphas.parameters(),
-            *self.confidence_biases.parameters(),
+            {"params": [self.P_table], "lr": p_lr},
+            {"params": [self.R_QT], "lr": r_lr},
         ]
-
-    def set_confidence_transform(self, enabled: bool) -> None:
-        """Enable or disable trainable monotonic type-pair calibration."""
-
-        enabled = bool(enabled)
-        if enabled == self.confidence_transform:
-            return
-        if not enabled:
-            self.confidence_alphas = nn.ParameterDict()
-            self.confidence_biases = nn.ParameterDict()
-            self.confidence_transform = False
-            return
-        parameter = next(self.parameters())
-        initial_alpha = math.log(math.expm1(1.0 - self.confidence_epsilon))
-        self.confidence_alphas = nn.ParameterDict(
-            {
-                self.relation_key(source_type, destination_type): nn.Parameter(
-                    parameter.new_tensor(initial_alpha)
-                )
-                for source_type in OBJECT_TYPES
-                for destination_type in OBJECT_TYPES
-            }
-        )
-        self.confidence_biases = nn.ParameterDict(
-            {
-                self.relation_key(source_type, destination_type): nn.Parameter(
-                    parameter.new_tensor(0.0)
-                )
-                for source_type in OBJECT_TYPES
-                for destination_type in OBJECT_TYPES
-            }
-        )
-        self.confidence_transform = True
-
-    def confidence_scale(
-        self, source_type: str, destination_type: str
-    ) -> torch.Tensor:
-        """Return the positive affine scale for one ordered type pair."""
-
-        key = self.relation_key(source_type, destination_type)
-        if self.confidence_transform:
-            return F.softplus(self.confidence_alphas[key]) + self.confidence_epsilon
-        return next(self.parameters()).new_tensor(1.0)
-
-    def transform_edge_scores(
-        self,
-        raw_scores: torch.Tensor,
-        source_type: str,
-        destination_type: str,
-        score_space: str,
-    ) -> torch.Tensor:
-        """Map raw bilinear scores to explicit logits or sigmoid confidence."""
-
-        if score_space not in STUDENT_SCORE_SPACES:
-            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
-        if score_space == "raw_logit":
-            return raw_scores
-        key = self.relation_key(source_type, destination_type)
-        logits = raw_scores
-        if self.confidence_transform:
-            logits = (
-                self.confidence_scale(source_type, destination_type) * raw_scores
-                + self.confidence_biases[key]
-            )
-        return logits if score_space == "confidence_logit" else torch.sigmoid(logits)
-
-    def relation_residual_squared_norm(self, key: str) -> torch.Tensor:
-        """Return ``||R - I||_F^2`` without materializing a low-rank matrix."""
-
-        if self.relation_param == "full":
-            relation = self.relations[key]
-            identity = torch.eye(
-                self.student_dim,
-                device=relation.device,
-                dtype=relation.dtype,
-            )
-            return (relation - identity).square().sum()
-        left_gram = self.relation_as[key].T @ self.relation_as[key]
-        right_gram = self.relation_bs[key].T @ self.relation_bs[key]
-        return (left_gram * right_gram).sum()
-
-    def set_projection_frozen(self, frozen: bool) -> None:
-        """Freeze or unfreeze the object-type projections explicitly."""
-
-        self.freeze_projections = bool(frozen)
-        for projection in self.projections.values():
-            projection.weight.requires_grad_(not self.freeze_projections)
-        for projection in self.projection_residual_inputs.values():
-            projection.weight.requires_grad_(not self.freeze_projections)
-        for projection in self.projection_residual_outputs.values():
-            projection.weight.requires_grad_(not self.freeze_projections)
-
-    @torch.no_grad()
-    def reset_projection_anchors(self) -> None:
-        """Record a stage boundary without changing the full-chain reference."""
-
-        self.stage_initial_projection_weights.copy_(
-            torch.stack(
-                [self.projections[key].weight for key in self.projection_keys]
-            )
-        )
-
-    def project(
-        self,
-        embedding: torch.Tensor,
-        object_type: str,
-        *,
-        role: str | None = None,
-    ) -> torch.Tensor:
-        key = self.projection_key(object_type, role)
-        projected = self.projections[key](embedding)
-        if self.projection_adapter == "none":
-            return projected
-        hidden = self.projection_residual_inputs[key](embedding)
-        hidden = hidden / self.projection_scales[key]
-        if self.projection_adapter == "gelu":
-            hidden = F.gelu(hidden)
-        return projected + self.projection_residual_outputs[key](hidden)
-
-    def _score_projected_pairs(
-        self,
-        sources: torch.Tensor,
-        destinations: torch.Tensor,
-        relation_key: str,
-    ) -> torch.Tensor:
-        if self.relation_param == "full":
-            return (
-                (sources @ self.relations[relation_key]) * destinations
-            ).sum(dim=-1)
-        direct = (sources * destinations).sum(dim=-1)
-        residual = (
-            (sources @ self.relation_as[relation_key])
-            * (destinations @ self.relation_bs[relation_key])
-        ).sum(dim=-1)
-        return direct + residual
-
-    def score_embeddings(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-        *,
-        source_role: str | None = None,
-        destination_role: str | None = None,
-    ) -> torch.Tensor:
-        source = self.project(
-            source_embedding,
-            source_type,
-            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
-        )
-        destination = self.project(
-            destination_embedding,
-            destination_type,
-            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
-        )
-        key = self.relation_key(source_type, destination_type)
-        return self._score_projected_pairs(source, destination, key)
-
-    def raw_score_embeddings(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        """Return the unbounded bilinear logit used for ANN ordering."""
-
-        return self.score_embeddings(
-            source_embedding,
-            source_type,
-            destination_embedding,
-            destination_type,
-        )
-
-    def confidence_logit_embeddings(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_embeddings(
-            source_embedding,
-            source_type,
-            destination_embedding,
-            destination_type,
-        )
-        return self.transform_edge_scores(
-            raw_scores, source_type, destination_type, "confidence_logit"
-        )
-
-    def confidence_embeddings(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_embeddings(
-            source_embedding,
-            source_type,
-            destination_embedding,
-            destination_type,
-        )
-        return self.transform_edge_scores(
-            raw_scores, source_type, destination_type, "confidence"
-        )
-
-    def score_embedding_matrix(
-        self,
-        source_embeddings: torch.Tensor,
-        source_type: str,
-        destination_embeddings: torch.Tensor,
-        destination_type: str,
-        *,
-        source_role: str | None = None,
-        destination_role: str | None = None,
-    ) -> torch.Tensor:
-        """Score every source/destination pair in two embedding batches."""
-
-        sources = self.project(
-            source_embeddings,
-            source_type,
-            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
-        )
-        destinations = self.project(
-            destination_embeddings,
-            destination_type,
-            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
-        )
-        key = self.relation_key(source_type, destination_type)
-        if self.relation_param == "full":
-            return sources @ self.relations[key] @ destinations.T
-        scores = sources @ destinations.T
-        return scores + (
-            (sources @ self.relation_as[key])
-            @ (destinations @ self.relation_bs[key]).T
-        )
-
-    def raw_score_embedding_matrix(
-        self,
-        source_embeddings: torch.Tensor,
-        source_type: str,
-        destination_embeddings: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        """Return raw bilinear logits for every source/destination pair."""
-
-        return self.score_embedding_matrix(
-            source_embeddings,
-            source_type,
-            destination_embeddings,
-            destination_type,
-        )
-
-    def confidence_logit_embedding_matrix(
-        self,
-        source_embeddings: torch.Tensor,
-        source_type: str,
-        destination_embeddings: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_embedding_matrix(
-            source_embeddings,
-            source_type,
-            destination_embeddings,
-            destination_type,
-        )
-        return self.transform_edge_scores(
-            raw_scores, source_type, destination_type, "confidence_logit"
-        )
-
-    def confidence_embedding_matrix(
-        self,
-        source_embeddings: torch.Tensor,
-        source_type: str,
-        destination_embeddings: torch.Tensor,
-        destination_type: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_embedding_matrix(
-            source_embeddings,
-            source_type,
-            destination_embeddings,
-            destination_type,
-        )
-        return self.transform_edge_scores(
-            raw_scores, source_type, destination_type, "confidence"
-        )
-
-    def score_embedding_matrix_in_space(
-        self,
-        source_embeddings: torch.Tensor,
-        source_type: str,
-        destination_embeddings: torch.Tensor,
-        destination_type: str,
-        score_space: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_embedding_matrix(
-            source_embeddings,
-            source_type,
-            destination_embeddings,
-            destination_type,
-        )
-        return self.transform_edge_scores(
-            raw_scores, source_type, destination_type, score_space
-        )
-
-    def score_pairs(
-        self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-    ) -> torch.Tensor:
-        if len(sources) != len(destinations):
-            raise ValueError("Pair inputs must have equal lengths")
-        parameter = next(self.parameters())
-        if not sources:
-            return parameter.new_empty(0)
-
-        projected: dict[tuple[str, str], torch.Tensor] = {}
-        features_by_projection: dict[str, dict[str, ObjectFeatures]] = defaultdict(dict)
-        for features in sources:
-            key = self.projection_key(
-                features.object_type,
-                "query" if features.object_type == "table" else None,
-            )
-            features_by_projection[key].setdefault(features.object_id, features)
-        for features in destinations:
-            key = self.projection_key(
-                features.object_type,
-                "target" if features.object_type == "table" else None,
-            )
-            features_by_projection[key].setdefault(features.object_id, features)
-
-        for projection_key, by_id in features_by_projection.items():
-            object_ids = list(by_id)
-            embeddings = torch.stack(
-                [by_id[object_id].embedding for object_id in object_ids]
-            ).to(device=parameter.device, dtype=torch.float32)
-            vectors = self.project(
-                embeddings,
-                "table" if projection_key.startswith("table_") else projection_key,
-                role=(
-                    projection_key.removeprefix("table_")
-                    if projection_key.startswith("table_")
-                    else None
-                ),
-            )
-            projected.update(
-                ((projection_key, object_id), vectors[row])
-                for row, object_id in enumerate(object_ids)
-            )
-
-        pair_groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for index, (source, destination) in enumerate(zip(sources, destinations)):
-            pair_groups[(source.object_type, destination.object_type)].append(index)
-
-        scores = parameter.new_empty(len(sources))
-        for (source_type, destination_type), pair_indices in pair_groups.items():
-            source_vectors = torch.stack(
-                [
-                    projected[(self.projection_key(source_type, "query" if source_type == "table" else None), sources[index].object_id)]
-                    for index in pair_indices
-                ]
-            )
-            destination_vectors = torch.stack(
-                [
-                    projected[(self.projection_key(destination_type, "target" if destination_type == "table" else None), destinations[index].object_id)]
-                    for index in pair_indices
-                ]
-            )
-            key = self.relation_key(source_type, destination_type)
-            values = self._score_projected_pairs(
-                source_vectors, destination_vectors, key
-            )
-            indices = torch.tensor(pair_indices, device=scores.device)
-            scores = scores.index_copy(0, indices, values)
-        return scores
-
-    def raw_score_pairs(
-        self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-    ) -> torch.Tensor:
-        """Return raw bilinear logits for directed object pairs."""
-
-        return self.score_pairs(sources, destinations)
-
-    def _transform_pair_scores(
-        self,
-        raw_scores: torch.Tensor,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-        score_space: str,
-    ) -> torch.Tensor:
-        if score_space not in STUDENT_SCORE_SPACES:
-            raise ValueError(f"score_space must be one of {STUDENT_SCORE_SPACES}")
-        if len(sources) != len(destinations) or len(sources) != len(raw_scores):
-            raise ValueError("Pair inputs and raw_scores must have equal lengths")
-        if score_space == "raw_logit" or not sources:
-            return raw_scores
-        transformed = raw_scores.new_empty(raw_scores.shape)
-        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for index, (source, destination) in enumerate(zip(sources, destinations)):
-            groups[(source.object_type, destination.object_type)].append(index)
-        for (source_type, destination_type), pair_indices in groups.items():
-            indices = torch.tensor(pair_indices, device=raw_scores.device)
-            values = raw_scores.index_select(0, indices)
-            values = self.transform_edge_scores(
-                values, source_type, destination_type, score_space
-            )
-            transformed = transformed.index_copy(0, indices, values)
-        return transformed
-
-    def confidence_logit_pairs(
-        self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_pairs(sources, destinations)
-        return self._transform_pair_scores(
-            raw_scores, sources, destinations, "confidence_logit"
-        )
-
-    def confidence_pairs(
-        self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_pairs(sources, destinations)
-        return self._transform_pair_scores(
-            raw_scores, sources, destinations, "confidence"
-        )
-
-    def score_pairs_in_space(
-        self,
-        sources: Sequence[ObjectFeatures],
-        destinations: Sequence[ObjectFeatures],
-        score_space: str,
-    ) -> torch.Tensor:
-        raw_scores = self.raw_score_pairs(sources, destinations)
-        return self._transform_pair_scores(
-            raw_scores, sources, destinations, score_space
-        )
-
-    def relation_query(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_type: str,
-        *,
-        source_role: str | None = None,
-    ) -> torch.Tensor:
-        source = self.project(
-            source_embedding,
-            source_type,
-            role=source_role or ("query" if normalize_object_type(source_type) == "table" else None),
-        )
-        key = self.relation_key(source_type, destination_type)
-        if self.relation_param == "full":
-            return source @ self.relations[key]
-        return torch.cat([source, source @ self.relation_as[key]], dim=-1)
-
-    def index_vector(
-        self,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-        source_type: str | None = None,
-        *,
-        destination_role: str | None = None,
-    ) -> torch.Tensor:
-        destination = self.project(
-            destination_embedding,
-            destination_type,
-            role=destination_role or ("target" if normalize_object_type(destination_type) == "table" else None),
-        )
-        if self.relation_param == "full":
-            return destination
-        if source_type is None:
-            raise ValueError("lowrank ANN index vectors require source_type")
-        key = self.relation_key(source_type, destination_type)
-        return torch.cat(
-            [destination, destination @ self.relation_bs[key]], dim=-1
-        )
-
-
-def split_table_projection(
-    shared: StudentJoinabilityModel,
-) -> StudentJoinabilityModel:
-    """Create a step-0-equivalent Q/T table split from a shared Student."""
-
-    if shared.projection_mode != "shared":
-        raise ValueError("Only a shared Student can be migrated to split table roles")
-    table_index = shared.projection_keys.index("table")
-    basis = shared.initial_projection_weights[table_index].detach().cpu()
-    if not bool(torch.isfinite(basis).all()):
-        raise ValueError("Role migration requires the persisted PCA reference")
-    split = StudentJoinabilityModel(
-        shared.input_dim,
-        shared.student_dim,
-        initialization="pca",
-        initialization_basis=basis,
-        freeze_projections=shared.freeze_projections,
-        relation_param=shared.relation_param,
-        relation_rank=shared.relation_rank,
-        confidence_transform=shared.confidence_transform,
-        confidence_epsilon=shared.confidence_epsilon,
-        projection_mode="split",
-    )
-    split = split.to(next(shared.parameters()).device)
-    with torch.no_grad():
-        table = shared.projections["table"].weight
-        split.projections["table_query"].weight.copy_(table)
-        split.projections["table_target"].weight.copy_(table)
-        for object_type in ("text", "image"):
-            split.projections[object_type].weight.copy_(
-                shared.projections[object_type].weight
-            )
-        for name, parameter in shared.relations.items():
-            split.relations[name].copy_(parameter)
-        for name, parameter in shared.relation_as.items():
-            split.relation_as[name].copy_(parameter)
-        for name, parameter in shared.relation_bs.items():
-            split.relation_bs[name].copy_(parameter)
-        for name, parameter in shared.confidence_alphas.items():
-            split.confidence_alphas[name].copy_(parameter)
-        for name, parameter in shared.confidence_biases.items():
-            split.confidence_biases[name].copy_(parameter)
-        shared_initial = {
-            key: value
-            for key, value in zip(
-                shared.projection_keys, shared.initial_projection_weights
-            )
-        }
-        split.initial_projection_weights.copy_(
-            torch.stack(
-                [
-                    shared_initial["table"],
-                    shared_initial["table"],
-                    shared_initial["text"],
-                    shared_initial["image"],
-                ]
-            )
-        )
-        split.reset_projection_anchors()
-    split.projection_reference_origin = shared.projection_reference_origin
-    return split
-
-
-def add_projection_residual(
-    shared: StudentJoinabilityModel,
-    adapter: str,
-    *,
-    hidden_dim: int = 256,
-    scales: Mapping[str, float] | None = None,
-) -> StudentJoinabilityModel:
-    """Add a zero-output residual projection without changing step-0 scores."""
-
-    if shared.projection_adapter != "none":
-        raise ValueError("Projection residual migration requires a linear base Student")
-    if adapter not in {"linear", "gelu"}:
-        raise ValueError("Residual adapter must be linear or gelu")
-    config = shared.config()
-    config.update(
-        projection_adapter=adapter,
-        projection_hidden_dim=hidden_dim,
-        projection_scales=dict(scales or {}),
-    )
-    if config["initialization"] == "pca":
-        config["initialization_basis"] = (
-            shared.initial_projection_weights[0].detach().cpu()
-        )
-    migrated = StudentJoinabilityModel(**config).to(next(shared.parameters()).device)
-    missing, unexpected = migrated.load_state_dict(shared.state_dict(), strict=False)
-    expected_missing = {
-        f"projection_residual_{side}.{key}.weight"
-        for side in ("inputs", "outputs")
-        for key in migrated.projection_keys
-    }
-    if set(missing) != expected_missing or unexpected:
-        raise RuntimeError(
-            f"Unexpected residual migration keys: missing={missing}, unexpected={unexpected}"
-        )
-    migrated.projection_reference_origin = shared.projection_reference_origin
-    return migrated
-
-
-class IdentityStudentJoinabilityModel(nn.Module):
-    """Zero-training Student with every type projection and relation equal to I."""
-
-    def __init__(self, embedding_dim: int) -> None:
-        super().__init__()
-        if embedding_dim <= 0:
-            raise ValueError("embedding_dim must be positive")
-        self.input_dim = embedding_dim
-        self.student_dim = embedding_dim
-
-    def config(self) -> dict[str, int | str]:
-        return {
-            "input_dim": self.input_dim,
-            "student_dim": self.student_dim,
-            "projection": "identity",
-            "relation": "identity",
-        }
-
-    def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
-        normalize_object_type(object_type)
-        if embedding.shape[-1] != self.input_dim:
-            raise ValueError(
-                f"Expected embedding dimension {self.input_dim}, got {embedding.shape[-1]}"
-            )
-        return embedding
-
-    def relation_query(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_type: str,
-    ) -> torch.Tensor:
-        normalize_object_type(destination_type)
-        return self.project(source_embedding, source_type)
-
-    def index_vector(
-        self,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-        source_type: str | None = None,
-    ) -> torch.Tensor:
-        if source_type is not None:
-            normalize_object_type(source_type)
-        return self.project(destination_embedding, destination_type)
-
-
-class ProjectedIdentityStudentJoinabilityModel(nn.Module):
-    """Zero-training shared projection P with every relation fixed to identity."""
-
-    def __init__(self, projection: torch.Tensor) -> None:
-        super().__init__()
-        if projection.ndim != 2 or min(projection.shape) <= 0:
-            raise ValueError("projection must have shape [student_dim, input_dim]")
-        projection = projection.detach().float()
-        if not torch.isfinite(projection).all():
-            raise ValueError("projection must be finite")
-        gram = projection @ projection.T
-        if not torch.allclose(
-            gram,
-            torch.eye(projection.shape[0], dtype=projection.dtype),
-            atol=1e-4,
-            rtol=1e-4,
-        ):
-            raise ValueError("projection rows must be orthonormal")
-        self.input_dim = int(projection.shape[1])
-        self.student_dim = int(projection.shape[0])
-        self.register_buffer("projection", projection)
-
-    def config(self) -> dict[str, int | str]:
-        return {
-            "input_dim": self.input_dim,
-            "student_dim": self.student_dim,
-            "projection": "shared_pca",
-            "relation": "identity",
-        }
-
-    def project(self, embedding: torch.Tensor, object_type: str) -> torch.Tensor:
-        normalize_object_type(object_type)
-        if embedding.shape[-1] != self.input_dim:
-            raise ValueError(
-                f"Expected embedding dimension {self.input_dim}, got {embedding.shape[-1]}"
-            )
-        return torch.nn.functional.linear(embedding, self.projection)
-
-    def relation_query(
-        self,
-        source_embedding: torch.Tensor,
-        source_type: str,
-        destination_type: str,
-    ) -> torch.Tensor:
-        normalize_object_type(destination_type)
-        return self.project(source_embedding, source_type)
-
-    def index_vector(
-        self,
-        destination_embedding: torch.Tensor,
-        destination_type: str,
-        source_type: str | None = None,
-    ) -> torch.Tensor:
-        if source_type is not None:
-            normalize_object_type(source_type)
-        return self.project(destination_embedding, destination_type)
-
-
-StudentANNModel = (
-    StudentJoinabilityModel
-    | IdentityStudentJoinabilityModel
-    | ProjectedIdentityStudentJoinabilityModel
-)

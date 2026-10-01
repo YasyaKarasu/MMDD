@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from mmdd_stage1.features import FeatureStore
+from mmdd_stage1.feature_cache import FeatureStore
 from mmdd_stage2.checkpoints import load_candidate_scorer
 from mmdd_stage2.data import (
     column_values,

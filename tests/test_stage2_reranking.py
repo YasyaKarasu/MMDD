@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import run_stage2
-from mmdd_stage1.artifacts import checkpoint_fingerprint
+from mmdd_stage1.data import sha256_file as checkpoint_fingerprint
 from mmdd_stage2.data import Stage2Objects, validate_retrieval_path_budget
 from mmdd_stage2.pipeline import LocalizedEvidence, Stage2Verifier
 from mmdd_stage2.verifier import CandidateColumnScorer, semantic_joinability

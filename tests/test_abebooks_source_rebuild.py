@@ -159,7 +159,7 @@ def test_frozen_table_reuse_requires_identical_complete_inputs(tmp_path, monkeyp
 def test_changed_text_composition_replaces_both_tiers_and_reuses_only_identical_images(tmp_path):
     import numpy as np
     import torch
-    from fresh_path import features
+    from mmdd_stage1 import content as features
     from prepare_abebooks_ablation_features import compose_reference_evidence
 
     reference, run = tmp_path / "reference", tmp_path / "run"

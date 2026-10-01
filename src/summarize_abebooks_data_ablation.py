@@ -6,8 +6,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from mmdd_cqet_v4_1.data import iter_jsonl, read_json, write_json
-from mmdd_cqet_v4_1.evaluate import paired_bootstrap
+from mmdd_stage1.data import iter_jsonl, read_json, write_json
+from mmdd_stage1.evaluate import paired_bootstrap
 
 ARMS = {"baseline": "原始", "hubs": "仅过滤素材", "columns": "仅精简列", "both": "两者同时"}
 KS = (5, 10, 15, 20)

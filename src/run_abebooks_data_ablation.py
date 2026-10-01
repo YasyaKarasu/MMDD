@@ -15,27 +15,26 @@ from pathlib import Path
 import torch
 
 from run_abebooks_fresh import ROOT
-from mmdd_cqet_v4_1 import pipeline, preflight
-from mmdd_cqet_v4_1.artifacts import save_pool_bundle, save_training_records
-from mmdd_cqet_v4_1.config import Paths
-from mmdd_cqet_v4_1.data import (build_content_aliases, iter_jsonl, read_json,
+from mmdd_stage1 import pipeline, preflight
+from mmdd_stage1.artifacts import save_pool_bundle, save_training_records
+from mmdd_stage1.config import resolve_default_paths
+from mmdd_stage1.data import (build_content_aliases, iter_jsonl, read_json,
                                 sha256_file, write_json, write_jsonl)
-from mmdd_cqet_v4_1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
-from mmdd_cqet_v4_1.features import (ContentStore, ObjectBank, build_or_load_row_store,
+from mmdd_stage1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
+from mmdd_stage1.features import (ContentStore, ObjectBank, build_or_load_row_store,
                                     fit_pca, load_pca, load_z)
-from mmdd_cqet_v4_1.labels import build_labels, export_eval_labels, load_labels
-from mmdd_cqet_v4_1.lists import (build_c1_edge_lists, build_c2_shared_graph,
+from mmdd_stage1.labels import build_labels, export_eval_labels, load_labels
+from mmdd_stage1.lists import (build_c1_edge_lists, build_c2_shared_graph,
                                  build_raw_et128_exact, build_raw_pools_split,
                                  build_ta_records, build_tb_records)
-from mmdd_cqet_v4_1.metrics import evaluate_matrix, export_funnels
-from mmdd_cqet_v4_1.models import NativeStudent
-from mmdd_cqet_v4_1.train import (build_teacher_logits_cache, model_state_sha,
+from mmdd_stage1.metrics import evaluate_matrix, export_funnels
+from mmdd_stage1.models import NativeStudent
+from mmdd_stage1.train import (build_teacher_logits_cache, model_state_sha,
                                  train_student_c1, train_student_c2, train_ta, train_tb)
 
 
 def runtime(run: Path, prepare: bool = False) -> pipeline.Runtime:
-    paths = Paths(ROOT, run / "dataset_view", ROOT / "hf_models/Qwen3-VL-Embedding-8B",
-                  run / "features", run / "encoder/manifest.jsonl", run / "protocol.json", run)
+    paths = resolve_default_paths(run / "protocol.json", run)
     if prepare:
         preflight.configure(paths)
         preflight.build_content_aliases()
@@ -78,7 +77,7 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
         raise FileExistsError("Training already completed; use evaluate")
     started = time.time()
     source_hashes = {str(p.relative_to(ROOT)): sha256_file(p) for directory in
-                     (ROOT / "src/mmdd_cqet_v4_1", ROOT / "src/fresh_path")
+                     (ROOT / "src/mmdd_stage1",)
                      for p in directory.glob("*.py")}
     write_json(run / "EXPERIMENT_PROTOCOL.json", {
         "seed": 13, "old_checkpoints_reused": False,

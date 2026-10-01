@@ -12,8 +12,11 @@ from run_abebooks_fresh import ROOT, finish, launch, prepare_data, write_json
 def reference_inputs(root: Path, reference: Path) -> None:
     """Reuse unchanged frozen inputs in a new training experiment."""
     root.mkdir(parents=True, exist_ok=False)
-    for name in ("dataset_view", "features", "encoder", "data", "FEATURE_COMPOSITION.json"):
-        (root / name).symlink_to(reference / name)
+    # Features live in the reference's feature directory (kept by the inherited protocol
+    # paths); only the filtered dataset view and the composition record are linked.
+    for name in ("dataset_view", "FEATURE_COMPOSITION.json"):
+        if (reference / name).exists():
+            (root / name).symlink_to(reference / name)
     # The recipe comes from the current template; only the frozen-input locations are inherited.
     protocol = json.loads((ROOT / "configs/mmdd_stage1_cqet_protocol.json").read_text())
     reference_protocol = json.loads((reference / "protocol.json").read_text())
@@ -32,8 +35,9 @@ def run_experiment(root: Path, command: str, gpu: int,
     if command == "train":
         run.mkdir(exist_ok=False)
         (run / "isolated_cwd").mkdir()
-        for shared in ("dataset_view", "features", "encoder", "data", "FEATURE_COMPOSITION.json"):
-            (run / shared).symlink_to(root / shared)
+        for shared in ("dataset_view", "FEATURE_COMPOSITION.json"):
+            if (root / shared).exists():
+                (run / shared).symlink_to(root / shared)
         protocol = json.loads((root / "protocol.json").read_text())
         protocol["paths"] = {k: v.replace(str(root), str(run)) for k, v in protocol["paths"].items()}
         protocol["student"].update(P_lr=student_lr_p, R_lr=student_lr_r)
@@ -42,7 +46,7 @@ def run_experiment(root: Path, command: str, gpu: int,
                                                checkpoints=[i / 10 for i in range(11)])
         write_json(run / "protocol.json", protocol)
         hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                  for package in ("mmdd_cqet_v4_1", "fresh_path")
+                  for package in ("mmdd_stage1",)
                   for p in (ROOT / "src" / package).glob("*.py")}
         hypothesis = ("Removing train-frequent nongold evidence improves evidence recall and target ranking on fixed queries/targets"
                       if (root / "HUB_FILTER.json").exists() else
@@ -91,7 +95,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "train", "dev", "test"))
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--gpu", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--gpu", type=int, default=0, help="physical GPU index (PCI bus order)")
     parser.add_argument("--reference-inputs", type=Path)
     parser.add_argument("--dataset", type=Path, help="Versioned dataset for the prepare command")
     parser.add_argument("--student-lr-p", type=float, default=1e-4)
@@ -101,7 +105,7 @@ def main() -> None:
         if args.dataset is None:
             parser.error("prepare requires --dataset")
         root, dataset = args.run_root.resolve(), args.dataset.resolve()
-        prepare_data(root, dataset)
+        prepare_data(root, dataset, args.gpu)
         report = json.loads((dataset / "REBUILD.json").read_text())
         write_json(root / "DATA_REBUILD.json", report)
         write_json(root / "SOURCE_SCHEMA_PLAN.json", {

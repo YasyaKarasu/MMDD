@@ -15,8 +15,8 @@ from typing import Any, Iterable
 import torch
 
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
-from mmdd_stage1.features import FeatureStore
-from mmdd_stage1.selection import validate_stage2_gate
+from mmdd_stage1.feature_cache import FeatureStore
+from mmdd_stage1.export import validate_stage2_gate
 from mmdd_stage2.checkpoints import load_candidate_scorer
 from mmdd_stage2.data import (
     direct_target_ids,

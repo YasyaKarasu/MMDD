@@ -278,47 +278,86 @@ and retained known witnesses. Its extra metrics do not change qrels, model
 selection, or the main Recall denominator. They are evidence diagnostics,
 not new extraction labels or verification of generated values.
 
-## Stage-1 CQET training pipeline (`mmdd_cqet_v4_1`, protocol 4.2.0)
+## Stage-1 main flow (`mmdd_stage1`, protocol 4.2.0)
 
-`src/mmdd_cqet_v4_1/` is the current Stage-1 Teacher/Student pipeline. One
-protocol file drives a run; the template is
-`configs/mmdd_stage1_cqet_protocol.json`. Nothing machine- or dataset-specific is
-in the code: the `paths` block names the dataset, backbone, feature caches and run
-root (relative paths are repo-relative), and the `hardware` block names the GPU the
-run is pinned to. The protocol must carry `version = "4.2.0"`; older 4.1.0 run roots
-cannot be resumed with this code.
+`src/run_stage1.py` runs Stage 1 end to end, from a dataset artifact to the Stage-2
+handoff. `src/mmdd_stage1/` holds the implementation: dataset construction, the
+frozen-feature layers, the CQET Teacher/Student training kernels, ANN retrieval,
+dev selection, frozen evaluation, and export. A run is fully described by
+`<run>/protocol.json`. `init` writes it from `configs/mmdd_stage1_cqet_protocol.json`
+and binds the dataset, backbone, feature directory, run layout, and GPU. The protocol
+must carry `version = "4.2.0"`.
 
-```bash
-# copy the template, edit paths/hardware, and keep it as <run_root>/protocol.json
-P=work/mmdd_stage1_v4_2_entitables/protocol.json
-RUN=work/mmdd_stage1_v4_2_entitables
-G="scripts/run_v4_1_gpu0.sh $P"          # pins CUDA_VISIBLE_DEVICES to hardware.uuid
-$G conda run -n MMDD python -m mmdd_cqet_v4_1.run lock            --protocol $P --run-root $RUN
-$G conda run -n MMDD python -m mmdd_cqet_v4_1.run verify-features --protocol $P --run-root $RUN
-   conda run -n MMDD python -m mmdd_cqet_v4_1.run prepare         --protocol $P --run-root $RUN
-   conda run -n MMDD python -m mmdd_cqet_v4_1.run validate        --protocol $P --run-root $RUN
-$G conda run -n MMDD python -m mmdd_cqet_v4_1.run smoke           --protocol $P --run-root $RUN
-$G conda run -n MMDD python -m mmdd_cqet_v4_1.run all             --protocol $P --run-root $RUN
+The frozen feature layer is **not** part of a run. It lives in its own directory
+(`--features-dir`, default `work/stage1_features/<dataset name>`) so that any number
+of runs — different seeds, recipes, or ablations — train on one encoding:
+
+```
+<features-dir>/data/      stage1_objects, edge_lists, target_lists, stage1_corpus  (build-data)
+<features-dir>/encoder/   two-tier Qwen cache merged from two shards              (encode)
+<features-dir>/features/  packed retrieval z and content tokens                    (encode / pack)
 ```
 
-Stages per seed, in order (`pipeline.train_seed`):
+`build-data` and `encode` refuse to overwrite a feature directory that is already
+populated. `work/stage1_features/entitables/` links the existing EntiTables encoding
+in this layout; `init --features-dir work/stage1_features/entitables` reuses it and
+`build-data` / `encode` are skipped (`init` prints which case applies).
+
+```bash
+RUN=work/stage1_entitables
+S="conda run -n MMDD python src/run_stage1.py"
+$S init --run-root $RUN --dataset-root <dataset-artifact> --gpu 0   # --features-dir DIR, --seeds 13 17 ...
+$S build-data      --run-root $RUN          # only for a new feature directory
+$S encode          --run-root $RUN          # only for a new feature directory; --gpus 0 1 runs the shards in parallel
+$S lock            --run-root $RUN
+$S verify-features --run-root $RUN
+$S prepare         --run-root $RUN
+$S validate        --run-root $RUN
+$S smoke           --run-root $RUN
+$S train           --run-root $RUN
+$S export          --run-root $RUN          # exports the KD Student (protocol primary); --arm SUP for the SUP control
+```
+
+Inputs and outputs (`F` = feature directory, everything else under `<run>`):
+
+| step | reads | writes |
+|---|---|---|
+| `build-data` | dataset artifact | `F/data/{stage1_objects,edge_lists,target_lists,stage1_corpus}.jsonl` (targets keep 20 rows) |
+| `encode` | `F/data/`, backbone | `F/encoder/` (two-tier Qwen cache, merged from two shards), `F/content_shard*/`, `F/features/{z,content}`; logs under `<run>/logs/` |
+| `lock` | dataset, backbone, `F/features/` | `DATASET_IDENTITY.json`, `FROZEN_RECIPE_LOCK.json`, `CONTENT_ALIASES.jsonl.gz`, `CACHE_MANIFEST.jsonl` |
+| `verify-features` | 16 objects per modality | `tests/real_tensor_probes/feature_provenance.json`; fails closed on any mismatch |
+| `prepare` | train qrels/recoveries | `labels/`, `rows/`, `pca/` (train queries + lake + evidence only) |
+| `validate` | | runs `tests/test_stage1_cqet.py` and `tests/test_stage1_reference_contracts.py`, bound to the source hash |
+| `smoke` | 8 train queries | `tests/smoke/` |
+| `train` | everything above | `seed<N>/<STAGE>/checkpoints`, `seed<N>/selections/`, `GLOBAL_SELECTION_FREEZE.json`, `seed<N>/eval/{dev,test}/`, `reports/DECISION.json` |
+| `export` | frozen selection | `stage2_handoff/retrieval.{train,dev,test}.jsonl`, `stage1_gate.json` |
+
+The encoder always uses two shards: `verify-features` replays the original
+batches, which assume `stage1_objects` position modulo 2 and content shards by
+object-ID hash. Encoder prompts are `cache_stage1_features.EMBEDDING_INSTRUCTIONS`.
+GPU commands set `CUDA_VISIBLE_DEVICES` to the protocol's `hardware.uuid` before
+importing torch, and the pipeline checks that UUID again.
+
+Training stages per seed, in order (`pipeline.train_seed`):
 
 1. Raw pools from frozen Qwen features (`lists.build_raw_pools_split`), then the
    TA / TB_SHARED / C1 training lists.
-2. `TA` — fresh Teacher, `teacher.TA.epochs` epochs; `TB_CQET`, `TB_LSE`, `TB_QT`
-   — one epoch each from TA's endpoint, candidate list
-   `RawU ∪ RawDirect150 ∪ G ∪ U32`. Epochs, lr, weight decay, batch and support
-   weight come from `teacher.TA` / `teacher.TB`.
-3. `NATIVE_C1_SUP`, `QT_C1_SUP` — Students from PCA/identity on the C1 edge lists;
-   the C1 endpoint is selected on dev (`student.native_selection`).
-4. The selected C1 Student retrieves the train queries; its pool, the Raw pool and
-   the gold form the shared C2 graph (`lists.build_c2_shared_graph`); the frozen
-   `TB_CQET` endpoint scores every graph list once (`teacher_logits_cache`).
-5. `NATIVE_C2_SUP`, `NATIVE_C2_KD`, `QT_C2_SUP` from the same C1 parent; the KD arm
-   uses the SUP arm's selected fraction. Then the frozen dev/test evaluation.
+2. `TA` — fresh Teacher, `teacher.TA.epochs` epochs. `TB_CQET`, `TB_LSE`, and `TB_QT`
+   each train for one epoch from TA's endpoint on the candidate list
+   `RawU ∪ RawDirect150 ∪ G ∪ U32`. Epochs, learning rate, weight decay, batch
+   size, and support weight come from `teacher.TA` / `teacher.TB`.
+3. `NATIVE_C1_SUP`, `QT_C1_SUP` — Students initialized from PCA/identity and trained
+   on the C1 edge lists. The C1 endpoint is selected on dev (`student.native_selection`).
+4. The selected C1 Student retrieves the train queries. Its pool, the Raw pool, and
+   the gold targets form the shared C2 graph (`lists.build_c2_shared_graph`). The
+   frozen `TB_CQET` endpoint scores every graph list once (`teacher_logits_cache`).
+5. `NATIVE_C2_SUP`, `NATIVE_C2_KD`, and `QT_C2_SUP` start from the same C1 parent;
+   the KD arm uses the SUP arm's selected fraction. The frozen dev/test evaluation
+   follows. Test labels are exported only after `GLOBAL_SELECTION_FREEZE.json`. Every
+   ranking is recomputed from raw IDs by `mmdd_stage1.independent_metrics`.
 
-Student recipe (`train.StudentRecipe`, read from `protocol["student"]` and written
-into every stage receipt and training-log row, so a run can be audited post hoc):
+Student recipe (`train.StudentRecipe`, read from `protocol["student"]`). It is
+written into every stage receipt and training-log row so a run can be audited post hoc:
 
 | key | value | why |
 |---|---|---|
@@ -334,550 +373,32 @@ The C2 kernel scores paths with index gathers instead of a per-path Python loop
 float32 rounding. The diagnosis behind the recipe is in
 `docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`.
 
+After a code change, completed stages are reused only if their recorded source
+hash still matches. Run `amend-source --amendment-id ID --carry STAGE ... --reason
+TEXT` before `prepare` to carry stages across an execution-only change.
+
+`export` writes one record per query with `results[].{target_id, score,
+direct_score, evidence_score, stage2_table_score, paths}`. Target order and table
+score come from the frozen `TB_CQET` endpoint's reranking of the selected Student's
+C150 pool. Direct paths mark targets in the Student's direct ANN top 100. Evidence
+paths keep the first `--evidence-path-k` retained `Q -> E -> T` paths. Train
+retrieval is computed once under `stage2_handoff/native_<arm>_train_retrieval/`;
+dev/test reuse the frozen evaluation pools. `train_stage2.py` / `run_stage2.py`
+take `--stage1-gate stage2_handoff/stage1_gate.json`; `validate_stage2_gate`
+rejects any retrieval record not produced by the gated checkpoint.
+
+`cache_stage1_features.py` remains the frozen encoder used by `encode`, and
+`run_stage2.py --stage1-features <run>/encoder` reads its `objects/` tier
+(`mmdd_stage1.feature_cache.FeatureStore`) for Stage-2 row routing.
+
 The AbeBooks drivers (`run_abebooks_fresh.py`, `run_abebooks_data_ablation.py`,
-`run_abebooks_source_experiment.py`) build their protocol from the same template
-and bind the preflight module with `preflight.configure(paths)`.
-
-## Directed joinability Teacher/Student
-
-Build the initial Stage-1 files directly from a completed dataset artifact:
-
-```bash
-conda run -n MMDD python src/build_stage1_training_data.py \
-  --dataset-root output_mm_joinability_v15 \
-  --output-dir work/stage1_v15
-```
-
-This writes `stage1_objects.jsonl`, `edge_lists.jsonl`, `target_lists.jsonl`,
-and `stage1_corpus.jsonl`. Initial target lists draw from random,
-TF-IDF-similar non-joinable, type/structure-matched, and corrupted-path
-negatives without retaining those construction-only labels. Candidate evidence
-contains all unique recovery or source-provenance assets.
-Table serialization cleans each cell and retains at most its first 1024
-characters so anomalously long WDC cells cannot consume the encoder context.
-Use `--max-cell-chars` to change this limit; changing it requires rebuilding
-the Stage-1 objects and feature cache.
-Target lists built with the former per-target evidence cap must be regenerated,
-along with their cached Teacher scores, before path training.
-
-`cache_stage1_features.py` freezes Qwen3-VL-Embedding and stores the two
-feature granularities in separate tiers. The base `objects/` tier contains the
-normalized final embedding for every object plus query-row routing embeddings;
-Student training, ANN indexing, retrieval, and Stage 2 read only this tier.
-The optional `teacher_objects/` tier contains pooling-before states only for
-objects referenced by the supplied training lists. Its input is JSONL. A text
-object uses only its body in `text`, and an image object uses only its local
-`image` file. Tables use only column names and cell values.
-Page titles, captions, sections, entity labels, source names, and provenance
-fields are never serialized into model input. Tables carry their retrieval
-identity in `embedding_role`: query tables use `query` and candidate tables use
-`target`; text and image objects are evidence by definition.
-A table additionally supplies `table_parts`, with schema text first and one
-entry per example row after it. The cache derives the complete table text and
-query-row routing views from this single list:
-
-```json
-{"object_id":"q1","object_type":"table","embedding_role":"query","table_parts":["Columns: player | country","Row: Messi | Argentina"]}
-{"object_id":"e1","object_type":"text","text":"Lionel Messi represents Argentina."}
-{"object_id":"i1","object_type":"image","image":"images/i1.jpg"}
-```
-
-The encoder uses separate instructions for query tables, query-row routing
-views, target tables, text evidence, and image evidence. They emphasize join
-keys and row identity on the query side, attributes offered by target tables,
-explicitly stated facts in text, and visually grounded facts in images.
-`--instruction` remains available as an explicit global override.
-
-Each table is encoded once for its Teacher/Student features. The cache uses
-tokenizer offsets to retain the schema/row tokens from that same sequence and
-mean-pools them into ordered contiguous segments. By default it stores one
-float32 vector per schema/example-row group; `--table-tokens-per-group` can keep
-several segments per group for table-token-budget ablations without retaining
-the full token matrix. The Student uses the final embedding from the same
-forward pass. For query objects, the cache derives one `schema + row` routing
-view per example row. Those short views are embedded in one additional batch
-and cached in the base tier for Stage-2 evidence assignment.
-
-Build a lazy per-object feature cache with the local 8B encoder:
-
-```bash
-conda run -n MMDD python src/cache_stage1_features.py \
-  --input-jsonl stage1_objects.jsonl \
-  --output-dir cache/stage1_qwen8b \
-  --model-dir hf_models/Qwen3-VL-Embedding-8B \
-  --teacher-data edge_lists.jsonl target_lists.jsonl \
-  --teacher-split all
-```
-
-The dev listwise objectives require Teacher features for the dev records, so
-the training cache uses `--teacher-split all`; test records are cached but are
-never loaded by training or checkpoint selection. Omit `--teacher-data` for a
-base-only retrieval/Stage-2 cache. Re-running the
-same command with additional hard-negative files writes only missing Teacher
-objects; already cached base objects are not encoded again. `--teacher-split`
-defaults to `train` and accepts `all` when all record splits are needed.
-
-Convert an existing all-hidden-state cache without running Qwen again:
-
-```bash
-conda run -n MMDD python src/compact_stage1_feature_cache.py \
-  --input-dir cache/stage1_qwen8b_legacy \
-  --output-dir cache/stage1_qwen8b \
-  --teacher-data edge_lists.jsonl target_lists.jsonl \
-  --teacher-split all
-```
-
-The conversion is resumable and can also prune an existing two-tier cache into
-a new directory containing only the Teacher objects referenced by the current
-lists. Verify the new cache before removing the legacy directory. Feature
-caches created before the row-routing format still need to be rebuilt; Stage 2
-fails explicitly when a selected query has no cached `row_embeddings`.
-
-Edge warm-up data contains a source object, an unordered same-destination-type
-candidate list, and its one positive object. The historical `query_id` field
-identifies the source, including for evidence-to-target edges:
-
-```json
-{"query_id":"q1","source_type":"table","candidate_ids":["e1","e2"],"positive_id":"e1","destination_type":"text","dataset":"2k","split":"train"}
-```
-
-Construction emits query-to-target edges plus query-to-evidence and
-evidence-to-target edges for all text/image recoveries whenever a valid negative
-exists. Each positive edge gets its own list; other known positives are excluded
-from its negatives. `source_type` and `destination_type` are checked against the
-feature cache during scoring.
-
-Path-level data groups all unique evidence by candidate target. Mined evidence
-remains in retrieval-score order:
-
-```json
-{"query_id":"q1","direct_positive_target_id":"t1","evidence_positive_target_id":"t2","positive_target_ids":["t1","t2"],"candidates":[{"target_id":"t1","evidence_ids":[]},{"target_id":"t2","evidence_ids":["e1","i1"]}],"dataset":"2k","split":"train"}
-```
-
-Run the four training stages explicitly:
-
-```bash
-conda run -n MMDD python src/train_stage1.py teacher-edge \
-  --features cache/stage1_qwen8b \
-  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
-  --output checkpoints/teacher_edge.pt
-
-conda run -n MMDD python src/train_stage1.py teacher-path \
-  --features cache/stage1_qwen8b \
-  --base-data target_lists.jsonl --dev-data target_lists.jsonl \
-  --teacher-checkpoint checkpoints/teacher_edge.pt \
-  --output checkpoints/teacher_path.pt
-
-conda run -n MMDD python src/train_stage1.py student-edge \
-  --features cache/stage1_qwen8b \
-  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --output checkpoints/student_edge.pt
-
-conda run -n MMDD python src/train_stage1.py student-path \
-  --features cache/stage1_qwen8b \
-  --base-data target_lists.jsonl --dev-data target_lists.jsonl \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --student-checkpoint checkpoints/student_edge.pt \
-  --corpus stage1_corpus.jsonl \
-  --primary-metric recall@10 --min-delta 0.001 --patience 3 \
-  --output checkpoints/student_path.pt
-```
-
-For a multi-token table cache, pass the same
-`--teacher-table-tokens-per-group K` to both Teacher stages. Fresh Teachers use
-one token per group when the flag is omitted; loaded checkpoints otherwise keep
-their saved token budget.
-
-Student stages with a nonzero `--distillation-weight` automatically cache all
-base-train and fixed-dev Teacher logits before optimization. `--distillation-weight 0`
-is a genuinely Teacher-free supervised run and does not require
-`--teacher-checkpoint`. Sidecars default to `FEATURES/teacher_logits/` and are
-keyed by the full Teacher checkpoint SHA-256, candidate-list fingerprint, and
-path aggregation settings. `--teacher-logit-cache` selects another directory,
-and `--teacher-logit-batch-size` controls only the one-time Teacher pass. Once
-both sidecars exist, Student training does not instantiate the Teacher or read
-the Teacher hidden-feature tier. Changing the Teacher, candidates, split, or
-path aggregation creates a distinct cache entry.
-
-Student training also preloads every raw embedding referenced by its base,
-hard, and dev examples into one contiguous CPU tensor. This avoids repeated
-per-object `torch.load` calls without duplicating embeddings on disk. Disable
-it with `--no-preload-embeddings` only when host memory is constrained. Pair
-projection and path aggregation are vectorized, so `--batch-size` defaults to
-64 for Student stages and 8 for Teacher stages; either can be overridden.
-
-Student projector initialization is selected with `--student-initialization`.
-The default `random` mode preserves the original behavior. `identity_noise`
-requires `--student-dim` to match the embedding dimension and initializes each
-projector as `I + noise`. `random_orthogonal` shares one row-orthogonal
-projector across object types and initializes every relation as `I`, so its
-initial score is the raw inner product restricted to one random low-rank
-subspace. Use `--student-init-noise-std` to set the projector noise in
-`identity_noise` mode. `pca` uses the same geometry but takes the shared
-subspace from a projection artifact built over frozen corpus embeddings:
-
-```bash
-conda run -n MMDD python src/build_stage1_pca_basis.py \
-  --features cache/stage1_qwen8b --corpus stage1_corpus.jsonl \
-  --student-dim 128 --device cuda --output work/stage1_pca_128.pt
-conda run -n MMDD python src/train_stage1.py student-edge \
-  ... --student-dim 128 --student-initialization pca \
-  --student-pca-basis work/stage1_pca_128.pt
-```
-
-Before training, the zero-training identity probe can exercise the complete
-Student index and dev retrieval path with `P = I` and `R = I`. It runs on CPU;
-`--raw-index` optionally evaluates an existing corpus-matched raw index in the
-same invocation and records the direct Recall@10 delta:
-
-```bash
-conda run -n MMDD python src/probe_stage1_identity.py \
-  --features cache/stage1_qwen8b \
-  --corpus stage1_corpus.jsonl \
-  --dev-data target_lists.jsonl \
-  --output-dir indices/stage1_identity \
-  --raw-index indices/stage1_raw
-```
-
-Use the zero-training PCA dimension probe to settle the Student dimension
-before another training run. It computes the complete centered covariance
-spectrum once, then evaluates shared `P = U_d^T`, `R = I` Students at the
-requested dimensions. Retrieval applies `P` to the original frozen embeddings
-without subtracting the PCA mean, matching the Student's linear projection.
-Only table indexes are built because the reported metric is dev direct
-Recall@10:
-
-```bash
-conda run -n MMDD python src/probe_stage1_pca_dimensions.py \
-  --features cache/stage1_qwen8b \
-  --corpus stage1_corpus.jsonl \
-  --dev-data entitables_target_lists.jsonl wdc_target_lists.jsonl \
-  --dimensions 128 256 512 1024 2048 \
-  --raw-index indices/stage1_raw \
-  --device cuda:0 \
-  --output-dir work/stage1_pca_dimension_ceiling
-```
-
-The output contains `summary.json`, exact dimension and variance CSV files,
-the reusable `pca_spectrum.pt`, one resumable index directory per dimension,
-and `pca_dimension_ceiling.png`. The summary selects the smallest tested
-dimension whose direct Recall@10 reaches at least 90% of the raw-embedding
-baseline; change that rule with `--raw-fraction-threshold`.
-
-The spectrum artifact can be passed directly to training. A geometry-preserving
-Student configuration freezes the shared PCA projection, uses a lower relation
-rate, and anchors the nine relation matrices to identity. In-batch negatives
-expand only the supervised lists; KD remains aligned to the original cached
-Teacher lists:
-
-```bash
-conda run -n MMDD python src/train_stage1.py student-edge \
-  --features cache/stage1_qwen8b \
-  --base-data edge_lists.jsonl --dev-data edge_lists.jsonl \
-  --student-dim 1024 --student-init pca \
-  --student-pca-basis work/stage1_pca_dimension_ceiling/pca_spectrum.pt \
-  --freeze-projection --relation-learning-rate 1e-5 --anchor-weight 0.1 \
-  --distillation-weight 0 --in-batch-negatives \
-  --in-batch-max-negatives 256 --output checkpoints/student_edge.pt
-```
-
-`--edge-type-oversample text_table:2 image_table:2` can increase the share of
-evidence-to-table edges. It is off by default. Frozen projection state and the
-initial projection anchors are retained across Student checkpoints.
-
-Training records are filtered to `train`; the fixed gate records are filtered
-to `dev`. Teacher edge/path and Student edge stages select on their matching dev
-listwise objective and never build an ANN index. Every Student path epoch saves
-a candidate checkpoint, rebuilds indexes over the same complete shared corpus,
-and evaluates the fixed dev queries. Its retrieval record contains the
-requested `--train-eval-ks` cutoffs (defaulting to `--recall-ks` =
-10/20/30/40/50) and MRR at the maximum requested cutoff for fused, direct, and
-evidence rankings, both overall and under `by_dataset`, plus the number
-and fraction of dev queries whose global top 10 contains a labeled positive
-evidence path. The same record includes a `raw_embedding` baseline that runs
-the identical zero/one-hop retrieval directly on the frozen normalized Qwen
-embeddings, without the Student projection or relation matrices. This
-corpus-bound raw index is built once and reused across epochs and mining rounds.
-`--primary-metric` also accepts nested names such as
-`direct.recall@10` or `evidence.mrr@50`.
-Student-path evaluation records epoch 0 before the first optimizer step by
-default, and this initial checkpoint participates in best-checkpoint selection.
-If `--student-checkpoint` is omitted, path training starts directly from
-`--student-initialization`; this supports a fresh PCA baseline when edge
-training is known to damage retrieval geometry.
-Use `--no-eval-epoch-zero` only to reproduce historical runs.
-
-To retrain a Teacher on retrieval-aligned lists, first expand the original
-handcrafted lists with frozen raw-ANN neighbors:
-
-```bash
-conda run -n MMDD python src/build_stage1_retrieval_aligned_data.py \
-  --features features_qwen3_vl_embedding_8b \
-  --edge-data entitables/edge_lists.jsonl wdc/edge_lists.jsonl \
-  --target-data entitables/target_lists.jsonl wdc/target_lists.jsonl \
-  --corpus mixed_stage1_data/stage1_corpus.jsonl \
-  --raw-index-root stage1_mining/raw_embedding_index \
-  --output-dir task7_teacher_retrain/data
-```
-
-The default width is 16: one positive, up to four original handcrafted
-negatives, then raw hard negatives. New path targets receive the query's top
-raw text and image evidence. `preflight.json` reports exactly how many selected
-objects still need Teacher hidden states before training.
-
-For large missing sets, `cache_stage1_features.py --teacher-output-dir ...`
-can write disjoint Teacher-only shards on separate GPUs. Merge completed shards
-with `merge_stage1_teacher_cache.py`; the main `teacher_manifest.jsonl` is
-replaced atomically. Use `partition_stage1_teacher_work.py` with the main and
-staging manifests to repartition only unfinished objects when one GPU finishes
-early. On a shared filesystem with insufficient room for a second copy, pass
-`--move` to the merge command so each staged file is installed with an atomic
-rename and its staging space is released immediately. Audit newly selected images with
-`audit_stage1_teacher_images.py` first so corrupt or decompression-bomb inputs
-can be excluded instead of silently becoming the upstream wrapper's `NULL`
-fallback. During `teacher-path`, `--teacher-rerank` together with
-`--teacher-rerank-dev-data` and
-`--primary-metric teacher_rerank.recall@10` selects checkpoints by raw-top-100
-reranking rather than listwise dev loss alone. Use
-`--teacher-rerank-interval 2` to run that expensive gate every second epoch;
-the default remains every epoch.
-
-For an output such as `student_path.pt`, training writes:
-
-- `student_path.pt`: best checkpoint selected by the dev gate;
-- `student_path.last.pt`: final attempted checkpoint, never overwriting best;
-- `student_path.epochs/epoch_NNN.pt`: per-epoch candidates;
-- `student_path.dev_indices/epoch_NNN/`: best and latest full-corpus indexes;
-- `student_path.pt.history.json`: epoch objectives, retrieval metrics, sampling
-  counts, best epoch, and stop reason;
-- `student_path.pt.selection.json`: best checkpoint/index fingerprints and the
-  Stage-2 evidence-coverage decision.
-
-The Teacher uses one shared Relation Transformer with modality, direction,
-and ordered type-pair identities. The Student learns one projection per type
-and one relation matrix per ordered type pair. Target/path training keeps the
-direct `Q -> T` and evidence `Q -> E -> T` channels separate. The direct
-channel uses dataset qrels as its positives; a recovery target absent from
-those qrels is a direct hard negative. The evidence channel uses query-scoped
-recoveries as its positives, so the two listwise losses may use different
-positive target indices. The evidence channel
-first aggregates each target's paths with the configured LogSumExp, top-k
-mean, or top-k sum, then uses a separate listwise loss over targets that have
-evidence. A batch row contributes evidence loss only when its positive and at
-least one negative have evidence. The two channel losses are added; their
-scores are never combined into one training logit. The path checkpoint stores
-the evidence aggregation configuration.
-
-Online retrieval computes `direct_score` and `evidence_score` separately and
-ranks each target in both channels. `--fusion-mode` selects ordinary RRF,
-weighted RRF, or evidence-gated RRF. Weighted RRF uses `--direct-weight` and
-`--evidence-weight`; setting the latter to zero makes fused ranking exactly
-direct ranking while retaining discovered evidence paths for Stage 2.
-The Stage-1 round-2 default is `--fusion-mode weighted_rrf
---evidence-weight 0.05`. Evaluation also emits `fused_e0` and `fused_e005`
-for direct-only and default-fusion comparisons from the same retrieval pass.
-When a raw embedding index is available, `evidence_identity_baseline` records
-the evidence channel with identity relations.
-
-For frozen-PCA Student path runs, `--anchor-weight-evidence` gives the four
-table-to/from-text/image relations an independent identity-anchor weight.
-Every epoch history records `relation_drift` (`||R-I||_F`) for all nine
-directed relation matrices. Repeated `--per-dataset-gate
-DATASET:METRIC>=VALUE` constraints restrict checkpoint selection to qualifying
-epochs and fall back to epoch 0 with `gate_unsatisfied: true` if none qualify.
-A clean dataset-gated KD ablation can use `--distillation-datasets` to apply
-the global `--distillation-weight` only to named datasets.
-`--evidence-modality-weights text=1 image=0.3` applies optional modality priors
-inside the evidence channel. `--rrf-k` controls the rank constant (default 60). The channel
-ranks and `direct_score` are intermediate values and are not written to the
-retrieval results. Student relation queries and projected target vectors
-preserve the bilinear score exactly as an inner product for ANN indexing.
-Evidence-to-target expansion submits all evidence relation vectors for one
-query to HNSW in one batch. Relation vectors are cached for the lifetime of the
-loaded index, so evidence reused across full-dev retrieval is projected once.
-
-`--base-data` and `--dev-data` accept multiple files. Every record should carry `dataset`;
-when it does not, the input filename stem is used. Sampling assigns dataset
-mass proportional to `n_d ** alpha`. The default `--dataset-sampling-alpha 0`
-gives 2K and 20K equal epoch mass, while `1` preserves their natural sample
-ratio. Intermediate values provide temperature-style sampling. Every history
-record includes `dataset_samples` so the realized balance is auditable:
-
-```bash
-conda run -n MMDD python src/train_stage1.py teacher-edge \
-  --features cache/stage1_qwen8b \
-  --base-data edge_lists_2k.jsonl edge_lists_20k.jsonl \
-  --dev-data edge_lists_2k.jsonl edge_lists_20k.jsonl \
-  --dataset-sampling-alpha 0 \
-  --output checkpoints/teacher_edge.pt
-```
-
-After training, list every indexable target/evidence object in a corpus JSONL
-with `object_id` and optional `object_type`, then build and query the per-type
-HNSW indexes:
-
-```bash
-conda run -n MMDD python src/build_stage1_index.py \
-  --features cache/stage1_qwen8b \
-  --student-checkpoint checkpoints/student_path.pt \
-  --corpus stage1_corpus.jsonl --output-dir indices/stage1
-
-conda run -n MMDD python src/retrieve_stage1.py \
-  --query-id q1 --features cache/stage1_qwen8b \
-  --student-checkpoint checkpoints/student_path.pt \
-  --index-dir indices/stage1 --corpus stage1_corpus.jsonl \
-  --output retrieval_q1.json
-```
-
-Retrieval expands only `Q -> T` and `Q -> E -> T`, keeps the evidence object
-on each path, and restores the two-level path aggregation from the Student
-checkpoint. Explicit retrieval flags may override that saved configuration.
-All paths participate in channel aggregation and RRF ranking, but they are not
-all serialized. By default, `k=10`, the direct pool is `gamma*k=40`, and both
-the evidence and evidence-to-target pools are `gamma_evidence*k=20`.
-`--direct-k`, `--evidence-k`, and `--targets-per-evidence` remain explicit
-advanced overrides. The first `k` target IDs/scores are returned unless
-`--result-k` overrides that serialization limit; only the first 10 targets
-retain a direct marker and the top four aggregated evidence paths.
-`--path-result-k` and `--evidence-path-k` control those two path-detail limits;
-they must cover the Stage-2 **input** `--input-candidate-budget` (N, default 50)
-and `--top-k-evidence` values. The recovery budget M is not a path-detail limit.
-Returning 50 IDs with only 10 targets' paths is insufficient for N=50, even if
-M is smaller than 10. Stage 2 rejects this input before loading models; it does
-not automatically retrieve or export replacement data. Each target keeps only its final fusion `score`, a
-non-null `evidence_score` when available for Stage 2, and compact paths:
-`{"kind":"direct"}` or
-`{"kind":"evidence","evidence_id":"e1","path_score":1.2}`.
-
-### Hard-negative refresh
-
-After several Student epochs, rebuild the HNSW indexes from that exact Student
-checkpoint and refresh its candidate distribution:
-
-```bash
-conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
-  --features cache/stage1_qwen8b \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --student-checkpoint checkpoints/student_path_round0.pt \
-  --index-dir indices/stage1_round0 \
-  --corpus stage1_corpus.jsonl \
-  --target-lists target_lists_2k.jsonl target_lists_20k.jsonl \
-  --output-target-lists hard_targets_round1.jsonl \
-  --output-edge-lists hard_edges_round1.jsonl \
-  --hard-targets-per-query 16 \
-  --hard-evidence-per-type 16 \
-  --hard-paths-per-query 16 \
-  --mining-round 1
-```
-
-With a two-tier cache, first mine without Teacher scoring, supplement only the
-newly referenced Teacher objects, then rerun the same refresh command without
-`--mine-only` to write logits:
-
-```bash
-conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
-  --mine-only --features cache/stage1_qwen8b \
-  --student-checkpoint checkpoints/student_path_round0.pt \
-  --index-dir indices/stage1_round0 --corpus stage1_corpus.jsonl \
-  --target-lists target_lists.jsonl \
-  --output-target-lists hard_targets_round1.pending.jsonl \
-  --output-edge-lists hard_edges_round1.pending.jsonl
-
-conda run -n MMDD python src/cache_stage1_features.py \
-  --input-jsonl stage1_objects.jsonl --output-dir cache/stage1_qwen8b \
-  --model-dir hf_models/Qwen3-VL-Embedding-8B \
-  --teacher-data \
-    hard_targets_round1.pending.jsonl hard_edges_round1.pending.jsonl
-
-conda run -n MMDD python src/refresh_stage1_hard_negatives.py \
-  --features cache/stage1_qwen8b \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --student-checkpoint checkpoints/student_path_round0.pt \
-  --index-dir indices/stage1_round0 --corpus stage1_corpus.jsonl \
-  --target-lists target_lists.jsonl \
-  --pending-target-lists hard_targets_round1.pending.jsonl \
-  --pending-edge-lists hard_edges_round1.pending.jsonl \
-  --output-target-lists hard_targets_round1.jsonl \
-  --output-edge-lists hard_edges_round1.jsonl
-```
-
-The scoring pass reads the persisted pending candidates directly. It does not
-repeat ANN retrieval after Teacher features have been supplemented.
-
-The refresh mines three independent current-Student distributions. `Q -> T`
-ANN returns hard targets outside `positive_target_ids`. Per-modality `Q -> E`
-ANN returns hard evidence outside the query-scoped positive evidence set,
-whether or not that evidence reaches a selected target. Finally, every `Q -> E`
-ANN hit is expanded through `E -> T`; complete paths ending at a non-GT
-target are ranked directly by `s(Q,E) + s(E,T)` to obtain path-hard negatives.
-Path mining does not use target aggregation or RRF. A target found by both the
-direct and path channels is deduplicated while retaining its mined evidence.
-
-Shared mining provenance and the three quotas are written once to the
-corresponding `.jsonl.metadata.json` sidecars instead of repeated on every
-record. The frozen Teacher then rescores the target/path lists and their
-directly supervised edge lists. Independently mined same-modality evidence is
-used for query-to-evidence lists; path evidence remains attached to its wrong
-target for the Evidence target channel. Edge outputs store aligned
-`teacher_logits`; target outputs separately store aligned
-`teacher_direct_logits` and `teacher_evidence_logits`.
-`student-edge` and `student-path` consume these cached soft labels directly.
-The loader rejects the obsolete merged target `teacher_logits` format and also
-checks declared edge types, the Teacher checkpoint, and path-aggregation
-configuration before reuse:
-
-```bash
-conda run -n MMDD python src/train_stage1.py student-edge \
-  --features cache/stage1_qwen8b \
-  --base-data edge_lists.jsonl --hard-data hard_edges_round1.jsonl \
-  --dev-data edge_lists.jsonl --hard-fraction 0.5 \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --student-checkpoint checkpoints/student_path_round0.pt \
-  --hard-source-checkpoint checkpoints/student_path_round0.pt \
-  --hard-learning-rate 2e-5 \
-  --output checkpoints/student_edge_round1.pt
-
-conda run -n MMDD python src/train_stage1.py student-path \
-  --features cache/stage1_qwen8b \
-  --base-data target_lists.jsonl --hard-data hard_targets_round1.jsonl \
-  --dev-data target_lists.jsonl --hard-fraction 0.5 \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --student-checkpoint checkpoints/student_edge_round1.pt \
-  --hard-source-checkpoint checkpoints/student_path_round0.pt \
-  --corpus stage1_corpus.jsonl --hard-learning-rate 2e-5 \
-  --output checkpoints/student_path_round1.pt
-```
-
-The hard fraction is sampled explicitly and deterministically every epoch; a
-value of `0.5` gives one sampled hard record per sampled base record. Base and
-hard counts are separate in history. Hard inputs must have one round number and
-matching source-Student, frozen-Teacher, and path-aggregation fingerprints.
-
-Use the multi-round driver to rebuild, mine, supplement the two-tier Teacher
-cache when needed, rescore, mixed-train, and dev-gate until the round patience
-or maximum is reached:
-
-```bash
-conda run -n MMDD python src/run_stage1_rounds.py \
-  --features cache/stage1_qwen8b --objects stage1_objects.jsonl \
-  --corpus stage1_corpus.jsonl \
-  --teacher-checkpoint checkpoints/teacher_path.pt \
-  --initial-selection checkpoints/student_path.pt.selection.json \
-  --base-edge-data edge_lists.jsonl --base-path-data target_lists.jsonl \
-  --dev-edge-data edge_lists.jsonl --dev-path-data target_lists.jsonl \
-  --test-data target_lists.jsonl --output-dir runs/stage1_mining \
-  --max-mining-rounds 3 --round-patience 2 \
-  --hard-fraction 0.5 --hard-learning-rate 2e-5
-```
-
-Each `round_NN/` owns its mining index, pending and Teacher-scored hard files,
-metadata, Student edge/path checkpoints, per-epoch dev indexes, and metrics.
-Step markers bind all reusable outputs to their input fingerprints; mismatches
-raise instead of silently reusing an old index or logits. `final_selection.json`
-records the selected round, epoch, checkpoint, complete dev metrics, round stop
-reason, and the single final test evaluation. Test labels are loaded only after
-round selection has finished.
+`run_abebooks_source_experiment.py`) first copy the dataset into a filtered
+`<run>/dataset_view/`, encode it into `work/stage1_features/<run name>/`, and then
+call `run_stage1.build_protocol` / `build_data` / `encode` / `pack` and the same
+`mmdd_stage1` training functions. They take `--gpu N` (physical index, PCI bus order)
+and bind that GPU into the protocol the same way `init` does; nothing is hardcoded.
+`prepare_abebooks_ablation_features.py` recomposes per-arm features inside each
+ablation run and writes those locations into the arm's protocol explicitly.
 
 ## Stage-2 verification
 
@@ -936,14 +457,14 @@ optimized term as `column_loss` and the fixed Stage-1 term as `table_loss`,
 while inference still ranks all candidate pairs with
 `softmax(r_T) * rho_(T,c)`. Training retrieval files
 contain one JSON object or JSONL record per query in the format emitted by
-`retrieve_stage1.py`; records whose positive target has no retrieved evidence
+`run_stage1.py export`; records whose positive target has no retrieved evidence
 path are skipped:
 
 ```bash
 conda run -n MMDD python src/train_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_train.jsonl \
-  --stage1-gate runs/stage1_mining/final_selection.json \
+  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
   --model-dir hf_models/Qwen3.5-9B \
   --output checkpoints/stage2_candidate.pt
 ```
@@ -955,7 +476,7 @@ same order. A single root is still shared by every retrieval file:
 conda run -n MMDD python src/train_stage2.py \
   --dataset-root output_entitables output_wdc \
   --retrieval-results retrieval_entitables_train.jsonl retrieval_wdc_train.jsonl \
-  --stage1-gate runs/stage1_mining/final_selection.json \
+  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
   --model-dir hf_models/Qwen3.5-9B \
   --output checkpoints/stage2_candidate.pt
 ```
@@ -1004,7 +525,7 @@ list; evidence-only targets outside M are separately marked not attempted.
 conda run -n MMDD python src/run_stage2.py \
   --dataset-root output_mm_joinability_v15 \
   --retrieval-results retrieval_q1.json \
-  --stage1-gate runs/stage1_mining/final_selection.json \
+  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
   --stage1-features cache/stage1_qwen8b \
   --scorer-checkpoint checkpoints/stage2_candidate.pt \
   --model-dir hf_models/Qwen3.5-9B \

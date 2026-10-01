@@ -18,8 +18,7 @@ from PIL import Image
 from torch.nn import functional as F
 
 from mmdd_progress import progress
-from mmdd_stage1.features import normalize_object_type
-from mmdd_stage1.models import structural_table_pool_with_groups
+from mmdd_stage1.feature_cache import normalize_object_type
 
 PROMPT_VERSION = "role_modality_v2_object_only"
 TEACHER_MANIFEST = "teacher_manifest.jsonl"
@@ -59,6 +58,33 @@ EMBEDDING_INSTRUCTIONS = {
         "in the image."
     ),
 }
+
+
+def structural_table_pool_with_groups(
+    hidden_states: torch.Tensor,
+    token_groups: torch.Tensor | None,
+    tokens_per_group: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Pool each schema/row into ordered contiguous semantic segments."""
+
+    if hidden_states.shape[0] == 0:
+        raise ValueError("A table must contain at least one hidden-state token")
+    if tokens_per_group <= 0:
+        raise ValueError("tokens_per_group must be positive")
+    if token_groups is None:
+        return hidden_states, None
+    pooled = []
+    pooled_groups = []
+    for group in torch.unique(token_groups, sorted=True):
+        values = hidden_states[token_groups == group]
+        chunks = torch.tensor_split(values, min(tokens_per_group, values.shape[0]))
+        pooled.extend(chunk.mean(dim=0) for chunk in chunks)
+        pooled_groups.extend([int(group)] * len(chunks))
+    return torch.stack(pooled), torch.tensor(
+        pooled_groups,
+        dtype=token_groups.dtype,
+        device=token_groups.device,
+    )
 
 
 def embedding_instructions(

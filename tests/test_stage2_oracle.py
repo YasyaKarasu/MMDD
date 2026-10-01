@@ -32,7 +32,6 @@ from mmdd_stage2.r12_column import (
     train_r12_candidate_scorer,
 )
 from mmdd_stage2.verifier import EvidenceBundle
-from run_stage2_round1 import _round1_conclusion
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -638,59 +637,3 @@ def test_train_stage2_oracle_mode_does_not_require_gate(tmp_path, monkeypatch):
     train_stage2.run(args)
 
     assert events == ["backend", "train", "save"]
-
-
-def test_round1_conclusion_marks_perfect_position_baseline_as_confounded():
-    per_dataset = {
-        "entitables": {"column_accuracy@1": 1.0},
-        "wdc": {"column_accuracy@1": 1.0},
-    }
-    summary = {
-        "seeds": {
-            str(seed): {"trained": {"test": {"by_dataset": per_dataset}}}
-            for seed in (13, 17, 23)
-        },
-        "baselines_test": {
-            "by_dataset": {
-                dataset: {"majority_column_position_accuracy@1": 1.0}
-                for dataset in per_dataset
-            }
-        },
-        "three_seed": {
-            split: {
-                "macro_column_accuracy@1": {"mean": 1.0},
-                "by_dataset_column_accuracy@1": {
-                    dataset: {"mean": 1.0} for dataset in per_dataset
-                },
-            }
-            for split in ("dev", "test")
-        },
-    }
-    audit = {
-        "datasets": {
-            dataset: {
-                "splits": {
-                    split: {"gold_column_position": {"0": count}}
-                    for split, count in (("train", 3), ("dev", 2), ("test", 1))
-                }
-            }
-            for dataset in per_dataset
-        },
-        "cross_split_intersections": {
-            "train__dev": {"source_table_ids": [], "chain_ids": []}
-        },
-        "id_conflicts": [],
-    }
-
-    conclusion = _round1_conclusion(summary, audit)
-
-    assert conclusion["decision_code"] == "C"
-    assert conclusion["improvement_over_majority_by_dataset"] == {
-        "entitables": 0.0,
-        "wdc": 0.0,
-    }
-    assert conclusion["gold_column_position_counts"] == {"0": 12}
-    assert conclusion["perfect_majority_baseline"] is True
-    assert conclusion["identifiability"] == (
-        "confounded_by_degenerate_gold_column_position"
-    )

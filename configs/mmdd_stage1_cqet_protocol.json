@@ -16,11 +16,12 @@
   "paths": {
     "dataset_root": "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9",
     "backbone_dir": "hf_models/Qwen3-VL-Embedding-8B",
-    "pure_cache_dir": "work/mmdd_stage1_fresh_path_v2_1_20260920/features",
-    "row_cache_manifest": "work/stage1_optimization_r10_20260907/features_qwen3_vl_embedding_8b/manifest.jsonl",
-    "upstream_cache_dir": "work/stage1_optimization_r10_20260907/features_qwen3_vl_embedding_8b",
-    "upstream_data_dir": "work/stage1_optimization_r10_20260907/stage1_data",
-    "run_root": "work/mmdd_stage1_v4_2_entitables"
+    "features_dir": "work/stage1_features/entitables",
+    "pure_cache_dir": "work/stage1_features/entitables/features",
+    "row_cache_manifest": "work/stage1_features/entitables/encoder/manifest.jsonl",
+    "upstream_cache_dir": "work/stage1_features/entitables/encoder",
+    "upstream_data_dir": "work/stage1_features/entitables/data",
+    "run_root": "work/stage1_entitables"
   },
   "seeds": [
     13

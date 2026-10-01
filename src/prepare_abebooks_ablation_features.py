@@ -13,7 +13,11 @@ import numpy as np
 import torch
 
 from run_abebooks_fresh import ROOT, finish, launch, read_rows, write_json, write_rows
-from fresh_path import features
+import run_stage1
+from mmdd_stage1 import content as features
+
+# Physical GPU index (PCI bus order) for encoding jobs; set from --gpu in main().
+GPU = 0
 from mmdd_dataset.abebooks_ablation import (commercial_text_assets, duplicate_book_image_assets, make_view, nongold_hubs, nongold_text_hubs, nonpositive_source_assets,
                                            unanchored_text_assets, unlabelled_text_assets, unsupported_source_assets)
 
@@ -44,14 +48,15 @@ def curate(root: Path) -> None:
                            removed_assets=removed if filter_hubs else set())
         write_json(run / "CURATION.json", report)
         protocol = json.loads((baseline / "protocol.json").read_text())
-        protocol["paths"] = {k: v.replace(str(baseline), str(run)) for k, v in protocol["paths"].items()}
+        protocol["paths"] = {**{k: v.replace(str(baseline), str(run)) for k, v in protocol["paths"].items()},
+                             **run_stage1.feature_paths(run)}  # this arm recomposes its own features
         write_json(run / "protocol.json", protocol)
 
 
 def build_inputs(run: Path) -> None:
     finish("build_data", launch(run, "build_data", [str(ROOT / "src/build_stage1_training_data.py"),
         "--dataset-root", str(run / "dataset_view"), "--dataset-name", "abebooks_joinability_bal04_clean",
-        "--output-dir", str(run / "data"), "--max-rows", "20", "--seed", "13"], gpu=1))
+        "--output-dir", str(run / "data"), "--max-rows", "20", "--seed", "13"], gpu=GPU))
 
 
 def encode_tables(run: Path) -> None:
@@ -62,7 +67,7 @@ def encode_tables(run: Path) -> None:
         "--input-jsonl", str(run / "data/tables.jsonl"), "--output-dir", str(run / "table_encoder"),
         "--model-dir", str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"), "--device", "cuda:0",
         "--object-batch-size", "4", "--teacher-data", str(run / "data/tables.jsonl"),
-        "--teacher-split", "all"], gpu=1))
+        "--teacher-split", "all"], gpu=GPU))
 
 
 def encode_changed_text(run: Path, reference: Path) -> None:
@@ -74,7 +79,7 @@ def encode_changed_text(run: Path, reference: Path) -> None:
     finish("encode_changed_text", launch(run, "encode_changed_text", [str(ROOT / "src/cache_stage1_features.py"),
         "--input-jsonl", str(run / "data/changed_text.jsonl"), "--output-dir", str(run / "text_encoder"),
         "--model-dir", str(ROOT / "hf_models/Qwen3-VL-Embedding-8B"), "--device", "cuda:0",
-        "--teacher-data", str(run / "data/changed_text.jsonl"), "--teacher-split", "all"], gpu=1))
+        "--teacher-data", str(run / "data/changed_text.jsonl"), "--teacher-split", "all"], gpu=GPU))
 
 
 def compose(run: Path) -> None:
@@ -286,7 +291,8 @@ def curate_reference_evidence(run: Path, reference: Path, *, filter_kind: str) -
         "label_scope": "Dataset curation uses existing all-split annotations (qrels for positive_sources); not an unlabeled deployment filter",
         "removed_assets": sorted(removed), "curation": report})
     protocol = json.loads((reference / "protocol.json").read_text())
-    protocol["paths"] = {k: v.replace(str(reference), str(run)) for k, v in protocol["paths"].items()}
+    protocol["paths"] = {**{k: v.replace(str(reference), str(run)) for k, v in protocol["paths"].items()},
+                         **run_stage1.feature_paths(run)}  # this run recomposes its own features
     write_json(run / "protocol.json", protocol)
     build_inputs(run)
     tables = [r for r in read_rows(run / "data/stage1_objects.jsonl") if r["object_type"] == "table"]
@@ -314,7 +320,10 @@ def main() -> None:
     parser.add_argument("command", choices=["curate", "encode-tables", "encode-changed-text", "compose", "compose-reference", "reuse-identical-tables", *filters])
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument("--gpu", type=int, default=0, help="physical GPU index (PCI bus order) for encoding jobs")
     args = parser.parse_args()
+    global GPU
+    GPU = args.gpu
     if args.command in {"compose-reference", "reuse-identical-tables", "encode-changed-text"} or args.command in filters:
         if args.reference is None:
             parser.error(f"{args.command} requires --reference")

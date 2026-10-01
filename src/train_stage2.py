@@ -17,7 +17,7 @@ from mmdd_stage2.training import (
     train_candidate_scorer,
 )
 from mmdd_stage2.verifier import CandidateColumnScorer
-from mmdd_stage1.selection import validate_stage2_gate
+from mmdd_stage1.export import validate_stage2_gate
 
 
 def run(args: argparse.Namespace) -> None:
