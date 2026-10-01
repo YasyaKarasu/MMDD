@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from . import SCHEMA_VERSION
 from .data import utf8_sorted, write_json, write_jsonl_gz
 from .evaluate import paired_bootstrap
 from .labels import Labels
@@ -144,7 +145,7 @@ def export_funnels(
         for target_id in utf8_sorted(strict_gold):
             strict_rows.append(
                 {
-                    "schema_version": "4.1.0",
+                    "schema_version": SCHEMA_VERSION,
                     "seed": seed,
                     "generator": generator,
                     "query_id": query_id,
@@ -172,7 +173,7 @@ def export_funnels(
                 )
                 witness_rows.append(
                     {
-                        "schema_version": "4.1.0",
+                        "schema_version": SCHEMA_VERSION,
                         "seed": seed,
                         "generator": generator,
                         "query_id": query_id,
@@ -203,7 +204,7 @@ def export_funnels(
     }
     nonempty = [q for q, counts in strict_by_query.items() if counts["strict_gold"] > 0]
     strict_summary = {
-        "schema_version": "4.1.0",
+        "schema_version": SCHEMA_VERSION,
         "seed": seed,
         "generator": generator,
         "all_query_denominator": len(strict_by_query),
@@ -245,7 +246,7 @@ def export_funnels(
         pair_groups.items(), key=lambda item: (item[0][0].encode("utf-8"), item[0][1].encode("utf-8"))
     ):
         witness_pair_rows.append({
-            "schema_version": "4.1.0",
+            "schema_version": SCHEMA_VERSION,
             "seed": seed,
             "generator": generator,
             "query_id": query_id,

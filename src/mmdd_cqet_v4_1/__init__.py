@@ -1,6 +1,8 @@
-"""MMDD Stage1 V4.1 correctness-locked experiment implementation."""
+"""MMDD Stage1 CQET experiment implementation (V4.2 student recipe on the V4.1 pipeline)."""
 
-EXPERIMENT_ID = "MMDD_STAGE1_V4_1_CORRECTNESS_LOCKED_CQET"
+EXPERIMENT_ID = "MMDD_STAGE1_V4_2_CQET"
+# Artifact (pool bundle, label, metric) record layouts are unchanged since 4.1.0.
 SCHEMA_VERSION = "4.1.0"
-VERSION = SCHEMA_VERSION
-DATE = "2026-09-25"
+# Protocol / training-recipe version; a protocol must declare this exact value.
+VERSION = "4.2.0"
+DATE = "2026-10-01"

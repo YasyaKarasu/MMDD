@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from . import EXPERIMENT_ID, VERSION
-from .config import Paths
+from .config import STAGE_ORDER, Paths
 from .data import iter_jsonl, sha256_file, write_json
 from .train import state_sha
 
@@ -33,8 +33,10 @@ def source_files(paths: Paths) -> list[Path]:
         paths.repo_root / "tests" / "test_mmdd_cqet_v4_1.py",
         paths.repo_root / "tests" / "conftest.py",
         paths.repo_root / "src" / "cache_stage1_features.py",
-        paths.repo_root / "hf_models" / "Qwen3-VL-Embedding-8B" / "scripts" / "qwen3_vl_embedding.py",
     ])
+    backbone_script = paths.backbone_dir / "scripts" / "qwen3_vl_embedding.py"
+    if backbone_script.is_file():
+        files.append(backbone_script)
     files.extend(sorted((paths.repo_root / "src" / "fresh_path").glob("*.py")))
     package_root = paths.repo_root / "audit" / "MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE"
     files.extend(sorted((package_root / "tools").glob("*.py")))
@@ -47,7 +49,7 @@ def source_manifest(paths: Paths) -> list[dict[str, object]]:
     files = source_files(paths)
     return [
         {
-            "path": str(path.relative_to(paths.repo_root)),
+            "path": str(path.relative_to(paths.repo_root)) if path.is_relative_to(paths.repo_root) else str(path),
             "bytes": path.stat().st_size,
             "sha256": sha256_file(path),
             "role": "executed_source",
@@ -262,7 +264,7 @@ def append_error_ledger(
         handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def generate_provenance_manifests(paths: Paths, gpu_uuid: str) -> None:
+def generate_provenance_manifests(paths: Paths, gpu_uuid: str, seeds: Sequence[int] = (13,)) -> None:
     manifest = source_manifest(paths)
     source_path = paths.run_root / "SOURCE_TREE_MANIFEST.jsonl"
     with source_path.open("w", encoding="utf-8") as handle:
@@ -272,11 +274,8 @@ def generate_provenance_manifests(paths: Paths, gpu_uuid: str) -> None:
         paths.run_root / "EXECUTION_DAG.json",
         {
             "schema_version": VERSION,
-            "seed_order": [13, 29],
-            "stage_order": [
-                "TA", "TB_CQET", "TB_LSE", "TB_QT", "NATIVE_C1_SUP",
-                "QT_C1_SUP", "NATIVE_C2_SUP", "NATIVE_C2_KD", "QT_C2_SUP",
-            ],
+            "seed_order": list(seeds),
+            "stage_order": list(STAGE_ORDER),
             "parents": {
                 "TA": "fresh_init",
                 "TB_CQET": "TA_epoch2",

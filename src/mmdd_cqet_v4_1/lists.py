@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from . import SCHEMA_VERSION
 from .config import Paths
 from .data import iter_jsonl, read_json, sha256_file, utf8_sorted, write_json, write_jsonl_gz
 from .features import RowStore, ZStore
@@ -695,7 +696,7 @@ def build_c2_shared_graph(
                 merged.items(), key=lambda pair: (pair[0][0].encode("utf-8"), pair[0][1].encode("utf-8"))
             ):
                 yield {
-                    "schema_version": "4.1.0",
+                    "schema_version": SCHEMA_VERSION,
                     "query_id": query_id,
                     "target_id": target_id,
                     "evidence_id": evidence_id,

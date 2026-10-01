@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from . import SCHEMA_VERSION
 from .config import Paths
 from .data import iter_jsonl, read_json, sha256_file, utf8_sorted, write_json, write_jsonl
 from .labels import Labels
@@ -322,7 +323,7 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
     )
     write_jsonl(
         pca_dir / "fit_ids.jsonl",
-        ({"schema_version": "4.1.0", "position": i, "object_id": object_id}
+        ({"schema_version": SCHEMA_VERSION, "position": i, "object_id": object_id}
          for i, object_id in enumerate(fit_ids)),
     )
 

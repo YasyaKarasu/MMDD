@@ -1,0 +1,289 @@
+{
+  "experiment_id": "MMDD_STAGE1_V4_2_CQET",
+  "version": "4.2.0",
+  "status": "SPEC_NOT_RUN",
+  "date": "2026-10-01",
+  "hardware": {
+    "physical_index": 0,
+    "uuid": "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725",
+    "model": "RTX 4090",
+    "vram_gib": 24,
+    "gpu_processes": 1,
+    "ddp": false,
+    "max_cpu_workers": 4,
+    "max_prefetch_units": 16
+  },
+  "paths": {
+    "dataset_root": "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9",
+    "backbone_dir": "hf_models/Qwen3-VL-Embedding-8B",
+    "pure_cache_dir": "work/mmdd_stage1_fresh_path_v2_1_20260920/features",
+    "row_cache_manifest": "work/stage1_optimization_r10_20260907/features_qwen3_vl_embedding_8b/manifest.jsonl",
+    "upstream_cache_dir": "work/stage1_optimization_r10_20260907/features_qwen3_vl_embedding_8b",
+    "upstream_data_dir": "work/stage1_optimization_r10_20260907/stage1_data",
+    "run_root": "work/mmdd_stage1_v4_2_entitables"
+  },
+  "seeds": [
+    13
+  ],
+  "seed_order": "sequential",
+  "stages_per_seed": 9,
+  "max_registered_stages": 9,
+  "stage_order": [
+    "TA",
+    "TB_CQET",
+    "TB_LSE",
+    "TB_QT",
+    "NATIVE_C1_SUP",
+    "QT_C1_SUP",
+    "NATIVE_C2_SUP",
+    "NATIVE_C2_KD",
+    "QT_C2_SUP"
+  ],
+  "parents": {
+    "TA": "fresh_init",
+    "TB_CQET": "same_seed_TA_epoch2",
+    "TB_LSE": "same_seed_TA_epoch2",
+    "TB_QT": "same_seed_TA_epoch2",
+    "NATIVE_C1_SUP": "same_run_PCA_identity",
+    "QT_C1_SUP": "same_run_PCA_identity",
+    "NATIVE_C2_SUP": "same_seed_selected_NATIVE_C1_SUP",
+    "NATIVE_C2_KD": "same_seed_selected_NATIVE_C1_SUP",
+    "QT_C2_SUP": "same_seed_selected_QT_C1_SUP"
+  },
+  "primary_system": "NativeC2KD_common_SUP_fraction_own_ANN_C150_plus_TB_CQET_end_Real",
+  "fallback_on_research_failure": false,
+  "feedback_to_teacher": false,
+  "historical_training_dependencies": false,
+  "feature_provenance": {
+    "freeze_backbone": true,
+    "dim": 4096,
+    "recipe_must_be_recovered_not_guessed": true,
+    "probe_per_modality": 16,
+    "probe_train_queries": 16,
+    "rtol": 0.0001,
+    "atol": 1e-05,
+    "unknown_recipe_action": "BLOCKED_FEATURE_PROVENANCE",
+    "global_task_input": "unit_norm_z",
+    "token_input": "unchanged_locked_recipe"
+  },
+  "retrieval": {
+    "direct_k": 100,
+    "first_text_k": 20,
+    "first_image_k": 20,
+    "second_k": 50,
+    "teacher_budget": 150,
+    "prepath_top_l": 16,
+    "retained_max": 4,
+    "rrf_constant": 60,
+    "evidence_order": "D1_retained_row_coverage",
+    "all_U_true_QT": true,
+    "matched_direct_C": "min(150,len(U))",
+    "matched_direct_U": "len(U)",
+    "formal_hops": "all_ANN",
+    "exact_audit": true,
+    "hnsw": {
+      "space": "ip",
+      "M": 32,
+      "efConstruction": 200,
+      "efSearch_floor": 256,
+      "threads": 1
+    },
+    "tie_break": "UTF8_id"
+  },
+  "teacher": {
+    "width": 512,
+    "heads": 8,
+    "layers": 3,
+    "ffn": 2048,
+    "dropout": 0.1,
+    "text_slots": 16,
+    "image_slots": 24,
+    "global_blocks": 11,
+    "empty_E": "six_explicit_zero_blocks",
+    "TA": {
+      "epochs": 2,
+      "logical_batch_queries": 8,
+      "lr": 5e-05,
+      "wd": 0.01,
+      "support_weight": 0.2,
+      "checkpoints": [
+        "init",
+        "epoch1",
+        "epoch2"
+      ],
+      "parent_endpoint": "epoch2"
+    },
+    "TB": {
+      "epochs": 1,
+      "logical_batch_queries": 8,
+      "lr": 5e-05,
+      "wd": 0.01,
+      "freeze_prefix": [
+        "adapters",
+        "poolers",
+        "globals",
+        "modality",
+        "table_kind"
+      ],
+      "checkpoints": [
+        0,
+        0.5,
+        1
+      ],
+      "endpoint": 1,
+      "candidate_list": "RawU_union_trueRawDirect150_union_G_union_U32",
+      "shuffle_namespace": "TB_SHARED",
+      "CQET_aggregation": "nonempty_LME_QET_else_f0",
+      "LSE_aggregation": "LSE_f0_and_QET",
+      "path_direct_weight": 0.5,
+      "path_aggregate_weight": 0.5,
+      "support_weight": 0.2,
+      "QT_loss": "direct_only_weight1"
+    }
+  },
+  "student": {
+    "architecture": "Native_P_R",
+    "projection_dim": 1024,
+    "post_projection_norm": false,
+    "P_lr": 0.0001,
+    "R_lr": 0.001,
+    "wd": 0,
+    "anchor_weight": 0.0,
+    "kd_weight": 1.0,
+    "temperature": 10.0,
+    "C1": {
+      "epochs": 1,
+      "logical_batch_edge_lists": 64,
+      "hard": 32,
+      "uniform": 31,
+      "score": "logit_scale*raw",
+      "KD": false,
+      "checkpoints": [
+        0,
+        0.25,
+        0.5,
+        0.75,
+        1
+      ],
+      "shuffle": "whole_valid_list"
+    },
+    "C2": {
+      "epochs": 1,
+      "logical_batch_queries": 64,
+      "score": "logit_scale*raw",
+      "path_aggregation": "LME_QE_plus_ET",
+      "KD_teacher": "TB_CQET_end",
+      "checkpoints": [
+        0,
+        0.25,
+        0.5,
+        0.75,
+        1
+      ],
+      "init_hash_equals_C1": true,
+      "graph": "RawU_union_sharedNativeC1U_union_G",
+      "graph_paths": "merged_prepaths_rescored_by_shared_C1_then_D1",
+      "selection_owner": "NATIVE_SUP",
+      "KD_uses_SUP_fraction": true,
+      "direct_list": "record_targets_plus_random_negatives_from_legal_targets"
+    },
+    "native_selection": [
+      "CR_C150_overall",
+      "RawUnionRecall_overall",
+      "Direct_ANN_R10_overall",
+      "earlier_step"
+    ],
+    "QT_selection": [
+      "Direct_ANN_R10_overall",
+      "earlier_step"
+    ],
+    "logit_scale": 20.0,
+    "random_negatives": 256,
+    "recipe_note": "V4.2: student scores are multiplied by logit_scale before every softmax loss; KD = KL(softmax(teacher/temperature) || softmax(student)) with weight kd_weight; each C2 direct list gets random_negatives uniform draws from legal_targets; anchor MSE is off (0) and R_QT drift is logged as sigma1/sigma2 of R_QT - I."
+  },
+  "numerics": {
+    "task_dtype": "float32",
+    "AMP": false,
+    "TF32": false,
+    "adam_betas": [
+      0.9,
+      0.999
+    ],
+    "adam_eps": 1e-08,
+    "grad_clip": 1,
+    "teacher_candidate_chunks": [
+      16,
+      8,
+      4,
+      2,
+      1
+    ],
+    "student_query_microbatches": [
+      64,
+      32,
+      16,
+      8,
+      4,
+      2,
+      1
+    ],
+    "scheduler": null,
+    "full_denominator_required": true
+  },
+  "evaluation": {
+    "k": [
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "main": "query_macro_target_Recall10",
+    "coverage": "query_macro_fraction_gold_targets",
+    "hit_rate": "separate_metric",
+    "bootstrap_unit": "source_group",
+    "bootstrap_aggregation": "query_weighted_after_group_sampling",
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260925,
+    "confidence": 0.95,
+    "segments": [
+      "overall",
+      "implicit",
+      "explicit",
+      "mixed",
+      "unknown"
+    ],
+    "test_role": "historically_exposed_regression_after_freeze",
+    "strict_EO_excludes": [
+      "correct_exact_D100",
+      "ANN_D100"
+    ],
+    "formal_budget": 150,
+    "readonly_budget_curves": [
+      100,
+      150,
+      200
+    ],
+    "teacher_FullU_dev_subset": 128
+  },
+  "acceptance_pp": {
+    "candidate_mean_gain_each_split": 1.0,
+    "content_dev_mean_implicit": 0.5,
+    "content_test_mean_strictly_positive": true,
+    "teacher_vs_QT_each_split_seed_floor": -0.5,
+    "CQET_vs_correctedLSE_each_split_mean_floor": 0,
+    "KD_dev_mean": 0.3,
+    "KD_test_mean_strictly_positive": true,
+    "KD_coverage_floor": -0.5,
+    "all_content_and_KD_seed_split_directions_nonnegative": true
+  },
+  "local_reference_tests": "see_local_test_receipt_not_server_validation",
+  "server_integration_tests": "NOT_RUN",
+  "smoke": {
+    "max_train_queries": 16,
+    "max_updates": 8,
+    "smoke_as_formal_parent": false
+  },
+  "freeze_recipe_missing_is_blocker": true,
+  "history_reference_missing_is_blocker": false
+}

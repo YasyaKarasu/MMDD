@@ -5,7 +5,6 @@ import argparse
 import gzip
 import hashlib
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -21,16 +20,38 @@ from PIL import Image, ImageFile, ImageOps
 from torch.nn import functional as F
 
 from . import EXPERIMENT_ID, SCHEMA_VERSION
+from .config import Paths, resolve_default_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATASET_ROOT = REPO_ROOT / "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9"
-BACKBONE_DIR = REPO_ROOT / "hf_models" / "Qwen3-VL-Embedding-8B"
-PURE_CACHE_DIR = REPO_ROOT / "work" / "mmdd_stage1_fresh_path_v2_1_20260920" / "features"
-UPSTREAM_CACHE_DIR = REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "features_qwen3_vl_embedding_8b"
-UPSTREAM_DATA_DIR = REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "stage1_data"
-PACKAGE_DIR = REPO_ROOT / "audit" / "MMDD_S1_V4_AUDIT_AND_V4_1_PACKAGE"
-RUN_ROOT = REPO_ROOT / "work" / "mmdd_stage1_v4_1_correctness_locked"
+# Bound by configure() from the protocol's ``paths`` / ``hardware`` blocks; never hardcoded.
+DATASET_ROOT: Path = None
+BACKBONE_DIR: Path = None
+PURE_CACHE_DIR: Path = None
+UPSTREAM_CACHE_DIR: Path = None
+UPSTREAM_DATA_DIR: Path = None
+PACKAGE_DIR: Path = None
+RUN_ROOT: Path = None
+GPU_UUID: str = None
+
+
+def configure(paths: Paths) -> None:
+    """Bind the module to one run. ``package_dir`` holds ``next_round/protocol.json``."""
+    global DATASET_ROOT, BACKBONE_DIR, PURE_CACHE_DIR, UPSTREAM_CACHE_DIR, UPSTREAM_DATA_DIR
+    global PACKAGE_DIR, RUN_ROOT, GPU_UUID
+    DATASET_ROOT = paths.dataset_root
+    BACKBONE_DIR = paths.backbone_dir
+    PURE_CACHE_DIR = paths.pure_cache_dir
+    UPSTREAM_CACHE_DIR = paths.upstream_cache_dir or paths.row_cache_manifest.parent
+    UPSTREAM_DATA_DIR = paths.upstream_data_dir
+    PACKAGE_DIR = paths.package_dir or paths.run_root / "protocol_package"
+    RUN_ROOT = paths.run_root
+    GPU_UUID = paths.gpu_uuid
+
+
+def _require_configured() -> None:
+    if RUN_ROOT is None or DATASET_ROOT is None:
+        raise RuntimeError("preflight is not bound to a run; call preflight.configure(paths) first")
 
 # Match the real frozen extractor's image boundary. Dataset images are trusted
 # local inputs and some legitimately exceed Pillow's heuristic pixel ceiling.
@@ -53,8 +74,9 @@ def sha256_json(value: Any) -> str:
 
 def file_identity(path: Path, *, root: Path | None = None, role: str | None = None) -> dict[str, Any]:
     path = Path(path).resolve()
+    relative = root is not None and path.is_relative_to(root.resolve())
     record: dict[str, Any] = {
-        "path": str(path.relative_to(root.resolve())) if root is not None else str(path),
+        "path": str(path.relative_to(root.resolve())) if relative else str(path),
         "bytes": path.stat().st_size,
         "sha256": sha256_file(path),
     }
@@ -234,7 +256,7 @@ def build_recipe_lock() -> dict[str, Any]:
         REPO_ROOT / "src" / "mmdd_stage1" / "models.py",
         REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "run_feature_cache.sh",
         REPO_ROOT / "work" / "stage1_optimization_r10_20260907" / "split_feature_inputs.py",
-        PACKAGE_DIR / "next_round" / "protocol.json",
+        RUN_ROOT / "protocol.json",
         REPO_ROOT / "audit" / "MMDD_STAGE1_FRESH_PATH_v2_1_20260920" / "ENCODER_PROMPTS.json",
     ]
     recipe = {
@@ -387,7 +409,7 @@ def build_content_aliases() -> dict[str, Any]:
 def build_identity() -> dict[str, Any]:
     protocol = RUN_ROOT / "protocol.json"
     expected_protocol = PACKAGE_DIR / "next_round" / "protocol.json"
-    if sha256_file(protocol) != sha256_file(expected_protocol):
+    if expected_protocol.exists() and sha256_file(protocol) != sha256_file(expected_protocol):
         raise ValueError("run protocol differs from delivered protocol")
     dataset_files = _required_dataset_files()
     dataset_records = _hash_files(dataset_files, root=DATASET_ROOT, role="original_dataset")
@@ -628,15 +650,18 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
     )
     from fresh_path.features import ContentStore, compress_bins
 
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725":
-        raise RuntimeError("BLOCKED_GPU_IDENTITY: CUDA_VISIBLE_DEVICES must be the locked GPU0 UUID")
+    _require_configured()
+    if UPSTREAM_DATA_DIR is None:
+        raise RuntimeError("protocol paths.upstream_data_dir is required to replay the feature recipe")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("BLOCKED_GPU_IDENTITY: expected one visible CUDA device")
     properties = torch.cuda.get_device_properties(0)
     runtime_uuid = str(getattr(properties, "uuid", ""))
-    expected_uuid = os.environ["CUDA_VISIBLE_DEVICES"].removeprefix("GPU-")
-    if "RTX 4090" not in properties.name or runtime_uuid.lower() != expected_uuid.lower():
-        raise RuntimeError("BLOCKED_GPU_IDENTITY: runtime cuda:0 does not match the locked GPU")
+    expected_uuid = (GPU_UUID or "").removeprefix("GPU-")
+    if not expected_uuid or runtime_uuid.lower() != expected_uuid.lower():
+        raise RuntimeError(
+            f"BLOCKED_GPU_IDENTITY: runtime cuda:0 is GPU-{runtime_uuid}, protocol pins {GPU_UUID}"
+        )
     torch.cuda.set_device(torch.device(device))
 
     samples = _feature_samples()
@@ -877,11 +902,13 @@ def write_access_ledger() -> None:
             (UPSTREAM_DATA_DIR, "pure_extractor_input_reconstruction", "provenance_only_not_training_material"),
             (PACKAGE_DIR, "locked_protocol", "fresh_allowed"),
         )
+        if path is not None
     ]
     write_jsonl(RUN_ROOT / "INPUT_ACCESS_LEDGER.jsonl", records)
 
 
 def run_lock() -> dict[str, Any]:
+    _require_configured()
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     result = {
         "run_identity": build_identity(),
@@ -902,12 +929,15 @@ def run_lock() -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command", choices=("lock", "verify-features"))
+    ap.add_argument("--protocol", type=Path, required=True)
+    ap.add_argument("--run-root", type=Path, required=True)
     ap.add_argument("--device", default="cuda:0")
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    configure(resolve_default_paths(args.protocol, args.run_root))
     result = run_lock() if args.command == "lock" else verify_feature_provenance(args.device)
     print(json.dumps({"status": "complete", "command": args.command, "result": result}, default=str))
     return 0

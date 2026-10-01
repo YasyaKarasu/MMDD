@@ -12,11 +12,11 @@ from typing import Mapping, Sequence
 
 import torch
 
+from . import SCHEMA_VERSION
 from .data import sha256_file, utf8_sorted, write_json, write_jsonl_gz
 from .labels import Labels
 from .retrieval import PoolRecord
 
-SCHEMA_VERSION = "4.1.0"
 
 
 def json_identity(value: object) -> str:

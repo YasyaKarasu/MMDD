@@ -22,7 +22,7 @@ import torch
 from .execution_layout import teacher_numerical_layout
 from . import EXPERIMENT_ID, VERSION
 from .artifacts import json_identity, load_pool_bundle, save_pool_bundle, save_training_records
-from .config import Paths, load_protocol, resolve_default_paths
+from .config import STAGE_ORDER, Paths, load_protocol, resolve_default_paths
 from .content_store import ContentStore
 from .data import (
     build_content_aliases,
@@ -61,6 +61,7 @@ from .provenance import (
     source_identity,
 )
 from .train import (
+    StudentRecipe,
     _hash_order,
     _order_sha,
     build_teacher_logits_cache,
@@ -72,11 +73,7 @@ from .train import (
     train_tb,
 )
 
-GPU_UUID = "GPU-3d43b1bc-b727-456f-2b9f-e3c3b69eb725"
-STAGES = [
-    "TA", "TB_CQET", "TB_LSE", "TB_QT", "NATIVE_C1_SUP",
-    "QT_C1_SUP", "NATIVE_C2_SUP", "NATIVE_C2_KD", "QT_C2_SUP",
-]
+STAGES = list(STAGE_ORDER)
 
 
 @dataclass
@@ -105,15 +102,16 @@ def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
     return sorted(ids, key=lambda value: (hashlib.sha256(value.encode()).digest(), value.encode()))[:count]
 
 
-def _gpu_guard() -> None:
+def _gpu_guard(paths: Paths) -> None:
+    """The process must see exactly the GPU the protocol pins (set CUDA_VISIBLE_DEVICES to its UUID)."""
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("formal/smoke execution requires exactly one visible CUDA device")
     props = torch.cuda.get_device_properties(0)
     uuid = str(props.uuid)
     if not uuid.startswith("GPU-"):
         uuid = "GPU-" + uuid
-    if uuid.lower() != GPU_UUID.lower() or "RTX 4090" not in props.name:
-        raise RuntimeError(f"BLOCKED_GPU_IDENTITY: cuda:0={uuid} {props.name}")
+    if paths.gpu_uuid is None or uuid.lower() != paths.gpu_uuid.lower():
+        raise RuntimeError(f"BLOCKED_GPU_IDENTITY: cuda:0={uuid} {props.name}, protocol pins {paths.gpu_uuid}")
 
 
 def _protocol_paths(protocol_path: Path, run_root: Path) -> tuple[dict[str, Any], Paths]:
@@ -156,7 +154,7 @@ def prepare(protocol_path: Path, run_root: Path) -> None:
     preflight = read_json(paths.run_root / "FROZEN_RECIPE_LOCK.json")
     if preflight.get("status") != "PASS":
         raise RuntimeError("BLOCKED_FEATURE_PROVENANCE")
-    generate_provenance_manifests(paths, GPU_UUID)
+    generate_provenance_manifests(paths, paths.gpu_uuid, seeds=protocol["seeds"])
     canonical = build_content_aliases(paths)
     if not (paths.labels_dir / "label_stats.json").exists():
         build_labels(paths, canonical)
@@ -354,7 +352,7 @@ def _run_stage(
     if completed is not None:
         return completed
     attempt = record_stage_pre_run(
-        stage_dir, stage, seed, GPU_UUID, paths=rt.paths, parents=parents,
+        stage_dir, stage, seed, rt.paths.gpu_uuid, paths=rt.paths, parents=parents,
         config=config, inputs=inputs, lists=lists,
     )
     checkpoints = stage_dir / "attempts" / attempt / "checkpoints"
@@ -377,7 +375,7 @@ def _run_stage(
             "stage": stage,
             "attempt_id": attempt,
             "pid": os.getpid(),
-            "gpu_uuid": GPU_UUID,
+            "gpu_uuid": rt.paths.gpu_uuid,
             "mapped_device": "cuda:0",
             "wall_seconds": time.time() - started,
             "cuda_event_seconds": cuda_seconds,
@@ -786,6 +784,7 @@ def _attach_student_gradient_probes(
     qt_c1_selection: dict,
     native_c2_selection: dict,
     qt_c2_selection: dict,
+    recipe: StudentRecipe,
 ) -> dict[str, Any]:
     probe_ids = _hashed_ids([row["query_id"] for row in c2_records], 128)
     by_query = {row["query_id"]: row for row in c2_records}
@@ -803,7 +802,7 @@ def _attach_student_gradient_probes(
         checkpoint = Path(point[checkpoint_key])
         model = _load_qt(checkpoint, rt) if qt else _load_native(checkpoint, rt)
         probe = student_gradient_probe(
-            model, rt.bank, probe_rows, None if qt else probe_logits,
+            model, rt.bank, probe_rows, None if qt else probe_logits, recipe=recipe,
         )
         probe.update({
             "checkpoint": str(checkpoint),
@@ -828,8 +827,8 @@ def _attach_student_gradient_probes(
 
 
 def smoke(protocol_path: Path, run_root: Path) -> None:
-    _gpu_guard()
     rt = load_runtime(protocol_path, run_root)
+    _gpu_guard(rt.paths)
     if read_json(rt.paths.run_root / "PHASE_STATUS.json")["status"] != "PASS_READY_FOR_SMOKE":
         raise RuntimeError("prepare and CPU integration gates must pass before smoke")
     validation = read_json(rt.paths.run_root / "tests" / "integration" / "VALIDATION_RECEIPT.json")
@@ -862,10 +861,20 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     smoke_labels = dataclasses.replace(rt.labels, edge_anchors=subset_anchors)
     edge_lists = build_c1_edge_lists(smoke_labels, raw, rt.z_store, 13, raw_et)
 
+    teacher_ta = rt.protocol["teacher"]["TA"]
+    teacher_tb = rt.protocol["teacher"]["TB"]
+    recipe = StudentRecipe.from_protocol(rt.protocol)
+    student_kwargs = dict(
+        lr_p=recipe.lr_p, lr_r=recipe.lr_r, logit_scale=recipe.logit_scale,
+        anchor_weight=recipe.anchor_weight, clip_norm=recipe.clip_norm,
+    )
     _set_seed(13, "SMOKE_TA")
     ta_model = _teacher()
     ta_end = train_ta(
-        ta_model, rt.bank, ta_records, rt.labels, epochs=2, logical_batch=8,
+        ta_model, rt.bank, ta_records, rt.labels,
+        epochs=int(teacher_ta["epochs"]), lr=float(teacher_ta["lr"]),
+        weight_decay=float(teacher_ta["wd"]), logical_batch=int(teacher_ta["logical_batch_queries"]),
+        support_weight=float(teacher_ta["support_weight"]),
         save_dir=smoke_root / "TA", seed=13,
     )
     tb_models = {}
@@ -873,7 +882,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
         _set_seed(13, "SMOKE_TB_SHARED")
         model = _load_teacher(ta_end)
         train_tb(
-            model, rt.bank, tb_records, mode=mode, logical_batch=8,
+            model, rt.bank, tb_records, mode=mode,
+            epochs=int(teacher_tb["epochs"]), lr=float(teacher_tb["lr"]),
+            weight_decay=float(teacher_tb["wd"]), logical_batch=int(teacher_tb["logical_batch_queries"]),
+            direct_weight=float(teacher_tb["path_direct_weight"]),
+            aggregate_weight=float(teacher_tb["path_aggregate_weight"]),
+            support_weight=float(teacher_tb["support_weight"]),
             save_dir=smoke_root / f"TB_{mode.upper()}", seed=13,
         )
         tb_models[mode] = model
@@ -881,12 +895,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     native = NativeStudent(rt.pca_basis, rt.pca_mean)
     native_points = train_student_c1(
         native, edge_lists, None, rt.bank, arm="NATIVE_SUP", logical_batch=64,
-        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13,
+        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, **student_kwargs,
     )
     qt = QTStudent(rt.pca_basis, rt.pca_mean)
     train_student_c1(
         qt, edge_lists, None, rt.bank, arm="QT_SUP", logical_batch=64,
-        save_dir=smoke_root / "QT_C1_SUP", seed=13,
+        save_dir=smoke_root / "QT_C1_SUP", seed=13, **student_kwargs,
     )
     native_parent = native_points[1.0]
     native_selected = _load_native(native_parent, rt)
@@ -904,7 +918,9 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     train_student_c2(
         kd_model, c2_records, tb_models["cqet"], rt.bank, arm="NATIVE_KD",
         logical_batch=64, save_dir=smoke_root / "NATIVE_C2_KD", seed=13,
-        expected_parent_hash=parent_hash, max_updates=1,
+        expected_parent_hash=parent_hash, max_updates=1, **student_kwargs,
+        kd_weight=recipe.kd_weight, kd_temperature=recipe.kd_temperature,
+        random_negatives=recipe.random_negatives, negative_pool=rt.labels.legal_targets,
     )
     result = {
         "schema_version": VERSION,
@@ -1015,14 +1031,27 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         "raw_dev_pool_manifest": sha256_file(seed_dir / "eval" / "dev" / "raw" / "POOL_MANIFEST.json"),
     }
 
+    teacher_ta = rt.protocol["teacher"]["TA"]
+    teacher_tb = rt.protocol["teacher"]["TB"]
+    recipe = StudentRecipe.from_protocol(rt.protocol)
+    c1_epochs = int(rt.protocol["student"]["C1"]["epochs"])
+    c1_batch = int(rt.protocol["student"]["C1"]["logical_batch_edge_lists"])
+    c2_epochs = int(rt.protocol["student"]["C2"]["epochs"])
+    c2_batch = int(rt.protocol["student"]["C2"]["logical_batch_queries"])
+    student_kwargs = dict(
+        lr_p=recipe.lr_p, lr_r=recipe.lr_r, logit_scale=recipe.logit_scale,
+        anchor_weight=recipe.anchor_weight, clip_norm=recipe.clip_norm,
+    )
+
     _set_seed(seed, "TA")
     ta_model = _teacher()
+    ta_batch = int(teacher_ta["logical_batch_queries"])
     ta_config = {
-        **rt.protocol["teacher"]["TA"],
-        "optimizer_steps": 2 * ((len(ta_records) + 7) // 8),
+        **teacher_ta,
+        "optimizer_steps": int(teacher_ta["epochs"]) * ((len(ta_records) + ta_batch - 1) // ta_batch),
         "order_sha256_by_epoch": {
             str(epoch): _order_sha(_hash_order(ta_records, "TA", seed, epoch))
-            for epoch in (1, 2)
+            for epoch in range(1, int(teacher_ta["epochs"]) + 1)
         },
         "numerical_layout": teacher_numerical_layout(),
     }
@@ -1031,15 +1060,19 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         config=ta_config, inputs=common_inputs, lists={"TA": hashes["TA"]},
         action=lambda ckpts, log, attempt: train_ta(
             ta_model, rt.bank, ta_records, rt.labels, save_dir=ckpts,
+            epochs=int(teacher_ta["epochs"]), lr=float(teacher_ta["lr"]),
+            weight_decay=float(teacher_ta["wd"]), logical_batch=ta_batch,
+            support_weight=float(teacher_ta["support_weight"]),
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
     ta_hash = _checkpoint_state(ta_ckpt)
 
     tb_ckpts = {}
+    tb_batch = int(teacher_tb["logical_batch_queries"])
     tb_config = {
-        **rt.protocol["teacher"]["TB"],
-        "optimizer_steps": (len(tb_records) + 7) // 8,
+        **teacher_tb,
+        "optimizer_steps": int(teacher_tb["epochs"]) * ((len(tb_records) + tb_batch - 1) // tb_batch),
         "order_sha256": _order_sha(_hash_order(tb_records, "TB_SHARED", seed, 1)),
         "numerical_layout": teacher_numerical_layout(),
     }
@@ -1055,6 +1088,11 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
             inputs=common_inputs, lists={"TB_SHARED": hashes["TB_SHARED"]},
             action=lambda ckpts, log, attempt, model=model, mode=mode: train_tb(
                 model, rt.bank, tb_records, mode=mode, save_dir=ckpts,
+                epochs=int(teacher_tb["epochs"]), lr=float(teacher_tb["lr"]),
+                weight_decay=float(teacher_tb["wd"]), logical_batch=tb_batch,
+                direct_weight=float(teacher_tb["path_direct_weight"]),
+                aggregate_weight=float(teacher_tb["path_aggregate_weight"]),
+                support_weight=float(teacher_tb["support_weight"]),
                 seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
             ),
         )
@@ -1063,19 +1101,20 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     c1_native_order = _hash_order(edge_lists, "C1_NATIVE", seed, 1)
     c1_qt_records = [row for row in edge_lists if row["relation"] == "QT"]
     c1_qt_order = _hash_order(c1_qt_records, "C1_QT", seed, 1)
-    c1_layout = {"logical_batch": 64, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]}
+    c1_layout = {"logical_batch": c1_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]}
     native_c1_points = _run_stage(
         rt, seed, "NATIVE_C1_SUP",
         parents={"PCA": sha256_file(rt.paths.pca_dir / "basis.pt")},
         config={
-            **rt.protocol["student"]["C1"],
-            "optimizer_steps": (len(c1_native_order) + 63) // 64,
+            **rt.protocol["student"]["C1"], **recipe.as_dict(),
+            "optimizer_steps": c1_epochs * ((len(c1_native_order) + c1_batch - 1) // c1_batch),
             "order_sha256": _order_sha(c1_native_order),
             "numerical_layout": c1_layout,
         }, inputs=common_inputs,
         lists={"C1_NATIVE": hashes["C1_NATIVE"]},
         action=lambda ckpts, log, attempt: train_student_c1(
             native_c1, edge_lists, None, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
+            epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
@@ -1084,14 +1123,15 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         rt, seed, "QT_C1_SUP",
         parents={"PCA": sha256_file(rt.paths.pca_dir / "basis.pt")},
         config={
-            **rt.protocol["student"]["C1"],
-            "optimizer_steps": (len(c1_qt_order) + 63) // 64,
+            **rt.protocol["student"]["C1"], **recipe.as_dict(),
+            "optimizer_steps": c1_epochs * ((len(c1_qt_order) + c1_batch - 1) // c1_batch),
             "order_sha256": _order_sha(c1_qt_order),
             "numerical_layout": c1_layout,
         }, inputs=common_inputs,
         lists={"C1_QT": hashes["C1_QT"]},
         action=lambda ckpts, log, attempt: train_student_c1(
             qt_c1, edge_lists, None, rt.bank, arm="QT_SUP", save_dir=ckpts,
+            epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
@@ -1128,11 +1168,17 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     parent_hash = native_c1_selection["selected_state_sha256"]
     c2_order = _hash_order(c2_records, "C2_SHARED", seed, 1)
     c2_config = {
-        **rt.protocol["student"]["C2"],
-        "optimizer_steps": (len(c2_order) + 63) // 64,
+        **rt.protocol["student"]["C2"], **recipe.as_dict(),
+        "optimizer_steps": c2_epochs * ((len(c2_order) + c2_batch - 1) // c2_batch),
         "order_sha256": _order_sha(c2_order),
-        "numerical_layout": {"logical_batch": 64, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
+        "negative_pool": "legal_targets",
+        "numerical_layout": {"logical_batch": c2_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
     }
+    c2_kwargs = dict(
+        **student_kwargs, kd_weight=recipe.kd_weight, kd_temperature=recipe.kd_temperature,
+        random_negatives=recipe.random_negatives, negative_pool=rt.labels.legal_targets,
+        epochs=c2_epochs, logical_batch=c2_batch,
+    )
 
     native_sup = _load_native(Path(native_c1_selection["selected_checkpoint"]), rt)
     native_sup_points = _run_stage(
@@ -1143,7 +1189,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
             native_sup, c2_records, None, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
-            seed=seed, expected_parent_hash=parent_hash,
+            seed=seed, expected_parent_hash=parent_hash, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
     )
@@ -1181,7 +1227,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
             native_kd, c2_records, cqet_teacher, rt.bank, arm="NATIVE_KD", save_dir=ckpts,
-            seed=seed, expected_parent_hash=parent_hash, teacher_logits=logits,
+            seed=seed, expected_parent_hash=parent_hash, teacher_logits=logits, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
     )
@@ -1196,7 +1242,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
             qt_c2, c2_records, None, rt.bank, arm="QT_SUP", save_dir=ckpts,
-            seed=seed, expected_parent_hash=qt_parent_hash,
+            seed=seed, expected_parent_hash=qt_parent_hash, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
     )
@@ -1214,6 +1260,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     gradient_summary = _attach_student_gradient_probes(
         rt, seed, c2_records, logits,
         native_c1_selection, qt_c1_selection, native_c2_selection, qt_c2_selection,
+        recipe=recipe,
     )
     write_json(selections / "NATIVE_C1.json", native_c1_selection)
     write_json(selections / "QT_C1.json", qt_c1_selection)
@@ -1760,8 +1807,8 @@ def _verify_delivery_manifest(rt: Runtime) -> None:
 
 
 def run_formal(protocol_path: Path, run_root: Path) -> None:
-    _gpu_guard()
     rt = load_runtime(protocol_path, run_root)
+    _gpu_guard(rt.paths)
     assert_declared_project_imports(rt.paths)
     smoke_result = read_json(rt.paths.run_root / "tests" / "smoke" / "LATEST.json")
     if smoke_result.get("status") != "PASS" or smoke_result["source_identity_sha256"] != source_identity(rt.paths):

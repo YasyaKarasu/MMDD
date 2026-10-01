@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from . import SCHEMA_VERSION
 from .execution_layout import TEACHER_INFERENCE_CHUNK
 from .artifacts import pool_identity
 from .data import sha256_file, utf8_sorted, write_json, write_jsonl_gz
@@ -543,7 +544,7 @@ def evaluate_teacher_matrix(
                     ranked_ids = [targets[i] for i in order]
                     ranked_scores = [float(scores[i]) for i in order]
                     row = {
-                        "schema_version": "4.1.0",
+                        "schema_version": SCHEMA_VERSION,
                         "query_id": query_id,
                         "split": split,
                         "seed": seed,
@@ -577,7 +578,7 @@ def evaluate_teacher_matrix(
                     for target_i, target_id in enumerate(targets):
                         logit_rows[(teacher_name, view)].append(
                             {
-                                "schema_version": "4.1.0",
+                                "schema_version": SCHEMA_VERSION,
                                 "query_id": query_id,
                                 "target_id": target_id,
                                 "split": split,
@@ -612,7 +613,7 @@ def evaluate_teacher_matrix(
     write_json(
         output_dir / "SWAP_COLLISIONS.json",
         {
-            "schema_version": "4.1.0",
+            "schema_version": SCHEMA_VERSION,
             "split": split,
             "generator": generator,
             "pool_kind": pool_kind,

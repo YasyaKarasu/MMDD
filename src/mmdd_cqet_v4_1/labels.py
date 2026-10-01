@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import SCHEMA_VERSION
 from .config import Paths
 from .data import (
     iter_jsonl,
@@ -211,7 +212,7 @@ def build_labels(paths: Paths, canonical_map: dict[str, str]) -> dict:
         labels_dir / "training_exposure.jsonl.gz",
         (
             {
-                "schema_version": "4.1.0",
+                "schema_version": SCHEMA_VERSION,
                 "query_id": qid,
                 "split": "train",
                 "eligible": qid in gold,
@@ -225,7 +226,7 @@ def build_labels(paths: Paths, canonical_map: dict[str, str]) -> dict:
     contract_dir = labels_dir / "train"
     query_contract = [
         {
-            "schema_version": "4.1.0",
+            "schema_version": SCHEMA_VERSION,
             "query_id": row["query_id"],
             "split": "train",
             "source_group": row["source_group"],
@@ -234,13 +235,13 @@ def build_labels(paths: Paths, canonical_map: dict[str, str]) -> dict:
         for row in query_records
     ]
     qrel_contract = [
-        {"schema_version": "4.1.0", "query_id": qid, "target_id": target, "rel": 1}
+        {"schema_version": SCHEMA_VERSION, "query_id": qid, "target_id": target, "rel": 1}
         for qid in utf8_sorted(gold)
         for target in utf8_sorted(gold[qid])
     ]
     witness_contract = [
         {
-            "schema_version": "4.1.0",
+            "schema_version": SCHEMA_VERSION,
             "query_id": row["query_id"],
             "target_id": target,
             "evidence_id": evidence,
@@ -253,7 +254,7 @@ def build_labels(paths: Paths, canonical_map: dict[str, str]) -> dict:
     ]
     closure_contract = [
         {
-            "schema_version": "4.1.0",
+            "schema_version": SCHEMA_VERSION,
             "query_id": row["query_id"],
             "G": row["G"],
             "W": row["W"],
@@ -269,7 +270,7 @@ def build_labels(paths: Paths, canonical_map: dict[str, str]) -> dict:
         }
         for row in query_records
     ]
-    edge_contract = [{"schema_version": "4.1.0", **row} for row in edge_anchors]
+    edge_contract = [{"schema_version": SCHEMA_VERSION, **row} for row in edge_anchors]
     write_jsonl_gz(contract_dir / "queries.jsonl.gz", query_contract)
     write_jsonl_gz(contract_dir / "qrels.jsonl.gz", qrel_contract)
     write_jsonl_gz(contract_dir / "witness.jsonl.gz", witness_contract)
@@ -306,7 +307,7 @@ def export_eval_labels(paths: Paths, canonical_map: dict[str, str], split: str) 
     rows_by_name = {
         "queries.jsonl": [
             {
-                "schema_version": "4.1.0",
+                "schema_version": SCHEMA_VERSION,
                 "query_id": qid,
                 "split": split,
                 "source_group": gt[qid]["source_group"],
@@ -315,13 +316,13 @@ def export_eval_labels(paths: Paths, canonical_map: dict[str, str], split: str) 
             for qid in utf8_sorted(gt)
         ],
         "qrels.jsonl": [
-            {"schema_version": "4.1.0", "query_id": qid, "target_id": target, "rel": 1}
+            {"schema_version": SCHEMA_VERSION, "query_id": qid, "target_id": target, "rel": 1}
             for qid in utf8_sorted(gt)
             for target in gt[qid]["G"]
         ],
         "witness.jsonl": [
             {
-                "schema_version": "4.1.0",
+                "schema_version": SCHEMA_VERSION,
                 "query_id": qid,
                 "target_id": target,
                 "evidence_id": evidence,

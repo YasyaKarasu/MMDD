@@ -1123,3 +1123,169 @@ def test_teacher_list_scorer_keeps_chunk_as_the_oom_knob():
     for name in ("adapters.table.weight", "globals.table.0.weight", "scoring_head.0.weight"):
         assert model.get_parameter(name).grad is not None
     assert model.rel.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# V4.2 student recipe: scaled logits, tempered KD, random negatives, protocol wiring
+# ---------------------------------------------------------------------------
+
+def _mixed_evidence_fixture():
+    """Two targets with text and image paths, a third with no bag; random P/R so the
+    bilinear scores are not trivially symmetric."""
+    torch.manual_seed(7)
+    vectors = {
+        "q0": torch.randn(4), "tp": torch.randn(4), "tn": torch.randn(4), "tx": torch.randn(4),
+        "ea": torch.randn(4), "eb": torch.randn(4), "ec": torch.randn(4),
+    }
+    kinds = {"q0": "table", "tp": "table", "tn": "table", "tx": "table",
+             "ea": "text", "eb": "image", "ec": "text"}
+    bank = TinyBank(vectors, kinds)
+    row = {"query_id": "q0", "targets": ["tp", "tn", "tx"], "positives": ["tp"],
+           "natural_bags": {"tp": ["ea", "eb"], "tn": ["ec", "eb"], "tx": []}}
+    student = NativeStudent(torch.randn(2, 4), torch.zeros(4), dim=2)
+    with torch.no_grad():
+        for parameter in student.parameters():
+            parameter.add_(0.3 * torch.randn_like(parameter))
+    return bank, row, student
+
+
+def _reference_c2_scores(student, bank, row, scale):
+    """The original per-path Python loop, kept as the oracle for the gathered version."""
+    from mmdd_cqet_v4_1.losses import aggregate_cqet as agg
+
+    targets = row["targets"]
+    uq = student.u("table", bank.z(row["query_id"]))
+    ut = student.u("table", bank.z_many(targets))
+    direct = scale * (uq @ student.R["QT"] * ut).sum(-1)
+    flat = [(i, e) for i, t in enumerate(targets) for e in row["natural_bags"].get(t, [])]
+    scores = []
+    for target_i, e in flat:
+        modality = bank.kind(e)
+        ue = student.u(modality, bank.z(e))
+        qe = (uq @ student.R[f"Q_{modality}"] * ue).sum()
+        et = ((ue @ student.R[f"{modality}_T"]) * ut[target_i]).sum()
+        scores.append(scale * (qe + et))
+    aggregate = agg(direct, torch.stack(scores), torch.tensor([i for i, _ in flat]))
+    bag_targets = [i for i, t in enumerate(targets) if row["natural_bags"].get(t)]
+    return direct, aggregate[bag_targets]
+
+
+def test_student_c2_scores_gathered_paths_match_per_path_loop():
+    from mmdd_cqet_v4_1.train import _student_c2_scores
+
+    bank, row, student = _mixed_evidence_fixture()
+    direct, evidence, bag_targets, evidence_ids = _student_c2_scores(student, bank, row, logit_scale=20.0)
+    ref_direct, ref_evidence = _reference_c2_scores(student, bank, row, 20.0)
+    assert torch.allclose(direct, ref_direct, atol=1e-6)
+    assert torch.allclose(evidence, ref_evidence, atol=1e-6)
+    assert [t for _, t in bag_targets] == ["tp", "tn"]
+    assert set(evidence_ids) == {"ea", "eb", "ec"}
+    # scale enters every bilinear term, so halving it halves the direct logits exactly
+    half, _, _, _ = _student_c2_scores(student, bank, row, logit_scale=10.0)
+    assert torch.allclose(half, direct / 2)
+
+
+def test_random_negatives_are_deterministic_and_exclude_pool_and_positives():
+    from mmdd_cqet_v4_1.train import _random_negative_ids
+
+    pool = [f"t{i}" for i in range(50)]
+    first = _random_negative_ids(pool, {"t3", "t7"}, 8, "C2_SHARED", 13, 1, "q0")
+    again = _random_negative_ids(pool, {"t3", "t7"}, 8, "C2_SHARED", 13, 1, "q0")
+    assert first == again and len(first) == 8 and len(set(first)) == 8
+    assert not {"t3", "t7"} & set(first)
+    assert first != _random_negative_ids(pool, {"t3", "t7"}, 8, "C2_SHARED", 13, 2, "q0")
+    assert first != _random_negative_ids(pool, {"t3", "t7"}, 8, "C2_SHARED", 13, 1, "q1")
+    # a pool that is fully excluded yields nothing instead of looping forever
+    assert _random_negative_ids(["a", "b"], {"a", "b"}, 4, "C2_SHARED", 13, 1, "q0") == []
+
+
+def test_c2_random_negatives_enter_the_sup_loss_and_are_logged(tmp_path: Path):
+    bank, records, basis, mean = tiny_fixture()
+    bank.vectors["far"] = torch.tensor([-0.9, -0.1, -0.3, 0.2])
+    bank.kinds["far"] = "table"
+    base = NativeStudent(basis, mean, dim=2)
+    parent_hash = model_state_sha(base)
+    common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=1, seed=13,
+                  expected_parent_hash=parent_hash, max_updates=1)
+    with_negs = copy.deepcopy(base)
+    train_student_c2(with_negs, records, None, bank, random_negatives=4,
+                     negative_pool=["tp", "tn", "tx", "far"], log_path=tmp_path / "negs.jsonl", **common)
+    without = copy.deepcopy(base)
+    train_student_c2(without, records, None, bank, random_negatives=0, **common)
+    assert model_state_sha(with_negs) != model_state_sha(without)
+    row = json.loads((tmp_path / "negs.jsonl").read_text().splitlines()[0])
+    assert row["random_negatives"] == 4 and row["negative_pool_size"] == 4
+    assert row["logit_scale"] == 20.0 and row["P_lr"] == 1e-4 and row["R_lr"] == 1e-3
+    assert row["sigma1_R_QT_minus_I"] >= row["sigma2_R_QT_minus_I"] >= 0.0
+
+
+def test_kd_temperature_divides_teacher_logits():
+    bank, records, basis, mean = tiny_fixture()
+    base = NativeStudent(basis, mean, dim=2)
+    parent_hash = model_state_sha(base)
+    hot = {"q0": (torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0]))}
+    cooled = {"q0": (hot["q0"][0] / 5.0, hot["q0"][1] / 5.0)}
+    common = dict(device="cpu", arm="NATIVE_KD", logical_batch=1, seed=29,
+                  expected_parent_hash=parent_hash, max_updates=1, random_negatives=0)
+    tempered = copy.deepcopy(base)
+    train_student_c2(tempered, records, None, bank, teacher_logits=hot, kd_temperature=5.0, **common)
+    pre_divided = copy.deepcopy(base)
+    train_student_c2(pre_divided, records, None, bank, teacher_logits=cooled, kd_temperature=1.0, **common)
+    assert model_state_sha(tempered) == model_state_sha(pre_divided)
+    untempered = copy.deepcopy(base)
+    train_student_c2(untempered, records, None, bank, teacher_logits=hot, kd_temperature=1.0, **common)
+    assert model_state_sha(tempered) != model_state_sha(untempered)
+
+
+def test_c1_uses_logit_scale_and_optional_anchor(tmp_path: Path):
+    bank, _records, basis, mean = tiny_fixture()
+    edges = [{"item_id": "e0", "relation": "QT", "anchor_id": "q0",
+              "candidates": ["tp", "tn", "tx"], "positives": ["tp"]}]
+    base = NativeStudent(basis, mean, dim=2)
+    scaled = copy.deepcopy(base)
+    train_student_c1(scaled, edges, None, bank, device="cpu", logical_batch=1, logit_scale=20.0,
+                     log_path=tmp_path / "c1.jsonl")
+    flat = copy.deepcopy(base)
+    train_student_c1(flat, edges, None, bank, device="cpu", logical_batch=1, logit_scale=1.0)
+    assert model_state_sha(scaled) != model_state_sha(flat)
+    row = json.loads((tmp_path / "c1.jsonl").read_text().splitlines()[0])
+    assert row["logit_scale"] == 20.0 and row["anchor_weight"] == 0.0
+    assert "sigma1_R_QT_minus_I" in row
+
+
+def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
+    from mmdd_cqet_v4_1 import EXPERIMENT_ID, VERSION
+    from mmdd_cqet_v4_1.config import load_protocol, resolve_default_paths, validate_protocol
+    from mmdd_cqet_v4_1.train import StudentRecipe
+
+    template = Path("/home/oycy/MMDD/configs/mmdd_stage1_cqet_protocol.json")
+    protocol = json.loads(template.read_text())
+    assert protocol["experiment_id"] == EXPERIMENT_ID and protocol["version"] == VERSION
+    validate_protocol(protocol)
+    recipe = StudentRecipe.from_protocol(protocol)
+    assert (recipe.lr_p, recipe.lr_r, recipe.logit_scale) == (1e-4, 1e-3, 20.0)
+    assert (recipe.kd_weight, recipe.kd_temperature, recipe.random_negatives) == (1.0, 10.0, 256)
+    assert recipe.anchor_weight == 0.0
+
+    protocol["hardware"]["uuid"] = "GPU-deadbeef"
+    protocol["paths"]["run_root"] = str(tmp_path / "run")
+    protocol["paths"]["dataset_root"] = "relative/dataset"
+    protocol_path = tmp_path / "protocol.json"
+    protocol_path.write_text(json.dumps(protocol))
+    paths = resolve_default_paths(protocol_path, tmp_path / "run")
+    assert paths.gpu_uuid == "GPU-deadbeef" and paths.gpu_physical_index == 0
+    assert paths.dataset_root == Path("/home/oycy/MMDD/relative/dataset")
+    assert paths.package_dir is None  # preflight then defaults to <run_root>/protocol_package
+    with pytest.raises(ValueError, match="run root is fixed by protocol"):
+        resolve_default_paths(protocol_path, tmp_path / "elsewhere")
+
+    for broken, match in (
+        ({"paths": {k: v for k, v in protocol["paths"].items() if k != "dataset_root"}}, "paths block is missing"),
+        ({"hardware": {**protocol["hardware"], "uuid": "0"}}, "full GPU UUID"),
+        ({"student": {**protocol["student"], "temperature": 0}}, "must be positive"),
+        ({"student": {k: v for k, v in protocol["student"].items() if k != "random_negatives"}}, "random_negatives"),
+        ({"version": "4.1.0"}, "Unexpected version"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            validate_protocol({**protocol, **broken})
+    assert load_protocol(protocol_path)["student"]["logit_scale"] == 20.0

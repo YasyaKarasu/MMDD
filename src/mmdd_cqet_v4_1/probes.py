@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from . import SCHEMA_VERSION
 from .data import sha256_file, write_json, write_jsonl_gz
 from .features import ObjectBank
 from .losses import (
@@ -20,7 +21,7 @@ from .losses import (
 from .models import FreshPathTeacher, NativeStudent, QTStudent
 if TYPE_CHECKING:
     from .retrieval import PoolRecord
-from .train import TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids
+from .train import StudentRecipe, TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids
 from .execution_layout import TEACHER_INFERENCE_CHUNK
 
 
@@ -171,7 +172,7 @@ def teacher_content_probe(
                     else:
                         witness_without_natural_competitor += 1
                 rows.append({
-                    "schema_version": "4.1.0",
+                    "schema_version": SCHEMA_VERSION,
                     "seed": seed,
                     "checkpoint": str(checkpoint),
                     "checkpoint_sha256": checkpoint_sha256,
@@ -222,7 +223,7 @@ def teacher_content_probe(
     raw_path = output_dir / "CONTENT_ABLATIONS.jsonl.gz"
     write_jsonl_gz(raw_path, rows)
     summary = {
-        "schema_version": "4.1.0",
+        "schema_version": SCHEMA_VERSION,
         "seed": seed,
         "teacher": teacher_name,
         "mode": mode,
@@ -420,8 +421,9 @@ def _student_component(
     component: str,
     teacher_logits: Optional[tuple[Tensor, Optional[Tensor]]],
     scale: float,
+    recipe: StudentRecipe,
 ) -> Optional[float]:
-    direct, evidence, bag_targets, _ = _student_c2_scores(model, bank, row)
+    direct, evidence, bag_targets, _ = _student_c2_scores(model, bank, row, recipe.logit_scale)
     positives = set(row["positives"])
     direct_positive = torch.tensor(
         [target in positives for target in row["targets"]], device=direct.device
@@ -436,14 +438,14 @@ def _student_component(
             if evidence_loss is not None:
                 loss = evidence_loss if loss is None else loss + evidence_loss
     elif component == "direct_KD" and teacher_logits is not None and not isinstance(model, QTStudent):
-        loss = list_kl_divergence(direct, teacher_logits[0].to(direct.device))
+        loss = list_kl_divergence(direct, teacher_logits[0].to(direct.device) / recipe.kd_temperature)
     elif (
         component == "evidence_KD" and teacher_logits is not None
         and not isinstance(model, QTStudent) and evidence is not None and teacher_logits[1] is not None
     ):
-        loss = list_kl_divergence(evidence, teacher_logits[1].to(evidence.device))
-    elif component == "anchor":
-        loss = 0.1 * model.anchor_loss()
+        loss = list_kl_divergence(evidence, teacher_logits[1].to(evidence.device) / recipe.kd_temperature)
+    elif component == "anchor" and recipe.anchor_weight:
+        loss = recipe.anchor_weight * model.anchor_loss()
     else:
         loss = None
     if loss is None:
@@ -459,7 +461,9 @@ def student_gradient_probe(
     teacher_logits: Optional[
         Mapping[str, tuple[Tensor, Optional[Tensor]]] | tuple[Tensor, Optional[Tensor]]
     ],
+    recipe: StudentRecipe = StudentRecipe(),
 ) -> dict[str, Any]:
+    """Per-component gradient norms and cosines under the same scale/temperature as training."""
     records = [rows] if isinstance(rows, dict) else list(rows)
     if teacher_logits is None:
         logits_by_query = {}
@@ -512,11 +516,19 @@ def student_gradient_probe(
         for row in active:
             loss = _student_component(
                 model, bank, row, component,
-                logits_by_query.get(row["query_id"]), scale=1.0 / len(active),
+                logits_by_query.get(row["query_id"]), scale=1.0 / len(active), recipe=recipe,
             )
             if loss is None:
+                if component == "anchor" and not recipe.anchor_weight:
+                    break
                 raise RuntimeError("prevalidated Student probe component became inactive")
             losses.append(loss)
+        if not losses:
+            values[component] = {
+                "loss": None, "gradient_norm": None, "parameter_count": 0,
+                "active_queries": 0, "reason": "anchor_weight_zero",
+            }
+            continue
         vector = _gradient_vector(model)
         values[component] = {
             "loss": float(np.mean(losses)),
@@ -530,6 +542,7 @@ def student_gradient_probe(
     return {
         "probe_query_ids": [row["query_id"] for row in records],
         "probe_query_count": len(records),
+        "recipe": recipe.as_dict(),
         "components": values,
         "gradient_cosines": _cosines(vectors),
     }
