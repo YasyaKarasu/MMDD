@@ -1,4 +1,9 @@
-"""Fail-closed input, feature-recipe, cache, and alias preflight for Stage-1 CQET."""
+"""Fail-closed input, feature-recipe, cache, and alias preflight for Stage-1 CQET.
+
+``run_lock`` hashes the dataset, backbone and frozen feature cache into identity files under the
+run root and derives the canonical content aliases; ``verify_feature_provenance`` re-encodes a
+fixed sample with the original batching recipes and compares it with the cache (GPU).
+"""
 from __future__ import annotations
 
 import gzip
@@ -6,51 +11,21 @@ import hashlib
 import json
 import platform
 import subprocess
-import sys
 import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable
 
 import numpy as np
 import torch
 from PIL import Image, ImageFile, ImageOps
-from torch.nn import functional as F
 
 from . import EXPERIMENT_ID, SCHEMA_VERSION
 from .config import Paths
-
+from .data import iter_jsonl, json_identity, sha256_file, write_json, write_jsonl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Bound by configure() from the protocol's ``paths`` / ``hardware`` blocks; never hardcoded.
-DATASET_ROOT: Path = None
-BACKBONE_DIR: Path = None
-PURE_CACHE_DIR: Path = None
-UPSTREAM_CACHE_DIR: Path = None
-UPSTREAM_DATA_DIR: Path = None
-PACKAGE_DIR: Path = None
-RUN_ROOT: Path = None
-GPU_UUID: str = None
-
-
-def configure(paths: Paths) -> None:
-    """Bind the module to one run. ``package_dir`` holds ``next_round/protocol.json``."""
-    global DATASET_ROOT, BACKBONE_DIR, PURE_CACHE_DIR, UPSTREAM_CACHE_DIR, UPSTREAM_DATA_DIR
-    global PACKAGE_DIR, RUN_ROOT, GPU_UUID
-    DATASET_ROOT = paths.dataset_root
-    BACKBONE_DIR = paths.backbone_dir
-    PURE_CACHE_DIR = paths.pure_cache_dir
-    UPSTREAM_CACHE_DIR = paths.upstream_cache_dir or paths.row_cache_manifest.parent
-    UPSTREAM_DATA_DIR = paths.upstream_data_dir
-    PACKAGE_DIR = paths.package_dir or paths.run_root / "protocol_package"
-    RUN_ROOT = paths.run_root
-    GPU_UUID = paths.gpu_uuid
-
-
-def _require_configured() -> None:
-    if RUN_ROOT is None or DATASET_ROOT is None:
-        raise RuntimeError("preflight is not bound to a run; call preflight.configure(paths) first")
 
 # Match the real frozen extractor's image boundary. Dataset images are trusted
 # local inputs and some legitimately exceed Pillow's heuristic pixel ceiling.
@@ -58,17 +33,12 @@ Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _upstream_cache_dir(paths: Paths) -> Path:
+    return paths.upstream_cache_dir or paths.row_cache_manifest.parent
 
 
-def sha256_json(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _package_dir(paths: Paths) -> Path:
+    return paths.package_dir or paths.run_root / "protocol_package"
 
 
 def file_identity(path: Path, *, root: Path | None = None, role: str | None = None) -> dict[str, Any]:
@@ -84,51 +54,21 @@ def file_identity(path: Path, *, root: Path | None = None, role: str | None = No
     return record
 
 
-def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    with Path(path).open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise TypeError(f"{path}:{line_number}: expected object")
-            yield value
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-    temporary.replace(path)
-
-
-def _required_dataset_files() -> list[Path]:
-    paths = [
-        DATASET_ROOT / "dataset_manifest.json",
-        DATASET_ROOT / "splits.json",
-        DATASET_ROOT / "qrels.jsonl",
-        DATASET_ROOT / "query_tables" / "part-00000.jsonl",
-        DATASET_ROOT / "data_lake_tables" / "part-00000.jsonl",
-        DATASET_ROOT / "source_tables" / "part-00000.jsonl",
-        DATASET_ROOT / "evidence_recoveries" / "part-00000.jsonl",
+def _required_dataset_files(paths: Paths) -> list[Path]:
+    files = [
+        paths.dataset_root / "dataset_manifest.json",
+        paths.dataset_root / "splits.json",
+        paths.dataset_root / "qrels.jsonl",
+        paths.dataset_root / "query_tables" / "part-00000.jsonl",
+        paths.dataset_root / "data_lake_tables" / "part-00000.jsonl",
+        paths.dataset_root / "source_tables" / "part-00000.jsonl",
+        paths.dataset_root / "evidence_recoveries" / "part-00000.jsonl",
     ]
-    paths.extend(sorted((DATASET_ROOT / "bridge_assets").glob("part-*.jsonl")))
-    missing = [str(path) for path in paths if not path.is_file()]
+    files.extend(sorted((paths.dataset_root / "bridge_assets").glob("part-*.jsonl")))
+    missing = [str(path) for path in files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing original inputs: {missing}")
-    return paths
+    return files
 
 
 def _hash_files(paths: list[Path], *, root: Path, role: str) -> list[dict[str, Any]]:
@@ -137,12 +77,12 @@ def _hash_files(paths: list[Path], *, root: Path, role: str) -> list[dict[str, A
     return sorted(records, key=lambda row: str(row["path"]).encode("utf-8"))
 
 
-def validate_dataset() -> dict[str, Any]:
-    splits = json.loads((DATASET_ROOT / "splits.json").read_text(encoding="utf-8"))
+def validate_dataset(paths: Paths) -> dict[str, Any]:
+    splits = json.loads((paths.dataset_root / "splits.json").read_text(encoding="utf-8"))
     queries: dict[str, dict[str, str]] = {}
     split_counts: Counter[str] = Counter()
     source_groups: dict[str, str] = {}
-    for row in iter_jsonl(DATASET_ROOT / "query_tables" / "part-00000.jsonl"):
+    for row in iter_jsonl(paths.dataset_root / "query_tables" / "part-00000.jsonl"):
         query_id = str(row["table_id"])
         if query_id in queries:
             raise ValueError(f"duplicate query: {query_id}")
@@ -155,7 +95,7 @@ def validate_dataset() -> dict[str, Any]:
         split_counts[split] += 1
 
     targets: set[str] = set()
-    for row in iter_jsonl(DATASET_ROOT / "data_lake_tables" / "part-00000.jsonl"):
+    for row in iter_jsonl(paths.dataset_root / "data_lake_tables" / "part-00000.jsonl"):
         target_id = str(row["table_id"])
         if target_id in targets:
             raise ValueError(f"duplicate target: {target_id}")
@@ -163,7 +103,7 @@ def validate_dataset() -> dict[str, Any]:
 
     assets: set[str] = set()
     modality_counts: Counter[str] = Counter()
-    for part in sorted((DATASET_ROOT / "bridge_assets").glob("part-*.jsonl")):
+    for part in sorted((paths.dataset_root / "bridge_assets").glob("part-*.jsonl")):
         for row in iter_jsonl(part):
             asset_id = str(row["asset_id"])
             if asset_id in assets:
@@ -174,7 +114,7 @@ def validate_dataset() -> dict[str, Any]:
     qrel_pairs: set[tuple[str, str]] = set()
     gold_counts: Counter[str] = Counter()
     query_kinds: dict[str, set[str]] = defaultdict(set)
-    for row in iter_jsonl(DATASET_ROOT / "qrels.jsonl"):
+    for row in iter_jsonl(paths.dataset_root / "qrels.jsonl"):
         query_id = str(row["query_table_id"])
         target_id = str(row["target_table_id"])
         pair = (query_id, target_id)
@@ -191,7 +131,7 @@ def validate_dataset() -> dict[str, Any]:
             query_kinds[query_id].add(reason)
 
     recovery_count = 0
-    for row in iter_jsonl(DATASET_ROOT / "evidence_recoveries" / "part-00000.jsonl"):
+    for row in iter_jsonl(paths.dataset_root / "evidence_recoveries" / "part-00000.jsonl"):
         query_id = str(row["query_table_id"])
         target_id = str(row["target_table_id"])
         evidence = row.get("evidence") or {}
@@ -221,7 +161,7 @@ def validate_dataset() -> dict[str, Any]:
     }
 
 
-def _backbone_files() -> list[Path]:
+def _backbone_files(paths: Paths) -> list[Path]:
     names = (
         "config.json",
         "config_sentence_transformers.json",
@@ -237,28 +177,28 @@ def _backbone_files() -> list[Path]:
         "model.safetensors.index.json",
         "scripts/qwen3_vl_embedding.py",
     )
-    files = [BACKBONE_DIR / name for name in names]
-    files.extend(sorted(BACKBONE_DIR.glob("model-*.safetensors")))
+    files = [paths.backbone_dir / name for name in names]
+    files.extend(sorted(paths.backbone_dir.glob("model-*.safetensors")))
     missing = [str(path) for path in files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing frozen-backbone files: {missing}")
     return files
 
 
-def build_recipe_lock() -> dict[str, Any]:
+def build_recipe_lock(paths: Paths) -> dict[str, Any]:
     source_paths = [
         REPO_ROOT / "src" / "cache_stage1_features.py",
         REPO_ROOT / "src" / "run_stage1.py",
         REPO_ROOT / "src" / "mmdd_stage1" / "content.py",
         REPO_ROOT / "src" / "mmdd_stage1" / "content_encoder.py",
         REPO_ROOT / "src" / "mmdd_stage1" / "construction.py",
-        RUN_ROOT / "protocol.json",
+        paths.protocol_path,
     ]
     recipe = {
         "schema_version": SCHEMA_VERSION,
         "status": "SOURCE_RECOVERED_PENDING_NUMERIC_PROBE",
         "backbone": "Qwen3-VL-Embedding-8B",
-        "backbone_dir": str(BACKBONE_DIR),
+        "backbone_dir": str(paths.backbone_dir),
         "frozen": True,
         "compute_dtype": "bfloat16",
         "task_input_dtype": "float32",
@@ -305,18 +245,18 @@ def build_recipe_lock() -> dict[str, Any]:
         },
         "numeric_probe": {"samples_per_modality": 16, "train_queries": 16, "rtol": 1e-4, "atol": 1e-5},
         "source_files": _hash_files(source_paths, root=REPO_ROOT, role="frozen_recipe_source"),
-        "backbone_files": _hash_files(_backbone_files(), root=BACKBONE_DIR, role="frozen_backbone"),
+        "backbone_files": _hash_files(_backbone_files(paths), root=paths.backbone_dir, role="frozen_backbone"),
     }
-    recipe["recipe_sha256"] = sha256_json(recipe)
-    write_json(RUN_ROOT / "FROZEN_RECIPE_LOCK.json", recipe)
+    recipe["recipe_sha256"] = json_identity(recipe)
+    write_json(paths.run_root / "FROZEN_RECIPE_LOCK.json", recipe)
     return recipe
 
 
-def build_content_aliases() -> dict[str, Any]:
+def build_content_aliases(paths: Paths) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     groups: dict[tuple[str, str], list[str]] = defaultdict(list)
     image_file_cache: dict[str, tuple[str, str, int, int]] = {}
-    for part in sorted((DATASET_ROOT / "bridge_assets").glob("part-*.jsonl")):
+    for part in sorted((paths.dataset_root / "bridge_assets").glob("part-*.jsonl")):
         for raw in iter_jsonl(part):
             asset_id = str(raw["asset_id"])
             modality = str(raw["asset_type"])
@@ -380,7 +320,7 @@ def build_content_aliases() -> dict[str, Any]:
         row["alias_count"] = len(groups[key])
     rows.sort(key=lambda row: str(row["asset_id"]).encode("utf-8"))
 
-    output = RUN_ROOT / "CONTENT_ALIASES.jsonl.gz"
+    output = paths.run_root / "CONTENT_ALIASES.jsonl.gz"
     temporary = output.with_suffix(".jsonl.gz.tmp")
     output.parent.mkdir(parents=True, exist_ok=True)
     with temporary.open("wb") as raw_handle:
@@ -395,29 +335,29 @@ def build_content_aliases() -> dict[str, Any]:
         "alias_objects": sum(len(ids) - 1 for ids in groups.values()),
         "alias_groups": sum(len(ids) > 1 for ids in groups.values()),
         "modalities": dict(Counter(str(row["modality"]) for row in rows)),
-        "file": file_identity(output, root=RUN_ROOT, role="content_aliases"),
+        "file": file_identity(output, root=paths.run_root, role="content_aliases"),
     }
-    write_json(RUN_ROOT / "CONTENT_ALIAS_REPORT.json", report)
+    write_json(paths.run_root / "CONTENT_ALIAS_REPORT.json", report)
     return report
 
 
-def build_identity() -> dict[str, Any]:
-    protocol = RUN_ROOT / "protocol.json"
-    expected_protocol = PACKAGE_DIR / "next_round" / "protocol.json"
+def build_identity(paths: Paths) -> dict[str, Any]:
+    protocol = paths.protocol_path
+    expected_protocol = _package_dir(paths) / "next_round" / "protocol.json"
     if expected_protocol.exists() and sha256_file(protocol) != sha256_file(expected_protocol):
         raise ValueError("run protocol differs from delivered protocol")
-    dataset_files = _required_dataset_files()
-    dataset_records = _hash_files(dataset_files, root=DATASET_ROOT, role="original_dataset")
-    dataset_report = validate_dataset()
+    dataset_files = _required_dataset_files(paths)
+    dataset_records = _hash_files(dataset_files, root=paths.dataset_root, role="original_dataset")
+    dataset_report = validate_dataset(paths)
     dataset_identity = {
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
-        "root": str(DATASET_ROOT),
+        "root": str(paths.dataset_root),
         "files": dataset_records,
         "validation": dataset_report,
     }
-    dataset_identity["identity_sha256"] = sha256_json(dataset_identity)
-    write_json(RUN_ROOT / "DATASET_IDENTITY.json", dataset_identity)
+    dataset_identity["identity_sha256"] = json_identity(dataset_identity)
+    write_json(paths.run_root / "DATASET_IDENTITY.json", dataset_identity)
 
     try:
         git_head = subprocess.check_output(
@@ -428,35 +368,36 @@ def build_identity() -> dict[str, Any]:
     run_identity = {
         "schema_version": SCHEMA_VERSION,
         "experiment_id": EXPERIMENT_ID,
-        "protocol": file_identity(protocol, root=RUN_ROOT, role="protocol"),
+        "protocol": file_identity(protocol, root=paths.run_root, role="protocol"),
         "dataset_identity_sha256": dataset_identity["identity_sha256"],
         "git_head": git_head,
         "python": platform.python_version(),
         "torch": torch.__version__,
         "numpy": np.__version__,
         "historical_training_dependencies": [],
-        "declared_inputs": [str(DATASET_ROOT), str(BACKBONE_DIR), str(PURE_CACHE_DIR), str(UPSTREAM_CACHE_DIR)],
+        "declared_inputs": [str(paths.dataset_root), str(paths.backbone_dir), str(paths.pure_cache_dir), str(_upstream_cache_dir(paths))],
         "status": "PREFLIGHT_IN_PROGRESS",
     }
-    run_identity["identity_sha256"] = sha256_json(run_identity)
-    write_json(RUN_ROOT / "RUN_IDENTITY.json", run_identity)
+    run_identity["identity_sha256"] = json_identity(run_identity)
+    write_json(paths.run_root / "RUN_IDENTITY.json", run_identity)
     return run_identity
 
 
-def build_cache_manifest() -> dict[str, Any]:
-    paths = [PURE_CACHE_DIR / "z" / "z_index.json", PURE_CACHE_DIR / "z" / "z.f32.npy"]
-    paths.extend(sorted((PURE_CACHE_DIR / "content").glob("*.json")))
-    paths.extend(sorted((PURE_CACHE_DIR / "content" / "chunks").glob("chunk_*.npy")))
-    records = _hash_files(paths, root=PURE_CACHE_DIR, role="pure_frozen_cache")
-    write_jsonl(RUN_ROOT / "CACHE_MANIFEST.jsonl", records)
+def build_cache_manifest(paths: Paths) -> dict[str, Any]:
+    cache = paths.pure_cache_dir
+    files = [cache / "z" / "z_index.json", cache / "z" / "z.f32.npy"]
+    files.extend(sorted((cache / "content").glob("*.json")))
+    files.extend(sorted((cache / "content" / "chunks").glob("chunk_*.npy")))
+    records = _hash_files(files, root=cache, role="pure_frozen_cache")
+    write_jsonl(paths.run_root / "CACHE_MANIFEST.jsonl", records)
     report = {
         "status": "PASS",
         "files": len(records),
         "bytes": sum(int(row["bytes"]) for row in records),
-        "manifest": file_identity(RUN_ROOT / "CACHE_MANIFEST.jsonl", root=RUN_ROOT, role="cache_manifest"),
+        "manifest": file_identity(paths.run_root / "CACHE_MANIFEST.jsonl", root=paths.run_root, role="cache_manifest"),
     }
-    report["identity_sha256"] = sha256_json(report)
-    write_json(RUN_ROOT / "CACHE_IDENTITY.json", report)
+    report["identity_sha256"] = json_identity(report)
+    write_json(paths.run_root / "CACHE_IDENTITY.json", report)
     return report
 
 
@@ -473,10 +414,10 @@ def _hash_sample(rows: Iterable[dict[str, Any]], count: int, namespace: str) -> 
     return ranked[:count]
 
 
-def _feature_samples() -> dict[str, list[dict[str, Any]]]:
+def _feature_samples(paths: Paths) -> dict[str, list[dict[str, Any]]]:
     query_split = {
         str(row["table_id"]): str(row["split"])
-        for row in iter_jsonl(DATASET_ROOT / "query_tables" / "part-00000.jsonl")
+        for row in iter_jsonl(paths.dataset_root / "query_tables" / "part-00000.jsonl")
     }
     categories: dict[str, list[dict[str, Any]]] = {
         "target_table": [],
@@ -484,7 +425,7 @@ def _feature_samples() -> dict[str, list[dict[str, Any]]]:
         "image": [],
         "train_query": [],
     }
-    for row in iter_jsonl(UPSTREAM_DATA_DIR / "stage1_objects.jsonl"):
+    for row in iter_jsonl(paths.upstream_data_dir / "stage1_objects.jsonl"):
         object_id = str(row["object_id"])
         kind = str(row["object_type"])
         role = str(row.get("embedding_role") or "")
@@ -501,7 +442,7 @@ def _feature_samples() -> dict[str, list[dict[str, Any]]]:
 
 
 def _original_retrieval_batches(
-    selected_ids: set[str], teacher_ids: set[str]
+    paths: Paths, selected_ids: set[str], teacher_ids: set[str]
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
     """Recover exact original cache batches from the deterministic sharding script."""
     from cache_stage1_features import _base_object_batch_cost
@@ -519,7 +460,7 @@ def _original_retrieval_batches(
                 batch,
                 key=lambda row: _base_object_batch_cost(
                     row,
-                    input_dir=UPSTREAM_DATA_DIR,
+                    input_dir=paths.upstream_data_dir,
                     max_image_pixels=1843200,
                 ),
             )
@@ -531,7 +472,7 @@ def _original_retrieval_batches(
                         selected_batches[object_id] = chunk
         batch.clear()
 
-    for position, row in enumerate(iter_jsonl(UPSTREAM_DATA_DIR / "stage1_objects.jsonl")):
+    for position, row in enumerate(iter_jsonl(paths.upstream_data_dir / "stage1_objects.jsonl")):
         object_id = str(row["object_id"])
         shard = position % 2
         kind = str(row["object_type"])
@@ -555,7 +496,7 @@ def _original_retrieval_batches(
     return selected_batches, selected_records
 
 
-def _content_generation_batches(selected_ids: set[str]) -> dict[str, list[dict[str, Any]]]:
+def _content_generation_batches(paths: Paths, selected_ids: set[str]) -> dict[str, list[dict[str, Any]]]:
     batch_sizes = {"text": 8, "image": 4}
     pending: dict[tuple[str, int], list[dict[str, Any]]] = {
         (kind, shard): [] for kind in batch_sizes for shard in range(2)
@@ -567,7 +508,7 @@ def _content_generation_batches(selected_ids: set[str]) -> dict[str, list[dict[s
         for object_id in selected:
             result[object_id] = list(batch)
 
-    for part in sorted((DATASET_ROOT / "bridge_assets").glob("part-*.jsonl")):
+    for part in sorted((paths.dataset_root / "bridge_assets").glob("part-*.jsonl")):
         for row in iter_jsonl(part):
             kind = str(row["asset_type"])
             if kind not in batch_sizes:
@@ -633,7 +574,7 @@ def _raw_asset_item(row: dict[str, Any], prompt: str) -> dict[str, Any]:
     }
 
 
-def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
+def verify_feature_provenance(paths: Paths, device: str = "cuda:0") -> dict[str, Any]:
     """Recompute the locked sample using the exact original batching recipes."""
     from cache_stage1_features import (
         EMBEDDING_INSTRUCTIONS,
@@ -646,21 +587,21 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
     )
     from .content import ContentStore, compress_bins
 
-    _require_configured()
-    if UPSTREAM_DATA_DIR is None:
+    if paths.upstream_data_dir is None:
         raise RuntimeError("protocol paths.upstream_data_dir is required to replay the feature recipe")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("BLOCKED_GPU_IDENTITY: expected one visible CUDA device")
     properties = torch.cuda.get_device_properties(0)
     runtime_uuid = str(getattr(properties, "uuid", ""))
-    expected_uuid = (GPU_UUID or "").removeprefix("GPU-")
+    expected_uuid = (paths.gpu_uuid or "").removeprefix("GPU-")
     if not expected_uuid or runtime_uuid.lower() != expected_uuid.lower():
         raise RuntimeError(
-            f"BLOCKED_GPU_IDENTITY: runtime cuda:0 is GPU-{runtime_uuid}, protocol pins {GPU_UUID}"
+            f"BLOCKED_GPU_IDENTITY: runtime cuda:0 is GPU-{runtime_uuid}, protocol pins {paths.gpu_uuid}"
         )
     torch.cuda.set_device(torch.device(device))
 
-    samples = _feature_samples()
+    samples = _feature_samples(paths)
+    upstream_data, upstream_cache = paths.upstream_data_dir, _upstream_cache_dir(paths)
     sampled_records = [row for rows in samples.values() for row in rows]
     selected_ids = {str(row["object_id"]) for row in sampled_records}
     evidence_ids = {
@@ -669,20 +610,20 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         if str(row["object_type"]) in ("text", "image")
     }
     teacher_ids = teacher_object_ids(
-        [UPSTREAM_DATA_DIR / "edge_lists.jsonl", UPSTREAM_DATA_DIR / "target_lists.jsonl"],
+        [upstream_data / "edge_lists.jsonl", upstream_data / "target_lists.jsonl"],
         split=None,
     )
-    retrieval_batches, source_records = _original_retrieval_batches(selected_ids, teacher_ids)
-    content_batches = _content_generation_batches(evidence_ids)
-    base_manifest = _manifest_by_id(UPSTREAM_CACHE_DIR / "manifest.jsonl")
+    retrieval_batches, source_records = _original_retrieval_batches(paths, selected_ids, teacher_ids)
+    content_batches = _content_generation_batches(paths, evidence_ids)
+    base_manifest = _manifest_by_id(upstream_cache / "manifest.jsonl")
 
-    z_index = json.loads((PURE_CACHE_DIR / "z" / "z_index.json").read_text(encoding="utf-8"))
+    z_index = json.loads((paths.pure_cache_dir / "z" / "z_index.json").read_text(encoding="utf-8"))
     z_positions = {str(object_id): index for index, object_id in enumerate(z_index["ids"])}
-    z = np.load(PURE_CACHE_DIR / "z" / "z.f32.npy", mmap_mode="r", allow_pickle=False)
-    content = ContentStore(PURE_CACHE_DIR / "content")
+    z = np.load(paths.pure_cache_dir / "z" / "z.f32.npy", mmap_mode="r", allow_pickle=False)
+    content = ContentStore(paths.pure_cache_dir / "content")
 
-    embedder = _load_embedder_class(BACKBONE_DIR)(
-        str(BACKBONE_DIR),
+    embedder = _load_embedder_class(paths.backbone_dir)(
+        str(paths.backbone_dir),
         torch_dtype=torch.bfloat16,
         max_length=8192,
         min_pixels=4096,
@@ -704,7 +645,7 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
             result = build_object_features(
                 embedder,
                 record,
-                input_dir=UPSTREAM_DATA_DIR,
+                input_dir=upstream_data,
                 instruction=None,
                 storage_dtype=torch.bfloat16,
                 include_hidden=str(record["object_id"]) in teacher_ids,
@@ -717,7 +658,7 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
             outputs = build_base_object_features_batch(
                 embedder,
                 batch,
-                input_dir=UPSTREAM_DATA_DIR,
+                input_dir=upstream_data,
                 instruction=None,
             )
             if len(outputs) != len(batch):
@@ -737,7 +678,7 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         output = build_object_features(
             embedder,
             record,
-            input_dir=UPSTREAM_DATA_DIR,
+            input_dir=upstream_data,
             instruction=None,
             storage_dtype=torch.bfloat16,
             include_hidden=True,
@@ -755,7 +696,7 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         output = build_object_features(
             embedder,
             record,
-            input_dir=UPSTREAM_DATA_DIR,
+            input_dir=upstream_data,
             instruction=None,
             storage_dtype=torch.bfloat16,
             include_hidden=True,
@@ -818,7 +759,7 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         ]
         row_result = None
         if object_id in query_rows_recomputed:
-            feature_path = UPSTREAM_CACHE_DIR / str(manifest_record["feature_path"])
+            feature_path = upstream_cache / str(manifest_record["feature_path"])
             payload = torch.load(feature_path, map_location="cpu", weights_only=True)
             row_result = _allclose_report(query_rows_recomputed[object_id], payload["row_embeddings"])
         passed = bool(
@@ -854,15 +795,15 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         "comparisons": comparisons,
         "failure_count": len(failures),
     }
-    output = RUN_ROOT / "tests" / "real_tensor_probes" / "feature_provenance.json"
+    output = paths.run_root / "tests" / "real_tensor_probes" / "feature_provenance.json"
     write_json(output, report)
 
-    recipe_path = RUN_ROOT / "FROZEN_RECIPE_LOCK.json"
+    recipe_path = paths.run_root / "FROZEN_RECIPE_LOCK.json"
     recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
     recipe["status"] = "PASS" if report["status"] == "PASS" else "BLOCKED_FEATURE_PROVENANCE"
-    recipe["numeric_probe_result"] = file_identity(output, root=RUN_ROOT, role="feature_provenance_probe")
+    recipe["numeric_probe_result"] = file_identity(output, root=paths.run_root, role="feature_provenance_probe")
     recipe.pop("recipe_sha256", None)
-    recipe["recipe_sha256"] = sha256_json(recipe)
+    recipe["recipe_sha256"] = json_identity(recipe)
     write_json(recipe_path, recipe)
 
     phase = {
@@ -871,13 +812,13 @@ def verify_feature_provenance(device: str = "cuda:0") -> dict[str, Any]:
         "status": "PASS_READY_FOR_REFERENCE_TESTS" if report["status"] == "PASS" else "BLOCKED_FEATURE_PROVENANCE",
         "formal_training_started": False,
     }
-    write_json(RUN_ROOT / "PHASE_STATUS.json", phase)
+    write_json(paths.run_root / "PHASE_STATUS.json", phase)
     if report["status"] != "PASS":
         raise RuntimeError("BLOCKED_FEATURE_PROVENANCE")
     return report
 
 
-def write_access_ledger() -> None:
+def write_access_ledger(paths: Paths) -> None:
     records = [
         {
             "schema_version": SCHEMA_VERSION,
@@ -888,29 +829,28 @@ def write_access_ledger() -> None:
             "mode": "read",
         }
         for path, kind, source in (
-            (DATASET_ROOT, "original_dataset", "fresh_allowed"),
-            (BACKBONE_DIR, "public_frozen_backbone", "fresh_allowed"),
-            (PURE_CACHE_DIR, "candidate_pure_cache", "reuse_only_after_numeric_probe"),
-            (UPSTREAM_CACHE_DIR, "candidate_row_cache", "reuse_only_after_numeric_probe"),
-            (UPSTREAM_DATA_DIR, "pure_extractor_input_reconstruction", "provenance_only_not_training_material"),
-            (PACKAGE_DIR, "locked_protocol", "fresh_allowed"),
+            (paths.dataset_root, "original_dataset", "fresh_allowed"),
+            (paths.backbone_dir, "public_frozen_backbone", "fresh_allowed"),
+            (paths.pure_cache_dir, "candidate_pure_cache", "reuse_only_after_numeric_probe"),
+            (_upstream_cache_dir(paths), "candidate_row_cache", "reuse_only_after_numeric_probe"),
+            (paths.upstream_data_dir, "pure_extractor_input_reconstruction", "provenance_only_not_training_material"),
+            (_package_dir(paths), "locked_protocol", "fresh_allowed"),
         )
         if path is not None
     ]
-    write_jsonl(RUN_ROOT / "INPUT_ACCESS_LEDGER.jsonl", records)
+    write_jsonl(paths.run_root / "INPUT_ACCESS_LEDGER.jsonl", records)
 
 
-def run_lock() -> dict[str, Any]:
-    _require_configured()
-    RUN_ROOT.mkdir(parents=True, exist_ok=True)
+def run_lock(paths: Paths) -> dict[str, Any]:
+    paths.run_root.mkdir(parents=True, exist_ok=True)
     result = {
-        "run_identity": build_identity(),
-        "recipe": build_recipe_lock(),
-        "aliases": build_content_aliases(),
-        "cache": build_cache_manifest(),
+        "run_identity": build_identity(paths),
+        "recipe": build_recipe_lock(paths),
+        "aliases": build_content_aliases(paths),
+        "cache": build_cache_manifest(paths),
     }
-    write_access_ledger()
-    write_json(RUN_ROOT / "PHASE_STATUS.json", {
+    write_access_ledger(paths)
+    write_json(paths.run_root / "PHASE_STATUS.json", {
         "schema_version": SCHEMA_VERSION,
         "phase": "PREFLIGHT",
         "status": "SOURCE_AND_CACHE_LOCKED_PENDING_NUMERIC_PROBE",

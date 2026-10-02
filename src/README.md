@@ -329,7 +329,7 @@ Inputs and outputs (`F` = feature directory, everything else under `<run>`):
 | `prepare` | train qrels/recoveries | `labels/`, `rows/`, `pca/` (train queries + lake + evidence only) |
 | `validate` | | runs `tests/test_stage1_cqet.py` and `tests/test_stage1_reference_contracts.py`, bound to the source hash |
 | `smoke` | 8 train queries | `tests/smoke/` |
-| `train` | everything above | `seed<N>/<STAGE>/checkpoints`, `seed<N>/selections/`, `GLOBAL_SELECTION_FREEZE.json`, `seed<N>/eval/{dev,test}/`, `reports/DECISION.json` |
+| `train` | everything above | `seed<N>/<STAGE>/checkpoints`, `seed<N>/selections/`, `GLOBAL_SELECTION_FREEZE.json`, `seed<N>/eval/{dev,test}/`, `seed<N>/timing/stages.jsonl`, `reports/{DECISION.json,RESULTS.md}` |
 | `export` | frozen selection | `stage2_handoff/retrieval.{train,dev,test}.jsonl`, `stage1_gate.json` |
 
 The encoder always uses two shards: `verify-features` replays the original
@@ -368,10 +368,21 @@ written into every stage receipt and training-log row so a run can be audited po
 | `random_negatives` | 256 | uniform targets appended to every C2 direct list; without them a rank-one drift along the mean target direction destroys global retrieval |
 | `anchor_weight` | 0 | the elementwise MSE anchor was ~1e-6 and did nothing; drift is logged instead as `sigma1/sigma2_R_QT_minus_I` |
 
-The C2 kernel scores paths with index gathers instead of a per-path Python loop
-(≈0.5 s per 64-query step on a 4090 instead of ≈6 s); outputs are identical to
-float32 rounding. The diagnosis behind the recipe is in
-`docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`.
+Execution notes (none of these change a loss, a list or a checkpoint format):
+
+- Raw and Student pools share one retrieval kernel (`retrieval.build_pools`): Raw is the
+  same two-hop → D1 → P3 procedure with the frozen `z` in place of the Student's
+  projected relation vectors. Each Student retrieval pass first builds three HNSW
+  indices single-threaded (protocol `hnsw.threads = 1`, ≈3 min on EntiTables); the
+  per-query work after that is ≈0.15 s.
+- The Teacher scores a candidate list as one batched relation/global-feature
+  computation per chunk (`FreshPathTeacher.score_pairs/score_triplets` over a
+  pre-encoded, role-tagged cache); the content store keeps every chunk memory-mapped.
+  On a 4090 a TA logical batch of 8 queries takes ≈1.3 s (was ≈5.9 s), TB ≈2.3 s
+  (was ≈5.2 s), with losses bit-identical and gradients within float32 rounding.
+- The C2 kernel scores paths with index gathers instead of a per-path Python loop;
+  KD reads the frozen `teacher_logits_cache` only. The diagnosis behind the recipe
+  is in `docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`.
 
 After a code change, completed stages are reused only if their recorded source
 hash still matches. Run `amend-source --amendment-id ID --carry STAGE ... --reason

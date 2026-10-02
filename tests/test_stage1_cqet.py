@@ -13,12 +13,8 @@ import numpy as np
 import pytest
 import torch
 
-from mmdd_stage1.evaluate import (
-    coverage_at_k,
-    evaluate_teacher_matrix,
-    hit_rate_at_k,
-    paired_bootstrap,
-)
+from mmdd_stage1.evaluate import evaluate_teacher_matrix, paired_bootstrap
+from mmdd_stage1.metrics import rank_metrics
 from mmdd_stage1.artifacts import load_pool_bundle, save_pool_bundle
 from mmdd_stage1.config import Paths
 from mmdd_stage1.data import iter_jsonl, utf8_sorted, write_jsonl
@@ -50,14 +46,15 @@ from mmdd_stage1.probes import (
     teacher_content_probe,
     teacher_gradient_probe,
 )
+from mmdd_stage1.data import json_identity
 from mmdd_stage1.provenance import (
-    json_sha,
     record_source_amendment,
     source_identity,
     source_manifest,
 )
 from mmdd_stage1.train import (
     TeacherListScorer,
+    build_teacher_logits_cache,
     model_state_sha,
     train_student_c1,
     train_student_c2,
@@ -149,10 +146,12 @@ def test_actual_c2_kd_step_has_student_gradient_and_locked_parent(tmp_path: Path
     before = {name: value.detach().clone() for name, value in student.state_dict().items()}
     out = tmp_path / "kd"
 
+    logits = build_teacher_logits_cache(teacher, bank, records, device="cpu")
+    assert logits["q0"][0].shape == (3,) and logits["q0"][1].shape == (2,)
     train_student_c2(
-        student, records, teacher, bank, device="cpu", arm="NATIVE_KD",
+        student, records, bank, device="cpu", arm="NATIVE_KD",
         logical_batch=1, save_dir=out, seed=13,
-        expected_parent_hash=parent_hash, max_updates=1,
+        expected_parent_hash=parent_hash, max_updates=1, teacher_logits=logits,
     )
 
     init = torch.load(out / "snapshot_frac000.pt", map_location="cpu", weights_only=False)
@@ -180,7 +179,7 @@ def test_c1_oom_retry_replays_batch_without_duplicate_optimizer_step(
     clean = copy.deepcopy(initial)
     retried = copy.deepcopy(initial)
     train_student_c1(
-        clean, edge_lists, None, bank, device="cpu", logical_batch=2,
+        clean, edge_lists, bank, device="cpu", logical_batch=2,
         save_dir=tmp_path / "clean", seed=13,
     )
 
@@ -196,7 +195,7 @@ def test_c1_oom_retry_replays_batch_without_duplicate_optimizer_step(
     monkeypatch.setattr(NativeStudent, "score", score_with_one_oom)
     log_path = tmp_path / "retry.jsonl"
     train_student_c1(
-        retried, edge_lists, None, bank, device="cpu", logical_batch=2,
+        retried, edge_lists, bank, device="cpu", logical_batch=2,
         save_dir=tmp_path / "retry", seed=13, log_path=log_path,
     )
 
@@ -321,11 +320,11 @@ def test_actual_c2_sup_and_kd_updates_differ():
     teacher_logits = {"q0": (torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0]))}
 
     train_student_c2(
-        sup, records, None, bank, device="cpu", arm="NATIVE_SUP", logical_batch=1,
+        sup, records, bank, device="cpu", arm="NATIVE_SUP", logical_batch=1,
         seed=29, expected_parent_hash=parent_hash, max_updates=1,
     )
     train_student_c2(
-        kd, records, None, bank, device="cpu", arm="NATIVE_KD", logical_batch=1,
+        kd, records, bank, device="cpu", arm="NATIVE_KD", logical_batch=1,
         seed=29, expected_parent_hash=parent_hash, teacher_logits=teacher_logits, max_updates=1,
     )
     assert model_state_sha(sup) != model_state_sha(kd)
@@ -344,7 +343,7 @@ def test_actual_c2_resume_matches_continuous(tmp_path: Path):
     np.random.seed(71)
     continuous = copy.deepcopy(base)
     train_student_c2(
-        continuous, records, None, bank, device="cpu", arm="NATIVE_KD",
+        continuous, records, bank, device="cpu", arm="NATIVE_KD",
         logical_batch=1, seed=13, expected_parent_hash=parent_hash,
         teacher_logits=logits,
     )
@@ -354,13 +353,13 @@ def test_actual_c2_resume_matches_continuous(tmp_path: Path):
     partial = copy.deepcopy(base)
     part_dir = tmp_path / "partial"
     train_student_c2(
-        partial, records, None, bank, device="cpu", arm="NATIVE_KD",
+        partial, records, bank, device="cpu", arm="NATIVE_KD",
         logical_batch=1, seed=13, expected_parent_hash=parent_hash,
         teacher_logits=logits, save_dir=part_dir, max_updates=2,
     )
     resumed = copy.deepcopy(base)
     train_student_c2(
-        resumed, records, None, bank, device="cpu", arm="NATIVE_KD",
+        resumed, records, bank, device="cpu", arm="NATIVE_KD",
         logical_batch=1, seed=13, expected_parent_hash=parent_hash,
         teacher_logits=logits, save_dir=tmp_path / "resumed",
         resume_from=part_dir / "snapshot_frac050.pt",
@@ -375,7 +374,7 @@ def test_student_multiple_epochs_preserve_batches_and_optimizer_state(tmp_path: 
     common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=3, epochs=3,
                   expected_parent_hash=parent_hash, seed=13)
     continuous = copy.deepcopy(base)
-    points = train_student_c2(continuous, records, None, bank, **common,
+    points = train_student_c2(continuous, records, bank, **common,
         save_dir=tmp_path / "continuous", log_path=tmp_path / "steps.jsonl")
     rows = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
     assert [r["epoch"] for r in rows] == [1, 1, 2, 2, 3, 3]
@@ -385,15 +384,15 @@ def test_student_multiple_epochs_preserve_batches_and_optimizer_state(tmp_path: 
     endpoint = torch.load(points[1.0], map_location="cpu", weights_only=False)
     assert all(int(state["step"]) == 6 for state in endpoint["optimizer"]["state"].values())
     partial = copy.deepcopy(base)
-    train_student_c2(partial, records, None, bank, **common,
+    train_student_c2(partial, records, bank, **common,
                      save_dir=tmp_path / "partial", max_updates=2)
     resumed = copy.deepcopy(base)
-    train_student_c2(resumed, records, None, bank, **common,
+    train_student_c2(resumed, records, bank, **common,
                      resume_from=tmp_path / "partial/snapshot_epoch001.pt")
     assert model_state_sha(resumed) == model_state_sha(continuous)
     edges = [{"item_id": r["query_id"], "relation": "QT", "anchor_id": r["query_id"],
               "candidates": r["targets"], "positives": r["positives"]} for r in records]
-    train_student_c1(copy.deepcopy(base), edges, None, bank, device="cpu", epochs=3,
+    train_student_c1(copy.deepcopy(base), edges, bank, device="cpu", epochs=3,
                      logical_batch=3, log_path=tmp_path / "c1_steps.jsonl")
     c1_rows = [json.loads(line) for line in (tmp_path / "c1_steps.jsonl").read_text().splitlines()]
     assert [r["epoch"] for r in c1_rows] == [1, 1, 2, 2, 3, 3]
@@ -465,10 +464,26 @@ def test_hierarchical_denominators():
     assert support.item() == 6.0
 
 
+def _per_object_cache(model: FreshPathTeacher, rows, keys) -> dict:
+    """Reference encoding: every object through ``encode_one`` and ``tag`` individually."""
+    cache = {}
+    for row, key in zip(rows, keys):
+        for slot, role in enumerate((0, 1) if len(row) == 6 else (0, 2, 1)):
+            ref = (row[3 * slot], key[slot])
+            if ref not in cache:
+                tokens, g = model.encode_one(row[3 * slot], row[3 * slot + 1], row[3 * slot + 2])
+                cache[ref] = (model.tag(row[3 * slot], role, tokens, g), g)
+    return cache
+
+
+def _refs(rows, keys):
+    return [tuple((row[3 * slot], key[slot]) for slot in range(len(row) // 3)) for row, key in zip(rows, keys)]
+
+
 def test_teacher_list_scorer_matches_per_chunk_scoring_with_dropout():
-    """The shared-cache, batched-encode scorer must reproduce the previous per-chunk
-    scoring forward bit for bit at the same chunk size: same dropout draws (same batch
-    shapes, same order), same complete-list denominator, same gradients."""
+    """The shared-cache, batched-encode scorer must reproduce per-object encoding with one
+    graph per chunk at the same chunk size: same dropout draws (same batch shapes, same
+    order), same complete-list denominator, same gradients."""
     torch.manual_seed(101)
     bank, _records, _basis, _mean = tiny_fixture()
     legacy = FreshPathTeacher(
@@ -480,13 +495,14 @@ def test_teacher_list_scorer_matches_per_chunk_scoring_with_dropout():
         ("table", bank.z("q0"), bank.tokens("q0"), "table", bank.z(target), bank.tokens(target))
         for target in ("tp", "tn", "tx")
     ]
-    keys = [("q0", target) for target in ("tp", "tn", "tx")]
+    keys = [(("q0", 0), (target, 1)) for target in ("tp", "tn", "tx")]
     chunk = 2
     rng = torch.get_rng_state()
 
-    # Previous implementation: per-object encode, fresh cache, one graph per chunk.
+    # Reference: per-object encode, fresh cache, one graph per chunk.
     legacy_scores = torch.cat([
-        legacy.score_pairs(pairs[start : start + chunk], cache={}, cache_keys=keys[start : start + chunk])
+        legacy.score_pairs(_per_object_cache(legacy, pairs[start : start + chunk], keys[start : start + chunk]),
+                           _refs(pairs[start : start + chunk], keys[start : start + chunk]))
         for start in range(0, len(pairs), chunk)
     ])
     legacy_loss = torch.logsumexp(legacy_scores, 0) - legacy_scores[0]
@@ -522,7 +538,7 @@ def test_teacher_list_scorer_consumes_the_same_dropout_stream_as_per_chunk_scori
         ("table", bank.z("q0"), bank.tokens("q0"), "table", bank.z(target), bank.tokens(target))
         for target in ("tp", "tn", "tx")
     ]
-    keys = [("q0", target) for target in ("tp", "tn", "tx")]
+    keys = [(("q0", 0), (target, 1)) for target in ("tp", "tn", "tx")]
 
     torch.manual_seed(4321)
     before = torch.get_rng_state().clone()
@@ -531,7 +547,8 @@ def test_teacher_list_scorer_consumes_the_same_dropout_stream_as_per_chunk_scori
 
     torch.set_rng_state(before)
     torch.cat([
-        model.score_pairs(pairs[start : start + 2], cache={}, cache_keys=keys[start : start + 2])
+        model.score_pairs(_per_object_cache(model, pairs[start : start + 2], keys[start : start + 2]),
+                          _refs(pairs[start : start + 2], keys[start : start + 2]))
         for start in range(0, len(pairs), 2)
     ])
     per_chunk_stream = torch.get_rng_state().clone()
@@ -609,8 +626,8 @@ def test_d1_score_controls_admission():
 def test_target_coverage_hit_rate_and_query_weighted_bootstrap():
     ranked = ["a", "x"]
     gold = {"a", "b", "c", "d"}
-    assert coverage_at_k(ranked, gold, 2) == 0.25
-    assert hit_rate_at_k(ranked, gold, 2) == 1.0
+    assert rank_metrics(ranked, gold)["target_coverage"] == 0.25
+    assert rank_metrics(ranked, gold)["query_hit_rate"] == 1.0
     result = paired_bootstrap(
         {"q1": 1.0, "q2": 0.0, "q3": 0.0, "q4": 0.0},
         {"q1": "a", "q2": "b", "q3": "b", "q4": "b"},
@@ -853,12 +870,12 @@ def test_source_amendment_carries_only_declared_stages(tmp_path: Path):
     previous[0]["sha256"] = "0" * 64  # the manifest prepare wrote before the code edit
     write_jsonl(paths.run_root / "SOURCE_TREE_MANIFEST.jsonl", previous)
     stage_dir = tmp_path / "seed13" / "TA"
-    _write_completed_ta(stage_dir, json_sha(previous))
+    _write_completed_ta(stage_dir, json_identity(previous))
     with pytest.raises(RuntimeError, match="completed source differs"):
         _completed_stage_result(paths, stage_dir, "TA")
 
     row = record_source_amendment(paths, amendment_id="a1", carried_stages=["TB_CQET"], reason="r")
-    assert row["from_source_identity_sha256"] == json_sha(previous)
+    assert row["from_source_identity_sha256"] == json_identity(previous)
     assert row["to_source_identity_sha256"] == source_identity(paths)
     assert row["changed_paths"] == {
         current[0]["path"]: {"from_sha256": "0" * 64, "to_sha256": current[0]["sha256"]},
@@ -871,7 +888,7 @@ def test_source_amendment_carries_only_declared_stages(tmp_path: Path):
     # Chains through earlier amendments only when each later link carries the stage.
     older = "1" * 64
     (stage_dir / "PRE_RUN.attempt_001.json").write_text(json.dumps({"source_identity_sha256": older}))
-    link = {"from_source_identity_sha256": older, "to_source_identity_sha256": json_sha(previous)}
+    link = {"from_source_identity_sha256": older, "to_source_identity_sha256": json_identity(previous)}
     ledger = paths.run_root / "SOURCE_AMENDMENTS.jsonl"
     rows = list(iter_jsonl(ledger))
     write_jsonl(ledger, [{**link, "carried_stages": ["TA"]}, *rows])
@@ -1177,14 +1194,13 @@ def test_student_c2_scores_gathered_paths_match_per_path_loop():
     from mmdd_stage1.train import _student_c2_scores
 
     bank, row, student = _mixed_evidence_fixture()
-    direct, evidence, bag_targets, evidence_ids = _student_c2_scores(student, bank, row, logit_scale=20.0)
+    direct, evidence, bag_targets = _student_c2_scores(student, bank, row, logit_scale=20.0)
     ref_direct, ref_evidence = _reference_c2_scores(student, bank, row, 20.0)
     assert torch.allclose(direct, ref_direct, atol=1e-6)
     assert torch.allclose(evidence, ref_evidence, atol=1e-6)
     assert [t for _, t in bag_targets] == ["tp", "tn"]
-    assert set(evidence_ids) == {"ea", "eb", "ec"}
     # scale enters every bilinear term, so halving it halves the direct logits exactly
-    half, _, _, _ = _student_c2_scores(student, bank, row, logit_scale=10.0)
+    half, _, _ = _student_c2_scores(student, bank, row, logit_scale=10.0)
     assert torch.allclose(half, direct / 2)
 
 
@@ -1211,10 +1227,10 @@ def test_c2_random_negatives_enter_the_sup_loss_and_are_logged(tmp_path: Path):
     common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=1, seed=13,
                   expected_parent_hash=parent_hash, max_updates=1)
     with_negs = copy.deepcopy(base)
-    train_student_c2(with_negs, records, None, bank, random_negatives=4,
+    train_student_c2(with_negs, records, bank, random_negatives=4,
                      negative_pool=["tp", "tn", "tx", "far"], log_path=tmp_path / "negs.jsonl", **common)
     without = copy.deepcopy(base)
-    train_student_c2(without, records, None, bank, random_negatives=0, **common)
+    train_student_c2(without, records, bank, random_negatives=0, **common)
     assert model_state_sha(with_negs) != model_state_sha(without)
     row = json.loads((tmp_path / "negs.jsonl").read_text().splitlines()[0])
     assert row["random_negatives"] == 4 and row["negative_pool_size"] == 4
@@ -1231,12 +1247,12 @@ def test_kd_temperature_divides_teacher_logits():
     common = dict(device="cpu", arm="NATIVE_KD", logical_batch=1, seed=29,
                   expected_parent_hash=parent_hash, max_updates=1, random_negatives=0)
     tempered = copy.deepcopy(base)
-    train_student_c2(tempered, records, None, bank, teacher_logits=hot, kd_temperature=5.0, **common)
+    train_student_c2(tempered, records, bank, teacher_logits=hot, kd_temperature=5.0, **common)
     pre_divided = copy.deepcopy(base)
-    train_student_c2(pre_divided, records, None, bank, teacher_logits=cooled, kd_temperature=1.0, **common)
+    train_student_c2(pre_divided, records, bank, teacher_logits=cooled, kd_temperature=1.0, **common)
     assert model_state_sha(tempered) == model_state_sha(pre_divided)
     untempered = copy.deepcopy(base)
-    train_student_c2(untempered, records, None, bank, teacher_logits=hot, kd_temperature=1.0, **common)
+    train_student_c2(untempered, records, bank, teacher_logits=hot, kd_temperature=1.0, **common)
     assert model_state_sha(tempered) != model_state_sha(untempered)
 
 
@@ -1246,10 +1262,10 @@ def test_c1_uses_logit_scale_and_optional_anchor(tmp_path: Path):
               "candidates": ["tp", "tn", "tx"], "positives": ["tp"]}]
     base = NativeStudent(basis, mean, dim=2)
     scaled = copy.deepcopy(base)
-    train_student_c1(scaled, edges, None, bank, device="cpu", logical_batch=1, logit_scale=20.0,
+    train_student_c1(scaled, edges, bank, device="cpu", logical_batch=1, logit_scale=20.0,
                      log_path=tmp_path / "c1.jsonl")
     flat = copy.deepcopy(base)
-    train_student_c1(flat, edges, None, bank, device="cpu", logical_batch=1, logit_scale=1.0)
+    train_student_c1(flat, edges, bank, device="cpu", logical_batch=1, logit_scale=1.0)
     assert model_state_sha(scaled) != model_state_sha(flat)
     row = json.loads((tmp_path / "c1.jsonl").read_text().splitlines()[0])
     assert row["logit_scale"] == 20.0 and row["anchor_weight"] == 0.0

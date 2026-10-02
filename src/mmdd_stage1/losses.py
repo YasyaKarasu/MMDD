@@ -12,8 +12,9 @@ def rank_mass_loss(
     positive_mask: Tensor,
     valid_mask: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
-    """Multi-positive total-probability loss; missing supervision returns None.
-    
+    """Multi-positive total-probability loss; a list without a valid positive and a valid
+    negative carries no supervision and returns None.
+
     R(s; P, C) = LSE_{x in C}(s_x) - LSE_{p in P}(s_p).
     """
     if scores.ndim != 1:
@@ -24,16 +25,12 @@ def rank_mass_loss(
         valid_mask = torch.ones_like(positive_mask)
     if valid_mask.shape != scores.shape or valid_mask.dtype != torch.bool:
         raise ValueError("invalid valid_mask")
-    if torch.any(positive_mask & ~valid_mask):
-        raise ValueError("positive outside valid candidate set")
-
     positives = positive_mask & valid_mask
     negatives = valid_mask & ~positive_mask
-    if not bool(positives.any()) or not bool(negatives.any()):
+    has_positive, has_negative = torch.stack([positives.any(), negatives.any()]).tolist()
+    if not has_positive or not has_negative:
         return None
-    return torch.logsumexp(scores[valid_mask], 0) - torch.logsumexp(
-        scores[positives], 0
-    )
+    return torch.logsumexp(scores[valid_mask], 0) - torch.logsumexp(scores[positives], 0)
 
 
 def positive_average_pair_loss(
@@ -55,32 +52,16 @@ def positive_average_pair_loss(
     return torch.logsumexp(torch.cat((zero, differences), dim=1), dim=1).mean()
 
 
-def _validate_path_inputs(
-    f0: Tensor,
-    path_scores: Tensor,
-    path_target_index: Tensor,
-) -> None:
-    if f0.ndim != 1 or path_scores.ndim != 1:
-        raise ValueError("one-dimensional score arrays required")
-    if path_target_index.shape != path_scores.shape:
-        raise ValueError("path index/score length mismatch")
-    if path_target_index.dtype != torch.long:
-        raise ValueError("path_target_index must be int64")
-    if path_target_index.numel():
-        if int(path_target_index.min()) < 0:
-            raise ValueError("negative target index")
-        if int(path_target_index.max()) >= f0.numel():
-            raise ValueError("target index outside candidate list")
-
-
-
 def _path_slots(
     f0: Tensor,
     path_scores: Tensor,
     path_target_index: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Return (path-only slots, per-target counts) independent of input order."""
-    _validate_path_inputs(f0, path_scores, path_target_index)
+    if f0.ndim != 1 or path_scores.ndim != 1:
+        raise ValueError("one-dimensional score arrays required")
+    if path_target_index.shape != path_scores.shape or path_target_index.dtype != torch.long:
+        raise ValueError("path_target_index must be int64 and align with path_scores")
     n_targets = f0.numel()
     counts = torch.bincount(path_target_index, minlength=n_targets)
     if path_scores.numel() == 0:
@@ -121,15 +102,6 @@ def aggregate_corrected_lse(
     if slots.shape[1] == 0:
         return f0
     return torch.logsumexp(torch.cat((f0[:, None], slots), dim=1), dim=1)
-
-
-def aggregate_paths(
-    f0: Tensor,
-    path_scores: Tensor,
-    path_target_index: Tensor,
-) -> Tensor:
-    """Compatibility name for the corrected-LSE control, never the CQET arm."""
-    return aggregate_corrected_lse(f0, path_scores, path_target_index)
 
 
 def global_features(

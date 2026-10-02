@@ -14,7 +14,7 @@ from cache_stage1_features import (
     _completed_records,
     _source_fingerprint,
 )
-from mmdd_stage1.feature_cache import normalize_object_type
+from cache_stage1_features import normalize_object_type
 
 
 def _link(source: Path, destination: Path) -> None:

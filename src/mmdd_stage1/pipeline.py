@@ -1,9 +1,7 @@
 """End-to-end Stage-1 CQET preparation, smoke, formal DAG, and frozen evaluation."""
 from __future__ import annotations
 
-import copy
 import dataclasses
-import gc
 import gzip
 import hashlib
 import json
@@ -19,25 +17,12 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-from .execution_layout import teacher_numerical_layout
-from . import EXPERIMENT_ID, VERSION
-from .artifacts import json_identity, load_pool_bundle, save_pool_bundle, save_training_records
+from . import EXPERIMENT_ID, VERSION, independent_metrics
+from .artifacts import load_pool_bundle, save_pool_bundle, save_training_records
 from .config import STAGE_ORDER, Paths, load_protocol, resolve_default_paths
 from .content import ContentStore
-from .data import (
-    build_content_aliases,
-    iter_jsonl,
-    load_split_gt,
-    read_json,
-    sha256_file,
-    split_query_ids,
-    utf8_sorted,
-    write_json,
-    write_jsonl,
-)
+from .data import build_content_aliases, iter_jsonl, json_identity, read_json, sha256_file, utf8_sorted, write_json, write_jsonl
 from .evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
-from .retrieval import PoolRecord
-from . import independent_metrics
 from .features import ObjectBank, RowStore, ZStore, build_or_load_row_store, fit_pca, load_pca, load_z
 from .labels import Labels, build_labels, export_eval_labels, load_labels
 from .lists import (
@@ -49,7 +34,7 @@ from .lists import (
     build_tb_records,
 )
 from .metrics import bootstrap_contrast, candidate_metrics, evaluate_matrix, export_funnels
-from .models import FreshPathTeacher, NativeStudent, QTStudent
+from .models import FreshPathTeacher, NativeStudent, QTStudent, model_state_sha, state_sha
 from .probes import student_gradient_probe, teacher_content_probe, teacher_gradient_probe
 from .provenance import (
     append_error_ledger,
@@ -62,13 +47,13 @@ from .provenance import (
     source_identity,
     verify_file_manifest,
 )
+from .retrieval import PoolRecord
 from .train import (
     StudentRecipe,
     _hash_order,
     _order_sha,
     build_teacher_logits_cache,
-    model_state_sha,
-    state_sha,
+    teacher_numerical_layout,
     train_student_c1,
     train_student_c2,
     train_ta,
@@ -105,7 +90,11 @@ def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
 
 
 def _gpu_guard(paths: Paths) -> None:
-    """The process must see exactly the GPU the protocol pins (set CUDA_VISIBLE_DEVICES to its UUID)."""
+    """The process must see exactly the GPU the protocol pins (set CUDA_VISIBLE_DEVICES to its UUID).
+
+    Runs before the multi-GiB feature load: it fails fast, and on this machine CUDA's first
+    initialisation is far less likely to fail when it happens before large host allocations.
+    """
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("formal/smoke execution requires exactly one visible CUDA device")
     props = torch.cuda.get_device_properties(0)
@@ -247,8 +236,7 @@ def load_runtime(protocol_path: Path, run_root: Path) -> Runtime:
     z_store = load_z(paths)
     row_store = build_or_load_row_store(paths)
     basis, mean = load_pca(paths)
-    content = ContentStore(paths.pure_cache_dir / "content", lru_bytes=8 * 2**30)
-    bank = ObjectBank(z_store, content)
+    bank = ObjectBank(z_store, ContentStore(paths.pure_cache_dir / "content"))
     return Runtime(paths, protocol, labels, z_store, row_store, bank, basis, mean)
 
 
@@ -354,73 +342,36 @@ def _run_stage(
     if completed is not None:
         return completed
     attempt = record_stage_pre_run(
-        stage_dir, stage, seed, rt.paths.gpu_uuid, paths=rt.paths, parents=parents,
-        config=config, inputs=inputs, lists=lists,
+        stage_dir, stage, seed, rt.paths, parents=parents, config=config, inputs=inputs, lists=lists,
     )
     checkpoints = stage_dir / "attempts" / attempt / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=False)
     log_path = stage_dir / f"train.{attempt}.jsonl"
     started = time.time()
     torch.cuda.reset_peak_memory_stats()
-    cuda_start = torch.cuda.Event(enable_timing=True)
-    cuda_end = torch.cuda.Event(enable_timing=True)
-    cuda_start.record()
     try:
         result = action(checkpoints, log_path, attempt)
-        cuda_end.record()
         torch.cuda.synchronize()
-        cuda_seconds = cuda_start.elapsed_time(cuda_end) / 1000.0
         log_rows = list(iter_jsonl(log_path))
-        timing_row = {
-            "schema_version": VERSION,
-            "seed": seed,
-            "stage": stage,
-            "attempt_id": attempt,
-            "pid": os.getpid(),
-            "gpu_uuid": rt.paths.gpu_uuid,
-            "mapped_device": "cuda:0",
+        timing = {
             "wall_seconds": time.time() - started,
-            "cuda_event_seconds": cuda_seconds,
             "optimizer_steps": len(log_rows),
-            "exposure_units": sum(
-                int(row.get("batch_queries", row.get("batch_lists", 0))) for row in log_rows
-            ),
+            "exposure_units": sum(int(row.get("batch_queries", row.get("batch_lists", 0))) for row in log_rows),
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-            "synchronization": "event_end_then_torch.cuda.synchronize",
         }
-        timing_dir = seed_dir / "timing"
-        _append_jsonl(timing_dir / "stage_wall.jsonl", timing_row)
-        _append_jsonl(timing_dir / "gpu_events.jsonl", timing_row)
-        _append_jsonl(timing_dir / "peak_memory.jsonl", timing_row)
-        _append_jsonl(
-            timing_dir / "throughput.jsonl",
-            {
-                **timing_row,
-                "exposure_units_per_wall_second": (
-                    timing_row["exposure_units"] / timing_row["wall_seconds"]
-                    if timing_row["wall_seconds"] else None
-                ),
-            },
-        )
+        _append_jsonl(seed_dir / "timing" / "stages.jsonl", {
+            "schema_version": VERSION, "seed": seed, "stage": stage, "attempt_id": attempt,
+            "pid": os.getpid(), "gpu_uuid": rt.paths.gpu_uuid, **timing,
+        })
         _publish_checkpoints(stage_dir, checkpoints)
         outputs = {path.name: str(path) for path in sorted(checkpoints.glob("*.pt"))}
         outputs["train_log"] = str(log_path)
         record_stage_post_run(
             stage_dir, stage, seed, attempt_id=attempt, status="SUCCESS",
-            counters={
-                "checkpoint_count": len(list(checkpoints.glob("*.pt"))),
-                "optimizer_steps": timing_row["optimizer_steps"],
-                "exposure_units": timing_row["exposure_units"],
-            },
-            outputs=outputs,
-            timing={
-                "wall_seconds": timing_row["wall_seconds"],
-                "cuda_event_seconds": cuda_seconds,
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-                "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-            },
-            impact="formal training stage",
+            counters={"checkpoint_count": len(outputs) - 1, "optimizer_steps": timing["optimizer_steps"],
+                      "exposure_units": timing["exposure_units"]},
+            outputs=outputs, timing=timing, impact="formal training stage",
         )
         return result
     except Exception as error:
@@ -434,15 +385,6 @@ def _run_stage(
             impact="no descendant may consume this attempt",
         )
         raise
-
-
-def _split_map(paths: Paths, query_ids: Sequence[str]) -> dict[str, str]:
-    mapping = {}
-    for split in ("train", "dev", "test"):
-        for query_id in split_query_ids(paths, split):
-            if query_id in query_ids:
-                mapping[query_id] = split
-    return mapping
 
 
 def _candidate_summary(pools: Mapping[str, Any], gt: Mapping[str, dict]) -> dict[str, float]:
@@ -829,8 +771,8 @@ def _attach_student_gradient_probes(
 
 
 def smoke(protocol_path: Path, run_root: Path) -> None:
+    _gpu_guard(resolve_default_paths(protocol_path, run_root))
     rt = load_runtime(protocol_path, run_root)
-    _gpu_guard(rt.paths)
     if read_json(rt.paths.run_root / "PHASE_STATUS.json")["status"] != "PASS_READY_FOR_SMOKE":
         raise RuntimeError("prepare and CPU integration gates must pass before smoke")
     validation = read_json(rt.paths.run_root / "tests" / "integration" / "VALIDATION_RECEIPT.json")
@@ -896,12 +838,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
 
     native = NativeStudent(rt.pca_basis, rt.pca_mean)
     native_points = train_student_c1(
-        native, edge_lists, None, rt.bank, arm="NATIVE_SUP", logical_batch=64,
+        native, edge_lists, rt.bank, arm="NATIVE_SUP", logical_batch=64,
         save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, **student_kwargs,
     )
     qt = QTStudent(rt.pca_basis, rt.pca_mean)
     train_student_c1(
-        qt, edge_lists, None, rt.bank, arm="QT_SUP", logical_batch=64,
+        qt, edge_lists, rt.bank, arm="QT_SUP", logical_batch=64,
         save_dir=smoke_root / "QT_C1_SUP", seed=13, **student_kwargs,
     )
     native_parent = native_points[1.0]
@@ -918,9 +860,10 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     parent_hash = model_state_sha(native_selected)
     kd_model = _load_native(native_parent, rt)
     train_student_c2(
-        kd_model, c2_records, tb_models["cqet"], rt.bank, arm="NATIVE_KD",
+        kd_model, c2_records, rt.bank, arm="NATIVE_KD",
         logical_batch=64, save_dir=smoke_root / "NATIVE_C2_KD", seed=13,
         expected_parent_hash=parent_hash, max_updates=1, **student_kwargs,
+        teacher_logits=build_teacher_logits_cache(tb_models["cqet"], rt.bank, c2_records),
         kd_weight=recipe.kd_weight, kd_temperature=recipe.kd_temperature,
         random_negatives=recipe.random_negatives, negative_pool=rt.labels.legal_targets,
     )
@@ -1115,7 +1058,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         }, inputs=common_inputs,
         lists={"C1_NATIVE": hashes["C1_NATIVE"]},
         action=lambda ckpts, log, attempt: train_student_c1(
-            native_c1, edge_lists, None, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
+            native_c1, edge_lists, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
             epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
@@ -1132,7 +1075,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         }, inputs=common_inputs,
         lists={"C1_QT": hashes["C1_QT"]},
         action=lambda ckpts, log, attempt: train_student_c1(
-            qt_c1, edge_lists, None, rt.bank, arm="QT_SUP", save_dir=ckpts,
+            qt_c1, edge_lists, rt.bank, arm="QT_SUP", save_dir=ckpts,
             epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
@@ -1190,7 +1133,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         config=c2_config, inputs={**common_inputs, "graph_hash": graph_hash},
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
-            native_sup, c2_records, None, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
+            native_sup, c2_records, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
             seed=seed, expected_parent_hash=parent_hash, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
@@ -1198,6 +1141,8 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
 
     cqet_teacher = _load_teacher(tb_ckpts["TB_CQET"])
     logits = build_teacher_logits_cache(cqet_teacher, rt.bank, c2_records)
+    teacher_state_sha = model_state_sha(cqet_teacher)
+    del cqet_teacher
     logits_dir = seed_dir / "teacher_logits_cache"
     logits_dir.mkdir(exist_ok=True)
     logits_path = logits_dir / "scores.pt"
@@ -1207,7 +1152,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         "teacher": "TB_CQET",
         "teacher_checkpoint": str(tb_ckpts["TB_CQET"]),
         "teacher_checkpoint_sha256": sha256_file(tb_ckpts["TB_CQET"]),
-        "teacher_state_sha256": model_state_sha(cqet_teacher),
+        "teacher_state_sha256": teacher_state_sha,
         "graph_sha256": graph_hash,
         "training_list_sha256": hashes["C2_SHARED"],
         "feature_identity": common_inputs["cache_identity"],
@@ -1228,7 +1173,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         inputs={**common_inputs, "graph_hash": graph_hash, "teacher_logits": logits_identity},
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
-            native_kd, c2_records, cqet_teacher, rt.bank, arm="NATIVE_KD", save_dir=ckpts,
+            native_kd, c2_records, rt.bank, arm="NATIVE_KD", save_dir=ckpts,
             seed=seed, expected_parent_hash=parent_hash, teacher_logits=logits, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
@@ -1243,7 +1188,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         config=c2_config, inputs={**common_inputs, "graph_hash": graph_hash},
         lists={"C2_SHARED": hashes["C2_SHARED"]},
         action=lambda ckpts, log, attempt: train_student_c2(
-            qt_c2, c2_records, None, rt.bank, arm="QT_SUP", save_dir=ckpts,
+            qt_c2, c2_records, rt.bank, arm="QT_SUP", save_dir=ckpts,
             seed=seed, expected_parent_hash=qt_parent_hash, **c2_kwargs,
             metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
         ),
@@ -1303,9 +1248,6 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     }
     freeze["freeze_sha256"] = json_identity(freeze)
     write_json(seed_dir / "SELECTION_FREEZE.json", freeze)
-    del raw_dev, c2_records, logits
-    gc.collect()
-    torch.cuda.empty_cache()
     return freeze
 
 
@@ -1588,7 +1530,6 @@ def evaluate_seed(rt: Runtime, seed: int, global_freeze_hash: str) -> dict:
         implicit = [q for q in query_ids if gt[q]["kind"] == "implicit"]
         kd = split_result["native_kd"]["per_query"]
         sup = split_result["native_sup"]["per_query"]
-        raw = split_result["raw"]["per_query"]
         contrasts = {
             "content_CQET_Real_minus_Swap_implicit": bootstrap_contrast(
                 {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
@@ -1661,55 +1602,45 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
                     kd_candidate["C150_target_coverage"] - sup_candidate["C150_target_coverage"]
                 ),
             })
-    dev = [row for row in rows if row["split"] == "dev"]
-    test = [row for row in rows if row["split"] == "test"]
+    gates = rt.protocol["acceptance_pp"]
+    by_split = {split: [row for row in rows if row["split"] == split] for split in ("dev", "test")}
+
+    def mean(split: str, key: str) -> float:
+        return float(np.mean([row[key] for row in by_split[split]]))
+
     candidate_pass = all(row["candidate_gain_pp"] >= 0 for row in rows) and all(
-        np.mean([r["candidate_gain_pp"] for r in rows if r["split"] == split]) >= 1.0
-        for split in ("dev", "test")
+        mean(split, "candidate_gain_pp") >= gates["candidate_mean_gain_each_split"] for split in by_split
     )
     content_pass = (
         all(row["content_implicit_pp"] >= 0 for row in rows)
-        and np.mean([r["content_implicit_pp"] for r in dev]) >= 0.5
-        and np.mean([r["content_implicit_pp"] for r in test]) > 0
-        and all(row["teacher_vs_qt_pp"] >= -0.5 for row in rows)
-        and np.mean([r["cqet_vs_lse_pp"] for r in dev]) >= 0
-        and np.mean([r["cqet_vs_lse_pp"] for r in test]) >= 0
+        and mean("dev", "content_implicit_pp") >= gates["content_dev_mean_implicit"]
+        and mean("test", "content_implicit_pp") > 0
+        and all(row["teacher_vs_qt_pp"] >= gates["teacher_vs_QT_each_split_seed_floor"] for row in rows)
+        and all(mean(split, "cqet_vs_lse_pp") >= gates["CQET_vs_correctedLSE_each_split_mean_floor"] for split in by_split)
     )
     kd_pass = (
         all(row["kd_pp"] >= 0 for row in rows)
-        and np.mean([r["kd_pp"] for r in dev]) >= 0.3
-        and np.mean([r["kd_pp"] for r in test]) > 0
-        and all(row["kd_coverage_delta_pp"] >= -0.5 for row in rows)
+        and mean("dev", "kd_pp") >= gates["KD_dev_mean"]
+        and mean("test", "kd_pp") > 0
+        and all(row["kd_coverage_delta_pp"] >= gates["KD_coverage_floor"] for row in rows)
     )
     decision = {
         "schema_version": VERSION,
-        "correctness": "PASS",
         "candidate_gain": {"pass": bool(candidate_pass), "rows": rows},
         "teacher_E_content_gain": {"pass": bool(content_pass)},
         "KD_gain": {"pass": bool(kd_pass)},
-        "historical_comparability": "NOT_CAUSALLY_COMPARABLE_TO_V4_0_DUE_TO_CORRECTNESS_FIXES",
-        "historical_reference": "HISTORICAL_REFERENCE_UNAVAILABLE",
     }
     write_json(reports / "DECISION.json", decision)
-    (reports / "DECISION.md").write_text(
-        "# Preregistered decision\n\n"
-        f"- Correctness: {decision['correctness']}\n"
-        f"- Candidate gain: {'PASS' if candidate_pass else 'FAIL'}\n"
-        f"- Teacher E-content gain: {'PASS' if content_pass else 'FAIL'}\n"
-        f"- C2 KD gain: {'PASS' if kd_pass else 'FAIL'}\n"
-        "- Historical comparison: not causally comparable to V4.0.\n",
-        encoding="utf-8",
-    )
     lines = [
-        "# MMDD Stage1 V4.1 results",
+        f"# {EXPERIMENT_ID} results",
         "",
-        f"- Correctness: {decision['correctness']}",
         f"- Candidate gain gate: {'PASS' if candidate_pass else 'FAIL'}",
         f"- Teacher E-content gate: {'PASS' if content_pass else 'FAIL'}",
         f"- KD gate: {'PASS' if kd_pass else 'FAIL'}",
-        "- Historical comparison: V4.0 is not a single-factor causal baseline because V4.1 repairs multiple execution semantics.",
         "",
-        "If only the candidate gate passes, the supported conclusion is candidate expansion only; the Path-content and KD claims are not retained.",
+        "If only the candidate gate passes, the supported conclusion is candidate expansion only; "
+        "the Path-content and KD claims are not retained. The test split is a historically exposed "
+        "regression set, not an unseen holdout.",
         "",
         "| seed | split | candidate pp | E-content pp | Teacher-vs-QT pp | CQET-vs-LSE pp | KD pp | KD coverage pp |",
         "|---:|:---|---:|---:|---:|---:|---:|---:|",
@@ -1721,11 +1652,6 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
             f"{row['cqet_vs_lse_pp']:.4f} | {row['kd_pp']:.4f} | {row['kd_coverage_delta_pp']:.4f} |"
         )
     (reports / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (reports / "AUDIT_LIMITATIONS.md").write_text(
-        "# Audit limitations\n\nThe test split is a historically exposed regression set, not an unseen holdout. "
-        "No compatible predeclared historical-reference manifest was available.\n",
-        encoding="utf-8",
-    )
     return decision
 
 
@@ -1762,37 +1688,30 @@ def _write_file_manifest(run_root: Path) -> None:
 
 
 def _write_delivery_readme(rt: Runtime, decision: dict, phase_status: str) -> None:
-    candidate = decision["candidate_gain"]["pass"]
-    content = decision["teacher_E_content_gain"]["pass"]
-    kd = decision["KD_gain"]["pass"]
-    seeds = tuple(rt.protocol.get("seeds", [13]))
+    seeds = list(rt.protocol["seeds"])
+    gates = {
+        "Candidate gain": decision["candidate_gain"]["pass"],
+        "Teacher E-content": decision["teacher_E_content_gain"]["pass"],
+        "C2 KD": decision["KD_gain"]["pass"],
+    }
     text = (
-        "# MMDD Stage1 V4.1 delivery\n\n"
-        f"Status: `{phase_status}`. Seeds {list(seeds)} ({len(seeds) * 9} registered stages) completed on the locked GPU.\n\n"
+        f"# {EXPERIMENT_ID} delivery\n\n"
+        f"Status: `{phase_status}`. Seeds {seeds} ({len(seeds) * len(STAGES)} registered stages) completed on the locked GPU.\n\n"
         "All registered checkpoints are full checkpoints containing model, optimizer, RNG, cursor, order, "
         "parent, source, protocol, and feature identities. Test evaluation began only after "
         "`GLOBAL_SELECTION_FREEZE.json` was written. Metrics were recomputed from exported qrels and raw "
         "rankings by the independent audit tool.\n\n"
-        f"- Correctness: {decision['correctness']}\n"
-        f"- Candidate gain gate: {'PASS' if candidate else 'FAIL'}\n"
-        f"- Teacher E-content gate: {'PASS' if content else 'FAIL'}\n"
-        f"- C2 KD gate: {'PASS' if kd else 'FAIL'}\n"
-        "- Historical comparison: V4.0 is not a causal single-factor baseline; no historical checkpoint "
-        "was used to fill or train this run.\n\n"
-        "Pure frozen feature bytes are referenced by the locked recipe and complete shard manifest rather "
+        + "".join(f"- {name} gate: {'PASS' if passed else 'FAIL'}\n" for name, passed in gates.items())
+        + "\nPure frozen feature bytes are referenced by the locked recipe and complete shard manifest rather "
         "than duplicated into this run directory. The test split is historically exposed and is reported "
         "as a regression set, not an unseen holdout.\n"
     )
     (rt.paths.run_root / "README.md").write_text(text, encoding="utf-8")
 
 
-def _verify_delivery_manifest(rt: Runtime) -> None:
-    verify_file_manifest(rt.paths.run_root, rt.paths.run_root / "FILE_MANIFEST.jsonl", check_stages=True)
-
-
 def run_formal(protocol_path: Path, run_root: Path) -> None:
+    _gpu_guard(resolve_default_paths(protocol_path, run_root))
     rt = load_runtime(protocol_path, run_root)
-    _gpu_guard(rt.paths)
     assert_declared_project_imports(rt.paths)
     smoke_result = read_json(rt.paths.run_root / "tests" / "smoke" / "LATEST.json")
     if smoke_result.get("status") != "PASS" or smoke_result["source_identity_sha256"] != source_identity(rt.paths):
@@ -1841,7 +1760,7 @@ def run_formal(protocol_path: Path, run_root: Path) -> None:
     _write_delivery_readme(rt, decision, phase_status)
     _write_file_manifest(rt.paths.run_root)
     try:
-        _verify_delivery_manifest(rt)
+        verify_file_manifest(rt.paths.run_root, rt.paths.run_root / "FILE_MANIFEST.jsonl", check_stages=True)
     except Exception:
         _phase(rt.paths, "COMPLETE_DELIVERY_INTEGRITY_FAILED", formal_training_started=True,
                detail={"seeds_completed": list(seeds), "test_evaluated_after_global_freeze": True,

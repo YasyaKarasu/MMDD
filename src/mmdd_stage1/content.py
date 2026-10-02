@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -130,7 +131,7 @@ def write_chunk(chunk_dir: Path, index: int, rows: list[tuple[str, str, np.ndarr
     return chunk_stem(chunk_dir, index)
 
 
-def build_chunk_index(chunk_dir: Path, *, compact: bool = False) -> dict[str, object]:
+def build_chunk_index(chunk_dir: Path) -> dict[str, object]:
     """Index every published chunk; first occurrence of an object id wins."""
     ids: list[str] = []
     types: list[str] = []
@@ -159,7 +160,7 @@ def build_chunk_index(chunk_dir: Path, *, compact: bool = False) -> dict[str, ob
     }
     (Path(chunk_dir).parent / "index.json").write_text(json.dumps(payload))
     (Path(chunk_dir).parent / "coverage.json").write_text(
-        json.dumps({"objects": len(ids), "types": compact_types(types), "duplicate_objects_skipped": duplicates})
+        json.dumps({"objects": len(ids), "types": dict(Counter(types)), "duplicate_objects_skipped": duplicates})
     )
     return payload
 
@@ -194,71 +195,55 @@ def merge_chunk_dirs(sources: Sequence[Path], dest: Path) -> dict[str, object]:
 class ContentStore:
     """Chunked pure-content token store with random access by object id.
 
-    Layout under ``root``: ``index.json`` plus ``chunks/chunk_*.{ids,lens,tokens}.npy``.  Chunks
-    are immutable once published; readers never look at a partial file.
+    Layout under ``root``: ``index.json`` plus ``chunks/chunk_*.{ids,lens,tokens}.npy``. Every
+    chunk's token block is memory-mapped once on first use and stays mapped; the OS page cache
+    is the only token cache. Tokens stay float16 on the host, ``ObjectBank`` expands them to
+    float32 after the device transfer.
     """
 
-    def __init__(self, root: Path, *, lru_bytes: int = 0) -> None:
+    def __init__(self, root: Path) -> None:
         self.root = Path(root)
         payload = json.loads((self.root / "index.json").read_text())
         self.ids: list[str] = payload["ids"]
         self.types: list[str] = payload["types"]
-        self.chunks = payload["chunks"]
-        self.rows = payload["rows"]
         self.index = {oid: i for i, oid in enumerate(self.ids)}
         self.chunk_dir = self.root / "chunks"
-        self._open: dict[int, dict[str, np.ndarray]] = {}
-        self._lru: dict[str, torch.Tensor] = {}
-        self._lru_used = 0
-        self._lru_limit = lru_bytes
-
-    def has(self, object_id: str) -> bool:
-        return object_id in self.index
+        chunk_of = np.asarray(payload["chunks"], dtype=np.int64)
+        row_of = np.asarray(payload["rows"], dtype=np.int64)
+        lens = {index: np.load(chunk_files(self.chunk_dir, index)["lens"], allow_pickle=False)
+                for index in np.unique(chunk_of).tolist()}
+        offsets = {index: np.concatenate([[0], np.cumsum(value)]) for index, value in lens.items()}
+        self.chunk_of = chunk_of
+        self.length = np.array([lens[c][r] for c, r in zip(chunk_of.tolist(), row_of.tolist())], dtype=np.int64)
+        self.start = np.array([offsets[c][r] for c, r in zip(chunk_of.tolist(), row_of.tolist())], dtype=np.int64)
+        self._tokens: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.ids)
 
-    def _chunk(self, index: int) -> dict[str, np.ndarray]:
-        if index not in self._open:
-            files = chunk_files(self.chunk_dir, index)
-            lens = np.load(files["lens"], allow_pickle=False)
-            self._open[index] = {
-                "ids": np.load(files["ids"], allow_pickle=False),
-                "lens": lens,
-                "offsets": np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
-                "tokens": np.load(files["tokens"], mmap_mode="r", allow_pickle=False),
-            }
-            if len(self._open) > 8:
-                self._open.pop(next(iter(self._open)))
-        return self._open[index]
+    def _chunk_tokens(self, index: int) -> np.ndarray:
+        if index not in self._tokens:
+            self._tokens[index] = np.load(chunk_files(self.chunk_dir, index)["tokens"], mmap_mode="r", allow_pickle=False)
+        return self._tokens[index]
+
+    def locate(self, object_ids: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+        """``(positions, lengths)`` of ``object_ids`` in index order."""
+        positions = np.fromiter((self.index[oid] for oid in object_ids), dtype=np.int64, count=len(object_ids))
+        return positions, self.length[positions]
+
+    def copy_rows(self, positions: np.ndarray, out: np.ndarray) -> None:
+        """Concatenate the token rows of ``positions`` into ``out`` (float16, rows x EMBED_DIM)."""
+        cursor = 0
+        for position in positions.tolist():
+            start, length = int(self.start[position]), int(self.length[position])
+            out[cursor : cursor + length] = self._chunk_tokens(int(self.chunk_of[position]))[start : start + length]
+            cursor += length
 
     def get(self, object_id: str) -> torch.Tensor:
-        cached = self._lru.pop(object_id, None)
-        if cached is not None:
-            self._lru[object_id] = cached
-            return cached
-        i = self.index[object_id]
-        chunk = self._chunk(int(self.chunks[i]))
-        row = int(self.rows[i])
-        start = int(chunk["offsets"][row])
-        length = int(chunk["lens"][row])
-        # Keep the contracted float16 representation on the CPU.  ObjectBank
-        # expands it only after host-to-device transfer, preserving the exact
-        # float32 model input while halving transfer and CPU-cache bytes.
-        tensor = torch.from_numpy(np.array(chunk["tokens"][start : start + length], copy=True))
-        if self._lru_limit:
-            nbytes = tensor.numel() * tensor.element_size()
-            while self._lru and self._lru_used + nbytes > self._lru_limit:
-                victim_id = next(iter(self._lru))
-                victim = self._lru.pop(victim_id)
-                self._lru_used -= victim.numel() * victim.element_size()
-            if nbytes <= self._lru_limit:
-                self._lru[object_id] = tensor
-                self._lru_used += nbytes
-        return tensor
-
-    def ids_by_type(self, object_type: str) -> list[str]:
-        return [oid for oid, t in zip(self.ids, self.types) if t == object_type]
+        positions, lengths = self.locate([object_id])
+        out = np.empty((int(lengths[0]), EMBED_DIM), dtype=np.float16)
+        self.copy_rows(positions, out)
+        return torch.from_numpy(out)
 
 
 # --------------------------------------------------------------- generation ---
@@ -280,16 +265,8 @@ def load_embedder_class(backbone_dir: Path):
     return module.Qwen3VLEmbedder
 
 
-def encode_hidden(embedder, items: list[dict]) -> list[torch.Tensor]:
-    """One frozen forward; return the last-layer valid-token states per item."""
-    return [h for h, _ in _encode(embedder, items, with_ids=False)]
-
-
-def encode_hidden_ids(embedder, items: list[dict]) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    return _encode(embedder, items, with_ids=True)
-
-
-def _encode(embedder, items: list[dict], *, with_ids: bool):
+def encode_hidden(embedder, items: list[dict]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """One frozen forward; per item the last-layer valid-token states and their input ids."""
     conversations = [
         embedder.format_model_input(
             text=item.get("text"), image=item.get("image"), instruction=item["instruction"]
@@ -302,12 +279,7 @@ def _encode(embedder, items: list[dict], *, with_ids: bool):
         outputs = embedder.forward(inputs)
     hidden = outputs["last_hidden_state"]
     mask = outputs["attention_mask"].bool()
-    out = []
-    for i in range(hidden.shape[0]):
-        valid = hidden[i][mask[i]].cpu()
-        ids = inputs["input_ids"][i][mask[i]].cpu() if with_ids else None
-        out.append((valid, ids))
-    return out
+    return [(hidden[i][mask[i]].cpu(), inputs["input_ids"][i][mask[i]].cpu()) for i in range(hidden.shape[0])]
 
 
 def table_token_groups(embedder, item: dict, parts: list[str], input_ids: torch.Tensor):
@@ -368,16 +340,3 @@ def pool_table_groups(hidden: torch.Tensor, groups: torch.Tensor) -> torch.Tenso
             raise ValueError("empty table token group")
         out.append(members.float().mean(0))
     return torch.stack(out)
-
-
-def compact_types(types: Sequence[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for t in types:
-        counts[t] = counts.get(t, 0) + 1
-    return counts
-
-
-def iter_jsonl(path: Path) -> Iterator[dict]:
-    with Path(path).open() as fh:
-        for line in fh:
-            yield json.loads(line)

@@ -7,7 +7,7 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Generator, Iterable, Sequence
+from typing import Any, Generator, Iterable
 
 from .config import Paths
 
@@ -70,6 +70,12 @@ def sha256_file(path: Path) -> str:
 
 def utf8_sorted(items: Iterable[str]) -> list[str]:
     return sorted(items, key=lambda s: s.encode("utf-8"))
+
+
+def json_identity(value: Any) -> str:
+    """SHA256 of the canonical (sorted-key, compact) JSON encoding; the identity of receipts and ids."""
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def build_content_aliases(paths: Paths) -> dict[str, str]:

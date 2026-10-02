@@ -1,7 +1,6 @@
 """Auditable materialization for pools, training records, and model artifacts."""
 from __future__ import annotations
 
-import hashlib
 import gzip
 import json
 import os
@@ -13,15 +12,9 @@ from typing import Mapping, Sequence
 import torch
 
 from . import SCHEMA_VERSION
-from .data import sha256_file, utf8_sorted, write_json, write_jsonl_gz
+from .data import json_identity, sha256_file, utf8_sorted, write_json, write_jsonl_gz
 from .labels import Labels
 from .retrieval import PoolRecord
-
-
-
-def json_identity(value: object) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def pool_identity(pool: PoolRecord) -> str:

@@ -45,18 +45,6 @@ class Paths:
     def pca_dir(self) -> Path:
         return self.run_root / "pca"
 
-    @property
-    def raw_dir(self) -> Path:
-        return self.run_root / "raw"
-
-    @property
-    def lists_dir(self) -> Path:
-        return self.run_root / "lists"
-
-    @property
-    def source_snapshots_dir(self) -> Path:
-        return self.run_root / "source_snapshots"
-
     def seed_dir(self, seed: int) -> Path:
         return self.run_root / f"seed{seed}"
 

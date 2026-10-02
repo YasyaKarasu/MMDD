@@ -23,6 +23,7 @@ from cache_stage1_features import EMBEDDING_INSTRUCTIONS
 
 from . import content
 from .construction import serialize_table_parts
+from .data import iter_jsonl
 
 # Preparation-stage imaging contract: decode whatever the dataset ships instead
 # of letting PIL's heuristic bomb guard turn a real object into a NULL token
@@ -43,7 +44,7 @@ def shard_of(object_id: str, num_shards: int) -> int:
 
 def load_source_tables(dataset_root: Path, needed: set[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
-    for row in content.iter_jsonl(dataset_root / "source_tables" / "part-00000.jsonl"):
+    for row in iter_jsonl(dataset_root / "source_tables" / "part-00000.jsonl"):
         sid = str(row["source_table_id"])
         if sid in needed:
             out[sid] = row
@@ -79,7 +80,7 @@ def plan_work(dataset_root: Path, cache_dir: Path, kinds: set[str], shard: int, 
     work: list[dict] = []
     if "text" in kinds or "image" in kinds:
         for shard_path in sorted((dataset_root / "bridge_assets").glob("part-*.jsonl")):
-            for row in content.iter_jsonl(shard_path):
+            for row in iter_jsonl(shard_path):
                 kind = str(row["asset_type"])
                 if kind not in kinds:
                     continue
@@ -96,7 +97,7 @@ def plan_work(dataset_root: Path, cache_dir: Path, kinds: set[str], shard: int, 
                     }
                 )
     if "table" in kinds:
-        records = [r for r in content.iter_jsonl(dataset_root / "data_lake_tables" / "part-00000.jsonl")
+        records = [r for r in iter_jsonl(dataset_root / "data_lake_tables" / "part-00000.jsonl")
                    if str(r["table_id"]) not in covered]
         refs = {
             (r["source_table_ref"]["source_table_id"] if isinstance(r.get("source_table_ref"), dict) else str(r["source_table_ref"]))
@@ -186,22 +187,12 @@ def main(argv: list[str] | None = None) -> int:
     def handle(batch: list[dict]) -> None:
         kind = batch[0]["object_type"]
         try:
-            if kind == "table":
-                pairs = content.encode_hidden_ids(
-                    embedder,
-                    [{"text": "\n".join(b["parts"]), "image": None, "instruction": b["instruction"]} for b in batch],
-                )
-            else:
-                hidden_list = content.encode_hidden(
-                    embedder,
-                    [
-                        {"text": b["text"] if kind == "text" else None,
-                         "image": b["image"] if kind == "image" else None,
-                         "instruction": b["instruction"]}
-                        for b in batch
-                    ],
-                )
-                pairs = list(zip(hidden_list, [None] * len(batch)))
+            pairs = content.encode_hidden(embedder, [
+                {"text": "\n".join(b["parts"]) if kind == "table" else b["text"],
+                 "image": b["image"] if kind == "image" else None,
+                 "instruction": b["instruction"]}
+                for b in batch
+            ])
         except Exception as error:  # external file/model boundary
             for b in batch:
                 if b["object_type"] == "image" and not Path(str(b.get("image") or "")).is_file():

@@ -1,29 +1,22 @@
 """Immutable stage receipts and source/output identity for Stage-1 CQET."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
 
 from . import EXPERIMENT_ID, VERSION
 from .config import STAGE_ORDER, Paths
-from .data import iter_jsonl, sha256_file, write_json
-from .train import state_sha
+from .data import iter_jsonl, json_identity, sha256_file, write_json
 
 SOURCE_AMENDMENTS = "SOURCE_AMENDMENTS.jsonl"
-
-
-def json_sha(value: object) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def source_files(paths: Paths) -> list[Path]:
@@ -59,7 +52,7 @@ def source_manifest(paths: Paths) -> list[dict[str, object]]:
 
 
 def source_identity(paths: Paths) -> str:
-    return json_sha(source_manifest(paths))
+    return json_identity(source_manifest(paths))
 
 
 def record_source_amendment(
@@ -88,13 +81,13 @@ def record_source_amendment(
         "schema_version": VERSION,
         "amendment_id": amendment_id,
         "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "from_source_identity_sha256": json_sha(previous),
-        "to_source_identity_sha256": json_sha(current),
+        "from_source_identity_sha256": json_identity(previous),
+        "to_source_identity_sha256": json_identity(current),
         "changed_paths": changed,
         "carried_stages": list(carried_stages),
         "reason": reason,
     }
-    row["receipt_sha256"] = json_sha(row)
+    row["receipt_sha256"] = json_identity(row)
     with (paths.run_root / SOURCE_AMENDMENTS).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     return row
@@ -138,18 +131,16 @@ def record_stage_pre_run(
     stage_dir: Path,
     stage: str,
     seed: int,
-    gpu_uuid: str,
+    paths: Paths,
     *,
-    paths: Optional[Paths] = None,
-    parents: Optional[dict[str, str]] = None,
-    config: Optional[dict[str, Any]] = None,
-    inputs: Optional[dict[str, Any]] = None,
-    lists: Optional[dict[str, str]] = None,
-    command: Optional[Sequence[str]] = None,
+    parents: dict[str, str],
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    lists: dict[str, str],
 ) -> str:
+    """Write the immutable PRE_RUN receipt of a new attempt and return its id."""
     stage_dir.mkdir(parents=True, exist_ok=True)
     attempt = _next_attempt(stage_dir)
-    source_sha = source_identity(paths) if paths is not None else None
     payload = {
         "schema_version": VERSION,
         "experiment_id": EXPERIMENT_ID,
@@ -160,22 +151,19 @@ def record_stage_pre_run(
         "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "gpu": {
             "physical_index": 0,
-            "uuid": gpu_uuid,
+            "uuid": paths.gpu_uuid,
             "mapped_device": "cuda:0",
             "visible_device_count": torch.cuda.device_count(),
         },
         "pid": os.getpid(),
-        "parents": parents or {},
-        "config": config or {},
-        "inputs": inputs or {},
-        "training_lists": lists or {},
-        "source_identity_sha256": source_sha,
-        "protocol_sha256": sha256_file(paths.protocol_path) if paths is not None else None,
-        "feature_identity_sha256": (
-            json.loads((paths.run_root / "CACHE_IDENTITY.json").read_text())["identity_sha256"]
-            if paths is not None else None
-        ),
-        "command": list(command or sys.argv),
+        "parents": parents,
+        "config": config,
+        "inputs": inputs,
+        "training_lists": lists,
+        "source_identity_sha256": source_identity(paths),
+        "protocol_sha256": sha256_file(paths.protocol_path),
+        "feature_identity_sha256": json.loads((paths.run_root / "CACHE_IDENTITY.json").read_text())["identity_sha256"],
+        "command": list(sys.argv),
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -183,7 +171,7 @@ def record_stage_pre_run(
             "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
     }
-    payload["receipt_sha256"] = json_sha(payload)
+    payload["receipt_sha256"] = json_identity(payload)
     path = stage_dir / f"PRE_RUN.{attempt}.json"
     if path.exists():
         raise FileExistsError(path)
@@ -231,7 +219,7 @@ def record_stage_post_run(
         "impact": impact,
         "pre_run_sha256": sha256_file(pre),
     }
-    payload["receipt_sha256"] = json_sha(payload)
+    payload["receipt_sha256"] = json_identity(payload)
     path = stage_dir / f"POST_RUN.{attempt_id}.json"
     if path.exists():
         raise FileExistsError(path)

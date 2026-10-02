@@ -18,7 +18,23 @@ from PIL import Image
 from torch.nn import functional as F
 
 from mmdd_progress import progress
-from mmdd_stage1.feature_cache import normalize_object_type
+
+TYPE_ALIASES = {
+    "table": "table",
+    "table_fragment": "table",
+    "text": "text",
+    "text_asset": "text",
+    "image": "image",
+    "image_asset": "image",
+}
+
+
+def normalize_object_type(value: str) -> str:
+    try:
+        return TYPE_ALIASES[value]
+    except KeyError as exc:
+        raise ValueError(f"Unknown object type {value!r}; expected one of: {', '.join(sorted(TYPE_ALIASES))}") from exc
+
 
 PROMPT_VERSION = "role_modality_v2_object_only"
 TEACHER_MANIFEST = "teacher_manifest.jsonl"

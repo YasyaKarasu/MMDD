@@ -19,10 +19,10 @@ from .losses import (
     rank_mass_loss,
 )
 from .models import FreshPathTeacher, NativeStudent, QTStudent
+from .train import StudentRecipe, TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids
+
 if TYPE_CHECKING:
     from .retrieval import PoolRecord
-from .train import StudentRecipe, TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids
-from .execution_layout import TEACHER_INFERENCE_CHUNK
 
 
 def _stats(values: Sequence[float], *, reason: str) -> dict[str, Any]:
@@ -129,7 +129,7 @@ def teacher_content_probe(
                     f0, path_logits = teacher.score_query_lists(
                         (bank.z(query_id), tokens[query_id]),
                         (bank.z_many(targets), [tokens[target] for target in targets]),
-                        evidence_map, paths, chunk=TEACHER_INFERENCE_CHUNK,
+                        evidence_map, paths,
                     )
                 if mode == "qt":
                     aggregate = f0
@@ -423,7 +423,7 @@ def _student_component(
     scale: float,
     recipe: StudentRecipe,
 ) -> Optional[float]:
-    direct, evidence, bag_targets, _ = _student_c2_scores(model, bank, row, recipe.logit_scale)
+    direct, evidence, bag_targets = _student_c2_scores(model, bank, row, recipe.logit_scale)
     positives = set(row["positives"])
     direct_positive = torch.tensor(
         [target in positives for target in row["targets"]], device=direct.device

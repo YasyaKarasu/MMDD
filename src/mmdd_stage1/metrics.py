@@ -198,10 +198,9 @@ def export_funnels(
         "two_hop_reached", "in_U", "D1_nonempty_bag", "in_C150",
         "teacher_top10", "teacher_top20", "teacher_top50",
     )
-    rows_by_query = {
-        query_id: [row for row in strict_rows if row["query_id"] == query_id]
-        for query_id in strict_by_query
-    }
+    rows_by_query: dict[str, list[dict]] = {query_id: [] for query_id in strict_by_query}
+    for row in strict_rows:
+        rows_by_query[row["query_id"]].append(row)
     nonempty = [q for q, counts in strict_by_query.items() if counts["strict_gold"] > 0]
     strict_summary = {
         "schema_version": SCHEMA_VERSION,

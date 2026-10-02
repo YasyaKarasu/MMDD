@@ -36,9 +36,8 @@ from mmdd_stage1.train import (build_teacher_logits_cache, model_state_sha,
 def runtime(run: Path, prepare: bool = False) -> pipeline.Runtime:
     paths = resolve_default_paths(run / "protocol.json", run)
     if prepare:
-        preflight.configure(paths)
-        preflight.build_content_aliases()
-        preflight.build_cache_manifest()
+        preflight.build_content_aliases(paths)
+        preflight.build_cache_manifest(paths)
         build_labels(paths, build_content_aliases(paths))
     labels = load_labels(paths)
     z = load_z(paths)
@@ -46,7 +45,7 @@ def runtime(run: Path, prepare: bool = False) -> pipeline.Runtime:
     if prepare:
         fit_pca(paths, z, labels)
     basis, mean = load_pca(paths)
-    bank = ObjectBank(z, ContentStore(paths.pure_cache_dir / "content", lru_bytes=8 * 2**30))
+    bank = ObjectBank(z, ContentStore(paths.pure_cache_dir / "content"))
     return pipeline.Runtime(paths, read_json(paths.protocol_path), labels, z, rows, bank, basis, mean)
 
 
@@ -127,7 +126,7 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
     del teacher
     student = NativeStudent(rt.pca_basis, rt.pca_mean)
     print("TRAIN C1", flush=True)
-    c1_points = train_student_c1(student, c1, None, rt.bank, arm="NATIVE_SUP",
+    c1_points = train_student_c1(student, c1, rt.bank, arm="NATIVE_SUP",
                                  save_dir=run / "C1", log_path=run / "C1.jsonl",
                                  epochs=student_epochs, logical_batch=student_batch,
                                  lr_p=student_lr_p, lr_r=student_lr_r)
@@ -151,7 +150,7 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
             torch.save(logits, run / "teacher_c2_logits.pt")
             del teacher
         print(f"TRAIN C2 {arm}", flush=True)
-        all_points[arm] = train_student_c2(student, c2, None, rt.bank, arm=f"NATIVE_{arm}",
+        all_points[arm] = train_student_c2(student, c2, rt.bank, arm=f"NATIVE_{arm}",
             save_dir=run / f"C2_{arm}", expected_parent_hash=parent_hash, teacher_logits=logits,
             log_path=run / f"C2_{arm}.jsonl", epochs=student_epochs, logical_batch=student_batch,
             lr_p=student_lr_p, lr_r=student_lr_r)

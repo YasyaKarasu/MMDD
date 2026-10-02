@@ -9,15 +9,14 @@ scores are the frozen ``TB_CQET`` end-point reranking of that Student's C150 poo
 from __future__ import annotations
 
 import gc
-import gzip
-import hashlib
 import json
 import math
-import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
+
+from .data import iter_jsonl, sha256_file, write_json, write_jsonl
 
 
 def validate_retrieval_path_budget(
@@ -40,14 +39,6 @@ def validate_retrieval_path_budget(
         if not paths or any(path.get("kind") not in {"direct", "evidence"}
                             or (path["kind"] == "evidence" and not path.get("evidence_id")) for path in paths):
             raise ValueError(f"{target_id}: missing or invalid retrieval path detail")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def load_stage1_selection(path: Path) -> dict[str, Any]:
@@ -81,48 +72,16 @@ def validate_stage2_gate(
             f"Stage-1 best checkpoint is missing: {checkpoint_path}"
         )
     expected_sha256 = str(selection["best_checkpoint_sha256"])
-    if _sha256(checkpoint_path) != expected_sha256:
+    if sha256_file(checkpoint_path) != expected_sha256:
         raise ValueError("Stage-1 best checkpoint fingerprint no longer matches its gate")
     for retrieval_path in retrieval_paths or []:
-        text = retrieval_path.read_text(encoding="utf-8")
-        try:
-            payload = json.loads(text)
-            records = payload if isinstance(payload, list) else [payload]
-        except json.JSONDecodeError:
-            records = [json.loads(line) for line in text.splitlines() if line.strip()]
-        for record_number, record in enumerate(records, 1):
+        for record_number, record in enumerate(iter_jsonl(retrieval_path), 1):
             if record.get("student_checkpoint_sha256") != expected_sha256:
                 raise ValueError(
                     f"{retrieval_path}:record {record_number}: retrieval was not produced "
                     "by the dev-gated best Student checkpoint"
                 )
     return selection
-
-
-def _read_jsonl_gz(path: Path) -> list[dict[str, Any]]:
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
-
-
-def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
 
 
 def _materialize_train(
@@ -148,51 +107,26 @@ def _materialize_train(
         return output_dir
 
     runtime = load_runtime(protocol_path, run_root)
-    generator = f"{output_dir.name}"
-    pools = None
-    student = None
-    teacher = None
-    try:
-        if pool_manifest.is_file():
-            pools = load_pool_bundle(output_dir)
-        else:
-            student = _load_native(checkpoint, runtime, device=device)
-            pools = evaluate_student_retrieval(
-                student,
-                runtime.z_store,
-                runtime.row_store,
-                runtime.labels.query_ids,
-                runtime.labels,
-                "train",
-                hnsw_seed=seed,
-                generator_id=generator,
-                index_dir=str(output_dir / "indices"),
-            )
-            save_pool_bundle(output_dir, pools, runtime.labels, seed=seed, generator=generator)
-            del student
-            student = None
-            torch.cuda.empty_cache()
-
-        teacher = _load_teacher(
-            run_root / f"seed{seed}" / "TB_CQET" / "checkpoints" / "end.pt",
-            device=device,
+    generator = output_dir.name
+    if pool_manifest.is_file():
+        pools = load_pool_bundle(output_dir)
+    else:
+        student = _load_native(checkpoint, runtime, device=device)
+        pools = evaluate_student_retrieval(
+            student, runtime.z_store, runtime.row_store, runtime.labels.query_ids, runtime.labels, "train",
+            hnsw_seed=seed, generator_id=generator, index_dir=output_dir / "indices",
         )
-        evaluate_teacher_matrix(
-            {"TB_CQET": teacher},
-            runtime.bank,
-            pools,
-            runtime.labels,
-            seed=seed,
-            generator=generator,
-            split="train",
-            output_dir=output_dir,
-            device=device,
-        )
-    finally:
-        del pools, student, teacher, runtime
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        save_pool_bundle(output_dir, pools, runtime.labels, seed=seed, generator=generator)
+        del student
+        torch.cuda.empty_cache()
+    teacher = _load_teacher(run_root / f"seed{seed}" / "TB_CQET" / "checkpoints" / "end.pt", device=device)
+    evaluate_teacher_matrix(
+        {"TB_CQET": teacher}, runtime.bank, pools, runtime.labels,
+        seed=seed, generator=generator, split="train", output_dir=output_dir, device=device,
+    )
+    del pools, teacher, runtime
+    gc.collect()
+    torch.cuda.empty_cache()
     return output_dir
 
 
@@ -289,10 +223,10 @@ def _export_split(
     top_k: int,
     evidence_path_k: int,
 ) -> list[dict[str, Any]]:
-    pools = {str(row["query_id"]): row for row in _read_jsonl_gz(source_dir / "pools.jsonl.gz")}
-    rankings = _read_jsonl_gz(source_dir / "rankings.TB_CQET.Real.jsonl.gz")
+    pools = {str(row["query_id"]): row for row in iter_jsonl(source_dir / "pools.jsonl.gz")}
+    rankings = list(iter_jsonl(source_dir / "rankings.TB_CQET.Real.jsonl.gz"))
     logits_by_query: dict[str, dict[str, dict[str, Any]]] = {}
-    for row in _read_jsonl_gz(source_dir / "logits.TB_CQET.Real.jsonl.gz"):
+    for row in iter_jsonl(source_dir / "logits.TB_CQET.Real.jsonl.gz"):
         logits_by_query.setdefault(str(row["query_id"]), {})[str(row["target_id"])] = row
 
     records = []
@@ -313,7 +247,7 @@ def _export_split(
         )
         records.append(record)
     records.sort(key=lambda row: str(row["query_id"]).encode("utf-8"))
-    _write_jsonl(output_path, records)
+    write_jsonl(output_path, records)
     return records
 
 
@@ -369,7 +303,7 @@ def export_stage2(
     selection_path = seed_dir / "selections" / "NATIVE_C2_COMMON.json"
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
     checkpoint = Path(selection[f"{arm}_checkpoint"])
-    checkpoint_sha256 = _sha256(checkpoint)
+    checkpoint_sha256 = sha256_file(checkpoint)
     if checkpoint_sha256 != selection[f"{arm}_checkpoint_sha256"]:
         raise ValueError(f"Selected NATIVE_C2_{arm} checkpoint hash mismatch")
 
@@ -398,7 +332,7 @@ def export_stage2(
         records_by_split[split] = records
         exports[split] = {
             "path": str(destination.resolve()),
-            "sha256": _sha256(destination),
+            "sha256": sha256_file(destination),
             "records": len(records),
             "source_dir": str(source.resolve()),
         }
@@ -414,7 +348,7 @@ def export_stage2(
         "best_metrics": dev_coverage,
         "stage1_selection": {
             "path": str(selection_path.resolve()),
-            "sha256": _sha256(selection_path),
+            "sha256": sha256_file(selection_path),
             "arm": f"NATIVE_C2_{arm}",
             "selection_owner": selection["selection_owner"],
             "selected_fraction": selection["selected_fraction"],
@@ -427,7 +361,7 @@ def export_stage2(
         "retrievals": exports,
     }
     gate_path = output_dir / "stage1_gate.json"
-    _write_json(gate_path, gate)
+    write_json(gate_path, gate)
     validate_stage2_gate(
         gate_path,
         [Path(exports[split]["path"]) for split in ("train", "dev", "test")],
@@ -436,9 +370,9 @@ def export_stage2(
         "status": "COMPLETE",
         "stage1_run": str(run_root.resolve()),
         "dataset_root": str(dataset_root.resolve()),
-        "gate": {"path": str(gate_path.resolve()), "sha256": _sha256(gate_path)},
+        "gate": {"path": str(gate_path.resolve()), "sha256": sha256_file(gate_path)},
         "retrievals": exports,
         "dev_evidence_coverage": dev_coverage,
     }
-    _write_json(output_dir / "EXPORT_MANIFEST.json", manifest)
+    write_json(output_dir / "EXPORT_MANIFEST.json", manifest)
     return manifest

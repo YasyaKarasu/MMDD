@@ -125,10 +125,9 @@ def bind(run: Path):
     from mmdd_stage1 import pipeline, preflight, provenance
     from mmdd_stage1.config import resolve_default_paths
 
-    preflight.configure(resolve_default_paths(run / "protocol.json", run))
     original_sources = provenance.source_files
     provenance.source_files = lambda paths: [*original_sources(paths), Path(__file__).resolve()]
-    return pipeline, preflight
+    return pipeline, preflight, resolve_default_paths(run / "protocol.json", run)
 
 
 def endpoint_evaluation(run: Path) -> None:
@@ -136,7 +135,7 @@ def endpoint_evaluation(run: Path) -> None:
     from mmdd_stage1.data import load_split_gt
     from mmdd_stage1.evaluate import evaluate_student_retrieval, evaluate_teacher_matrix
 
-    pipeline, _ = bind(run)
+    pipeline, _preflight, _paths = bind(run)
     freeze = json.loads((run / "GLOBAL_SELECTION_FREEZE.json").read_text())
     if freeze["status"] != "ALL_SELECTIONS_FROZEN_BEFORE_TEST":
         raise ValueError("Endpoint diagnostics require completed selection")
@@ -241,11 +240,11 @@ def main() -> None:
     elif args.command == "summarize":
         summarize(run)
     else:
-        pipeline, preflight = bind(run)
+        pipeline, preflight, paths = bind(run)
         if args.command == "lock":
-            preflight.run_lock()
+            preflight.run_lock(paths)
         elif args.command == "verify-features":
-            preflight.verify_feature_provenance("cuda:0")
+            preflight.verify_feature_provenance(paths)
         else:
             function = pipeline.run_formal if args.command == "all" else getattr(pipeline, args.command)
             function(run / "protocol.json", run)

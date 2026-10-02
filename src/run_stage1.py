@@ -323,11 +323,11 @@ def main(argv: list[str] | None = None) -> None:
         from mmdd_stage1 import preflight
         from mmdd_stage1.config import resolve_default_paths
 
-        preflight.configure(resolve_default_paths(protocol_path, run))
+        paths = resolve_default_paths(protocol_path, run)
         if args.command == "lock":
-            preflight.run_lock()
+            preflight.run_lock(paths)
         else:
-            preflight.verify_feature_provenance("cuda:0")
+            preflight.verify_feature_provenance(paths)
     elif args.command == "export":
         from mmdd_stage1.export import export_stage2
 

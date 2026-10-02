@@ -5,4 +5,3 @@ EXPERIMENT_ID = "MMDD_STAGE1_V4_2_CQET"
 SCHEMA_VERSION = "4.1.0"
 # Protocol / training-recipe version; a protocol must declare this exact value.
 VERSION = "4.2.0"
-DATE = "2026-10-01"

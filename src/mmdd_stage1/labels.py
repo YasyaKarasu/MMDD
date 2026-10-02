@@ -1,24 +1,12 @@
 """Labels, ground truth, and protection sets for Stage-1 CQET."""
 from __future__ import annotations
 
-import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable, Sequence
 
 from . import SCHEMA_VERSION
 from .config import Paths
-from .data import (
-    iter_jsonl,
-    load_split_gt,
-    read_json,
-    sha256_file,
-    utf8_sorted,
-    write_json,
-    write_jsonl,
-    write_jsonl_gz,
-)
+from .data import iter_jsonl, load_split_gt, read_json, utf8_sorted, write_json, write_jsonl, write_jsonl_gz
 
 RELATIONS = ("QT", "Q_text", "Q_image", "text_T", "image_T")
 

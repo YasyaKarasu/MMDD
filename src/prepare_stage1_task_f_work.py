@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from mmdd_stage1.feature_cache import normalize_object_type
+from cache_stage1_features import normalize_object_type
 
 
 def _records(path: Path) -> Iterable[dict[str, Any]]:

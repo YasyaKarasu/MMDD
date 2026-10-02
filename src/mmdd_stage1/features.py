@@ -1,24 +1,21 @@
-"""Feature stores, ContentStore, ObjectBank, and PCA fitting for Stage-1 CQET."""
+"""Frozen feature stores (z, content tokens, query rows), the ObjectBank, and PCA fitting."""
 from __future__ import annotations
 
-import json
 import hashlib
-import os
-from collections import defaultdict
+import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from . import SCHEMA_VERSION
 from .config import Paths
-from .data import iter_jsonl, read_json, sha256_file, utf8_sorted, write_json, write_jsonl
+from .content import EMBED_DIM, ContentStore
+from .data import iter_jsonl, read_json, sha256_file, utf8_sorted, write_json
 from .labels import Labels
 
-INPUT_DIM = 4096
+INPUT_DIM = EMBED_DIM
 PCA_COMPONENTS = 1024
 
 
@@ -55,17 +52,10 @@ def load_z(paths: Paths) -> ZStore:
     if raw.shape != (len(ids), INPUT_DIM) or raw.dtype != np.float32:
         raise ValueError(f"unexpected frozen z array: shape={raw.shape}, dtype={raw.dtype}")
     z_tensor = torch.from_numpy(np.array(raw, dtype=np.float32, copy=True, order="C"))
-    min_norm = float("inf")
-    max_norm = 0.0
-    for start in range(0, len(z_tensor), 4096):
-        block = z_tensor[start : start + 4096]
-        norms = torch.linalg.vector_norm(block, dim=1)
-        if bool((norms == 0).any()):
-            bad = ids[start + int(torch.nonzero(norms == 0, as_tuple=False)[0])]
-            raise ValueError(f"zero frozen feature vector: {bad}")
-        min_norm = min(min_norm, float(norms.min()))
-        max_norm = max(max_norm, float(norms.max()))
-        block.div_(norms[:, None])
+    norms = torch.linalg.vector_norm(z_tensor, dim=1)
+    if bool((norms == 0).any()):
+        raise ValueError(f"zero frozen feature vector: {ids[int(torch.nonzero(norms == 0)[0])]}")
+    z_tensor.div_(norms[:, None])
 
     index = {oid: i for i, oid in enumerate(ids)}
     if len(index) != len(ids):
@@ -86,32 +76,20 @@ def load_z(paths: Paths) -> ZStore:
     ).hexdigest()
     write_json(
         paths.run_root / "Z_UNIT_IDENTITY.json",
-        {**identity, "identity_sha256": z_sha, "input_norm_min": min_norm, "input_norm_max": max_norm},
+        {**identity, "identity_sha256": z_sha,
+         "input_norm_min": float(norms.min()), "input_norm_max": float(norms.max())},
     )
     return ZStore(ids=ids, types=types, z=z_tensor, index=index, sha256=z_sha)
 
 
-from .content import ContentStore
-
-
 class ObjectBank:
-    """Combines ZStore and ContentStore with GPU caching for fast training."""
+    """Retrieval ``z`` (device-resident) plus content tokens fetched per batch from the ContentStore."""
 
-    def __init__(
-        self,
-        z_store: ZStore,
-        content: ContentStore,
-        device: Optional[str | torch.device] = None,
-        gpu_token_bytes: int = 1 * 2**30,
-    ) -> None:
+    def __init__(self, z_store: ZStore, content: ContentStore, device: Optional[str | torch.device] = None) -> None:
         self.z_store = z_store
         self.content = content
         self._device: Optional[torch.device] = None
         self._z_gpu: Optional[Tensor] = None
-        self._gpu_tokens: dict[str, Tensor] = {}
-        self._gpu_token_bytes = gpu_token_bytes
-        self._gpu_token_used = 0
-
         if device is not None:
             self.attach_device(device)
 
@@ -130,83 +108,23 @@ class ObjectBank:
         return self.z_store.z[idx]
 
     def z_many(self, object_ids: Sequence[str]) -> Tensor:
-        positions = torch.tensor(
-            [self.z_store.index[i] for i in object_ids], dtype=torch.long
-        )
+        positions = torch.tensor([self.z_store.index[i] for i in object_ids], dtype=torch.long)
         if self._z_gpu is not None:
             return self._z_gpu[positions.to(self._device)]
         return self.z_store.z[positions]
 
-
-    def tokens(self, object_id: str) -> Tensor:
-        if self._device is not None:
-            cached = self._gpu_tokens.pop(object_id, None)
-            if cached is not None:
-                self._gpu_tokens[object_id] = cached
-                return cached
-            t = self.content.get(object_id).to(device=self._device, dtype=torch.float32)
-            nbytes = t.numel() * t.element_size()
-            while self._gpu_tokens and self._gpu_token_used + nbytes > self._gpu_token_bytes:
-                victim = next(iter(self._gpu_tokens))
-                self._gpu_token_used -= self._gpu_tokens.pop(victim).numel() * 4
-            if nbytes <= self._gpu_token_bytes:
-                self._gpu_tokens[object_id] = t
-                self._gpu_token_used += nbytes
-            return t
-        return self.content.get(object_id).float()
-
     def tokens_many(self, object_ids: Sequence[str]) -> list[Tensor]:
-        """Batched token fetch: gather rows on host into one buffer, single transfer, .float() on device."""
+        """Content tokens of ``object_ids`` as float32 device tensors, gathered in one host buffer and one transfer."""
         if not object_ids:
             return []
-        content = self.content
-        if hasattr(content, "index") and hasattr(content, "_chunk") and hasattr(content, "chunks") and hasattr(content, "rows"):
-            chunk_groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
-            for pos, oid in enumerate(object_ids):
-                i = content.index[oid]
-                ch_id = int(content.chunks[i])
-                r = int(content.rows[i])
-                chunk_groups[ch_id].append((pos, r))
-
-            lens = [0] * len(object_ids)
-            item_coords = [None] * len(object_ids)
-            for ch_id, items in chunk_groups.items():
-                ch = content._chunk(ch_id)
-                for pos, r in items:
-                    s = int(ch["offsets"][r])
-                    l = int(ch["lens"][r])
-                    lens[pos] = l
-                    item_coords[pos] = (ch_id, s, l)
-
-            total_len = sum(lens)
-            if self._device is not None and self._device.type == "cuda":
-                host = torch.empty((total_len, 4096), dtype=torch.float16).pin_memory()
-            else:
-                host = torch.empty((total_len, 4096), dtype=torch.float16)
-
-            host_np = host.numpy()
-            target_offsets = [0] * len(object_ids)
-            curr = 0
-            for pos, l in enumerate(lens):
-                target_offsets[pos] = curr
-                curr += l
-
-            for ch_id, items in chunk_groups.items():
-                ch = content._chunk(ch_id)
-                tok_data = ch["tokens"]
-                for pos, r in items:
-                    _, s, l = item_coords[pos]
-                    dst = target_offsets[pos]
-                    host_np[dst : dst + l] = tok_data[s : s + l]
-
-            if self._device is not None and self._device.type == "cuda":
-                flat = host.to(self._device, non_blocking=True).float()
-            else:
-                flat = host.float()
-                if self._device is not None:
-                    flat = flat.to(self._device)
-            return list(torch.split(flat, lens))
-        return [self.tokens(oid) for oid in object_ids]
+        positions, lengths = self.content.locate(object_ids)
+        cuda = self._device is not None and self._device.type == "cuda"
+        # pin_memory=True draws from torch's cached host allocator, so repeated batches do not
+        # pay cudaHostAlloc again; the float16 -> float32 expansion happens on the device.
+        host = torch.empty((int(lengths.sum()), INPUT_DIM), dtype=torch.float16, pin_memory=cuda)
+        self.content.copy_rows(positions, host.numpy())
+        flat = host.to(self._device, non_blocking=cuda) if self._device is not None else host
+        return list(torch.split(flat.float(), lengths.tolist()))
 
 
 @dataclass
@@ -321,13 +239,7 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
             "z_unit_identity_sha256": z_store.sha256,
         },
     )
-    write_jsonl(
-        pca_dir / "fit_ids.jsonl",
-        ({"schema_version": SCHEMA_VERSION, "position": i, "object_id": object_id}
-         for i, object_id in enumerate(fit_ids)),
-    )
 
-    # 1. Compute Mean
     total = len(fit_ids)
     sum_vec = np.zeros(INPUT_DIM, dtype=np.float64)
     chunk_size = 4096
@@ -339,7 +251,6 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
 
     mean = sum_vec / total
 
-    # 2. Compute Covariance
     cov = np.zeros((INPUT_DIM, INPUT_DIM), dtype=np.float64)
     for start in range(0, total, chunk_size):
         batch_ids = fit_ids[start : start + chunk_size]
@@ -349,14 +260,10 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
 
     cov /= total
 
-    # 3. Eigendecomposition
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    # eigh returns ascending order; reverse to descending
     order = np.argsort(eigenvalues)[::-1]
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
-
-    # Top 1024 components
     basis64 = eigenvectors[:, :PCA_COMPONENTS].T
     for row in basis64:
         pivot = int(np.argmax(np.abs(row)))
@@ -365,13 +272,9 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
     basis = basis64.astype(np.float32)  # (1024, 4096)
     mean_f32 = mean.astype(np.float32)
 
-    # Save
     np.save(pca_dir / "mean.f32.npy", mean_f32)
     np.save(pca_dir / "basis.f32.npy", basis)
     np.save(pca_dir / "eigenvalues.f64.npy", eigenvalues)
-    np.save(pca_dir / "mean.npy", mean_f32)
-    np.save(pca_dir / "basis.npy", basis)
-    np.save(pca_dir / "eigenvalues.npy", eigenvalues)
     torch.save(
         {"basis": torch.from_numpy(basis), "mean": torch.from_numpy(mean_f32)},
         pca_dir / "basis.pt",
@@ -387,7 +290,6 @@ def fit_pca(paths: Paths, z_store: ZStore, labels: Labels) -> dict[str, Any]:
         "basis_sha256": sha256_file(pca_dir / "basis.f32.npy"),
         "basis_pt_sha256": sha256_file(pca_dir / "basis.pt"),
         "fit_ids_sha256": sha256_file(pca_dir / "fit_ids.json"),
-        "fit_ids_jsonl_sha256": sha256_file(pca_dir / "fit_ids.jsonl"),
         "sign_rule": "largest_absolute_component_positive",
         "covariance_denominator": total,
     }
