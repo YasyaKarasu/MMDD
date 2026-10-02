@@ -62,6 +62,8 @@ from .train import (
 )
 
 STAGES = list(STAGE_ORDER)
+# How often a process of a two-GPU run polls for the stages and files of the other one.
+PEER_POLL_SECONDS = 30
 
 
 @dataclass
@@ -95,7 +97,7 @@ def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
     return sorted(ids, key=lambda value: (hashlib.sha256(value.encode()).digest(), value.encode()))[:count]
 
 
-def _gpu_guard(paths: Paths) -> None:
+def _gpu_guard(expected_uuid: str | None) -> None:
     """The process must see exactly the GPU the protocol pins (set CUDA_VISIBLE_DEVICES to its UUID).
 
     Runs before the multi-GiB feature load: it fails fast, and on this machine CUDA's first
@@ -107,8 +109,8 @@ def _gpu_guard(paths: Paths) -> None:
     uuid = str(props.uuid)
     if not uuid.startswith("GPU-"):
         uuid = "GPU-" + uuid
-    if paths.gpu_uuid is None or uuid.lower() != paths.gpu_uuid.lower():
-        raise RuntimeError(f"BLOCKED_GPU_IDENTITY: cuda:0={uuid} {props.name}, protocol pins {paths.gpu_uuid}")
+    if expected_uuid is None or uuid.lower() != expected_uuid.lower():
+        raise RuntimeError(f"BLOCKED_GPU_IDENTITY: cuda:0={uuid} {props.name}, protocol pins {expected_uuid}")
 
 
 def _protocol_paths(protocol_path: Path, run_root: Path) -> tuple[dict[str, Any], Paths]:
@@ -777,7 +779,7 @@ def _attach_student_gradient_probes(
 
 
 def smoke(protocol_path: Path, run_root: Path) -> None:
-    _gpu_guard(resolve_default_paths(protocol_path, run_root))
+    _gpu_guard(resolve_default_paths(protocol_path, run_root).gpu_uuid)
     rt = load_runtime(protocol_path, run_root)
     if read_json(rt.paths.run_root / "PHASE_STATUS.json")["status"] != "PASS_READY_FOR_SMOKE":
         raise RuntimeError("prepare and CPU integration gates must pass before smoke")
@@ -825,7 +827,7 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
         save_dir=smoke_root / "TA", seed=13,
     )
     tb_models = {}
-    for mode in ("cqet", "lse", "qt"):
+    for mode in ("cqet", "qt"):
         _set_seed(13, "SMOKE_TB_SHARED")
         model = _load_teacher(ta_end)
         train_tb(
@@ -934,7 +936,225 @@ def _load_raw_bundle(directory: Path, query_ids: Sequence[str], seed: int) -> di
     return pools
 
 
+def _common_inputs(rt: Runtime, seed: int) -> dict[str, str]:
+    seed_dir = rt.paths.seed_dir(seed)
+    return {
+        "dataset_identity": read_json(rt.paths.run_root / "DATASET_IDENTITY.json")["identity_sha256"],
+        "cache_identity": read_json(rt.paths.run_root / "CACHE_IDENTITY.json")["identity_sha256"],
+        "pca_report": sha256_file(rt.paths.run_root / "PCA_REPORT.json"),
+        "raw_train_pool_manifest": sha256_file(seed_dir / "training_records" / "raw_train" / "POOL_MANIFEST.json"),
+        "raw_dev_pool_manifest": sha256_file(seed_dir / "eval" / "dev" / "raw" / "POOL_MANIFEST.json"),
+    }
+
+
+def _tb_stage(
+    rt: Runtime, seed: int, stage: str, mode: str, ta_ckpt: Path,
+    tb_records: Sequence[dict], tb_list_hash: str, common_inputs: dict,
+) -> Path:
+    teacher_tb = rt.protocol["teacher"]["TB"]
+    tb_batch = int(teacher_tb["logical_batch_queries"])
+    tb_config = {
+        **teacher_tb,
+        "optimizer_steps": int(teacher_tb["epochs"]) * ((len(tb_records) + tb_batch - 1) // tb_batch),
+        "order_sha256": _order_sha(_hash_order(tb_records, "TB_SHARED", seed, 1)),
+        "numerical_layout": teacher_numerical_layout(),
+    }
+    ta_hash = _checkpoint_state(ta_ckpt)
+    _set_seed(seed, "TB_SHARED")
+    model = _load_teacher(ta_ckpt)
+    if model_state_sha(model) != ta_hash:
+        raise AssertionError(f"{stage} did not load TA epoch2")
+    return _run_stage(
+        rt, seed, stage,
+        parents={"TA_epoch2": sha256_file(ta_ckpt), "TA_state": ta_hash},
+        config={**tb_config, "mode": mode},
+        inputs=common_inputs, lists={"TB_SHARED": tb_list_hash},
+        action=lambda ckpts, log, attempt: train_tb(
+            model, rt.bank, tb_records, mode=mode, save_dir=ckpts,
+            epochs=int(teacher_tb["epochs"]), lr=float(teacher_tb["lr"]),
+            weight_decay=float(teacher_tb["wd"]), logical_batch=tb_batch,
+            direct_weight=float(teacher_tb["path_direct_weight"]),
+            aggregate_weight=float(teacher_tb["path_aggregate_weight"]),
+            support_weight=float(teacher_tb["support_weight"]),
+            seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
+        ),
+    )
+
+
+def _c1_stage(
+    rt: Runtime, seed: int, edge_lists: Sequence[dict], list_hash: str, common_inputs: dict, *, qt: bool,
+) -> dict[float, Path]:
+    recipe = StudentRecipe.from_protocol(rt.protocol)
+    c1_epochs = int(rt.protocol["student"]["C1"]["epochs"])
+    c1_batch = int(rt.protocol["student"]["C1"]["logical_batch_edge_lists"])
+    records = [row for row in edge_lists if row["relation"] == "QT"] if qt else edge_lists
+    order = _hash_order(records, "C1_QT" if qt else "C1_NATIVE", seed, 1)
+    model = QTStudent(rt.pca_basis, rt.pca_mean) if qt else NativeStudent(rt.pca_basis, rt.pca_mean)
+    return _run_stage(
+        rt, seed, "QT_C1_SUP" if qt else "NATIVE_C1_SUP",
+        parents={"PCA": sha256_file(rt.paths.pca_dir / "basis.pt")},
+        config={
+            **rt.protocol["student"]["C1"], **recipe.as_dict(),
+            "optimizer_steps": c1_epochs * ((len(order) + c1_batch - 1) // c1_batch),
+            "order_sha256": _order_sha(order),
+            "numerical_layout": {"logical_batch": c1_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
+        }, inputs=common_inputs,
+        lists={"C1_QT" if qt else "C1_NATIVE": list_hash},
+        action=lambda ckpts, log, attempt: train_student_c1(
+            model, edge_lists, rt.bank, arm="QT_SUP" if qt else "NATIVE_SUP", save_dir=ckpts,
+            epochs=c1_epochs, logical_batch=c1_batch, recipe=recipe,
+            seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
+        ),
+    )
+
+
+def _c2_setup(rt: Runtime, seed: int, c2_records: Sequence[dict]) -> tuple[dict, dict]:
+    """Stage config and training kwargs shared by the three C2 arms (one shared graph)."""
+    recipe = StudentRecipe.from_protocol(rt.protocol)
+    c2_epochs = int(rt.protocol["student"]["C2"]["epochs"])
+    c2_batch = int(rt.protocol["student"]["C2"]["logical_batch_queries"])
+    c2_order = _hash_order(c2_records, "C2_SHARED", seed, 1)
+    c2_config = {
+        **rt.protocol["student"]["C2"], **recipe.as_dict(),
+        "optimizer_steps": c2_epochs * ((len(c2_order) + c2_batch - 1) // c2_batch),
+        "order_sha256": _order_sha(c2_order),
+        "negative_pool": "legal_targets",
+        "evidence_pool": "canonical_text_then_canonical_image",
+        "numerical_layout": {"logical_batch": c2_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
+    }
+    c2_kwargs = dict(
+        recipe=recipe, negative_pool=rt.labels.legal_targets, evidence_pool=_evidence_pool(rt.labels),
+        epochs=c2_epochs, logical_batch=c2_batch,
+    )
+    return c2_config, c2_kwargs
+
+
+def _selection(path: Path, select) -> dict:
+    """Reuse a selection either process already wrote, as long as its selected checkpoint is unchanged."""
+    if path.exists():
+        cached = read_json(path)
+        key = "selected_checkpoint" if "selected_checkpoint" in cached else "SUP_checkpoint"
+        if Path(cached[key]).exists() and sha256_file(Path(cached[key])) == cached[f"{key}_sha256"]:
+            return cached
+    result = select()
+    write_json(path, result)
+    return result
+
+
+def _process_file(paths: Paths, role: str) -> Path:
+    return paths.run_root / "processes" / f"{role}.json"
+
+
+def _set_process_state(paths: Paths, role: str, status: str, **detail: Any) -> None:
+    write_json(_process_file(paths, role), {
+        "role": role, "pid": os.getpid(), "gpu_uuid": paths.gpu_uuid, "status": status,
+        "updated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **detail,
+    })
+
+
+def _wait_for(paths: Paths, peer: str | None, ready, what: str) -> None:
+    """Block until ``ready()``; fail as soon as the peer process that should produce it is gone.
+
+    ``peer`` is None in a single-GPU run, where everything was produced in-process already.
+    """
+    waited = 0
+    while not ready():
+        if peer is None:
+            raise RuntimeError(f"{what} is missing")
+        state_path = _process_file(paths, peer)
+        if state_path.exists():
+            state = read_json(state_path)
+            if state["status"] != "RUNNING":
+                raise RuntimeError(f"the {peer} process is {state['status']} and did not produce {what}")
+            try:
+                os.kill(int(state["pid"]), 0)
+            except ProcessLookupError:
+                raise RuntimeError(
+                    f"the {peer} process (pid {state['pid']}) died before producing {what}; restart it"
+                ) from None
+        if waited % 600 == 0:
+            print(f"[wait] {what} from the {peer} process ({waited}s)", flush=True)
+        time.sleep(PEER_POLL_SECONDS)
+        waited += PEER_POLL_SECONDS
+
+
+def _wait_stage(rt: Runtime, seed: int, stage: str, peer: str | None) -> Any:
+    stage_dir = rt.paths.seed_dir(seed) / stage
+    _wait_for(
+        rt.paths, peer,
+        lambda: any(read_json(path).get("status") == "SUCCESS" for path in stage_dir.glob("POST_RUN.attempt_*.json")),
+        f"seed{seed}/{stage}",
+    )
+    return _completed_stage_result(rt.paths, stage_dir, stage)
+
+
+def _teacher_trajectory_path(rt: Runtime, seed: int) -> Path:
+    return rt.paths.seed_dir(seed) / "eval" / "dev" / "trajectories" / "teacher" / "TRAJECTORY_SUMMARY.json"
+
+
+def qt_and_trajectory_work(rt: Runtime, seed: int, peer: str | None) -> None:
+    """TB_QT, the QT C1/C2 Students and the Teacher trajectory: everything off the Native critical path.
+
+    ``train-side`` runs this on the second GPU while ``train`` waits for the stages and files it
+    produces; a single-GPU ``train`` runs it in-process after the Native C2 selection. Every
+    stage seeds itself, so where and in which order it runs does not change its inputs.
+    """
+    seed_dir = rt.paths.seed_dir(seed)
+    training_dir = seed_dir / "training_records"
+    selections = seed_dir / "selections"
+    selections.mkdir(parents=True, exist_ok=True)
+    # TA succeeds only after the Raw bundles and every training list are on disk.
+    ta_ckpt = _wait_stage(rt, seed, "TA", peer)
+    common_inputs = _common_inputs(rt, seed)
+    tb_gz = training_dir / "TB_SHARED.jsonl.gz"
+    tb_records = list(iter_jsonl(tb_gz))
+    tb_qt = _tb_stage(rt, seed, "TB_QT", "qt", ta_ckpt, tb_records, sha256_file(tb_gz), common_inputs)
+
+    edge_lists = list(iter_jsonl(training_dir / "C1_NATIVE.jsonl.gz"))
+    qt_c1_points = _c1_stage(
+        rt, seed, edge_lists, sha256_file(training_dir / "C1_QT.jsonl.gz"), common_inputs, qt=True,
+    )
+    dev_gt = export_eval_labels(rt.paths, rt.labels.canonical_map, "dev")
+    dev_ids = utf8_sorted(dev_gt)
+    qt_c1_selection = _selection(selections / "QT_C1.json", lambda: _select_c1(
+        rt, seed, qt_c1_points, dev_ids, dev_gt, qt=True, trajectory_teacher_checkpoint=tb_qt,
+    ))
+
+    if not _teacher_trajectory_path(rt, seed).exists():
+        _wait_stage(rt, seed, "TB_CQET", peer)
+        raw_dev = _load_raw_bundle(seed_dir / "eval" / "dev" / "raw", dev_ids, seed)
+        _teacher_trajectory(rt, seed, raw_dev, dev_gt, tb_records)
+        del raw_dev
+
+    # QT C2 trains on the shared C2 graph, built from the selected Native C1 on the main process.
+    c2_gz = training_dir / "C2_SHARED.jsonl.gz"
+    _wait_for(rt.paths, peer, c2_gz.exists, f"seed{seed}/C2_SHARED.jsonl.gz")
+    c2_records = list(iter_jsonl(c2_gz))
+    graph_hash = sha256_file(c2_gz)
+    c2_config, c2_kwargs = _c2_setup(rt, seed, c2_records)
+    qt_parent_hash = qt_c1_selection["selected_state_sha256"]
+    qt_c2 = _load_qt(Path(qt_c1_selection["selected_checkpoint"]), rt)
+    qt_c2_points = _run_stage(
+        rt, seed, "QT_C2_SUP",
+        parents={"selected_QT_C1_SUP": qt_c1_selection["selected_checkpoint_sha256"],
+                 "parent_state": qt_parent_hash},
+        config=c2_config, inputs={**common_inputs, "graph_hash": graph_hash},
+        lists={"C2_SHARED": graph_hash},
+        action=lambda ckpts, log, attempt: train_student_c2(
+            qt_c2, c2_records, rt.bank, arm="QT_SUP", save_dir=ckpts,
+            seed=seed, expected_parent_hash=qt_parent_hash, **c2_kwargs,
+            metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
+        ),
+    )
+    _selection(selections / "QT_C2.json", lambda: _select_c2(
+        rt, seed, qt_c2_points, None, dev_ids, dev_gt, qt=True,
+        parent_checkpoint=Path(qt_c1_selection["selected_checkpoint"]),
+        trajectory_teacher_checkpoint=tb_qt,
+    ))
+
+
 def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> dict:
+    side = rt.paths.side_gpu_uuid is not None
     seed_dir = rt.paths.seed_dir(seed)
     seed_dir.mkdir(parents=True, exist_ok=True)
     write_json(seed_dir / "execution_dag.json", {"seed": seed, "stage_order": STAGES})
@@ -942,6 +1162,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     dev_gt = export_eval_labels(rt.paths, rt.labels.canonical_map, "dev")
     dev_ids = utf8_sorted(dev_gt)
     raw_train, raw_dev = _materialize_raw_train_dev(rt, seed, raw_et, dev_ids)
+    del raw_dev  # the Teacher trajectory reloads the Raw dev bundle from disk
     # D1 traces are read only by save_pool_bundle and the Raw train bundle is on disk;
     # dropping them frees ~8 GiB of the ~25 GiB Raw train pools held until the C2 graph.
     for pool in raw_train.values():
@@ -973,22 +1194,9 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
                 c1_qt_gz, [row for row in edge_lists if row["relation"] == "QT"]
             ),
         }
-    common_inputs = {
-        "dataset_identity": read_json(rt.paths.run_root / "DATASET_IDENTITY.json")["identity_sha256"],
-        "cache_identity": read_json(rt.paths.run_root / "CACHE_IDENTITY.json")["identity_sha256"],
-        "pca_report": sha256_file(rt.paths.run_root / "PCA_REPORT.json"),
-        "raw_train_pool_manifest": sha256_file(training_dir / "raw_train" / "POOL_MANIFEST.json"),
-        "raw_dev_pool_manifest": sha256_file(seed_dir / "eval" / "dev" / "raw" / "POOL_MANIFEST.json"),
-    }
+    common_inputs = _common_inputs(rt, seed)
 
     teacher_ta = rt.protocol["teacher"]["TA"]
-    teacher_tb = rt.protocol["teacher"]["TB"]
-    recipe = StudentRecipe.from_protocol(rt.protocol)
-    c1_epochs = int(rt.protocol["student"]["C1"]["epochs"])
-    c1_batch = int(rt.protocol["student"]["C1"]["logical_batch_edge_lists"])
-    c2_epochs = int(rt.protocol["student"]["C2"]["epochs"])
-    c2_batch = int(rt.protocol["student"]["C2"]["logical_batch_queries"])
-
     _set_seed(seed, "TA")
     ta_model = _teacher()
     ta_batch = int(teacher_ta["logical_batch_queries"])
@@ -1012,87 +1220,19 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
-    ta_hash = _checkpoint_state(ta_ckpt)
+    # TB_QT and the QT Students run in qt_and_trajectory_work (on the side GPU when configured).
+    tb_cqet = _tb_stage(rt, seed, "TB_CQET", "cqet", ta_ckpt, tb_records, hashes["TB_SHARED"], common_inputs)
+    del tb_records
 
-    tb_ckpts = {}
-    tb_batch = int(teacher_tb["logical_batch_queries"])
-    tb_config = {
-        **teacher_tb,
-        "optimizer_steps": int(teacher_tb["epochs"]) * ((len(tb_records) + tb_batch - 1) // tb_batch),
-        "order_sha256": _order_sha(_hash_order(tb_records, "TB_SHARED", seed, 1)),
-        "numerical_layout": teacher_numerical_layout(),
-    }
-    for stage, mode in (("TB_CQET", "cqet"), ("TB_LSE", "lse"), ("TB_QT", "qt")):
-        _set_seed(seed, "TB_SHARED")
-        model = _load_teacher(ta_ckpt)
-        if model_state_sha(model) != ta_hash:
-            raise AssertionError(f"{stage} did not load TA epoch2")
-        tb_ckpts[stage] = _run_stage(
-            rt, seed, stage,
-            parents={"TA_epoch2": sha256_file(ta_ckpt), "TA_state": ta_hash},
-            config={**tb_config, "mode": mode},
-            inputs=common_inputs, lists={"TB_SHARED": hashes["TB_SHARED"]},
-            action=lambda ckpts, log, attempt, model=model, mode=mode: train_tb(
-                model, rt.bank, tb_records, mode=mode, save_dir=ckpts,
-                epochs=int(teacher_tb["epochs"]), lr=float(teacher_tb["lr"]),
-                weight_decay=float(teacher_tb["wd"]), logical_batch=tb_batch,
-                direct_weight=float(teacher_tb["path_direct_weight"]),
-                aggregate_weight=float(teacher_tb["path_aggregate_weight"]),
-                support_weight=float(teacher_tb["support_weight"]),
-                seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
-            ),
-        )
-
-    native_c1 = NativeStudent(rt.pca_basis, rt.pca_mean)
-    c1_native_order = _hash_order(edge_lists, "C1_NATIVE", seed, 1)
-    c1_qt_records = [row for row in edge_lists if row["relation"] == "QT"]
-    c1_qt_order = _hash_order(c1_qt_records, "C1_QT", seed, 1)
-    c1_layout = {"logical_batch": c1_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]}
-    native_c1_points = _run_stage(
-        rt, seed, "NATIVE_C1_SUP",
-        parents={"PCA": sha256_file(rt.paths.pca_dir / "basis.pt")},
-        config={
-            **rt.protocol["student"]["C1"], **recipe.as_dict(),
-            "optimizer_steps": c1_epochs * ((len(c1_native_order) + c1_batch - 1) // c1_batch),
-            "order_sha256": _order_sha(c1_native_order),
-            "numerical_layout": c1_layout,
-        }, inputs=common_inputs,
-        lists={"C1_NATIVE": hashes["C1_NATIVE"]},
-        action=lambda ckpts, log, attempt: train_student_c1(
-            native_c1, edge_lists, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
-            epochs=c1_epochs, logical_batch=c1_batch, recipe=recipe,
-            seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
-        ),
-    )
-    qt_c1 = QTStudent(rt.pca_basis, rt.pca_mean)
-    qt_c1_points = _run_stage(
-        rt, seed, "QT_C1_SUP",
-        parents={"PCA": sha256_file(rt.paths.pca_dir / "basis.pt")},
-        config={
-            **rt.protocol["student"]["C1"], **recipe.as_dict(),
-            "optimizer_steps": c1_epochs * ((len(c1_qt_order) + c1_batch - 1) // c1_batch),
-            "order_sha256": _order_sha(c1_qt_order),
-            "numerical_layout": c1_layout,
-        }, inputs=common_inputs,
-        lists={"C1_QT": hashes["C1_QT"]},
-        action=lambda ckpts, log, attempt: train_student_c1(
-            qt_c1, edge_lists, rt.bank, arm="QT_SUP", save_dir=ckpts,
-            epochs=c1_epochs, logical_batch=c1_batch, recipe=recipe,
-            seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
-        ),
-    )
+    native_c1_points = _c1_stage(rt, seed, edge_lists, hashes["C1_NATIVE"], common_inputs, qt=False)
+    del edge_lists
     selections = seed_dir / "selections"
     selections.mkdir(exist_ok=True)
     native_c1_selection = _select_c1(
         rt, seed, native_c1_points, dev_ids, dev_gt, qt=False,
-        trajectory_teacher_checkpoint=tb_ckpts["TB_CQET"],
-    )
-    qt_c1_selection = _select_c1(
-        rt, seed, qt_c1_points, dev_ids, dev_gt, qt=True,
-        trajectory_teacher_checkpoint=tb_ckpts["TB_QT"],
+        trajectory_teacher_checkpoint=tb_cqet,
     )
     write_json(selections / "NATIVE_C1.json", native_c1_selection)
-    write_json(selections / "QT_C1.json", qt_c1_selection)
 
     selected_native_c1 = _load_native(Path(native_c1_selection["selected_checkpoint"]), rt)
     c1_train_pools = evaluate_student_retrieval(
@@ -1112,20 +1252,8 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     hashes["C2_SHARED"] = save_training_records(training_dir / "C2_SHARED.jsonl.gz", c2_records)
     graph_hash = hashes["C2_SHARED"]
     parent_hash = native_c1_selection["selected_state_sha256"]
-    c2_order = _hash_order(c2_records, "C2_SHARED", seed, 1)
-    c2_config = {
-        **rt.protocol["student"]["C2"], **recipe.as_dict(),
-        "optimizer_steps": c2_epochs * ((len(c2_order) + c2_batch - 1) // c2_batch),
-        "order_sha256": _order_sha(c2_order),
-        "negative_pool": "legal_targets",
-        "evidence_pool": "canonical_text_then_canonical_image",
-        "numerical_layout": {"logical_batch": c2_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
-    }
-    evidence_pool = _evidence_pool(rt.labels)
-    c2_kwargs = dict(
-        recipe=recipe, negative_pool=rt.labels.legal_targets, evidence_pool=evidence_pool,
-        epochs=c2_epochs, logical_batch=c2_batch,
-    )
+    c2_config, c2_kwargs = _c2_setup(rt, seed, c2_records)
+    recipe = c2_kwargs["recipe"]
 
     native_sup = _load_native(Path(native_c1_selection["selected_checkpoint"]), rt)
     native_sup_points = _run_stage(
@@ -1141,10 +1269,10 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         ),
     )
 
-    cqet_teacher = _load_teacher(tb_ckpts["TB_CQET"])
+    cqet_teacher = _load_teacher(tb_cqet)
     logits = build_teacher_logits_cache(
         cqet_teacher, rt.bank,
-        c2_teacher_rows(c2_records, recipe, rt.labels.legal_targets, evidence_pool, seed),
+        c2_teacher_rows(c2_records, recipe, rt.labels.legal_targets, c2_kwargs["evidence_pool"], seed),
     )
     teacher_state_sha = model_state_sha(cqet_teacher)
     del cqet_teacher
@@ -1155,8 +1283,8 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     logits_identity = {
         "schema_version": VERSION,
         "teacher": "TB_CQET",
-        "teacher_checkpoint": str(tb_ckpts["TB_CQET"]),
-        "teacher_checkpoint_sha256": sha256_file(tb_ckpts["TB_CQET"]),
+        "teacher_checkpoint": str(tb_cqet),
+        "teacher_checkpoint_sha256": sha256_file(tb_cqet),
         "teacher_state_sha256": teacher_state_sha,
         "graph_sha256": graph_hash,
         "training_list_sha256": hashes["C2_SHARED"],
@@ -1176,7 +1304,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         parents={
             "selected_NATIVE_C1_SUP": native_c1_selection["selected_checkpoint_sha256"],
             "parent_state": parent_hash,
-            "TB_CQET_end": sha256_file(tb_ckpts["TB_CQET"]),
+            "TB_CQET_end": sha256_file(tb_cqet),
         },
         config=c2_config,
         inputs={**common_inputs, "graph_hash": graph_hash, "teacher_logits": logits_identity},
@@ -1188,31 +1316,22 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         ),
     )
 
-    qt_parent_hash = qt_c1_selection["selected_state_sha256"]
-    qt_c2 = _load_qt(Path(qt_c1_selection["selected_checkpoint"]), rt)
-    qt_c2_points = _run_stage(
-        rt, seed, "QT_C2_SUP",
-        parents={"selected_QT_C1_SUP": qt_c1_selection["selected_checkpoint_sha256"],
-                 "parent_state": qt_parent_hash},
-        config=c2_config, inputs={**common_inputs, "graph_hash": graph_hash},
-        lists={"C2_SHARED": hashes["C2_SHARED"]},
-        action=lambda ckpts, log, attempt: train_student_c2(
-            qt_c2, c2_records, rt.bank, arm="QT_SUP", save_dir=ckpts,
-            seed=seed, expected_parent_hash=qt_parent_hash, **c2_kwargs,
-            metadata={"attempt": attempt, "graph_hash": graph_hash, **common_inputs}, log_path=log,
-        ),
-    )
-
     native_c2_selection = _select_c2(
         rt, seed, native_sup_points, native_kd_points, dev_ids, dev_gt, qt=False,
         parent_checkpoint=Path(native_c1_selection["selected_checkpoint"]),
-        trajectory_teacher_checkpoint=tb_ckpts["TB_CQET"],
+        trajectory_teacher_checkpoint=tb_cqet,
     )
-    qt_c2_selection = _select_c2(
-        rt, seed, qt_c2_points, None, dev_ids, dev_gt, qt=True,
-        parent_checkpoint=Path(qt_c1_selection["selected_checkpoint"]),
-        trajectory_teacher_checkpoint=tb_ckpts["TB_QT"],
-    )
+    if side:
+        _wait_for(
+            rt.paths, "side",
+            lambda: (selections / "QT_C2.json").exists() and _teacher_trajectory_path(rt, seed).exists(),
+            f"seed{seed} QT selections and Teacher trajectory",
+        )
+    else:
+        qt_and_trajectory_work(rt, seed, peer=None)
+    qt_c1_selection = read_json(selections / "QT_C1.json")
+    qt_c2_selection = read_json(selections / "QT_C2.json")
+    teacher_trajectory = read_json(_teacher_trajectory_path(rt, seed))
     gradient_summary = _attach_student_gradient_probes(
         rt, seed, c2_records, logits,
         native_c1_selection, qt_c1_selection, native_c2_selection, qt_c2_selection,
@@ -1242,7 +1361,6 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         seed_dir / "eval" / "dev" / "trajectories" / "student" / "TRAJECTORY_SUMMARY.json"
     )
     write_json(student_trajectory_path, student_trajectory)
-    teacher_trajectory = _teacher_trajectory(rt, seed, raw_dev, dev_gt, tb_records)
     freeze = {
         "schema_version": VERSION,
         "seed": seed,
@@ -1310,14 +1428,11 @@ def _teacher_trajectory(
         ("TB_CQET_init", "TB_CQET", "init.pt", "cqet"),
         ("TB_CQET_half", "TB_CQET", "half.pt", "cqet"),
         ("TB_CQET_end", "TB_CQET", "end.pt", "cqet"),
-        ("TB_LSE_init", "TB_LSE", "init.pt", "lse"),
-        ("TB_LSE_half", "TB_LSE", "half.pt", "lse"),
-        ("TB_LSE_end", "TB_LSE", "end.pt", "lse"),
         ("TB_QT_init", "TB_QT", "init.pt", "qt"),
         ("TB_QT_half", "TB_QT", "half.pt", "qt"),
         ("TB_QT_end", "TB_QT", "end.pt", "qt"),
     ]
-    root = rt.paths.seed_dir(seed) / "eval" / "dev" / "trajectories" / "teacher"
+    root = _teacher_trajectory_path(rt, seed).parent
     result = {
         "schema_version": VERSION,
         "seed": seed,
@@ -1360,7 +1475,7 @@ def _teacher_trajectory(
         }
         del teacher, matrix
         torch.cuda.empty_cache()
-    write_json(root / "TRAJECTORY_SUMMARY.json", result)
+    write_json(_teacher_trajectory_path(rt, seed), result)
     return result
 
 
@@ -1389,13 +1504,12 @@ def _pool_target_view(
     return result
 
 
-def evaluate_seed(rt: Runtime, seed: int, global_freeze_hash: str) -> dict:
+def evaluate_split(rt: Runtime, seed: int, split: str, global_freeze_hash: str) -> dict:
+    """Frozen evaluation of one split; also written to ``seed<seed>/eval/<split>/SUMMARY.json``."""
     seed_dir = rt.paths.seed_dir(seed)
-    freeze = read_json(seed_dir / "SELECTION_FREEZE.json")
-    selections = freeze
+    selections = read_json(seed_dir / "SELECTION_FREEZE.json")
     teachers = {
         "TB_CQET": _load_teacher(seed_dir / "TB_CQET" / "checkpoints" / "end.pt"),
-        "TB_LSE": _load_teacher(seed_dir / "TB_LSE" / "checkpoints" / "end.pt"),
         "TB_QT": _load_teacher(seed_dir / "TB_QT" / "checkpoints" / "end.pt"),
     }
     models = {
@@ -1403,216 +1517,209 @@ def evaluate_seed(rt: Runtime, seed: int, global_freeze_hash: str) -> dict:
         "native_kd": _load_native(Path(selections["NATIVE_C2_COMMON"]["KD_checkpoint"]), rt),
         "qt_sup": _load_qt(Path(selections["QT_C2"]["SUP_checkpoint"]), rt),
     }
-    result = {"seed": seed, "global_freeze_sha256": global_freeze_hash, "splits": {}}
-    for split in ("dev", "test"):
-        global_freeze = read_json(rt.paths.run_root / "GLOBAL_SELECTION_FREEZE.json")
-        if global_freeze.get("freeze_sha256") != global_freeze_hash:
-            raise RuntimeError("global selection freeze identity changed before evaluation")
-        if split == "test" and global_freeze.get("status") != "ALL_SELECTIONS_FROZEN_BEFORE_TEST":
-            raise RuntimeError("test firewall opened before all seed selections were frozen")
-        gt = export_eval_labels(rt.paths, rt.labels.canonical_map, split)
-        query_ids = utf8_sorted(gt)
-        split_root = seed_dir / "eval" / split
-        raw_dir = split_root / "raw"
-        if (raw_dir / "POOL_MANIFEST.json").exists():
-            raw_pools = load_pool_bundle(raw_dir)
-        else:
-            raw_pools = build_raw_pools_split(
-                rt.z_store, rt.row_store, query_ids, rt.labels, split,
-                hnsw_seed=seed, index_dir=raw_dir / "indices" if split == "test" else None,
-            )
-            save_pool_bundle(raw_dir, raw_pools, rt.labels, seed=seed, generator="raw")
-        pools_by_generator = {"raw": raw_pools}
-        for generator, model in models.items():
-            directory = split_root / generator
-            pools = evaluate_student_retrieval(
-                model, rt.z_store, rt.row_store, query_ids, rt.labels, split,
-                hnsw_seed=seed, generator_id=generator,
-                index_dir=str(directory / "indices"),
-            )
-            save_pool_bundle(directory, pools, rt.labels, seed=seed, generator=generator)
-            pools_by_generator[generator] = pools
-
-        split_result = {}
-        for generator, pools in pools_by_generator.items():
-            directory = split_root / generator
-            matrix = evaluate_teacher_matrix(
-                teachers, rt.bank, pools, rt.labels, seed=seed, generator=generator,
-                split=split, output_dir=directory, split_gt=gt,
-            )
-            metrics = evaluate_matrix(pools, matrix, gt, directory)
-            primary = (
-                matrix["TB_QT"]["Direct"] if generator == "qt_sup"
-                else matrix["TB_CQET"]["Real"]
-            )
-            export_funnels(
-                pools, primary, gt, rt.labels, split_root / "funnels" / generator,
-                seed=seed, generator=generator,
-            )
-            _independent_verify(rt, split, directory, metrics)
-            split_result[generator] = metrics
-
-            if generator != "qt_sup":
-                direct_results = {}
-                for direct_name, field in (
-                    ("MatchedDirectC", "MatchedDirectC"),
-                    ("MatchedDirectU", "MatchedDirectU"),
-                ):
-                    targets = {
-                        q: [target for target, _score in getattr(pools[q], field)]
-                        for q in pools
-                    }
-                    direct_pools = _pool_target_view(
-                        pools,
-                        target_lists=targets,
-                        generator=f"{generator}.{direct_name}",
-                        keep_bags=False,
-                    )
-                    direct_dir = directory / "direct_baselines" / direct_name
-                    direct_matrix = evaluate_teacher_matrix(
-                        {"TB_QT": teachers["TB_QT"], "TB_CQET": teachers["TB_CQET"]},
-                        rt.bank,
-                        direct_pools,
-                        rt.labels,
-                        seed=seed,
-                        generator=f"{generator}.{direct_name}",
-                        split=split,
-                        output_dir=direct_dir,
-                        pool_kind=direct_name,
-                        direct_only=True,
-                        split_gt=gt,
-                    )
-                    direct_metrics = evaluate_matrix(direct_pools, direct_matrix, gt, direct_dir)
-                    _independent_verify(rt, split, direct_dir, direct_metrics)
-                    direct_results[direct_name] = direct_metrics
-                split_result[generator]["direct_baselines"] = direct_results
-
-        main_pools = pools_by_generator["native_kd"]
-        admission_order = {
-            q: sorted(
-                main_pools[q].admission_scores,
-                key=lambda target: (
-                    -main_pools[q].admission_scores[target], target.encode("utf-8")
-                ),
-            )
-            for q in main_pools
-        }
-        curve_results = {}
-        for budget in (100, 200):
-            targets = {q: admission_order[q][:budget] for q in admission_order}
-            curve_pools = _pool_target_view(
-                main_pools,
-                target_lists=targets,
-                generator=f"native_kd.C{budget}",
-                keep_bags=True,
-            )
-            curve_dir = split_root / "native_kd" / "budget_curves" / f"C{budget}"
-            curve_matrix = evaluate_teacher_matrix(
-                {"TB_CQET": teachers["TB_CQET"]}, rt.bank, curve_pools, rt.labels,
-                seed=seed, generator=f"native_kd.C{budget}", split=split,
-                output_dir=curve_dir, pool_kind=f"C{budget}", split_gt=gt,
-            )
-            curve_metrics = evaluate_matrix(curve_pools, curve_matrix, gt, curve_dir)
-            _independent_verify(rt, split, curve_dir, curve_metrics)
-            curve_results[f"C{budget}"] = curve_metrics
-        split_result["native_kd"]["budget_curves"] = curve_results
-
-        if split == "dev":
-            probe_ids = _hashed_ids(query_ids, 128)
-            full_u_targets = {q: main_pools[q].U for q in probe_ids}
-            full_u_pools = _pool_target_view(
-                {q: main_pools[q] for q in probe_ids},
-                target_lists=full_u_targets,
-                generator="native_kd.FullU_dev128",
-                keep_bags=True,
-            )
-            full_u_dir = split_root / "trajectories" / "FullU_dev128"
-            full_u_matrix = evaluate_teacher_matrix(
-                teachers, rt.bank, full_u_pools, rt.labels, seed=seed,
-                generator="native_kd.FullU_dev128", split=split,
-                output_dir=full_u_dir, pool_kind="FullU", split_gt=gt,
-            )
-            full_u_metrics = evaluate_matrix(full_u_pools, full_u_matrix, gt, full_u_dir)
-            _independent_verify(rt, split, full_u_dir, full_u_metrics, allow_subset=True)
-            split_result["native_kd"]["FullU_dev128"] = full_u_metrics
-
-        implicit = [q for q in query_ids if gt[q]["kind"] == "implicit"]
-        kd = split_result["native_kd"]["per_query"]
-        sup = split_result["native_sup"]["per_query"]
-        # Student-side candidate metrics per query (the Student's own retrieval, before any Teacher).
-        student = {
-            generator: {
-                q: candidate_metrics(pools_by_generator[generator][q], set(gt[q]["G"])) for q in query_ids
-            }
-            for generator in ("native_sup", "native_kd")
-        }
-        contrasts = {
-            "content_CQET_Real_minus_Swap_implicit": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
-                {q: kd[q]["TB_CQET.Swap.R@10"] for q in implicit}, gt,
-            ),
-            "CQET_Real_minus_TB_QT_overall": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
-                {q: kd[q]["TB_QT.Direct.R@10"] for q in query_ids}, gt,
-            ),
-            "CQET_Real_minus_LSE_Real_overall": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
-                {q: kd[q]["TB_LSE.Real.R@10"] for q in query_ids}, gt,
-            ),
-            "KD_minus_SUP_same_TB_CQET_overall": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
-                {q: sup[q]["TB_CQET.Real.R@10"] for q in query_ids}, gt,
-            ),
-            # Diagnostics for the evidence narrative; none of them is a preregistered gate.
-            "evidence_CQET_Real_minus_f0_overall": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
-                {q: kd[q]["TB_CQET.f0.R@10"] for q in query_ids}, gt,
-            ),
-            "evidence_CQET_Real_minus_f0_implicit": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
-                {q: kd[q]["TB_CQET.f0.R@10"] for q in implicit}, gt,
-            ),
-            "KD_minus_SUP_same_TB_CQET_implicit": bootstrap_contrast(
-                {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
-                {q: sup[q]["TB_CQET.Real.R@10"] for q in implicit}, gt,
-            ),
-            "KD_minus_SUP_student_Direct_R10_overall": bootstrap_contrast(
-                {q: student["native_kd"][q]["Direct_ANN_R10"] for q in query_ids},
-                {q: student["native_sup"][q]["Direct_ANN_R10"] for q in query_ids}, gt,
-            ),
-            "KD_minus_SUP_E_target_coverage_overall": bootstrap_contrast(
-                {q: student["native_kd"][q]["E_target_coverage"] for q in query_ids},
-                {q: student["native_sup"][q]["E_target_coverage"] for q in query_ids}, gt,
-            ),
-        }
-        split_result["narrative"] = {
-            generator: {
-                segment: {
-                    "queries": split_result[generator]["candidate"][segment]["queries"],
-                    **{
-                        key: split_result[generator]["candidate"][segment].get(key)
-                        for key in ("Direct_ANN_R10", "E_target_coverage", "E_query_hit_rate", "C150_target_coverage")
-                    },
-                    **{
-                        f"TB_CQET.{view}.R@10": split_result[generator]["teacher"]["TB_CQET"][view][segment]["R@10"]
-                        for view in ("f0", "Real", "Swap")
-                    },
-                }
-                for segment in ("overall", "implicit", "explicit")
-            }
-            for generator in ("native_sup", "native_kd")
-        }
-        bootstrap_dir = split_root / "bootstrap"
-        bootstrap_dir.mkdir(exist_ok=True)
-        write_json(bootstrap_dir / "results.json", contrasts)
-        write_jsonl(
-            bootstrap_dir / "group_map.jsonl",
-            ({"query_id": q, "source_group": gt[q]["source_group"]} for q in query_ids),
+    global_freeze = read_json(rt.paths.run_root / "GLOBAL_SELECTION_FREEZE.json")
+    if global_freeze.get("freeze_sha256") != global_freeze_hash:
+        raise RuntimeError("global selection freeze identity changed before evaluation")
+    if split == "test" and global_freeze.get("status") != "ALL_SELECTIONS_FROZEN_BEFORE_TEST":
+        raise RuntimeError("test firewall opened before all seed selections were frozen")
+    gt = export_eval_labels(rt.paths, rt.labels.canonical_map, split)
+    query_ids = utf8_sorted(gt)
+    split_root = seed_dir / "eval" / split
+    raw_dir = split_root / "raw"
+    if (raw_dir / "POOL_MANIFEST.json").exists():
+        raw_pools = load_pool_bundle(raw_dir)
+    else:
+        raw_pools = build_raw_pools_split(
+            rt.z_store, rt.row_store, query_ids, rt.labels, split,
+            hnsw_seed=seed, index_dir=raw_dir / "indices" if split == "test" else None,
         )
-        split_result["contrasts"] = contrasts
-        result["splits"][split] = split_result
-        write_json(split_root / "SUMMARY.json", split_result)
-    return result
+        save_pool_bundle(raw_dir, raw_pools, rt.labels, seed=seed, generator="raw")
+    pools_by_generator = {"raw": raw_pools}
+    for generator, model in models.items():
+        directory = split_root / generator
+        pools = evaluate_student_retrieval(
+            model, rt.z_store, rt.row_store, query_ids, rt.labels, split,
+            hnsw_seed=seed, generator_id=generator,
+            index_dir=str(directory / "indices"),
+        )
+        save_pool_bundle(directory, pools, rt.labels, seed=seed, generator=generator)
+        pools_by_generator[generator] = pools
+
+    split_result = {}
+    for generator, pools in pools_by_generator.items():
+        directory = split_root / generator
+        matrix = evaluate_teacher_matrix(
+            teachers, rt.bank, pools, rt.labels, seed=seed, generator=generator,
+            split=split, output_dir=directory, split_gt=gt,
+        )
+        metrics = evaluate_matrix(pools, matrix, gt, directory)
+        primary = (
+            matrix["TB_QT"]["Direct"] if generator == "qt_sup"
+            else matrix["TB_CQET"]["Real"]
+        )
+        export_funnels(
+            pools, primary, gt, rt.labels, split_root / "funnels" / generator,
+            seed=seed, generator=generator,
+        )
+        _independent_verify(rt, split, directory, metrics)
+        split_result[generator] = metrics
+
+        if generator != "qt_sup":
+            direct_results = {}
+            for direct_name, field in (
+                ("MatchedDirectC", "MatchedDirectC"),
+                ("MatchedDirectU", "MatchedDirectU"),
+            ):
+                targets = {
+                    q: [target for target, _score in getattr(pools[q], field)]
+                    for q in pools
+                }
+                direct_pools = _pool_target_view(
+                    pools,
+                    target_lists=targets,
+                    generator=f"{generator}.{direct_name}",
+                    keep_bags=False,
+                )
+                direct_dir = directory / "direct_baselines" / direct_name
+                direct_matrix = evaluate_teacher_matrix(
+                    {"TB_QT": teachers["TB_QT"], "TB_CQET": teachers["TB_CQET"]},
+                    rt.bank,
+                    direct_pools,
+                    rt.labels,
+                    seed=seed,
+                    generator=f"{generator}.{direct_name}",
+                    split=split,
+                    output_dir=direct_dir,
+                    pool_kind=direct_name,
+                    direct_only=True,
+                    split_gt=gt,
+                )
+                direct_metrics = evaluate_matrix(direct_pools, direct_matrix, gt, direct_dir)
+                _independent_verify(rt, split, direct_dir, direct_metrics)
+                direct_results[direct_name] = direct_metrics
+            split_result[generator]["direct_baselines"] = direct_results
+
+    main_pools = pools_by_generator["native_kd"]
+    admission_order = {
+        q: sorted(
+            main_pools[q].admission_scores,
+            key=lambda target: (
+                -main_pools[q].admission_scores[target], target.encode("utf-8")
+            ),
+        )
+        for q in main_pools
+    }
+    curve_results = {}
+    for budget in (100, 200):
+        targets = {q: admission_order[q][:budget] for q in admission_order}
+        curve_pools = _pool_target_view(
+            main_pools,
+            target_lists=targets,
+            generator=f"native_kd.C{budget}",
+            keep_bags=True,
+        )
+        curve_dir = split_root / "native_kd" / "budget_curves" / f"C{budget}"
+        curve_matrix = evaluate_teacher_matrix(
+            {"TB_CQET": teachers["TB_CQET"]}, rt.bank, curve_pools, rt.labels,
+            seed=seed, generator=f"native_kd.C{budget}", split=split,
+            output_dir=curve_dir, pool_kind=f"C{budget}", split_gt=gt,
+        )
+        curve_metrics = evaluate_matrix(curve_pools, curve_matrix, gt, curve_dir)
+        _independent_verify(rt, split, curve_dir, curve_metrics)
+        curve_results[f"C{budget}"] = curve_metrics
+    split_result["native_kd"]["budget_curves"] = curve_results
+
+    if split == "dev":
+        probe_ids = _hashed_ids(query_ids, 128)
+        full_u_targets = {q: main_pools[q].U for q in probe_ids}
+        full_u_pools = _pool_target_view(
+            {q: main_pools[q] for q in probe_ids},
+            target_lists=full_u_targets,
+            generator="native_kd.FullU_dev128",
+            keep_bags=True,
+        )
+        full_u_dir = split_root / "trajectories" / "FullU_dev128"
+        full_u_matrix = evaluate_teacher_matrix(
+            teachers, rt.bank, full_u_pools, rt.labels, seed=seed,
+            generator="native_kd.FullU_dev128", split=split,
+            output_dir=full_u_dir, pool_kind="FullU", split_gt=gt,
+        )
+        full_u_metrics = evaluate_matrix(full_u_pools, full_u_matrix, gt, full_u_dir)
+        _independent_verify(rt, split, full_u_dir, full_u_metrics, allow_subset=True)
+        split_result["native_kd"]["FullU_dev128"] = full_u_metrics
+
+    implicit = [q for q in query_ids if gt[q]["kind"] == "implicit"]
+    kd = split_result["native_kd"]["per_query"]
+    sup = split_result["native_sup"]["per_query"]
+    # Student-side candidate metrics per query (the Student's own retrieval, before any Teacher).
+    student = {
+        generator: {
+            q: candidate_metrics(pools_by_generator[generator][q], set(gt[q]["G"])) for q in query_ids
+        }
+        for generator in ("native_sup", "native_kd")
+    }
+    contrasts = {
+        "content_CQET_Real_minus_Swap_implicit": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
+            {q: kd[q]["TB_CQET.Swap.R@10"] for q in implicit}, gt,
+        ),
+        "CQET_Real_minus_TB_QT_overall": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
+            {q: kd[q]["TB_QT.Direct.R@10"] for q in query_ids}, gt,
+        ),
+        "KD_minus_SUP_same_TB_CQET_overall": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
+            {q: sup[q]["TB_CQET.Real.R@10"] for q in query_ids}, gt,
+        ),
+        # Diagnostics for the evidence narrative; none of them is a preregistered gate.
+        "evidence_CQET_Real_minus_f0_overall": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
+            {q: kd[q]["TB_CQET.f0.R@10"] for q in query_ids}, gt,
+        ),
+        "evidence_CQET_Real_minus_f0_implicit": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
+            {q: kd[q]["TB_CQET.f0.R@10"] for q in implicit}, gt,
+        ),
+        "KD_minus_SUP_same_TB_CQET_implicit": bootstrap_contrast(
+            {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
+            {q: sup[q]["TB_CQET.Real.R@10"] for q in implicit}, gt,
+        ),
+        "KD_minus_SUP_student_Direct_R10_overall": bootstrap_contrast(
+            {q: student["native_kd"][q]["Direct_ANN_R10"] for q in query_ids},
+            {q: student["native_sup"][q]["Direct_ANN_R10"] for q in query_ids}, gt,
+        ),
+        "KD_minus_SUP_E_target_coverage_overall": bootstrap_contrast(
+            {q: student["native_kd"][q]["E_target_coverage"] for q in query_ids},
+            {q: student["native_sup"][q]["E_target_coverage"] for q in query_ids}, gt,
+        ),
+    }
+    split_result["narrative"] = {
+        generator: {
+            segment: {
+                "queries": split_result[generator]["candidate"][segment]["queries"],
+                **{
+                    key: split_result[generator]["candidate"][segment].get(key)
+                    for key in ("Direct_ANN_R10", "E_target_coverage", "E_query_hit_rate", "C150_target_coverage")
+                },
+                **{
+                    f"TB_CQET.{view}.R@10": split_result[generator]["teacher"]["TB_CQET"][view][segment]["R@10"]
+                    for view in ("f0", "Real", "Swap")
+                },
+            }
+            for segment in ("overall", "implicit", "explicit")
+        }
+        for generator in ("native_sup", "native_kd")
+    }
+    bootstrap_dir = split_root / "bootstrap"
+    bootstrap_dir.mkdir(exist_ok=True)
+    write_json(bootstrap_dir / "results.json", contrasts)
+    write_jsonl(
+        bootstrap_dir / "group_map.jsonl",
+        ({"query_id": q, "source_group": gt[q]["source_group"]} for q in query_ids),
+    )
+    split_result["contrasts"] = contrasts
+    write_json(split_root / "SUMMARY.json", split_result)
+    return split_result
 
 
 def _checkpoint_manifest(seed_dir: Path) -> None:
@@ -1650,7 +1757,6 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
                 ),
                 "content_implicit_pp": contrasts["content_CQET_Real_minus_Swap_implicit"]["mean_delta_pp"],
                 "teacher_vs_qt_pp": contrasts["CQET_Real_minus_TB_QT_overall"]["mean_delta_pp"],
-                "cqet_vs_lse_pp": contrasts["CQET_Real_minus_LSE_Real_overall"]["mean_delta_pp"],
                 "kd_pp": contrasts["KD_minus_SUP_same_TB_CQET_overall"]["mean_delta_pp"],
                 "kd_coverage_delta_pp": 100 * (
                     kd_candidate["C150_target_coverage"] - sup_candidate["C150_target_coverage"]
@@ -1678,7 +1784,6 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
         and mean("dev", "content_implicit_pp") >= gates["content_dev_mean_implicit"]
         and mean("test", "content_implicit_pp") > 0
         and all(row["teacher_vs_qt_pp"] >= gates["teacher_vs_QT_each_split_seed_floor"] for row in rows)
-        and all(mean(split, "cqet_vs_lse_pp") >= gates["CQET_vs_correctedLSE_each_split_mean_floor"] for split in by_split)
     )
     kd_pass = (
         all(row["kd_pp"] >= 0 for row in rows)
@@ -1704,14 +1809,14 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
         "the Path-content and KD claims are not retained. The test split is a historically exposed "
         "regression set, not an unseen holdout.",
         "",
-        "| seed | split | candidate pp | E-content pp | Teacher-vs-QT pp | CQET-vs-LSE pp | KD pp | KD coverage pp |",
-        "|---:|:---|---:|---:|---:|---:|---:|---:|",
+        "| seed | split | candidate pp | E-content pp | Teacher-vs-QT pp | KD pp | KD coverage pp |",
+        "|---:|:---|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
             f"| {row['seed']} | {row['split']} | {row['candidate_gain_pp']:.4f} | "
             f"{row['content_implicit_pp']:.4f} | {row['teacher_vs_qt_pp']:.4f} | "
-            f"{row['cqet_vs_lse_pp']:.4f} | {row['kd_pp']:.4f} | {row['kd_coverage_delta_pp']:.4f} |"
+            f"{row['kd_pp']:.4f} | {row['kd_coverage_delta_pp']:.4f} |"
         )
     lines += [
         "",
@@ -1758,6 +1863,8 @@ def _write_file_manifest(run_root: Path) -> None:
         if not path.is_file() or path.name == "FILE_MANIFEST.jsonl" or ".tmp." in path.name:
             continue
         relative = path.relative_to(run_root)
+        if relative.parts[0] == "processes":  # live process state, rewritten after the manifest
+            continue
         rows.append({
             "path": relative.as_posix(),
             "bytes": path.stat().st_size,
@@ -1776,7 +1883,10 @@ def _write_delivery_readme(rt: Runtime, decision: dict, phase_status: str) -> No
     }
     text = (
         f"# {EXPERIMENT_ID} delivery\n\n"
-        f"Status: `{phase_status}`. Seeds {seeds} ({len(seeds) * len(STAGES)} registered stages) completed on the locked GPU.\n\n"
+        f"Status: `{phase_status}`. Seeds {seeds} ({len(seeds) * len(STAGES)} registered stages) completed on "
+        f"the pinned GPU {rt.paths.gpu_uuid}"
+        + (f" with side GPU {rt.paths.side_gpu_uuid} (see each stage's PRE_RUN `gpu`)" if rt.paths.side_gpu_uuid else "")
+        + ".\n\n"
         "All registered checkpoints are full checkpoints containing model, optimizer, RNG, cursor, order, "
         "parent, source, protocol, and feature identities. Test evaluation began only after "
         "`GLOBAL_SELECTION_FREEZE.json` was written. Metrics were recomputed from exported qrels and raw "
@@ -1789,16 +1899,66 @@ def _write_delivery_readme(rt: Runtime, decision: dict, phase_status: str) -> No
     (rt.paths.run_root / "README.md").write_text(text, encoding="utf-8")
 
 
-def run_formal(protocol_path: Path, run_root: Path) -> None:
-    _gpu_guard(resolve_default_paths(protocol_path, run_root))
-    rt = load_runtime(protocol_path, run_root)
+def _require_smoke(rt: Runtime) -> None:
     assert_declared_project_imports(rt.paths)
     smoke_result = read_json(rt.paths.run_root / "tests" / "smoke" / "LATEST.json")
     if smoke_result.get("status") != "PASS" or smoke_result["source_identity_sha256"] != source_identity(rt.paths):
         raise RuntimeError("current source has not passed the restricted GPU smoke")
+
+
+def run_formal(protocol_path: Path, run_root: Path) -> None:
+    paths = resolve_default_paths(protocol_path, run_root)
+    _gpu_guard(paths.gpu_uuid)
+    _set_process_state(paths, "main", "RUNNING")
+    try:
+        _run_formal(protocol_path, run_root)
+    except BaseException as error:
+        _set_process_state(paths, "main", "FAILED", error=f"{type(error).__name__}: {error}")
+        raise
+    _set_process_state(paths, "main", "COMPLETE")
+
+
+def run_side(protocol_path: Path, run_root: Path) -> None:
+    """Second-GPU worker of a two-GPU ``train``: TB_QT, the QT Students, the Teacher trajectory, test split.
+
+    Start it next to ``train`` on the same run root; each process waits for the other's stages and
+    files, and fails as soon as the other one has died.
+    """
+    paths = resolve_default_paths(protocol_path, run_root)
+    if paths.side_gpu_uuid is None:
+        raise RuntimeError("protocol pins no side GPU; init the run with --side-gpu")
+    _gpu_guard(paths.side_gpu_uuid)
+    paths = dataclasses.replace(paths, gpu_uuid=paths.side_gpu_uuid)  # stage receipts name this GPU
+    _set_process_state(paths, "side", "RUNNING")
+    try:
+        rt = load_runtime(protocol_path, run_root)
+        rt.paths = paths
+        _require_smoke(rt)
+        seeds = tuple(rt.protocol.get("seeds", [13]))
+        for seed in seeds:
+            qt_and_trajectory_work(rt, seed, peer="main")
+        freeze_path = rt.paths.run_root / "GLOBAL_SELECTION_FREEZE.json"
+        _wait_for(
+            rt.paths, "main",
+            lambda: freeze_path.exists() and read_json(freeze_path)["status"] == "ALL_SELECTIONS_FROZEN_BEFORE_TEST",
+            "the global selection freeze",
+        )
+        freeze_hash = read_json(freeze_path)["freeze_sha256"]
+        for seed in seeds:
+            evaluate_split(rt, seed, "test", freeze_hash)
+    except BaseException as error:
+        _set_process_state(paths, "side", "FAILED", error=f"{type(error).__name__}: {error}")
+        raise
+    _set_process_state(paths, "side", "COMPLETE", global_freeze_sha256=freeze_hash)
+
+
+def _run_formal(protocol_path: Path, run_root: Path) -> None:
+    rt = load_runtime(protocol_path, run_root)
+    _require_smoke(rt)
+    side = rt.paths.side_gpu_uuid is not None
     seeds = tuple(rt.protocol.get("seeds", [13]))
     _phase(rt.paths, "FORMAL_TRAINING", formal_training_started=True,
-           detail={"seed_order": list(seeds)})
+           detail={"seed_order": list(seeds), "side_gpu_uuid": rt.paths.side_gpu_uuid})
     raw_et_path = rt.paths.run_root / "training_shared" / "RawET128.pt"
     raw_et_path.parent.mkdir(exist_ok=True)
     if raw_et_path.exists():
@@ -1820,10 +1980,26 @@ def run_formal(protocol_path: Path, run_root: Path) -> None:
     write_json(rt.paths.run_root / "GLOBAL_SELECTION_FREEZE.json", global_freeze)
     _phase(rt.paths, "FROZEN_EVALUATION", formal_training_started=True,
            detail={"global_freeze_sha256": global_freeze["freeze_sha256"]})
+    freeze_hash = global_freeze["freeze_sha256"]
     seed_results = {
-        seed: evaluate_seed(rt, seed, global_freeze["freeze_sha256"])
+        seed: {"seed": seed, "global_freeze_sha256": freeze_hash,
+               "splits": {"dev": evaluate_split(rt, seed, "dev", freeze_hash)}}
         for seed in seeds
     }
+    if side:
+        # The side process evaluates the test split once it sees the global freeze.
+        side_state = _process_file(rt.paths, "side")
+        _wait_for(
+            rt.paths, "side",
+            lambda: side_state.exists() and read_json(side_state)["status"] == "COMPLETE"
+            and read_json(side_state)["global_freeze_sha256"] == freeze_hash,
+            "the frozen test evaluation",
+        )
+    for seed in seeds:
+        seed_results[seed]["splits"]["test"] = (
+            read_json(rt.paths.seed_dir(seed) / "eval" / "test" / "SUMMARY.json") if side
+            else evaluate_split(rt, seed, "test", freeze_hash)
+        )
     for seed, result in seed_results.items():
         write_json(rt.paths.seed_dir(seed) / "FINAL_EVALUATION.json", result)
         _checkpoint_manifest(rt.paths.seed_dir(seed))

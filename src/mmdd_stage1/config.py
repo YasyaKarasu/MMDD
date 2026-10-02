@@ -2,7 +2,8 @@
 
 Everything machine-specific lives in the protocol file: the ``paths`` block names the
 dataset, backbone, feature caches and run root, and ``hardware`` names the GPU the run is
-pinned to. Nothing in this package hardcodes a dataset, a cache directory or a GPU UUID.
+pinned to (plus an optional side GPU for ``train-side``). Nothing in this package hardcodes
+a dataset, a cache directory or a GPU UUID.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from . import EXPERIMENT_ID, VERSION
 
 REQUIRED_PATH_KEYS = ("dataset_root", "backbone_dir", "pure_cache_dir", "row_cache_manifest", "run_root")
 STAGE_ORDER = [
-    "TA", "TB_CQET", "TB_LSE", "TB_QT", "NATIVE_C1_SUP",
+    "TA", "TB_CQET", "TB_QT", "NATIVE_C1_SUP",
     "QT_C1_SUP", "NATIVE_C2_SUP", "NATIVE_C2_KD", "QT_C2_SUP",
 ]
 
@@ -36,6 +37,8 @@ class Paths:
     # GPU the run is pinned to; None means "not pinned" (CPU tests, offline analysis).
     gpu_uuid: str | None = None
     gpu_physical_index: int | None = None
+    # Second GPU of a two-process run (``train-side``); None for a single-GPU run.
+    side_gpu_uuid: str | None = None
 
     @property
     def labels_dir(self) -> Path:
@@ -70,17 +73,24 @@ def validate_protocol(p: Mapping[str, Any]) -> None:
         raise ValueError("hardware.uuid must be the full GPU UUID (GPU-...)")
     if not hw.get("model"):
         raise ValueError("hardware.model must name the GPU model")
-    if hw.get("gpu_processes") != 1 or hw.get("ddp") is not False:
-        raise ValueError("the pipeline runs as one non-DDP GPU process")
+    if hw.get("gpu_processes") not in (1, 2) or hw.get("ddp") is not False:
+        raise ValueError("the pipeline runs as one or two non-DDP GPU processes")
+    if ("side_uuid" in hw) != (hw["gpu_processes"] == 2):
+        raise ValueError("hardware.side_uuid is required exactly when gpu_processes is 2")
+    if hw["gpu_processes"] == 2:
+        if not str(hw["side_uuid"]).startswith("GPU-") or hw["side_uuid"] == hw["uuid"]:
+            raise ValueError("hardware.side_uuid must be the full UUID of a second GPU")
+        if not isinstance(hw.get("side_physical_index"), int) or hw["side_physical_index"] < 0:
+            raise ValueError("hardware.side_physical_index must be a non-negative integer")
     if hw.get("max_cpu_workers") != 4 or hw.get("max_prefetch_units") != 16:
         raise ValueError("CPU worker/prefetch limits changed")
     seeds = p.get("seeds")
     if not isinstance(seeds, list) or not seeds or any(not isinstance(s, int) for s in seeds):
         raise ValueError("seeds must be a non-empty list of integers")
-    if p.get("stage_order") != STAGE_ORDER or p.get("stages_per_seed") != 9:
-        raise ValueError("nine-stage order changed")
-    if p.get("max_registered_stages") != 9 * len(seeds):
-        raise ValueError("max_registered_stages must be 9 * len(seeds)")
+    if p.get("stage_order") != STAGE_ORDER or p.get("stages_per_seed") != len(STAGE_ORDER):
+        raise ValueError("stage order changed")
+    if p.get("max_registered_stages") != len(STAGE_ORDER) * len(seeds):
+        raise ValueError("max_registered_stages must be stages_per_seed * len(seeds)")
     if p.get("historical_training_dependencies") is not False:
         raise ValueError("historical training dependencies are forbidden")
     if p.get("fallback_on_research_failure") is not False:
@@ -157,4 +167,5 @@ def resolve_default_paths(protocol_path: Path, run_root: Path) -> Paths:
         package_dir=_resolve(repo_root, configured.get("package_dir")),
         gpu_uuid=str(hw["uuid"]),
         gpu_physical_index=int(hw["physical_index"]),
+        side_gpu_uuid=str(hw["side_uuid"]) if "side_uuid" in hw else None,
     )

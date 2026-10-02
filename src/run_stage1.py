@@ -13,6 +13,7 @@ feature layer lives in its own directory (``--features-dir``, default
 Order:
 
     init --dataset-root D --gpu N   bind dataset, backbone, features dir, run root and GPU
+         [--side-gpu M]             optional second GPU for train-side
     build-data                      write <features-dir>/data (refuses to overwrite)
     encode                          write <features-dir>/{encoder,features} (refuses to overwrite)
     lock                            hash dataset/backbone/cache, content-alias archive
@@ -20,12 +21,15 @@ Order:
     prepare                         train labels, row store, run PCA
     validate                        CPU reference/contract tests bound to the source hash
     smoke                           every stage on 8 train queries (GPU)
-    train                           TA, TB_{CQET,LSE,QT}, Native/QT C1, Native C2 SUP/KD, QT C2,
+    train                           TA, TB_{CQET,QT}, Native/QT C1, Native C2 SUP/KD, QT C2,
                                     dev selection freeze, then frozen dev/test evaluation (GPU)
+    train-side                      with --side-gpu, run next to train on the same run root: TB_QT,
+                                    QT C1/C2, the Teacher trajectory and the test split (side GPU)
     export                          retrieval.{train,dev,test}.jsonl + stage1_gate.json for Stage 2
 
-GPU commands set CUDA_VISIBLE_DEVICES to the protocol's ``hardware.uuid`` before torch is
-imported, so the process sees exactly that device as ``cuda:0``.
+GPU commands set CUDA_VISIBLE_DEVICES to the protocol's ``hardware.uuid`` (``train-side``:
+``hardware.side_uuid``) before torch is imported, so the process sees exactly that device as
+``cuda:0``.
 """
 from __future__ import annotations
 
@@ -44,7 +48,7 @@ FEATURES_ROOT = ROOT / "work" / "stage1_features"
 # encoder shards (stage1_objects position mod 2; content by object-id hash mod 2).
 ENCODER_SHARDS = 2
 TARGET_MAX_ROWS = 20
-GPU_COMMANDS = {"verify-features", "smoke", "train", "export"}
+GPU_COMMANDS = {"verify-features", "smoke", "train", "train-side", "export"}
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -111,16 +115,22 @@ def query_gpu(index: int) -> dict:
 
 
 def init(run: Path, dataset_root: Path, features_dir: Path, backbone_dir: Path, gpu: int,
-         seeds: list[int] | None) -> None:
+         seeds: list[int] | None, side_gpu: int | None = None) -> None:
     protocol_path = run / "protocol.json"
     if protocol_path.exists():
         raise FileExistsError(f"run already initialised: {protocol_path}")
     template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     if seeds:
         template["seeds"] = seeds
+    hardware = query_gpu(gpu)
+    if side_gpu is not None:
+        side = query_gpu(side_gpu)
+        if side["model"] != hardware["model"]:
+            raise ValueError(f"side GPU {side['model']} differs from main GPU {hardware['model']}")
+        hardware.update(gpu_processes=2, side_physical_index=side_gpu, side_uuid=side["uuid"])
     protocol = build_protocol(
         template, dataset_root=dataset_root, run_root=run, features_dir=features_dir,
-        backbone_dir=backbone_dir, hardware=query_gpu(gpu),
+        backbone_dir=backbone_dir, hardware=hardware,
     )
     from mmdd_stage1.config import validate_protocol
 
@@ -275,7 +285,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
     commands = ("init", "build-data", "encode", "pack", "lock", "verify-features", "prepare",
-                "validate", "smoke", "train", "export", "amend-source")
+                "validate", "smoke", "train", "train-side", "export", "amend-source")
     for command in commands:
         subparsers.add_parser(command).add_argument("--run-root", type=Path, required=True)
     init_parser = subparsers.choices["init"]
@@ -285,6 +295,10 @@ def main(argv: list[str] | None = None) -> None:
                              help=f"frozen-feature directory, shared across runs (default: {FEATURES_ROOT}/<dataset name>)")
     init_parser.add_argument("--backbone-dir", type=Path, default=DEFAULT_BACKBONE)
     init_parser.add_argument("--seeds", type=int, nargs="+")
+    init_parser.add_argument("--side-gpu", type=int,
+                             help="physical index of a second GPU of the same model for train-side")
+    subparsers.choices["lock"].add_argument(
+        "--workers", type=int, default=32, help="processes decoding evidence images for content aliases")
     subparsers.choices["encode"].add_argument(
         "--gpus", type=int, nargs="+", help="physical GPU indices for the two shards (default: protocol GPU)")
     export_parser = subparsers.choices["export"]
@@ -304,14 +318,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "init":
         dataset_root = args.dataset_root.resolve()
         features_dir = (args.features_dir or FEATURES_ROOT / dataset_root.name).resolve()
-        init(run, dataset_root, features_dir, args.backbone_dir.resolve(), args.gpu, args.seeds)
+        init(run, dataset_root, features_dir, args.backbone_dir.resolve(), args.gpu, args.seeds, args.side_gpu)
         return
     protocol_path = run / "protocol.json"
     protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
     if args.command in GPU_COMMANDS:
         # Must happen before the first torch import in this process.
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = protocol["hardware"]["uuid"]
+        os.environ["CUDA_VISIBLE_DEVICES"] = protocol["hardware"][
+            "side_uuid" if args.command == "train-side" else "uuid"]
 
     if args.command == "build-data":
         build_data(protocol)
@@ -325,7 +340,7 @@ def main(argv: list[str] | None = None) -> None:
 
         paths = resolve_default_paths(protocol_path, run)
         if args.command == "lock":
-            preflight.run_lock(paths)
+            preflight.run_lock(paths, args.workers)
         else:
             preflight.verify_feature_provenance(paths)
     elif args.command == "export":
@@ -348,6 +363,8 @@ def main(argv: list[str] | None = None) -> None:
             pipeline.smoke(protocol_path, run)
         elif args.command == "train":
             pipeline.run_formal(protocol_path, run)
+        elif args.command == "train-side":
+            pipeline.run_side(protocol_path, run)
         else:
             unknown = set(args.carry) - set(pipeline.STAGES)
             if unknown:

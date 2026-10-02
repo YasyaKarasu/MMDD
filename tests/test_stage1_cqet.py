@@ -1358,7 +1358,7 @@ def test_run_stage1_init_binds_run_layout_and_gpu_into_valid_protocol(tmp_path: 
         hardware={"physical_index": 1, "uuid": "GPU-abc", "model": "RTX 4090"},
     )
     validate_protocol(protocol)
-    assert protocol["max_registered_stages"] == 18
+    assert protocol["max_registered_stages"] == 16
     assert template["hardware"]["physical_index"] == 0  # template itself is not mutated
     run.mkdir()
     (run / "protocol.json").write_text(json.dumps(protocol))
@@ -1616,7 +1616,6 @@ def test_reports_add_evidence_and_student_diagnostics_without_changing_gates(tmp
         "contrasts": {
             "content_CQET_Real_minus_Swap_implicit": contrast(1.0),
             "CQET_Real_minus_TB_QT_overall": contrast(0.0),
-            "CQET_Real_minus_LSE_Real_overall": contrast(0.1),
             "KD_minus_SUP_same_TB_CQET_overall": contrast(0.5),
             "evidence_CQET_Real_minus_f0_overall": contrast(0.8),
             "evidence_CQET_Real_minus_f0_implicit": contrast(None),
@@ -1635,3 +1634,137 @@ def test_reports_add_evidence_and_student_diagnostics_without_changing_gates(tmp
     text = (tmp_path / "reports" / "RESULTS.md").read_text()
     assert "Evidence and Student diagnostics (not gates)" in text
     assert "| 13 | dev | 0.8000 | n/a | n/a | 0.4500 | 4.0000 | 0.3000 | -0.2000 | n/a |" in text
+
+
+def test_lock_content_aliases_hash_each_image_once_across_workers(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from mmdd_stage1 import preflight
+
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (3, 2), (10, 20, 30)).save(images / "a.png")
+    Image.new("RGB", (3, 2), (10, 20, 30)).save(images / "a_copy.png", compress_level=0)
+    Image.new("RGB", (2, 2), (200, 0, 0)).save(images / "b.png")
+    rows = [
+        {"asset_id": "img_b", "asset_type": "image", "local_path": str(images / "b.png")},
+        {"asset_id": "img_a2", "asset_type": "image", "local_path": str(images / "a_copy.png")},
+        {"asset_id": "img_a1", "asset_type": "image", "local_path": str(images / "a.png")},
+        {"asset_id": "img_a1_again", "asset_type": "image", "local_path": str(images / "a.png")},
+        {"asset_id": "txt_2", "asset_type": "text", "content": "x\r\ny"},
+        {"asset_id": "txt_1", "asset_type": "text", "content": "x\ny"},
+    ]
+    write_jsonl(tmp_path / "bridge_assets" / "part-00000.jsonl", rows)
+    paths = Paths(
+        repo_root=tmp_path, dataset_root=tmp_path, backbone_dir=tmp_path, pure_cache_dir=tmp_path,
+        row_cache_manifest=tmp_path / "manifest", protocol_path=tmp_path / "protocol",
+        run_root=tmp_path / "run",
+    )
+
+    report = preflight.build_content_aliases(paths, workers=2)
+    out = {row["asset_id"]: row for row in iter_jsonl_gz(paths.run_root / "CONTENT_ALIASES.jsonl.gz")}
+    assert list(out) == utf8_sorted(out)
+    assert report["objects"] == 6 and report["canonical_objects"] == 3 and report["alias_groups"] == 2
+    # Same pixels in a different file encoding alias to one canonical image.
+    assert {out[key]["canonical_evidence_id"] for key in ("img_a1", "img_a1_again", "img_a2")} == {"img_a1"}
+    assert out["img_a1"]["raw_file_sha256"] != out["img_a2"]["raw_file_sha256"]
+    assert out["img_a1"]["alias_count"] == 3 and (out["img_a1"]["width"], out["img_a1"]["height"]) == (3, 2)
+    pixels = hashlib.sha256((3).to_bytes(8, "big") + (2).to_bytes(8, "big") + bytes([10, 20, 30]) * 6)
+    assert out["img_a1"]["pixel_sha256"] == pixels.hexdigest()
+    assert out["img_b"]["canonical_evidence_id"] == "img_b" and out["img_b"]["alias_count"] == 1
+    assert out["txt_2"]["canonical_evidence_id"] == "txt_1"
+
+    rows[3]["sha256"] = "0" * 64
+    write_jsonl(tmp_path / "bridge_assets" / "part-00000.jsonl", rows)
+    with pytest.raises(ValueError, match="image hash mismatch for img_a1_again"):
+        preflight.build_content_aliases(paths, workers=2)
+
+
+def iter_jsonl_gz(path: Path) -> list[dict]:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle]
+
+
+def test_protocol_side_gpu_is_bound_only_for_two_gpu_runs(tmp_path: Path):
+    import run_stage1
+    from mmdd_stage1.config import STAGE_ORDER, resolve_default_paths, validate_protocol
+
+    assert "TB_LSE" not in STAGE_ORDER and len(STAGE_ORDER) == 8
+    template = json.loads(run_stage1.TEMPLATE.read_text())
+    run = tmp_path / "run"
+    hardware = {"physical_index": 0, "uuid": "GPU-main", "model": "RTX 4090",
+                "gpu_processes": 2, "side_physical_index": 1, "side_uuid": "GPU-side"}
+    protocol = run_stage1.build_protocol(
+        template, dataset_root=tmp_path / "dataset", run_root=run, features_dir=tmp_path / "features",
+        backbone_dir=tmp_path / "qwen", hardware=hardware,
+    )
+    validate_protocol(protocol)
+    run.mkdir()
+    (run / "protocol.json").write_text(json.dumps(protocol))
+    paths = resolve_default_paths(run / "protocol.json", run)
+    assert (paths.gpu_uuid, paths.side_gpu_uuid) == ("GPU-main", "GPU-side")
+
+    bound = protocol["hardware"]
+    single = {**{k: v for k, v in bound.items() if not k.startswith("side_")}, "gpu_processes": 1}
+    for broken, match in (
+        ({**single, "gpu_processes": 2}, "side_uuid is required"),
+        ({**single, "side_uuid": "GPU-side", "side_physical_index": 1}, "side_uuid is required"),
+        ({**bound, "side_uuid": "GPU-main"}, "second GPU"),
+        ({**bound, "gpu_processes": 3}, "one or two"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            validate_protocol({**protocol, "hardware": broken})
+    protocol["hardware"] = single
+    (run / "protocol.json").write_text(json.dumps(protocol))
+    assert resolve_default_paths(run / "protocol.json", run).side_gpu_uuid is None
+
+
+def test_peer_wait_returns_when_ready_and_fails_when_the_peer_is_gone(tmp_path: Path, monkeypatch):
+    import subprocess as _subprocess
+
+    from mmdd_stage1 import pipeline
+
+    monkeypatch.setattr(pipeline, "PEER_POLL_SECONDS", 0)
+    paths = types.SimpleNamespace(run_root=tmp_path, gpu_uuid="GPU-side")
+    marker = tmp_path / "marker"
+    calls = []
+
+    def ready():
+        calls.append(1)
+        if len(calls) == 3:
+            marker.write_text("x")
+        return marker.exists()
+
+    pipeline._wait_for(paths, "side", ready, "marker")  # peer not registered yet: keep waiting
+    assert len(calls) == 3
+    with pytest.raises(RuntimeError, match="missing"):
+        pipeline._wait_for(paths, None, lambda: False, "graph")
+
+    pipeline._set_process_state(paths, "side", "FAILED")
+    with pytest.raises(RuntimeError, match="side process is FAILED"):
+        pipeline._wait_for(paths, "side", lambda: False, "graph")
+    dead = _subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    pipeline.write_json(pipeline._process_file(paths, "side"), {"pid": dead.pid, "status": "RUNNING"})
+    with pytest.raises(RuntimeError, match="died before producing graph"):
+        pipeline._wait_for(paths, "side", lambda: False, "graph")
+
+
+def test_selection_is_reused_only_while_its_checkpoint_is_unchanged(tmp_path: Path):
+    from mmdd_stage1 import pipeline
+    from mmdd_stage1.data import sha256_file
+
+    checkpoint = tmp_path / "frac050.pt"
+    checkpoint.write_bytes(b"a")
+    calls = []
+
+    def select():
+        calls.append(1)
+        return {"selected_checkpoint": str(checkpoint), "selected_checkpoint_sha256": sha256_file(checkpoint),
+                "call": len(calls)}
+
+    path = tmp_path / "QT_C1.json"
+    assert pipeline._selection(path, select)["call"] == 1
+    assert pipeline._selection(path, select)["call"] == 1  # written by the other process: reused
+    checkpoint.write_bytes(b"b")
+    assert pipeline._selection(path, select)["call"] == 2

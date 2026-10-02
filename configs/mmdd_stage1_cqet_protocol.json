@@ -27,12 +27,11 @@
     13
   ],
   "seed_order": "sequential",
-  "stages_per_seed": 9,
-  "max_registered_stages": 9,
+  "stages_per_seed": 8,
+  "max_registered_stages": 8,
   "stage_order": [
     "TA",
     "TB_CQET",
-    "TB_LSE",
     "TB_QT",
     "NATIVE_C1_SUP",
     "QT_C1_SUP",
@@ -43,7 +42,6 @@
   "parents": {
     "TA": "fresh_init",
     "TB_CQET": "same_seed_TA_epoch2",
-    "TB_LSE": "same_seed_TA_epoch2",
     "TB_QT": "same_seed_TA_epoch2",
     "NATIVE_C1_SUP": "same_run_PCA_identity",
     "QT_C1_SUP": "same_run_PCA_identity",
@@ -135,7 +133,6 @@
       "candidate_list": "RawU_union_trueRawDirect150_union_G_union_U32",
       "shuffle_namespace": "TB_SHARED",
       "CQET_aggregation": "nonempty_LME_QET_else_f0",
-      "LSE_aggregation": "LSE_f0_and_QET",
       "path_direct_weight": 0.5,
       "path_aggregate_weight": 0.5,
       "support_weight": 0.2,
@@ -277,7 +274,6 @@
     "content_dev_mean_implicit": 0.5,
     "content_test_mean_strictly_positive": true,
     "teacher_vs_QT_each_split_seed_floor": -0.5,
-    "CQET_vs_correctedLSE_each_split_mean_floor": 0,
     "KD_dev_mean": 0.3,
     "KD_test_mean_strictly_positive": true,
     "KD_coverage_floor": -0.5,

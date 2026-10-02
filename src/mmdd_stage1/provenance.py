@@ -267,7 +267,6 @@ def generate_provenance_manifests(paths: Paths, gpu_uuid: str, seeds: Sequence[i
             "parents": {
                 "TA": "fresh_init",
                 "TB_CQET": "TA_epoch2",
-                "TB_LSE": "TA_epoch2",
                 "TB_QT": "TA_epoch2",
                 "NATIVE_C1_SUP": "run_PCA_identity",
                 "QT_C1_SUP": "run_PCA_identity",
@@ -276,6 +275,7 @@ def generate_provenance_manifests(paths: Paths, gpu_uuid: str, seeds: Sequence[i
                 "QT_C2_SUP": "selected_QT_C1_SUP",
             },
             "gpu_uuid": gpu_uuid,
+            "side_gpu_uuid": paths.side_gpu_uuid,
             "source_identity_sha256": source_identity(paths),
         },
     )

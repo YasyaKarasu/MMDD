@@ -30,7 +30,7 @@ def main() -> None:
     run = args.run_root.resolve()
     pipeline, _ = bind(run)
     rt = pipeline.load_runtime(run / "protocol.json", run)
-    pipeline._gpu_guard(rt.paths)
+    pipeline._gpu_guard(rt.paths.gpu_uuid)
     source = source_identity(rt.paths)
     stages = {}
     for stage in pipeline.STAGES:

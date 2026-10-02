@@ -13,7 +13,7 @@ import platform
 import subprocess
 import unicodedata
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,6 +26,8 @@ from .config import Paths
 from .data import iter_jsonl, json_identity, sha256_file, write_json, write_jsonl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# Worker processes for decoding evidence images in ``build_content_aliases``.
+LOCK_WORKERS = 32
 
 # Match the real frozen extractor's image boundary. Dataset images are trusted
 # local inputs and some legitimately exceed Pillow's heuristic pixel ceiling.
@@ -72,7 +74,8 @@ def _required_dataset_files(paths: Paths) -> list[Path]:
 
 
 def _hash_files(paths: list[Path], *, root: Path, role: str) -> list[dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # hashlib releases the GIL, so threads hash files in parallel (the cache alone is ~130 GB).
+    with ThreadPoolExecutor(max_workers=16) as executor:
         records = list(executor.map(lambda path: file_identity(path, root=root, role=role), paths))
     return sorted(records, key=lambda row: str(row["path"]).encode("utf-8"))
 
@@ -252,63 +255,75 @@ def build_recipe_lock(paths: Paths) -> dict[str, Any]:
     return recipe
 
 
-def build_content_aliases(paths: Paths) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
-    image_file_cache: dict[str, tuple[str, str, int, int]] = {}
+def _image_identity(image_path: str) -> tuple[str, str, int, int]:
+    """(raw file sha256, decoded-pixel sha256, width, height) of one evidence image."""
+    path = Path(image_path)
+    file_hash = sha256_file(path)
+    with Image.open(path) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        pixel_digest = hashlib.sha256()
+        pixel_digest.update(width.to_bytes(8, "big"))
+        pixel_digest.update(height.to_bytes(8, "big"))
+        pixel_digest.update(image.tobytes())
+    return file_hash, pixel_digest.hexdigest(), width, height
+
+
+def build_content_aliases(paths: Paths, workers: int = LOCK_WORKERS) -> dict[str, Any]:
+    # Pass 1 keeps (asset_id, modality, text hash or image path, advertised file hash).
+    assets: list[tuple[str, str, str, str | None]] = []
     for part in sorted((paths.dataset_root / "bridge_assets").glob("part-*.jsonl")):
         for raw in iter_jsonl(part):
             asset_id = str(raw["asset_id"])
             modality = str(raw["asset_type"])
             if modality == "text":
                 visible = unicodedata.normalize("NFC", str(raw["content"]).replace("\r\n", "\n").replace("\r", "\n"))
-                content_hash = hashlib.sha256(visible.encode("utf-8")).hexdigest()
-                record = {
-                    "schema_version": SCHEMA_VERSION,
-                    "asset_id": asset_id,
-                    "modality": modality,
-                    "visible_content_sha256": content_hash,
-                    "raw_file_sha256": None,
-                    "pixel_sha256": None,
-                    "width": None,
-                    "height": None,
-                }
+                assets.append((asset_id, modality, hashlib.sha256(visible.encode("utf-8")).hexdigest(), None))
             elif modality == "image":
                 image_path = str(Path(str(raw.get("local_path") or raw.get("relative_path"))).resolve())
-                identity = image_file_cache.get(image_path)
-                if identity is None:
-                    path = Path(image_path)
-                    file_hash = sha256_file(path)
-                    advertised = raw.get("sha256")
-                    if advertised and str(advertised) != file_hash:
-                        raise ValueError(f"image hash mismatch for {asset_id}")
-                    with Image.open(path) as opened:
-                        image = ImageOps.exif_transpose(opened).convert("RGB")
-                        width, height = image.size
-                        pixel_digest = hashlib.sha256()
-                        pixel_digest.update(width.to_bytes(8, "big"))
-                        pixel_digest.update(height.to_bytes(8, "big"))
-                        pixel_digest.update(image.tobytes())
-                        pixel_hash = pixel_digest.hexdigest()
-                    identity = (file_hash, pixel_hash, width, height)
-                    image_file_cache[image_path] = identity
-                file_hash, content_hash, width, height = identity
-                record = {
-                    "schema_version": SCHEMA_VERSION,
-                    "asset_id": asset_id,
-                    "modality": modality,
-                    "visible_content_sha256": content_hash,
-                    "raw_file_sha256": file_hash,
-                    "pixel_sha256": content_hash,
-                    "width": width,
-                    "height": height,
-                }
+                advertised = raw.get("sha256")
+                assets.append((asset_id, modality, image_path, str(advertised) if advertised else None))
             else:
                 raise ValueError(f"unsupported evidence modality: {modality}")
-            if content_hash == asset_id:
-                raise ValueError(f"fake content hash for {asset_id}")
-            groups[(modality, content_hash)].append(asset_id)
-            rows.append(record)
+
+    # Image decoding is the lock's CPU bottleneck (~15 images/s per core); each unique file once.
+    image_paths = sorted({value for _, modality, value, _ in assets if modality == "image"})
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        image_identity = dict(zip(image_paths, executor.map(_image_identity, image_paths, chunksize=16)))
+
+    rows: list[dict[str, Any]] = []
+    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for asset_id, modality, value, advertised in assets:
+        if modality == "text":
+            content_hash = value
+            record = {
+                "schema_version": SCHEMA_VERSION,
+                "asset_id": asset_id,
+                "modality": modality,
+                "visible_content_sha256": content_hash,
+                "raw_file_sha256": None,
+                "pixel_sha256": None,
+                "width": None,
+                "height": None,
+            }
+        else:
+            file_hash, content_hash, width, height = image_identity[value]
+            if advertised and advertised != file_hash:
+                raise ValueError(f"image hash mismatch for {asset_id}")
+            record = {
+                "schema_version": SCHEMA_VERSION,
+                "asset_id": asset_id,
+                "modality": modality,
+                "visible_content_sha256": content_hash,
+                "raw_file_sha256": file_hash,
+                "pixel_sha256": content_hash,
+                "width": width,
+                "height": height,
+            }
+        if content_hash == asset_id:
+            raise ValueError(f"fake content hash for {asset_id}")
+        groups[(modality, content_hash)].append(asset_id)
+        rows.append(record)
 
     canonical = {
         key: min(ids, key=lambda value: value.encode("utf-8"))
@@ -841,12 +856,12 @@ def write_access_ledger(paths: Paths) -> None:
     write_jsonl(paths.run_root / "INPUT_ACCESS_LEDGER.jsonl", records)
 
 
-def run_lock(paths: Paths) -> dict[str, Any]:
+def run_lock(paths: Paths, workers: int = LOCK_WORKERS) -> dict[str, Any]:
     paths.run_root.mkdir(parents=True, exist_ok=True)
     result = {
         "run_identity": build_identity(paths),
         "recipe": build_recipe_lock(paths),
-        "aliases": build_content_aliases(paths),
+        "aliases": build_content_aliases(paths, workers),
         "cache": build_cache_manifest(paths),
     }
     write_access_ledger(paths)

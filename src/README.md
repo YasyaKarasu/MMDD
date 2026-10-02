@@ -306,7 +306,7 @@ in this layout; `init --features-dir work/stage1_features/entitables` reuses it 
 ```bash
 RUN=work/stage1_entitables
 S="conda run -n MMDD python src/run_stage1.py"
-$S init --run-root $RUN --dataset-root <dataset-artifact> --gpu 0   # --features-dir DIR, --seeds 13 17 ...
+$S init --run-root $RUN --dataset-root <dataset-artifact> --gpu 0   # --features-dir DIR, --seeds 13 17 ..., --side-gpu 1
 $S build-data      --run-root $RUN          # only for a new feature directory
 $S encode          --run-root $RUN          # only for a new feature directory; --gpus 0 1 runs the shards in parallel
 $S lock            --run-root $RUN
@@ -315,6 +315,7 @@ $S prepare         --run-root $RUN
 $S validate        --run-root $RUN
 $S smoke           --run-root $RUN
 $S train           --run-root $RUN
+$S train-side      --run-root $RUN          # only with --side-gpu: start next to train, same run root
 $S export          --run-root $RUN          # exports the KD Student (protocol primary); --arm SUP for the SUP control
 ```
 
@@ -330,20 +331,32 @@ Inputs and outputs (`F` = feature directory, everything else under `<run>`):
 | `validate` | | runs `tests/test_stage1_cqet.py` and `tests/test_stage1_reference_contracts.py`, bound to the source hash |
 | `smoke` | 8 train queries | `tests/smoke/` |
 | `train` | everything above | `seed<N>/<STAGE>/checkpoints`, `seed<N>/selections/`, `GLOBAL_SELECTION_FREEZE.json`, `seed<N>/eval/{dev,test}/`, `seed<N>/timing/stages.jsonl`, `reports/{DECISION.json,RESULTS.md}` |
+| `train-side` | as `train` | `seed<N>/{TB_QT,QT_C1_SUP,QT_C2_SUP}/`, `seed<N>/selections/QT_C{1,2}.json`, the Teacher trajectory, `seed<N>/eval/test/`; process states in `processes/{main,side}.json` |
 | `export` | frozen selection | `stage2_handoff/retrieval.{train,dev,test}.jsonl`, `stage1_gate.json` |
 
 The encoder always uses two shards: `verify-features` replays the original
 batches, which assume `stage1_objects` position modulo 2 and content shards by
 object-ID hash. Encoder prompts are `cache_stage1_features.EMBEDDING_INSTRUCTIONS`.
-GPU commands set `CUDA_VISIBLE_DEVICES` to the protocol's `hardware.uuid` before
-importing torch, and the pipeline checks that UUID again.
+GPU commands set `CUDA_VISIBLE_DEVICES` to the protocol's `hardware.uuid` (`train-side`:
+`hardware.side_uuid`) before importing torch, and the pipeline checks that UUID again.
+
+**Two GPUs.** `init --side-gpu M` pins a second GPU of the same model. `train` then keeps the
+Native critical path (Raw pools → TA → `TB_CQET` → Native C1 → C2 graph → Native C2 SUP/KD →
+dev evaluation) and `train-side` runs everything off it (`pipeline.qt_and_trajectory_work`):
+`TB_QT` as soon as TA ends, `QT_C1_SUP` and its selection, the Teacher trajectory, `QT_C2_SUP`
+once the shared C2 graph is on disk, and the test split after the global freeze. The two
+processes share the run root and wait for each other's stage receipts and files; each fails as
+soon as the other one died (`processes/{main,side}.json`). Restart both with the same commands:
+completed stages and selections are reused. Every stage seeds itself, so the split does not
+change any stage's inputs; each stage's PRE_RUN receipt names the GPU it ran on. Without
+`--side-gpu`, `train` runs the same work in-process after the Native C2 selection.
 
 Training stages per seed, in order (`pipeline.train_seed`):
 
 1. Raw pools from frozen Qwen features (`lists.build_raw_pools_split`), then the
    TA / TB_SHARED / C1 training lists.
-2. `TA` — fresh Teacher, `teacher.TA.epochs` epochs. `TB_CQET`, `TB_LSE`, and `TB_QT`
-   each train for one epoch from TA's endpoint on the candidate list
+2. `TA` — fresh Teacher, `teacher.TA.epochs` epochs. `TB_CQET` and `TB_QT` (the
+   evidence-free control) each train for one epoch from TA's endpoint on the candidate list
    `RawU ∪ RawDirect150 ∪ G ∪ U32`. Epochs, learning rate, weight decay, batch
    size, and support weight come from `teacher.TA` / `teacher.TB`.
 3. `NATIVE_C1_SUP`, `QT_C1_SUP` — Students initialized from PCA/identity and trained
@@ -351,8 +364,9 @@ Training stages per seed, in order (`pipeline.train_seed`):
 4. The selected C1 Student retrieves the train queries. Its pool, the Raw pool, and
    the gold targets form the shared C2 graph (`lists.build_c2_shared_graph`). The
    frozen `TB_CQET` endpoint scores every graph list once (`teacher_logits_cache`).
-5. `NATIVE_C2_SUP`, `NATIVE_C2_KD`, and `QT_C2_SUP` start from the same C1 parent;
-   the KD arm uses the SUP arm's selected fraction. The frozen dev/test evaluation
+5. `NATIVE_C2_SUP` and `NATIVE_C2_KD` start from the selected Native C1, `QT_C2_SUP`
+   from the selected QT C1; all three train on the shared C2 graph, so the arms differ in
+   the model, not in the mined lists. The KD arm uses the SUP arm's selected fraction. The frozen dev/test evaluation
    follows. Test labels are exported only after `GLOBAL_SELECTION_FREEZE.json`. Every
    ranking is recomputed from raw IDs by `mmdd_stage1.independent_metrics`.
 
