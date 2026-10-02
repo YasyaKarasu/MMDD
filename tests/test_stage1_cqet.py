@@ -53,7 +53,9 @@ from mmdd_stage1.provenance import (
     source_manifest,
 )
 from mmdd_stage1.train import (
+    StudentRecipe,
     TeacherListScorer,
+    _scored_list_sha,
     build_teacher_logits_cache,
     model_state_sha,
     train_student_c1,
@@ -108,6 +110,15 @@ class TinyRowStore:
         return self.rows[object_id]
 
 
+def teacher_cache(records, logits) -> dict:
+    """Hand-written Teacher logits in the ``build_teacher_logits_cache`` layout, aligned with the records."""
+    rows = {row["query_id"]: row for row in records}
+    return {
+        q: {"direct": direct, "evidence": evidence, "list_sha256": _scored_list_sha(rows[q])}
+        for q, (direct, evidence) in logits.items()
+    }
+
+
 def tiny_fixture(n_queries: int = 1):
     vectors = {
         "tp": torch.tensor([0.8, 0.1, 0.3, -0.2]),
@@ -147,7 +158,7 @@ def test_actual_c2_kd_step_has_student_gradient_and_locked_parent(tmp_path: Path
     out = tmp_path / "kd"
 
     logits = build_teacher_logits_cache(teacher, bank, records, device="cpu")
-    assert logits["q0"][0].shape == (3,) and logits["q0"][1].shape == (2,)
+    assert logits["q0"]["direct"].shape == (3,) and logits["q0"]["evidence"].shape == (2,)
     train_student_c2(
         student, records, bank, device="cpu", arm="NATIVE_KD",
         logical_batch=1, save_dir=out, seed=13,
@@ -303,7 +314,7 @@ def test_actual_teacher_and_student_trajectory_probes(tmp_path: Path):
     student = NativeStudent(basis, mean, dim=2)
     student_probe = student_gradient_probe(
         student, bank, records[0],
-        (torch.tensor([3.0, -1.0, -2.0]), torch.tensor([2.0, -1.0])),
+        teacher_cache(records, {"q0": (torch.tensor([3.0, -1.0, -2.0]), torch.tensor([2.0, -1.0]))}),
     )
     assert student_probe["components"]["SUP"]["gradient_norm"] > 0
     assert student_probe["components"]["direct_KD"]["gradient_norm"] > 0
@@ -317,7 +328,7 @@ def test_actual_c2_sup_and_kd_updates_differ():
     sup = copy.deepcopy(initial)
     kd = copy.deepcopy(initial)
     parent_hash = model_state_sha(initial)
-    teacher_logits = {"q0": (torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0]))}
+    teacher_logits = teacher_cache(records, {"q0": (torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0]))})
 
     train_student_c2(
         sup, records, bank, device="cpu", arm="NATIVE_SUP", logical_batch=1,
@@ -332,10 +343,10 @@ def test_actual_c2_sup_and_kd_updates_differ():
 
 def test_actual_c2_resume_matches_continuous(tmp_path: Path):
     bank, records, basis, mean = tiny_fixture(n_queries=4)
-    logits = {
+    logits = teacher_cache(records, {
         f"q{i}": (torch.tensor([2.0 + i, -1.0, -2.0]), torch.tensor([1.0, -1.0]))
         for i in range(4)
-    }
+    })
     base = NativeStudent(basis, mean, dim=2)
     parent_hash = model_state_sha(base)
 
@@ -1227,10 +1238,10 @@ def test_c2_random_negatives_enter_the_sup_loss_and_are_logged(tmp_path: Path):
     common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=1, seed=13,
                   expected_parent_hash=parent_hash, max_updates=1)
     with_negs = copy.deepcopy(base)
-    train_student_c2(with_negs, records, bank, random_negatives=4,
+    train_student_c2(with_negs, records, bank, recipe=StudentRecipe(random_negatives=4),
                      negative_pool=["tp", "tn", "tx", "far"], log_path=tmp_path / "negs.jsonl", **common)
     without = copy.deepcopy(base)
-    train_student_c2(without, records, bank, random_negatives=0, **common)
+    train_student_c2(without, records, bank, recipe=StudentRecipe(random_negatives=0), **common)
     assert model_state_sha(with_negs) != model_state_sha(without)
     row = json.loads((tmp_path / "negs.jsonl").read_text().splitlines()[0])
     assert row["random_negatives"] == 4 and row["negative_pool_size"] == 4
@@ -1242,17 +1253,21 @@ def test_kd_temperature_divides_teacher_logits():
     bank, records, basis, mean = tiny_fixture()
     base = NativeStudent(basis, mean, dim=2)
     parent_hash = model_state_sha(base)
-    hot = {"q0": (torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0]))}
-    cooled = {"q0": (hot["q0"][0] / 5.0, hot["q0"][1] / 5.0)}
+    direct, evidence = torch.tensor([4.0, -2.0, -3.0]), torch.tensor([-2.0, 3.0])
+    hot = teacher_cache(records, {"q0": (direct, evidence)})
+    cooled = teacher_cache(records, {"q0": (direct / 5.0, evidence / 5.0)})
     common = dict(device="cpu", arm="NATIVE_KD", logical_batch=1, seed=29,
-                  expected_parent_hash=parent_hash, max_updates=1, random_negatives=0)
+                  expected_parent_hash=parent_hash, max_updates=1)
     tempered = copy.deepcopy(base)
-    train_student_c2(tempered, records, bank, teacher_logits=hot, kd_temperature=5.0, **common)
+    train_student_c2(tempered, records, bank, teacher_logits=hot,
+                     recipe=StudentRecipe(kd_temperature=5.0, random_negatives=0), **common)
     pre_divided = copy.deepcopy(base)
-    train_student_c2(pre_divided, records, bank, teacher_logits=cooled, kd_temperature=1.0, **common)
+    train_student_c2(pre_divided, records, bank, teacher_logits=cooled,
+                     recipe=StudentRecipe(kd_temperature=1.0, random_negatives=0), **common)
     assert model_state_sha(tempered) == model_state_sha(pre_divided)
     untempered = copy.deepcopy(base)
-    train_student_c2(untempered, records, bank, teacher_logits=hot, kd_temperature=1.0, **common)
+    train_student_c2(untempered, records, bank, teacher_logits=hot,
+                     recipe=StudentRecipe(kd_temperature=1.0, random_negatives=0), **common)
     assert model_state_sha(tempered) != model_state_sha(untempered)
 
 
@@ -1262,10 +1277,10 @@ def test_c1_uses_logit_scale_and_optional_anchor(tmp_path: Path):
               "candidates": ["tp", "tn", "tx"], "positives": ["tp"]}]
     base = NativeStudent(basis, mean, dim=2)
     scaled = copy.deepcopy(base)
-    train_student_c1(scaled, edges, bank, device="cpu", logical_batch=1, logit_scale=20.0,
+    train_student_c1(scaled, edges, bank, device="cpu", logical_batch=1, recipe=StudentRecipe(logit_scale=20.0),
                      log_path=tmp_path / "c1.jsonl")
     flat = copy.deepcopy(base)
-    train_student_c1(flat, edges, bank, device="cpu", logical_batch=1, logit_scale=1.0)
+    train_student_c1(flat, edges, bank, device="cpu", logical_batch=1, recipe=StudentRecipe(logit_scale=1.0))
     assert model_state_sha(scaled) != model_state_sha(flat)
     row = json.loads((tmp_path / "c1.jsonl").read_text().splitlines()[0])
     assert row["logit_scale"] == 20.0 and row["anchor_weight"] == 0.0
@@ -1286,6 +1301,8 @@ def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
     assert (recipe.lr_p, recipe.lr_r, recipe.logit_scale) == (1e-4, 1e-3, 20.0)
     assert (recipe.kd_weight, recipe.kd_temperature, recipe.random_negatives) == (1.0, 10.0, 256)
     assert recipe.anchor_weight == 0.0
+    assert (recipe.lr_schedule, recipe.kd_normalization, recipe.kd_top_k) == ("cosine", "temperature", 50)
+    assert recipe.teacher_scored_negatives is True and recipe.evidence_random_negatives == 256
 
     protocol["hardware"]["uuid"] = "GPU-deadbeef"
     protocol["paths"]["run_root"] = str(tmp_path / "run")
@@ -1304,6 +1321,8 @@ def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
         ({"hardware": {**protocol["hardware"], "uuid": "0"}}, "full GPU UUID"),
         ({"student": {**protocol["student"], "temperature": 0}}, "must be positive"),
         ({"student": {k: v for k, v in protocol["student"].items() if k != "random_negatives"}}, "random_negatives"),
+        ({"student": {**protocol["student"], "lr_schedule": "step"}}, "lr_schedule"),
+        ({"student": {**protocol["student"], "evidence_random_negatives": 300}}, "cannot exceed"),
         ({"version": "4.1.0"}, "Unexpected version"),
     ):
         with pytest.raises(ValueError, match=match):
@@ -1440,3 +1459,179 @@ def test_run_stage1_pack_merges_encoder_tiers_into_feature_store(tmp_path: Path)
     (run / "content_shard1" / "chunks" / "chunk_000000.ids.npy").unlink()
     with pytest.raises(ValueError, match="content tokens missing"):
         run_stage1.pack(run)
+
+
+# ------------------------------------------------- diagnosis plans A-D (2026-10-01) --
+
+def _negatives_fixture():
+    """``tiny_fixture`` plus out-of-pool targets and evidence for random negatives; only the gold
+    target has a bag, so without evidence negatives the evidence list has no negative."""
+    bank, records, basis, mean = tiny_fixture(n_queries=2)
+    for i, vector in enumerate(([-0.9, -0.1, -0.3, 0.2], [0.1, 0.4, -0.8, 0.3], [0.5, -0.5, 0.1, -0.6])):
+        bank.vectors[f"far{i}"] = torch.tensor(vector)
+        bank.kinds[f"far{i}"] = "table"
+    bank.vectors["ex"] = torch.tensor([0.3, 0.3, -0.6, 0.2])
+    bank.kinds["ex"] = "text"
+    for row in records:
+        row["natural_bags"] = {"tp": ["ep"], "tn": [], "tx": []}
+    pools = dict(negative_pool=["tp", "tn", "tx", "far0", "far1", "far2"], evidence_pool=["ep", "en", "ex"])
+    return bank, records, basis, mean, pools
+
+
+def test_batch_scores_match_single_record_scores():
+    from mmdd_stage1.models import QTStudent
+    from mmdd_stage1.train import _student_c2_batch_scores, _student_c2_scores
+
+    bank, row, student = _mixed_evidence_fixture()
+    other = {"query_id": "tp", "targets": ["tn", "q0", "tx"], "positives": ["q0"],
+             "natural_bags": {"q0": ["eb"], "tn": ["ea", "ec"], "tx": []}}
+    batched = _student_c2_batch_scores(student, bank, [row, other], logit_scale=20.0)
+    for record, (direct, evidence, bag_targets) in zip([row, other], batched):
+        single_direct, single_evidence, single_bags = _student_c2_scores(student, bank, record, 20.0)
+        assert torch.allclose(direct, single_direct, atol=1e-6)
+        assert torch.allclose(evidence, single_evidence, atol=1e-6)
+        assert bag_targets == single_bags
+    qt = QTStudent(torch.randn(2, 4), torch.zeros(4), dim=2)
+    qt_direct, qt_evidence, _ = _student_c2_batch_scores(qt, bank, [row, other], 20.0)[1]
+    assert qt_evidence is None
+    assert torch.allclose(qt_direct, 20.0 * qt.score(bank.z("tp"), bank.z_many(["tn", "q0", "tx"])), atol=1e-6)
+
+
+def test_cosine_schedule_decays_lr_and_resume_follows_it(tmp_path: Path):
+    bank, records, basis, mean = tiny_fixture(n_queries=4)
+    base = NativeStudent(basis, mean, dim=2)
+    common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=1, seed=13,
+                  expected_parent_hash=model_state_sha(base), recipe=StudentRecipe(lr_schedule="cosine"))
+    continuous = copy.deepcopy(base)
+    train_student_c2(continuous, records, bank, log_path=tmp_path / "c2.jsonl", **common)
+    rows = [json.loads(line) for line in (tmp_path / "c2.jsonl").read_text().splitlines()]
+    assert [round(r["lr_factor"], 6) for r in rows] == [round(0.5 * (1 + np.cos(np.pi * k / 4)), 6) for k in range(4)]
+    assert rows[0]["lr_schedule"] == "cosine"
+    partial = copy.deepcopy(base)
+    train_student_c2(partial, records, bank, save_dir=tmp_path / "partial", max_updates=2, **common)
+    resumed = copy.deepcopy(base)
+    train_student_c2(resumed, records, bank, resume_from=tmp_path / "partial/snapshot_frac050.pt", **common)
+    assert model_state_sha(resumed) == model_state_sha(continuous)
+    constant = copy.deepcopy(base)
+    train_student_c2(constant, records, bank, **{**common, "recipe": StudentRecipe()})
+    assert model_state_sha(constant) != model_state_sha(continuous)
+
+
+def test_top_k_kd_is_full_kl_on_short_lists_and_ranks_the_tail_below_the_top_k():
+    from mmdd_stage1.losses import list_kl_divergence, rank_mass_loss, top_k_list_kd
+
+    student = torch.tensor([0.4, -1.2, 2.0, 0.3, -0.5], requires_grad=True)
+    teacher = torch.tensor([3.0, -2.0, 1.0, 2.5, -4.0])
+    assert torch.allclose(top_k_list_kd(student, teacher, 0), list_kl_divergence(student, teacher))
+    assert torch.allclose(top_k_list_kd(student, teacher, 5), list_kl_divergence(student, teacher))
+    top = torch.tensor([True, False, True, True, False])
+    expected = list_kl_divergence(student, teacher, top) + rank_mass_loss(student, top)
+    assert torch.allclose(top_k_list_kd(student, teacher, 3), expected)
+    # the tail's internal order carries no KD signal
+    reordered = torch.tensor([3.0, -4.0, 1.0, 2.5, -2.0])
+    assert torch.allclose(top_k_list_kd(student, reordered, 3), expected)
+
+
+def test_kd_zscore_normalisation_removes_the_teacher_logit_scale():
+    student = torch.tensor([0.4, -1.2, 2.0, 0.3], requires_grad=True)
+    teacher = torch.tensor([3.0, -2.0, 1.0, 2.5])
+    zscore = StudentRecipe(kd_normalization="zscore", kd_temperature=1.0)
+    assert torch.allclose(zscore.kd_loss(student, teacher), zscore.kd_loss(student, 7.0 * teacher - 3.0))
+    tempered = StudentRecipe(kd_temperature=10.0)
+    assert not torch.allclose(tempered.kd_loss(student, teacher), tempered.kd_loss(student, 7.0 * teacher))
+
+
+def test_teacher_scored_negatives_are_fixed_scored_by_the_teacher_and_inside_kd(tmp_path: Path):
+    from mmdd_stage1.train import c2_teacher_rows, c2_training_row
+
+    torch.manual_seed(13)
+    bank, records, basis, mean, pools = _negatives_fixture()
+    recipe = StudentRecipe(random_negatives=2, evidence_random_negatives=1, teacher_scored_negatives=True)
+    row = records[0]
+    first = c2_training_row(row, recipe, pools["negative_pool"], pools["evidence_pool"], 13, epoch=1)
+    assert first == c2_training_row(row, recipe, pools["negative_pool"], pools["evidence_pool"], 13, epoch=2)
+    negatives = first["targets"][3:]
+    assert first["targets"][:3] == row["targets"] and len(negatives) == 2
+    assert set(negatives) <= {"far0", "far1", "far2"}
+    assert first["natural_bags"][negatives[0]][0] in {"en", "ex"} and negatives[1] not in first["natural_bags"]
+    per_epoch = StudentRecipe(random_negatives=2, evidence_random_negatives=1)
+    assert any(
+        c2_training_row(r, per_epoch, pools["negative_pool"], pools["evidence_pool"], 13, epoch=1)
+        != c2_training_row(r, per_epoch, pools["negative_pool"], pools["evidence_pool"], 13, epoch=2)
+        for r in [{**row, "query_id": f"q{i}"} for i in range(8)]
+    )
+
+    teacher = FreshPathTeacher(input_dim=4, width=4, heads=1, layers=1, ffn=8,
+                               text_slots=1, image_slots=1, dropout=0.0)
+    scored_rows = c2_teacher_rows(records, recipe, pools["negative_pool"], pools["evidence_pool"], 13)
+    assert scored_rows[0] == first
+    logits = build_teacher_logits_cache(teacher, bank, scored_rows, device="cpu")
+    assert logits["q0"]["direct"].shape == (5,)  # 3 graph targets + 2 negatives
+    assert logits["q0"]["evidence"].shape == (2,)  # the gold bag + one random-evidence negative
+    base = NativeStudent(basis, mean, dim=2)
+    common = dict(device="cpu", arm="NATIVE_KD", logical_batch=2, seed=13, max_updates=1,
+                  expected_parent_hash=model_state_sha(base), **pools)
+    student = copy.deepcopy(base)
+    train_student_c2(student, records, bank, recipe=recipe, teacher_logits=logits,
+                     log_path=tmp_path / "kd.jsonl", **common)
+    step = json.loads((tmp_path / "kd.jsonl").read_text().splitlines()[0])
+    assert step["direct_kd_denominator"] == 2 and step["evidence_kd_denominator"] == 2
+    assert step["teacher_scored_negatives"] is True
+    unextended = build_teacher_logits_cache(teacher, bank, records, device="cpu")
+    with pytest.raises(ValueError, match="different C2 list"):
+        train_student_c2(copy.deepcopy(base), records, bank, recipe=recipe, teacher_logits=unextended, **common)
+
+
+def test_evidence_random_negatives_activate_the_evidence_list(tmp_path: Path):
+    bank, records, basis, mean, pools = _negatives_fixture()
+    base = NativeStudent(basis, mean, dim=2)
+    common = dict(device="cpu", arm="NATIVE_SUP", logical_batch=2, seed=13, max_updates=1,
+                  expected_parent_hash=model_state_sha(base), **pools)
+    denominators = {}
+    for count in (0, 2):
+        student = copy.deepcopy(base)
+        log = tmp_path / f"evidence{count}.jsonl"
+        train_student_c2(student, records, bank, log_path=log,
+                         recipe=StudentRecipe(random_negatives=2, evidence_random_negatives=count), **common)
+        denominators[count] = json.loads(log.read_text().splitlines()[0])["evidence_sup_denominator"]
+        if count:
+            # Q-E and E-T relations receive gradient only through the evidence list
+            assert not torch.equal(student.R["Q_text"], base.R["Q_text"])
+            assert not torch.equal(student.R["text_T"], base.R["text_T"])
+    assert denominators == {0: 0, 2: 2}
+
+
+def test_reports_add_evidence_and_student_diagnostics_without_changing_gates(tmp_path: Path):
+    import types as _types
+
+    from mmdd_stage1.pipeline import _reports
+
+    contrast = lambda value: {"mean_delta_pp": value}  # noqa: E731
+    candidate = {"C150_target_coverage": 0.8, "MatchedDirectC_target_coverage": 0.7,
+                 "Direct_ANN_R10": 0.45, "E_target_coverage": 0.3}
+    split = {
+        "native_kd": {"candidate": {"overall": candidate}},
+        "native_sup": {"candidate": {"overall": {**candidate, "C150_target_coverage": 0.79}}},
+        "narrative": {"native_kd": {"implicit": {"TB_CQET.Real.R@10": None}}},
+        "contrasts": {
+            "content_CQET_Real_minus_Swap_implicit": contrast(1.0),
+            "CQET_Real_minus_TB_QT_overall": contrast(0.0),
+            "CQET_Real_minus_LSE_Real_overall": contrast(0.1),
+            "KD_minus_SUP_same_TB_CQET_overall": contrast(0.5),
+            "evidence_CQET_Real_minus_f0_overall": contrast(0.8),
+            "evidence_CQET_Real_minus_f0_implicit": contrast(None),
+            "KD_minus_SUP_same_TB_CQET_implicit": contrast(None),
+            "KD_minus_SUP_student_Direct_R10_overall": contrast(4.0),
+            "KD_minus_SUP_E_target_coverage_overall": contrast(-0.2),
+        },
+    }
+    protocol = json.loads((Path(__file__).resolve().parents[1] / "configs/mmdd_stage1_cqet_protocol.json").read_text())
+    rt = _types.SimpleNamespace(paths=_types.SimpleNamespace(run_root=tmp_path), protocol=protocol)
+    decision = _reports(rt, {13: {"splits": {"dev": split, "test": split}}})
+    row = decision["candidate_gain"]["rows"][0]
+    assert row["evidence_real_minus_f0_pp"] == 0.8 and row["kd_student_direct_pp"] == 4.0
+    assert row["KD_student_Direct_R10"] == 0.45 and row["KD_implicit_Real_R10"] is None
+    assert decision["KD_gain"]["pass"] is True
+    text = (tmp_path / "reports" / "RESULTS.md").read_text()
+    assert "Evidence and Student diagnostics (not gates)" in text
+    assert "| 13 | dev | 0.8000 | n/a | n/a | 0.4500 | 4.0000 | 0.3000 | -0.2000 | n/a |" in text

@@ -53,6 +53,7 @@ from .train import (
     _hash_order,
     _order_sha,
     build_teacher_logits_cache,
+    c2_teacher_rows,
     teacher_numerical_layout,
     train_student_c1,
     train_student_c2,
@@ -83,6 +84,11 @@ def _set_seed(seed: int, namespace: str) -> None:
     torch.manual_seed(value)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(value)
+
+
+def _evidence_pool(labels: Labels) -> list[str]:
+    """Uniform pool of the C2 random-evidence negatives: every canonical evidence object."""
+    return [*labels.canonical_text, *labels.canonical_image]
 
 
 def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
@@ -723,7 +729,7 @@ def _attach_student_gradient_probes(
     rt: Runtime,
     seed: int,
     c2_records: Sequence[dict],
-    teacher_logits: Mapping[str, tuple[torch.Tensor, torch.Tensor | None]],
+    teacher_logits: Mapping[str, dict],
     native_c1_selection: dict,
     qt_c1_selection: dict,
     native_c2_selection: dict,
@@ -808,10 +814,7 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     teacher_ta = rt.protocol["teacher"]["TA"]
     teacher_tb = rt.protocol["teacher"]["TB"]
     recipe = StudentRecipe.from_protocol(rt.protocol)
-    student_kwargs = dict(
-        lr_p=recipe.lr_p, lr_r=recipe.lr_r, logit_scale=recipe.logit_scale,
-        anchor_weight=recipe.anchor_weight, clip_norm=recipe.clip_norm,
-    )
+    evidence_pool = _evidence_pool(rt.labels)
     _set_seed(13, "SMOKE_TA")
     ta_model = _teacher()
     ta_end = train_ta(
@@ -839,12 +842,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     native = NativeStudent(rt.pca_basis, rt.pca_mean)
     native_points = train_student_c1(
         native, edge_lists, rt.bank, arm="NATIVE_SUP", logical_batch=64,
-        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, **student_kwargs,
+        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, recipe=recipe,
     )
     qt = QTStudent(rt.pca_basis, rt.pca_mean)
     train_student_c1(
         qt, edge_lists, rt.bank, arm="QT_SUP", logical_batch=64,
-        save_dir=smoke_root / "QT_C1_SUP", seed=13, **student_kwargs,
+        save_dir=smoke_root / "QT_C1_SUP", seed=13, recipe=recipe,
     )
     native_parent = native_points[1.0]
     native_selected = _load_native(native_parent, rt)
@@ -859,13 +862,15 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     )
     parent_hash = model_state_sha(native_selected)
     kd_model = _load_native(native_parent, rt)
+    smoke_logits = build_teacher_logits_cache(
+        tb_models["cqet"], rt.bank,
+        c2_teacher_rows(c2_records, recipe, rt.labels.legal_targets, evidence_pool, 13),
+    )
     train_student_c2(
         kd_model, c2_records, rt.bank, arm="NATIVE_KD",
         logical_batch=64, save_dir=smoke_root / "NATIVE_C2_KD", seed=13,
-        expected_parent_hash=parent_hash, max_updates=1, **student_kwargs,
-        teacher_logits=build_teacher_logits_cache(tb_models["cqet"], rt.bank, c2_records),
-        kd_weight=recipe.kd_weight, kd_temperature=recipe.kd_temperature,
-        random_negatives=recipe.random_negatives, negative_pool=rt.labels.legal_targets,
+        expected_parent_hash=parent_hash, max_updates=1, recipe=recipe,
+        teacher_logits=smoke_logits, negative_pool=rt.labels.legal_targets, evidence_pool=evidence_pool,
     )
     result = {
         "schema_version": VERSION,
@@ -983,10 +988,6 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     c1_batch = int(rt.protocol["student"]["C1"]["logical_batch_edge_lists"])
     c2_epochs = int(rt.protocol["student"]["C2"]["epochs"])
     c2_batch = int(rt.protocol["student"]["C2"]["logical_batch_queries"])
-    student_kwargs = dict(
-        lr_p=recipe.lr_p, lr_r=recipe.lr_r, logit_scale=recipe.logit_scale,
-        anchor_weight=recipe.anchor_weight, clip_norm=recipe.clip_norm,
-    )
 
     _set_seed(seed, "TA")
     ta_model = _teacher()
@@ -1059,7 +1060,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         lists={"C1_NATIVE": hashes["C1_NATIVE"]},
         action=lambda ckpts, log, attempt: train_student_c1(
             native_c1, edge_lists, rt.bank, arm="NATIVE_SUP", save_dir=ckpts,
-            epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
+            epochs=c1_epochs, logical_batch=c1_batch, recipe=recipe,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
@@ -1076,7 +1077,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         lists={"C1_QT": hashes["C1_QT"]},
         action=lambda ckpts, log, attempt: train_student_c1(
             qt_c1, edge_lists, rt.bank, arm="QT_SUP", save_dir=ckpts,
-            epochs=c1_epochs, logical_batch=c1_batch, **student_kwargs,
+            epochs=c1_epochs, logical_batch=c1_batch, recipe=recipe,
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
@@ -1117,11 +1118,12 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         "optimizer_steps": c2_epochs * ((len(c2_order) + c2_batch - 1) // c2_batch),
         "order_sha256": _order_sha(c2_order),
         "negative_pool": "legal_targets",
+        "evidence_pool": "canonical_text_then_canonical_image",
         "numerical_layout": {"logical_batch": c2_batch, "query_microbatch_ladder": [64, 32, 16, 8, 4, 2, 1]},
     }
+    evidence_pool = _evidence_pool(rt.labels)
     c2_kwargs = dict(
-        **student_kwargs, kd_weight=recipe.kd_weight, kd_temperature=recipe.kd_temperature,
-        random_negatives=recipe.random_negatives, negative_pool=rt.labels.legal_targets,
+        recipe=recipe, negative_pool=rt.labels.legal_targets, evidence_pool=evidence_pool,
         epochs=c2_epochs, logical_batch=c2_batch,
     )
 
@@ -1140,7 +1142,10 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     )
 
     cqet_teacher = _load_teacher(tb_ckpts["TB_CQET"])
-    logits = build_teacher_logits_cache(cqet_teacher, rt.bank, c2_records)
+    logits = build_teacher_logits_cache(
+        cqet_teacher, rt.bank,
+        c2_teacher_rows(c2_records, recipe, rt.labels.legal_targets, evidence_pool, seed),
+    )
     teacher_state_sha = model_state_sha(cqet_teacher)
     del cqet_teacher
     logits_dir = seed_dir / "teacher_logits_cache"
@@ -1155,6 +1160,10 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         "teacher_state_sha256": teacher_state_sha,
         "graph_sha256": graph_hash,
         "training_list_sha256": hashes["C2_SHARED"],
+        "scored_lists": (
+            "C2_SHARED_plus_fixed_random_negatives" if recipe.teacher_scored_negatives else "C2_SHARED"
+        ),
+        "recipe": recipe.as_dict(),
         "feature_identity": common_inputs["cache_identity"],
         "scoring_source_identity": source_identity(rt.paths),
         "scores_sha256": sha256_file(logits_path),
@@ -1530,6 +1539,13 @@ def evaluate_seed(rt: Runtime, seed: int, global_freeze_hash: str) -> dict:
         implicit = [q for q in query_ids if gt[q]["kind"] == "implicit"]
         kd = split_result["native_kd"]["per_query"]
         sup = split_result["native_sup"]["per_query"]
+        # Student-side candidate metrics per query (the Student's own retrieval, before any Teacher).
+        student = {
+            generator: {
+                q: candidate_metrics(pools_by_generator[generator][q], set(gt[q]["G"])) for q in query_ids
+            }
+            for generator in ("native_sup", "native_kd")
+        }
         contrasts = {
             "content_CQET_Real_minus_Swap_implicit": bootstrap_contrast(
                 {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
@@ -1547,6 +1563,44 @@ def evaluate_seed(rt: Runtime, seed: int, global_freeze_hash: str) -> dict:
                 {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
                 {q: sup[q]["TB_CQET.Real.R@10"] for q in query_ids}, gt,
             ),
+            # Diagnostics for the evidence narrative; none of them is a preregistered gate.
+            "evidence_CQET_Real_minus_f0_overall": bootstrap_contrast(
+                {q: kd[q]["TB_CQET.Real.R@10"] for q in query_ids},
+                {q: kd[q]["TB_CQET.f0.R@10"] for q in query_ids}, gt,
+            ),
+            "evidence_CQET_Real_minus_f0_implicit": bootstrap_contrast(
+                {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
+                {q: kd[q]["TB_CQET.f0.R@10"] for q in implicit}, gt,
+            ),
+            "KD_minus_SUP_same_TB_CQET_implicit": bootstrap_contrast(
+                {q: kd[q]["TB_CQET.Real.R@10"] for q in implicit},
+                {q: sup[q]["TB_CQET.Real.R@10"] for q in implicit}, gt,
+            ),
+            "KD_minus_SUP_student_Direct_R10_overall": bootstrap_contrast(
+                {q: student["native_kd"][q]["Direct_ANN_R10"] for q in query_ids},
+                {q: student["native_sup"][q]["Direct_ANN_R10"] for q in query_ids}, gt,
+            ),
+            "KD_minus_SUP_E_target_coverage_overall": bootstrap_contrast(
+                {q: student["native_kd"][q]["E_target_coverage"] for q in query_ids},
+                {q: student["native_sup"][q]["E_target_coverage"] for q in query_ids}, gt,
+            ),
+        }
+        split_result["narrative"] = {
+            generator: {
+                segment: {
+                    "queries": split_result[generator]["candidate"][segment]["queries"],
+                    **{
+                        key: split_result[generator]["candidate"][segment].get(key)
+                        for key in ("Direct_ANN_R10", "E_target_coverage", "E_query_hit_rate", "C150_target_coverage")
+                    },
+                    **{
+                        f"TB_CQET.{view}.R@10": split_result[generator]["teacher"]["TB_CQET"][view][segment]["R@10"]
+                        for view in ("f0", "Real", "Swap")
+                    },
+                }
+                for segment in ("overall", "implicit", "explicit")
+            }
+            for generator in ("native_sup", "native_kd")
         }
         bootstrap_dir = split_root / "bootstrap"
         bootstrap_dir.mkdir(exist_ok=True)
@@ -1601,6 +1655,14 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
                 "kd_coverage_delta_pp": 100 * (
                     kd_candidate["C150_target_coverage"] - sup_candidate["C150_target_coverage"]
                 ),
+                "evidence_real_minus_f0_pp": contrasts["evidence_CQET_Real_minus_f0_overall"]["mean_delta_pp"],
+                "evidence_real_minus_f0_implicit_pp": contrasts["evidence_CQET_Real_minus_f0_implicit"]["mean_delta_pp"],
+                "kd_implicit_pp": contrasts["KD_minus_SUP_same_TB_CQET_implicit"]["mean_delta_pp"],
+                "kd_student_direct_pp": contrasts["KD_minus_SUP_student_Direct_R10_overall"]["mean_delta_pp"],
+                "kd_E_coverage_pp": contrasts["KD_minus_SUP_E_target_coverage_overall"]["mean_delta_pp"],
+                "KD_student_Direct_R10": kd_candidate["Direct_ANN_R10"],
+                "KD_E_target_coverage": kd_candidate["E_target_coverage"],
+                "KD_implicit_Real_R10": split_result["narrative"]["native_kd"]["implicit"]["TB_CQET.Real.R@10"],
             })
     gates = rt.protocol["acceptance_pp"]
     by_split = {split: [row for row in rows if row["split"] == split] for split in ("dev", "test")}
@@ -1651,6 +1713,24 @@ def _reports(rt: Runtime, seed_results: Mapping[int, dict]) -> dict:
             f"{row['content_implicit_pp']:.4f} | {row['teacher_vs_qt_pp']:.4f} | "
             f"{row['cqet_vs_lse_pp']:.4f} | {row['kd_pp']:.4f} | {row['kd_coverage_delta_pp']:.4f} |"
         )
+    lines += [
+        "",
+        "Evidence and Student diagnostics (not gates). `Real - f0` is the Teacher gain from evidence paths on "
+        "the KD pool; the KD-minus-SUP columns compare the Students' own retrieval before any reranking.",
+        "",
+        "| seed | split | Real-f0 pp | Real-f0 implicit pp | KD implicit pp | KD student Direct R@10 | "
+        "KD-SUP Direct pp | KD E coverage | KD-SUP E coverage pp | KD implicit Real R@10 |",
+        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    diagnostic_columns = (
+        "evidence_real_minus_f0_pp", "evidence_real_minus_f0_implicit_pp", "kd_implicit_pp",
+        "KD_student_Direct_R10", "kd_student_direct_pp", "KD_E_target_coverage", "kd_E_coverage_pp",
+        "KD_implicit_Real_R10",
+    )
+    for row in rows:
+        # Implicit-only values are None when a split has no implicit query.
+        cells = ["n/a" if row[key] is None else f"{row[key]:.4f}" for key in diagnostic_columns]
+        lines.append(f"| {row['seed']} | {row['split']} | " + " | ".join(cells) + " |")
     (reports / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return decision
 

@@ -9,6 +9,13 @@ softmax, (2) divides teacher logits by ``kd_temperature`` so the KD target keeps
 information, (3) adds ``random_negatives`` uniformly drawn targets to every C2 direct list so
 the global geometry is anchored, and (4) logs the top two singular values of ``R_QT - I`` so a
 rank-one drift is visible in the training log.
+
+Extensions, each a recipe switch so it can be ablated: a cosine learning-rate decay over the
+stage; a per-list z-score of the teacher logits before the temperature; ``teacher_scored_negatives``
+fixes the random negatives per query so the frozen teacher can score them and KD covers the same
+list as SUP; ``kd_top_k`` restricts the KL to the teacher's top-k and only ranks the tail below
+it; ``evidence_random_negatives`` gives that many random negatives a one-path bag with a random
+evidence object, so the evidence list (Q-E and E-T relations) is anchored the same way.
 """
 from __future__ import annotations
 
@@ -39,10 +46,11 @@ from .losses import (
     aggregate_cqet,
     hierarchical_relation_mean,
     hierarchical_support_mean,
-    list_kl_divergence,
     positive_average_pair_loss,
     rank_mass_loss,
+    top_k_list_kd,
 )
+from .data import json_identity, utf8_sorted
 from .models import RELATION_KINDS, TEACHER_INFERENCE_CHUNK, FreshPathTeacher, NativeStudent, QTStudent, model_state_sha
 
 # Teacher candidate chunk: the relation transformer batch, halved on OOM (whole logical batch replayed).
@@ -78,6 +86,11 @@ class StudentRecipe:
     random_negatives: int = 256
     anchor_weight: float = 0.0
     clip_norm: float = 1.0
+    lr_schedule: str = "constant"  # or "cosine": lr * (1 + cos(pi * step / steps)) / 2 over the stage
+    kd_normalization: str = "temperature"  # or "zscore": standardise each teacher list, then / temperature
+    kd_top_k: int = 0  # > 0: KL on the teacher's top-k only, plus rank-mass of that set over the rest
+    teacher_scored_negatives: bool = False  # fixed per-query negatives, scored by the teacher, inside KD
+    evidence_random_negatives: int = 0  # random negatives that get a one-path bag with random evidence
 
     @classmethod
     def from_protocol(cls, protocol: Mapping) -> "StudentRecipe":
@@ -91,10 +104,34 @@ class StudentRecipe:
             random_negatives=int(student["random_negatives"]),
             anchor_weight=float(student["anchor_weight"]),
             clip_norm=float(protocol.get("numerics", {}).get("grad_clip", 1.0)),
+            lr_schedule=str(student["lr_schedule"]),
+            kd_normalization=str(student["kd_normalization"]),
+            kd_top_k=int(student["kd_top_k"]),
+            teacher_scored_negatives=bool(student["teacher_scored_negatives"]),
+            evidence_random_negatives=int(student["evidence_random_negatives"]),
         )
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    def lr_factor(self, step: int, total_steps: int) -> float:
+        """Multiplier of the base learning rates for optimizer update ``step`` (0-based)."""
+        if self.lr_schedule == "constant":
+            return 1.0
+        if self.lr_schedule == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
+        raise ValueError(f"unknown lr_schedule {self.lr_schedule!r}")
+
+    def kd_loss(self, student_logits: Tensor, teacher_logits: Tensor) -> Optional[Tensor]:
+        """KD of one list: ``student_logits`` are already scaled by ``logit_scale``; the teacher
+        list is optionally z-scored, divided by ``kd_temperature``, then matched in full or
+        top-k focused (``losses.top_k_list_kd``)."""
+        target = teacher_logits
+        if self.kd_normalization == "zscore":
+            target = (target - target.mean()) / target.std(unbiased=False).clamp_min(1e-6)
+        elif self.kd_normalization != "temperature":
+            raise ValueError(f"unknown kd_normalization {self.kd_normalization!r}")
+        return top_k_list_kd(student_logits, target / self.kd_temperature, self.kd_top_k)
 
 
 def enforce_task_numerics() -> None:
@@ -740,21 +777,36 @@ def _student_scores(student: NativeStudent | QTStudent, bank: ObjectBank, relati
     return student.score(left_kind, anchor, right_kind, zb)
 
 
+def _recipe_log(recipe: StudentRecipe, **overrides) -> dict:
+    """Recipe fields as written into stage logs and checkpoints (``P_lr``/``R_lr`` naming)."""
+    values = {key: value for key, value in recipe.as_dict().items() if key not in ("lr_p", "lr_r")}
+    return {"P_lr": recipe.lr_p, "R_lr": recipe.lr_r, **values, **overrides}
+
+
+def _set_scheduled_lr(optimizer: AdamW, recipe: StudentRecipe, step: int, total_steps: int) -> float:
+    """Set the P/R group learning rates for update ``step`` (0-based); a pure function of the
+    step, so a resumed run follows the same schedule without scheduler state."""
+    factor = recipe.lr_factor(step, total_steps)
+    for group, base in zip(optimizer.param_groups, (recipe.lr_p, recipe.lr_r)):
+        group["lr"] = base * factor
+    return factor
+
+
 def _student_step(
     student: NativeStudent | QTStudent,
     optimizer: AdamW,
     batch: Sequence[dict],
-    item_loss: Callable[[dict], tuple[Tensor, dict[str, Tensor]]],
+    micro_losses: Callable[[Sequence[dict]], tuple[list[Tensor], dict[str, list[Tensor]]]],
     *,
     anchor_weight: float,
-    clip_norm: float,
     stage: str,
 ) -> tuple[int, float, dict[str, list[float]], float]:
     """One optimizer step over ``batch`` with the OOM microbatch ladder.
 
-    ``item_loss(row)`` returns the row's loss and its named components; a CUDA OOM restores
-    the RNG, halves the query microbatch and replays the whole batch. Returns the microbatch
-    used, the mean item loss, the per-component values and the weighted anchor loss.
+    ``micro_losses(rows)`` returns each row's loss and the microbatch's named loss components;
+    a CUDA OOM restores the RNG, halves the query microbatch and replays the whole batch.
+    Returns the microbatch used, the mean row loss, the per-component values and the weighted
+    anchor loss.
     """
     batch_rng = _rng_state()
     microbatch = STUDENT_MICROBATCH
@@ -764,12 +816,9 @@ def _student_step(
         components: dict[str, list[Tensor]] = defaultdict(list)
         try:
             for micro_start in range(0, len(batch), microbatch):
-                losses = []
-                for row in batch[micro_start : micro_start + microbatch]:
-                    loss, parts = item_loss(row)
-                    losses.append(loss)
-                    for name, value in parts.items():
-                        components[name].append(value.detach())
+                losses, parts = micro_losses(batch[micro_start : micro_start + microbatch])
+                for name, values in parts.items():
+                    components[name].extend(value.detach() for value in values)
                 micro_sum = torch.stack(losses).sum()
                 totals.append(micro_sum.detach())
                 (micro_sum / len(batch)).backward()
@@ -798,11 +847,7 @@ def train_student_c1(
     device: str = "cuda:0",
     arm: str = "NATIVE_SUP",
     logical_batch: int = 64,
-    lr_p: float = StudentRecipe.lr_p,
-    lr_r: float = StudentRecipe.lr_r,
-    logit_scale: float = StudentRecipe.logit_scale,
-    anchor_weight: float = StudentRecipe.anchor_weight,
-    clip_norm: float = StudentRecipe.clip_norm,
+    recipe: StudentRecipe = StudentRecipe(),
     save_dir: Optional[Path] = None,
     seed: int = 13,
     metadata: Optional[dict] = None,
@@ -820,21 +865,24 @@ def train_student_c1(
     is_qt = isinstance(student, QTStudent)
     valid_lists = [row for row in edge_lists if not is_qt or row["relation"] == "QT"]
     ordered, batches = _student_schedule(valid_lists, "C1_QT" if is_qt else "C1_NATIVE", seed, epochs, logical_batch)
-    optimizer = AdamW(student.param_groups(lr_p, lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+    optimizer = AdamW(student.param_groups(recipe.lr_p, recipe.lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     total_steps = len(batches)
     fraction_steps = _student_snapshot_steps(total_steps, epochs)
     stage = "QT_C1_SUP" if is_qt else "NATIVE_C1_SUP"
-    base_meta = {**(metadata or {}), "epochs": epochs, "logical_batch": logical_batch,
-                 "P_lr": lr_p, "R_lr": lr_r, "logit_scale": logit_scale, "anchor_weight": anchor_weight}
+    recipe_log = _recipe_log(recipe)
+    base_meta = {**(metadata or {}), "epochs": epochs, "logical_batch": logical_batch, **recipe_log}
 
-    def edge_loss(row: dict) -> tuple[Tensor, dict[str, Tensor]]:
-        candidates = list(row["candidates"])
-        positives = set(row["positives"])
-        raw = _student_scores(student, bank, row["relation"], bank.z(row["anchor_id"]), candidates)
-        loss = rank_mass_loss(logit_scale * raw, torch.tensor([c in positives for c in candidates], device=dev))
-        if loss is None:
-            raise RuntimeError(f"{stage}: prevalidated active list became inactive")
-        return loss, {}
+    def edge_losses(rows: Sequence[dict]) -> tuple[list[Tensor], dict[str, list[Tensor]]]:
+        losses = []
+        for row in rows:
+            candidates = list(row["candidates"])
+            positives = set(row["positives"])
+            raw = _student_scores(student, bank, row["relation"], bank.z(row["anchor_id"]), candidates)
+            loss = rank_mass_loss(recipe.logit_scale * raw, torch.tensor([c in positives for c in candidates], device=dev))
+            if loss is None:
+                raise RuntimeError(f"{stage}: prevalidated active list became inactive")
+            losses.append(loss)
+        return losses, {}
 
     saved: dict[float, Path] = {}
     if save_dir:
@@ -854,9 +902,10 @@ def train_student_c1(
         if not active_batch:
             continue
         microbatch, rank_loss, _components, anchor_value = _student_step(
-            student, optimizer, active_batch, edge_loss, anchor_weight=anchor_weight, clip_norm=clip_norm, stage=stage,
+            student, optimizer, active_batch, edge_losses, anchor_weight=recipe.anchor_weight, stage=stage,
         )
-        grad_norm = float(nn.utils.clip_grad_norm_(student.parameters(), clip_norm))
+        grad_norm = float(nn.utils.clip_grad_norm_(student.parameters(), recipe.clip_norm))
+        lr_factor = _set_scheduled_lr(optimizer, recipe, logical_step, total_steps)
         optimizer.step()
         logical_step += 1
         _log(log_path, {
@@ -864,9 +913,8 @@ def train_student_c1(
             "record_ids": [row["item_id"] for row in batch],
             "active_lists": len(active_batch), "batch_lists": len(batch),
             "loss": rank_loss + anchor_value, "rank_mass_loss": rank_loss, "anchor_loss_weighted": anchor_value,
-            "grad_norm_preclip": grad_norm, "grad_norm_postclip": min(grad_norm, clip_norm),
-            "clip_norm": clip_norm, "P_lr": lr_p, "R_lr": lr_r, "logit_scale": logit_scale,
-            "anchor_weight": anchor_weight, "student_query_microbatch": microbatch,
+            "grad_norm_preclip": grad_norm, "grad_norm_postclip": min(grad_norm, recipe.clip_norm),
+            **recipe_log, "lr_factor": lr_factor, "student_query_microbatch": microbatch,
             "elapsed_seconds": time.time() - started, **_student_stats(student), **_gpu_peaks(),
         })
         if logical_step in fraction_steps and save_dir:
@@ -883,51 +931,131 @@ def train_student_c1(
     return saved
 
 
+def _student_c2_batch_scores(
+    student: NativeStudent | QTStudent,
+    bank: ObjectBank,
+    rows: Sequence[dict],
+    logit_scale: float = 1.0,
+) -> list[tuple[Tensor, Optional[Tensor], list[tuple[int, str]]]]:
+    """Scaled student logits for a batch of C2 records; every distinct object is projected once.
+
+    Per record ``(direct, evidence, bag_targets)``: ``direct`` is one logit per target,
+    ``evidence`` one CQET-aggregated logit per target with a non-empty bag (None if no bags).
+    Every bilinear score is multiplied by ``logit_scale``; a path logit is the sum of the scaled
+    Q-E and E-T scores, gathered with index tensors rather than a per-path Python loop.
+    """
+    tables = list(dict.fromkeys(i for row in rows for i in (row["query_id"], *row["targets"])))
+    table_pos = {object_id: i for i, object_id in enumerate(tables)}
+    if isinstance(student, QTStudent):
+        u = student.u(bank.z_many(tables))
+        result = []
+        for row in rows:
+            index = torch.tensor([table_pos[t] for t in row["targets"]], dtype=torch.long, device=u.device)
+            uq = u[table_pos[row["query_id"]]]
+            result.append((logit_scale * (uq @ student.R_QT * u[index]).sum(dim=-1), None, []))
+        return result
+    u_table = student.u("table", bank.z_many(tables))
+    dev = u_table.device
+    evidence = list(dict.fromkeys(
+        e for row in rows for t in row["targets"] for e in row.get("natural_bags", {}).get(t, ())
+    ))
+    modalities = [m for m in ("text", "image") if any(bank.kind(e) == m for e in evidence)]
+    by_modality = {m: [e for e in evidence if bank.kind(e) == m] for m in modalities}
+    evidence_pos = {e: i for i, e in enumerate(e for m in modalities for e in by_modality[m])}
+    if evidence:
+        u_parts = [student.u(m, bank.z_many(by_modality[m])) for m in modalities]
+        u_evidence = torch.cat(u_parts)
+        et_projected = torch.cat([part @ student.R[f"{m}_T"] for m, part in zip(modalities, u_parts)])
+        evidence_relation = torch.tensor(
+            [k for k, m in enumerate(modalities) for _ in by_modality[m]], dtype=torch.long, device=dev,
+        )
+    result = []
+    for row in rows:
+        targets = row["targets"]
+        uq = u_table[table_pos[row["query_id"]]]
+        ut = u_table[torch.tensor([table_pos[t] for t in targets], dtype=torch.long, device=dev)]
+        direct = logit_scale * (uq @ student.R["QT"] * ut).sum(dim=-1)
+        bags = row.get("natural_bags", {})
+        bag_targets = [(i, t) for i, t in enumerate(targets) if bags.get(t)]
+        flat = [(target_i, e) for target_i, target in bag_targets for e in bags[target]]
+        if not flat:
+            result.append((direct, None, bag_targets))
+            continue
+        path_evidence = torch.tensor([evidence_pos[e] for _, e in flat], dtype=torch.long, device=dev)
+        path_target = torch.tensor([target_i for target_i, _ in flat], dtype=torch.long, device=dev)
+        uq_relations = torch.stack([uq @ student.R[f"Q_{m}"] for m in modalities])
+        qe = (uq_relations[evidence_relation[path_evidence]] * u_evidence[path_evidence]).sum(dim=-1)
+        path_scores = logit_scale * (qe + (et_projected[path_evidence] * ut[path_target]).sum(dim=-1))
+        evidence_all_targets = aggregate_cqet(direct, path_scores, path_target)
+        bag_index = torch.tensor([target_i for target_i, _ in bag_targets], dtype=torch.long, device=dev)
+        result.append((direct, evidence_all_targets[bag_index], bag_targets))
+    return result
+
+
 def _student_c2_scores(
     student: NativeStudent | QTStudent,
     bank: ObjectBank,
     row: dict,
     logit_scale: float = 1.0,
 ) -> tuple[Tensor, Optional[Tensor], list[tuple[int, str]]]:
-    """Scaled student logits for one C2 record.
+    """``_student_c2_batch_scores`` of a single C2 record."""
+    return _student_c2_batch_scores(student, bank, [row], logit_scale)[0]
 
-    Returns ``(direct, evidence, bag_targets)``: ``direct`` is one logit per target, ``evidence``
-    one CQET-aggregated logit per target with a non-empty bag (None if no bags). Every bilinear
-    score is multiplied by ``logit_scale``; a path logit is the sum of the scaled Q-E and E-T
-    scores, gathered with index tensors rather than a per-path Python loop.
+
+def c2_training_row(
+    row: dict,
+    recipe: StudentRecipe,
+    negative_pool: Sequence[str],
+    evidence_pool: Sequence[str],
+    seed: int,
+    epoch: int,
+) -> dict:
+    """The C2 record a Student trains on in ``epoch``.
+
+    Targets are the shared-graph targets followed by ``random_negatives`` uniform draws from
+    ``negative_pool``; the first ``evidence_random_negatives`` of those draws get a one-path
+    bag with a uniform draw from ``evidence_pool``, so they also enter the evidence list.
+    Draws are keyed by (seed, epoch, query), or by (seed, query) alone under
+    ``teacher_scored_negatives`` so that the frozen teacher can score the same list once.
     """
-    qid = row["query_id"]
-    targets = list(row["targets"])
-    zq, zt = bank.z(qid), bank.z_many(targets)
-    if isinstance(student, QTStudent):
-        return logit_scale * student.score(zq, zt), None, []
-    uq = student.u("table", zq)
-    ut = student.u("table", zt)
-    direct = logit_scale * (uq @ student.R["QT"] * ut).sum(dim=-1)
+    epoch = 0 if recipe.teacher_scored_negatives else epoch
+    query_id = row["query_id"]
     bags = row.get("natural_bags", {})
-    bag_targets = [(i, t) for i, t in enumerate(targets) if bags.get(t)]
-    flat = [(target_i, evidence_id) for target_i, target in bag_targets for evidence_id in bags[target]]
-    if not flat:
-        return direct, None, bag_targets
-    unique = list(dict.fromkeys(e for _, e in flat))
-    by_modality = {m: [e for e in unique if bank.kind(e) == m] for m in ("text", "image")}
-    qe_parts, et_parts = [], []
-    for modality in ("text", "image"):
-        ids = by_modality[modality]
-        if not ids:
-            continue
-        ue = student.u(modality, bank.z_many(ids))
-        qe_parts.append((uq @ student.R[f"Q_{modality}"] * ue).sum(dim=-1))
-        et_parts.append(ue @ student.R[f"{modality}_T"])
-    qe = torch.cat(qe_parts)
-    et_projected = torch.cat(et_parts)
-    position = {e: i for i, e in enumerate(by_modality["text"] + by_modality["image"])}
-    path_evidence = torch.tensor([position[e] for _, e in flat], dtype=torch.long, device=direct.device)
-    path_target = torch.tensor([target_i for target_i, _ in flat], dtype=torch.long, device=direct.device)
-    path_scores = logit_scale * (qe[path_evidence] + (et_projected[path_evidence] * ut[path_target]).sum(dim=-1))
-    evidence_all_targets = aggregate_cqet(direct, path_scores, path_target)
-    bag_index = torch.tensor([target_i for target_i, _ in bag_targets], dtype=torch.long, device=direct.device)
-    return direct, evidence_all_targets[bag_index], bag_targets
+    negatives = _random_negative_ids(
+        negative_pool, set(row["targets"]) | set(row["positives"]), recipe.random_negatives,
+        "C2_SHARED", seed, epoch, query_id,
+    )
+    if not negatives:
+        return row
+    evidence = _random_negative_ids(
+        evidence_pool, {e for t in row["targets"] for e in bags.get(t, ())},
+        min(recipe.evidence_random_negatives, len(negatives)), "C2_SHARED_EVIDENCE", seed, epoch, query_id,
+    )
+    return {
+        **row,
+        "targets": [*row["targets"], *negatives],
+        "natural_bags": {**bags, **{t: [e] for t, e in zip(negatives, evidence)}},
+    }
+
+
+def c2_teacher_rows(
+    records: Sequence[dict],
+    recipe: StudentRecipe,
+    negative_pool: Sequence[str],
+    evidence_pool: Sequence[str],
+    seed: int,
+) -> list[dict]:
+    """The lists the frozen teacher scores for KD: the shared-graph records, or under
+    ``teacher_scored_negatives`` the fixed extended records every C2 arm trains on."""
+    if not recipe.teacher_scored_negatives:
+        return list(records)
+    return [c2_training_row(row, recipe, negative_pool, evidence_pool, seed, epoch=0) for row in records]
+
+
+def _scored_list_sha(row: dict) -> str:
+    """Identity of the direct and evidence lists of a C2 record (targets and their bags, in order)."""
+    bags = row.get("natural_bags", {})
+    return json_identity([list(row["targets"]), [list(bags.get(t, ())) for t in row["targets"]]])
 
 
 def build_teacher_logits_cache(
@@ -936,9 +1064,10 @@ def build_teacher_logits_cache(
     c2_records: Sequence[dict],
     *,
     device: str = "cuda:0",
-) -> dict[str, tuple[Tensor, Optional[Tensor]]]:
-    """Frozen TB_CQET Direct / aggregated-evidence logits per C2 record (CPU float32), aligned
-    with ``_student_c2_scores``."""
+) -> dict[str, dict]:
+    """Frozen TB_CQET logits per C2 record (CPU float32), aligned with ``_student_c2_scores``:
+    ``{"direct": one logit per target, "evidence": one aggregated logit per bag target or None,
+    "list_sha256": identity of the scored lists}``."""
     dev = torch.device(device)
     teacher.to(dev).eval()
     teacher.requires_grad_(False)
@@ -961,7 +1090,7 @@ def build_teacher_logits_cache(
                 target_index = torch.tensor([k for k, _ in paths], dtype=torch.long, device=dev)
                 bag_index = torch.tensor([k for k, t in enumerate(targets) if bags.get(t)], dtype=torch.long, device=dev)
                 evidence = aggregate_cqet(direct, path_scores, target_index)[bag_index].cpu().float()
-            result[qid] = (direct.cpu().float(), evidence)
+            result[qid] = {"direct": direct.cpu().float(), "evidence": evidence, "list_sha256": _scored_list_sha(row)}
             if i % 100 == 0 or i == len(c2_records):
                 print(f"[TB_CQET C2 logits] {i}/{len(c2_records)} elapsed={time.time()-started:.1f}s", flush=True)
     return result
@@ -974,34 +1103,29 @@ def train_student_c2(
     device: str = "cuda:0",
     arm: str = "NATIVE_KD",
     logical_batch: int = 64,
-    lr_p: float = StudentRecipe.lr_p,
-    lr_r: float = StudentRecipe.lr_r,
-    logit_scale: float = StudentRecipe.logit_scale,
-    kd_weight: float = StudentRecipe.kd_weight,
-    kd_temperature: float = StudentRecipe.kd_temperature,
-    random_negatives: int = StudentRecipe.random_negatives,
+    recipe: StudentRecipe = StudentRecipe(),
     negative_pool: Optional[Sequence[str]] = None,
-    anchor_weight: float = StudentRecipe.anchor_weight,
-    clip_norm: float = StudentRecipe.clip_norm,
+    evidence_pool: Optional[Sequence[str]] = None,
     save_dir: Optional[Path] = None,
     seed: int = 13,
     expected_parent_hash: Optional[str] = None,
     metadata: Optional[dict] = None,
     resume_from: Optional[Path] = None,
-    teacher_logits: Optional[Mapping[str, tuple[Tensor, Optional[Tensor]]]] = None,
+    teacher_logits: Optional[Mapping[str, dict]] = None,
     max_updates: Optional[int] = None,
     log_path: Optional[Path] = None,
     epochs: int = 1,
 ) -> dict[float, Path]:
     """C2 training on the shared graph.
 
-    Per query the loss is ``SUP_direct + SUP_evidence + kd_weight * (KD_direct + KD_evidence)``.
-    The direct SUP list is the record's targets plus ``random_negatives`` uniform draws from
-    ``negative_pool`` (default: every target that appears in ``c2_records``); the evidence
-    list and both KD lists cover the record's targets only, because teacher logits exist only
-    there. KD is ``KL(softmax(teacher / kd_temperature) || softmax(student))`` with the
-    student logits already multiplied by ``logit_scale``; ``teacher_logits`` is the frozen
-    cache from ``build_teacher_logits_cache``.
+    Each record is extended by ``c2_training_row`` (random negative targets, some with a
+    random-evidence bag). Per query the loss is ``SUP_direct + SUP_evidence + kd_weight *
+    (KD_direct + KD_evidence)``; SUP covers the extended lists, KD covers the prefix of each
+    list the teacher scored (``teacher_logits`` from ``build_teacher_logits_cache`` over
+    ``c2_teacher_rows``): the shared-graph targets, or the whole extended list under
+    ``teacher_scored_negatives``. ``recipe.kd_loss`` sets temperature, normalisation and top-k.
+    ``negative_pool`` defaults to every target of ``c2_records``, ``evidence_pool`` to every
+    evidence object in their bags.
     """
     is_qt = isinstance(student, QTStudent)
     is_kd = arm == "NATIVE_KD"
@@ -1017,58 +1141,64 @@ def train_student_c2(
     if expected_parent_hash is None or parent_hash != expected_parent_hash:
         raise ValueError(f"C2 step0 state {parent_hash} != selected C1 {expected_parent_hash}")
     if negative_pool is None:
-        negative_pool = sorted({t for row in c2_records for t in row["targets"]}, key=lambda x: x.encode("utf-8"))
-    negative_pool = list(negative_pool)
+        negative_pool = utf8_sorted({t for row in c2_records for t in row["targets"]})
+    if evidence_pool is None:
+        evidence_pool = utf8_sorted({e for row in c2_records for bag in row.get("natural_bags", {}).values() for e in bag})
+    negative_pool, evidence_pool = list(negative_pool), list(evidence_pool)
     if is_kd:
-        teacher_logits = {q: (d.to(dev), None if e is None else e.to(dev)) for q, (d, e) in teacher_logits.items()}
+        for row in c2_teacher_rows(c2_records, recipe, negative_pool, evidence_pool, seed):
+            if teacher_logits[row["query_id"]]["list_sha256"] != _scored_list_sha(row):
+                raise ValueError(f"{row['query_id']}: teacher logits were scored on a different C2 list")
+        teacher_logits = {
+            q: {"direct": entry["direct"].to(dev), "evidence": None if entry["evidence"] is None else entry["evidence"].to(dev)}
+            for q, entry in teacher_logits.items()
+        }
 
     ordered, batches = _student_schedule(c2_records, "C2_SHARED", seed, epochs, logical_batch)
     order_sha = _order_sha(ordered)
-    optimizer = AdamW(student.param_groups(lr_p, lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+    optimizer = AdamW(student.param_groups(recipe.lr_p, recipe.lr_r), betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     stage = "QT_C2_SUP" if is_qt else ("NATIVE_C2_KD" if is_kd else "NATIVE_C2_SUP")
     total_steps = len(batches)
     fraction_steps = _student_snapshot_steps(total_steps, epochs)
-    recipe = {
-        "P_lr": lr_p, "R_lr": lr_r, "logit_scale": logit_scale,
-        "kd_weight": kd_weight if is_kd else 0.0, "kd_temperature": kd_temperature,
-        "random_negatives": random_negatives, "negative_pool_size": len(negative_pool),
-        "anchor_weight": anchor_weight, "clip_norm": clip_norm,
-    }
-    base_meta = {**(metadata or {}), "epochs": epochs, "logical_batch": logical_batch, **recipe}
+    recipe_log = _recipe_log(
+        recipe, kd_weight=recipe.kd_weight if is_kd else 0.0,
+        negative_pool_size=len(negative_pool), evidence_pool_size=len(evidence_pool),
+    )
+    base_meta = {**(metadata or {}), "epochs": epochs, "logical_batch": logical_batch, **recipe_log}
 
-    def query_loss(row: dict, epoch: int) -> tuple[Tensor, dict[str, Tensor]]:
-        qid = row["query_id"]
-        targets = list(row["targets"])
-        positives = set(row["positives"])
-        direct_s, evidence_s, bag_targets = _student_c2_scores(student, bank, row, logit_scale)
-        negative_ids = _random_negative_ids(
-            negative_pool, set(targets) | positives, random_negatives, "C2_SHARED", seed, epoch, qid,
-        )
-        sup_scores, sup_positive = direct_s, [t in positives for t in targets]
-        if negative_ids:
-            sup_scores = torch.cat([direct_s, logit_scale * _student_scores(student, bank, "QT", bank.z(qid), negative_ids)])
-            sup_positive = sup_positive + [False] * len(negative_ids)
-        direct_sup = rank_mass_loss(sup_scores, torch.tensor(sup_positive, device=dev))
-        if direct_sup is None:
-            raise ValueError(f"{qid}: C2 Direct supervision is inactive")
-        total, parts = direct_sup, {"direct_sup": direct_sup}
-        evidence_sup = None
-        if evidence_s is not None:
-            evidence_sup = rank_mass_loss(evidence_s, torch.tensor([t in positives for _, t in bag_targets], device=dev))
-            if evidence_sup is not None:
-                total, parts["evidence_sup"] = total + evidence_sup, evidence_sup
-        if is_kd:
-            direct_t, evidence_t = teacher_logits[qid]
-            direct_kd = list_kl_divergence(direct_s, direct_t / kd_temperature)
-            if direct_kd is None:
-                raise RuntimeError(f"{qid}: Direct KD list is too short")
-            total, parts["direct_kd"] = total + kd_weight * direct_kd, direct_kd
-            if evidence_sup is not None:
-                if evidence_t is None:
-                    raise RuntimeError(f"{qid}: active evidence SUP has no aligned Teacher logits")
-                evidence_kd = list_kl_divergence(evidence_s, evidence_t / kd_temperature)
-                total, parts["evidence_kd"] = total + kd_weight * evidence_kd, evidence_kd
-        return total, parts
+    def query_losses(rows: Sequence[dict], epoch: int) -> tuple[list[Tensor], dict[str, list[Tensor]]]:
+        extended = [c2_training_row(row, recipe, negative_pool, evidence_pool, seed, epoch) for row in rows]
+        scored = _student_c2_batch_scores(student, bank, extended, recipe.logit_scale)
+        losses: list[Tensor] = []
+        parts: dict[str, list[Tensor]] = defaultdict(list)
+        for row, (direct_s, evidence_s, bag_targets) in zip(extended, scored):
+            qid = row["query_id"]
+            positives = set(row["positives"])
+            direct_sup = rank_mass_loss(direct_s, torch.tensor([t in positives for t in row["targets"]], device=dev))
+            if direct_sup is None:
+                raise ValueError(f"{qid}: C2 Direct supervision is inactive")
+            total = direct_sup
+            parts["direct_sup"].append(direct_sup)
+            evidence_sup = None
+            if evidence_s is not None:
+                evidence_sup = rank_mass_loss(evidence_s, torch.tensor([t in positives for _, t in bag_targets], device=dev))
+                if evidence_sup is not None:
+                    total = total + evidence_sup
+                    parts["evidence_sup"].append(evidence_sup)
+            if is_kd:
+                entry = teacher_logits[qid]
+                direct_kd = recipe.kd_loss(direct_s[: entry["direct"].numel()], entry["direct"])
+                if direct_kd is None:
+                    raise RuntimeError(f"{qid}: Direct KD list is too short")
+                total = total + recipe.kd_weight * direct_kd
+                parts["direct_kd"].append(direct_kd)
+                if evidence_sup is not None and entry["evidence"] is not None:
+                    evidence_kd = recipe.kd_loss(evidence_s[: entry["evidence"].numel()], entry["evidence"])
+                    if evidence_kd is not None:
+                        total = total + recipe.kd_weight * evidence_kd
+                        parts["evidence_kd"].append(evidence_kd)
+            losses.append(total)
+        return losses, parts
 
     saved: dict[float, Path] = {}
     logical_step = 0
@@ -1096,10 +1226,11 @@ def train_student_c2(
             break
         batch = ordered[start:end]
         microbatch, mean_loss, components, anchor_value = _student_step(
-            student, optimizer, batch, lambda row: query_loss(row, epoch),
-            anchor_weight=anchor_weight, clip_norm=clip_norm, stage=stage,
+            student, optimizer, batch, lambda rows: query_losses(rows, epoch),
+            anchor_weight=recipe.anchor_weight, stage=stage,
         )
-        grad_norm = float(nn.utils.clip_grad_norm_(student.parameters(), clip_norm))
+        grad_norm = float(nn.utils.clip_grad_norm_(student.parameters(), recipe.clip_norm))
+        lr_factor = _set_scheduled_lr(optimizer, recipe, logical_step, total_steps)
         optimizer.step()
         logical_step += 1
         next_cursor = end
@@ -1107,12 +1238,13 @@ def train_student_c2(
             "stage": stage, "epoch": epoch, "step": logical_step,
             "record_ids": [row["query_id"] for row in batch], "batch_queries": len(batch),
             "loss": mean_loss + anchor_value, "anchor_loss_weighted": anchor_value,
-            "grad_norm_preclip": grad_norm, "grad_norm_postclip": min(grad_norm, clip_norm),
+            "grad_norm_preclip": grad_norm, "grad_norm_postclip": min(grad_norm, recipe.clip_norm),
             **{f"{name}_loss": float(np.mean(components[name])) if name in components else None
                for name in ("direct_sup", "evidence_sup", "direct_kd", "evidence_kd")},
             **{f"{name}_denominator": len(components.get(name, ()))
                for name in ("direct_sup", "evidence_sup", "direct_kd", "evidence_kd")},
-            **recipe, "parent_state_sha256": parent_hash, "student_query_microbatch": microbatch,
+            **recipe_log, "lr_factor": lr_factor, "parent_state_sha256": parent_hash,
+            "student_query_microbatch": microbatch,
             "elapsed_seconds": time.time() - started, **_student_stats(student), **_gpu_peaks(),
         })
         if logical_step in fraction_steps and save_dir:

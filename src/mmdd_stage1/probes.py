@@ -15,7 +15,6 @@ from .features import ObjectBank
 from .losses import (
     aggregate_corrected_lse,
     aggregate_cqet,
-    list_kl_divergence,
     rank_mass_loss,
 )
 from .models import FreshPathTeacher, NativeStudent, QTStudent
@@ -419,7 +418,7 @@ def _student_component(
     bank: ObjectBank,
     row: dict,
     component: str,
-    teacher_logits: Optional[tuple[Tensor, Optional[Tensor]]],
+    teacher_logits: Optional[Mapping[str, Tensor]],
     scale: float,
     recipe: StudentRecipe,
 ) -> Optional[float]:
@@ -438,12 +437,14 @@ def _student_component(
             if evidence_loss is not None:
                 loss = evidence_loss if loss is None else loss + evidence_loss
     elif component == "direct_KD" and teacher_logits is not None and not isinstance(model, QTStudent):
-        loss = list_kl_divergence(direct, teacher_logits[0].to(direct.device) / recipe.kd_temperature)
+        # Under teacher_scored_negatives the teacher list extends the record's targets; its
+        # prefix is aligned with the unextended probe record.
+        loss = recipe.kd_loss(direct, teacher_logits["direct"][: direct.numel()].to(direct.device))
     elif (
         component == "evidence_KD" and teacher_logits is not None
-        and not isinstance(model, QTStudent) and evidence is not None and teacher_logits[1] is not None
+        and not isinstance(model, QTStudent) and evidence is not None and teacher_logits["evidence"] is not None
     ):
-        loss = list_kl_divergence(evidence, teacher_logits[1].to(evidence.device) / recipe.kd_temperature)
+        loss = recipe.kd_loss(evidence, teacher_logits["evidence"][: evidence.numel()].to(evidence.device))
     elif component == "anchor" and recipe.anchor_weight:
         loss = recipe.anchor_weight * model.anchor_loss()
     else:
@@ -458,21 +459,12 @@ def student_gradient_probe(
     model: NativeStudent | QTStudent,
     bank: ObjectBank,
     rows: Sequence[dict] | dict,
-    teacher_logits: Optional[
-        Mapping[str, tuple[Tensor, Optional[Tensor]]] | tuple[Tensor, Optional[Tensor]]
-    ],
+    teacher_logits: Optional[Mapping[str, Mapping[str, Tensor]]],
     recipe: StudentRecipe = StudentRecipe(),
 ) -> dict[str, Any]:
     """Per-component gradient norms and cosines under the same scale/temperature as training."""
     records = [rows] if isinstance(rows, dict) else list(rows)
-    if teacher_logits is None:
-        logits_by_query = {}
-    elif isinstance(teacher_logits, tuple):
-        if len(records) != 1:
-            raise ValueError("single Teacher logit tuple only aligns with one probe record")
-        logits_by_query = {records[0]["query_id"]: teacher_logits}
-    else:
-        logits_by_query = teacher_logits
+    logits_by_query = teacher_logits or {}
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(True)
@@ -498,8 +490,8 @@ def student_gradient_probe(
             active = [
                 row for row in records
                 if row["query_id"] in logits_by_query
-                and logits_by_query[row["query_id"]][1] is not None
-                and logits_by_query[row["query_id"]][1].numel() > 1
+                and logits_by_query[row["query_id"]]["evidence"] is not None
+                and logits_by_query[row["query_id"]]["evidence"].numel() > 1
             ]
         if not active:
             values[component] = {

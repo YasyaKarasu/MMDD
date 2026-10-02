@@ -29,7 +29,7 @@ from mmdd_stage1.lists import (build_c1_edge_lists, build_c2_shared_graph,
                                  build_ta_records, build_tb_records)
 from mmdd_stage1.metrics import evaluate_matrix, export_funnels
 from mmdd_stage1.models import NativeStudent
-from mmdd_stage1.train import (build_teacher_logits_cache, model_state_sha,
+from mmdd_stage1.train import (StudentRecipe, build_teacher_logits_cache, model_state_sha,
                                  train_student_c1, train_student_c2, train_ta, train_tb)
 
 
@@ -129,7 +129,7 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
     c1_points = train_student_c1(student, c1, rt.bank, arm="NATIVE_SUP",
                                  save_dir=run / "C1", log_path=run / "C1.jsonl",
                                  epochs=student_epochs, logical_batch=student_batch,
-                                 lr_p=student_lr_p, lr_r=student_lr_r)
+                                 recipe=StudentRecipe(lr_p=student_lr_p, lr_r=student_lr_r))
     del student
     choice1 = select(rt, c1_points, gt, "C1")
     parent = pipeline._load_native(Path(choice1["selected"]["checkpoint"]), rt)
@@ -153,7 +153,7 @@ def train(run: Path, student_epochs: int = 1, student_batch: int = 64,
         all_points[arm] = train_student_c2(student, c2, rt.bank, arm=f"NATIVE_{arm}",
             save_dir=run / f"C2_{arm}", expected_parent_hash=parent_hash, teacher_logits=logits,
             log_path=run / f"C2_{arm}.jsonl", epochs=student_epochs, logical_batch=student_batch,
-            lr_p=student_lr_p, lr_r=student_lr_r)
+            recipe=StudentRecipe(lr_p=student_lr_p, lr_r=student_lr_r))
         del student, logits
         torch.cuda.empty_cache()
     choice2 = select(rt, all_points["SUP"], gt, "C2_SUP")

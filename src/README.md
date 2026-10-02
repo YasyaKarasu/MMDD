@@ -367,6 +367,23 @@ written into every stage receipt and training-log row so a run can be audited po
 | `kd_weight` | 1.0 | KD-only and SUP+KD both beat SUP by 3–5 pp dev R@10 once τ is matched |
 | `random_negatives` | 256 | uniform targets appended to every C2 direct list; without them a rank-one drift along the mean target direction destroys global retrieval |
 | `anchor_weight` | 0 | the elementwise MSE anchor was ~1e-6 and did nothing; drift is logged instead as `sigma1/sigma2_R_QT_minus_I` |
+| `lr_schedule` | `cosine` | LR decays to 0 over each Student stage (`C2.epochs = 3`); in the probe KD peaked mid-run and fell back under a constant LR |
+| `kd_normalization` | `temperature` | `zscore` standardises each teacher list before dividing by `temperature`, removing the dependence on the teacher's logit range |
+| `teacher_scored_negatives` | true | the random negatives are fixed per query (`train.c2_training_row`, epoch-independent), the frozen TB_CQET scores them in `teacher_logits_cache`, and KD covers the same lists as SUP. Every C2 arm trains on the same extended lists |
+| `kd_top_k` | 50 | the KL covers only the teacher's top 50 (teacher entropy ≈ 1.1 nat); the rest only has to rank below that set (`losses.top_k_list_kd`) |
+| `evidence_random_negatives` | 256 | that many random negatives get a one-path bag with a random canonical evidence object, so they also enter the evidence list and anchor `Q_text/Q_image/text_T/image_T` the way the direct negatives anchor `QT` |
+
+The first six rows are the probe-validated fix (plans A/B in the diagnosis). `teacher_scored_negatives`,
+`kd_top_k`, and `evidence_random_negatives` (plans C/D) and the cosine schedule are untested hypotheses.
+Each one is a protocol switch, so it can be ablated against its "off" value (`false` / `0` / `constant`).
+`teacher_logits_cache/scores.pt` holds `{query_id: {direct, evidence, list_sha256}}`. `train_student_c2`
+refuses a cache whose `list_sha256` differs from the lists it would train on.
+
+The frozen evaluation also reports, without gating, the evidence narrative per split:
+`SUMMARY.json → narrative` (per Student and segment: own `Direct_ANN_R10`, `E_target_coverage`,
+`C150_target_coverage`, and TB_CQET `f0/Real/Swap` R@10). It also adds bootstrap contrasts for `Real − f0`
+(overall and implicit), KD − SUP on implicit queries, the Student's own direct R@10, and E-pool coverage.
+These are listed in a second table in `reports/RESULTS.md`.
 
 Execution notes (none of these change a loss, a list or a checkpoint format):
 
@@ -380,8 +397,10 @@ Execution notes (none of these change a loss, a list or a checkpoint format):
   pre-encoded, role-tagged cache); the content store keeps every chunk memory-mapped.
   On a 4090 a TA logical batch of 8 queries takes ≈1.3 s (was ≈5.9 s), TB ≈2.3 s
   (was ≈5.2 s), with losses bit-identical and gradients within float32 rounding.
-- The C2 kernel scores paths with index gathers instead of a per-path Python loop;
-  KD reads the frozen `teacher_logits_cache` only. The diagnosis behind the recipe
+- The C2 kernel projects every distinct object of a query microbatch once
+  (`train._student_c2_batch_scores`) and scores paths with index gathers instead of a
+  per-path Python loop. On a 4090 a 64-query step with ~1000 candidates per query takes
+  ≈0.19 s (was ≈0.54 s). KD reads the frozen `teacher_logits_cache` only. The diagnosis behind the recipe
   is in `docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`.
 
 After a code change, completed stages are reused only if their recorded source

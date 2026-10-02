@@ -169,16 +169,15 @@
       "shuffle": "whole_valid_list"
     },
     "C2": {
-      "epochs": 1,
+      "epochs": 3,
       "logical_batch_queries": 64,
       "score": "logit_scale*raw",
       "path_aggregation": "LME_QE_plus_ET",
       "KD_teacher": "TB_CQET_end",
       "checkpoints": [
         0,
-        0.25,
-        0.5,
-        0.75,
+        0.3333333333333333,
+        0.6666666666666666,
         1
       ],
       "init_hash_equals_C1": true,
@@ -186,7 +185,8 @@
       "graph_paths": "merged_prepaths_rescored_by_shared_C1_then_D1",
       "selection_owner": "NATIVE_SUP",
       "KD_uses_SUP_fraction": true,
-      "direct_list": "record_targets_plus_random_negatives_from_legal_targets"
+      "direct_list": "record_targets_plus_random_negatives_from_legal_targets_fixed_per_query",
+      "evidence_list": "bag_targets_plus_random_negatives_with_one_random_canonical_evidence_path"
     },
     "native_selection": [
       "CR_C150_overall",
@@ -200,7 +200,12 @@
     ],
     "logit_scale": 20.0,
     "random_negatives": 256,
-    "recipe_note": "V4.2: student scores are multiplied by logit_scale before every softmax loss; KD = KL(softmax(teacher/temperature) || softmax(student)) with weight kd_weight; each C2 direct list gets random_negatives uniform draws from legal_targets; anchor MSE is off (0) and R_QT drift is logged as sigma1/sigma2 of R_QT - I."
+    "lr_schedule": "cosine",
+    "kd_normalization": "temperature",
+    "kd_top_k": 50,
+    "teacher_scored_negatives": true,
+    "evidence_random_negatives": 256,
+    "recipe_note": "V4.2: student scores are multiplied by logit_scale before every softmax loss; KD = KL(softmax(teacher/temperature) || softmax(student)) with weight kd_weight; each C2 direct list gets random_negatives uniform draws from legal_targets; anchor MSE is off (0) and R_QT drift is logged as sigma1/sigma2 of R_QT - I. Diagnosis plans A-D (docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md): cosine LR decay over each Student stage and 3 C2 epochs selected on dev; teacher_scored_negatives fixes the random negatives per query, the frozen TB_CQET scores them and KD covers the same lists as SUP; kd_top_k focuses the KL on the teacher's top 50 and ranks the rest below them; evidence_random_negatives gives that many random negatives a one-path bag with a random canonical evidence object, so the evidence lists are anchored like the direct list."
   },
   "numerics": {
     "task_dtype": "float32",

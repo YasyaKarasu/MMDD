@@ -110,6 +110,17 @@ def validate_protocol(p: Mapping[str, Any]) -> None:
             raise ValueError(f"student.{key} must be a number")
     if student["logit_scale"] <= 0 or student["temperature"] <= 0:
         raise ValueError("student.logit_scale and student.temperature must be positive")
+    if student.get("lr_schedule") not in ("constant", "cosine"):
+        raise ValueError("student.lr_schedule must be constant or cosine")
+    if student.get("kd_normalization") not in ("temperature", "zscore"):
+        raise ValueError("student.kd_normalization must be temperature or zscore")
+    if not isinstance(student.get("teacher_scored_negatives"), bool):
+        raise ValueError("student.teacher_scored_negatives must be a boolean")
+    for key in ("kd_top_k", "evidence_random_negatives"):
+        if not isinstance(student.get(key), int) or student[key] < 0:
+            raise ValueError(f"student.{key} must be a non-negative integer")
+    if student["evidence_random_negatives"] > student["random_negatives"]:
+        raise ValueError("student.evidence_random_negatives draws from the random negatives and cannot exceed them")
     configured = p.get("paths")
     if not isinstance(configured, dict) or any(k not in configured for k in REQUIRED_PATH_KEYS):
         missing = sorted(set(REQUIRED_PATH_KEYS) - set(configured or {}))

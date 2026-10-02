@@ -203,3 +203,26 @@ def list_kl_divergence(
     # KL = sum(p_T * (log_p_T - log_p_S))
     p_t = torch.exp(t_log_p)
     return (p_t * (t_log_p - s_log_p)).sum()
+
+
+def top_k_list_kd(
+    student_scores: Tensor,
+    teacher_scores: Tensor,
+    k: int,
+) -> Optional[Tensor]:
+    """Top-K focused KD over one list (final logits, as in ``list_kl_divergence``).
+
+    The teacher softmax puts almost all mass on a few dozen candidates, so the KL is taken
+    only over the teacher's top ``k`` (both softmaxes renormalised there), and the rest of
+    the list only has to stay below that set: ``rank_mass_loss`` with the top ``k`` as the
+    positive set. ``k <= 0`` or a list of at most ``k`` candidates is the plain full-list KL.
+    """
+    if k <= 0 or teacher_scores.numel() <= k:
+        return list_kl_divergence(student_scores, teacher_scores)
+    top = torch.zeros_like(teacher_scores, dtype=torch.bool)
+    top[torch.topk(teacher_scores.detach(), k).indices] = True
+    terms = [
+        loss for loss in (list_kl_divergence(student_scores, teacher_scores, top), rank_mass_loss(student_scores, top))
+        if loss is not None
+    ]
+    return sum(terms[1:], terms[0]) if terms else None
