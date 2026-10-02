@@ -1,7 +1,7 @@
 """Hand the frozen Stage-1 selection to Stage 2.
 
 Writes one ``retrieval.<split>.jsonl`` per split in the format consumed by
-``train_stage2.py`` / ``run_stage2.py`` plus a ``stage1_gate.json`` that binds every
+``run_stage2.py`` (``mmdd_stage2.stage1``) plus a ``stage1_gate.json`` that binds every
 record to the selected Native C2 Student checkpoint. Target order and table
 scores are the frozen ``TB_CQET`` end-point reranking of that Student's C150 pool.
 """
@@ -18,7 +18,28 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from mmdd_dataset.wdc_runtime import iter_dataset_artifact
-from mmdd_stage2.data import validate_retrieval_path_budget
+
+
+def validate_retrieval_path_budget(
+    record: dict[str, Any], *, max_targets: int, top_k_evidence: int
+) -> None:
+    """Reject an exported record whose path detail does not cover its own budget."""
+    metadata = record["path_aggregation"]
+    selected = record["results"][:max_targets]
+    if len(selected) > int(metadata["path_result_k"]):
+        raise ValueError(f"{record['query_id']}: paths retained for only {metadata['path_result_k']} targets")
+    if top_k_evidence > int(metadata["evidence_path_k"]):
+        raise ValueError(f"{record['query_id']}: only {metadata['evidence_path_k']} evidence paths retained")
+    seen: set[str] = set()
+    for result in selected:
+        target_id = str(result["target_id"])
+        if target_id in seen:
+            raise ValueError(f"Duplicate Stage-1 target_id in input pool: {target_id}")
+        seen.add(target_id)
+        paths = result.get("paths")
+        if not paths or any(path.get("kind") not in {"direct", "evidence"}
+                            or (path["kind"] == "evidence" and not path.get("evidence_id")) for path in paths):
+            raise ValueError(f"{target_id}: missing or invalid retrieval path detail")
 
 
 def _sha256(path: Path) -> str:

@@ -1,0 +1,80 @@
+{
+  "experiment_id": "MMDD_STAGE2_BIDF",
+  "paths": {
+    "dataset_root": "output_mm_joinability_entitables_20000_retry100_rounds5_qwen35_final_survivor_context_gaussian_v9",
+    "stage1_handoff": "work/stage1_entitables/stage2_handoff",
+    "qwen_model": "hf_models/Qwen3.5-9B",
+    "minilm_model": "hf_models/all-MiniLM-L6-v2",
+    "run_root": "work/stage2_entitables"
+  },
+  "seed": 13,
+  "cpu_threads": 4,
+  "candidate_scope": 30,
+  "output_depth": 50,
+  "max_evidence": 4,
+  "selector_reads_evidence": true,
+  "reader": {
+    "column_permutation_seeds": [13001, 26002],
+    "max_image_pixels": 262144,
+    "max_input_tokens": 16384,
+    "evidence_text_budget_total_chars": 12000
+  },
+  "head": {
+    "input_dim": 8192,
+    "hidden_dim": 256,
+    "dropout": 0.1,
+    "epochs": 20,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "betas": [0.9, 0.999],
+    "eps": 1e-08,
+    "gradient_clip": 1.0,
+    "batch_pairs": 32,
+    "holdout_hash_salt": "R7_SOURCE_GROUP_HOLDOUT_V1",
+    "holdout_modulus": 10,
+    "holdout_residue": 0
+  },
+  "plan": {
+    "branch_budget": 10,
+    "per_table_cap": 3
+  },
+  "recovery": {
+    "batch_size": 4,
+    "text_chars": 3000,
+    "max_image_pixels": 262144,
+    "max_input_tokens": 8192,
+    "max_new_tokens": 1280
+  },
+  "crop": {
+    "layers": [15, 23, 27],
+    "localizer_max_pixels": 262144,
+    "crop_max_pixels": 262144,
+    "flat_epsilon": 1e-08,
+    "min_joint_concentration": 0.05,
+    "padding_ratio": 0.1,
+    "min_width_ratio": 0.15,
+    "min_height_ratio": 0.15,
+    "fallback_area_ratio": 0.85,
+    "roi": {
+      "anchors": 8,
+      "min_anchor_distance": 2.0,
+      "min_side": 2,
+      "max_side": null,
+      "expansion_threshold": 1.5,
+      "nms_threshold": 0.2
+    }
+  },
+  "matching": {
+    "tau_cosine": 0.98,
+    "max_length": 256,
+    "batch_size": 256
+  },
+  "fusion": {
+    "rrf_constant": 60
+  },
+  "evaluation": {
+    "cutoffs": [1, 5, 10, 15, 20, 30, 50],
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260925
+  }
+}

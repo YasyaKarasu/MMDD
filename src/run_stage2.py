@@ -1,148 +1,106 @@
 #!/usr/bin/env python
-"""Run RATA/FOCUS verification for one Stage-1 retrieval result."""
+"""Stage-2 main flow: Stage-1 C30 -> evidence-reading column selector -> 9B value recovery -> B+IDF.
 
+Every command takes ``--run-root``; the run is described by ``<run-root>/config.json``, written
+once by ``init`` from ``configs/mmdd_stage2_bidf.json``. Stage 2 reads only the top
+``candidate_scope`` (30) Stage-1 targets; Stage-1 ranks 31..50 are appended unchanged.
+
+    init --stage1-handoff H --dataset-root D   bind inputs (H = run_stage1.py export output)
+    catalog                 dataset -> catalog.sqlite + population/<split>.json           (CPU)
+    jobs                    selector pairs + train column labels (C30 only)              (CPU)
+    features --split S      frozen Qwen reader states, train views 0/1, dev/test view 0  (GPU)
+    train-head              fresh selector head, fixed epoch count                        (CPU)
+    plans                   head logits -> scheduled (target, column) recovery views      (CPU)
+    recover                 9B ROW1 recovery with RAEA crops -> bridges                   (GPU)
+    score                   D-0.98 bridge scores + C30 visible IDF -> rankings            (CPU)
+    evaluate                metrics and source-group bootstrap vs Stage 1                 (CPU)
+
+GPU commands take ``--gpu N`` (physical index) and set CUDA_VISIBLE_DEVICES before torch loads.
+Recovery and feature extraction resume from the files they already wrote.
+"""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
-import torch
-from mmdd_stage1.feature_cache import FeatureStore
-from mmdd_stage1.export import validate_stage2_gate
-from mmdd_stage2.checkpoints import load_candidate_scorer
-from mmdd_stage2.data import (
-    direct_target_ids,
-    iter_retrieval_results,
-    load_stage2_objects,
-    validate_retrieval_path_budget,
-)
-from mmdd_stage2.pipeline import Stage2Verifier
-from mmdd_stage2.qwen import QwenStage2Backend
-from mmdd_stage2.routing import SimilarityEvidenceRouter
-from mmdd_stage2.verifier import build_evidence_bundles
+ROOT = Path(__file__).resolve().parents[1]
+TEMPLATE = ROOT / "configs" / "mmdd_stage2_bidf.json"
+GPU_COMMANDS = {"features", "recover"}
 
 
-def run(args: argparse.Namespace) -> dict:
-    if args.input_candidate_budget <= 0:
-        raise ValueError("--input-candidate-budget must be positive")
-    if args.recovery_budget < 0:
-        raise ValueError("--recovery-budget must be non-negative")
-    if args.top_k_evidence <= 0:
-        raise ValueError("--top-k-evidence must be positive")
-    validate_stage2_gate(
-        Path(args.stage1_gate), [Path(args.retrieval_results)]
-    )
-    records = list(iter_retrieval_results(Path(args.retrieval_results)))
-    if args.query_id:
-        records = [record for record in records if str(record["query_id"]) == args.query_id]
-    if len(records) != 1:
-        raise ValueError("Select exactly one retrieval record with --query-id")
-    record = records[0]
-    validate_retrieval_path_budget(
-        record,
-        max_targets=args.input_candidate_budget,
-        top_k_evidence=args.top_k_evidence,
-    )
-    results = record["results"][: args.input_candidate_budget]
-    bundles = build_evidence_bundles(results, top_k_evidence=args.top_k_evidence)
-    direct_ids = direct_target_ids(results)
-    objects = load_stage2_objects(
-        Path(args.dataset_root),
-        str(record["query_id"]),
-        bundles,
-        extra_target_ids=direct_ids,
-    )
-    scorer = load_candidate_scorer(
-        Path(args.scorer_checkpoint),
-        torch.device("cpu"),
-        expected_model_dir=Path(args.model_dir),
-    )
-    backend = QwenStage2Backend(
-        Path(args.model_dir),
-        device=args.device,
-        dtype=args.dtype,
-        focus_start_layer=args.focus_start_layer,
-        max_text_evidence_tokens=args.max_text_evidence_tokens,
-        text_overlap_tokens=args.text_overlap_tokens,
-        max_span_tokens=args.max_span_tokens,
-        roi_candidates=args.roi_candidates,
-        embedding_batch_size=args.embedding_batch_size,
-        max_embedding_tokens=args.max_embedding_tokens,
-    )
-    scorer.to(backend.device)
-    evidence_router = SimilarityEvidenceRouter(FeatureStore.from_path(Path(args.stage1_features)))
-    verifier = Stage2Verifier(
-        backend,
-        scorer,
-        evidence_router=evidence_router,
-        similarity_threshold=args.similarity_threshold,
-        min_row_coverage=args.min_row_coverage,
-        similarity_batch_size=args.similarity_batch_size,
-    )
-    payload = verifier.verify(
-        objects.query,
-        results,
-        objects.targets,
-        objects.evidence,
-        recovery_budget=args.recovery_budget,
-        top_k_evidence=args.top_k_evidence,
-    ).to_dict()
-    payload["input_candidate_budget"] = args.input_candidate_budget
-    rendered = json.dumps(payload, ensure_ascii=False, indent=2)
-    if args.output:
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rendered + "\n", encoding="utf-8")
+def init(run: Path, args: argparse.Namespace) -> None:
+    path = run / "config.json"
+    if path.exists():
+        raise FileExistsError(f"run already initialised: {path}")
+    config = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    for key in ("dataset_root", "stage1_handoff", "qwen_model", "minilm_model"):
+        value = getattr(args, key) or config["paths"][key]
+        config["paths"][key] = str((ROOT / value).resolve() if not Path(value).is_absolute() else Path(value))
+    config["paths"]["run_root"] = str(run)
+    if args.no_selector_evidence:
+        config["selector_reads_evidence"] = False  # arm A ablation: the selector reads Q and T only
+    for key in ("dataset_root", "stage1_handoff", "qwen_model", "minilm_model"):
+        if not Path(config["paths"][key]).exists():
+            raise FileNotFoundError(f"{key}: {config['paths'][key]}")
+    run.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"config": str(path), "paths": config["paths"],
+                      "selector_reads_evidence": config["selector_reads_evidence"]}, indent=2), flush=True)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("init", "catalog", "jobs", "features", "train-head", "plans", "recover", "score", "evaluate"):
+        subparsers.add_parser(command).add_argument("--run-root", type=Path, required=True)
+    init_parser = subparsers.choices["init"]
+    init_parser.add_argument("--stage1-handoff", required=True, help="directory with retrieval.{train,dev,test}.jsonl")
+    init_parser.add_argument("--dataset-root")
+    init_parser.add_argument("--qwen-model")
+    init_parser.add_argument("--minilm-model")
+    init_parser.add_argument("--no-selector-evidence", action="store_true",
+                             help="ablation: the selector reader does not see the natural evidence")
+    subparsers.choices["features"].add_argument("--split", choices=("train", "dev", "test"), required=True)
+    for command in GPU_COMMANDS:
+        subparsers.choices[command].add_argument("--gpu", type=int, required=True, help="physical GPU index")
+    args = parser.parse_args(argv)
+    run = args.run_root.resolve()
+    if args.command == "init":
+        init(run, args)
+        return
+    if args.command in GPU_COMMANDS:
+        # Must happen before the first torch import in this process.
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    config = json.loads((run / "config.json").read_text(encoding="utf-8"))
+
+    if args.command == "catalog":
+        from mmdd_stage2.catalog import build_catalog
+        build_catalog(Path(config["paths"]["dataset_root"]), run)
+    elif args.command == "jobs":
+        from mmdd_stage2.jobs import build_jobs
+        build_jobs(config, run)
+    elif args.command == "features":
+        from mmdd_stage2.reader import extract_features
+        extract_features(config, run, args.split)
+    elif args.command == "train-head":
+        from mmdd_stage2.selector import train_head
+        train_head(config, run)
+    elif args.command == "plans":
+        from mmdd_stage2.selector import make_plans
+        make_plans(config, run)
+    elif args.command == "recover":
+        from mmdd_stage2.recovery import run_recovery
+        run_recovery(config, run)
+    elif args.command == "score":
+        from mmdd_stage2.rerank import run_scoring
+        run_scoring(config, run)
     else:
-        print(rendered)
-    return payload
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", required=True)
-    parser.add_argument("--retrieval-results", required=True)
-    parser.add_argument(
-        "--stage1-gate",
-        required=True,
-        help="Final dev-gated Stage-1 selection manifest.",
-    )
-    parser.add_argument("--scorer-checkpoint", required=True)
-    parser.add_argument(
-        "--stage1-features",
-        required=True,
-        help="Feature cache containing query row_embeddings and retrieved evidence embeddings.",
-    )
-    parser.add_argument("--query-id")
-    parser.add_argument("--output")
-    parser.add_argument("--model-dir", default="hf_models/Qwen3.5-9B")
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--focus-start-layer", type=int, default=14)
-    parser.add_argument("--top-k-evidence", type=int, default=4)
-    parser.add_argument(
-        "--input-candidate-budget", "--max-targets",
-        dest="input_candidate_budget", type=int, default=50,
-        help="N: unique Stage-1 input targets, all requiring path detail (default: 50). "
-        "--max-targets is a legacy alias for this input budget only.",
-    )
-    parser.add_argument(
-        "--recovery-budget", type=int, default=20,
-        help="M: unique evidence targets to recover after full-pool column scoring (default: 20). "
-        "Direct paths are all verified and do not consume this budget.",
-    )
-    parser.add_argument("--max-text-evidence-tokens", type=int, default=1024)
-    parser.add_argument("--text-overlap-tokens", type=int, default=128)
-    parser.add_argument("--max-span-tokens", type=int, default=192)
-    parser.add_argument("--roi-candidates", type=int, default=4)
-    parser.add_argument("--embedding-batch-size", type=int, default=64)
-    parser.add_argument("--max-embedding-tokens", type=int, default=128)
-    parser.add_argument("--similarity-batch-size", type=int, default=1024)
-    parser.add_argument("--similarity-threshold", type=float, default=0.8)
-    parser.add_argument("--min-row-coverage", type=float, default=0.6)
-    return parser.parse_args(argv)
+        from mmdd_stage2.evaluate import evaluate
+        evaluate(config, run)
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    main()

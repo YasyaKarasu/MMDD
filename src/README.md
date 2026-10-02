@@ -383,13 +383,11 @@ score come from the frozen `TB_CQET` endpoint's reranking of the selected Studen
 C150 pool. Direct paths mark targets in the Student's direct ANN top 100. Evidence
 paths keep the first `--evidence-path-k` retained `Q -> E -> T` paths. Train
 retrieval is computed once under `stage2_handoff/native_<arm>_train_retrieval/`;
-dev/test reuse the frozen evaluation pools. `train_stage2.py` / `run_stage2.py`
-take `--stage1-gate stage2_handoff/stage1_gate.json`; `validate_stage2_gate`
-rejects any retrieval record not produced by the gated checkpoint.
+dev/test reuse the frozen evaluation pools. `run_stage2.py` reads these files
+(`--stage1-handoff`); `validate_stage2_gate` rejects any retrieval record not
+produced by the gated checkpoint.
 
-`cache_stage1_features.py` remains the frozen encoder used by `encode`, and
-`run_stage2.py --stage1-features <run>/encoder` reads its `objects/` tier
-(`mmdd_stage1.feature_cache.FeatureStore`) for Stage-2 row routing.
+`cache_stage1_features.py` remains the frozen encoder used by `encode`.
 
 The AbeBooks drivers (`run_abebooks_fresh.py`, `run_abebooks_data_ablation.py`,
 `run_abebooks_source_experiment.py`) first copy the dataset into a filtered
@@ -400,166 +398,89 @@ and bind that GPU into the protocol the same way `init` does; nothing is hardcod
 `prepare_abebooks_ablation_features.py` recomposes per-arm features inside each
 ablation run and writes those locations into the arm's protocol explicitly.
 
-## Stage-2 verification
+## Stage-2 main flow (`mmdd_stage2`, B+IDF)
 
-The natural-evidence column selector (`NAT_E`) and the bridge-first reranking stage are documented
-in `EVIDENCE_SELECTOR_AND_BRIDGE_RERANK.md`. The merged provenance and remaining runtime limits are
-recorded in `MIGRATION_GAPS.md`.
+`src/run_stage2.py` reranks each query's Stage-1 **C30** with recovered bridge
+attributes and visible-column evidence. Stage 2 reads only the top 30 Stage-1
+targets: selector supervision, reader features, recovery and both scorers work on
+C30. Stage-1 ranks 31–50 are appended unchanged, so @50 metrics stay comparable.
+Every command takes `--run-root R`; `init` writes `R/config.json` from
+`configs/mmdd_stage2_bidf.json`.
 
-For a fresh R7-style C30 run, create a new audit output with
-`run_stage2_columns.py audit --candidate-scope-file <stage1-c30-scope.json>`. The scope may list
-candidate target tables per query or candidate columns per `(dataset, query, target)` pair. Pass
-`--view-seeds 13001 26002` to the cache entry points when reproducing the R7 second view; custom
-seeds are part of each cache contract. After fresh bridge score files exist,
-`run_stage2_b_plus_idf.py` fuses them with frozen IDF visible scores without loading a previous
-Stage-2 checkpoint.
+| Command | Device | Writes |
+|---|---|---|
+| `init --stage1-handoff H --dataset-root D [--no-selector-evidence]` | – | `config.json` |
+| `catalog` | CPU | `catalog.sqlite`, `population/<split>.json` |
+| `jobs` | CPU | `jobs/{train,dev,test}.jsonl`, `jobs/train_labels.json`, `jobs/FUNNEL.json` |
+| `features --split S --gpu N` | GPU | `features/<split>/view<v>/<pair>.npz` |
+| `train-head` | CPU | `head/head.pt`, `head/history.json` |
+| `plans` | CPU | `plans/{dev,test}.jsonl` |
+| `recover --gpu N` | GPU | `recovery/<split>/<query>.json` |
+| `score` | CPU | `matching/` (MiniLM vectors), `scores/<split>.jsonl` |
+| `evaluate` | CPU | `evaluation/{METRICS,PER_QUERY,CONTRASTS}.csv` |
 
-Stage 2 is an executable RATA/FOCUS pipeline over canonical dataset artifacts
-and Stage-1 retrieval JSON. `--input-candidate-budget` sets N (default 50): the
-first N unique targets in the Stage-1 result order. Duplicate target IDs and
-missing path detail are errors. `--recovery-budget` independently sets M
-(default 20, zero is allowed). `--max-targets` remains an alias for N only;
-`--max-direct-targets` has been removed.
+`H` is the `run_stage1.py export` directory (`retrieval.<split>.jsonl`; per
+target the table score and up to four retained evidence ids). Feature extraction
+and recovery skip outputs that already exist, so an interrupted command resumes.
 
-Inside this single Top-N pool, a `Q -> T` path creates a direct branch and a
-`Q -> E -> T` path creates an evidence branch. A target can have both. Branches
-depend only on retrieved paths, never on gold implicit/explicit labels, and
-path existence does not imply joinability. All direct candidates are verified
-against the original query; they neither consume M nor get truncated by it.
+1. **Jobs** (`jobs.py`). Each pair is (query, C30 target, that target's natural
+   evidence bag). Train labels are the hidden column of `model_recoverable_join_column`
+   qrels, mapped through `source_column_index`. A labeled target outside C30 is
+   dropped. The fit/holdout split hashes the source group. Dev/test jobs cover all
+   30 targets and never read qrels.
+2. **Selector** (`reader.py`, `selector.py`). Frozen Qwen3.5-9B reads query table,
+   anonymized evidence and the candidate table. Each target column is restated at
+   the end inside `<|object_ref_start|>…<|object_ref_end|>`, and the hidden states
+   at those two markers are the column feature. A fresh MLP head (8192→256→1) is
+   trained with the multi-positive softmax loss for a fixed 20 epochs. Train views
+   use column permutations 13001/26002, alternating by epoch. The holdout only
+   monitors training. `--no-selector-evidence` is the No-E ablation (arm A).
+3. **Plan.** `pair_score = log_softmax_C30(Stage-1 score) + log_softmax_columns(head)`.
+   Up to 10 pairs are taken, at most 3 per target. Pairs with the same column name
+   and the same evidence bag form one recovery view.
+4. **Recovery** (`recovery.py`, `localizer.py`). For every view and every query row
+   without a visible value for that attribute, the 9B model answers one ROW1
+   request: a JSON string or null. Rows still without a VALUE then retry each image
+   alone. Text evidence that names only *other* rows' entities is gated out.
+   Images are shown as the original plus, when RAEA-Attr+ConsensusMask (v_proj
+   layers 15/23/27) finds a dense local ROI, a context crop and a tight zoom.
+   VALUE claims are grouped by attribute into five row slots; disagreeing claims
+   become CONFLICT. A token-limit hit sends the whole query back to Stage 1.
+5. **Scoring** (`matching.py`, `visible.py`, `rerank.py`). Cells match on the typed
+   key. TEXT values may also match when they share numeric tokens and have
+   MiniLM cosine ≥ 0.98.
+   - `bridge(T)` = max over same-attribute columns of matched recovered rows / 5.
+   - `vis_row(T)` = max over (eligible query column, target column) of matched rows / 5.
+   - `vis_idf(T)` weights each row by `w = log((K+1)/(df+1))/log(K+1)`, where df
+     counts the C30 candidates containing the value and K = 30.
+   - The B+IDF tiers: bridge > 0 by bridge score, then vis_idf > 0 by
+     (vis_idf, vis_row), then Stage 1. The tiered order is RRF-fused (k = 60) with Stage 1.
 
-For **every evidence candidate**, the query, target and top-k evidence objects
-are placed in one reader input and produce RATA boundary states for all target
-columns. Stage 2 reuses `joint_candidate_probabilities` to compute
-`P(T,c) = softmax(r_T) * softmax(g_T,c)` over the complete evidence pool.
-The table prior is exported `stage2_table_score` when present, otherwise
-`evidence_score`; the existing requirement for an evidence-channel score remains.
-Repeated evidence paths have already been aggregated by Stage 1, and bundles
-preserve its compact path order. No M cutoff is applied before reader scoring.
-
-Each table selects `c_T = argmax_c P(T,c)` and receives recovery priority
-`s_T = max_c P(T,c)`. The top M unique tables by this priority are recovered;
-ties preserve Stage-1 order (column ties preserve header order). Summing column
-probabilities would discard column information, and taking flattened top-M
-pairs would allow one table to consume multiple slots; neither is used.
-The full evidence pool still pays the column-selection reader cost. Only
-row routing, FOCUS localization, value generation and evidence-branch final
-verification are limited to M tables. Preselected columns are reused without
-another reader call. Each target has its own generated column, representing
-its augmented query `Q_T+`, without modifying the original query or another
-candidate's row values.
-
-The RATA reader uses Qwen3.5's existing `<|object_ref_start|>` and
-`<|object_ref_end|>` tokens around every target header. Qwen is frozen; only
-the linear candidate head is trained. Because the Stage-1 evidence-channel
-distribution `softmax(r_T)` is fixed, training runs the reader only for the
-gold target and optimizes the column loss `-log rho_(T,c)`. History records the
-optimized term as `column_loss` and the fixed Stage-1 term as `table_loss`,
-while inference still ranks all candidate pairs with
-`softmax(r_T) * rho_(T,c)`. Training retrieval files
-contain one JSON object or JSONL record per query in the format emitted by
-`run_stage1.py export`; records whose positive target has no retrieved evidence
-path are skipped:
-
-```bash
-conda run -n MMDD python src/train_stage2.py \
-  --dataset-root output_mm_joinability_v15 \
-  --retrieval-results retrieval_train.jsonl \
-  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
-  --model-dir hf_models/Qwen3.5-9B \
-  --output checkpoints/stage2_candidate.pt
-```
-
-For mixed-source training, pass one dataset root per retrieval file in the
-same order. A single root is still shared by every retrieval file:
+`evaluate` reports `STAGE1`, `BRIDGE_RRF60` (bridges only), `VISIBLE_IDF_RRF60`
+(no recovered evidence) and `BIDF_RRF60`. It covers dev/test × overall/implicit/explicit,
+with Recall/Precision/nDCG and a paired source-group bootstrap. The
+`BIDF − VISIBLE_IDF` contrast isolates what recovered evidence adds over visible
+columns.
 
 ```bash
-conda run -n MMDD python src/train_stage2.py \
-  --dataset-root output_entitables output_wdc \
-  --retrieval-results retrieval_entitables_train.jsonl retrieval_wdc_train.jsonl \
-  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
-  --model-dir hf_models/Qwen3.5-9B \
-  --output checkpoints/stage2_candidate.pt
+python src/run_stage2.py init --run-root work/stage2_entitables \
+  --stage1-handoff work/stage1_entitables/stage2_handoff --dataset-root <dataset>
+python src/run_stage2.py catalog --run-root work/stage2_entitables
+python src/run_stage2.py jobs --run-root work/stage2_entitables
+for s in train dev test; do python src/run_stage2.py features --split $s --gpu 1 --run-root work/stage2_entitables; done
+python src/run_stage2.py train-head --run-root work/stage2_entitables
+python src/run_stage2.py plans --run-root work/stage2_entitables
+python src/run_stage2.py recover --gpu 1 --run-root work/stage2_entitables
+python src/run_stage2.py score --run-root work/stage2_entitables
+python src/run_stage2.py evaluate --run-root work/stage2_entitables
 ```
 
-For each table admitted to recovery, after the target column is fixed, each selected evidence object's original
-Qwen embedding is compared with the cached query-row routing embeddings and
-assigned to exactly one row by cosine argmax. A row may receive zero or many
-evidence objects, but each evidence object runs through FOCUS at most once per
-recovered target (localization is target-attribute-specific).
-The routing embeddings contain only `Columns: ...` plus the current `Row: ...`
-for a query row, only `content` for text evidence, and only pixels for image
-evidence. No external table or asset metadata participates in routing.
-Rows with no assigned evidence produce an empty value without localization or
-generation. For assigned evidence, the Qwen backend captures the later
-full-attention layers' `v_proj` outputs. It builds separate entity and attribute
-relevance maps over text or image tokens and combines them. For text evidence,
-joint pre-softmax logits from overlapping token windows are averaged on the
-full evidence token axis, normalized once per layer, averaged over layers, and
-reduced to a coherent high-relevance span. Image maps are
-Gaussian-smoothed; FOCUS-style separated anchors, adaptive ROI expansion, NMS,
-and an existence confidence pass select the crop. The output names the
-modality-local values explicitly as `text_span_relevance` or
-`image_presence_probability`; they are never compared across evidence objects.
-All localized text spans and image crops routed to one row are instead placed
-in one multimodal prompt with fixed single-letter labels. The Qwen next-token logits
-for those labels form one row-local listwise decision, and the highest-logit
-candidate is used to generate the bridge value. Rows with one candidate skip
-the redundant reranker forward. Aggregated retrieval path scores determine the
-top-k evidence set but do not modify this final selection. Candidate order and
-labels remain fixed; no order rotation is applied. The generated column is
-marked joinable only when enough query rows match the selected target column.
-Both branches use the same exact/fuzzy-or-semantic matching rule, similarity
-threshold and minimum coverage. Empty values count in the denominator of all
-query rows and never count as matches. Direct verification chooses its best
-original query-column/target-column pair by coverage, then mean similarity.
+This is the R7 fresh-selector B arm (`audit/MMDD_R7_FRESH_AB_C30_D098_PACKAGE`) plus
+the LEXICO IDF scorer, merged and moved to C30. The earlier RATA/FOCUS verifier
+and the r4/r4c/r5b/r12/r25/r26/column-R1/R2 experiment code were removed. They
+can be restored from git `3649483`.
 
-Verified targets are merged by `target_id` and sorted by coverage descending,
-mean similarity descending, then Stage-1 rank ascending. If both branches were
-verified, the better branch under the same rule supplies the final score;
-an exact tie keeps direct. Both branch results and all generated row evidence
-remain in the output. There is no branch-specific normalization, and `P(T,c)`
-is never a final joinability score. Verified failures remain in the reranked
-list; evidence-only targets outside M are separately marked not attempted.
-
-```bash
-conda run -n MMDD python src/run_stage2.py \
-  --dataset-root output_mm_joinability_v15 \
-  --retrieval-results retrieval_q1.json \
-  --stage1-gate <run>/stage2_handoff/stage1_gate.json \
-  --stage1-features cache/stage1_qwen8b \
-  --scorer-checkpoint checkpoints/stage2_candidate.pt \
-  --model-dir hf_models/Qwen3.5-9B \
-  --input-candidate-budget 50 --recovery-budget 20 \
-  --output stage2_q1.json
-```
-
-Output contains `input_candidate_budget`, the actual `input_candidate_count`,
-`recovery_budget`, `reranked_candidates`, and `unattempted_candidates`.
-Every candidate includes its `target_id`, 1-based `stage1_rank`, `stage1_score`,
-`table_prior` (raw r_T), `table_probability`, `selection`, per-column
-`joint_probabilities`, `recovery_priority`, and `selected_for_recovery`.
-Direct-only candidates without an exported table prior use null; their
-`stage1_score` is still retained and they do not participate in the evidence softmax.
-Each `branches.direct` / `branches.evidence` record retains its own
-`verification`; direct records identify the matched query and target columns,
-and evidence records retain `evidence_ids` plus row-aligned `rows` with values
-and compact localization provenance. Unrouted rows have empty values and null
-evidence. `final_branch`, `verification` and 1-based `rerank_rank` identify the
-merged result. Unattempted candidates have null final verification and rank,
-not fabricated zero scores; their evidence branch has status `not_attempted`
-and reason `recovery_budget`. Full input tables are not duplicated.
-
-`Stage2Verifier.verify(query, retrieval_results, targets, evidence, ...)` takes
-the already selected Top-N path records. `candidate_logits`, the candidate-head
-training interface, and Oracle loading/cache interfaces remain unchanged.
-This workflow change is covered by synthetic offline unit tests only, not
-training or model-inference experiments. Recall@1/3/5/7/9 evaluation, ablations,
-budget comparisons and effectiveness claims are outside this implementation.
-
-`mmdd_stage2/verifier.py` contains the paper-derived math,
-`mmdd_stage2/qwen.py` is the only model-specific boundary, and
-`mmdd_stage2/pipeline.py` implements table/column selection, row filling,
-direct-path checking, and final semantic joinability.
+## Shared joinability construction
 
 The two source families share one joinability algorithm in
 `mmdd_dataset/joinability.py`:

@@ -1,1 +1,1 @@
-"""RATA/FOCUS second-stage verification for multimodal join discovery."""
+"""Stage 2: evidence-reading column selector -> 9B value recovery -> bridge + IDF reranking of C30."""
