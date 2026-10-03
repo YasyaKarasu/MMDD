@@ -310,6 +310,7 @@ $S init --run-root $RUN --dataset-root <dataset-artifact> --gpu 0   # --features
 $S build-data      --run-root $RUN          # only for a new feature directory
 $S encode          --run-root $RUN          # only for a new feature directory; --gpus 0 1 runs the shards in parallel
 $S lock            --run-root $RUN
+$S import-teacher  --run-root $RUN --from-run <completed run> --reason TEXT   # optional: reuse its Teacher chain
 $S verify-features --run-root $RUN
 $S prepare         --run-root $RUN
 $S validate        --run-root $RUN
@@ -326,6 +327,7 @@ Inputs and outputs (`F` = feature directory, everything else under `<run>`):
 | `build-data` | dataset artifact | `F/data/{stage1_objects,edge_lists,target_lists,stage1_corpus}.jsonl` (targets keep 20 rows) |
 | `encode` | `F/data/`, backbone | `F/encoder/` (two-tier Qwen cache, merged from two shards), `F/content_shard*/`, `F/features/{z,content}`; logs under `<run>/logs/` |
 | `lock` | dataset, backbone, `F/features/` | `DATASET_IDENTITY.json`, `FROZEN_RECIPE_LOCK.json`, `CONTENT_ALIASES.jsonl.gz`, `CACHE_MANIFEST.jsonl` |
+| `import-teacher` | a completed run with the same dataset, feature cache, seeds and `teacher` / `retrieval` / `feature_provenance` blocks | copies of its `seed<N>/training_records/raw_train`, `seed<N>/eval/dev/raw` pool bundles, `TA/TB_SHARED/C1_*` lists and `TA`, `TB_CQET`, `TB_QT` stage directories; `SOURCE_AMENDMENTS.jsonl` carrying those stages from the source run's code; `IMPORTED_TEACHER_CHAIN.json` |
 | `verify-features` | 16 objects per modality | `tests/real_tensor_probes/feature_provenance.json`; fails closed on any mismatch |
 | `prepare` | train qrels/recoveries | `labels/`, `rows/`, `pca/` (train queries + lake + evidence only) |
 | `validate` | | runs `tests/test_stage1_cqet.py` and `tests/test_stage1_reference_contracts.py`, bound to the source hash |
@@ -423,6 +425,19 @@ Execution notes (none of these change a loss, a list or a checkpoint format):
 After a code change, completed stages are reused only if their recorded source
 hash still matches. Run `amend-source --amendment-id ID --carry STAGE ... --reason
 TEXT` before `prepare` to carry stages across an execution-only change.
+
+**Reusing a Teacher chain.** Everything upstream of the Students (Raw pools, the TA /
+TB_SHARED / C1 lists, `TA`, `TB_CQET`, `TB_QT`) depends only on the dataset, the frozen
+features, the seed and the protocol's `teacher` and `retrieval` blocks. A run that changes
+only the Student recipe can therefore take that chain from a completed run instead of
+spending ~3.5 h retraining it: `import-teacher --from-run OLD --reason TEXT`, after `lock`
+and before `prepare`. It refuses when the dataset or cache identity, those protocol blocks
+or the seeds differ, copies the files, re-hashes every copy against the source receipts
+and pool manifests, records a source amendment carrying the three stages from the source
+run's code, and runs `train`'s own reuse check on the copies. Receipts are copied byte for
+byte, so their `outputs[*].path` still name the source run; reuse checks resolve outputs
+inside the stage directory, not at that recorded path. The Teacher trajectory, the test
+Raw pools and every Student stage are recomputed in the new run.
 
 `export` writes one record per query with `results[].{target_id, score,
 direct_score, evidence_score, stage2_table_score, paths}`. Target order and table

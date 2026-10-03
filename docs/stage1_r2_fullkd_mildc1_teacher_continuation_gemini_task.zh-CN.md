@@ -1,22 +1,23 @@
-# Stage-1 第二轮：全列表 KD + 温和 C1 + Teacher 学生池续训（EntiTables，seed 13，双卡）
+# Stage-1 第二轮：全列表 KD + 温和 C1 + 复用 Teacher 链 + Teacher 续训（EntiTables，seed 13，双卡）
 
 给执行者（Gemini）：按顺序执行，每一步检查完成标志再进入下一步。本文是两段任务：
-**第一部分**跑一个新的 Stage-1 正式 run；**第二部分**在它结束后，用它选出的 KD 学生做 Teacher 续训（主臂 + 对照臂）。
-背景见 `docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`（诊断）、`docs/stage1_plan_abcd_run_guide.zh-CN.md`
-（上一轮 run 的说明）、`docs/stage1_teacher_student_pool_continuation_gemini_task.zh-CN.md`（上一轮续训的说明）。
-实现说明见 `src/README.md` 的 "Stage-1 main flow" 一节。
+**第一部分**跑一个新的 Stage-1 run，teacher 链从上一轮复用，只重跑学生侧；**第二部分**在它结束后，用它选出的 KD 学生做
+Teacher 续训（主臂 + 对照臂）。背景见 `docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md`（诊断）、
+`docs/stage1_plan_abcd_run_guide.zh-CN.md`（上一轮 run 的说明）、`docs/stage1_teacher_student_pool_continuation_gemini_task.zh-CN.md`
+（上一轮续训的说明）。实现说明见 `src/README.md` 的 "Stage-1 main flow" 一节（含 "Reusing a Teacher chain" 一段）。
 
 ## 0. 这一轮改了什么，为什么
 
 上一轮 run `work/stage1_entitables_abcd_s13`（方案 A–D 全开）跑完了，三个 gate 全部 FAIL。事后归因（direct-only 探针，
-`work/stage1_entitables_abcd_s13_probe/`）和 Teacher 续训（`work/stage1_entitables_abcd_s13_teacher_sp{,_raw2}`）给出三个结论，
-对应本轮三处改动。**代码与协议模板已经改好，执行者不需要改任何文件。**
+`work/stage1_entitables_abcd_s13_probe/`）和 Teacher 续训（`work/stage1_entitables_abcd_s13_teacher_sp{,_raw2}`）给出下面的结论，
+对应本轮四处改动。**代码与协议模板已经改好，执行者不需要改任何文件。**
 
-| 改动 | 协议键 | 上一轮 | 本轮 | 依据 |
+| 改动 | 协议键 / 命令 | 上一轮 | 本轮 | 依据 |
 |---|---|---|---|---|
 | KD 用全列表 KL，关掉 top-50 + rank-mass 尾项 | `student.kd_top_k` | 50 | **0** | 其它条件相同，只把 KD 从全列表 KL 换成 top-50，dev Direct R@10 掉 4–5pp，正是上一轮 KD < SUP 的全部幅度。全列表 KL 下 SUP+KD 0.470 vs SUP 0.436（dev，2/3 处） |
 | C1 用单独的、更温和的学习率 | `student.C1.P_lr` / `student.C1.R_lr` | 继承 1e-4 / 1e-3 | **1e-05 / 0.0001**（依据见第 7.1 节） | 共享学习率下 C1 把 dev E 池覆盖从 0.68 打到 0.33，C150 优先的选点退回 fraction 0（identity），C1 等于白跑 |
-| 跑完后接一轮 Teacher 续训 | 不在协议里，用 `src/continue_teacher_on_student_pool.py` | 已跑过一次 | 在新 run 上重跑主臂 + 对照臂 | 上一轮：学生池列表续训 1 epoch 后，Teacher 在 KD 学生 dev 池上 Real R@10 0.394 → 0.488（+9.3pp，CI [7.0, 11.6]），高出学生自己的直接检索 6.0pp；对照臂（同起点、Raw 列表再训 1 epoch）−0.3pp |
+| Teacher 链从上一轮复用，不重训 | `run_stage1.py import-teacher` | 全部重训（Raw 池与列表约 2 小时 + TA 76 分钟 + TB_CQET 58 分钟，主进程约 4.3 小时） | **复制上一轮的 Raw 池、训练列表和 TA / TB_CQET / TB_QT** | 这三处改动都在学生侧，teacher 链只依赖数据集、冻结特征、seed 和协议的 `teacher` / `retrieval` 块，这些都没变；而且探针用的就是上一轮这个 TB_CQET 的 logits，复用它才能和探针逐一比较 |
+| 跑完后接一轮 Teacher 续训 | `src/continue_teacher_on_student_pool.py` | 已跑过一次 | 在新 run 的 KD 学生池上重跑主臂 + 对照臂 | 上一轮：学生池列表续训 1 epoch 后，Teacher 在 KD 学生 dev 池上 Real R@10 0.394 → 0.488（+9.3pp，CI [7.0, 11.6]），高出学生自己的直接检索 6.0pp；对照臂（同起点、Raw 列表再训 1 epoch）−0.3pp。本轮起点与上一轮是同一个 checkpoint，两轮续训可直接比较 |
 
 其它开关不变：`teacher_scored_negatives=true`、`lr_schedule=cosine`、`evidence_random_negatives=256`（方案 D，仍未消融）、
 C2 3 个 epoch、τ=10、`kd_weight=1`。`evidence_random_negatives` 故意保留：上一轮 KD 臂的 E 池覆盖比 SUP 低 10.6pp（CI 不跨 0），
@@ -39,8 +40,8 @@ top-50 关掉之后如果这个差距还在，就能归到方案 D 的 evidence 
 - **运行期间不要修改 `src/`、`tests/`、`configs/` 下的任何文件。** `validate`、`smoke`、`train`、`train-side` 绑定源码哈希，
   改了源码后续步骤会拒绝执行。遇到代码报错：停下来报告报错与日志路径，不要自行打补丁，不要 `amend-source`。
 - 不要读取、查看或修改 `.env.openai`。本实验不需要它。
-- 不要删除或覆盖 `work/stage1_features/` 下的任何内容（多个 run 共享的冻结特征，只读）；也不要碰上一轮的
-  `work/stage1_entitables_abcd_s13*` 目录。
+- 不要删除、移动或修改 `work/stage1_features/`（多个 run 共享的冻结特征）和上一轮的 `work/stage1_entitables_abcd_s13*` 目录。
+  `import-teacher` 只从上一轮目录**读**，往新 run 目录**写**。
 - 只跑本文这一个 run，不要同时跑其它 run。
 - gate 判定为 FAIL 是研究结论，不是程序错误。照常完成并如实报告，不要为了让 gate 通过而改配置重跑。
 - 本机首次 CUDA 初始化偶尔报 `CUDA driver initialization failed`（`cuInit` 返回 3）。不是权限问题，原样重跑一次该命令即可。
@@ -51,15 +52,17 @@ top-50 关掉之后如果这个差距还在，就能归到方案 D 的 evidence 
 
 ```bash
 cd /home/oycy/MMDD
-git status --short            # 记录进最终报告。预期：configs/mmdd_stage1_cqet_protocol.json、src/mmdd_stage1/{config,pipeline,train}.py、
-                              # src/README.md、tests/test_stage1_cqet.py 为已修改或已提交；另有续训脚本及其文档/测试
+git status --short            # 记录进最终报告
 git log --oneline -1
 python3 -c "
 import json; s=json.load(open('configs/mmdd_stage1_cqet_protocol.json'))['student']
 print('kd_top_k', s['kd_top_k']); print('C1 lr', s['C1'].get('P_lr'), s['C1'].get('R_lr')); print('shared lr', s['P_lr'], s['R_lr'])
 print('teacher_scored_negatives', s['teacher_scored_negatives'], 'lr_schedule', s['lr_schedule'], 'evidence_random_negatives', s['evidence_random_negatives'], 'C2 epochs', s['C2']['epochs'])"
+cat work/stage1_entitables_abcd_s13/PHASE_STATUS.json | head -3          # 上一轮必须是 COMPLETE_*
+ls work/stage1_entitables_abcd_s13/seed13/TB_CQET/checkpoints/end.pt     # 要复用的 teacher 必须在
 nvidia-smi --query-gpu=index,name,memory.used --format=csv     # 两张 4090 都应空闲（memory.used 接近 0）
 free -g                                                         # available 必须 ≥ 90 GiB；机器上不要有其它大内存任务
+df -h /home/oycy/MMDD/work | tail -1                            # 可用空间 ≥ 60 GiB（import 复制约 10 GiB，run 本身约 30 GiB）
 ls work/stage1_features/entitables/features/z/z.f32.npy         # 冻结特征必须存在
 ls -d work/stage1_entitables_r2_fullkd_s13 2>/dev/null && echo "RUN DIR ALREADY EXISTS - STOP AND REPORT"
 ```
@@ -74,6 +77,7 @@ ls -d work/stage1_entitables_r2_fullkd_s13 2>/dev/null && echo "RUN DIR ALREADY 
 ```bash
 cd /home/oycy/MMDD
 RUN=work/stage1_entitables_r2_fullkd_s13       # 新 run 目录；必须是尚不存在的路径
+OLD_RUN=work/stage1_entitables_abcd_s13        # 上一轮，teacher 链的来源；只读
 GPU=0                                          # 主 GPU（物理 index）
 SIDE_GPU=1                                     # 第二张 GPU（物理 index，与主 GPU 同型号）
 S="conda run --no-capture-output -n MMDD python src/run_stage1.py"
@@ -82,22 +86,26 @@ OUT=${RUN}_teacher_sp                          # 续训主臂输出目录（第�
 T="conda run --no-capture-output -n MMDD python src/continue_teacher_on_student_pool.py"
 ```
 
-## 4. 第一部分：正式 run
+## 4. 第一部分：正式 run（teacher 链复用）
 
-每一步完成后 `cat $RUN/PHASE_STATUS.json`，`status` 应为下表所列的值。
+每一步完成后 `cat $RUN/PHASE_STATUS.json`，`status` 应为下表所列的值（`import-teacher` 不改 PHASE_STATUS，看它自己的产物）。
 
 | # | 命令 | 设备 | 完成标志 |
 |---|---|---|---|
 | 1 | `$S init --run-root $RUN --dataset-root $DATASET --features-dir work/stage1_features/entitables --gpu $GPU --side-gpu $SIDE_GPU --seeds 13` | CPU | 生成 `$RUN/protocol.json`；打印的 `hardware` 含 `side_uuid` 且 `gpu_processes` 为 2；打印 `existing encoding found; skip build-data and encode` |
-| 1b | `python3 -c "import json; s=json.load(open('$RUN/protocol.json'))['student']; print(s['kd_top_k'], s['C1']['P_lr'], s['C1']['R_lr'])"` | CPU | 打印 `0 <C1.P_lr> <C1.R_lr>`，与第 2 节一致 |
+| 1b | `python3 -c "import json; s=json.load(open('$RUN/protocol.json'))['student']; print(s['kd_top_k'], s['C1']['P_lr'], s['C1']['R_lr'])"` | CPU | 打印 `0 1e-05 0.0001` |
 | 2 | `$S lock --run-root $RUN` | CPU（约 5 分钟） | `SOURCE_AND_CACHE_LOCKED_PENDING_NUMERIC_PROBE` |
-| 3 | `$S verify-features --run-root $RUN` | 主 GPU | `PASS_READY_FOR_REFERENCE_TESTS` |
-| 4 | `$S prepare --run-root $RUN` | CPU | `PASS_READY_FOR_VALIDATION` |
-| 5 | `$S validate --run-root $RUN` | CPU | `PASS_READY_FOR_SMOKE`；`$RUN/tests/integration/VALIDATION_RECEIPT.json` 的 `status` 为 `PASS` |
-| 6 | `$S smoke --run-root $RUN`（后台，见下） | 主 GPU | `PASS_READY_FOR_FORMAL`；`$RUN/tests/smoke/LATEST.json` 的 `status` 为 `PASS` |
-| 7 | `$S train` 与 `$S train-side` 两个进程同时启动（见下） | 主 GPU + 第二张 GPU | `COMPLETE_PASS` 或 `COMPLETE_PERFORMANCE_GATES_FAILED`（两者都表示跑完） |
+| **3** | `$S import-teacher --run-root $RUN --from-run $OLD_RUN --reason "round 2 changes only the Student recipe (kd_top_k 0, C1 lr); teacher chain identical"` | CPU（复制约 10 GiB 并逐文件校验哈希，约 5–10 分钟） | 打印一段 JSON（含 `amendment`）；`$RUN/IMPORTED_TEACHER_CHAIN.json`、`$RUN/SOURCE_AMENDMENTS.jsonl` 出现；`$RUN/seed13/{TA,TB_CQET,TB_QT}/checkpoints/` 和 `$RUN/seed13/training_records/raw_train/POOL_MANIFEST.json` 出现 |
+| 4 | `$S verify-features --run-root $RUN` | 主 GPU | `PASS_READY_FOR_REFERENCE_TESTS` |
+| 5 | `$S prepare --run-root $RUN` | CPU | `PASS_READY_FOR_VALIDATION` |
+| 5b | `python3 -c "import json; a=json.load(open('$RUN/PCA_REPORT.json')); b=json.load(open('$OLD_RUN/PCA_REPORT.json')); print('PCA basis identical:', a['basis_sha256']==b['basis_sha256'])"` | CPU | 打印 `True`。打印 `False` 不是错误（PCA 只影响学生，不影响复用的 teacher），但要写进报告 |
+| 6 | `$S validate --run-root $RUN` | CPU | `PASS_READY_FOR_SMOKE`；`$RUN/tests/integration/VALIDATION_RECEIPT.json` 的 `status` 为 `PASS` |
+| 7 | `$S smoke --run-root $RUN`（后台，见下） | 主 GPU | `PASS_READY_FOR_FORMAL`；`$RUN/tests/smoke/LATEST.json` 的 `status` 为 `PASS` |
+| 8 | `$S train` 与 `$S train-side` 两个进程同时启动（见下） | 主 GPU + 第二张 GPU | `COMPLETE_PASS` 或 `COMPLETE_PERFORMANCE_GATES_FAILED`（两者都表示跑完） |
 
-复用已有特征，不执行 `build-data` 和 `encode`。除这两步外不要跳过任何步骤。
+复用已有特征，不执行 `build-data` 和 `encode`。**第 3 步必须在 `lock` 之后、`prepare` 之前**，顺序错了命令会直接拒绝
+（`import-teacher runs after lock` / `runs before prepare`）。它会核对两个 run 的数据集身份、特征缓存身份、协议的 `teacher` /
+`retrieval` / `feature_provenance` 块和 seed，不一致就拒绝；拒绝了就报告原因，不要绕过。
 
 ```bash
 mkdir -p $RUN/logs
@@ -111,9 +119,10 @@ setsid nohup $S train      --run-root $RUN > $RUN/logs/train.log      2>&1 < /de
 setsid nohup $S train-side --run-root $RUN > $RUN/logs/train_side.log 2>&1 < /dev/null & echo $! > $RUN/logs/train_side.pid
 ```
 
-**分工。** `train`（主 GPU）跑 Native 主线：Raw 池 → TA → TB_CQET → Native C1 → C2 共享图 → Native C2 SUP/KD → dev 评估。
-`train-side`（第二张 GPU）跑其余：TA 结束后训 TB_QT，然后 QT C1 与选点、teacher 轨迹，等 C2 图落盘后训 QT C2 并选点，
-全局冻结后做 test 评估。日志里的 `[wait] ...` 是互相等待，正常。
+**分工。** `train`（主 GPU）：加载运行时 → 重算 RawET128（约 1 分钟）→ 直接读入复用的 Raw 池与列表 → TA、TB_CQET 的收据校验通过即跳过训练 → Native C1 →
+C1 选点 → C2 共享图 → teacher logits 缓存 → Native C2 SUP/KD → 选点 → dev 评估。`train-side`（第二张 GPU）：TB_QT 同样跳过 →
+QT C1 与选点 → teacher 轨迹（重算）→ 等 C2 图落盘后训 QT C2 并选点 → 全局冻结后做 test 评估（含重建 Raw test 池）。
+日志里的 `[wait] ...` 是互相等待，正常。
 
 **轮询：**
 
@@ -121,24 +130,28 @@ setsid nohup $S train-side --run-root $RUN > $RUN/logs/train_side.log 2>&1 < /de
 date -u; tail -n 5 $RUN/logs/train.log $RUN/logs/train_side.log
 cat $RUN/PHASE_STATUS.json
 cat $RUN/processes/main.json $RUN/processes/side.json        # status：RUNNING / FAILED / COMPLETE
-tail -n 3 $RUN/seed13/timing/stages.jsonl 2>/dev/null        # 每完成一个阶段追加一行
+tail -n 3 $RUN/seed13/timing/stages.jsonl 2>/dev/null        # 复用的 TA/TB 三行带 imported_from；之后每完成一个阶段追加一行
 ls $RUN/seed13/selections/ 2>/dev/null
 ps -p $(cat $RUN/logs/train.pid) >/dev/null && echo train running || echo train exited
 ps -p $(cat $RUN/logs/train_side.pid) >/dev/null && echo side running || echo side exited
 ```
 
-**里程碑**（出现时各报告一次，带 UTC 时间）：TA 完成（`$RUN/seed13/TA/POST_RUN.attempt_*.json` 有 `status: SUCCESS`）→
-TB_CQET 完成 → **Native C1 选点**（`selections/NATIVE_C1.json` 出现，**立刻按 6.2 节汇报 C1 的数字**）→
-学生训练结束（`NATIVE_C2_SUP`、`NATIVE_C2_KD` 都有 SUCCESS 的 POST_RUN）→ **学生选点**（`selections/NATIVE_C2_COMMON.json`，
-**立刻按 6.3 节汇报**）→ 进入评估（`GLOBAL_SELECTION_FREEZE.json` 出现）→ side 结束（`processes/side.json` 为 `COMPLETE`）→
+**里程碑**（出现时各报告一次，带 UTC 时间）。TA、TB_CQET、TB_QT 在启动时就已经是完成状态，不再出现：
+**Native C1 选点**（`selections/NATIVE_C1.json` 出现，**立刻按 6.2 节汇报 C1 的数字**）→ 学生训练结束（`NATIVE_C2_SUP`、
+`NATIVE_C2_KD` 都有 SUCCESS 的 POST_RUN）→ **学生选点**（`selections/NATIVE_C2_COMMON.json`，**立刻按 6.3 节汇报**）→
+进入评估（`GLOBAL_SELECTION_FREEZE.json` 出现）→ side 结束（`processes/side.json` 为 `COMPLETE`）→
 run 结束（`PHASE_STATUS.json` 的 `status` 以 `COMPLETE_` 开头，`processes/main.json` 为 `COMPLETE`）。
+
+训练开始 15 分钟内核对一次复用是否生效：`$RUN/seed13/TA/` 和 `$RUN/seed13/TB_CQET/` 下**只有** `attempt_001`（来自上一轮），
+没有新的 `PRE_RUN.attempt_002.json`。出现 `attempt_002` 说明 teacher 在重训，立刻报告（不用杀进程，等用户决定）。
 
 **中断与恢复。** 任一进程挂掉后，另一个会在下一次等待时报 `... died before producing ...` 或 `... is FAILED ...` 并退出。
 先把两份日志复制为 `*.failed.<UTC时间>`，报告 `processes/*.json` 的 `error` 和两份日志最后 50 行，然后用**同一组命令**把两个
-进程都重新启动一次（已完成阶段和选点会被复用）。第二次仍失败就停下来报告，等用户指示。
+进程都重新启动一次（已完成阶段和选点会被复用，复用的 teacher 阶段也在内）。第二次仍失败就停下来报告，等用户指示。
 
-**耗时（上一轮实测）：** Raw 池约 1 小时；TA 76 分钟；TB_CQET 58 分钟；C1 1 分钟 + 选点约 50 分钟；C2 建图约 2 小时；
-C2 SUP 5 分钟、KD 7 分钟 + 选点约 1 小时；dev 评估约 1 小时。上一轮 06:45 启动、16:10 结束，共 9.4 小时。
+**耗时（按上一轮实测外推）：** 加载 + RawET128 约 6 分钟；C1 1 分钟 + 选点约 50 分钟；C1 学生检索 train 查询 + C2 建图约 2 小时；
+teacher logits 缓存约 50 分钟；C2 SUP 5 分钟、KD 7 分钟 + 选点约 1 小时；dev 评估约 1 小时（side 同时做 test 评估，含重建 Raw test 池）。
+合计约 5–5.5 小时。上一轮 9.4 小时里，Raw 池 + 列表（06:45→08:46）、TA（76 分钟）、TB_CQET（58 分钟）共约 4.3 小时，本轮全部跳过。
 
 ## 5. 第二部分：Teacher 续训（run 结束后）
 
@@ -184,7 +197,8 @@ KD 学生 `Direct_ANN_R10 < 0.35` 说明学生配方没生效或崩了：**报�
 
 ### 5.3 主臂（学生池列表）
 
-脚本和上一轮完全相同，已经在本机跑通过（含 16 查询冒烟），本轮不再冒烟。
+脚本和上一轮完全相同，已经在本机跑通过（含 16 查询冒烟），本轮不再冒烟。起点 `$RUN/seed13/TB_CQET/checkpoints/end.pt`
+是从上一轮复制来的同一个文件（sha256 以 `69b46f3e` 开头），所以本轮续训与上一轮的区别只在学生池。
 
 ```bash
 mkdir -p $OUT
@@ -214,7 +228,8 @@ tail -n 1 $OUT/train.jsonl 2>/dev/null | python3 -c "import sys,json; r=json.loa
 
 ### 5.4 对照臂（主臂结束后执行；用户没叫停就默认跑）
 
-同一起点、同样 1 个 epoch，列表换回本 run 的 Raw 列表，用来把"多训一个 epoch"与"换成学生池列表"分开：
+同一起点、同样 1 个 epoch，列表换回 Raw 列表（本 run 里这份文件也是从上一轮复制来的），用来把"多训一个 epoch"与
+"换成学生池列表"分开：
 
 ```bash
 mkdir -p ${OUT}_raw2
@@ -253,12 +268,13 @@ KD 臂的 `direct_kd_loss` 本轮应当明显低于上一轮的 1.1（上一轮�
 重点是 `KD_minus_SUP_student_Direct_R10_overall`、`KD_minus_SUP_E_target_coverage_overall`、`KD_minus_SUP_same_TB_CQET_overall`、
 `evidence_CQET_Real_minus_f0_{overall,implicit}`、`content_CQET_Real_minus_Swap_implicit`、`CQET_Real_minus_TB_QT_overall`。
 另取 `raw / native_sup / native_kd` 三个块下 `teacher.TB_CQET.{f0,Real}.overall.R@10`（Teacher 在三种池上的数字）。
+`raw` 块下的 teacher 数字应与上一轮逐位相同（同一 teacher、同一 Raw 池：dev f0 0.4521 / Real 0.4479），不同要标出。
 原样贴出，不要自行解读成"机制成立"。
 
 ### 6.5 Teacher 续训（主臂与对照臂各一份）
 
-1. `IDENTITY.json`：`student.path`、`student.state_sha256`、`init_checkpoint.sha256`、`records.count`、`records.source`、
-   `config.epochs/lr`、`gpu_uuid`、`git_head`。
+1. `IDENTITY.json`：`student.path`、`student.state_sha256`、`init_checkpoint.sha256`（应以 `69b46f3e` 开头）、`records.count`、
+   `records.source`、`config.epochs/lr`、`gpu_uuid`、`git_head`。
 2. `records_summary.json` 全文（主臂才有）。
 3. `TRAIN_TIMING.json` 全文；`train.jsonl` 首行与末行的 `loss`、`direct`、`path`、`support`、`grad_norm_preclip`、
    `gpu_peak_allocated_bytes`，以及 `oom_events` 非空的行数。
@@ -268,34 +284,38 @@ KD 臂的 `direct_kd_loss` 本轮应当明显低于上一轮的 1.1（上一轮�
    `half.Real_minus_init.Real` 的 `mean_delta_pp`、`ci_95`、`wlt`。行是 `student / init / half / end`，
    列是 `native_kd f0 | native_kd Real | raw f0 | raw Real`。
 5. **一致性核对**：`generators.native_kd.teacher.init` 的 f0/Real/Swap `overall` 必须与正式 run `eval/dev/SUMMARY.json`
-   的 `native_kd.teacher.TB_CQET.{f0,Real,Swap}.overall.R@10` 逐位相同；`generators.raw.teacher.init` 对应 `raw.teacher.TB_CQET...`。
-   `generators.native_kd.pools` 应指向 `$RUN/seed13/eval/dev/native_kd`。不相同要明确标出。
+   的 `native_kd.teacher.TB_CQET.{f0,Real,Swap}.overall.R@10` 逐位相同；`generators.raw.teacher.init` 对应 `raw.teacher.TB_CQET...`，
+   并且应与上一轮续训的 `raw.init`（f0 0.4521 / Real 0.4479）相同。`generators.native_kd.pools` 应指向
+   `$RUN/seed13/eval/dev/native_kd`。不相同要明确标出。
 
 ### 6.6 运行信息
 
-两个训练进程和两条续训各自的开始/结束 UTC 时间、GPU UUID；`$RUN/seed13/timing/stages.jsonl` 全文；`git status --short`
-与 `git log --oneline -1`；是否发生过重启及原因。
+- `$RUN/IMPORTED_TEACHER_CHAIN.json` 去掉 `copied` 字段后的内容；`$RUN/SOURCE_AMENDMENTS.jsonl` 全文。
+- 两个训练进程和两条续训各自的开始/结束 UTC 时间、GPU UUID；`$RUN/seed13/timing/stages.jsonl` 全文（前三行是复用的 TA/TB，带 `imported_from`）。
+- 第 4 节 5b 步 PCA 核对的结果。
+- `git status --short` 与 `git log --oneline -1`；是否发生过重启及原因。
 
 ## 7. 参照数字与读法（参照不是保证；只陈述，不下结论）
 
 ### 7.1 C1
 
 C1 单独学习率的取值依据是在上一轮 run 的边列表上做的学习率探针（`work/stage1_entitables_abcd_s13_probe/c1_lr/RESULTS.jsonl`，
-dev，1198 查询，Native C1，余弦衰减，尺度 20；与正式 run 的 C1 选点用同一套检索与覆盖度量）：
+dev，1198 查询，Native C1，余弦衰减，尺度 20；与正式 run 的 C1 选点用同一套检索与覆盖度量。本轮的 C1 边列表是同一份文件）：
 
 | C1 学习率 P / R | fraction | Direct_ANN_R10 | C150 覆盖 | D150 覆盖 | E 覆盖 | U 覆盖 | R_QT 漂移 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | identity（fraction 0，上一轮实际选中点） | 0.0 | 0.2551 | 0.5807 | 0.5529 | 0.6834 | 0.7193 | 0.000 |
-| 1e-5 / 1e-4 | 0.5 | 0.3088 | 0.6813 | 0.6370 | 0.7305 | 0.8161 | 0.088 |
-| 1e-5 / 1e-4 | 1.0 | 0.2667 | 0.6772 | 0.5868 | 0.7308 | 0.8066 | 0.103 |
+| **1e-5 / 1e-4（本轮）** | 0.5 | 0.3088 | **0.6813** | 0.6370 | **0.7305** | 0.8161 | 0.088 |
+| 1e-5 / 1e-4（本轮） | 1.0 | 0.2667 | 0.6772 | 0.5868 | 0.7308 | 0.8066 | 0.103 |
 | 1e-6 / 1e-5（v4.1 旧值） | 1.0 | 0.2668 | 0.5961 | 0.5700 | 0.6976 | 0.7417 | 0.010 |
 | 3e-5 / 3e-4 | 1.0 | 0.2628 | 0.5051 | 0.5687 | 0.3555 | 0.6087 | 0.251 |
 | 上一轮正式 run 1e-4 / 1e-3（共享值） | 0.25 | 0.2309 | 0.4872 | 0.5626 | 0.3404 | 0.5927 | 0.437 |
 | 上一轮正式 run 1e-4 / 1e-3（共享值） | 1.0 | 0.2607 | 0.5478 | 0.6722 | 0.3334 | 0.6646 | 0.587 |
 
-本轮取 **`C1.P_lr = 1e-05`、`C1.R_lr = 0.0001`**（上表中 C150 覆盖最高且 E 覆盖不低于 identity 的一档）。
+窗口很窄：再放大 3 倍 E 覆盖就崩回 0.36。本轮取 1e-5 / 1e-4（C150 覆盖最高且 E 覆盖不低于 identity 的一档）。
 
-读法：`selected_fraction > 0` 且选中点的 `E_target_coverage ≥ 0.68`、`C150_target_coverage > 0.581`，说明 C1 这次没有被丢弃。
+读法：`selected_fraction > 0` 且选中点的 `E_target_coverage ≥ 0.68`、`C150_target_coverage > 0.581`，说明 C1 这次没有被丢弃；
+正式 run 的数字应与探针表里同 fraction 的行接近（同一列表、同一配方、同一 seed，差别只来自 ANN 与运行时顺序，预期 ≤ 0.5pp）。
 再退回 fraction 0 也不是程序错误，C2 会像上一轮一样从 identity 起训，KD 对照仍然有效；照实报告。
 
 ### 7.2 C2
@@ -308,8 +328,9 @@ direct-only 探针（同一份 C2 列表、同一个 Teacher、固定负样本 +
 | SUP + KD，全列表 KL（本轮配置） | 0.453 | 0.470 | 0.465 | 0.451 |
 | SUP + KD，top-50（上一轮配置） | 0.407 | 0.419 | 0.428 | 0.412 |
 
-正式 run 还同时训证据分支，所以数字会有出入。参照：KD 学生 Direct_ANN_R10 比 SUP 高 2–3pp 算与探针一致；
-KD ≤ SUP 要明确标出。3 epoch 下相邻快照的 dev R@10 波动约 ±2pp，单种子，1pp 以内的差别不要解读。
+本轮 C2 的起点是新 C1 的选中点（探针从 identity 起训），且正式 run 同时训证据分支，所以数字会有出入。参照：KD 学生
+Direct_ANN_R10 比 SUP 高 2–3pp 算与探针一致；KD ≤ SUP 要明确标出。3 epoch 下相邻快照的 dev R@10 波动约 ±2pp，单种子，
+1pp 以内的差别不要解读。
 
 E 池覆盖：上一轮 KD 比 SUP 低 10.6pp。本轮如果仍低 ≥ 5pp，就只能归到 `evidence_random_negatives` / evidence KD（方案 D），照实报。
 
@@ -318,8 +339,9 @@ E 池覆盖：上一轮 KD 比 SUP 低 10.6pp。本轮如果仍低 ≥ 5pp，就
 验收线（诊断文档 7.2）：`native_kd` 池上 `end.Real ≥ 学生 Direct_ANN_R10`，且 `end.Real_minus_init.Real` 的 `ci_95` 不跨 0。
 上一轮主臂：+9.3pp [7.0, 11.6]，高出学生 6.0pp [3.4, 8.6]；对照臂：−0.3pp [−1.5, 0.9]。`raw` 池上两臂都掉约 0.8pp
 （CI 跨 0），是多训一个 epoch 的副作用，与列表无关。`implicit` 段单独列出 `Real − f0`（上一轮 end：+2.5pp）。
+本轮起点与上一轮完全相同，所以两轮主臂的 `end.Real` 之差就是"学生池换成本轮 KD 学生的池"带来的差别。
 
 ## 8. 这个任务不做的事
 
-- 不改协议、不改源码、不调超参、不多跑 epoch、不换 Teacher 起点。
+- 不改协议、不改源码、不调超参、不多跑 epoch、不换 Teacher 起点、不手工复制任何文件（复用只通过 `import-teacher`）。
 - 不用续训后的 Teacher 重新蒸馏学生、不改 `teacher_logits_cache`、不跑 Stage 2、不碰上一轮的目录。这些由用户看完报告后决定。

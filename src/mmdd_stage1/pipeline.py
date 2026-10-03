@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -146,6 +147,133 @@ def amend_source(
         paths, amendment_id=amendment_id, carried_stages=carried_stages, reason=reason,
     )
     print(json.dumps(row, indent=2, ensure_ascii=False))
+
+
+TEACHER_CHAIN_STAGES = ("TA", "TB_CQET", "TB_QT")
+TEACHER_CHAIN_LISTS = ("TA", "TB_SHARED", "C1_NATIVE", "C1_QT")
+POOL_BUNDLE_FILES = (
+    "POOL_MANIFEST.json", "pool_records.pt", "pools.jsonl.gz", "prepaths.jsonl.gz",
+    "first_hop.jsonl.gz", "second_hop.jsonl.gz", "direct_exact.jsonl.gz", "matched_direct.jsonl.gz",
+)
+
+
+def _latest_success_receipts(stage_dir: Path) -> tuple[dict, dict]:
+    posts = [read_json(path) for path in sorted(stage_dir.glob("POST_RUN.attempt_*.json"))]
+    successful = [post for post in posts if post.get("status") == "SUCCESS"]
+    if not successful:
+        raise RuntimeError(f"{stage_dir}: no SUCCESS receipt to import")
+    post = successful[-1]
+    return read_json(stage_dir / f"PRE_RUN.{post['attempt_id']}.json"), post
+
+
+def import_teacher_chain(protocol_path: Path, run_root: Path, from_run: Path, reason: str) -> dict:
+    """Reuse another run's Raw pools, training lists and Teacher stages (TA, TB_CQET, TB_QT).
+
+    Everything upstream of the Students is a function of the dataset, the frozen features, the
+    seed and the protocol's ``teacher`` / ``retrieval`` blocks; when those agree, the Teacher
+    chain of ``from_run`` is the same experiment and only the Student stages need to run. The
+    files are copied (receipts byte for byte, so their recorded paths still name the source run),
+    each copy is re-hashed against the source receipts and pool manifests, and a source amendment
+    carries the three stages from the source run's code to the current one. Runs after ``lock``
+    and before ``prepare``, which rewrites the source manifest the amendment reads.
+    """
+    protocol, paths = _protocol_paths(protocol_path, run_root)
+    from_run = Path(from_run).resolve()
+    source = load_protocol(from_run / "protocol.json")
+    if not (paths.run_root / "CACHE_IDENTITY.json").exists():
+        raise RuntimeError("import-teacher runs after lock")
+    if (paths.run_root / "SOURCE_TREE_MANIFEST.jsonl").exists():
+        raise RuntimeError("import-teacher runs before prepare")
+    for name in ("DATASET_IDENTITY.json", "CACHE_IDENTITY.json"):
+        ours, theirs = read_json(paths.run_root / name)["identity_sha256"], read_json(from_run / name)["identity_sha256"]
+        if ours != theirs:
+            raise RuntimeError(f"{name} differs from {from_run}: the Teacher chain is not transferable")
+    for block in ("teacher", "retrieval", "feature_provenance"):
+        if protocol[block] != source[block]:
+            raise RuntimeError(f"protocol.{block} differs from {from_run}: the Teacher chain is not transferable")
+    missing = [seed for seed in protocol["seeds"] if seed not in source["seeds"]]
+    if missing:
+        raise RuntimeError(f"{from_run} has no seeds {missing}")
+
+    copied: dict[str, str] = {}
+
+    def copy_file(src: Path, dst: Path) -> str:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        digest = sha256_file(dst)
+        if digest != sha256_file(src):
+            raise RuntimeError(f"copy of {src} is corrupt")
+        copied[str(dst.relative_to(paths.run_root))] = digest
+        return digest
+
+    source_ids = set()
+    for seed in protocol["seeds"]:
+        src_seed, dst_seed = from_run / f"seed{seed}", paths.seed_dir(seed)
+        if dst_seed.exists():
+            raise RuntimeError(f"{dst_seed} exists; import-teacher needs an empty seed directory")
+        for bundle in ("training_records/raw_train", "eval/dev/raw"):
+            manifest = read_json(src_seed / bundle / "POOL_MANIFEST.json")
+            for name in POOL_BUNDLE_FILES:
+                digest = copy_file(src_seed / bundle / name, dst_seed / bundle / name)
+                key = "internal" if name == "pool_records.pt" else name.split(".")[0]
+                if key in manifest and manifest[key] != digest:
+                    raise RuntimeError(f"{bundle}/{name} does not match its POOL_MANIFEST")
+        list_hashes = {
+            name: copy_file(src_seed / "training_records" / f"{name}.jsonl.gz",
+                            dst_seed / "training_records" / f"{name}.jsonl.gz")
+            for name in TEACHER_CHAIN_LISTS
+        }
+        inputs = {  # what the imported receipts must agree with; PCA does not exist before prepare
+            "dataset_identity": read_json(paths.run_root / "DATASET_IDENTITY.json")["identity_sha256"],
+            "cache_identity": read_json(paths.run_root / "CACHE_IDENTITY.json")["identity_sha256"],
+            "raw_train_pool_manifest": copied[f"seed{seed}/training_records/raw_train/POOL_MANIFEST.json"],
+            "raw_dev_pool_manifest": copied[f"seed{seed}/eval/dev/raw/POOL_MANIFEST.json"],
+        }
+        for stage in TEACHER_CHAIN_STAGES:
+            pre, _post = _latest_success_receipts(src_seed / stage)
+            for key in ("dataset_identity", "cache_identity", "raw_train_pool_manifest", "raw_dev_pool_manifest"):
+                if pre["inputs"][key] != inputs[key]:
+                    raise RuntimeError(f"{stage}: receipt input {key} differs from the imported bundles")
+            for name, digest in pre["training_lists"].items():
+                if list_hashes[name] != digest:
+                    raise RuntimeError(f"{stage}: training list {name} differs from the imported file")
+            shutil.copytree(src_seed / stage, dst_seed / stage, symlinks=True)
+            source_ids.add(pre["source_identity_sha256"])
+        timing = src_seed / "timing" / "stages.jsonl"
+        if timing.exists():
+            for row in iter_jsonl(timing):
+                if row.get("stage") in TEACHER_CHAIN_STAGES:
+                    _append_jsonl(dst_seed / "timing" / "stages.jsonl", {**row, "imported_from": str(from_run)})
+
+    amendment = None
+    current = source_identity(paths)
+    if source_ids != {current}:
+        if len(source_ids) != 1:
+            raise RuntimeError(f"imported stages were trained under several sources: {sorted(source_ids)}")
+        previous = list(iter_jsonl(from_run / "SOURCE_TREE_MANIFEST.jsonl"))
+        if json_identity(previous) not in source_ids:
+            raise RuntimeError(f"{from_run}: SOURCE_TREE_MANIFEST.jsonl does not describe the Teacher stages' source")
+        write_jsonl(paths.run_root / "SOURCE_TREE_MANIFEST.jsonl", previous)
+        amendment = record_source_amendment(
+            paths, amendment_id=f"import-teacher-{from_run.name}", carried_stages=list(TEACHER_CHAIN_STAGES),
+            reason=reason,
+        )
+    for seed in protocol["seeds"]:
+        for stage in TEACHER_CHAIN_STAGES:
+            _completed_stage_result(paths, paths.seed_dir(seed) / stage, stage)  # the check train will run
+    receipt = {
+        "schema_version": VERSION,
+        "from_run": str(from_run),
+        "stages": list(TEACHER_CHAIN_STAGES),
+        "seeds": list(protocol["seeds"]),
+        "source_identity_sha256": sorted(source_ids),
+        "amendment": amendment,
+        "copied": copied,
+        "reason": reason,
+        "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    write_json(paths.run_root / "IMPORTED_TEACHER_CHAIN.json", receipt)
+    return receipt
 
 
 def prepare(protocol_path: Path, run_root: Path) -> None:
@@ -317,10 +445,12 @@ def _completed_stage_result(paths: Paths, stage_dir: Path, stage: str) -> Any | 
             f"{stage}: completed source differs; carry it over with `amend-source` "
             "before prepare, or invalidate it explicitly"
         )
-    for value in latest["outputs"].values():
+    for name, value in latest["outputs"].items():
         if not isinstance(value, dict) or "path" not in value:
             continue
-        path = Path(value["path"])
+        # Outputs are verified where this stage directory keeps them, not at the absolute path the
+        # receipt recorded, so a moved run root or a stage imported from another run checks its own files.
+        path = stage_dir / f"train.{latest['attempt_id']}.jsonl" if name == "train_log" else alias / name
         if not path.exists() or sha256_file(path) != value["sha256"]:
             raise RuntimeError(f"{stage}: completed output hash mismatch: {path}")
     if stage == "TA":

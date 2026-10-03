@@ -285,7 +285,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
     commands = ("init", "build-data", "encode", "pack", "lock", "verify-features", "prepare",
-                "validate", "smoke", "train", "train-side", "export", "amend-source")
+                "validate", "smoke", "train", "train-side", "export", "amend-source", "import-teacher")
     for command in commands:
         subparsers.add_parser(command).add_argument("--run-root", type=Path, required=True)
     init_parser = subparsers.choices["init"]
@@ -312,6 +312,10 @@ def main(argv: list[str] | None = None) -> None:
     amend.add_argument("--amendment-id", required=True)
     amend.add_argument("--carry", nargs="+", required=True)
     amend.add_argument("--reason", required=True)
+    import_parser = subparsers.choices["import-teacher"]
+    import_parser.add_argument("--from-run", type=Path, required=True,
+                               help="completed run root whose Raw pools, lists and TA/TB_CQET/TB_QT are reused")
+    import_parser.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
     run = args.run_root.resolve()
 
@@ -365,6 +369,9 @@ def main(argv: list[str] | None = None) -> None:
             pipeline.run_formal(protocol_path, run)
         elif args.command == "train-side":
             pipeline.run_side(protocol_path, run)
+        elif args.command == "import-teacher":
+            receipt = pipeline.import_teacher_chain(protocol_path, run, args.from_run.resolve(), args.reason)
+            print(json.dumps({k: v for k, v in receipt.items() if k != "copied"}, indent=2, ensure_ascii=False))
         else:
             unknown = set(args.carry) - set(pipeline.STAGES)
             if unknown:

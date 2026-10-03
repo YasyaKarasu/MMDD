@@ -863,6 +863,13 @@ def test_completed_stage_requires_success_source_and_output_hashes(tmp_path: Pat
     stage_dir = tmp_path / "seed13" / "TA"
     checkpoint = _write_completed_ta(stage_dir, source_identity(paths))
     assert _completed_stage_result(paths, stage_dir, "TA") == stage_dir / "checkpoints" / "epoch2.pt"
+    # Outputs are checked inside the stage directory, so a moved (or imported) stage still verifies
+    # although its receipt names the old absolute path.
+    moved = tmp_path / "elsewhere" / "TA"
+    moved.parent.mkdir()
+    stage_dir.rename(moved)
+    assert _completed_stage_result(paths, moved, "TA") == moved / "checkpoints" / "epoch2.pt"
+    moved.rename(stage_dir)
     checkpoint.write_bytes(b"changed")
     with pytest.raises(RuntimeError, match="output hash mismatch"):
         _completed_stage_result(paths, stage_dir, "TA")
@@ -911,6 +918,132 @@ def test_source_amendment_carries_only_declared_stages(tmp_path: Path):
     write_jsonl(paths.run_root / "SOURCE_TREE_MANIFEST.jsonl", current)
     with pytest.raises(RuntimeError, match="before prepare"):
         record_source_amendment(paths, amendment_id="a3", carried_stages=["TA"], reason="r")
+
+
+def _fake_run_root(root: Path, protocol: dict, identities: dict[str, str]) -> Path:
+    root.mkdir(parents=True)
+    protocol = json.loads(json.dumps(protocol))
+    protocol["paths"]["run_root"] = str(root)
+    (root / "protocol.json").write_text(json.dumps(protocol))
+    for name, value in identities.items():
+        (root / name).write_text(json.dumps({"identity_sha256": value}))
+    return root
+
+
+def _fake_pool_bundle(directory: Path) -> str:
+    from mmdd_stage1.pipeline import POOL_BUNDLE_FILES
+    directory.mkdir(parents=True)
+    manifest = {}
+    for name in POOL_BUNDLE_FILES:
+        if name == "POOL_MANIFEST.json":
+            continue
+        (directory / name).write_bytes(f"{directory.name}:{name}".encode())
+        key = "internal" if name == "pool_records.pt" else name.split(".")[0]
+        manifest[key] = hashlib.sha256(f"{directory.name}:{name}".encode()).hexdigest()
+    (directory / "POOL_MANIFEST.json").write_text(json.dumps(manifest))
+    return hashlib.sha256((directory / "POOL_MANIFEST.json").read_bytes()).hexdigest()
+
+
+def _fake_teacher_stage(stage_dir: Path, stage: str, source_sha: str, inputs: dict, lists: dict) -> None:
+    checkpoint_dir = stage_dir / "attempts" / "attempt_001" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    names = ("init.pt", "epoch1.pt", "epoch2.pt") if stage == "TA" else ("init.pt", "half.pt", "end.pt")
+    outputs = {}
+    for name in names:
+        (checkpoint_dir / name).write_bytes(f"{stage}:{name}".encode())
+        outputs[name] = {"path": str(checkpoint_dir / name), "sha256": hashlib.sha256(f"{stage}:{name}".encode()).hexdigest()}
+    log = stage_dir / "train.attempt_001.jsonl"
+    log.write_text("{}\n")
+    outputs["train_log"] = {"path": str(log), "sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
+    (stage_dir / "checkpoints").symlink_to(checkpoint_dir.relative_to(stage_dir))
+    (stage_dir / "PRE_RUN.attempt_001.json").write_text(json.dumps({
+        "source_identity_sha256": source_sha, "inputs": inputs, "training_lists": lists,
+    }))
+    (stage_dir / "POST_RUN.attempt_001.json").write_text(json.dumps({
+        "attempt_id": "attempt_001", "status": "SUCCESS", "outputs": outputs,
+    }))
+
+
+def test_import_teacher_chain_copies_verifies_and_carries_the_source(tmp_path: Path):
+    from mmdd_stage1.data import iter_jsonl, write_jsonl
+    from mmdd_stage1.pipeline import TEACHER_CHAIN_LISTS, TEACHER_CHAIN_STAGES, import_teacher_chain
+
+    repo = Path(__file__).resolve().parents[1]
+    protocol = json.loads((repo / "configs" / "mmdd_stage1_cqet_protocol.json").read_text())
+    protocol["hardware"]["uuid"] = "GPU-deadbeef"
+    protocol["paths"]["dataset_root"] = str(tmp_path / "dataset")
+    identities = {"DATASET_IDENTITY.json": "d" * 64, "CACHE_IDENTITY.json": "c" * 64}
+    old = _fake_run_root(tmp_path / "old", protocol, identities)
+    new = _fake_run_root(tmp_path / "new", {**protocol, "student": {**protocol["student"], "kd_top_k": 0}}, identities)
+    from mmdd_stage1.config import resolve_default_paths
+    new_paths = resolve_default_paths(new / "protocol.json", new)  # same backbone script as the pipeline hashes
+    # The source run's code differs from the current one in one file; its manifest records that.
+    previous = [dict(row) for row in source_manifest(new_paths)]
+    previous[0]["sha256"] = "0" * 64
+    write_jsonl(old / "SOURCE_TREE_MANIFEST.jsonl", previous)
+    old_source = json_identity(previous)
+    seed_dir = old / "seed13"
+    inputs = {
+        "dataset_identity": "d" * 64, "cache_identity": "c" * 64,
+        "raw_train_pool_manifest": _fake_pool_bundle(seed_dir / "training_records" / "raw_train"),
+        "raw_dev_pool_manifest": _fake_pool_bundle(seed_dir / "eval" / "dev" / "raw"),
+    }
+    lists = {}
+    for name in TEACHER_CHAIN_LISTS:
+        path = seed_dir / "training_records" / f"{name}.jsonl.gz"
+        path.write_bytes(name.encode())
+        lists[name] = hashlib.sha256(name.encode()).hexdigest()
+    _fake_teacher_stage(seed_dir / "TA", "TA", old_source, inputs, {"TA": lists["TA"]})
+    for stage in ("TB_CQET", "TB_QT"):
+        _fake_teacher_stage(seed_dir / stage, stage, old_source, inputs, {"TB_SHARED": lists["TB_SHARED"]})
+    write_jsonl(seed_dir / "timing" / "stages.jsonl", [
+        {"stage": "TA", "wall_seconds": 1.0}, {"stage": "NATIVE_C1_SUP", "wall_seconds": 2.0},
+    ])
+
+    receipt = import_teacher_chain(new / "protocol.json", new, old, reason="same teacher chain")
+    assert receipt["stages"] == list(TEACHER_CHAIN_STAGES) and receipt["source_identity_sha256"] == [old_source]
+    assert receipt["amendment"]["from_source_identity_sha256"] == old_source
+    assert receipt["amendment"]["to_source_identity_sha256"] == source_identity(new_paths)
+    assert receipt["amendment"]["carried_stages"] == list(TEACHER_CHAIN_STAGES)
+    assert (new / "IMPORTED_TEACHER_CHAIN.json").exists()
+    assert set(receipt["copied"]) >= {
+        "seed13/training_records/raw_train/pool_records.pt", "seed13/eval/dev/raw/POOL_MANIFEST.json",
+        "seed13/training_records/TB_SHARED.jsonl.gz",
+    }
+    # train's own reuse check passes on the copies although their receipts name the old run's paths
+    assert _completed_stage_result(new_paths, new / "seed13" / "TA", "TA") == new / "seed13" / "TA" / "checkpoints" / "epoch2.pt"
+    assert _completed_stage_result(new_paths, new / "seed13" / "TB_CQET", "TB_CQET") == new / "seed13" / "TB_CQET" / "checkpoints" / "end.pt"
+    assert json.loads((new / "seed13" / "TB_QT" / "POST_RUN.attempt_001.json").read_text())["outputs"]["end.pt"]["path"].startswith(str(old))
+    assert [row["stage"] for row in iter_jsonl(new / "seed13" / "timing" / "stages.jsonl")] == ["TA"]
+    assert next(iter_jsonl(new / "seed13" / "timing" / "stages.jsonl"))["imported_from"] == str(old)
+    # The copied manifest is the source run's; prepare rewrites it, and amend-source after that would be a no-op error.
+    assert json_identity(list(iter_jsonl(new / "SOURCE_TREE_MANIFEST.jsonl"))) == old_source
+
+    with pytest.raises(RuntimeError, match="before prepare"):  # the copied manifest now marks the run as amended
+        import_teacher_chain(new / "protocol.json", new, old, reason="again")
+    occupied = _fake_run_root(tmp_path / "occupied", protocol, identities)
+    (occupied / "seed13").mkdir()
+    with pytest.raises(RuntimeError, match="empty seed directory"):
+        import_teacher_chain(occupied / "protocol.json", occupied, old, reason="x")
+
+    # Fail closed on a different feature cache, a different teacher recipe, or a seed the source lacks.
+    other = _fake_run_root(tmp_path / "other_cache", protocol, {**identities, "CACHE_IDENTITY.json": "e" * 64})
+    with pytest.raises(RuntimeError, match="CACHE_IDENTITY.json differs"):
+        import_teacher_chain(other / "protocol.json", other, old, reason="x")
+    changed = _fake_run_root(tmp_path / "other_teacher", {**protocol, "teacher": {**protocol["teacher"], "width": 256}}, identities)
+    with pytest.raises(RuntimeError, match="protocol.teacher differs"):
+        import_teacher_chain(changed / "protocol.json", changed, old, reason="x")
+    seeds = _fake_run_root(tmp_path / "other_seed", {**protocol, "seeds": [17]}, identities)
+    with pytest.raises(RuntimeError, match="no seeds"):
+        import_teacher_chain(seeds / "protocol.json", seeds, old, reason="x")
+    # and before lock / after prepare
+    unlocked = _fake_run_root(tmp_path / "unlocked", protocol, {"DATASET_IDENTITY.json": "d" * 64})
+    with pytest.raises(RuntimeError, match="after lock"):
+        import_teacher_chain(unlocked / "protocol.json", unlocked, old, reason="x")
+    prepared = _fake_run_root(tmp_path / "prepared", protocol, identities)
+    write_jsonl(prepared / "SOURCE_TREE_MANIFEST.jsonl", previous)
+    with pytest.raises(RuntimeError, match="before prepare"):
+        import_teacher_chain(prepared / "protocol.json", prepared, old, reason="x")
 
 
 def test_teacher_matrix_modes_direct_only_and_swap_collision_ledger(tmp_path: Path):
