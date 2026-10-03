@@ -18,7 +18,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -38,6 +38,23 @@ class Head(nn.Module):
 
     def forward(self, opened: torch.Tensor, closed: torch.Tensor) -> torch.Tensor:
         return self.weight(torch.cat([opened, closed], dim=-1)).squeeze(-1)
+
+    def forward_many(self, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, ...]:
+        """Batch the wide input projection, preserving per-pair training and column order.
+
+        A single dropout call over all columns would change the seeded masks. Training also
+        keeps the scalar output layer per pair: its bias gradient sums to nearly zero under
+        column softmax, so changing that reduction order can amplify roundoff through Adam.
+        """
+        if not pairs:
+            return ()
+        lengths = [len(opened) for opened, _ in pairs]
+        x = torch.cat([torch.cat([opened, closed], dim=-1) for opened, closed in pairs])
+        hidden = self.weight[0](x)
+        if self.training:
+            return tuple(self.weight[3](self.weight[2](self.weight[1](part))).squeeze(-1)
+                         for part in hidden.split(lengths))
+        return self.weight[3](self.weight[2](self.weight[1](hidden))).squeeze(-1).split(lengths)
 
 
 def column_loss(logits: torch.Tensor, columns: list[int], gold: list[int]) -> torch.Tensor:
@@ -79,10 +96,11 @@ def train_head(config: dict[str, Any], run: Path) -> None:
             optimizer.zero_grad(set_to_none=True)
             torch.manual_seed(seed * 1_000_000 + epoch * 10_000 + start // h["batch_pairs"])  # dropout masks
             terms = []
-            for i in order[start:start + h["batch_pairs"]]:
-                job = fit[i]
-                opened, closed, columns = features[view, job["pair_id"]]
-                loss = column_loss(head(opened, closed), columns, gold[job["pair_id"]])
+            batch = [fit[i] for i in order[start:start + h["batch_pairs"]]]
+            batch_features = [features[view, job["pair_id"]] for job in batch]
+            logits = head.forward_many([(opened, closed) for opened, closed, _ in batch_features])
+            for job, (_, _, columns), scores in zip(batch, batch_features, logits):
+                loss = column_loss(scores, columns, gold[job["pair_id"]])
                 terms.append(loss * weight[job["pair_id"]])
                 losses.append(float(loss.detach()))
             loss = torch.stack(terms).mean()
@@ -91,7 +109,7 @@ def train_head(config: dict[str, Any], run: Path) -> None:
             optimizer.step()
         record = {"epoch": epoch, "view": view, "loss": float(np.mean(losses))}
         if epoch == 1 or epoch % 5 == 0:
-            record.update(holdout_metrics(head, holdout, features, gold))
+            record.update(holdout_metrics(head, holdout, features, gold, batch_pairs=h["batch_pairs"]))
         history.append(record)
         print(json.dumps(record), flush=True)
     (run / "head").mkdir(exist_ok=True)
@@ -100,17 +118,22 @@ def train_head(config: dict[str, Any], run: Path) -> None:
                                                "holdout_pairs": len(holdout), "epochs": history})
 
 
-def holdout_metrics(head: Head, jobs: list[dict], features: dict, gold: dict) -> dict[str, float]:
+def holdout_metrics(head: Head, jobs: list[dict], features: dict, gold: dict, *, batch_pairs: int = 32) -> dict[str, float]:
     """Query-averaged MRR / Hit@1 / Hit@3 of the first gold column (view 0)."""
     head.eval()
     per_query = collections.defaultdict(list)
     with torch.inference_mode():
-        for job in jobs:
-            opened, closed, columns = features[0, job["pair_id"]]
-            scores = head(opened, closed).tolist()
-            order = sorted(range(len(columns)), key=lambda i: (-scores[i], columns[i]))
-            rank = min(position + 1 for position, i in enumerate(order) if columns[i] in gold[job["pair_id"]])
-            per_query[job["query_id"]].append((1 / rank, float(rank <= 1), float(rank <= 3)))
+        for start in range(0, len(jobs), batch_pairs):
+            batch = jobs[start:start + batch_pairs]
+            batch_features = [features[0, job["pair_id"]] for job in batch]
+            logits = head.forward_many([(opened, closed) for opened, closed, _ in batch_features])
+            scores = torch.cat(logits).tolist()
+            offset = 0
+            for job, (_, _, columns) in zip(batch, batch_features):
+                order = sorted(range(len(columns)), key=lambda i: (-scores[offset + i], columns[i]))
+                rank = min(position + 1 for position, i in enumerate(order) if columns[i] in gold[job["pair_id"]])
+                per_query[job["query_id"]].append((1 / rank, float(rank <= 1), float(rank <= 3)))
+                offset += len(columns)
     values = np.array([np.mean(v, axis=0) for v in per_query.values()])
     return {"holdout_MRR": float(values[:, 0].mean()), "holdout_Hit1": float(values[:, 1].mean()),
             "holdout_Hit3": float(values[:, 2].mean())}
@@ -166,6 +189,7 @@ def build_plan(query_id: str, candidates: list[str], table_logits: dict[str, flo
 def make_plans(config: dict[str, Any], run: Path) -> None:
     """Score every dev/test C30 column with the trained head and write ``plans/<split>.jsonl``."""
     h = config["head"]
+    torch.set_num_threads(config["cpu_threads"])
     head = Head(h["input_dim"], h["hidden_dim"], h["dropout"])
     head.load_state_dict(torch.load(run / "head" / "head.pt", map_location="cpu", weights_only=True)["state_dict"])
     head.eval()
@@ -180,9 +204,10 @@ def make_plans(config: dict[str, Any], run: Path) -> None:
         with torch.inference_mode():
             for query_id, jobs in by_query.items():
                 column_logits = {}
-                for job in jobs:
-                    opened, closed, columns = load_features(run, split, 0, job["pair_id"])
-                    column_logits[job["target_id"]] = dict(zip(columns, head(opened, closed).tolist() if columns else []))
+                batch_features = [load_features(run, split, 0, job["pair_id"]) for job in jobs]
+                logits = head.forward_many([(opened, closed) for opened, closed, _ in batch_features])
+                for job, (_, _, columns), scores in zip(jobs, batch_features, logits):
+                    column_logits[job["target_id"]] = dict(zip(columns, scores.tolist()))
                 record = stage1[query_id]
                 tables = {t: catalog.get("target", t) for t in record["candidates"]}
                 views, selected = build_plan(query_id, record["candidates"], record["table_logits"], column_logits,

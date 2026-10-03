@@ -546,6 +546,14 @@ python src/run_stage2.py score --run-root work/stage2_entitables
 python src/run_stage2.py evaluate --run-root work/stage2_entitables
 ```
 
+The selector batches its wide input projection during training while preserving
+per-pair dropout calls, output-layer reductions, query weights and view order.
+Holdout evaluation and plan scoring also batch columns; `plans` respects
+`cpu_threads`. The image localizer captures only image/attribute V rows, copies
+them after the forward, and normalizes image vectors once per layer. Prompts,
+generation batches and crop formulas remain the same. Existing feature and
+checkpoint formats are compatible; float32 batching may slightly change logits.
+
 This is the R7 fresh-selector B arm (`audit/MMDD_R7_FRESH_AB_C30_D098_PACKAGE`) plus
 the LEXICO IDF scorer, merged and moved to C30. The earlier RATA/FOCUS verifier
 and the r4/r4c/r5b/r12/r25/r26/column-R1/R2 experiment code were removed. They

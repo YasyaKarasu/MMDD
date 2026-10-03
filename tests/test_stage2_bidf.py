@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import math
+import copy
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from mmdd_stage2 import localizer, matching, recovery, selector, stage1, values, visible
 from mmdd_stage2.evaluate import metrics
@@ -172,3 +174,82 @@ def test_recall_is_a_fraction_of_gold():
     m = metrics(["a", "x", "b"], {"a", "b", "c"}, [1, 3])
     assert m["R1"] == pytest.approx(1 / 3) and m["R3"] == pytest.approx(2 / 3)
     assert m["NDCG3"] == pytest.approx((1 + 1 / math.log2(4)) / (1 + 1 / math.log2(3) + 1 / math.log2(4)))
+
+
+def test_selector_batch_preserves_dropout_rng_weighted_loss_gradients_and_updates():
+    torch.manual_seed(17)
+    head = selector.Head(32, 16, dropout=0.3).train()
+    reference = copy.deepcopy(head)
+    pairs = [(torch.randn(n, 16), torch.randn(n, 16)) for n in (3, 7, 1, 5)]
+    columns = [[8, 2, 1], [7, 6, 5, 4, 3, 2, 1], [0], [5, 4, 3, 2, 1]]
+    gold = [[2, 1], [6, 2], [0], [4]]
+    weights = [0.5, 2, 0.5, 1]
+    optimizer = torch.optim.AdamW(head.parameters(), lr=3e-4)
+    ref_optimizer = torch.optim.AdamW(reference.parameters(), lr=3e-4)
+    for seed in (53, 71):
+        optimizer.zero_grad(set_to_none=True)
+        ref_optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(seed)
+        expected = [reference(opened, closed) for opened, closed in pairs]
+        expected_rng = torch.get_rng_state()
+        torch.manual_seed(seed)
+        actual = head.forward_many(pairs)
+        assert torch.equal(torch.get_rng_state(), expected_rng)
+        for x, y in zip(actual, expected):
+            torch.testing.assert_close(x, y, atol=1e-7, rtol=1e-5)
+        loss = torch.stack([selector.column_loss(s, c, g) * w for s, c, g, w in zip(actual, columns, gold, weights)]).mean()
+        ref_loss = torch.stack([selector.column_loss(s, c, g) * w for s, c, g, w in zip(expected, columns, gold, weights)]).mean()
+        torch.testing.assert_close(loss, ref_loss)
+        loss.backward()
+        ref_loss.backward()
+        for p, ref in zip(head.parameters(), reference.parameters()):
+            torch.testing.assert_close(p.grad, ref.grad, atol=1e-7, rtol=1e-5)
+        for model, opt in ((head, optimizer), (reference, ref_optimizer)):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        for p, ref in zip(head.parameters(), reference.parameters()):
+            torch.testing.assert_close(p, ref, atol=2e-6, rtol=1e-5)
+
+
+def test_selector_batched_inference_preserves_empty_columns_and_holdout_ties():
+    head = selector.Head(8, 4, 0.3).eval()
+    pairs = [(torch.randn(n, 4), torch.randn(n, 4)) for n in (0, 3, 1, 0)]
+    with torch.inference_mode():
+        for actual, (opened, closed) in zip(head.forward_many(pairs), pairs):
+            torch.testing.assert_close(actual, head(opened, closed))
+    assert head.forward_many([]) == ()
+    with torch.no_grad():
+        for p in head.parameters():
+            p.zero_()
+    jobs = [{"query_id": "q0", "pair_id": "a"}, {"query_id": "q0", "pair_id": "b"},
+            {"query_id": "q1", "pair_id": "c"}]
+    features = {(0, key): (*pairs[1], [2, 0, 1]) for key in ("a", "b", "c")}
+    gold = {"a": [2], "b": [0], "c": [1]}
+    expected = {"holdout_MRR": ((1 / 3 + 1) / 2 + 1 / 2) / 2, "holdout_Hit1": 0.25, "holdout_Hit3": 1.0}
+    assert selector.holdout_metrics(head, jobs, features, gold, batch_pairs=2) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("attribute_count", [0, 1, 5])
+@pytest.mark.parametrize("flat", [False, True])
+def test_compact_localizer_preserves_original_token_maps_and_crop(attribute_count, flat):
+    torch.manual_seed(11)
+    image_tokens = [1, 4, 8, 9, 10, 12]
+    attribute_tokens = list(range(20, 20 + attribute_count))
+    layers = [torch.randn(32, 8) for _ in range(3)]
+    if flat:
+        layers = [torch.ones_like(v) for v in layers]
+    reference_maps = []
+    for token in attribute_tokens:
+        per_layer = [(torch.nn.functional.normalize(v[image_tokens], dim=-1)
+                      @ torch.nn.functional.normalize(v[token], dim=0)).reshape(2, 3).numpy() for v in layers]
+        token_map = localizer.minmax_map(np.stack(per_layer).mean(0), 1e-8)
+        if token_map is not None:
+            reference_maps.append(token_map)
+    expected = localizer.aggregate_raea(reference_maps, 1e-8)["consensus"]
+    actual = localizer.attribute_consensus([v[image_tokens + attribute_tokens] for v in layers], (2, 3), 1e-8)
+    if expected is None:
+        assert actual is None
+    else:
+        np.testing.assert_array_equal(actual, expected)
+        policy = json.loads((Path(__file__).resolve().parents[1] / "configs" / "mmdd_stage2_bidf.json").read_text())["crop"]
+        assert localizer.crop_box(actual, (640, 480), policy) == localizer.crop_box(expected, (640, 480), policy)

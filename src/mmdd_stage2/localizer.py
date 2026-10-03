@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -218,6 +218,24 @@ def localization_prompt(row: dict[str, Any], attribute: str, tokenizer: Any) -> 
             "relation. No answer generation.\n")
 
 
+def attribute_consensus(layer_values: Sequence[torch.Tensor], grid: tuple[int, int], epsilon: float) -> np.ndarray | None:
+    """RAEA maps from compact CPU V rows: image tokens first, then attribute tokens.
+
+    Image vectors are normalized once per layer. Keep the original per-token matvec and
+    layer-mean order so the crop statistics retain their floating-point behavior.
+    """
+    image_count = grid[0] * grid[1]
+    normalized_images = [F.normalize(values[:image_count], dim=-1) for values in layer_values]
+    token_maps = []
+    for token in range(image_count, len(layer_values[0])):
+        per_layer = [(images @ F.normalize(values[token], dim=0)).reshape(grid).numpy()
+                     for images, values in zip(normalized_images, layer_values)]
+        token_map = minmax_map(np.stack(per_layer).mean(0), epsilon)
+        if token_map is not None:
+            token_maps.append(token_map)
+    return aggregate_raea(token_maps, epsilon)["consensus"]
+
+
 class ImageLocalizer:
     """Shares the recovery generator's model; one extra forward per (row, attribute, image).
 
@@ -267,11 +285,14 @@ class ImageLocalizer:
         gh, gw = h // merge, w // merge
         if gh * gw != len(image_tokens):
             raise RuntimeError("localizer image grid does not match the image token count")
+        # Text outside the attribute never participates in the maps. Keep just these rows
+        # on device during the forward, then copy them after all hooks have completed.
+        selected = torch.tensor([*image_tokens, *attribute_tokens], device="cuda:0")
         captured: dict[int, torch.Tensor] = {}
         handles = []
         for layer in self.policy["layers"]:
             def hook(_module, _args, output, index=layer):
-                captured[index] = output.detach()[0].float().cpu()
+                captured[index] = output.detach()[0].index_select(0, selected).float()
             handles.append(self.layers[layer].self_attn.v_proj.register_forward_hook(hook))
         previous_rope = getattr(model.model, "rope_deltas", None)
         try:
@@ -283,14 +304,5 @@ class ImageLocalizer:
                 handle.remove()
             model.model.rope_deltas = previous_rope
         self.stats["forwards"] += 1
-        token_maps = []
-        for token in attribute_tokens:
-            per_layer = []
-            for layer in self.policy["layers"]:
-                values = captured[layer]
-                cosine = F.normalize(values[image_tokens], dim=-1) @ F.normalize(values[token], dim=0)
-                per_layer.append(cosine.reshape(gh, gw).numpy())
-            token_map = minmax_map(np.stack(per_layer).mean(0), self.policy["flat_epsilon"])
-            if token_map is not None:
-                token_maps.append(token_map)
-        return aggregate_raea(token_maps, self.policy["flat_epsilon"])["consensus"]
+        return attribute_consensus([captured[layer].cpu() for layer in self.policy["layers"]],
+                                   (gh, gw), self.policy["flat_epsilon"])
