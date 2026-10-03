@@ -816,6 +816,7 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     teacher_ta = rt.protocol["teacher"]["TA"]
     teacher_tb = rt.protocol["teacher"]["TB"]
     recipe = StudentRecipe.from_protocol(rt.protocol)
+    c1_recipe = StudentRecipe.from_protocol(rt.protocol, stage="C1")
     evidence_pool = _evidence_pool(rt.labels)
     _set_seed(13, "SMOKE_TA")
     ta_model = _teacher()
@@ -844,12 +845,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     native = NativeStudent(rt.pca_basis, rt.pca_mean)
     native_points = train_student_c1(
         native, edge_lists, rt.bank, arm="NATIVE_SUP", logical_batch=64,
-        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, recipe=recipe,
+        save_dir=smoke_root / "NATIVE_C1_SUP", seed=13, recipe=c1_recipe,
     )
     qt = QTStudent(rt.pca_basis, rt.pca_mean)
     train_student_c1(
         qt, edge_lists, rt.bank, arm="QT_SUP", logical_batch=64,
-        save_dir=smoke_root / "QT_C1_SUP", seed=13, recipe=recipe,
+        save_dir=smoke_root / "QT_C1_SUP", seed=13, recipe=c1_recipe,
     )
     native_parent = native_points[1.0]
     native_selected = _load_native(native_parent, rt)
@@ -984,7 +985,7 @@ def _tb_stage(
 def _c1_stage(
     rt: Runtime, seed: int, edge_lists: Sequence[dict], list_hash: str, common_inputs: dict, *, qt: bool,
 ) -> dict[float, Path]:
-    recipe = StudentRecipe.from_protocol(rt.protocol)
+    recipe = StudentRecipe.from_protocol(rt.protocol, stage="C1")
     c1_epochs = int(rt.protocol["student"]["C1"]["epochs"])
     c1_batch = int(rt.protocol["student"]["C1"]["logical_batch_edge_lists"])
     records = [row for row in edge_lists if row["relation"] == "QT"] if qt else edge_lists

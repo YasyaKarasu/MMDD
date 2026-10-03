@@ -120,6 +120,11 @@ def validate_protocol(p: Mapping[str, Any]) -> None:
             raise ValueError(f"student.{key} must be a number")
     if student["logit_scale"] <= 0 or student["temperature"] <= 0:
         raise ValueError("student.logit_scale and student.temperature must be positive")
+    for stage in ("C1", "C2"):
+        for key in ("P_lr", "R_lr"):
+            value = student.get(stage, {}).get(key)
+            if value is not None and (not isinstance(value, (int, float)) or value <= 0):
+                raise ValueError(f"student.{stage}.{key} must be a positive number when present")
     if student.get("lr_schedule") not in ("constant", "cosine"):
         raise ValueError("student.lr_schedule must be constant or cosine")
     if student.get("kd_normalization") not in ("temperature", "zscore"):

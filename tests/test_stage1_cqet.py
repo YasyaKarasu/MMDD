@@ -1287,6 +1287,29 @@ def test_c1_uses_logit_scale_and_optional_anchor(tmp_path: Path):
     assert "sigma1_R_QT_minus_I" in row
 
 
+def test_student_recipe_stage_block_overrides_learning_rates():
+    import pytest
+    from mmdd_stage1.config import validate_protocol
+
+    repo = Path(__file__).resolve().parents[1]
+    protocol = json.loads((repo / "configs" / "mmdd_stage1_cqet_protocol.json").read_text())
+    student = protocol["student"]
+    student["P_lr"], student["R_lr"] = 1e-4, 1e-3
+    student["C1"]["P_lr"], student["C1"]["R_lr"] = 2e-6, 3e-5
+    student["C2"].pop("P_lr", None), student["C2"].pop("R_lr", None)
+    assert (StudentRecipe.from_protocol(protocol, stage="C1").lr_p, StudentRecipe.from_protocol(protocol, stage="C1").lr_r) == (2e-6, 3e-5)
+    # C2 has no block override and keeps the shared rates; the default stage is C2
+    assert (StudentRecipe.from_protocol(protocol).lr_p, StudentRecipe.from_protocol(protocol, stage="C2").lr_r) == (1e-4, 1e-3)
+    validate_protocol(protocol)
+    student["C1"]["R_lr"] = 0
+    with pytest.raises(ValueError, match="student.C1.R_lr"):
+        validate_protocol(protocol)
+    del student["C1"]["R_lr"]
+    student["C1"]["P_lr"] = "fast"
+    with pytest.raises(ValueError, match="student.C1.P_lr"):
+        validate_protocol(protocol)
+
+
 def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
     from mmdd_stage1 import EXPERIMENT_ID, VERSION
     from mmdd_stage1.config import load_protocol, resolve_default_paths, validate_protocol
@@ -1301,8 +1324,13 @@ def test_protocol_template_validates_and_binds_paths_and_gpu(tmp_path: Path):
     assert (recipe.lr_p, recipe.lr_r, recipe.logit_scale) == (1e-4, 1e-3, 20.0)
     assert (recipe.kd_weight, recipe.kd_temperature, recipe.random_negatives) == (1.0, 10.0, 256)
     assert recipe.anchor_weight == 0.0
-    assert (recipe.lr_schedule, recipe.kd_normalization, recipe.kd_top_k) == ("cosine", "temperature", 50)
+    assert (recipe.lr_schedule, recipe.kd_normalization, recipe.kd_top_k) == ("cosine", "temperature", 0)
     assert recipe.teacher_scored_negatives is True and recipe.evidence_random_negatives == 256
+    c1 = StudentRecipe.from_protocol(protocol, stage="C1")
+    assert (c1.lr_p, c1.lr_r) == (protocol["student"]["C1"]["P_lr"], protocol["student"]["C1"]["R_lr"])
+    assert c1.lr_p < recipe.lr_p and c1.lr_r < recipe.lr_r
+    assert {k: v for k, v in c1.as_dict().items() if k not in ("lr_p", "lr_r")} == \
+        {k: v for k, v in recipe.as_dict().items() if k not in ("lr_p", "lr_r")}
 
     protocol["hardware"]["uuid"] = "GPU-deadbeef"
     protocol["paths"]["run_root"] = str(tmp_path / "run")

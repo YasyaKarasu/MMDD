@@ -151,6 +151,8 @@
     "temperature": 10.0,
     "C1": {
       "epochs": 1,
+      "P_lr": 1e-05,
+      "R_lr": 0.0001,
       "logical_batch_edge_lists": 64,
       "hard": 32,
       "uniform": 31,
@@ -199,10 +201,10 @@
     "random_negatives": 256,
     "lr_schedule": "cosine",
     "kd_normalization": "temperature",
-    "kd_top_k": 50,
+    "kd_top_k": 0,
     "teacher_scored_negatives": true,
     "evidence_random_negatives": 256,
-    "recipe_note": "V4.2: student scores are multiplied by logit_scale before every softmax loss; KD = KL(softmax(teacher/temperature) || softmax(student)) with weight kd_weight; each C2 direct list gets random_negatives uniform draws from legal_targets; anchor MSE is off (0) and R_QT drift is logged as sigma1/sigma2 of R_QT - I. Diagnosis plans A-D (docs/entitables_kd_distillation_diagnosis_20261001.zh-CN.md): cosine LR decay over each Student stage and 3 C2 epochs selected on dev; teacher_scored_negatives fixes the random negatives per query, the frozen TB_CQET scores them and KD covers the same lists as SUP; kd_top_k focuses the KL on the teacher's top 50 and ranks the rest below them; evidence_random_negatives gives that many random negatives a one-path bag with a random canonical evidence object, so the evidence lists are anchored like the direct list."
+    "recipe_note": "V4.2: student scores are multiplied by logit_scale before every softmax loss; KD = KL(softmax(teacher/temperature) || softmax(student)) with weight kd_weight over the full teacher-scored list (kd_top_k = 0: the top-k variant with a rank-mass tail was tried in work/stage1_entitables_abcd_s13 and cost 4-5 pp dev Direct R@10 against the full-list KL, see docs/stage1_r2_fullkd_mildc1_teacher_continuation_gemini_task.zh-CN.md); each C2 direct list gets random_negatives uniform draws from legal_targets, fixed per query and scored by the frozen TB_CQET (teacher_scored_negatives); anchor MSE is off (0) and R_QT drift is logged as sigma1/sigma2 of R_QT - I. C1 trains at its own milder P_lr/R_lr (student.C1.P_lr/R_lr): at the shared 1e-4/1e-3 the C1 edge lists raised D150 coverage but cut the dev E-pool coverage from 0.68 to 0.33 and the C150-first selection fell back to fraction 0. Cosine LR decay over each Student stage, 3 C2 epochs selected on dev, evidence_random_negatives gives that many random negatives a one-path bag with a random canonical evidence object so the evidence lists are anchored like the direct list (plan D, still unablated)."
   },
   "numerics": {
     "task_dtype": "float32",

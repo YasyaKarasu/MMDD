@@ -375,7 +375,8 @@ written into every stage receipt and training-log row so a run can be audited po
 
 | key | value | why |
 |---|---|---|
-| `P_lr` / `R_lr` | 1e-4 / 1e-3 | at 1e-6 / 1e-5 the Student never left its PCA/identity initialisation |
+| `P_lr` / `R_lr` | 1e-4 / 1e-3 (C2) | at 1e-6 / 1e-5 the Student never left its PCA/identity initialisation |
+| `C1.P_lr` / `C1.R_lr` | 1e-5 / 1e-4 | a stage block may override the shared rates (`StudentRecipe.from_protocol(protocol, stage="C1")`). At the shared 1e-4 / 1e-3 the C1 edge lists (64 candidates, 32 Raw-space hard negatives) raised dev D150 coverage by 12 pp but cut E-pool coverage from 0.68 to 0.33 within 120 steps, so the C150-first selection fell back to fraction 0 (`work/stage1_entitables_abcd_s13`) |
 | `logit_scale` | 20 | bilinear scores are cosine-sized; without the scale every softmax loss sits at `log N` |
 | `temperature` | 10 | teacher logits span ~40; at τ=1 the KD target is one-hot and KD degenerates to SUP |
 | `kd_weight` | 1.0 | KD-only and SUP+KD both beat SUP by 3–5 pp dev R@10 once τ is matched |
@@ -384,11 +385,13 @@ written into every stage receipt and training-log row so a run can be audited po
 | `lr_schedule` | `cosine` | LR decays to 0 over each Student stage (`C2.epochs = 3`); in the probe KD peaked mid-run and fell back under a constant LR |
 | `kd_normalization` | `temperature` | `zscore` standardises each teacher list before dividing by `temperature`, removing the dependence on the teacher's logit range |
 | `teacher_scored_negatives` | true | the random negatives are fixed per query (`train.c2_training_row`, epoch-independent), the frozen TB_CQET scores them in `teacher_logits_cache`, and KD covers the same lists as SUP. Every C2 arm trains on the same extended lists |
-| `kd_top_k` | 50 | the KL covers only the teacher's top 50 (teacher entropy ≈ 1.1 nat); the rest only has to rank below that set (`losses.top_k_list_kd`) |
+| `kd_top_k` | 0 | full-list KL. `k > 0` restricts the KL to the teacher's top-k and adds a rank-mass term that ranks the rest below them (`losses.top_k_list_kd`); with `k = 50` that term (≈ 49 non-gold candidates treated as positives, loss stuck at ≈ 1.1) cost 4–5 pp dev Direct R@10 against the full-list KL in a direct-only probe on `work/stage1_entitables_abcd_s13` and turned KD − SUP negative |
 | `evidence_random_negatives` | 256 | that many random negatives get a one-path bag with a random canonical evidence object, so they also enter the evidence list and anchor `Q_text/Q_image/text_T/image_T` the way the direct negatives anchor `QT` |
 
-The first six rows are the probe-validated fix (plans A/B in the diagnosis). `teacher_scored_negatives`,
-`kd_top_k`, and `evidence_random_negatives` (plans C/D) and the cosine schedule are untested hypotheses.
+The first rows are the probe-validated fix (plans A/B in the diagnosis). In the direct-only probe on
+`work/stage1_entitables_abcd_s13` (`work/stage1_entitables_abcd_s13_probe/`), `teacher_scored_negatives` with the
+cosine schedule and the full-list KL gave SUP+KD 0.470 vs SUP 0.436 dev R@10 at the selected fraction; `kd_top_k = 50`
+alone reversed that (plan C.2, off since). `evidence_random_negatives` (plan D) is still unablated.
 Each one is a protocol switch, so it can be ablated against its "off" value (`false` / `0` / `constant`).
 `teacher_logits_cache/scores.pt` holds `{query_id: {direct, evidence, list_sha256}}`. `train_student_c2`
 refuses a cache whose `list_sha256` differs from the lists it would train on.

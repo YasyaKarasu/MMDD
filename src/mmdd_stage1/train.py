@@ -93,11 +93,14 @@ class StudentRecipe:
     evidence_random_negatives: int = 0  # random negatives that get a one-path bag with random evidence
 
     @classmethod
-    def from_protocol(cls, protocol: Mapping) -> "StudentRecipe":
+    def from_protocol(cls, protocol: Mapping, stage: str = "C2") -> "StudentRecipe":
+        """Recipe of a Student stage: ``student.P_lr/R_lr`` unless the stage block (``student.C1`` /
+        ``student.C2``) carries its own ``P_lr`` / ``R_lr``; everything else is shared."""
         student = protocol["student"]
+        block = student.get(stage, {})
         return cls(
-            lr_p=float(student["P_lr"]),
-            lr_r=float(student["R_lr"]),
+            lr_p=float(block.get("P_lr", student["P_lr"])),
+            lr_r=float(block.get("R_lr", student["R_lr"])),
             logit_scale=float(student["logit_scale"]),
             kd_weight=float(student["kd_weight"]),
             kd_temperature=float(student["temperature"]),
