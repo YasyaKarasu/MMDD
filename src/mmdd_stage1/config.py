@@ -109,8 +109,18 @@ def validate_protocol(p: Mapping[str, Any]) -> None:
     for key, expected in locked_budgets.items():
         if retrieval.get(key) != expected:
             raise ValueError(f"retrieval.{key} must be {expected}")
-    if retrieval.get("formal_hops") != "all_ANN":
-        raise ValueError("all formal hops must use ANN")
+    if retrieval.get("formal_hops") not in ("all_ANN", "exact"):
+        raise ValueError("retrieval.formal_hops must be all_ANN (HNSW with exact audit) or exact (GPU brute force)")
+    teacher = p.get("teacher", {})
+    if teacher.get("path_mode", "triplet") not in ("triplet", "pairwise_residual"):
+        raise ValueError("teacher.path_mode must be triplet or pairwise_residual")
+    tb = teacher.get("TB", {})
+    if tb.get("path_loss_scope", "all") not in ("all", "bagged"):
+        raise ValueError("teacher.TB.path_loss_scope must be all or bagged")
+    for key, kind in (("witness_target_weight", (int, float)), ("support_competitors", int)):
+        value = tb.get(key)
+        if value is not None and (not isinstance(value, kind) or value < 0):
+            raise ValueError(f"teacher.TB.{key} must be a non-negative number when present")
     numerics = p.get("numerics", {})
     if numerics.get("task_dtype") != "float32" or numerics.get("AMP") is not False:
         raise ValueError("task numerics must remain FP32 without AMP")

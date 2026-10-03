@@ -38,7 +38,7 @@ from mmdd_stage1.losses import (
     hierarchical_support_mean,
 )
 from mmdd_stage1.models import FreshPathTeacher, NativeStudent
-from mmdd_stage1.retrieval import HNSWIndex, PathEntry, PoolRecord, d1_retain, p3_admission
+from mmdd_stage1.retrieval import HNSWIndex, PathEntry, PoolRecord, d1_retain, d1_retain_batch, d1_retain_with_trace, p3_admission
 from mmdd_stage1.provenance import assert_declared_project_imports
 from mmdd_stage1.pipeline import _completed_stage_result
 from mmdd_stage1.probes import (
@@ -1929,3 +1929,166 @@ def test_selection_is_reused_only_while_its_checkpoint_is_unchanged(tmp_path: Pa
     assert pipeline._selection(path, select)["call"] == 1  # written by the other process: reused
     checkpoint.write_bytes(b"b")
     assert pipeline._selection(path, select)["call"] == 2
+
+
+def test_pairwise_residual_teacher_starts_at_f0_and_warm_starts_from_triplet(tmp_path: Path):
+    """A fresh ``path_head`` is zero, so every path scores f0 and the bag aggregate equals f0;
+    loading a triplet checkpoint into a pairwise_residual Teacher keeps every shared weight."""
+    from mmdd_stage1.pipeline import _load_teacher
+
+    torch.manual_seed(3)
+    bank, records, _basis, _mean = tiny_fixture()
+    triplet = FreshPathTeacher(input_dim=4, width=4, heads=1, layers=1, ffn=8, text_slots=1, image_slots=1, dropout=0.0)
+    checkpoint = tmp_path / "triplet.pt"
+    torch.save({"model": triplet.state_dict()}, checkpoint)
+    residual = FreshPathTeacher(input_dim=4, width=4, heads=1, layers=1, ffn=8, text_slots=1, image_slots=1,
+                                dropout=0.0, path_mode="pairwise_residual")
+    missing, unexpected = residual.load_state_dict(triplet.state_dict(), strict=False)
+    assert not unexpected and all(k.startswith("path_head.") for k in missing)
+    row = records[0]
+    targets, bags = row["targets"], row["natural_bags"]
+    paths = [(i, e) for i, t in enumerate(targets) for e in bags.get(t, ())]
+    evidence = {e: ("text", bank.z(e), bank.tokens(e)) for _, e in paths}
+    with torch.no_grad():
+        f0_t, path_t = triplet.eval().score_query_lists((bank.z("q0"), bank.tokens("q0")),
+                                                        (bank.z_many(targets), [bank.tokens(t) for t in targets]), evidence, paths)
+        f0_r, path_r = residual.eval().score_query_lists((bank.z("q0"), bank.tokens("q0")),
+                                                         (bank.z_many(targets), [bank.tokens(t) for t in targets]), evidence, paths)
+    torch.testing.assert_close(f0_r, f0_t)
+    index = torch.tensor([i for i, _ in paths])
+    assert torch.equal(path_r, f0_r[index])  # exactly f0: nothing but the zero head separates them
+    assert not torch.allclose(path_t, f0_t[index])
+    torch.testing.assert_close(aggregate_cqet(f0_r, path_r, index), f0_r)
+
+    # The pipeline loader infers the mode from the checkpoint and warm-starts on request.
+    import mmdd_stage1.pipeline as pipeline
+    original = pipeline._teacher
+    pipeline._teacher = lambda path_mode="triplet": FreshPathTeacher(
+        input_dim=4, width=4, heads=1, layers=1, ffn=8, text_slots=1, image_slots=1, dropout=0.0, path_mode=path_mode)
+    try:
+        assert _load_teacher(checkpoint, device="cpu").path_mode == "triplet"
+        warm = _load_teacher(checkpoint, device="cpu", path_mode="pairwise_residual")
+        assert warm.path_mode == "pairwise_residual"
+        torch.save({"model": warm.state_dict()}, tmp_path / "residual.pt")
+        assert _load_teacher(tmp_path / "residual.pt", device="cpu").path_mode == "pairwise_residual"
+    finally:
+        pipeline._teacher = original
+
+
+def test_pairwise_residual_tb_step_trains_the_path_head_through_bagged_and_witness_lists():
+    """Under path_loss_scope=bagged the direct list is the only supervision of bag-less targets;
+    the witness lists and the support loss reach the path head, whose gradient is non-zero."""
+    from torch.optim import AdamW
+    from mmdd_stage1.train import _run_teacher_logical_batch, _tb_query_backward
+
+    torch.manual_seed(5)
+    bank, records, _basis, _mean = tiny_fixture()
+    model = FreshPathTeacher(input_dim=4, width=4, heads=1, layers=1, ffn=8, text_slots=1, image_slots=1,
+                             dropout=0.0, path_mode="pairwise_residual")
+    row = {
+        **records[0],
+        "support_records": [{"target_id": "tp", "modality": "text", "positives": ["ep"], "competitors": ["en"]}],
+        "qet_lists": [{"evidence_id": "ep", "evidence_kind": "text", "positives": ["tp"], "ignore": [],
+                       "candidates": ["tp", "tn", "tx"]}],
+    }
+    optimizer = AdamW(model.set_tb_trainable(), lr=1e-3)
+    dev = torch.device("cpu")
+    metrics, _chunk, _mode, _events = _run_teacher_logical_batch(
+        optimizer, [row],
+        lambda r, chunk, mode, scale: _tb_query_backward(
+            model, bank, r, dev, chunk, mode, scale, "cqet", path_loss_scope="bagged", witness_target_weight=0.5),
+        candidate_chunk=256,
+    )
+    assert metrics[0]["witness_target"] is not None and metrics[0]["path"] is not None
+    assert sum(float(p.grad.norm()) for p in model.path_head.parameters() if p.grad is not None) > 0
+    assert all(p.grad is None or not p.requires_grad for name, p in model.named_parameters() if name.startswith("adapters"))
+
+
+def test_d1_retain_batch_matches_the_per_bag_reference():
+    rng = np.random.default_rng(11)
+    evidence = [f"e{i}" for i in range(40)]
+    support = {e: rng.random(6) for e in evidence}
+    canonical = {e: (e if i % 5 else f"e{i - 1}") for i, e in enumerate(evidence)}  # some content aliases
+    bags = []
+    for _ in range(50):
+        n = int(rng.integers(0, 25))
+        bags.append([PathEntry(evidence[int(rng.integers(0, 40))], "text", float(rng.normal()), float(rng.normal()))
+                     for _ in range(n)])
+    batched = d1_retain_batch(bags, support, content_key=canonical)
+    for bag, (kept, coverage, trace) in zip(bags, batched):
+        ref_kept, ref_coverage, ref_trace = d1_retain_with_trace(bag, support, content_key=canonical)
+        assert kept == ref_kept
+        assert coverage == ref_coverage
+        assert [(t["evidence_id"], t["selected_step"]) for t in trace] == [(t["evidence_id"], t["selected_step"]) for t in ref_trace]
+        for mine, ref in zip(trace, ref_trace):
+            assert (np.isnan(mine["marginal_gain"]) and np.isnan(ref["marginal_gain"])) or mine["marginal_gain"] == ref["marginal_gain"]
+
+
+def test_exact_search_reproduces_hnsw_pools_when_the_index_is_exhaustive(tmp_path: Path):
+    """With ef >= library size HNSW is exact, so ``search="exact"`` must give the same pools
+    without building an index; its ANN/exact audits are 1 by construction."""
+    generator = torch.Generator().manual_seed(21)
+    target_ids = [f"t{i:03d}" for i in range(160)]
+    text_ids = [f"et{i:03d}" for i in range(40)]
+    image_ids = [f"ei{i:03d}" for i in range(40)]
+    all_ids = ["q0", "q1", *target_ids, *text_ids, *image_ids]
+    matrix = torch.nn.functional.normalize(torch.randn(len(all_ids), 4, generator=generator), dim=1)
+    z_store = TinyZStore(dict(zip(all_ids, matrix)))
+    row_store = TinyRowStore({q: np.stack([z_store.vector("et000").numpy()]) for q in ("q0", "q1")})
+    canonical = {e: e for e in [*text_ids, *image_ids]}
+    labels = Labels(
+        queries={}, epos={}, legal_targets=target_ids, edge_anchors=[], canonical_map=canonical,
+        modality={e: "text" for e in text_ids} | {e: "image" for e in image_ids},
+        content_hash={e: e for e in canonical}, canonical_text=text_ids, canonical_image=image_ids,
+    )
+    hnsw = build_raw_pools_split(z_store, row_store, ["q0", "q1"], labels, "dev", device="cpu", hnsw_seed=13)
+    exact = build_raw_pools_split(z_store, row_store, ["q0", "q1"], labels, "dev", device="cpu", hnsw_seed=13,
+                                  index_dir=tmp_path / "unused", search="exact")
+    assert not (tmp_path / "unused").exists()
+    def ids_only(value):  # HNSW reports 1 - distance in float32; only the ranked ids are compared exactly
+        if isinstance(value, list):
+            return [ids_only(v) for v in value]
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], float):
+            return value[0]
+        if isinstance(value, PathEntry):
+            return value.evidence_id
+        if isinstance(value, dict):
+            return {k: ids_only(v) for k, v in value.items()}
+        return value
+
+    for q in ("q0", "q1"):
+        for field_name in ("direct", "first_hop", "pre_paths", "retained_paths", "U", "C150", "D150",
+                           "MatchedDirectC", "MatchedDirectU", "training_exact"):
+            assert ids_only(getattr(exact[q], field_name)) == ids_only(getattr(hnsw[q], field_name)), field_name
+        np.testing.assert_allclose([s for _, s in exact[q].direct], [s for _, s in hnsw[q].direct], rtol=1e-5, atol=1e-6)
+        assert all(value == 1.0 for value in exact[q].ann_exact_overlap.values())
+
+
+def test_tb_records_carry_witness_target_lists_and_the_support_budget():
+    generator = torch.Generator().manual_seed(9)
+    target_ids = [f"t{i:03d}" for i in range(160)]
+    text_ids = [f"et{i:03d}" for i in range(30)]
+    image_ids = [f"ei{i:03d}" for i in range(30)]
+    all_ids = ["q0", *target_ids, *text_ids, *image_ids]
+    matrix = torch.nn.functional.normalize(torch.randn(len(all_ids), 4, generator=generator), dim=1)
+    z_store = TinyZStore(dict(zip(all_ids, matrix)))
+    row_store = TinyRowStore({"q0": np.stack([z_store.vector("et000").numpy()])})
+    canonical = {e: e for e in [*text_ids, *image_ids]}
+    labels = Labels(
+        queries={"q0": {"G": ["t000", "t001"], "W": {"t000": ["et000", "ei000"]},
+                        "Qpos": {"text": ["et000"], "image": ["ei000"]}}},
+        epos={"et000": ["t000", "t007"], "ei000": ["t000"]}, legal_targets=target_ids, edge_anchors=[],
+        canonical_map=canonical, modality={e: "text" for e in text_ids} | {e: "image" for e in image_ids},
+        content_hash={e: e for e in canonical}, canonical_text=text_ids, canonical_image=image_ids,
+    )
+    pools = build_raw_pools_split(z_store, row_store, ["q0"], labels, "train", device="cpu", hnsw_seed=13, search="exact")
+    et128 = build_raw_et128_exact(z_store, labels, device="cpu", anchors=["et000", "ei000"])
+    plain = build_tb_records("q0", pools["q0"], labels, 13)
+    rich = build_tb_records("q0", pools["q0"], labels, 13, et128, support_competitors=20)
+    assert "qet_lists" not in plain and {item["evidence_id"] for item in rich["qet_lists"]} == {"et000", "ei000"}
+    text_list = next(item for item in rich["qet_lists"] if item["evidence_id"] == "et000")
+    assert text_list["positives"] == ["t000"] and text_list["ignore"] == ["t001", "t007"]
+    assert set(text_list["candidates"]) >= set(et128["et000"]) | set(pools["q0"].C150) | {"t000", "t001"}
+    assert all(len(r["competitors"]) == 8 for r in plain["support_records"])
+    assert all(len(r["competitors"]) == 20 for r in rich["support_records"])
+    assert plain["targets"] == rich["targets"] and plain["natural_bags"] == rich["natural_bags"]

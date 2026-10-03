@@ -99,6 +99,7 @@
     "image_slots": 24,
     "global_blocks": 11,
     "empty_E": "six_explicit_zero_blocks",
+    "path_mode": "triplet",
     "TA": {
       "epochs": 2,
       "logical_batch_queries": 8,
@@ -136,7 +137,10 @@
       "path_direct_weight": 0.5,
       "path_aggregate_weight": 0.5,
       "support_weight": 0.2,
-      "QT_loss": "direct_only_weight1"
+      "QT_loss": "direct_only_weight1",
+      "path_loss_scope": "all",
+      "witness_target_weight": 0.0,
+      "support_competitors": 8
     }
   },
   "student": {
@@ -185,7 +189,8 @@
       "selection_owner": "NATIVE_SUP",
       "KD_uses_SUP_fraction": true,
       "direct_list": "record_targets_plus_random_negatives_from_legal_targets_fixed_per_query",
-      "evidence_list": "bag_targets_plus_random_negatives_with_one_random_canonical_evidence_path"
+      "evidence_list": "bag_targets_plus_random_negatives_with_one_random_canonical_evidence_path",
+      "prepaths_audit": true
     },
     "native_selection": [
       "CR_C150_overall",

@@ -20,7 +20,7 @@ from .retrieval import (
     PathEntry,
     PoolRecord,
     build_pools,
-    d1_retain_with_trace,
+    d1_retain_batch,
     row_support,
     stable_topk,
 )
@@ -86,11 +86,12 @@ def build_raw_pools_split(
     hnsw_seed: int = 13,
     index_dir: Optional[Path] = None,
     reuse_index_dir: Optional[Path] = None,
+    search: str = "hnsw",
 ) -> dict[str, PoolRecord]:
     """Raw pools: ``build_pools`` in the frozen Qwen space, with the exact top-128 training lists."""
     return build_pools(
         z_store, row_store, query_ids, labels, split, student=None, generator_id="raw", hnsw_seed=hnsw_seed,
-        device=device, index_dir=index_dir, reuse_index_dir=reuse_index_dir, training_exact=True,
+        device=device, index_dir=index_dir, reuse_index_dir=reuse_index_dir, training_exact=True, search=search,
     )
 
 
@@ -100,26 +101,36 @@ def build_raw_et128_exact(
     device: str = "cuda:0",
     batch_size: int = 128,
     anchors: Optional[Sequence[str]] = None,
+    student: Optional[NativeStudent] = None,
 ) -> dict[str, list[str]]:
-    """Exact top-128 targets of every train witness evidence (default: all of ``labels.epos``)."""
+    """Exact top-128 targets of every train witness evidence (default: all of ``labels.epos``) in
+    the frozen space, or in ``student``'s ``text_T`` / ``image_T`` relation spaces."""
     dev = torch.device(device)
     targets = list(labels.legal_targets)
     anchors = utf8_sorted(anchors if anchors is not None else labels.epos)
     z_targets = z_store.rows(targets).to(dev)
+    if student is not None:
+        student.to(dev).eval()
+        z_targets = student.index_vectors("QT", z_targets)
     result: dict[str, list[str]] = {}
     with torch.no_grad():
         for start in range(0, len(anchors), batch_size):
             batch_ids = anchors[start : start + batch_size]
-            scores = z_store.rows(batch_ids).to(dev) @ z_targets.T
+            z_batch = z_store.rows(batch_ids).to(dev)
+            if student is not None:
+                z_batch = torch.stack([
+                    student.ann_query(f"{labels.modality[e]}_T", z_batch[i]) for i, e in enumerate(batch_ids)])
+            scores = z_batch @ z_targets.T
             top = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :128].cpu()
             for row, evidence_id in enumerate(batch_ids):
                 result[evidence_id] = [targets[int(i)] for i in top[row]]
     return result
 
 
-def _support_records(query_id: str, raw_pool: PoolRecord, labels: Labels, seed: int) -> list[dict]:
-    """Per (gold target, modality) with witnesses: up to 8 same-modality competitors outside
-    Protect(q, t), taken from the natural bag, then RawQE128, then a uniform sample."""
+def _support_records(query_id: str, raw_pool: PoolRecord, labels: Labels, seed: int,
+                     budget: int = SUPPORT_COMPETITORS) -> list[dict]:
+    """Per (gold target, modality) with witnesses: up to ``budget`` same-modality competitors
+    outside Protect(q, t), taken from the natural bag, then RawQE128, then a uniform sample."""
     w_map = labels.queries[query_id]["W"]
     records: list[dict] = []
     for tid in sorted(w_map, key=lambda x: x.encode("utf-8")):
@@ -133,13 +144,13 @@ def _support_records(query_id: str, raw_pool: PoolRecord, labels: Labels, seed: 
             bag_comps = [e for e in bag_m if e not in protect]
             qe_m = raw_pool.training_exact["RawQE128"][m]
             qe_comps = [e for e in qe_m if e not in protect and e not in bag_comps]
-            needed = max(0, SUPPORT_COMPETITORS - len(bag_comps) - len(qe_comps))
+            needed = max(0, budget - len(bag_comps) - len(qe_comps))
             sample_m = _hash_library(labels.library(f"Q_{m}")).first(
                 "UNIFORM_E", seed, f"{query_id}|{tid}|{m}", needed, protect | set(bag_comps) | set(qe_comps),
             )
-            chosen_bag = bag_comps[:SUPPORT_COMPETITORS]
-            chosen_qe = qe_comps[: max(0, SUPPORT_COMPETITORS - len(chosen_bag))]
-            chosen_uniform = sample_m[: max(0, SUPPORT_COMPETITORS - len(chosen_bag) - len(chosen_qe))]
+            chosen_bag = bag_comps[:budget]
+            chosen_qe = qe_comps[: max(0, budget - len(chosen_bag))]
+            chosen_uniform = sample_m[: max(0, budget - len(chosen_bag) - len(chosen_qe))]
             competitors = chosen_bag + chosen_qe + chosen_uniform
             if competitors:
                 records.append({
@@ -153,7 +164,7 @@ def _support_records(query_id: str, raw_pool: PoolRecord, labels: Labels, seed: 
                     "screening": {
                         "natural_bag_protected": sum(e in protect for e in bag_m),
                         "RawQE128_protected": sum(e in protect for e in qe_m),
-                        "shortfall": max(0, SUPPORT_COMPETITORS - len(competitors)),
+                        "shortfall": max(0, budget - len(competitors)),
                     },
                 })
     return records
@@ -179,7 +190,23 @@ def build_ta_records(
         u32_e = _hash_library(labels.library(f"Q_{m}")).first("UNIFORM_E", seed, f"{query_id}|{m}", 32, set(qpos_m))
         qe_lists[m] = utf8_sorted(set(qpos_m) | set(raw_pool.training_exact["RawQE128"][m]) | set(u32_e))
 
-    # C_QET(q, e) = RawET128(e) | RawC150(q) | G_q; other gold targets of q and other targets of e are ignored.
+    return {
+        "query_id": query_id,
+        "qt_candidates": qt_candidates,
+        "qe_candidates": qe_lists,
+        "qet_lists": witness_target_lists(query_id, raw_pool, labels, raw_et128),
+        "support_records": _support_records(query_id, raw_pool, labels, seed),
+    }
+
+
+def witness_target_lists(
+    query_id: str, pool: PoolRecord, labels: Labels, et128: Mapping[str, Sequence[str]],
+) -> list[dict]:
+    """One target list per witness evidence of ``query_id``: C_QET(q, e) = ET128(e) | C150(q) | G_q;
+    its positives are the gold targets it witnesses, other gold targets of q and other targets
+    of e are ignored."""
+    q_entry = labels.queries[query_id]
+    g_targets = set(q_entry["G"])
     w_map = q_entry["W"]
     qet_lists: list[dict] = []
     for eid in utf8_sorted({e for assets in w_map.values() for e in assets}):
@@ -190,15 +217,9 @@ def build_ta_records(
             "evidence_kind": labels.modality.get(eid, "text"),
             "positives": utf8_sorted(pos_targets),
             "ignore": utf8_sorted(ignore_targets),
-            "candidates": utf8_sorted(set(list(raw_et128[eid])[:128]) | set(raw_c150) | g_targets),
+            "candidates": utf8_sorted(set(list(et128[eid])[:128]) | set(pool.C150) | g_targets),
         })
-    return {
-        "query_id": query_id,
-        "qt_candidates": qt_candidates,
-        "qe_candidates": qe_lists,
-        "qet_lists": qet_lists,
-        "support_records": _support_records(query_id, raw_pool, labels, seed),
-    }
+    return qet_lists
 
 
 def build_tb_records(
@@ -206,19 +227,25 @@ def build_tb_records(
     raw_pool: PoolRecord,
     labels: Labels,
     seed: int,
+    et128: Optional[Mapping[str, Sequence[str]]] = None,
+    support_competitors: int = SUPPORT_COMPETITORS,
 ) -> dict:
-    """T_B list (SPEC 11.4-11.5, 13): C^B(q) = RawU | RawDirect150 | G_q | U32_T with natural bags."""
+    """T_B list (SPEC 11.4-11.5, 13): C^B(q) = RawU | RawDirect150 | G_q | U32_T with natural bags.
+    ``et128`` adds the witness-conditioned target lists (``qet_lists``, as in T_A)."""
     q_entry = labels.queries[query_id]
     g_targets = set(q_entry["G"])
     u32_t = _hash_library(labels.legal_targets).first("UNIFORM_T", seed, query_id, 32, g_targets)
     cb = utf8_sorted(set(raw_pool.U) | {t for t, _ in raw_pool.D150} | g_targets | set(u32_t))
-    return {
+    record = {
         "query_id": query_id,
         "targets": cb,
         "positives": utf8_sorted(g_targets),
         "natural_bags": {t: list(raw_pool.retained_paths.get(t, [])) for t in cb},
-        "support_records": _support_records(query_id, raw_pool, labels, seed),
+        "support_records": _support_records(query_id, raw_pool, labels, seed, support_competitors),
     }
+    if et128 is not None:
+        record["qet_lists"] = witness_target_lists(query_id, raw_pool, labels, et128)
+    return record
 
 
 def build_c1_edge_lists(
@@ -274,12 +301,13 @@ def build_c2_shared_graph(
     query_ids: Sequence[str],
     prepaths_path: Path,
     device: str = "cuda:0",
+    audit: bool = True,
 ) -> list[dict]:
     """Merge complete Raw/C1 prepaths, rescore with the selected C1, then run one shared D1.
 
     Returns the C2 records. The per-path audit rows (~3k per query, >30 GiB as Python objects
     on the full train split) are streamed to ``prepaths_path`` query by query instead of being
-    returned.
+    returned; ``audit=False`` streams only the retained paths (the ones the records use).
     """
     dev = torch.device(device)
     selected_c1.to(dev).eval()
@@ -331,14 +359,15 @@ def build_c2_shared_graph(
             retained: dict[str, list[str]] = {}
             d1_scores: dict[str, float] = {}
             trace_by_pair: dict[tuple[str, str], dict] = {}
-            for target_id in targets:
-                retained[target_id], d1_scores[target_id], trace = d1_retain_with_trace(
-                    by_target.get(target_id, []), support_map, content_key=labels.canonical_map,
-                )
+            for target_id, (kept, score, trace) in zip(targets, d1_retain_batch(
+                    [by_target.get(t, []) for t in targets], support_map, content_key=labels.canonical_map)):
+                retained[target_id], d1_scores[target_id] = kept, score
                 for item in trace:
                     trace_by_pair[(target_id, item["evidence_id"])] = {**item, "target_id": target_id}
 
             for target_id, evidence_id in merged:
+                if not audit and evidence_id not in retained[target_id]:
+                    continue
                 yield {
                     "schema_version": SCHEMA_VERSION,
                     "query_id": query_id,

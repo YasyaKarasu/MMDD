@@ -33,11 +33,13 @@ def evaluate_student_retrieval(
     hnsw_seed: int = 13,
     generator_id: str = "student",
     index_dir: Optional[str | Path] = None,
+    search: str = "hnsw",
 ) -> dict[str, PoolRecord]:
     """Student pools: ``build_pools`` in the Student's projected relation spaces."""
     return build_pools(
         z_store, row_store, query_ids, labels, split, student=student, generator_id=generator_id,
         hnsw_seed=hnsw_seed, device=device, index_dir=None if index_dir is None else Path(index_dir),
+        search=search,
     )
 
 

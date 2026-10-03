@@ -51,13 +51,13 @@ from .losses import (
     top_k_list_kd,
 )
 from .data import json_identity, utf8_sorted
-from .models import RELATION_KINDS, TEACHER_INFERENCE_CHUNK, FreshPathTeacher, NativeStudent, QTStudent, model_state_sha
+from .models import RELATION_KINDS, TEACHER_INFERENCE_CHUNK, FreshPathTeacher, NativeStudent, QTStudent, SegmentCache, model_state_sha
 
 # Teacher candidate chunk: the relation transformer batch, halved on OOM (whole logical batch replayed).
 TEACHER_CHUNK_LADDER = (256, 128, 64, 32, 16, 8, 4, 2, 1)
 # Student query microbatch, likewise halved on OOM.
 STUDENT_MICROBATCH = 64
-TEACHER_LAYOUT_REVISION = "v4_1_speed_c_full_list_20260926"
+TEACHER_LAYOUT_REVISION = "v4_3_pooled_gather_inference1024_20261003"
 
 
 def teacher_numerical_layout() -> dict:
@@ -302,10 +302,6 @@ def _is_cuda_oom(error: BaseException) -> bool:
 
 # ------------------------------------------------------------------- Teacher --
 
-# Slot -> relation role of a scored row: pairs are (query, target), triplets (query, evidence, target).
-_ROW_ROLES = {2: (0, 1), 3: (0, 2, 1)}
-
-
 def _torch_rng_state() -> tuple[Tensor, Optional[list[Tensor]]]:
     return (
         torch.get_rng_state().clone(),
@@ -341,19 +337,21 @@ class TeacherListScorer:
         self.model = model
         self.chunk = chunk
         self.mode = mode
-        self.cache: dict = {}
+        self.cache = SegmentCache()
         self.calls: list[tuple[str, list[tuple], list[tuple], tuple, Tensor]] = []
         self.scores: list[Tensor] = []
 
     def encode(self, rows: Sequence[tuple], keys: Sequence[tuple]) -> None:
-        """Encode every object of ``rows`` not yet cached, batched per kind, tagged per role."""
+        """Encode every object of ``rows`` not yet cached, batched per kind, tagged with the role
+        its cache key carries (0 query, 1 target, 2 evidence)."""
         grouped: dict[str, list[tuple]] = defaultdict(list)
+        pending: set[tuple] = set()
         for row, key in zip(rows, keys):
-            for slot, role in enumerate(_ROW_ROLES[len(row) // 3]):
+            for slot in range(len(row) // 3):
                 ref = (row[3 * slot], key[slot])
-                if ref not in self.cache:
-                    self.cache[ref] = None
-                    grouped[ref[0]].append((ref, role, row[3 * slot + 1], row[3 * slot + 2]))
+                if ref not in self.cache and ref not in pending:
+                    pending.add(ref)
+                    grouped[ref[0]].append((ref, key[slot][1], row[3 * slot + 1], row[3 * slot + 2]))
         for kind, items in grouped.items():
             segments, lengths, globals_ = self.model.encode_many(
                 kind, torch.stack([z for _, _, z, _ in items]), [c for _, _, _, c in items]
@@ -361,9 +359,10 @@ class TeacherListScorer:
             for role in sorted({role for _, role, _, _ in items}):
                 positions = [i for i, item in enumerate(items) if item[1] == role]
                 index = torch.tensor(positions, device=segments.device)
-                tagged = self.model.tag(kind, role, segments[index], globals_[index])
-                for j, i in enumerate(positions):
-                    self.cache[items[i][0]] = (tagged[j, : lengths[i] + (role == 2)], globals_[i])
+                self.cache.add(
+                    self.model.tag(kind, role, segments[index], globals_[index]),
+                    [lengths[i] + (role == 2) for i in positions], globals_[index], [items[i][0] for i in positions],
+                )
 
     @staticmethod
     def _refs(rows: Sequence[tuple], keys: Sequence[tuple]) -> list[tuple]:
@@ -372,7 +371,8 @@ class TeacherListScorer:
     def _score(self, kind: str, rows: Sequence[tuple], keys: Sequence[tuple]) -> Tensor:
         if len(rows) != len(keys):
             raise ValueError("scorer rows/cache keys must have the same length")
-        score = self.model.score_pairs if kind == "pairs" else self.model.score_triplets
+        score = {"pairs": self.model.score_pairs, "triplets": self.model.score_triplets,
+                 "path_pairs": self.model.score_path_pairs}[kind]
         if not rows:
             return torch.empty(0, device=next(self.model.parameters()).device)
         if self.mode == "single_graph":
@@ -403,6 +403,9 @@ class TeacherListScorer:
     def score_triplets(self, triplets: Sequence[tuple], keys: Sequence[tuple]) -> Tensor:
         return self._score("triplets", triplets, keys)
 
+    def score_path_pairs(self, pairs: Sequence[tuple], keys: Sequence[tuple]) -> Tensor:
+        return self._score("path_pairs", pairs, keys)
+
     def backward(self, loss: Tensor, *, scale: float) -> None:
         if not self.scores:
             raise RuntimeError("Teacher list scorer has no scored lists")
@@ -410,25 +413,62 @@ class TeacherListScorer:
             try:
                 (loss * scale).backward()
             finally:
-                self.cache.clear()
+                self.cache = SegmentCache()
                 self.scores.clear()
             return
         forward_end_rng = _torch_rng_state()
         adjoints = torch.autograd.grad(loss, [call[-1] for call in self.calls])
-        self.cache = {}
+        self.cache = SegmentCache()
         for _kind, rows, keys, _rng, _leaf in self.calls:
             self.encode(rows, keys)
         for index, ((kind, rows, keys, rng, _leaf), adjoint) in enumerate(zip(self.calls, adjoints)):
             _restore_torch_rng_state(rng)
-            score = self.model.score_pairs if kind == "pairs" else self.model.score_triplets
+            score = {"pairs": self.model.score_pairs, "triplets": self.model.score_triplets,
+                     "path_pairs": self.model.score_path_pairs}[kind]
             # Chunks share the encoder outputs, so every chunk but the last must retain them.
             score(self.cache, self._refs(rows, keys)).backward(
                 adjoint * scale, retain_graph=index + 1 < len(self.calls)
             )
         _restore_torch_rng_state(forward_end_rng)
         self.calls.clear()
-        self.cache.clear()
+        self.cache = SegmentCache()
         self.scores.clear()
+
+
+def path_scores(
+    scorer: TeacherListScorer,
+    bank: ObjectBank,
+    query_id: str,
+    query_tokens: Tensor,
+    pairs: Sequence[tuple[str, str]],
+    tokens: Mapping[str, Tensor],
+    base: Optional[Tensor] = None,
+) -> Tensor:
+    """Path scores ``(N,)`` of the ``(evidence, target)`` pairs of ``query_id``.
+
+    ``triplet`` Teachers score the QET triplet directly. ``pairwise_residual`` Teachers return
+    ``base + path(q, e) + path(e, t)`` where ``base`` is f0(q, t) per pair; callers that only rank
+    evidence for one fixed (q, t) pass ``base=None`` and get the evidence-dependent residual.
+    """
+    model = scorer.model
+    zq = bank.z(query_id)
+    if model.path_mode == "triplet":
+        return scorer.score_triplets(
+            [("table", zq, query_tokens, bank.kind(e), bank.z(e), tokens[e], "table", bank.z(t), tokens[t]) for e, t in pairs],
+            [((query_id, 0), (e, 2), (t, 1)) for e, t in pairs],
+        )
+    evidence = list(dict.fromkeys(e for e, _ in pairs))
+    position = {e: i for i, e in enumerate(evidence)}
+    qe = scorer.score_path_pairs(
+        [("table", zq, query_tokens, bank.kind(e), bank.z(e), tokens[e]) for e in evidence],
+        [((query_id, 0), (e, 2)) for e in evidence],
+    )
+    et = scorer.score_path_pairs(
+        [(bank.kind(e), bank.z(e), tokens[e], "table", bank.z(t), tokens[t]) for e, t in pairs],
+        [((e, 2), (t, 1)) for e, t in pairs],
+    )
+    delta = qe[torch.tensor([position[e] for e, _ in pairs], dtype=torch.long, device=qe.device)] + et
+    return delta if base is None else base + delta
 
 
 def _support_loss(
@@ -441,24 +481,42 @@ def _support_loss(
 ) -> Optional[Tensor]:
     """Same-modality witness-vs-competitor loss per (target, modality), averaged per target."""
     by_target: dict[str, list[Tensor]] = defaultdict(list)
-    zq = bank.z(query_id)
     for row in records:
-        target_id, modality = row["target_id"], row["modality"]
+        target_id = row["target_id"]
         positives, competitors = list(row["positives"]), list(row["competitors"])
         if not positives or not competitors:
             continue
-        zt, ct = bank.z(target_id), tokens[target_id]
-        scores = [
-            scorer.score_triplets(
-                [("table", zq, query_tokens, modality, bank.z(e), tokens[e], "table", zt, ct) for e in ids],
-                [((query_id, 0), (e, 2), (target_id, 1)) for e in ids],
-            )
-            for ids in (positives, competitors)
-        ]
+        scores = [path_scores(scorer, bank, query_id, query_tokens, [(e, target_id) for e in ids], tokens)
+                  for ids in (positives, competitors)]
         loss = positive_average_pair_loss(*scores)
         if loss is not None:
             by_target[target_id].append(loss)
     return hierarchical_support_mean([by_target[t] for t in sorted(by_target, key=lambda x: x.encode("utf-8"))])
+
+
+def _witness_target_loss(
+    scorer: TeacherListScorer,
+    bank: ObjectBank,
+    query_id: str,
+    query_tokens: Tensor,
+    qet_lists: Sequence[dict],
+    tokens: Mapping[str, Tensor],
+    f0_of: Mapping[str, Tensor],
+    dev: torch.device,
+) -> dict[str, list[Tensor]]:
+    """Rank-mass of the path score ``(q, witness, t)`` over each witness list's candidate targets,
+    keyed by ``QET_<modality>``; ``f0_of`` maps every candidate to its direct score."""
+    by_relation: dict[str, list[Tensor]] = defaultdict(list)
+    for item in qet_lists:
+        evidence_id, candidates = item["evidence_id"], list(item["candidates"])
+        ignore, positives = set(item.get("ignore", ())), set(item["positives"])
+        base = torch.stack([f0_of[t] for t in candidates]) if scorer.model.path_mode != "triplet" else None
+        scores = path_scores(scorer, bank, query_id, query_tokens, [(evidence_id, t) for t in candidates], tokens, base)
+        loss = rank_mass_loss(scores, torch.tensor([t in positives for t in candidates], device=dev),
+                              torch.tensor([t not in ignore for t in candidates], device=dev))
+        if loss is not None:
+            by_relation[f"QET_{item['evidence_kind']}"].append(loss)
+    return by_relation
 
 
 def _support_object_ids(records: Sequence[dict]) -> list[str]:
@@ -475,8 +533,9 @@ def _ta_query_backward(model, bank, row, labels, dev, candidate_chunk,
     zq = bank.z(qid)
     scorer = TeacherListScorer(model, candidate_chunk, mode=backward_mode)
     support_records = row.get("support_records", [])
+    qet_lists = row.get("qet_lists", [])
     needed = [qid, *row["qt_candidates"], *row["qe_candidates"]["text"], *row["qe_candidates"]["image"]]
-    for item in row.get("qet_lists", []):
+    for item in qet_lists:
         needed += [item["evidence_id"], *item["candidates"]]
     needed += _support_object_ids(support_records)
     needed = list(dict.fromkeys(needed))
@@ -484,28 +543,25 @@ def _ta_query_backward(model, bank, row, labels, dev, candidate_chunk,
 
     by_relation: dict[str, list[Tensor]] = {r: [] for r in ("QT", "Q_text", "Q_image", "QET_text", "QET_image")}
     qt = list(row["qt_candidates"])
-    lists = [("QT", "pairs", [("table", zq, tokens[qid], "table", bank.z(t), tokens[t]) for t in qt],
-              [((qid, 0), (t, 1)) for t in qt], set(labels.queries[qid]["G"]), None)]
+    # pairwise_residual path scores need f0 of every QET candidate: score the union once.
+    scored = qt if model.path_mode == "triplet" else list(dict.fromkeys([*qt, *(t for item in qet_lists for t in item["candidates"])]))
+    f0_all = scorer.score_pairs([("table", zq, tokens[qid], "table", bank.z(t), tokens[t]) for t in scored],
+                                [((qid, 0), (t, 1)) for t in scored])
+    f0_of = dict(zip(scored, f0_all))
+    loss = rank_mass_loss(f0_all[: len(qt)], torch.tensor([t in set(labels.queries[qid]["G"]) for t in qt], device=dev))
+    if loss is not None:
+        by_relation["QT"].append(loss)
     for modality in ("text", "image"):
         positives = set(labels.queries[qid]["Qpos"][modality])
         if positives:
             candidates = list(row["qe_candidates"][modality])
-            lists.append((f"Q_{modality}", "pairs",
-                          [("table", zq, tokens[qid], modality, bank.z(e), tokens[e]) for e in candidates],
-                          [((qid, 0), (e, 1)) for e in candidates], positives, None))
-    for item in row.get("qet_lists", []):
-        evidence_id, modality, candidates = item["evidence_id"], item["evidence_kind"], list(item["candidates"])
-        ignore = set(item.get("ignore", ()))
-        lists.append((f"QET_{modality}", "triplets",
-                      [("table", zq, tokens[qid], modality, bank.z(evidence_id), tokens[evidence_id],
-                        "table", bank.z(t), tokens[t]) for t in candidates],
-                      [((qid, 0), (evidence_id, 2), (t, 1)) for t in candidates],
-                      set(item["positives"]), torch.tensor([t not in ignore for t in candidates], device=dev)))
-    for relation, kind, rows_, keys, positives, valid in lists:
-        scores = scorer.score_triplets(rows_, keys) if kind == "triplets" else scorer.score_pairs(rows_, keys)
-        loss = rank_mass_loss(scores, torch.tensor([key[-1][0] in positives for key in keys], device=dev), valid)
-        if loss is not None:
-            by_relation[relation].append(loss)
+            scores = scorer.score_pairs([("table", zq, tokens[qid], modality, bank.z(e), tokens[e]) for e in candidates],
+                                        [((qid, 0), (e, 1)) for e in candidates])
+            loss = rank_mass_loss(scores, torch.tensor([e in positives for e in candidates], device=dev))
+            if loss is not None:
+                by_relation[f"Q_{modality}"].append(loss)
+    for relation, losses in _witness_target_loss(scorer, bank, qid, tokens[qid], qet_lists, tokens, f0_of, dev).items():
+        by_relation[relation].extend(losses)
 
     relation_loss = hierarchical_relation_mean(list(by_relation.values()))
     support = _support_loss(bank, qid, support_records, tokens[qid], scorer, tokens)
@@ -524,43 +580,53 @@ def _ta_query_backward(model, bank, row, labels, dev, candidate_chunk,
 
 
 def _tb_query_backward(model, bank, row, dev, candidate_chunk, backward_mode, scale, mode, *,
-                       direct_weight=0.5, aggregate_weight=0.5, support_weight=0.2) -> dict:
+                       direct_weight=0.5, aggregate_weight=0.5, support_weight=0.2,
+                       path_loss_scope="all", witness_target_weight=0.0) -> dict:
     """T_B: direct rank-mass on the shared candidate list, plus (cqet/lse) the aggregated-path
-    rank-mass over natural bags and the support loss."""
+    rank-mass over natural bags (over every target, or ``path_loss_scope="bagged"``: only the
+    targets that have a bag, so bag presence itself carries no supervision), the support loss and,
+    with ``witness_target_weight``, the witness-conditioned target lists of ``row["qet_lists"]``."""
     qid = row["query_id"]
     targets = list(row["targets"])
     positives = set(row["positives"])
     pos_mask = torch.tensor([t in positives for t in targets], device=dev)
     zq = bank.z(qid)
+    qet_lists = row.get("qet_lists", []) if mode != "qt" and witness_target_weight else []
     all_ids = [qid, *targets]
     if mode != "qt":
         all_ids += [e for t in targets for e in row["natural_bags"].get(t, ())]
         all_ids += _support_object_ids(row.get("support_records", []))  # tokens only; never in a ranking bag
+        all_ids += [x for item in qet_lists for x in (item["evidence_id"], *item["candidates"])]
     all_ids = list(dict.fromkeys(all_ids))
     tokens = dict(zip(all_ids, bank.tokens_many(all_ids)))
     cq = tokens[qid]
     scorer = TeacherListScorer(model, candidate_chunk, mode=backward_mode)
-    f0 = scorer.score_pairs(
-        [("table", zq, cq, "table", bank.z(target), tokens[target]) for target in targets],
-        [((qid, 0), (target, 1)) for target in targets],
+    scored = targets if model.path_mode == "triplet" else list(dict.fromkeys(
+        [*targets, *(t for item in qet_lists for t in item["candidates"])]))
+    f0_all = scorer.score_pairs(
+        [("table", zq, cq, "table", bank.z(t), tokens[t]) for t in scored],
+        [((qid, 0), (t, 1)) for t in scored],
     )
+    f0 = f0_all[: len(targets)]
     direct = rank_mass_loss(f0, pos_mask)
-    path_loss = support = None
+    path_loss = support = witness = None
     if mode == "qt":
         query_loss = direct
     else:
         paths = [(i, e) for i, t in enumerate(targets) for e in row["natural_bags"].get(t, ())]
-        path_scores = scorer.score_triplets(
-            [("table", zq, cq, bank.kind(e), bank.z(e), tokens[e], "table", bank.z(targets[i]), tokens[targets[i]])
-             for i, e in paths],
-            [((qid, 0), (e, 2), (targets[i], 1)) for i, e in paths],
-        )
         target_index = torch.tensor([i for i, _ in paths], dtype=torch.long, device=dev)
+        scores = path_scores(scorer, bank, qid, cq, [(e, targets[i]) for i, e in paths], tokens,
+                             None if model.path_mode == "triplet" else f0[target_index])
         aggregate = aggregate_cqet if mode == "cqet" else aggregate_corrected_lse
-        path_loss = rank_mass_loss(aggregate(f0, path_scores, target_index), pos_mask)
+        bagged = torch.bincount(target_index, minlength=len(targets)) > 0 if path_loss_scope == "bagged" else None
+        path_loss = rank_mass_loss(aggregate(f0, scores, target_index), pos_mask, bagged)
         support = _support_loss(bank, qid, row.get("support_records", []), cq, scorer, tokens)
+        if qet_lists:
+            witness = hierarchical_relation_mean(list(_witness_target_loss(
+                scorer, bank, qid, cq, qet_lists, tokens, dict(zip(scored, f0_all)), dev).values()))
         terms = [weight * loss for weight, loss in (
-            (direct_weight, direct), (aggregate_weight, path_loss), (support_weight, support)) if loss is not None]
+            (direct_weight, direct), (aggregate_weight, path_loss), (support_weight, support),
+            (witness_target_weight, witness)) if loss is not None]
         query_loss = sum(terms[1:], terms[0]) if terms else None
     if query_loss is None:
         raise RuntimeError(f"TB_{mode.upper()} query {qid} has no active loss")
@@ -570,6 +636,7 @@ def _tb_query_backward(model, bank, row, dev, candidate_chunk, backward_mode, sc
         "direct": None if direct is None else float(direct.detach()),
         "path": None if path_loss is None else float(path_loss.detach()),
         "support": None if support is None else float(support.detach()),
+        "witness_target": None if witness is None else float(witness.detach()),
     }
 
 
@@ -741,6 +808,8 @@ def train_tb(
     direct_weight: float = 0.5,
     aggregate_weight: float = 0.5,
     support_weight: float = 0.2,
+    path_loss_scope: str = "all",
+    witness_target_weight: float = 0.0,
     save_dir: Path = Path("TB"),
     seed: int = 13,
     metadata: Optional[dict] = None,
@@ -749,6 +818,8 @@ def train_tb(
     """T_B (cqet / lse / qt) over the relation head only; checkpoints ``init/half/end.pt``."""
     if mode not in {"cqet", "lse", "qt"}:
         raise ValueError("TB mode must be cqet, lse, or qt")
+    if path_loss_scope not in {"all", "bagged"}:
+        raise ValueError("path_loss_scope must be all or bagged")
     enforce_task_numerics()
     dev = torch.device(device)
     model.to(dev)
@@ -759,11 +830,14 @@ def train_tb(
         model, model.set_tb_trainable(), tb_records,
         lambda row, chunk, mode_, scale: _tb_query_backward(
             model, bank, row, dev, chunk, mode_, scale, mode, direct_weight=direct_weight,
-            aggregate_weight=aggregate_weight, support_weight=support_weight),
+            aggregate_weight=aggregate_weight, support_weight=support_weight,
+            path_loss_scope=path_loss_scope, witness_target_weight=witness_target_weight),
         stage=f"TB_{mode.upper()}", namespace="TB_SHARED", epochs=epochs, lr=lr, weight_decay=weight_decay,
         logical_batch=logical_batch, seed=seed, save_dir=save_dir,
         snapshot=lambda epoch, step, total: "half.pt" if step == half_step else "end.pt" if step == total else None,
-        metadata=metadata, log_path=log_path, log_extra={"aggregation": mode},
+        metadata=metadata, log_path=log_path,
+        log_extra={"aggregation": mode, "path_mode": model.path_mode, "path_loss_scope": path_loss_scope,
+                   "witness_target_weight": witness_target_weight},
     )
     return save_dir / "end.pt"
 

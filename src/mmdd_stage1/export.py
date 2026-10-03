@@ -115,6 +115,7 @@ def _materialize_train(
         pools = evaluate_student_retrieval(
             student, runtime.z_store, runtime.row_store, runtime.labels.query_ids, runtime.labels, "train",
             hnsw_seed=seed, generator_id=generator, index_dir=output_dir / "indices",
+            search="exact" if runtime.protocol["retrieval"].get("formal_hops") == "exact" else "hnsw",
         )
         save_pool_bundle(output_dir, pools, runtime.labels, seed=seed, generator=generator)
         del student

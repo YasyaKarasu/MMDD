@@ -23,7 +23,13 @@ RELATION_KINDS = {
     "text_T": ("text", "table"), "image_T": ("image", "table"),
 }
 PATH_FROZEN_PREFIXES = ("adapters", "poolers", "globals", "modality", "table_kind")
-TEACHER_INFERENCE_CHUNK = 256
+TEACHER_INFERENCE_CHUNK = 1024
+# How a Q-E-T path is scored. ``triplet``: one relation-transformer pass over [q; e; t] plus the
+# 11h global MLP (the score of the path replaces f0 in the bag aggregation). ``pairwise_residual``:
+# the path score is f0(q, t) + path_head(q, e) + path_head(e, t), two local relations (方案.md's
+# J(a -> b)) through the shared relation transformer and a zero-initialised head, so every path
+# equals f0 at initialisation and the residual can only be moved by evidence-dependent signals.
+PATH_MODES = ("triplet", "pairwise_residual")
 
 # An encoded object is addressed by ``(kind, key)``; a scoring cache maps that to its
 # role-tagged relation segment and global vector. Roles: 0 = query, 1 = target, 2 = evidence.
@@ -62,9 +68,76 @@ class QueryPool(nn.Module):
         return self.norm(q + pooled)
 
 
+class SegmentCache:
+    """Encoded, role-tagged objects for relation scoring.
+
+    Every ``encode_many`` result is one *group*: its tagged segments ``(N, L, W)`` flattened to
+    ``(N * L, W)``, its lengths and its global vectors. ``pool`` concatenates the groups once
+    (plus the relation/pair, separator and zero rows) so a scoring call packs its sequences with
+    a single gather instead of thousands of per-object views, whose backward would allocate and
+    accumulate a full-size zero tensor each. ``wrap`` accepts the plain
+    ``{ref: (tagged tokens, global)}`` mapping used by tests and probes.
+    """
+
+    def __init__(self) -> None:
+        self.tokens: list[Tensor] = []
+        self.globs: list[Tensor] = []
+        self.entry: dict[ObjectRef, tuple[int, int, int, int]] = {}  # ref -> (group, token start, length, global row)
+        self._pool: Optional[tuple[Tensor, np.ndarray, int, Tensor, np.ndarray]] = None
+
+    @classmethod
+    def wrap(cls, cache) -> "SegmentCache":
+        if isinstance(cache, cls):
+            return cache
+        wrapped = cls()
+        for ref, (tokens, g) in cache.items():
+            wrapped.add(tokens.unsqueeze(0), [tokens.shape[0]], g.unsqueeze(0), [ref])
+        return wrapped
+
+    def __contains__(self, ref: ObjectRef) -> bool:
+        return ref in self.entry
+
+    def __iter__(self):
+        return iter(self.entry)
+
+    def add(self, tagged: Tensor, lengths: Sequence[int], g: Tensor, refs: Sequence[ObjectRef]) -> None:
+        group, (n, length, width) = len(self.tokens), tagged.shape
+        self.tokens.append(tagged.reshape(n * length, width))
+        self.globs.append(g)
+        self.entry.update({ref: (group, k * length, int(lengths[k]), k) for k, ref in enumerate(refs)})
+        self._pool = None
+
+    def pool(self, model: "FreshPathTeacher") -> tuple[Tensor, np.ndarray, int]:
+        """``(token pool, group token offsets, specials offset)``: rows ``specials + 0..8`` are
+        ``rel + pair_kind``, ``specials + 9`` the separator and ``specials + 10`` a zero row."""
+        if self._pool is None:
+            offsets = np.cumsum([0, *(t.shape[0] for t in self.tokens)])
+            specials = torch.cat([model.rel + model.pair_kind.weight, model.sep[None], model.sep.new_zeros(1, model.width)])
+            pool = torch.cat([*self.tokens, specials])
+            glob_offsets = np.cumsum([0, *(g.shape[0] for g in self.globs)])
+            self._pool = (pool, offsets[:-1], int(offsets[-1]), torch.cat(self.globs), glob_offsets[:-1])
+        return self._pool[:3]
+
+    def locate(self, refs: Sequence[ObjectRef], offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(token start in the pool, length)`` of each ref."""
+        entries = [self.entry[ref] for ref in refs]
+        start = np.fromiter((offsets[g] + s for g, s, _, _ in entries), dtype=np.int64, count=len(entries))
+        length = np.fromiter((n for _, _, n, _ in entries), dtype=np.int64, count=len(entries))
+        return start, length
+
+    def globals(self, refs: Sequence[ObjectRef]) -> Tensor:
+        """Global vectors ``(N, W)`` of ``refs`` (one gather from the concatenated globals)."""
+        if self._pool is None:
+            raise RuntimeError("SegmentCache.pool must be built before globals are gathered")
+        _pool, _offsets, _specials, globs, glob_offsets = self._pool
+        index = [glob_offsets[g] + k for g, _, _, k in (self.entry[ref] for ref in refs)]
+        return globs[torch.tensor(index, dtype=torch.long, device=globs.device)]
+
+
 class FreshPathTeacher(nn.Module):
     """Shared-head Teacher: relation transformer over [rel; query; sep; (evidence; sep;) target]
-    plus an 11h global-feature MLP, summed into one scoring head."""
+    plus an 11h global-feature MLP, summed into one scoring head. ``path_mode`` (see
+    ``PATH_MODES``) selects how evidence paths are scored."""
 
     def __init__(
         self,
@@ -76,10 +149,14 @@ class FreshPathTeacher(nn.Module):
         text_slots: int = 16,
         image_slots: int = 24,
         dropout: float = 0.1,
+        path_mode: str = "triplet",
     ) -> None:
         super().__init__()
+        if path_mode not in PATH_MODES:
+            raise ValueError(f"unknown path_mode {path_mode!r}")
         self.width = width
         self.dropout = dropout
+        self.path_mode = path_mode
         self.adapters = nn.ModuleDict({k: nn.Linear(input_dim, width) for k in KINDS})
         self.poolers = nn.ModuleDict(
             {
@@ -116,6 +193,13 @@ class FreshPathTeacher(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(width, 1),
         )
+        if path_mode == "pairwise_residual":
+            self.path_head = nn.Sequential(
+                nn.Linear(width, width),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(width, 1),
+            )
         self.reset_fresh()
 
     def reset_fresh(self) -> None:
@@ -135,6 +219,9 @@ class FreshPathTeacher(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         for x in (self.rel, self.sep, self.poolers["text"].queries, self.poolers["image"].queries):
             nn.init.normal_(x, std=0.02)
+        if self.path_mode == "pairwise_residual":  # every path starts exactly at f0
+            nn.init.zeros_(self.path_head[-1].weight)
+            nn.init.zeros_(self.path_head[-1].bias)
 
     # ------------------------------------------------------------------ encoding --
 
@@ -182,63 +269,69 @@ class FreshPathTeacher(nn.Module):
 
     # ------------------------------------------------------------------- scoring --
 
-    def score_pairs(self, cache: ObjectCache, refs: Sequence[tuple[ObjectRef, ObjectRef]]) -> Tensor:
+    def score_pairs(self, cache: "SegmentCache | ObjectCache", refs: Sequence[tuple[ObjectRef, ObjectRef]]) -> Tensor:
         """Scores ``(N,)`` of (a, b) pairs whose tagged segments are in ``cache``."""
+        return self._pair_scores(cache, refs, self.scoring_head)
+
+    def score_path_pairs(self, cache: "SegmentCache | ObjectCache", refs: Sequence[tuple[ObjectRef, ObjectRef]]) -> Tensor:
+        """``pairwise_residual`` local relations ``(N,)`` of (query, evidence) or (evidence, target)
+        pairs: the same relation transformer and global MLP as ``score_pairs`` read by the
+        zero-initialised ``path_head``."""
+        if self.path_mode != "pairwise_residual":
+            raise RuntimeError("score_path_pairs needs path_mode='pairwise_residual'")
+        return self._pair_scores(cache, refs, self.path_head)
+
+    def _pair_scores(self, cache, refs: Sequence[tuple[ObjectRef, ObjectRef]], head: nn.Module) -> Tensor:
         if not refs:
             return torch.empty(0, device=self.rel.device)
-        a_entries = [cache[a] for a, _ in refs]
-        b_entries = [cache[b] for _, b in refs]
-        pair = self.pair_kind.weight[torch.tensor(
-            [3 * KINDS.index(a[0]) + KINDS.index(b[0]) for a, b in refs], device=self.rel.device
-        )]
-        relation = (self.rel + pair).unsqueeze(1)
-        sep = self.sep.unsqueeze(0)
-        seqs = [[relation[i], sa, sep, sb] for i, ((sa, _), (sb, _)) in enumerate(zip(a_entries, b_entries))]
-        ga = torch.stack([g for _, g in a_entries])
-        gb = torch.stack([g for _, g in b_entries])
-        return self._score(seqs, global_features(ga, gb, pair, evidence=None, evidence_type_embedding=None))
+        cache = SegmentCache.wrap(cache)
+        cache.pool(self)
+        pair = torch.tensor([3 * KINDS.index(a[0]) + KINDS.index(b[0]) for a, b in refs], device=self.rel.device)
+        a_glob, b_glob = cache.globals([a for a, _ in refs]), cache.globals([b for _, b in refs])
+        globs = global_features(a_glob, b_glob, self.pair_kind.weight[pair], evidence=None, evidence_type_embedding=None)
+        return self._score(cache, [[a for a, _ in refs], [b for _, b in refs]], pair, globs, head)
 
-    def score_triplets(self, cache: ObjectCache, refs: Sequence[tuple[ObjectRef, ObjectRef, ObjectRef]]) -> Tensor:
+    def score_triplets(self, cache: "SegmentCache | ObjectCache", refs: Sequence[tuple[ObjectRef, ObjectRef, ObjectRef]]) -> Tensor:
         """Scores ``(N,)`` of (query table, evidence, target table) triplets from ``cache``."""
         if not refs:
             return torch.empty(0, device=self.rel.device)
         if any(q[0] != "table" or t[0] != "table" or e[0] == "table" for q, e, t in refs):
             raise ValueError("QET is only defined for table-evidence-table")
-        q_entries = [cache[q] for q, _, _ in refs]
-        e_entries = [cache[e] for _, e, _ in refs]
-        t_entries = [cache[t] for _, _, t in refs]
-        pair = self.pair_kind.weight[3 * KINDS.index("table") + KINDS.index("table")].expand(len(refs), -1)
+        cache = SegmentCache.wrap(cache)
+        cache.pool(self)
+        pair = torch.full((len(refs),), 3 * KINDS.index("table") + KINDS.index("table"), dtype=torch.long, device=self.rel.device)
         etype = self.modality.weight[torch.tensor([KINDS.index(e[0]) for _, e, _ in refs], device=self.rel.device)]
-        relation = (self.rel + pair).unsqueeze(1)
-        sep = self.sep.unsqueeze(0)
-        seqs = [
-            [relation[i], sq, sep, se, sep, st]
-            for i, ((sq, _), (se, _), (st, _)) in enumerate(zip(q_entries, e_entries, t_entries))
-        ]
-        gq = torch.stack([g for _, g in q_entries])
-        ge = torch.stack([g for _, g in e_entries])
-        gt = torch.stack([g for _, g in t_entries])
-        return self._score(seqs, global_features(gq, gt, pair, evidence=ge, evidence_type_embedding=etype))
+        gq, ge, gt = (cache.globals([ref[slot] for ref in refs]) for slot in range(3))
+        globs = global_features(gq, gt, self.pair_kind.weight[pair], evidence=ge, evidence_type_embedding=etype)
+        return self._score(cache, [[r[0] for r in refs], [r[1] for r in refs], [r[2] for r in refs]], pair, globs, head=self.scoring_head)
 
-    def _score(self, seqs: list[list[Tensor]], globs: Tensor) -> Tensor:
-        """Pack variable-length segment lists into one padded batch, run the relation transformer
-        and combine its first token with the global-feature path."""
-        lengths = [sum(len(s) for s in segs) for segs in seqs]
-        batch, total = len(seqs), max(lengths)
-        device = globs.device
-        flat = torch.cat([s for segs in seqs for s in segs], dim=0)
-        tokens = flat.shape[0]
-        length_t = torch.tensor(lengths, device=device, dtype=torch.long)
-        rows = torch.repeat_interleave(torch.arange(batch, device=device), length_t, output_size=tokens)
-        starts = torch.cumsum(length_t, 0) - length_t
-        cols = torch.arange(tokens, device=device) - torch.repeat_interleave(starts, length_t, output_size=tokens)
-        dst = rows * total + cols
-        x = flat.new_zeros(batch * total, self.width)
-        x[dst] = flat
-        pad = torch.ones(batch * total, dtype=torch.bool, device=device)
-        pad[dst] = False
-        out = self.relation(x.view(batch, total, self.width), src_key_padding_mask=pad.view(batch, total))
-        return self.scoring_head(out[:, 0] + self.global_relation(globs)).squeeze(-1)
+    def _score(self, cache: "SegmentCache", slots: list[list[ObjectRef]], pair: Tensor, globs: Tensor, head: nn.Module) -> Tensor:
+        """Sequences ``[rel + pair_kind; slot_0; sep; slot_1 (; sep; slot_2)]``, tightly packed into one
+        padded batch by a single gather from the cache's token pool, through the relation
+        transformer; its first token plus the global-feature path is read by ``head``."""
+        pool, offsets, specials = cache.pool(self)
+        batch = len(slots[0])
+        parts = [(specials + pair.cpu().numpy(), np.ones(batch, dtype=np.int64))]
+        for i, refs in enumerate(slots):
+            if i:
+                parts.append((np.full(batch, specials + 9, dtype=np.int64), np.ones(batch, dtype=np.int64)))
+            parts.append(cache.locate(refs, offsets))
+        lengths = sum(length for _, length in parts)
+        total = int(lengths.max())
+        src = np.full(batch * total, specials + 10, dtype=np.int64)  # the zero row
+        col = np.zeros(batch, dtype=np.int64)
+        row_base = np.arange(batch, dtype=np.int64) * total
+        for start, length in parts:
+            n = int(length.sum())
+            rows = np.repeat(np.arange(batch), length)
+            within = np.arange(n) - np.repeat(np.cumsum(length) - length, length)
+            src[row_base[rows] + col[rows] + within] = np.repeat(start, length) + within
+            col += length
+        index = torch.from_numpy(src).to(pool.device, non_blocking=True)
+        x = pool[index].view(batch, total, self.width)
+        pad = torch.from_numpy(np.arange(total)[None, :] >= lengths[:, None]).to(pool.device, non_blocking=True)
+        out = self.relation(x, src_key_padding_mask=pad)
+        return head(out[:, 0] + self.global_relation(globs)).squeeze(-1)
 
     def score_query_lists(
         self,
@@ -275,26 +368,33 @@ class FreshPathTeacher(nn.Module):
     def _score_query_lists_once(self, q, targets, evidence, paths, chunk: int) -> tuple[Tensor, Tensor]:
         zq, cq = q
         zt, ct_list = targets
+        cache = SegmentCache()
         xq, gq = self.encode_one("table", zq, cq)
-        cache: dict[ObjectRef, tuple[Tensor, Tensor]] = {("table", "q"): (self.tag("table", 0, xq, gq), gq)}
+        cache.add(self.tag("table", 0, xq, gq).unsqueeze(0), [xq.shape[0]], gq.unsqueeze(0), [("table", "q")])
         if ct_list:
             x_t, lengths, g_t = self.encode_many("table", zt, ct_list)
-            tagged = self.tag("table", 1, x_t, g_t)
-            cache.update({("table", k): (tagged[k, :length], g_t[k]) for k, length in enumerate(lengths)})
+            cache.add(self.tag("table", 1, x_t, g_t), lengths, g_t, [("table", k) for k in range(len(ct_list))])
         evidence_ids = list(dict.fromkeys(e for _, e in paths))
         for kind in ("text", "image"):
             ids = [e for e in evidence_ids if evidence[e][0] == kind]
             if ids:
-                seg, _, g = self.encode_many(kind, torch.stack([evidence[e][1] for e in ids]), [evidence[e][2] for e in ids])
-                tagged = self.tag(kind, 2, seg, g)
-                cache.update({(kind, e): (tagged[i], g[i]) for i, e in enumerate(ids)})
+                seg, lengths, g = self.encode_many(kind, torch.stack([evidence[e][1] for e in ids]), [evidence[e][2] for e in ids])
+                cache.add(self.tag(kind, 2, seg, g), [n + 1 for n in lengths], g, [(kind, e) for e in ids])
         pair_refs = [(("table", "q"), ("table", k)) for k in range(len(ct_list))]
-        trip_refs = [(("table", "q"), (evidence[e][0], e), ("table", t)) for t, e in paths]
-        f0 = torch.cat([self.score_pairs(cache, pair_refs[i : i + chunk]) for i in range(0, len(pair_refs), chunk)]
-                       or [torch.empty(0, device=zq.device)])
-        path_scores = torch.cat([self.score_triplets(cache, trip_refs[i : i + chunk]) for i in range(0, len(trip_refs), chunk)]
-                                or [torch.empty(0, device=zq.device)])
-        return f0, path_scores
+        f0 = self._chunked(self.score_pairs, cache, pair_refs, chunk)
+        if self.path_mode == "triplet":
+            trip_refs = [(("table", "q"), (evidence[e][0], e), ("table", t)) for t, e in paths]
+            return f0, self._chunked(self.score_triplets, cache, trip_refs, chunk)
+        qe = self._chunked(self.score_path_pairs, cache, [(("table", "q"), (evidence[e][0], e)) for e in evidence_ids], chunk)
+        et = self._chunked(self.score_path_pairs, cache, [((evidence[e][0], e), ("table", t)) for t, e in paths], chunk)
+        position = {e: i for i, e in enumerate(evidence_ids)}
+        index = torch.tensor([[t, position[e]] for t, e in paths], dtype=torch.long, device=zq.device).reshape(-1, 2)
+        return f0, f0[index[:, 0]] + qe[index[:, 1]] + et
+
+    def _chunked(self, score, cache: ObjectCache, refs: Sequence[tuple], chunk: int) -> Tensor:
+        if not refs:
+            return torch.empty(0, device=self.rel.device)
+        return torch.cat([score(cache, refs[i : i + chunk]) for i in range(0, len(refs), chunk)])
 
     def set_tb_trainable(self) -> list[nn.Parameter]:
         """Freeze object representations and poolers for T_B stages (SPEC 13.2)."""

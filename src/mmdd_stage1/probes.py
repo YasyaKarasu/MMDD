@@ -18,7 +18,7 @@ from .losses import (
     rank_mass_loss,
 )
 from .models import FreshPathTeacher, NativeStudent, QTStudent
-from .train import StudentRecipe, TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids
+from .train import StudentRecipe, TeacherListScorer, _student_c2_scores, _support_loss, _support_object_ids, path_scores
 
 if TYPE_CHECKING:
     from .retrieval import PoolRecord
@@ -310,22 +310,14 @@ def _teacher_component(
             loss = rank_mass_loss(f0, positive_mask)
         elif component == "aggregate" and mode != "qt":
             paths = [(i, evidence) for i, target in enumerate(targets) for evidence in bags.get(target, ())]
-            trips = [
-                ("table", zq, tokens[query_id], bank.kind(evidence), bank.z(evidence), tokens[evidence],
-                 "table", bank.z(targets[target_i]), tokens[targets[target_i]])
-                for target_i, evidence in paths
-            ]
-            trip_keys = [
-                ((query_id, 0), (evidence, 2), (targets[target_i], 1))
-                for target_i, evidence in paths
-            ]
-            path_scores = scorer.score_triplets(trips, trip_keys)
             target_index = torch.tensor(
                 [target_i for target_i, _ in paths], dtype=torch.long, device=f0.device
             )
+            scores = path_scores(scorer, bank, query_id, tokens[query_id], [(e, targets[i]) for i, e in paths], tokens,
+                                 None if model.path_mode == "triplet" else f0[target_index])
             aggregate = (
-                aggregate_cqet(f0, path_scores, target_index)
-                if mode == "cqet" else aggregate_corrected_lse(f0, path_scores, target_index)
+                aggregate_cqet(f0, scores, target_index)
+                if mode == "cqet" else aggregate_corrected_lse(f0, scores, target_index)
             )
             loss = rank_mass_loss(aggregate, positive_mask)
         else:

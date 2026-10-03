@@ -98,6 +98,15 @@ def _hashed_ids(ids: Sequence[str], count: int) -> list[str]:
     return sorted(ids, key=lambda value: (hashlib.sha256(value.encode()).digest(), value.encode()))[:count]
 
 
+def _search(rt: "Runtime") -> str:
+    """Retrieval backend of every formal hop: ``formal_hops`` ``all_ANN`` -> HNSW, ``exact`` -> device top-k."""
+    return "exact" if rt.protocol["retrieval"].get("formal_hops") == "exact" else "hnsw"
+
+
+def _prepaths_audit(rt: "Runtime") -> bool:
+    return bool(rt.protocol["student"].get("C2", {}).get("prepaths_audit", True))
+
+
 def _gpu_guard(expected_uuid: str | None) -> None:
     """The process must see exactly the GPU the protocol pins (set CUDA_VISIBLE_DEVICES to its UUID).
 
@@ -376,17 +385,26 @@ def load_runtime(protocol_path: Path, run_root: Path) -> Runtime:
     return Runtime(paths, protocol, labels, z_store, row_store, bank, basis, mean)
 
 
-def _teacher() -> FreshPathTeacher:
+def _teacher(path_mode: str = "triplet") -> FreshPathTeacher:
     return FreshPathTeacher(
         input_dim=4096, width=512, heads=8, layers=3, ffn=2048,
-        text_slots=16, image_slots=24, dropout=0.1,
+        text_slots=16, image_slots=24, dropout=0.1, path_mode=path_mode,
     )
 
 
-def _load_teacher(path: Path, device: str = "cuda:0") -> FreshPathTeacher:
-    model = _teacher()
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(payload["model"], strict=True)
+def _load_teacher(path: Path, device: str = "cuda:0", path_mode: str | None = None) -> FreshPathTeacher:
+    """Load a Teacher checkpoint. ``path_mode`` defaults to the checkpoint's own (a ``path_head``
+    marks ``pairwise_residual``); asking for ``pairwise_residual`` on a ``triplet`` checkpoint
+    warm-starts it: every path then scores exactly f0 until the fresh ``path_head`` trains."""
+    state = torch.load(path, map_location="cpu", weights_only=False)["model"]
+    saved_mode = "pairwise_residual" if any(k.startswith("path_head.") for k in state) else "triplet"
+    model = _teacher(path_mode or saved_mode)
+    if model.path_mode == "pairwise_residual" and saved_mode == "triplet":
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if unexpected or any(not k.startswith("path_head.") for k in missing):
+            raise ValueError(f"{path}: cannot warm-start pairwise_residual from this state ({missing}, {unexpected})")
+    else:
+        model.load_state_dict(state, strict=True)
     return model.to(device)
 
 
@@ -720,7 +738,7 @@ def _select_c1(
         model = _load_qt(checkpoint, rt) if qt else _load_native(checkpoint, rt)
         pools = evaluate_student_retrieval(
             model, rt.z_store, rt.row_store, dev_ids, rt.labels, "dev",
-            hnsw_seed=seed, generator_id="QT_C1" if qt else "Native_C1",
+            hnsw_seed=seed, generator_id="QT_C1" if qt else "Native_C1", search=_search(rt),
         )
         summary = _candidate_summary(pools, dev_gt)
         key = (
@@ -785,7 +803,7 @@ def _select_c2(
         sup_model = _load_qt(checkpoint, rt) if qt else _load_native(checkpoint, rt)
         sup_pools = evaluate_student_retrieval(
             sup_model, rt.z_store, rt.row_store, dev_ids, rt.labels, "dev",
-            hnsw_seed=seed, generator_id="QT_C2_SUP" if qt else "Native_C2_SUP",
+            hnsw_seed=seed, generator_id="QT_C2_SUP" if qt else "Native_C2_SUP", search=_search(rt),
         )
         sup_metrics = _candidate_summary(sup_pools, dev_gt)
         key = (
@@ -813,7 +831,7 @@ def _select_c2(
             kd_model = _load_native(kd_checkpoints[fraction], rt)
             kd_pools = evaluate_student_retrieval(
                 kd_model, rt.z_store, rt.row_store, dev_ids, rt.labels, "dev",
-                hnsw_seed=seed, generator_id="Native_C2_KD",
+                hnsw_seed=seed, generator_id="Native_C2_KD", search=_search(rt),
             )
             point.update({
                 "KD_checkpoint": str(kd_checkpoints[fraction]),
@@ -925,7 +943,7 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     split_map = {query_id: "train" for query_id in train_ids}
     raw = build_raw_pools_split(
         rt.z_store, rt.row_store, train_ids, rt.labels, split_map,
-        hnsw_seed=13, device="cuda:0",
+        hnsw_seed=13, device="cuda:0", search=_search(rt),
     )
     evidence_anchors = utf8_sorted({
         evidence
@@ -935,7 +953,8 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     })
     raw_et = build_raw_et128_exact(rt.z_store, rt.labels, anchors=evidence_anchors)
     ta_records = [build_ta_records(q, raw[q], rt.labels, 13, raw_et) for q in train_ids]
-    tb_records = [build_tb_records(q, raw[q], rt.labels, 13) for q in train_ids]
+    tb_records = [build_tb_records(q, raw[q], rt.labels, 13, raw_et,
+                                   int(rt.protocol["teacher"]["TB"].get("support_competitors", 8))) for q in train_ids]
     subset_anchors = [
         row for row in rt.labels.edge_anchors
         if row["anchor_id"] in set(train_ids) | set(evidence_anchors)
@@ -949,7 +968,7 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     c1_recipe = StudentRecipe.from_protocol(rt.protocol, stage="C1")
     evidence_pool = _evidence_pool(rt.labels)
     _set_seed(13, "SMOKE_TA")
-    ta_model = _teacher()
+    ta_model = _teacher(str(rt.protocol["teacher"].get("path_mode", "triplet")))
     ta_end = train_ta(
         ta_model, rt.bank, ta_records, rt.labels,
         epochs=int(teacher_ta["epochs"]), lr=float(teacher_ta["lr"]),
@@ -963,6 +982,8 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
         model = _load_teacher(ta_end)
         train_tb(
             model, rt.bank, tb_records, mode=mode,
+            path_loss_scope=str(teacher_tb.get("path_loss_scope", "all")),
+            witness_target_weight=float(teacher_tb.get("witness_target_weight", 0.0)),
             epochs=int(teacher_tb["epochs"]), lr=float(teacher_tb["lr"]),
             weight_decay=float(teacher_tb["wd"]), logical_batch=int(teacher_tb["logical_batch_queries"]),
             direct_weight=float(teacher_tb["path_direct_weight"]),
@@ -986,12 +1007,12 @@ def smoke(protocol_path: Path, run_root: Path) -> None:
     native_selected = _load_native(native_parent, rt)
     c1_pools = evaluate_student_retrieval(
         native_selected, rt.z_store, rt.row_store, train_ids, rt.labels, "train",
-        hnsw_seed=13, generator_id="smoke_native_c1",
+        hnsw_seed=13, generator_id="smoke_native_c1", search=_search(rt),
     )
     c2_prepaths = smoke_root / "C2_SHARED_PREPATHS.jsonl.gz"
     c2_records = build_c2_shared_graph(
         raw, c1_pools, native_selected, rt.z_store, rt.row_store, rt.labels, train_ids,
-        c2_prepaths,
+        c2_prepaths, audit=_prepaths_audit(rt),
     )
     parent_hash = model_state_sha(native_selected)
     kd_model = _load_native(native_parent, rt)
@@ -1041,7 +1062,7 @@ def _materialize_raw_train_dev(
     else:
         raw_train = build_raw_pools_split(
             rt.z_store, rt.row_store, train_ids, rt.labels, "train", hnsw_seed=seed,
-            index_dir=train_bundle / "indices",
+            index_dir=train_bundle / "indices", search=_search(rt),
         )
         save_pool_bundle(train_bundle, raw_train, rt.labels, seed=seed, generator="raw")
     if (dev_bundle / "POOL_MANIFEST.json").exists():
@@ -1049,7 +1070,7 @@ def _materialize_raw_train_dev(
     else:
         raw_dev = build_raw_pools_split(
             rt.z_store, rt.row_store, dev_ids, rt.labels, "dev", hnsw_seed=seed,
-            reuse_index_dir=train_bundle / "indices",
+            reuse_index_dir=train_bundle / "indices", search=_search(rt),
         )
         save_pool_bundle(dev_bundle, raw_dev, rt.labels, seed=seed, generator="raw")
     return raw_train, raw_dev
@@ -1107,6 +1128,8 @@ def _tb_stage(
             direct_weight=float(teacher_tb["path_direct_weight"]),
             aggregate_weight=float(teacher_tb["path_aggregate_weight"]),
             support_weight=float(teacher_tb["support_weight"]),
+            path_loss_scope=str(teacher_tb.get("path_loss_scope", "all")),
+            witness_target_weight=float(teacher_tb.get("witness_target_weight", 0.0)),
             seed=seed, metadata={"attempt": attempt, **common_inputs}, log_path=log,
         ),
     )
@@ -1315,7 +1338,8 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
         }
     else:
         ta_records = [build_ta_records(q, raw_train[q], rt.labels, seed, raw_et) for q in train_ids]
-        tb_records = [build_tb_records(q, raw_train[q], rt.labels, seed) for q in train_ids]
+        tb_records = [build_tb_records(q, raw_train[q], rt.labels, seed, raw_et,
+                                       int(rt.protocol["teacher"]["TB"].get("support_competitors", 8))) for q in train_ids]
         edge_lists = build_c1_edge_lists(rt.labels, raw_train, rt.z_store, seed, raw_et)
         hashes = {
             "TA": save_training_records(ta_gz, ta_records),
@@ -1329,7 +1353,7 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
 
     teacher_ta = rt.protocol["teacher"]["TA"]
     _set_seed(seed, "TA")
-    ta_model = _teacher()
+    ta_model = _teacher(str(rt.protocol["teacher"].get("path_mode", "triplet")))
     ta_batch = int(teacher_ta["logical_batch_queries"])
     ta_config = {
         **teacher_ta,
@@ -1369,14 +1393,14 @@ def train_seed(rt: Runtime, seed: int, raw_et: Mapping[str, Sequence[str]]) -> d
     c1_train_pools = evaluate_student_retrieval(
         selected_native_c1, rt.z_store, rt.row_store, train_ids, rt.labels, "train",
         hnsw_seed=seed, generator_id="selected_Native_C1",
-        index_dir=str(training_dir / "native_c1_train_indices"),
+        index_dir=str(training_dir / "native_c1_train_indices"), search=_search(rt),
     )
     save_pool_bundle(training_dir / "native_c1_train", c1_train_pools, rt.labels,
                      seed=seed, generator="selected_native_c1")
     c2_records = build_c2_shared_graph(
         raw_train, c1_train_pools, selected_native_c1,
         rt.z_store, rt.row_store, rt.labels, train_ids,
-        training_dir / "C2_SHARED_PREPATHS.jsonl.gz",
+        training_dir / "C2_SHARED_PREPATHS.jsonl.gz", audit=_prepaths_audit(rt),
     )
     # Neither train pool dict is read again; release them before the C2 stages.
     del raw_train, c1_train_pools
@@ -1662,7 +1686,7 @@ def evaluate_split(rt: Runtime, seed: int, split: str, global_freeze_hash: str) 
     else:
         raw_pools = build_raw_pools_split(
             rt.z_store, rt.row_store, query_ids, rt.labels, split,
-            hnsw_seed=seed, index_dir=raw_dir / "indices" if split == "test" else None,
+            hnsw_seed=seed, index_dir=raw_dir / "indices" if split == "test" else None, search=_search(rt),
         )
         save_pool_bundle(raw_dir, raw_pools, rt.labels, seed=seed, generator="raw")
     pools_by_generator = {"raw": raw_pools}
@@ -1671,7 +1695,7 @@ def evaluate_split(rt: Runtime, seed: int, split: str, global_freeze_hash: str) 
         pools = evaluate_student_retrieval(
             model, rt.z_store, rt.row_store, query_ids, rt.labels, split,
             hnsw_seed=seed, generator_id=generator,
-            index_dir=str(directory / "indices"),
+            index_dir=str(directory / "indices"), search=_search(rt),
         )
         save_pool_bundle(directory, pools, rt.labels, seed=seed, generator=generator)
         pools_by_generator[generator] = pools

@@ -6,6 +6,10 @@ takes the direct ANN top-150 targets, the top-20 text and image evidence, the to
 of every evidence (second hop), keeps at most four evidence per target by greedy row coverage
 (D1), and admits the C150 Teacher pool by reciprocal-rank fusion of the QT order with the
 D1-coverage order (P3). Every ANN hit is checked against the exact bilinear score.
+
+``search="hnsw"`` (protocol ``formal_hops: all_ANN``) runs every hop on single-threaded HNSW
+indices; ``search="exact"`` (``formal_hops: exact``) takes the same top-k from the exact score
+vectors the audit computes anyway, on the device, so no index is built and ANN recall is 1.
 """
 from __future__ import annotations
 
@@ -171,6 +175,78 @@ def d1_retain_with_trace(
     return selected, float(current.mean()), trace
 
 
+def d1_retain_batch(
+    bags: Sequence[Sequence[PathEntry]],
+    support: Mapping[str, np.ndarray],
+    *,
+    content_key: Optional[Mapping[str, str]] = None,
+    top_l: int = TOP_L,
+    budget: int = EVIDENCE_BUDGET,
+) -> list[tuple[list[str], float, list[dict[str, object]]]]:
+    """``d1_retain_with_trace`` of every bag at once: one ``(bags, top_l, rows)`` array and
+    ``budget`` vectorised greedy steps instead of a numpy call chain per target. Same candidate
+    order, gains, ties and stop rule, so the per-bag results are identical."""
+    per_bag = []
+    for entries in bags:
+        best: dict[str, PathEntry] = {}
+        for entry in entries:
+            key = content_key.get(entry.evidence_id, entry.evidence_id) if content_key else entry.evidence_id
+            current = best.get(key)
+            if current is None or (-entry.raw_path_score, entry.evidence_id.encode("utf-8")) < (
+                -current.raw_path_score, current.evidence_id.encode("utf-8"),
+            ):
+                best[key] = entry
+        per_bag.append(sorted(best.values(), key=lambda p: (-p.raw_path_score, p.evidence_id.encode("utf-8")))[:top_l])
+    results: list = [([], 0.0, []) for _ in bags]
+    active = [i for i, candidates in enumerate(per_bag) if candidates]
+    if not active:
+        return results
+    n_rows = len(next(iter(support.values())))
+    if n_rows == 0:
+        raise ValueError("query rows required for D1 retention")
+    width = max(len(per_bag[i]) for i in active)
+    rows = np.zeros((len(active), width, n_rows), dtype=np.float64)
+    activation = np.zeros((len(active), width), dtype=np.float64)
+    valid = np.zeros((len(active), width), dtype=bool)
+    for b, i in enumerate(active):
+        for k, entry in enumerate(per_bag[i]):
+            rows[b, k] = support[entry.evidence_id]
+            activation[b, k] = sigmoid(entry.raw_path_score)
+            valid[b, k] = True
+    weighted = activation[:, :, None] * rows
+    current = np.zeros((len(active), n_rows), dtype=np.float64)
+    remaining = valid.copy()
+    live = np.ones(len(active), dtype=bool)  # bags still adding coverage
+    step = np.zeros((len(active), width), dtype=np.int64)
+    gain = np.full((len(active), width), np.nan)
+    for s_index in range(1, min(budget, width) + 1):
+        gains = np.maximum(current[:, None, :], weighted).mean(axis=2) - current.mean(axis=1)[:, None]
+        gains_masked = np.where(remaining, gains, -np.inf)
+        pick = gains_masked.argmax(axis=1)  # candidates are in tie-break order, argmax keeps the first
+        chosen = live & remaining.any(axis=1) & (gains_masked[np.arange(len(active)), pick] > 0.0)
+        live &= chosen
+        b = np.nonzero(chosen)[0]
+        step[b, pick[b]] = s_index
+        gain[b, pick[b]] = gains[b, pick[b]]
+        current[b] = np.maximum(current[b], weighted[b, pick[b]])
+        remaining[b, pick[b]] = False
+        if not live.any():
+            break
+    final = np.maximum(current[:, None, :], weighted).mean(axis=2) - current.mean(axis=1)[:, None]
+    gain = np.where(remaining & valid, final, gain)
+    for b, i in enumerate(active):
+        candidates = per_bag[i]
+        order = sorted((int(step[b, k]), k) for k in range(len(candidates)) if step[b, k])
+        trace = [
+            {"evidence_id": candidates[k].evidence_id, "path_raw_score": candidates[k].raw_path_score,
+             "row_support_mean": float(rows[b, k].mean()), "selected_step": int(step[b, k]) or None,
+             "marginal_gain": float(gain[b, k])}
+            for k in range(len(candidates))
+        ]
+        results[i] = ([candidates[k].evidence_id for _, k in order], float(current[b].mean()), trace)
+    return results
+
+
 def p3_admission(
     qt_scores: dict[str, float],
     evidence_order: Sequence[str],
@@ -288,20 +364,27 @@ def _sha256_file(path: Path) -> str:
 
 class _Library:
     """One right-hand object library of a relation: its index vectors (device and host), HNSW index
-    and exact-score audit."""
+    (``search="hnsw"``) or exact device top-k (``search="exact"``), and the exact-score audit."""
 
     def __init__(self, relation: str, ids: Sequence[str], vectors: Tensor, *, seed: int,
-                 index_path: Optional[Path], reuse_path: Optional[Path]) -> None:
+                 index_path: Optional[Path], reuse_path: Optional[Path], search: str = "hnsw") -> None:
+        if search not in ("hnsw", "exact"):
+            raise ValueError(f"unknown search backend {search!r}")
         self.relation = relation
         self.ids = list(ids)
         self.position = {object_id: i for i, object_id in enumerate(self.ids)}
         self.vectors = vectors
-        self.host = vectors.cpu().numpy().astype(np.float32)
+        self.host = np.ascontiguousarray(vectors.cpu().numpy(), dtype=np.float32)
+        self.index = None
+        self.meta = None
+        if search == "exact":
+            self.vector_hash = hashlib.sha256(memoryview(self.host).cast("B")).hexdigest()
+            return
         if reuse_path is None:
             self.index = HNSWIndex(self.host, self.ids, dim=vectors.shape[1], seed=seed)
         else:
             self.index = HNSWIndex.load(reuse_path)
-            vector_hash = hashlib.sha256(memoryview(np.ascontiguousarray(self.host)).cast("B")).hexdigest()
+            vector_hash = hashlib.sha256(memoryview(self.host).cast("B")).hexdigest()
             if self.index.ids != self.ids or self.index.seed != seed or self.index.vector_hash != vector_hash:
                 raise ValueError(f"reused Raw HNSW index does not match current objects: {reuse_path}")
         self.vector_hash = self.index.vector_hash
@@ -317,6 +400,16 @@ class _Library:
                 bad = int(np.argmax(~np.isclose(scores, exact, rtol=1e-4, atol=1e-5)))
                 raise AssertionError(f"ANN score mismatch for {hits[bad][0]}: {scores[bad]} != {exact[bad]}")
         return hits
+
+    def exact_hits(self, scores: Tensor, k: int) -> list[tuple[str, float]]:
+        """Top-``k`` of one exact score vector in the HNSW hit order (score desc, UTF-8 id)."""
+        k = min(int(k), len(self.ids))
+        if k <= 0:
+            return []
+        top = stable_topk(scores, k)
+        values = scores[top].tolist()
+        return sorted(((self.ids[int(i)], float(v)) for i, v in zip(top.tolist(), values)),
+                      key=lambda x: (-x[1], x[0].encode("utf-8")))
 
 
 def _relation_vectors(student, relation: str, z: Tensor) -> Tensor:
@@ -341,16 +434,18 @@ def build_pools(
     index_dir: Optional[Path] = None,
     reuse_index_dir: Optional[Path] = None,
     training_exact: bool = False,
+    search: str = "hnsw",
 ) -> dict[str, PoolRecord]:
     """Formal two-hop retrieval of ``query_ids`` (see module docstring).
 
     ``student=None`` scores every relation with the frozen ``z`` (Raw); a ``QTStudent`` has no
     evidence relations and admits its direct top-150. ``index_dir`` saves the three HNSW
     indices, ``reuse_index_dir`` reloads same-seed indices built earlier (their ids, seed and
-    vector hashes must match). ``training_exact`` adds the exact top-128 QT / QE lists the
-    Teacher training lists are built from.
+    vector hashes must match); both are ignored by ``search="exact"``. ``training_exact`` adds
+    the exact top-128 QT / QE lists the Teacher training lists are built from.
     """
     dev = torch.device(device)
+    exact_search = search == "exact"
     if student is not None:
         student.to(dev).eval()
     qt_only = isinstance(student, QTStudent)
@@ -362,8 +457,9 @@ def build_pools(
         libraries = {
             relation: _Library(
                 relation, ids, _relation_vectors(student, relation, z_store.rows(ids).to(dev)), seed=hnsw_seed,
-                index_path=None if index_dir is None else index_dir / index_names[relation],
-                reuse_path=None if reuse_index_dir is None else reuse_index_dir / index_names[relation],
+                index_path=None if index_dir is None or exact_search else index_dir / index_names[relation],
+                reuse_path=None if reuse_index_dir is None or exact_search else reuse_index_dir / index_names[relation],
+                search=search,
             )
             for relation, ids in relations.items()
         }
@@ -375,6 +471,7 @@ def build_pools(
     index_meta.update({
         "model_state_hash": None if student is None else model_state_sha(student),
         "score_space": "bilinear_ip",
+        "search": search,
         **{relation: library.meta for relation, library in libraries.items() if library.meta is not None},
     })
     index_hash = hashlib.sha256(json.dumps(index_meta, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -388,28 +485,39 @@ def build_pools(
         for qid in query_ids:
             zq = z_store.vector(qid).to(dev)
             queries = {relation: _relation_query(student, relation, zq) for relation in relations}
-            qt_query = queries["QT"].cpu().numpy().astype(np.float32)
-            direct_150 = targets.search(qt_query, CANDIDATE_BUDGET)
-            direct_100 = direct_150[:DIRECT_K]
             exact = {relation: libraries[relation].vectors @ queries[relation] for relation in relations}
+            if exact_search:
+                hits = lambda relation, k: libraries[relation].exact_hits(exact[relation], k)  # noqa: E731
+            else:
+                host_queries = {relation: queries[relation].cpu().numpy().astype(np.float32) for relation in relations}
+                hits = lambda relation, k: libraries[relation].search(host_queries[relation], k)  # noqa: E731
+            direct_150 = hits("QT", CANDIDATE_BUDGET)
+            direct_100 = direct_150[:DIRECT_K]
 
             first_hop: dict[str, list[tuple[str, float]]] = {"text": [], "image": []}
             pre_paths: dict[str, list[PathEntry]] = defaultdict(list)
             et_overlaps: list[float] = []
             if not qt_only:
                 for modality in ("text", "image"):
-                    first_hop[modality] = libraries[f"Q_{modality}"].search(
-                        queries[f"Q_{modality}"].cpu().numpy().astype(np.float32), FIRST_HOP_K)
+                    first_hop[modality] = hits(f"Q_{modality}", FIRST_HOP_K)
                 evidence_items = [(m, e, s) for m in ("text", "image") for e, s in first_hop[m]]
                 if evidence_items:
                     et_queries = torch.stack([
                         _relation_query(student, f"{m}_T", z_store.vector(e).to(dev)) for m, e, _ in evidence_items
                     ])
-                    exact_second = stable_topk_rows(et_queries @ targets.vectors.T, SECOND_HOP_K)
-                    et_host = et_queries.cpu().numpy().astype(np.float32)
+                    second_scores = et_queries @ targets.vectors.T
+                    exact_second = stable_topk_rows(second_scores, SECOND_HOP_K)
+                    if exact_search:
+                        second_values = torch.gather(second_scores, 1, exact_second.to(dev)).cpu()
+                    else:
+                        et_host = et_queries.cpu().numpy().astype(np.float32)
                 for row, (modality, evidence_id, first_score) in enumerate(evidence_items):
                     second_hits = second_hop_cache.get(evidence_id)
-                    if second_hits is None:
+                    if second_hits is None and exact_search:
+                        second_hits = second_hop_cache[evidence_id] = sorted(
+                            ((targets.ids[int(i)], float(v)) for i, v in zip(exact_second[row].tolist(), second_values[row].tolist())),
+                            key=lambda x: (-x[1], x[0].encode("utf-8")))
+                    elif second_hits is None:
                         second_hits = second_hop_cache[evidence_id] = targets.search(et_host[row], SECOND_HOP_K)
                     exact_ids = {targets.ids[int(i)] for i in exact_second[row]}
                     et_overlaps.append(len({t for t, _ in second_hits} & exact_ids) / len(second_hits))
@@ -425,10 +533,9 @@ def build_pools(
                 support = row_support(q_rows, z_store.rows(path_evidence).numpy())
                 support_map = {e: support[:, i] for i, e in enumerate(path_evidence)}
             retained_paths, retained_coverage, d1_trace = {}, {}, {}
-            for target_id in evidence_targets:
-                retained_paths[target_id], retained_coverage[target_id], d1_trace[target_id] = d1_retain_with_trace(
-                    pre_paths[target_id], support_map, content_key=labels.canonical_map,
-                )
+            for target_id, (kept, coverage, trace) in zip(evidence_targets, d1_retain_batch(
+                    [pre_paths[t] for t in evidence_targets], support_map, content_key=labels.canonical_map)):
+                retained_paths[target_id], retained_coverage[target_id], d1_trace[target_id] = kept, coverage, trace
             evidence_order = sorted(
                 (t for t in evidence_targets if retained_paths[t]),
                 key=lambda t: (-retained_coverage[t], t.encode("utf-8")),
@@ -444,8 +551,8 @@ def build_pools(
             else:
                 c150, adm_scores = p3_admission(qt_scores_all_u, evidence_order)
             qt_order = sorted(qt_scores_all_u, key=lambda t: (-qt_scores_all_u[t], t.encode("utf-8")))
-            matched_c = targets.search(qt_query, min(CANDIDATE_BUDGET, len(u_list)))
-            matched_u = targets.search(qt_query, len(u_list))
+            matched_c = hits("QT", min(CANDIDATE_BUDGET, len(u_list)))
+            matched_u = hits("QT", len(u_list))
 
             # Exact audits of the ANN hops.
             top = {relation: stable_topk(exact[relation], max(CANDIDATE_BUDGET, len(u_list))) for relation in relations}
