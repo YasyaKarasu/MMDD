@@ -286,10 +286,11 @@ class FreshPathTeacher(nn.Module):
             return torch.empty(0, device=self.rel.device)
         cache = SegmentCache.wrap(cache)
         cache.pool(self)
-        pair = torch.tensor([3 * KINDS.index(a[0]) + KINDS.index(b[0]) for a, b in refs], device=self.rel.device)
+        pair_codes = np.array([3 * KINDS.index(a[0]) + KINDS.index(b[0]) for a, b in refs], dtype=np.int64)
+        pair = torch.as_tensor(pair_codes, device=self.rel.device)
         a_glob, b_glob = cache.globals([a for a, _ in refs]), cache.globals([b for _, b in refs])
         globs = global_features(a_glob, b_glob, self.pair_kind.weight[pair], evidence=None, evidence_type_embedding=None)
-        return self._score(cache, [[a for a, _ in refs], [b for _, b in refs]], pair, globs, head)
+        return self._score(cache, [[a for a, _ in refs], [b for _, b in refs]], pair_codes, globs, head)
 
     def score_triplets(self, cache: "SegmentCache | ObjectCache", refs: Sequence[tuple[ObjectRef, ObjectRef, ObjectRef]]) -> Tensor:
         """Scores ``(N,)`` of (query table, evidence, target table) triplets from ``cache``."""
@@ -299,19 +300,20 @@ class FreshPathTeacher(nn.Module):
             raise ValueError("QET is only defined for table-evidence-table")
         cache = SegmentCache.wrap(cache)
         cache.pool(self)
-        pair = torch.full((len(refs),), 3 * KINDS.index("table") + KINDS.index("table"), dtype=torch.long, device=self.rel.device)
+        pair_codes = np.full(len(refs), 3 * KINDS.index("table") + KINDS.index("table"), dtype=np.int64)
+        pair = torch.as_tensor(pair_codes, device=self.rel.device)
         etype = self.modality.weight[torch.tensor([KINDS.index(e[0]) for _, e, _ in refs], device=self.rel.device)]
         gq, ge, gt = (cache.globals([ref[slot] for ref in refs]) for slot in range(3))
         globs = global_features(gq, gt, self.pair_kind.weight[pair], evidence=ge, evidence_type_embedding=etype)
-        return self._score(cache, [[r[0] for r in refs], [r[1] for r in refs], [r[2] for r in refs]], pair, globs, head=self.scoring_head)
+        return self._score(cache, [[r[0] for r in refs], [r[1] for r in refs], [r[2] for r in refs]], pair_codes, globs, head=self.scoring_head)
 
-    def _score(self, cache: "SegmentCache", slots: list[list[ObjectRef]], pair: Tensor, globs: Tensor, head: nn.Module) -> Tensor:
+    def _score(self, cache: "SegmentCache", slots: list[list[ObjectRef]], pair_codes: np.ndarray, globs: Tensor, head: nn.Module) -> Tensor:
         """Sequences ``[rel + pair_kind; slot_0; sep; slot_1 (; sep; slot_2)]``, tightly packed into one
         padded batch by a single gather from the cache's token pool, through the relation
         transformer; its first token plus the global-feature path is read by ``head``."""
         pool, offsets, specials = cache.pool(self)
         batch = len(slots[0])
-        parts = [(specials + pair.cpu().numpy(), np.ones(batch, dtype=np.int64))]
+        parts = [(specials + pair_codes, np.ones(batch, dtype=np.int64))]
         for i, refs in enumerate(slots):
             if i:
                 parts.append((np.full(batch, specials + 9, dtype=np.int64), np.ones(batch, dtype=np.int64)))

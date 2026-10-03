@@ -194,16 +194,16 @@ def test_c1_oom_retry_replays_batch_without_duplicate_optimizer_step(
         save_dir=tmp_path / "clean", seed=13,
     )
 
-    original_score = NativeStudent.score
+    original_u = NativeStudent.u
     injected = {"done": False}
 
-    def score_with_one_oom(self, *args, **kwargs):
+    def project_with_one_oom(self, *args, **kwargs):
         if self is retried and not injected["done"]:
             injected["done"] = True
             raise torch.cuda.OutOfMemoryError("synthetic C1 OOM")
-        return original_score(self, *args, **kwargs)
+        return original_u(self, *args, **kwargs)
 
-    monkeypatch.setattr(NativeStudent, "score", score_with_one_oom)
+    monkeypatch.setattr(NativeStudent, "u", project_with_one_oom)
     log_path = tmp_path / "retry.jsonl"
     train_student_c1(
         retried, edge_lists, bank, device="cpu", logical_batch=2,
@@ -1658,6 +1658,51 @@ def test_batch_scores_match_single_record_scores():
     assert torch.allclose(qt_direct, 20.0 * qt.score(bank.z("tp"), bank.z_many(["tn", "q0", "tx"])), atol=1e-6)
 
 
+@pytest.mark.parametrize("qt_only", [False, True])
+def test_c1_batched_projections_preserve_scores_gradients_and_updates(qt_only):
+    from mmdd_stage1.models import QTStudent
+    from mmdd_stage1.train import _student_c1_batch_scores, _student_scores
+
+    torch.manual_seed(31)
+    bank, _, basis, mean = tiny_fixture(2)
+    bank.vectors["im"] = torch.randn(4)
+    bank.kinds["im"] = "image"
+    rows = [
+        {"relation": "QT", "anchor_id": "q0", "candidates": ["tp", "tn", "tp"]},
+        {"relation": "QT", "anchor_id": "q1", "candidates": ["tn", "tx"]},
+    ]
+    if not qt_only:
+        rows += [
+            {"relation": "Q_text", "anchor_id": "q0", "candidates": ["ep", "en"]},
+            {"relation": "Q_image", "anchor_id": "q1", "candidates": ["im", "im"]},
+            {"relation": "text_T", "anchor_id": "ep", "candidates": ["tx", "tp"]},
+            {"relation": "image_T", "anchor_id": "im", "candidates": ["tn", "tp"]},
+        ]
+    model = QTStudent(basis, mean, dim=2) if qt_only else NativeStudent(basis, mean, dim=2)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    reference = copy.deepcopy(model)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-4)
+    for _ in range(2):  # projections must be rebuilt after each optimizer update
+        opt.zero_grad(set_to_none=True)
+        ref_opt.zero_grad(set_to_none=True)
+        actual = _student_c1_batch_scores(model, bank, rows)
+        expected = [_student_scores(reference, bank, r["relation"], bank.z(r["anchor_id"]), r["candidates"])
+                    for r in rows]
+        for x, y in zip(actual, expected):
+            torch.testing.assert_close(x, y, atol=1e-6, rtol=1e-5)
+        sum((i + 1) * scores.square().mean() for i, scores in enumerate(actual)).backward()
+        sum((i + 1) * scores.square().mean() for i, scores in enumerate(expected)).backward()
+        for p, ref in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(p.grad, ref.grad, atol=2e-6, rtol=1e-5)
+        opt.step()
+        ref_opt.step()
+        for p, ref in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(p, ref, atol=1e-6, rtol=1e-5)
+
+
 def test_cosine_schedule_decays_lr_and_resume_follows_it(tmp_path: Path):
     bank, records, basis, mean = tiny_fixture(n_queries=4)
     base = NativeStudent(basis, mean, dim=2)
@@ -2062,6 +2107,39 @@ def test_exact_search_reproduces_hnsw_pools_when_the_index_is_exhaustive(tmp_pat
             assert ids_only(getattr(exact[q], field_name)) == ids_only(getattr(hnsw[q], field_name)), field_name
         np.testing.assert_allclose([s for _, s in exact[q].direct], [s for _, s in hnsw[q].direct], rtol=1e-5, atol=1e-6)
         assert all(value == 1.0 for value in exact[q].ann_exact_overlap.values())
+
+
+@pytest.mark.parametrize("search", ["exact", "hnsw"])
+@pytest.mark.parametrize("use_student", [False, True])
+def test_second_hop_reuses_projection_and_exact_audit_without_changing_pools(monkeypatch, search, use_student):
+    from mmdd_stage1 import retrieval
+
+    torch.manual_seed(52)
+    targets, texts, images = [f"t{i}" for i in range(20)], ["e0", "e1"], ["i0", "i1"]
+    ids = ["q0", "q1", *targets, *texts, *images]
+    vectors = torch.nn.functional.normalize(torch.randn(len(ids), 4), dim=1)
+    vectors[1] = vectors[0]  # every evidence is shared by the two queries
+    z = TinyZStore(dict(zip(ids, vectors)))
+    row_store = TinyRowStore({q: vectors[:1].numpy() for q in ("q0", "q1")})
+    labels = Labels(queries={}, epos={}, legal_targets=targets, edge_anchors=[],
+                    canonical_map={e: e for e in texts + images},
+                    modality={e: "text" for e in texts} | {e: "image" for e in images},
+                    content_hash={e: e for e in texts + images}, canonical_text=texts, canonical_image=images)
+    student = NativeStudent(torch.randn(2, 4), torch.zeros(4), dim=2) if use_student else None
+    audits = []
+    original = retrieval.stable_topk_rows
+
+    def counted(scores, k):
+        audits.append(scores.shape[0])
+        return original(scores, k)
+
+    monkeypatch.setattr(retrieval, "stable_topk_rows", counted)
+    kwargs = dict(student=student, generator_id="test", hnsw_seed=13, device="cpu", search=search, training_exact=True)
+    combined = retrieval.build_pools(z, row_store, ["q0", "q1"], labels, "dev", **kwargs)
+    assert audits == [len(texts) + len(images)]
+    for q in ("q0", "q1"):
+        standalone = retrieval.build_pools(z, row_store, [q], labels, "dev", **kwargs)
+        assert combined[q] == standalone[q]  # paths, scores, coverage, tie order and audits
 
 
 def test_tb_records_carry_witness_target_lists_and_the_support_budget():

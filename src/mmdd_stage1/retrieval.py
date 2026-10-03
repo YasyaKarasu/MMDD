@@ -401,12 +401,12 @@ class _Library:
                 raise AssertionError(f"ANN score mismatch for {hits[bad][0]}: {scores[bad]} != {exact[bad]}")
         return hits
 
-    def exact_hits(self, scores: Tensor, k: int) -> list[tuple[str, float]]:
+    def exact_hits(self, scores: Tensor, k: int, *, order: Optional[Tensor] = None) -> list[tuple[str, float]]:
         """Top-``k`` of one exact score vector in the HNSW hit order (score desc, UTF-8 id)."""
         k = min(int(k), len(self.ids))
         if k <= 0:
             return []
-        top = stable_topk(scores, k)
+        top = stable_topk(scores, k) if order is None else order[:k]
         values = scores[top].tolist()
         return sorted(((self.ids[int(i)], float(v)) for i, v in zip(top.tolist(), values)),
                       key=lambda x: (-x[1], x[0].encode("utf-8")))
@@ -476,9 +476,9 @@ def build_pools(
     })
     index_hash = hashlib.sha256(json.dumps(index_meta, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     object_vector_hash = hashlib.sha256("".join(l.vector_hash for l in libraries.values()).encode("ascii")).hexdigest()
-    # HNSW search is deterministic for a fixed index and query, so each distinct evidence
-    # object needs one checked second-hop search per split.
-    second_hop_cache: dict[str, list[tuple[str, float]]] = {}
+    # Both second-hop scores and their exact audit depend only on the evidence and this
+    # frozen scoring space. Cache them together, scoped to this invocation/model/split.
+    second_hop_cache: dict[str, tuple[list[tuple[str, float]], float]] = {}
     pools: dict[str, PoolRecord] = {}
 
     with torch.no_grad():
@@ -486,8 +486,9 @@ def build_pools(
             zq = z_store.vector(qid).to(dev)
             queries = {relation: _relation_query(student, relation, zq) for relation in relations}
             exact = {relation: libraries[relation].vectors @ queries[relation] for relation in relations}
+            exact_order = {relation: stable_topk(scores, scores.numel()) for relation, scores in exact.items()}
             if exact_search:
-                hits = lambda relation, k: libraries[relation].exact_hits(exact[relation], k)  # noqa: E731
+                hits = lambda relation, k: libraries[relation].exact_hits(exact[relation], k, order=exact_order[relation])  # noqa: E731
             else:
                 host_queries = {relation: queries[relation].cpu().numpy().astype(np.float32) for relation in relations}
                 hits = lambda relation, k: libraries[relation].search(host_queries[relation], k)  # noqa: E731
@@ -501,26 +502,30 @@ def build_pools(
                 for modality in ("text", "image"):
                     first_hop[modality] = hits(f"Q_{modality}", FIRST_HOP_K)
                 evidence_items = [(m, e, s) for m in ("text", "image") for e, s in first_hop[m]]
-                if evidence_items:
+                missing = [(m, e) for m, e, _ in evidence_items if e not in second_hop_cache]
+                if missing:
                     et_queries = torch.stack([
-                        _relation_query(student, f"{m}_T", z_store.vector(e).to(dev)) for m, e, _ in evidence_items
+                        _relation_query(student, f"{m}_T", z_store.vector(e).to(dev)) for m, e in missing
                     ])
                     second_scores = et_queries @ targets.vectors.T
                     exact_second = stable_topk_rows(second_scores, SECOND_HOP_K)
                     if exact_search:
-                        second_values = torch.gather(second_scores, 1, exact_second.to(dev)).cpu()
+                        second_values = torch.gather(second_scores, 1, exact_second.to(dev)).tolist()
                     else:
                         et_host = et_queries.cpu().numpy().astype(np.float32)
-                for row, (modality, evidence_id, first_score) in enumerate(evidence_items):
-                    second_hits = second_hop_cache.get(evidence_id)
-                    if second_hits is None and exact_search:
-                        second_hits = second_hop_cache[evidence_id] = sorted(
-                            ((targets.ids[int(i)], float(v)) for i, v in zip(exact_second[row].tolist(), second_values[row].tolist())),
-                            key=lambda x: (-x[1], x[0].encode("utf-8")))
-                    elif second_hits is None:
-                        second_hits = second_hop_cache[evidence_id] = targets.search(et_host[row], SECOND_HOP_K)
-                    exact_ids = {targets.ids[int(i)] for i in exact_second[row]}
-                    et_overlaps.append(len({t for t, _ in second_hits} & exact_ids) / len(second_hits))
+                    for row, ((_, evidence_id), indices) in enumerate(zip(missing, exact_second.tolist())):
+                        if exact_search:
+                            second_hits = sorted(
+                                ((targets.ids[i], float(v)) for i, v in zip(indices, second_values[row])),
+                                key=lambda x: (-x[1], x[0].encode("utf-8")))
+                        else:
+                            second_hits = targets.search(et_host[row], SECOND_HOP_K)
+                        exact_ids = {targets.ids[i] for i in indices}
+                        overlap = len({t for t, _ in second_hits} & exact_ids) / len(second_hits)
+                        second_hop_cache[evidence_id] = second_hits, overlap
+                for modality, evidence_id, first_score in evidence_items:
+                    second_hits, overlap = second_hop_cache[evidence_id]
+                    et_overlaps.append(overlap)
                     for target_id, second_score in second_hits:
                         pre_paths[target_id].append(PathEntry(evidence_id, modality, first_score, second_score))
             evidence_targets = utf8_sorted(pre_paths)
@@ -555,13 +560,14 @@ def build_pools(
             matched_u = hits("QT", len(u_list))
 
             # Exact audits of the ANN hops.
-            top = {relation: stable_topk(exact[relation], max(CANDIDATE_BUDGET, len(u_list))) for relation in relations}
-            direct_exact = [targets.ids[int(i)] for i in top["QT"]]
+            top = {relation: order[:max(CANDIDATE_BUDGET, len(u_list))].tolist()
+                   for relation, order in exact_order.items()}
+            direct_exact = [targets.ids[i] for i in top["QT"]]
             overlap = {"QT_D100": len({t for t, _ in direct_100} & set(direct_exact[:DIRECT_K])) / max(1, len(direct_100))}
             if not qt_only:
                 for modality in ("text", "image"):
                     library = libraries[f"Q_{modality}"]
-                    exact_20 = {library.ids[int(i)] for i in top[f"Q_{modality}"][:FIRST_HOP_K]}
+                    exact_20 = {library.ids[i] for i in top[f"Q_{modality}"][:FIRST_HOP_K]}
                     hits = first_hop[modality]
                     overlap[f"Q_{modality}"] = len({e for e, _ in hits} & exact_20) / max(1, len(hits))
                 overlap["ET_mean"] = float(np.mean(et_overlaps)) if et_overlaps else 0.0
@@ -591,7 +597,7 @@ def build_pools(
                 ann_exact_overlap=overlap,
                 training_exact={
                     "RawQT128": direct_exact[:TRAINING_EXACT_K],
-                    "RawQE128": {m: [libraries[f"Q_{m}"].ids[int(i)] for i in top[f"Q_{m}"][:TRAINING_EXACT_K]]
+                    "RawQE128": {m: [libraries[f"Q_{m}"].ids[i] for i in top[f"Q_{m}"][:TRAINING_EXACT_K]]
                                  for m in ("text", "image")},
                 } if training_exact else {},
                 d1_trace=d1_trace,

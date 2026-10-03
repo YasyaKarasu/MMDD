@@ -460,6 +460,15 @@ and bind that GPU into the protocol the same way `init` does; nothing is hardcod
 `prepare_abebooks_ablation_features.py` recomposes per-arm features inside each
 ablation run and writes those locations into the arm's protocol explicitly.
 
+Stage-1 execution reuses C1 object projections within each microbatch (including
+their gradients), as C2 already does. Projections are rebuilt after every update.
+Teacher sequence packing keeps relation codes on the CPU to avoid copying them
+back from the GPU. Retrieval sorts each exact score vector once and caches both
+the second-hop hits and their exact audit per evidence, within one frozen-model
+invocation. Candidate budgets, stable tie rules, losses and optimizer schedules
+are unchanged. Batched matrix multiplication can introduce float32 roundoff;
+these optimizations do not promise bit-identical training trajectories.
+
 ## Stage-2 main flow (`mmdd_stage2`, B+IDF)
 
 `src/run_stage2.py` reranks each query's Stage-1 **C30** with recovered bridge

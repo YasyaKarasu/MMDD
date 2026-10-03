@@ -854,6 +854,39 @@ def _student_scores(student: NativeStudent | QTStudent, bank: ObjectBank, relati
     return student.score(left_kind, anchor, right_kind, zb)
 
 
+def _student_c1_batch_scores(
+    student: NativeStudent | QTStudent, bank: ObjectBank, rows: Sequence[dict],
+) -> list[Tensor]:
+    """Project each distinct object once per microbatch; keep every edge list's order.
+
+    Projections have no dropout. Reusing their graph sums all uses' gradients into the same
+    trainable P, as in C2; no representation survives an optimizer step.
+    """
+    positions: dict[str, dict[str, int]] = {}
+    for row in rows:
+        left, right = RELATION_KINDS[row["relation"]]
+        for kind, ids in ((left, [row["anchor_id"]]), (right, row["candidates"])):
+            index = positions.setdefault(kind, {})
+            for object_id in ids:
+                if object_id not in index:
+                    index[object_id] = len(index)
+    projected = {}
+    for kind, index in positions.items():
+        z = bank.z_many(list(index))
+        projected[kind] = student.u(z) if isinstance(student, QTStudent) else student.u(kind, z)
+    scores = []
+    for row in rows:
+        relation = row["relation"]
+        left, right = RELATION_KINDS[relation]
+        anchor = projected[left][positions[left][row["anchor_id"]]]
+        index = torch.tensor([positions[right][c] for c in row["candidates"]],
+                             dtype=torch.long, device=anchor.device)
+        candidates = projected[right][index]
+        matrix = student.R_QT if isinstance(student, QTStudent) else student.R[relation]
+        scores.append((anchor @ matrix * candidates).sum(dim=-1))
+    return scores
+
+
 def _recipe_log(recipe: StudentRecipe, **overrides) -> dict:
     """Recipe fields as written into stage logs and checkpoints (``P_lr``/``R_lr`` naming)."""
     values = {key: value for key, value in recipe.as_dict().items() if key not in ("lr_p", "lr_r")}
@@ -951,10 +984,9 @@ def train_student_c1(
 
     def edge_losses(rows: Sequence[dict]) -> tuple[list[Tensor], dict[str, list[Tensor]]]:
         losses = []
-        for row in rows:
+        for row, raw in zip(rows, _student_c1_batch_scores(student, bank, rows)):
             candidates = list(row["candidates"])
             positives = set(row["positives"])
-            raw = _student_scores(student, bank, row["relation"], bank.z(row["anchor_id"]), candidates)
             loss = rank_mass_loss(recipe.logit_scale * raw, torch.tensor([c in positives for c in candidates], device=dev))
             if loss is None:
                 raise RuntimeError(f"{stage}: prevalidated active list became inactive")
@@ -971,11 +1003,11 @@ def train_student_c1(
     started = time.time()
     for epoch, start, end in batches:
         batch = ordered[start:end]
-        active_batch = [
-            row for row in batch
-            if any(c in set(row["positives"]) for c in row["candidates"])
-            and any(c not in set(row["positives"]) for c in row["candidates"])
-        ]
+        active_batch = []
+        for row in batch:
+            positives = set(row["positives"])
+            if any(c in positives for c in row["candidates"]) and any(c not in positives for c in row["candidates"]):
+                active_batch.append(row)
         if not active_batch:
             continue
         microbatch, rank_loss, _components, anchor_value = _student_step(
