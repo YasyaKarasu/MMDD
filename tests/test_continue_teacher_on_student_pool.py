@@ -70,7 +70,7 @@ def test_mined_records_follow_the_tb_schema_on_the_student_pool(tmp_path: Path):
     assert (tmp_path / "idx" / "targets.hnsw").exists()
     for row in records:
         pool = pools[row["query_id"]]
-        assert set(row) == {"query_id", "targets", "positives", "natural_bags", "support_records"}
+        assert set(row) == {"query_id", "targets", "positives", "natural_bags", "support_records", "qet_lists"}
         assert row["positives"] == ["t000", "t001"]
         assert row["targets"] == sorted(set(row["targets"]), key=lambda t: t.encode())
         # C^B = U | D150 | G | U32 on the Student's pool, with the Student's retained bags.

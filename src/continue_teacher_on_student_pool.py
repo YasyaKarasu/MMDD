@@ -43,7 +43,7 @@ from mmdd_stage1.artifacts import load_pool_bundle, save_pool_bundle, save_train
 from mmdd_stage1.data import iter_jsonl, load_split_gt, read_json, sha256_file, utf8_sorted, write_json  # noqa: E402
 from mmdd_stage1.evaluate import evaluate_teacher_matrix  # noqa: E402
 from mmdd_stage1.labels import Labels  # noqa: E402
-from mmdd_stage1.lists import build_tb_records  # noqa: E402
+from mmdd_stage1.lists import build_raw_et128_exact, build_tb_records  # noqa: E402
 from mmdd_stage1.metrics import bootstrap_contrast, candidate_metrics, evaluate_matrix, summarize  # noqa: E402
 from mmdd_stage1.models import model_state_sha, state_sha  # noqa: E402
 from mmdd_stage1.pipeline import _gpu_guard, _load_native, _load_teacher, _set_seed, load_runtime  # noqa: E402
@@ -63,19 +63,23 @@ def gpu_uuid(physical_index: int) -> str:
 
 def mine_records(
     z_store, row_store, labels: Labels, student, query_ids: Sequence[str], seed: int, index_dir: Path,
-    device: str = "cuda:0",
+    device: str = "cuda:0", support_competitors: int = 8, search: str = "hnsw",
 ) -> tuple[list[dict], dict]:
     """T_B records whose candidate lists come from the Student's retrieval instead of the Raw pools.
 
     ``build_pools`` with ``training_exact`` also fills the exact top-128 QT/QE lists (under the
     Raw-named keys) that ``build_tb_records`` draws the support competitors from, so the record
     builder is reused verbatim: ``targets = U | D150 | G | U32`` with the Student's retained bags.
+    The witness-conditioned target lists (``qet_lists``) use the Student's exact ET top-128.
     """
     pools = build_pools(
         z_store, row_store, query_ids, labels, "train", student=student, generator_id="student_c2",
-        hnsw_seed=seed, device=device, index_dir=index_dir, training_exact=True,
+        hnsw_seed=seed, device=device, index_dir=index_dir, training_exact=True, search=search,
     )
-    records = [build_tb_records(query_id, pools[query_id], labels, seed) for query_id in query_ids]
+    witnesses = utf8_sorted({e for q in query_ids for assets in labels.queries[q]["W"].values() for e in assets})
+    et128 = build_raw_et128_exact(z_store, labels, device=device, anchors=witnesses, student=student)
+    records = [build_tb_records(query_id, pools[query_id], labels, seed, et128, support_competitors)
+               for query_id in query_ids]
     coverage = summarize(
         {q: candidate_metrics(pools[q], set(labels.queries[q]["G"])) for q in query_ids},
         {q: {"kind": "unknown"} for q in query_ids},
@@ -85,6 +89,9 @@ def mine_records(
         "mean_targets": sum(len(row["targets"]) for row in records) / len(records),
         "mean_paths": sum(len(bag) for row in records for bag in row["natural_bags"].values()) / len(records),
         "mean_support_records": sum(len(row["support_records"]) for row in records) / len(records),
+        "mean_support_competitors": sum(len(r["competitors"]) for row in records for r in row["support_records"])
+        / max(1, sum(len(row["support_records"]) for row in records)),
+        "mean_witness_lists": sum(len(row["qet_lists"]) for row in records) / len(records),
         **{key: coverage[key] for key in ("U_target_coverage", "D150_target_coverage", "C150_target_coverage",
                                           "U_size", "Direct_ANN_R10")},
     }
@@ -97,7 +104,8 @@ def _checkpoint_identity(path: Path) -> dict:
 
 
 def train_continuation(rt, records: list[dict], init_checkpoint: Path, out: Path, *, seed: int,
-                       epochs: int, lr: float, metadata: dict) -> Path:
+                       epochs: int, lr: float, metadata: dict, path_mode: str | None = None,
+                       path_loss_scope: str = "all", witness_target_weight: float = 0.0) -> Path:
     tb = rt.protocol["teacher"]["TB"]
     checkpoints = out / "checkpoints"
     if (checkpoints / "end.pt").exists():
@@ -106,14 +114,15 @@ def train_continuation(rt, records: list[dict], init_checkpoint: Path, out: Path
         if stale.exists():  # an interrupted attempt; the loop has no mid-epoch resume
             stale.rename(stale.with_name(f"{stale.name}.failed.{int(time.time())}"))
     _set_seed(seed, "TB_SHARED")
-    model = _load_teacher(init_checkpoint)
+    model = _load_teacher(init_checkpoint, path_mode=path_mode)
     started = time.time()
     torch.cuda.reset_peak_memory_stats()
     train_tb(
         model, rt.bank, records, mode="cqet", save_dir=checkpoints,
         epochs=epochs, lr=lr, weight_decay=float(tb["wd"]), logical_batch=int(tb["logical_batch_queries"]),
         direct_weight=float(tb["path_direct_weight"]), aggregate_weight=float(tb["path_aggregate_weight"]),
-        support_weight=float(tb["support_weight"]), seed=seed, metadata=metadata, log_path=out / "train.jsonl",
+        support_weight=float(tb["support_weight"]), path_loss_scope=path_loss_scope,
+        witness_target_weight=witness_target_weight, seed=seed, metadata=metadata, log_path=out / "train.jsonl",
     )
     torch.cuda.synchronize()
     write_json(out / "TRAIN_TIMING.json", {
@@ -187,6 +196,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--epochs", type=int, help="default: protocol teacher.TB.epochs")
     parser.add_argument("--lr", type=float, help="default: protocol teacher.TB.lr")
     parser.add_argument("--limit", type=int, default=0, help="smoke: only the first N train and dev queries")
+    parser.add_argument("--path-mode", choices=("triplet", "pairwise_residual"),
+                        help="Teacher path scoring (default: the init checkpoint's own); pairwise_residual on a "
+                             "triplet checkpoint warm-starts a zero path_head, so every path starts at f0")
+    parser.add_argument("--path-loss-scope", choices=("all", "bagged"), default="all",
+                        help="aggregated-path rank-mass over all targets or only the targets with a bag")
+    parser.add_argument("--witness-target-weight", type=float, default=0.0,
+                        help="weight of the witness-conditioned target lists (0 = off, as in protocol 4.2)")
+    parser.add_argument("--support-weight", type=float, help="default: protocol teacher.TB.support_weight")
+    parser.add_argument("--support-competitors", type=int, default=8, help="competitors per support record")
+    parser.add_argument("--search", choices=("hnsw", "exact"), default="hnsw", help="mining retrieval backend")
     args = parser.parse_args(argv)
 
     run = args.run_root.resolve()
@@ -228,7 +247,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         train_ids = rt.labels.query_ids[: args.limit or None]
         print(f"[mine] {len(train_ids)} train queries with the {args.student} Student", flush=True)
         started = time.time()
-        records, mined = mine_records(rt.z_store, rt.row_store, rt.labels, student, train_ids, seed, out / "indices")
+        records, mined = mine_records(rt.z_store, rt.row_store, rt.labels, student, train_ids, seed, out / "indices",
+                                      support_competitors=args.support_competitors, search=args.search)
         mined["wall_seconds"] = time.time() - started
         write_json(out / "records_summary.json", mined)
         save_training_records(records_path, records)
@@ -244,7 +264,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "init_checkpoint": _checkpoint_identity(init_checkpoint),
         "records": {"path": str(records_path), "sha256": sha256_file(records_path), "count": len(records),
                     "source": "student_pool" if args.records is None else "given"},
-        "config": {**tb, "epochs": epochs, "lr": lr, "mode": "cqet", "limit": args.limit},
+        "config": {**tb, "epochs": epochs, "lr": lr, "mode": "cqet", "limit": args.limit,
+                   "path_mode": args.path_mode, "path_loss_scope": args.path_loss_scope,
+                   "witness_target_weight": args.witness_target_weight, "support_competitors": args.support_competitors,
+                   "search": args.search, **({"support_weight": args.support_weight} if args.support_weight is not None else {})},
         "gpu_uuid": uuid,
         "source_identity_sha256": source_identity(rt.paths),
         "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -252,9 +275,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     write_json(out / "IDENTITY.json", identity)
 
+    if args.support_weight is not None:
+        rt.protocol["teacher"]["TB"]["support_weight"] = args.support_weight
     end_checkpoint = train_continuation(
         rt, records, init_checkpoint, out, seed=seed, epochs=epochs, lr=lr,
         metadata={"init_checkpoint": identity["init_checkpoint"], "records_sha256": identity["records"]["sha256"]},
+        path_mode=args.path_mode, path_loss_scope=args.path_loss_scope,
+        witness_target_weight=args.witness_target_weight,
     )
     del records
 
@@ -263,7 +290,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"[evaluate] {summary_path} exists; done", flush=True)
         return
     teachers = {
-        "init": _load_teacher(init_checkpoint),
+        "init": _load_teacher(init_checkpoint, path_mode=args.path_mode),
         "half": _load_teacher(end_checkpoint.with_name("half.pt")),
         "end": _load_teacher(end_checkpoint),
     }
