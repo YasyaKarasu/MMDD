@@ -417,17 +417,18 @@ class TeacherListScorer:
                 self.scores.clear()
             return
         forward_end_rng = _torch_rng_state()
-        adjoints = torch.autograd.grad(loss, [call[-1] for call in self.calls])
+        adjoints = torch.autograd.grad(loss, [call[-1] for call in self.calls], allow_unused=True)
+        active = [(call, adj) for call, adj in zip(self.calls, adjoints) if adj is not None]
         self.cache = SegmentCache()
-        for _kind, rows, keys, _rng, _leaf in self.calls:
+        for (_kind, rows, keys, _rng, _leaf), _adj in active:
             self.encode(rows, keys)
-        for index, ((kind, rows, keys, rng, _leaf), adjoint) in enumerate(zip(self.calls, adjoints)):
+        for index, ((kind, rows, keys, rng, _leaf), adjoint) in enumerate(active):
             _restore_torch_rng_state(rng)
             score = {"pairs": self.model.score_pairs, "triplets": self.model.score_triplets,
                      "path_pairs": self.model.score_path_pairs}[kind]
             # Chunks share the encoder outputs, so every chunk but the last must retain them.
             score(self.cache, self._refs(rows, keys)).backward(
-                adjoint * scale, retain_graph=index + 1 < len(self.calls)
+                adjoint * scale, retain_graph=index + 1 < len(active)
             )
         _restore_torch_rng_state(forward_end_rng)
         self.calls.clear()

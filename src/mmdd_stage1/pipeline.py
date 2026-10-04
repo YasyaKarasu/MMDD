@@ -160,6 +160,12 @@ def amend_source(
 
 TEACHER_CHAIN_STAGES = ("TA", "TB_CQET", "TB_QT")
 TEACHER_CHAIN_LISTS = ("TA", "TB_SHARED", "C1_NATIVE", "C1_QT")
+# The checkpoint names the pipeline reads from an adopted Teacher stage (the trainer writes these,
+# and the Teacher trajectory reads all three of each).
+TEACHER_CHECKPOINT_FILES = {
+    "TA": ("init.pt", "epoch1.pt", "epoch2.pt"),
+    "TB_CQET": ("init.pt", "half.pt", "end.pt"),
+}
 POOL_BUNDLE_FILES = (
     "POOL_MANIFEST.json", "pool_records.pt", "pools.jsonl.gz", "prepaths.jsonl.gz",
     "first_hop.jsonl.gz", "second_hop.jsonl.gz", "direct_exact.jsonl.gz", "matched_direct.jsonl.gz",
@@ -283,6 +289,138 @@ def import_teacher_chain(protocol_path: Path, run_root: Path, from_run: Path, re
     }
     write_json(paths.run_root / "IMPORTED_TEACHER_CHAIN.json", receipt)
     return receipt
+
+
+def adopt_teacher_chain(
+    protocol_path: Path, run_root: Path, *, ta_dir: Path, tb_dir: Path,
+    path_mode: str | None, reason: str, replace: bool = False,
+) -> dict:
+    """Install an external Teacher chain (TA + TB_CQET) as this run's completed stages.
+
+    The Student's C2 KD reads only its own run's ``seed<seed>/TB_CQET/checkpoints/end.pt``, and
+    ``import-teacher`` needs a completed *run root* as its source. A Teacher trained outside the
+    pipeline (``train_teacher_chain.py`` / ``continue_teacher_on_student_pool.py``) lives in an
+    out-dir with no protocol, stage directories or receipts, so neither the KD path nor
+    ``import-teacher`` can reach it. This installs it: the checkpoints are copied into freshly
+    written, correctly shaped stage directories, and a SUCCESS receipt is recorded under the
+    *current* source identity, so ``_run_stage`` treats TA and TB_CQET as done and trains only
+    TB_QT and the Students.
+
+    ``ta_dir`` and ``tb_dir`` each hold the checkpoints the pipeline reads
+    (``TEACHER_CHECKPOINT_FILES``); ``$R3A/TA`` and ``$R3A/TB_CQET`` already use those names.
+    ``path_mode`` must match the protocol's ``teacher.path_mode`` (the Teacher the Students then
+    train against) and the checkpoints' own mode; the two must agree because a KD teacher and its
+    architecture are a single experiment. Set ``replace`` to re-install (a new attempt supersedes
+    the previous one), e.g. after continuing the Teacher on the Student pool.
+
+    Runs after ``lock`` and before ``prepare``, like ``import-teacher``. Every copied file is
+    re-hashed into the receipt; the *origin* is recorded in ``ADOPTED_TEACHER_CHAIN.json``.
+    """
+    protocol, paths = _protocol_paths(protocol_path, run_root)
+    if not (paths.run_root / "CACHE_IDENTITY.json").exists():
+        raise RuntimeError("adopt-teacher runs after lock")
+    if (paths.run_root / "SOURCE_TREE_MANIFEST.jsonl").exists():
+        raise RuntimeError("adopt-teacher runs before prepare")
+    expected_mode = str(protocol["teacher"].get("path_mode", "triplet"))
+    mode = path_mode or expected_mode
+    if mode != expected_mode:
+        raise RuntimeError(
+            f"path_mode {mode!r} does not match protocol.teacher.path_mode {expected_mode!r}"
+        )
+    ta_dir, tb_dir = Path(ta_dir).resolve(), Path(tb_dir).resolve()
+    for stage, source_dir in (("TA", ta_dir), ("TB_CQET", tb_dir)):
+        if not source_dir.is_dir():
+            raise FileNotFoundError(f"{stage}: adopted checkpoint directory not found: {source_dir}")
+        missing = [name for name in TEACHER_CHECKPOINT_FILES[stage] if not (source_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"{stage}: {source_dir} is missing {missing}")
+
+    installed: dict[str, dict[str, str]] = {}
+    for seed in protocol["seeds"]:
+        seed_dir = paths.seed_dir(seed)
+        for stage, source_dir in (("TA", ta_dir), ("TB_CQET", tb_dir)):
+            stage_dir = seed_dir / stage
+            alias = stage_dir / "checkpoints"
+            if alias.exists() or alias.is_symlink():
+                if not replace:
+                    raise RuntimeError(f"{stage}: {stage_dir} already has checkpoints; pass replace=True")
+                alias.unlink()
+            config = {"adopted": True, "path_mode": mode, "origin": str(source_dir)}
+            if stage == "TB_CQET":
+                config["mode"] = "cqet"
+            attempt = record_stage_pre_run(
+                stage_dir, stage, seed, paths,
+                parents=({"adopted_origin": str(ta_dir)} if stage == "TA"
+                         else {"TA_state": _checkpoint_state(seed_dir / "TA" / "checkpoints" / "epoch2.pt")}),
+                config=config, inputs=_teacher_stage_inputs(paths, seed_dir),
+                lists=_teacher_stage_lists(seed_dir),
+            )
+            checkpoints = stage_dir / "attempts" / attempt / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            outputs = {}
+            for name in TEACHER_CHECKPOINT_FILES[stage]:
+                destination = checkpoints / name
+                shutil.copy2(source_dir / name, destination)
+                if sha256_file(destination) != sha256_file(source_dir / name):
+                    raise RuntimeError(f"{stage}: copy of {name} is corrupt")
+                outputs[name] = str(destination)
+                installed.setdefault(str(stage_dir.relative_to(paths.run_root)), {})[name] = sha256_file(destination)
+            log_path = stage_dir / f"train.{attempt}.jsonl"
+            log_path.write_text("", encoding="utf-8")
+            outputs["train_log"] = str(log_path)
+            _publish_checkpoints(stage_dir, checkpoints)
+            record_stage_post_run(
+                stage_dir, stage, seed, attempt_id=attempt, status="SUCCESS",
+                counters={"checkpoint_count": len(TEACHER_CHECKPOINT_FILES[stage]), "adopted": True},
+                outputs=outputs, timing={"wall_seconds": 0.0, "optimizer_steps": 0},
+                impact=f"Teacher stage adopted from {source_dir}",
+            )
+            _append_jsonl(seed_dir / "timing" / "stages.jsonl", {
+                "schema_version": VERSION, "seed": seed, "stage": stage, "attempt_id": attempt,
+                "wall_seconds": 0.0, "optimizer_steps": 0, "exposure_units": 0,
+                "peak_allocated_bytes": 0, "peak_reserved_bytes": 0,
+                "adopted_from": str(source_dir),
+            })
+    for seed in protocol["seeds"]:
+        for stage in ("TA", "TB_CQET"):
+            _completed_stage_result(paths, paths.seed_dir(seed) / stage, stage)  # the check train will run
+    receipt = {
+        "schema_version": VERSION,
+        "stages": ["TA", "TB_CQET"],
+        "seeds": list(protocol["seeds"]),
+        "path_mode": mode,
+        "ta_dir": str(ta_dir),
+        "tb_dir": str(tb_dir),
+        "installed": installed,
+        "reason": reason,
+        "recorded_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    write_json(paths.run_root / "ADOPTED_TEACHER_CHAIN.json", receipt)
+    return receipt
+
+
+def _teacher_stage_inputs(paths: Paths, seed_dir: Path) -> dict[str, str]:
+    """The inputs ``import-teacher`` already requires to agree; adopted stages record the same keys."""
+    inputs = {
+        "dataset_identity": read_json(paths.run_root / "DATASET_IDENTITY.json")["identity_sha256"],
+        "cache_identity": read_json(paths.run_root / "CACHE_IDENTITY.json")["identity_sha256"],
+    }
+    for key, relative in (
+        ("raw_train_pool_manifest", "training_records/raw_train/POOL_MANIFEST.json"),
+        ("raw_dev_pool_manifest", "eval/dev/raw/POOL_MANIFEST.json"),
+    ):
+        path = seed_dir / relative
+        inputs[key] = sha256_file(path) if path.is_file() else ""
+    return inputs
+
+
+def _teacher_stage_lists(seed_dir: Path) -> dict[str, str]:
+    lists = {}
+    for name in ("TA", "TB_SHARED"):
+        path = seed_dir / "training_records" / f"{name}.jsonl.gz"
+        if path.is_file():
+            lists[name] = sha256_file(path)
+    return lists
 
 
 def prepare(protocol_path: Path, run_root: Path) -> None:

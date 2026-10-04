@@ -285,7 +285,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
     commands = ("init", "build-data", "encode", "pack", "lock", "verify-features", "prepare",
-                "validate", "smoke", "train", "train-side", "export", "amend-source", "import-teacher")
+                "validate", "smoke", "train", "train-side", "export", "amend-source", "import-teacher",
+                "adopt-teacher")
     for command in commands:
         subparsers.add_parser(command).add_argument("--run-root", type=Path, required=True)
     init_parser = subparsers.choices["init"]
@@ -316,6 +317,16 @@ def main(argv: list[str] | None = None) -> None:
     import_parser.add_argument("--from-run", type=Path, required=True,
                                help="completed run root whose Raw pools, lists and TA/TB_CQET/TB_QT are reused")
     import_parser.add_argument("--reason", required=True)
+    adopt_parser = subparsers.choices["adopt-teacher"]
+    adopt_parser.add_argument("--ta-dir", type=Path, required=True,
+                              help="directory holding init.pt/epoch1.pt/epoch2.pt of an external T_A")
+    adopt_parser.add_argument("--tb-dir", type=Path, required=True,
+                              help="directory holding init.pt/half.pt/end.pt of an external T_B_CQET")
+    adopt_parser.add_argument("--path-mode", choices=("triplet", "pairwise_residual"),
+                              help="default: the protocol's teacher.path_mode; must agree with the checkpoints")
+    adopt_parser.add_argument("--replace", action="store_true",
+                              help="re-install over an existing TA/TB_CQET stage (a new attempt supersedes it)")
+    adopt_parser.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
     run = args.run_root.resolve()
 
@@ -372,6 +383,12 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "import-teacher":
             receipt = pipeline.import_teacher_chain(protocol_path, run, args.from_run.resolve(), args.reason)
             print(json.dumps({k: v for k, v in receipt.items() if k != "copied"}, indent=2, ensure_ascii=False))
+        elif args.command == "adopt-teacher":
+            receipt = pipeline.adopt_teacher_chain(
+                protocol_path, run, ta_dir=args.ta_dir.resolve(), tb_dir=args.tb_dir.resolve(),
+                path_mode=args.path_mode, reason=args.reason, replace=args.replace,
+            )
+            print(json.dumps(receipt, indent=2, ensure_ascii=False))
         else:
             unknown = set(args.carry) - set(pipeline.STAGES)
             if unknown:

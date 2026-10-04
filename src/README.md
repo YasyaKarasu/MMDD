@@ -311,6 +311,7 @@ $S build-data      --run-root $RUN          # only for a new feature directory
 $S encode          --run-root $RUN          # only for a new feature directory; --gpus 0 1 runs the shards in parallel
 $S lock            --run-root $RUN
 $S import-teacher  --run-root $RUN --from-run <completed run> --reason TEXT   # optional: reuse its Teacher chain
+$S adopt-teacher  --run-root $RUN --ta-dir DIR --tb-dir DIR --reason TEXT   # optional: install an external Teacher chain
 $S verify-features --run-root $RUN
 $S prepare         --run-root $RUN
 $S validate        --run-root $RUN
@@ -328,6 +329,7 @@ Inputs and outputs (`F` = feature directory, everything else under `<run>`):
 | `encode` | `F/data/`, backbone | `F/encoder/` (two-tier Qwen cache, merged from two shards), `F/content_shard*/`, `F/features/{z,content}`; logs under `<run>/logs/` |
 | `lock` | dataset, backbone, `F/features/` | `DATASET_IDENTITY.json`, `FROZEN_RECIPE_LOCK.json`, `CONTENT_ALIASES.jsonl.gz`, `CACHE_MANIFEST.jsonl` |
 | `import-teacher` | a completed run with the same dataset, feature cache, seeds and `teacher` / `retrieval` / `feature_provenance` blocks | copies of its `seed<N>/training_records/raw_train`, `seed<N>/eval/dev/raw` pool bundles, `TA/TB_SHARED/C1_*` lists and `TA`, `TB_CQET`, `TB_QT` stage directories; `SOURCE_AMENDMENTS.jsonl` carrying those stages from the source run's code; `IMPORTED_TEACHER_CHAIN.json` |
+| `adopt-teacher` | directories holding an external T_A (`init/epoch1/epoch2.pt`) and T_B_CQET (`init/half/end.pt`), e.g. the output of `train_teacher_chain.py` or `continue_teacher_on_student_pool.py` | copies of those checkpoints into freshly written `seed<N>/{TA,TB_CQET}/attempts/<n>/checkpoints/` with SUCCESS receipts under the current source and `ADOPTED_TEACHER_CHAIN.json`; `replace=True` re-installs over an existing stage |
 | `verify-features` | 16 objects per modality | `tests/real_tensor_probes/feature_provenance.json`; fails closed on any mismatch |
 | `prepare` | train qrels/recoveries | `labels/`, `rows/`, `pca/` (train queries + lake + evidence only) |
 | `validate` | | runs `tests/test_stage1_cqet.py` and `tests/test_stage1_reference_contracts.py`, bound to the source hash |
@@ -438,6 +440,8 @@ run's code, and runs `train`'s own reuse check on the copies. Receipts are copie
 byte, so their `outputs[*].path` still name the source run; reuse checks resolve outputs
 inside the stage directory, not at that recorded path. The Teacher trajectory, the test
 Raw pools and every Student stage are recomputed in the new run.
+
+**Adopting an external Teacher.** A Teacher trained outside the pipeline (`train_teacher_chain.py`, `continue_teacher_on_student_pool.py`) is not a run root, so `import-teacher` cannot take it. `adopt-teacher --ta-dir D --tb-dir D --reason TEXT` installs its checkpoints directly as this run's `TA` and `TB_CQET`: it copies the names the pipeline reads, writes SUCCESS receipts under the *current* source (so no `amend-source` is needed), and `train` then skips both stages and distils the Students from that Teacher. `--path-mode` defaults to the protocol's and must agree with the checkpoints; `--replace` re-installs, e.g. after continuing the Teacher on the Student pool. `TB_QT` is not adopted and is trained normally from the adopted `TA`.
 
 `export` writes one record per query with `results[].{target_id, score,
 direct_score, evidence_score, stage2_table_score, paths}`. Target order and table

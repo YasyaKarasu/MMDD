@@ -536,6 +536,26 @@ def test_teacher_list_scorer_matches_per_chunk_scoring_with_dropout():
             torch.testing.assert_close(parameter.grad, legacy_grads[name], rtol=1e-4, atol=1e-5)
 
 
+def test_teacher_list_scorer_handles_unused_scored_chunks_in_two_pass():
+    torch.manual_seed(42)
+    bank, _records, _basis, _mean = tiny_fixture()
+    model = FreshPathTeacher(
+        input_dim=4, width=4, heads=1, layers=1, ffn=8,
+        text_slots=1, image_slots=1, dropout=0.0,
+    ).train()
+    pairs = [
+        ("table", bank.z("q0"), bank.tokens("q0"), "table", bank.z(target), bank.tokens(target))
+        for target in ("tp", "tn", "tx")
+    ]
+    keys = [(("q0", 0), (target, 1)) for target in ("tp", "tn", "tx")]
+    scorer = TeacherListScorer(model, chunk=1, mode="two_pass")
+    scores = scorer.score_pairs(pairs, keys)
+    # loss only depends on the first 2 scores; the 3rd chunk is completely unused
+    loss = scores[0] + scores[1]
+    scorer.backward(loss, scale=1.0)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
 def test_teacher_list_scorer_consumes_the_same_dropout_stream_as_per_chunk_scoring():
     """Chunking bounds the relation batch but must not change the dropout draws:
     the relation transformer sees the same sequence of batch shapes either way."""
@@ -2170,3 +2190,76 @@ def test_tb_records_carry_witness_target_lists_and_the_support_budget():
     assert all(len(r["competitors"]) == 8 for r in plain["support_records"])
     assert all(len(r["competitors"]) == 20 for r in rich["support_records"])
     assert plain["targets"] == rich["targets"] and plain["natural_bags"] == rich["natural_bags"]
+
+
+def test_adopt_teacher_chain_installs_external_checkpoints(tmp_path: Path):
+    from mmdd_stage1.pipeline import (
+        TEACHER_CHECKPOINT_FILES,
+        _completed_stage_result,
+        adopt_teacher_chain,
+    )
+
+    repo = Path(__file__).resolve().parents[1]
+    protocol = json.loads((repo / "configs" / "mmdd_stage1_cqet_protocol.json").read_text())
+    protocol["hardware"]["uuid"] = "GPU-deadbeef"
+    protocol["paths"]["dataset_root"] = str(tmp_path / "dataset")
+    identities = {"DATASET_IDENTITY.json": "d" * 64, "CACHE_IDENTITY.json": "c" * 64}
+    run = _fake_run_root(tmp_path / "run", protocol, identities)
+    from mmdd_stage1.config import resolve_default_paths
+    paths = resolve_default_paths(run / "protocol.json", run)
+
+    # The external Teacher out-dir: real (tiny) checkpoints under the names the pipeline reads.
+    external = tmp_path / "external"
+    for stage, names in TEACHER_CHECKPOINT_FILES.items():
+        directory = external / stage
+        directory.mkdir(parents=True)
+        for name in names:
+            torch.save({"model": {f"{stage}_{name}": torch.arange(4, dtype=torch.float32)}},
+                       directory / name)
+
+    # Both preconditions fail closed: no lock yet, then already past prepare.
+    unlocked = _fake_run_root(tmp_path / "unlocked", protocol, {"DATASET_IDENTITY.json": "d" * 64})
+    with pytest.raises(RuntimeError, match="after lock"):
+        adopt_teacher_chain(unlocked / "protocol.json", unlocked, ta_dir=external / "TA",
+                            tb_dir=external / "TB_CQET", path_mode=None, reason="x")
+    (run / "SOURCE_TREE_MANIFEST.jsonl").write_text("")
+    with pytest.raises(RuntimeError, match="before prepare"):
+        adopt_teacher_chain(run / "protocol.json", run, ta_dir=external / "TA", tb_dir=external / "TB_CQET",
+                            path_mode=None, reason="x")
+    (run / "SOURCE_TREE_MANIFEST.jsonl").unlink()
+
+    # A path_mode that disagrees with the protocol, or a directory missing a checkpoint, is rejected.
+    with pytest.raises(RuntimeError, match="does not match protocol.teacher.path_mode"):
+        adopt_teacher_chain(run / "protocol.json", run, ta_dir=external / "TA", tb_dir=external / "TB_CQET",
+                            path_mode="pairwise_residual", reason="x")
+    empty = tmp_path / "empty_ta"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError, match="missing"):
+        adopt_teacher_chain(run / "protocol.json", run, ta_dir=empty, tb_dir=external / "TB_CQET",
+                            path_mode=None, reason="x")
+
+    receipt = adopt_teacher_chain(run / "protocol.json", run, ta_dir=external / "TA", tb_dir=external / "TB_CQET",
+                                  path_mode=None, reason="adopt R3 teacher")
+    assert receipt["stages"] == ["TA", "TB_CQET"] and receipt["path_mode"] == protocol["teacher"]["path_mode"]
+    assert (run / "ADOPTED_TEACHER_CHAIN.json").exists()
+    # train's own reuse check accepts both stages, and returns the endpoints KD and export read.
+    assert _completed_stage_result(paths, run / "seed13" / "TA", "TA") == run / "seed13" / "TA" / "checkpoints" / "epoch2.pt"
+    assert _completed_stage_result(paths, run / "seed13" / "TB_CQET", "TB_CQET") == run / "seed13" / "TB_CQET" / "checkpoints" / "end.pt"
+    for stage, names in TEACHER_CHECKPOINT_FILES.items():
+        for name in names:
+            installed = run / "seed13" / stage / "checkpoints" / name
+            assert installed.read_bytes() == (external / stage / name).read_bytes()
+    post = json.loads((run / "seed13" / "TB_CQET" / "POST_RUN.attempt_001.json").read_text())
+    assert post["status"] == "SUCCESS" and post["counters"]["adopted"] is True
+    assert post["outputs"]["end.pt"]["sha256"] == hashlib.sha256((external / "TB_CQET" / "end.pt").read_bytes()).hexdigest()
+
+    # Second install without --replace is refused; with replace it supersedes the first attempt.
+    with pytest.raises(RuntimeError, match="pass replace=True"):
+        adopt_teacher_chain(run / "protocol.json", run, ta_dir=external / "TA", tb_dir=external / "TB_CQET",
+                            path_mode=None, reason="again")
+    (external / "TB_CQET" / "end.pt").write_bytes(b"continued")
+    adopt_teacher_chain(run / "protocol.json", run, ta_dir=external / "TA", tb_dir=external / "TB_CQET",
+                        path_mode=None, reason="continued", replace=True)
+    assert _completed_stage_result(paths, run / "seed13" / "TB_CQET", "TB_CQET") == run / "seed13" / "TB_CQET" / "checkpoints" / "end.pt"
+    assert (run / "seed13" / "TB_CQET" / "checkpoints" / "end.pt").read_bytes() == b"continued"
+    assert (run / "seed13" / "TB_CQET" / "POST_RUN.attempt_002.json").exists()
