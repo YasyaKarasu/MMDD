@@ -180,15 +180,25 @@ class Generator:
         for value in (self.model.generation_config.eos_token_id, self.processor.tokenizer.eos_token_id):
             self.eos.update([value] if isinstance(value, int) else value or [])
         self.crops: dict[str, list[dict[str, Any]]] = {}
+        self.text_spans: dict[str, list[dict[str, Any]]] = {}
+        self.text_selector = None
+        if config.get("text_span", {}).get("mode", "prefix") != "prefix":
+            from .text_span import TextSpanSelector
+            self.text_selector = TextSpanSelector(self.processor, self.model, config["text_span"])
 
     def message(self, task: dict[str, Any], query: dict[str, Any]) -> list[dict[str, Any]]:
         content = [{"type": "text", "text": ROW1_PROMPT + "\nQUERY ROW\n" + json.dumps(task["row"], ensure_ascii=False)
                     + "\nREQUESTED ATTRIBUTE: " + task["column_name"] + "\nRETRIEVED EVIDENCE\n"}]
-        crops = []
+        crops, text_spans = [], []
         for index, evidence_id in enumerate(task["evidence_ids"], 1):
             asset, label = query["assets"][evidence_id], f"E{index}"
             if asset["asset_type"] == "text":
-                content.append({"type": "text", "text": f"\n{label} (text):\n{asset['content'][:self.c['text_chars']]}\n"})
+                text = asset["content"][:self.c["text_chars"]]
+                if self.text_selector is not None:
+                    span = self.text_selector.select(task["row"], task["column_name"], text)
+                    text = span["text"]
+                    text_spans.append({"evidence_id": evidence_id, **span})
+                content.append({"type": "text", "text": f"\n{label} (text):\n{text}\n"})
                 continue
             original = bounded_rgb(decode_original(asset["local_path"]), self.c["max_image_pixels"])
             content += [{"type": "text", "text": f"\n{label} (image): ORIGINAL\n"}, {"type": "image", "image": original}]
@@ -205,6 +215,7 @@ class Generator:
                     {"type": "image", "image": crop["tight"]}]
         content.append({"type": "text", "text": "\nEND EVIDENCE. Return only the requested JSON value."})
         self.crops[task["task_id"]] = crops
+        self.text_spans[task["task_id"]] = text_spans
         return [{"role": "user", "content": content}]
 
     def run(self, tasks: list[dict[str, Any]], query: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -257,6 +268,8 @@ def recover_query(generator: Generator, query: dict[str, Any], views: list[dict[
     predictions: list[dict[str, Any]] = []
     log: list[dict[str, Any]] = []
     model_inputs = 0
+    text_selector = getattr(generator, "text_selector", None)
+    text_initial = (text_selector.forwards, text_selector.seconds) if text_selector is not None else (0, 0.0)
 
     def run_phase(tasks: list[dict[str, Any]]) -> None:
         nonlocal model_inputs
@@ -273,7 +286,8 @@ def recover_query(generator: Generator, query: dict[str, Any], views: list[dict[
             if item["input_limit"] or item["length_limit"]:
                 raise RecoveryLimit(f"{t['task_id']}: input_limit={item['input_limit']} length_limit={item['length_limit']}")
             status, value = parse_completion(item["raw_completion"])
-            answers[k] = {"status": status, "value": value, "raw_completion": item["raw_completion"]}
+            answers[k] = {"status": status, "value": value, "raw_completion": item["raw_completion"],
+                          "prompt_tokens": item.get("prompt_tokens"), "generated_tokens": item.get("generated_tokens")}
         for t in tasks:
             verdict = verdicts[t["task_id"]]
             if verdict == "NO_EVIDENCE":
@@ -284,7 +298,8 @@ def recover_query(generator: Generator, query: dict[str, Any], views: list[dict[
                 answer = answers[key[t["task_id"]]]
             log.append({"task_id": t["task_id"], "phase": t["phase"], "row_id": t["row"]["query_row_id"],
                         "attribute": t["attribute"], "evidence_ids": t["evidence_ids"], "gate": verdict,
-                        "crops": generator.crops.get(t["task_id"], []), **answer})
+                        "crops": generator.crops.get(t["task_id"], []),
+                        "text_spans": getattr(generator, "text_spans", {}).get(t["task_id"], []), **answer})
             for link in t["origin_links"]:
                 predictions.append({"unit_id": digest([t["task_id"], link["target_id"], link["column_id"]]),
                                     "query_row_id": t["row"]["query_row_id"], "target_id": link["target_id"],
@@ -298,7 +313,11 @@ def recover_query(generator: Generator, query: dict[str, Any], views: list[dict[
     run_phase(singles)
     return {"query_id": query["query_id"], "status": "RECOVERY_OK", "predictions": predictions,
             "bridges": build_bridges(query["query_id"], predictions, query["tables"]), "tasks": log,
-            "skips": skips + more_skips, "model_inputs": model_inputs, "seconds": time.perf_counter() - started}
+            "skips": skips + more_skips, "model_inputs": model_inputs, "seconds": time.perf_counter() - started,
+            "generation_tokens": {name: sum(a[name] or 0 for a in answers.values())
+                                  for name in ("prompt_tokens", "generated_tokens")},
+            "text_localization": {"forwards": text_selector.forwards - text_initial[0] if text_selector else 0,
+                                  "seconds": text_selector.seconds - text_initial[1] if text_selector else 0.0}}
 
 
 def recovery_query(catalog: Catalog, query_id: str, candidates: list[str], views: list[dict[str, Any]]) -> dict[str, Any]:
@@ -325,6 +344,9 @@ def run_recovery(config: dict[str, Any], run: Path) -> None:
             query = recovery_query(catalog, plan["query_id"], stage1[plan["query_id"]]["candidates"], plan["views"])
             generator.localizer.cache.clear()
             generator.crops.clear()
+            generator.text_spans.clear()
+            if generator.text_selector is not None:
+                generator.text_selector.cache.clear()
             try:
                 result = recover_query(generator, query, plan["views"], config["recovery"]["text_chars"])
                 counts["recovered"] += 1

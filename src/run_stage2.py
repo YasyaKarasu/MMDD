@@ -75,6 +75,9 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     config = json.loads((run / "config.json").read_text(encoding="utf-8"))
+    if (run / "EXPERIMENT.json").exists():
+        from mmdd_stage2.experiments import verify
+        verify(run)
 
     if args.command == "catalog":
         from mmdd_stage2.catalog import build_catalog
