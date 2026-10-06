@@ -308,6 +308,10 @@ def main(argv: list[str] | None = None) -> None:
     export_parser.add_argument("--arm", choices=("SUP", "KD"), default="KD",
                                help="which dev-selected Native C2 Student to export (protocol primary: KD)")
     export_parser.add_argument("--top-k", type=int, default=50)
+    export_parser.add_argument(
+        "--residual-scale", type=float, default=1.0,
+        help="shrink the evidence residual: score = f0 + alpha * (score - f0); 1.0 = current behaviour",
+    )
     export_parser.add_argument("--evidence-path-k", type=int, default=4)
     amend = subparsers.choices["amend-source"]
     amend.add_argument("--amendment-id", required=True)
@@ -365,6 +369,7 @@ def main(argv: list[str] | None = None) -> None:
             protocol_path, run, (args.output_dir or run / "stage2_handoff").resolve(),
             seed=args.seed if args.seed is not None else protocol["seeds"][0], arm=args.arm,
             top_k=args.top_k, evidence_path_k=args.evidence_path_k,
+            residual_scale=args.residual_scale,
         )
         print(json.dumps(manifest, indent=2, ensure_ascii=False), flush=True)
     else:

@@ -1590,6 +1590,39 @@ def test_stage2_gate_rejects_retrieval_from_another_checkpoint(tmp_path: Path):
         validate_stage2_gate(gate_path)
 
 
+def test_residual_scale_shrinks_the_evidence_residual_and_keeps_the_ranking_sorted():
+    from mmdd_stage1.export import _apply_residual_scale
+
+    def logits(f0, aggregated, raw):
+        return {"f0": f0, "aggregated_score": aggregated, "paths": [{"raw_QET": x} for x in raw]}
+
+    ranking = {"target_ids": ["t_a", "t_b", "t_c"], "scores": [6.0, 5.0, 1.0]}
+    by_target = {
+        "t_a": logits(1.0, 6.0, [6.0]),          # residual +5.0
+        "t_b": logits(4.0, 5.0, [5.0]),          # residual +1.0
+        "t_c": logits(1.0, 1.0, []),             # empty bag: must stay exactly f0
+    }
+
+    same, _ = _apply_residual_scale(copy.deepcopy(ranking), copy.deepcopy(by_target), 1.0)
+    assert same == ranking
+
+    half, scaled = _apply_residual_scale(copy.deepcopy(ranking), copy.deepcopy(by_target), 0.5)
+    assert scaled["t_a"]["aggregated_score"] == pytest.approx(1.0 + 0.5 * 5.0)
+    assert scaled["t_a"]["paths"][0]["raw_QET"] == pytest.approx(1.0 + 0.5 * 5.0)
+    assert scaled["t_b"]["aggregated_score"] == pytest.approx(4.0 + 0.5 * 1.0)
+    assert scaled["t_c"]["aggregated_score"] == pytest.approx(1.0)
+    assert scaled["t_c"]["paths"] == []
+    # half the residual: t_a 1.0+2.5 = 3.5, t_b 4.0+0.5 = 4.5, t_c unchanged at 1.0
+    assert half["target_ids"] == ["t_b", "t_a", "t_c"]
+    assert half["scores"] == [scaled[t]["aggregated_score"] for t in half["target_ids"]]
+    assert half["scores"] == sorted(half["scores"], reverse=True)
+
+    zero, zero_scaled = _apply_residual_scale(copy.deepcopy(ranking), copy.deepcopy(by_target), 0.0)
+    assert [zero_scaled[t]["aggregated_score"] for t in ("t_a", "t_b", "t_c")] == [1.0, 4.0, 1.0]
+    assert zero["target_ids"] == ["t_b", "t_a", "t_c"]      # sorted by f0 now, UTF-8 tie-break
+    assert zero["scores"] == [4.0, 1.0, 1.0]
+
+
 def test_declared_sources_cover_the_main_flow_and_exclude_removed_packages():
     from mmdd_stage1.provenance import source_files
 

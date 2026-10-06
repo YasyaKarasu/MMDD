@@ -41,6 +41,41 @@ def validate_retrieval_path_budget(
             raise ValueError(f"{target_id}: missing or invalid retrieval path detail")
 
 
+def _apply_residual_scale(
+    ranking: dict[str, Any],
+    logits: dict[str, dict[str, Any]],
+    residual_scale: float,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Rescale the evidence residual: ``score(alpha) = f0 + alpha * (score - f0)``.
+
+    The Teacher's aggregated score is ``f0 + LME(path residual)``, so an empty answer bag stays
+    exactly at ``f0``. Every retained evidence path is scaled by the same factor, and the target
+    order is re-derived from the scaled scores so Stage 2 still reads a sorted ranking.
+    """
+    if residual_scale == 1.0:
+        return ranking, logits
+    scaled: dict[str, dict[str, Any]] = {}
+    for target_id, item in logits.items():
+        f0 = float(item["f0"])
+        if item.get("paths"):
+            paths = [
+                {**path, "raw_QET": f0 + residual_scale * (float(path["raw_QET"]) - f0)}
+                for path in item["paths"]
+            ]
+            aggregated = f0 + residual_scale * (float(item["aggregated_score"]) - f0)
+        else:
+            paths, aggregated = [], f0
+        scaled[target_id] = {**item, "aggregated_score": aggregated, "paths": paths}
+    order = sorted(
+        (str(target) for target in ranking["target_ids"]),
+        key=lambda target: (-scaled[target]["aggregated_score"], target.encode("utf-8")),
+    )
+    return (
+        {**ranking, "target_ids": order, "scores": [scaled[t]["aggregated_score"] for t in order]},
+        scaled,
+    )
+
+
 def load_stage1_selection(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("format_version") != 1:
@@ -139,6 +174,7 @@ def _build_record(
     checkpoint_sha256: str,
     top_k: int,
     evidence_path_k: int,
+    residual_scale: float = 1.0,
 ) -> dict[str, Any]:
     direct_ids = {str(value) for value in pool["D100_ANN"]}
     target_ids = [str(value) for value in ranking["target_ids"][:top_k]]
@@ -210,7 +246,8 @@ def _build_record(
         "path_aggregation": {
             "path_result_k": top_k,
             "evidence_path_k": evidence_path_k,
-            "table_score": "TB_CQET_end.Real.nonempty_path_logmeanexp_else_f0",
+            "table_score": "TB_CQET_end.Real.nonempty_path_logmeanexp_else_f0"
+            + ("" if residual_scale == 1.0 else f".residual_scale={residual_scale:g}"),
         },
         "results": results,
     }
@@ -223,6 +260,7 @@ def _export_split(
     checkpoint_sha256: str,
     top_k: int,
     evidence_path_k: int,
+    residual_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
     pools = {str(row["query_id"]): row for row in iter_jsonl(source_dir / "pools.jsonl.gz")}
     rankings = list(iter_jsonl(source_dir / "rankings.TB_CQET.Real.jsonl.gz"))
@@ -233,6 +271,8 @@ def _export_split(
     records = []
     for ranking in rankings:
         query_id = str(ranking["query_id"])
+        ranking, logits = _apply_residual_scale(ranking, logits_by_query[query_id], residual_scale)
+        logits_by_query[query_id] = logits
         record = _build_record(
             ranking,
             pools[query_id],
@@ -240,6 +280,7 @@ def _export_split(
             checkpoint_sha256=checkpoint_sha256,
             top_k=top_k,
             evidence_path_k=evidence_path_k,
+            residual_scale=residual_scale,
         )
         validate_retrieval_path_budget(
             record,
@@ -287,6 +328,7 @@ def export_stage2(
     arm: str = "KD",
     top_k: int = 50,
     evidence_path_k: int = 4,
+    residual_scale: float = 1.0,
     device: str = "cuda:0",
 ) -> dict[str, Any]:
     """Export train/dev/test retrieval of the dev-selected ``NATIVE_C2_<arm>`` Student."""
@@ -294,6 +336,8 @@ def export_stage2(
         raise ValueError(f"unknown Native C2 arm: {arm}")
     if top_k <= 0 or evidence_path_k <= 0:
         raise ValueError("top_k and evidence_path_k must be positive")
+    if not 0.0 <= residual_scale <= 2.0:
+        raise ValueError("residual_scale must be within [0, 2]")
     protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
     dataset_root = Path(protocol["paths"]["dataset_root"])
     if not dataset_root.is_absolute():
@@ -329,6 +373,7 @@ def export_stage2(
             checkpoint_sha256=checkpoint_sha256,
             top_k=top_k,
             evidence_path_k=evidence_path_k,
+            residual_scale=residual_scale,
         )
         records_by_split[split] = records
         exports[split] = {
