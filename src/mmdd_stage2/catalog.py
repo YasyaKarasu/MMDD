@@ -57,7 +57,16 @@ def build_catalog(dataset_root: Path, run: Path) -> None:
         add("query_sources", query_id, source_columns(table))
         population[table["split"]].append({"query_id": query_id, "split": table["split"],
                                            "source_group": str(table["source_table_id"])})
+    sources: dict[str, dict] | None = None
     for table in iter_dataset_artifact(dataset_root, "data_lake_tables"):
+        if "source_table_ref" in table:
+            if sources is None:
+                sources = {
+                    str(r["source_table_id"]): r
+                    for r in iter_dataset_artifact(dataset_root, "source_tables")
+                }
+            sid = str(table["source_table_ref"]["source_table_id"])
+            table = {**sources[sid], **{k: v for k, v in table.items() if k != "source_table_ref"}}
         target_id = str(table["table_id"])
         add("target", target_id, reader_table(table))
         add("target_sources", target_id, source_columns(table))
